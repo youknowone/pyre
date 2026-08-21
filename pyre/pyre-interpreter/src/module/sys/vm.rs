@@ -10,6 +10,10 @@ use crate::{
 use pyre_object::*;
 use std::sync::OnceLock;
 
+#[cfg(windows)]
+static LEGACY_WINDOWS_FS_ENCODING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const GETSIZEOF_DOC: &str = "getsizeof(object [, default]) -> int\n\n\
 Return the size of object in bytes.";
 
@@ -1360,10 +1364,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.version_info — structseq(major, minor, micro, releaselevel,
     // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
     {
-        let version_info_type = crate::_structseq::make_struct_seq(
-            "sys.version_info",
-            &["major", "minor", "micro", "releaselevel", "serial"],
-        );
+        let version_info_type =
+            crate::_structseq::disallow_instantiation(crate::_structseq::make_struct_seq(
+                "sys.version_info",
+                &["major", "minor", "micro", "releaselevel", "serial"],
+            ));
         let vi = crate::_structseq::new_instance(
             version_info_type,
             vec![
@@ -1521,29 +1526,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `context_aware_warnings` sit past the sequence as named-only extras,
     // which is what makes `n_fields` (21) exceed `len()` (18).
     {
-        let flags_type = crate::_structseq::make_struct_seq_with_extra(
-            "sys.flags",
-            &[
-                "debug",
-                "inspect",
-                "interactive",
-                "optimize",
-                "dont_write_bytecode",
-                "no_user_site",
-                "no_site",
-                "ignore_environment",
-                "verbose",
-                "bytes_warning",
-                "quiet",
-                "hash_randomization",
-                "isolated",
-                "dev_mode",
-                "utf8_mode",
-                "warn_default_encoding",
-                "safe_path",
-                "int_max_str_digits",
-            ],
-            &["gil", "thread_inherit_context", "context_aware_warnings"],
+        let flags_type = crate::_structseq::disallow_instantiation(
+            crate::_structseq::make_struct_seq_with_extra(
+                "sys.flags",
+                &[
+                    "debug",
+                    "inspect",
+                    "interactive",
+                    "optimize",
+                    "dont_write_bytecode",
+                    "no_user_site",
+                    "no_site",
+                    "ignore_environment",
+                    "verbose",
+                    "bytes_warning",
+                    "quiet",
+                    "hash_randomization",
+                    "isolated",
+                    "dev_mode",
+                    "utf8_mode",
+                    "warn_default_encoding",
+                    "safe_path",
+                    "int_max_str_digits",
+                ],
+                &["gil", "thread_inherit_context", "context_aware_warnings"],
+            ),
         );
         let flags = crate::_structseq::new_instance_with_extra(
             flags_type,
@@ -1621,16 +1628,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `type(sys.getwindowsversion())` a different class each time.
                 static SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                 let cls = *SEQ_TYPE.get_or_init(|| {
-                    crate::_structseq::make_struct_seq_with_extra(
-                        "sys.getwindowsversion",
-                        &["major", "minor", "build", "platform", "service_pack"],
-                        &[
-                            "service_pack_major",
-                            "service_pack_minor",
-                            "suite_mask",
-                            "product_type",
-                            "platform_version",
-                        ],
+                    crate::_structseq::disallow_instantiation(
+                        crate::_structseq::make_struct_seq_with_extra(
+                            "sys.getwindowsversion",
+                            &["major", "minor", "build", "platform", "service_pack"],
+                            &[
+                                "service_pack_major",
+                                "service_pack_minor",
+                                "suite_mask",
+                                "product_type",
+                                "platform_version",
+                            ],
+                        ),
                     ) as usize
                 }) as PyObjectRef;
                 Ok(crate::_structseq::new_instance_with_extra(
@@ -1798,6 +1807,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    module_ns_store(
+        ns,
+        "_current_exceptions",
+        make_builtin_function_with_arity(
+            "_current_exceptions",
+            |_| Ok(crate::module::thread::current_exceptions()),
+            0,
+        ),
+    );
     // PyPy: pypy/module/sys/state.py:get_int_max_str_digits and
     // set_int_max_str_digits. The limit is object-space state, shared by
     // every caller rather than thread-local state.
@@ -1875,6 +1893,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    module_ns_store(ns, "api_version", w_int_new(1013));
+    module_ns_store(
+        ns,
+        "_git",
+        w_tuple_new(vec![w_str_new("pyre"), w_str_new(""), w_str_new("")]),
+    );
+    module_ns_store(ns, "_home", w_none());
     // sys.implementation — PyPy app.py's implementation_dict, with the Pyre
     // implementation version rather than Python's language version.
     {
@@ -1907,57 +1932,93 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         module_ns_store(ns, "implementation", impl_obj);
     }
-    // sys.hash_info — structseq with width/modulus/... fields.
-    // PyPy: pypy/module/sys/system.py hash_info.
+    // `system.py:get_hash_info|get_float_info|get_thread_info|get_int_info`:
+    // these values are instances of their named structseq classes, not
+    // namespace-shaped records. Tuple storage is observable through indexing,
+    // unpacking, repr, pickling and the n_* class attributes.
     {
-        let hash_info = make_sys_namespace_instance();
-        crate::baseobjspace::setdictvalue_native(hash_info, "width", w_int_new(64));
-        crate::baseobjspace::setdictvalue_native(hash_info, "modulus", w_int_new((1i64 << 61) - 1));
-        crate::baseobjspace::setdictvalue_native(hash_info, "inf", w_int_new(314159));
-        crate::baseobjspace::setdictvalue_native(hash_info, "nan", w_int_new(0));
-        crate::baseobjspace::setdictvalue_native(hash_info, "imag", w_int_new(1000003));
-        crate::baseobjspace::setdictvalue_native(hash_info, "algorithm", w_str_new("siphash13"));
-        crate::baseobjspace::setdictvalue_native(hash_info, "hash_bits", w_int_new(64));
-        crate::baseobjspace::setdictvalue_native(hash_info, "seed_bits", w_int_new(128));
-        crate::baseobjspace::setdictvalue_native(hash_info, "cutoff", w_int_new(0));
-        module_ns_store(ns, "hash_info", hash_info);
+        let ty = crate::_structseq::make_struct_seq(
+            "sys.hash_info",
+            &[
+                "width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits",
+                "seed_bits", "cutoff",
+            ],
+        );
+        let value = crate::_structseq::new_instance(
+            ty,
+            vec![
+                w_int_new(64),
+                w_int_new((1i64 << 61) - 1),
+                w_int_new(314159),
+                w_int_new(0),
+                w_int_new(1000003),
+                w_str_new("siphash13"),
+                w_int_new(64),
+                w_int_new(128),
+                w_int_new(0),
+            ],
+        );
+        module_ns_store(ns, "hash_info", value);
     }
-    // sys.float_info — structseq with IEEE 754 double metadata.
-    // PyPy: pypy/module/sys/system.py float_info.
     {
-        let fi = make_sys_namespace_instance();
-        crate::baseobjspace::setdictvalue_native(fi, "max", w_float_new(f64::MAX));
-        crate::baseobjspace::setdictvalue_native(fi, "max_exp", w_int_new(1024));
-        crate::baseobjspace::setdictvalue_native(fi, "max_10_exp", w_int_new(308));
-        crate::baseobjspace::setdictvalue_native(fi, "min", w_float_new(f64::MIN_POSITIVE));
-        crate::baseobjspace::setdictvalue_native(fi, "min_exp", w_int_new(-1021));
-        crate::baseobjspace::setdictvalue_native(fi, "min_10_exp", w_int_new(-307));
-        crate::baseobjspace::setdictvalue_native(fi, "dig", w_int_new(15));
-        crate::baseobjspace::setdictvalue_native(fi, "mant_dig", w_int_new(53));
-        crate::baseobjspace::setdictvalue_native(fi, "epsilon", w_float_new(f64::EPSILON));
-        crate::baseobjspace::setdictvalue_native(fi, "radix", w_int_new(2));
-        crate::baseobjspace::setdictvalue_native(fi, "rounds", w_int_new(1));
-        module_ns_store(ns, "float_info", fi);
+        let ty = crate::_structseq::make_struct_seq(
+            "sys.float_info",
+            &[
+                "max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig",
+                "mant_dig", "epsilon", "radix", "rounds",
+            ],
+        );
+        let value = crate::_structseq::new_instance(
+            ty,
+            vec![
+                w_float_new(f64::MAX),
+                w_int_new(1024),
+                w_int_new(308),
+                w_float_new(f64::MIN_POSITIVE),
+                w_int_new(-1021),
+                w_int_new(-307),
+                w_int_new(15),
+                w_int_new(53),
+                w_float_new(f64::EPSILON),
+                w_int_new(2),
+                w_int_new(1),
+            ],
+        );
+        module_ns_store(ns, "float_info", value);
     }
     // sysmodule.c — `sys.float_repr_style` is "short" wherever float repr
     // uses David Gay's shortest-round-trip algorithm (always, here).
     module_ns_store(ns, "float_repr_style", w_str_new("short"));
-    // sys.thread_info — structseq(name, lock, version).
     {
-        let ti = make_sys_namespace_instance();
-        crate::baseobjspace::setdictvalue_native(ti, "name", w_str_new("pthread"));
-        crate::baseobjspace::setdictvalue_native(ti, "lock", w_str_new("semaphore"));
-        crate::baseobjspace::setdictvalue_native(ti, "version", w_none());
-        module_ns_store(ns, "thread_info", ti);
+        let ty = crate::_structseq::make_struct_seq(
+            "sys.thread_info",
+            &["name", "lock", "version"],
+        );
+        let value = crate::_structseq::new_instance(
+            ty,
+            vec![
+                w_str_new(if cfg!(windows) { "nt" } else { "pthread" }),
+                if cfg!(windows) { w_none() } else { w_str_new("semaphore") },
+                w_none(),
+            ],
+        );
+        module_ns_store(ns, "thread_info", value);
     }
-    // sys.int_info — structseq with int implementation details.
     {
-        let ii = make_sys_namespace_instance();
-        crate::baseobjspace::setdictvalue_native(ii, "bits_per_digit", w_int_new(30));
-        crate::baseobjspace::setdictvalue_native(ii, "sizeof_digit", w_int_new(4));
-        crate::baseobjspace::setdictvalue_native(ii, "default_max_str_digits", w_int_new(4300));
-        crate::baseobjspace::setdictvalue_native(ii, "str_digits_check_threshold", w_int_new(640));
-        module_ns_store(ns, "int_info", ii);
+        let ty = crate::_structseq::make_struct_seq(
+            "sys.int_info",
+            &[
+                "bits_per_digit",
+                "sizeof_digit",
+                "default_max_str_digits",
+                "str_digits_check_threshold",
+            ],
+        );
+        let value = crate::_structseq::new_instance(
+            ty,
+            vec![w_int_new(30), w_int_new(4), w_int_new(4300), w_int_new(640)],
+        );
+        module_ns_store(ns, "int_info", value);
     }
     module_ns_store(ns, "hexversion", w_int_new(0x030e06f0));
     #[cfg(feature = "host_env")]
@@ -2193,11 +2254,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );
-    // sys.abiflags — `t` for a build without a global interpreter lock.  The
-    // attribute is absent on Windows, where the flag is spelled in
-    // `sys.winver` and neither the `nt` scheme nor `site._get_path` reads it;
-    // every reader guards with `hasattr`, so an empty string answers the same.
-    module_ns_store(ns, "abiflags", w_str_new(if cfg!(windows) { "" } else { "t" }));
+    // `init_sys_streams`: Windows has no `sys.abiflags`; its ABI tag
+    // belongs to `sys.winver`.  Absence is observable through `hasattr` and is
+    // relied on by the 3.14 Windows sys tests, so do not publish an empty
+    // stand-in.
+    #[cfg(not(windows))]
+    module_ns_store(ns, "abiflags", w_str_new("t"));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {
@@ -2567,6 +2629,202 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "exc_clear",
         make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
     );
+    module_ns_store(
+        ns,
+        "call_tracing",
+        make_builtin_function_with_arity(
+            "call_tracing",
+            |args| {
+                if !unsafe { pyre_object::is_tuple(args[1]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "call_tracing() argument 2 must be tuple, not {}",
+                        crate::type_methods::arg_type_name(args[1])
+                    )));
+                }
+                let ec = current_execution_context();
+                if ec.is_null() {
+                    return Err(crate::PyError::runtime_error(
+                        "no current execution context",
+                    ));
+                }
+                let result = unsafe { (*ec).call_tracing(args[0], args[1]) };
+                if result.is_null() {
+                    Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::runtime_error("call_tracing failed")
+                    }))
+                } else {
+                    Ok(result)
+                }
+            },
+            2,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_clear_internal_caches",
+        make_builtin_function_with_arity(
+            "_clear_internal_caches",
+            |_| {
+                crate::baseobjspace::clear_method_cache();
+                crate::objspace::std::mapdict::clear_map_attr_cache();
+                Ok(w_none())
+            },
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_clear_type_cache",
+        make_builtin_function_with_arity(
+            "_clear_type_cache",
+            |_| {
+                crate::warn::warn_category(
+                    "sys._clear_type_cache() is deprecated and scheduled for removal in a future version. Use sys._clear_internal_caches() instead.",
+                    "DeprecationWarning",
+                    1,
+                )?;
+                crate::baseobjspace::clear_method_cache();
+                crate::objspace::std::mapdict::clear_map_attr_cache();
+                Ok(w_none())
+            },
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_debugmallocstats",
+        make_builtin_function_with_arity("_debugmallocstats", |_| Ok(w_none()), 0),
+    );
+    module_ns_store(
+        ns,
+        "getallocatedblocks",
+        make_builtin_function_with_arity(
+            "getallocatedblocks",
+            // MiniMark accounts bytes rather than allocator blocks.  Zero is
+            // the documented answer for a build without pymalloc accounting.
+            |_| Ok(w_int_new(0)),
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "getunicodeinternedsize",
+        crate::make_builtin_function("getunicodeinternedsize", |args| {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            crate::builtins::kwarg_reject_unknown(
+                kwargs,
+                &["_only_immortal"],
+                "getunicodeinternedsize",
+            )?;
+            if !positional.is_empty() {
+                return Err(crate::PyError::type_error(
+                    "getunicodeinternedsize() takes no positional arguments",
+                ));
+            }
+            if let Some(value) = crate::builtins::kwarg_get(kwargs, "_only_immortal") {
+                let _ = crate::baseobjspace::is_true(value)?;
+            }
+            Ok(w_int_new(
+                pyre_object::unicodeobject::interned_size() as i64,
+            ))
+        }),
+    );
+    module_ns_store(
+        ns,
+        "_is_interned",
+        make_builtin_function_with_arity(
+            "_is_interned",
+            |args| {
+                if !unsafe { pyre_object::is_str(args[0]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "_is_interned() argument must be str, not {}",
+                        crate::type_methods::arg_type_name(args[0]),
+                    )));
+                }
+                let exact = unsafe {
+                    pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE)
+                };
+                Ok(w_bool_from(
+                    exact && unsafe {
+                        pyre_object::unicodeobject::is_interned_exact_str(args[0])
+                    },
+                ))
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_is_immortal",
+        make_builtin_function_with_arity(
+            "_is_immortal",
+            |args| Ok(w_bool_from(!pyre_object::gc_hook::try_gc_owns_object(args[0].cast()))),
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_is_gil_enabled",
+        // This is the 3.14t observable: pyre's execution contexts run
+        // concurrently and synchronize the moving collector with STW safepoints,
+        // not a process-wide interpreter lock.
+        make_builtin_function_with_arity("_is_gil_enabled", |_| Ok(w_bool_from(false)), 0),
+    );
+    module_ns_store(
+        ns,
+        "activate_stack_trampoline",
+        make_builtin_function_with_arity(
+            "activate_stack_trampoline",
+            |_| Err(crate::PyError::value_error("perf trampoline not available")),
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "deactivate_stack_trampoline",
+        make_builtin_function_with_arity("deactivate_stack_trampoline", |_| Ok(w_none()), 0),
+    );
+    module_ns_store(
+        ns,
+        "is_stack_trampoline_active",
+        make_builtin_function_with_arity(
+            "is_stack_trampoline_active",
+            |_| Ok(w_bool_from(false)),
+            0,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_dump_tracelets",
+        make_builtin_function_with_arity(
+            "_dump_tracelets",
+            |args| {
+                let _ = crate::gateway::fsencode_bytes_w(args[0])?;
+                Err(crate::PyError::not_implemented("No JIT available"))
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        ns,
+        "_baserepl",
+        make_builtin_function_with_arity("_baserepl", |_| Ok(w_none()), 0),
+    );
+    module_ns_store(
+        ns,
+        "remote_exec",
+        make_builtin_function_with_arity(
+            "remote_exec",
+            |args| {
+                let _pid = crate::builtins::space_index_w(args[0])?;
+                let _script = crate::gateway::fsencode_bytes_w(args[1])?;
+                Err(crate::PyError::runtime_error(
+                    "remote debugging is not supported by this interpreter",
+                ))
+            },
+            2,
+        ),
+    );
     // sys.is_remote_debug_enabled() — no remote-debug interface is wired,
     // so always False.
     module_ns_store(
@@ -2702,7 +2960,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "getfilesystemencoding",
-        make_builtin_function_with_arity("getfilesystemencoding", |_| Ok(w_str_new("utf-8")), 0),
+        make_builtin_function_with_arity(
+            "getfilesystemencoding",
+            |_| {
+                #[cfg(windows)]
+                if LEGACY_WINDOWS_FS_ENCODING.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(w_str_new("mbcs"));
+                }
+                Ok(w_str_new("utf-8"))
+            },
+            0,
+        ),
     );
     // `interp_encoding.py:8-12 base_error` — PEP 529 puts Windows on
     // `surrogatepass`, every other platform on `surrogateescape`. `os.fsencode`
@@ -2713,7 +2981,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "getfilesystemencodeerrors",
         make_builtin_function_with_arity(
             "getfilesystemencodeerrors",
-            |_| Ok(w_str_new(crate::typedef::FS_ERRORS)),
+            |_| {
+                #[cfg(windows)]
+                if LEGACY_WINDOWS_FS_ENCODING.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(w_str_new("replace"));
+                }
+                Ok(w_str_new(crate::typedef::FS_ERRORS))
+            },
+            0,
+        ),
+    );
+    #[cfg(windows)]
+    module_ns_store(
+        ns,
+        "_enablelegacywindowsfsencoding",
+        make_builtin_function_with_arity(
+            "_enablelegacywindowsfsencoding",
+            |_| {
+                crate::warn::warn_category(
+                    "sys._enablelegacywindowsfsencoding() is deprecated and will be removed in Python 3.16. Use PYTHONLEGACYWINDOWSFSENCODING instead.",
+                    "DeprecationWarning",
+                    1,
+                )?;
+                LEGACY_WINDOWS_FS_ENCODING
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(w_none())
+            },
             0,
         ),
     );

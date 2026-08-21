@@ -119,6 +119,27 @@ fn socket_converted_error(
     err
 }
 
+#[cfg(all(windows, feature = "host_env"))]
+fn interface_io_error(error: std::io::Error) -> crate::PyError {
+    use rustpython_host_env::os::ErrorExt;
+
+    // The two scalar conversions fail through the C runtime `errno` the IP
+    // Helper API sets, which `raw_os_error` leaves empty on purpose so that no
+    // `winerror` is attached to it; `posix_errno` is what recovers it.  The
+    // enumeration path instead fails through a Win32 status, and that one is
+    // reported as the Win32 flavour it is.
+    let Some(winerror) = error.raw_os_error() else {
+        let errno = error.posix_errno();
+        let message = match errno {
+            libc::ENODEV => "No such device".to_string(),
+            libc::ENXIO => "No such device or address".to_string(),
+            _ => error.to_string(),
+        };
+        return crate::PyError::os_error_with_errno(errno, message);
+    };
+    crate::PyError::os_error_win32_syscall2(winerror, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
+
 /// One `space.acquire_writebuf` export held for the whole of a `recv_into`
 /// family call, the way `with rwbuffer:` keeps it across `c_recv`.
 ///
@@ -531,6 +552,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("AF_DECnet", ws::AF_DECnet);
         cst!("AF_IPX", ws::AF_IPX);
         cst!("AF_LINK", ws::AF_LINK);
+        // `socketmodule.c:PyInit__socket` publishes the address families the
+        // 3.14 Windows SDK exposes in addition to PyPy's older MSVC census.
+        cst!("AF_SNA", 11);
+        cst!("AF_IRDA", 26);
+        cst!("AF_BLUETOOTH", 32);
+        cst!("AF_HYPERV", 34);
         // ── Socket types ──
         cst!("SOCK_STREAM", ws::SOCK_STREAM);
         cst!("SOCK_DGRAM", ws::SOCK_DGRAM);
@@ -543,12 +570,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_ICMP", ws::IPPROTO_ICMP);
         cst!("IPPROTO_IGMP", ws::IPPROTO_IGMP);
         cst!("IPPROTO_GGP", ws::IPPROTO_GGP);
+        cst!("IPPROTO_ST", 5);
+        cst!("IPPROTO_CBT", 7);
+        cst!("IPPROTO_IGP", 9);
         cst!("IPPROTO_IPV4", ws::IPPROTO_IPV4);
         cst!("IPPROTO_TCP", ws::IPPROTO_TCP);
         cst!("IPPROTO_EGP", ws::IPPROTO_EGP);
         cst!("IPPROTO_PUP", ws::IPPROTO_PUP);
         cst!("IPPROTO_UDP", ws::IPPROTO_UDP);
         cst!("IPPROTO_IDP", ws::IPPROTO_IDP);
+        cst!("IPPROTO_ICLFXBM", 78);
         cst!("IPPROTO_IPV6", ws::IPPROTO_IPV6);
         cst!("IPPROTO_ROUTING", ws::IPPROTO_ROUTING);
         cst!("IPPROTO_FRAGMENT", ws::IPPROTO_FRAGMENT);
@@ -561,6 +592,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_PIM", ws::IPPROTO_PIM);
         cst!("IPPROTO_PGM", ws::IPPROTO_PGM);
         cst!("IPPROTO_RDP", ws::IPPROTO_RDP);
+        cst!("IPPROTO_L2TP", 115);
         cst!("IPPROTO_SCTP", ws::IPPROTO_SCTP);
         cst!("IPPROTO_RAW", ws::IPPROTO_RAW);
         cst!("IPPROTO_MAX", ws::IPPROTO_MAX);
@@ -599,14 +631,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("SO_SNDBUF", ws::SO_SNDBUF);
         cst!("SO_RCVTIMEO", ws::SO_RCVTIMEO);
         cst!("SO_SNDTIMEO", ws::SO_SNDTIMEO);
+        cst!("SO_SNDLOWAT", 0x1003);
+        cst!("SO_RCVLOWAT", 0x1004);
         cst!("SO_ERROR", ws::SO_ERROR);
         cst!("SO_TYPE", ws::SO_TYPE);
         cst!("SO_ACCEPTCONN", ws::SO_ACCEPTCONN);
         cst!("SO_USELOOPBACK", ws::SO_USELOOPBACK);
+        cst!("SO_ORIGINAL_DST", 12303);
+        // Bluetooth/RFCOMM constants.  The option names are unsigned SDK
+        // words but `PyModule_AddIntConstant` exposes their signed C-long
+        // readings on Windows.
+        cst!("BTPROTO_RFCOMM", 3);
+        cst!("SOL_RFCOMM", 3);
+        cst!("SO_BTH_ENCRYPT", 2);
+        cst!("SO_BTH_MTU", 0x80000007u32 as i32);
+        cst!("SO_BTH_MTU_MAX", 0x80000008u32 as i32);
+        cst!("SO_BTH_MTU_MIN", 0x8000000au32 as i32);
         // ── TCP-level ──
         cst!("TCP_NODELAY", ws::TCP_NODELAY);
         cst!("TCP_MAXSEG", ws::TCP_MAXSEG);
         cst!("TCP_KEEPALIVE", ws::TCP_KEEPALIVE);
+        cst!("TCP_KEEPIDLE", 3);
+        cst!("TCP_FASTOPEN", 15);
+        cst!("TCP_KEEPCNT", 16);
+        cst!("TCP_KEEPINTVL", 17);
+        cst!("TCP_QUICKACK", 0x98000017u32 as i32);
         // ── IP-level ──
         cst!("IP_TTL", ws::IP_TTL);
         cst!("IP_TOS", ws::IP_TOS);
@@ -618,6 +667,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IP_DROP_MEMBERSHIP", ws::IP_DROP_MEMBERSHIP);
         cst!("IP_HDRINCL", ws::IP_HDRINCL);
         cst!("IP_RECVDSTADDR", ws::IP_RECVDSTADDR);
+        cst!("IP_ADD_SOURCE_MEMBERSHIP", 15);
+        cst!("IP_DROP_SOURCE_MEMBERSHIP", 16);
+        cst!("IP_BLOCK_SOURCE", 17);
+        cst!("IP_UNBLOCK_SOURCE", 18);
+        cst!("IP_PKTINFO", 19);
+        cst!("IP_RECVTTL", 21);
+        cst!("IP_RECVTOS", 40);
+        cst!("IP_RECVERR", 75);
         cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
         cst!("IP_DEFAULT_MULTICAST_TTL", 1);
         cst!("IP_MAX_MEMBERSHIPS", 20);
@@ -635,6 +692,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPV6_PKTINFO", ws::IPV6_PKTINFO);
         cst!("IPV6_RECVRTHDR", ws::IPV6_RECVRTHDR);
         cst!("IPV6_RECVTCLASS", ws::IPV6_RECVTCLASS);
+        cst!("IPV6_RECVERR", 75);
         cst!("IPV6_RTHDR", ws::IPV6_RTHDR);
         cst!("IPV6_TCLASS", ws::IPV6_TCLASS);
         cst!("IPV6_UNICAST_HOPS", ws::IPV6_UNICAST_HOPS);
@@ -651,6 +709,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("MSG_TRUNC", ws::MSG_TRUNC);
         cst!("MSG_BCAST", ws::MSG_BCAST);
         cst!("MSG_MCAST", ws::MSG_MCAST);
+        cst!("MSG_ERRQUEUE", 0x1000);
         // ── Address-info flags ──
         cst!("AI_PASSIVE", ws::AI_PASSIVE);
         cst!("AI_CANONNAME", ws::AI_CANONNAME);
@@ -687,6 +746,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("RCVALL_ON", ws::RCVALL_ON);
         cst!("RCVALL_SOCKETLEVELONLY", ws::RCVALL_SOCKETLEVELONLY);
         cst!("RCVALL_IPLEVEL", ws::RCVALL_IPLEVEL);
+        cst!("RCVALL_MAX", 3);
+        // Hyper-V socket ABI constants (`hvsocket.h`).  GUIDs and Bluetooth
+        // addresses are public strings rather than integer enum members.
+        cst!("HV_PROTOCOL_RAW", 1);
+        cst!("HVSOCKET_CONNECT_TIMEOUT", 1);
+        cst!("HVSOCKET_CONNECTED_SUSPEND", 4);
+        cst!("HVSOCKET_CONNECT_TIMEOUT_MAX", 300_000);
+        cst!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", 1);
+        for (name, value) in [
+            ("BDADDR_ANY", "00:00:00:00:00:00"),
+            ("BDADDR_LOCAL", "00:00:00:FF:FF:FF"),
+            ("HV_GUID_ZERO", "00000000-0000-0000-0000-000000000000"),
+            ("HV_GUID_WILDCARD", "00000000-0000-0000-0000-000000000000"),
+            ("HV_GUID_BROADCAST", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
+            ("HV_GUID_CHILDREN", "90DB8B89-0D35-4F79-8CE9-49EA0AC8B7CD"),
+            ("HV_GUID_LOOPBACK", "E0E16197-DD56-4A10-9195-5EE7A155A838"),
+            ("HV_GUID_PARENT", "A42E7CDA-D03F-480C-9CC2-A4DE20ABB878"),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_str_new(value));
+        }
         // ── socket-level cap ──
         // `<winsock2.h>` defines SOMAXCONN as 0x7fffffff; the WinSock 1.1
         // value of 5 the metadata carries is the one `listen` outgrew.
@@ -1527,6 +1606,94 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
+    // Windows has the same public trio but no POSIX `if_nameindex` array.
+    // `rustpython_host_env::socket` follows the same IP Helper API route:
+    // `GetIfTable2Ex` for enumeration and the WinSock conversion calls for
+    // the two scalar directions.
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        crate::module_ns_store(
+            ns,
+            "if_nameindex",
+            crate::make_builtin_function_with_arity(
+                "if_nameindex",
+                |_| {
+                    let entries = rustpython_host_env::socket::if_nameindex()
+                        .map_err(interface_io_error)?;
+                    Ok(pyre_object::w_list_new(
+                        entries
+                            .into_iter()
+                            .map(|(index, name)| {
+                                pyre_object::w_tuple_new(vec![
+                                    pyre_object::w_int_new(index as i64),
+                                    pyre_object::w_str_new(&name),
+                                ])
+                            })
+                            .collect(),
+                    ))
+                },
+                0,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "if_nametoindex",
+            crate::make_builtin_function_with_arity(
+                "if_nametoindex",
+                |args| {
+                    let name = crate::gateway::fsencode_bytes_w(args[0])?;
+                    let name = std::ffi::CString::new(name)
+                        .map_err(|_| crate::PyError::value_error("embedded null in name"))?;
+                    let index = rustpython_host_env::socket::if_nametoindex_checked(&name)
+                        .map_err(interface_io_error)?;
+                    Ok(pyre_object::w_int_new(index as i64))
+                },
+                1,
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "if_indextoname",
+            crate::make_builtin_function_with_arity(
+                "if_indextoname",
+                |args| {
+                    // `socket_if_indextoname`'s NET_IFINDEX converter reads
+                    // `__index__` first, rejects a negative value, and only
+                    // then the ones no interface index can hold.  An argument
+                    // wider than a machine word has to reach those same two
+                    // answers rather than a conversion error of its own, so
+                    // take its sign from the object when the word conversion
+                    // is the thing that fails.
+                    let w_index = crate::baseobjspace::space_index(args[0])?;
+                    let word = crate::builtins::space_index_w(w_index).ok();
+                    let negative = match word {
+                        Some(index) => index < 0,
+                        // Only a long fails to fit a machine word.
+                        None => unsafe {
+                            pyre_object::longobject::jit_bigint_sign_i64(
+                                pyre_object::longobject::w_long_get_value(w_index),
+                            ) < 0
+                        },
+                    };
+                    if negative {
+                        return Err(crate::PyError::value_error("Cannot convert negative int"));
+                    }
+                    let index = word
+                        .and_then(|index| u32::try_from(index).ok())
+                        .ok_or_else(|| {
+                            crate::PyError::overflow_error(
+                                "Python int too large for C NET_IFINDEX",
+                            )
+                        })?;
+                    let name = rustpython_host_env::socket::if_indextoname_checked(index)
+                        .map_err(interface_io_error)?;
+                    Ok(pyre_object::w_str_new(&name))
+                },
+                1,
+            ),
+        );
+    }
+
     // ── CMSG_SPACE / CMSG_LEN ──
     // `interp_func.py:341-376` — POSIX macros, exposed only when the
     // host libc has them.  rust's `libc` crate provides both on every
@@ -1608,10 +1775,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, "SocketType", socket_tp);
     }
 
-    // `socket.py` reaches for `_socket.socketpair` and falls back to its
-    // own AF_INET pair when the module does not carry one; `dup`/`fromfd`
-    // likewise have no WinSock spelling that duplicates a descriptor in
-    // place.  All three stay with the POSIX calls they are built on.
+    // `socket.py` defines `socketpair` only when `_socket` carries one and
+    // falls back to `_fallback_socketpair`'s own AF_INET pair otherwise, and
+    // `fromfd` is built out of `dup` at app level everywhere else.  Both stay
+    // with the POSIX calls they are made of; `dup` itself is registered for
+    // Windows too, further down, out of the WinSock calls that stand in for
+    // it.
     #[cfg(unix)]
     {
         // socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0)
@@ -1734,6 +1903,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }),
         );
     }
+
+    // `socket.py:286 socket.dup` and `:554 fromfd` both go through
+    // `_socket.dup`, which on Windows cannot duplicate a descriptor in place:
+    // a socket is not a C runtime file descriptor there.  `socket_dup` hands
+    // the socket to the process it is already in with `WSADuplicateSocketW`
+    // and re-opens it from the protocol info that writes, which is the pair of
+    // calls `share_socket` / `socket_from_share_data` make.  The new socket is
+    // non-inheritable, as PEP 446 asks and as `socket_from_share_data` leaves
+    // it.
+    #[cfg(all(windows, feature = "host_env"))]
+    crate::module_ns_store(
+        ns,
+        "dup",
+        crate::make_builtin_function_with_arity(
+            "dup",
+            |args| {
+                let fd = crate::builtins::space_index_w(args[0])?;
+                let share =
+                    rustpython_host_env::socket::share_socket(fd as _, std::process::id())
+                        .map_err(socket_io_err)?;
+                let shared = rustpython_host_env::socket::socket_from_share_data(&share)
+                    .map_err(socket_io_err)?;
+                Ok(pyre_object::w_int_new(shared.raw as i64))
+            },
+            1,
+        ),
+    );
 }
 
 // ── hostent → (name, aliases, addrs) ──
@@ -4573,4 +4769,3 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 }
-

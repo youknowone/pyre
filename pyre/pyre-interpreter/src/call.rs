@@ -3623,7 +3623,9 @@ pub(crate) fn calculate_metaclass(
 /// `Type()` with `cannot create 'X' instances`.
 pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError> {
     if unsafe { pyre_object::w_type_disallows_instantiation(w_type) } {
-        let name = unsafe { pyre_object::w_type_get_name(w_type) };
+        // The name here is `tp_name`, which a heap type such as `sys.flags`
+        // spells with its module in front of it.
+        let name = unsafe { crate::baseobjspace::type_repr_qualified_name(w_type) };
         return Err(PyError::type_error(format!(
             "cannot create '{name}' instances"
         )));

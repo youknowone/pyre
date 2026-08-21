@@ -506,6 +506,42 @@ pub(crate) fn current_frames() -> PyObjectRef {
     result
 }
 
+/// `threadmappings.py:_current_exceptions` — snapshot every registered
+/// ExecutionContext's currently handled exception under the same stop-the-
+/// world boundary `_current_frames` uses.  Values are rooted before the
+/// registry lock is released, so building the result dict cannot retain a
+/// pre-move address.
+pub(crate) fn current_exceptions() -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let mut entries = Vec::new();
+    majit_gc::gc_sync::request_stw(|_| {
+        let contexts = EXECUTION_CONTEXTS.lock();
+        for (&ident, &ec) in contexts.iter() {
+            let exception =
+                unsafe { (*(ec as *const crate::PyExecutionContext)).current_exception() };
+            pyre_object::gc_roots::pin_root(if exception.is_null() {
+                w_none()
+            } else {
+                exception
+            });
+            entries.push(ident);
+        }
+    });
+    let result = w_dict_new();
+    for (index, ident) in entries.into_iter().enumerate() {
+        unsafe {
+            w_dict_setitem(
+                result,
+                ident,
+                pyre_object::gc_roots::shadow_stack_get(base + index),
+            )
+        };
+    }
+    drop(roots);
+    result
+}
+
 /// `pypy/module/thread/os_thread.py:reinit_threads`.
 pub(crate) fn after_fork_child() {
     let ident = current_ident();
@@ -2241,6 +2277,167 @@ fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_none())
 }
 
+/// `os_thread.py:exit` — ending a thread is expressed as `SystemExit`, so the
+/// bootstrapper's normal exception path performs the same handle/count/TLS
+/// cleanup as a function which returned normally.
+fn exit_thread(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = crate::builtins::lookup_exc_class("SystemExit")
+        .expect("SystemExit must be installed before _thread init");
+    let exc = crate::builtins::exc_exception_new(&[cls])?;
+    Err(unsafe { crate::PyError::from_exc_object(exc) })
+}
+
+#[cfg(windows)]
+fn current_thread_name() -> Result<PyObjectRef, crate::PyError> {
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        System::Threading::{GetCurrentThread, GetThreadDescription},
+    };
+
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe { GetThreadDescription(GetCurrentThread(), &mut raw) };
+    if status < 0 {
+        // An unnamed thread is reported as absent by older Windows builds;
+        // That state is reported as the empty string.
+        return Ok(w_str_new(""));
+    }
+    if raw.is_null() {
+        return Ok(w_str_new(""));
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let name = pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
+        std::slice::from_raw_parts(raw, len)
+    }));
+    unsafe { LocalFree(raw.cast()) };
+    Ok(name)
+}
+
+#[cfg(windows)]
+fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+
+    // `PyThread_set_name`: Windows counts UTF-16 code units, stops at
+    // the first NUL, and truncates without splitting a surrogate pair.
+    let all: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_name) }
+        .encode_wide()
+        .collect();
+    let nul = all.iter().position(|&unit| unit == 0).unwrap_or(all.len());
+    let mut end = nul.min(32_766);
+    if end < all.len()
+        && end > 0
+        && (0xD800..=0xDBFF).contains(&all[end - 1])
+        && (0xDC00..=0xDFFF).contains(&all[end])
+    {
+        end -= 1;
+    }
+    let wide: Vec<u16> = all[..end].iter().copied().chain([0]).collect();
+    let status = unsafe { SetThreadDescription(GetCurrentThread(), wide.as_ptr()) };
+    if status < 0 {
+        return Err(crate::PyError::os_error(format!(
+            "SetThreadDescription failed with HRESULT 0x{:08x}",
+            status as u32
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_thread_name() -> Result<String, crate::PyError> {
+    let mut buffer = [0u8; 16];
+    let status = unsafe {
+        libc::pthread_getname_np(
+            libc::pthread_self(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if status != 0 {
+        return Err(crate::PyError::os_error_syscall(status, PY_NULL));
+    }
+    let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn current_thread_name() -> Result<String, crate::PyError> {
+    let mut buffer = [0u8; 64];
+    let status = unsafe {
+        libc::pthread_getname_np(
+            libc::pthread_self(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if status != 0 {
+        return Err(crate::PyError::os_error_syscall(status, PY_NULL));
+    }
+    let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn current_thread_name() -> Result<String, crate::PyError> {
+    Ok(std::thread::current().name().unwrap_or("").to_string())
+}
+
+#[cfg(not(windows))]
+fn set_current_thread_name(name: &str) -> Result<(), crate::PyError> {
+    let limit = if cfg!(target_os = "linux") {
+        15
+    } else if cfg!(target_os = "macos") {
+        63
+    } else {
+        usize::MAX
+    };
+    let nul = name.find('\0').unwrap_or(name.len());
+    let mut end = nul.min(limit);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    #[cfg(all(feature = "host_env", any(unix, windows)))]
+    rustpython_host_env::thread::set_current_thread_name(&name[..end]);
+    #[cfg(not(all(feature = "host_env", any(unix, windows))))]
+    let _ = end;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn get_thread_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    current_thread_name()
+}
+
+#[cfg(not(windows))]
+fn get_thread_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(w_str_new(&current_thread_name()?))
+}
+
+fn set_thread_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { !pyre_object::is_str(args[0]) } {
+        // `_PyArg_BadArgument` renders the None singleton as `None`, rather
+        // than its class name `NoneType`.
+        let type_name = if unsafe { pyre_object::is_none(args[0]) } {
+            "None"
+        } else {
+            unsafe { pyre_object::type_name_of(args[0]) }
+        };
+        return Err(crate::PyError::type_error(format!(
+            "set_name() argument 'name' must be str, not {type_name}"
+        )));
+    }
+    // The wide host takes the string object itself, since the name it sets is
+    // counted in UTF-16 code units.
+    #[cfg(windows)]
+    set_current_thread_name(args[0])?;
+    #[cfg(not(windows))]
+    set_current_thread_name(crate::baseobjspace::str_utf8_w(args[0])?)?;
+    Ok(w_none())
+}
+
 crate::py_module! {
     "_thread",
     interpleveldefs: {
@@ -2259,6 +2456,15 @@ crate::py_module! {
         "_local"        => local_type(),
         "_ExceptHookArgs" => except_hook_args_type(),
         "TIMEOUT_MAX"   => w_float_new(TIMEOUT_MAX),
+        "_NAME_MAXLEN"  => w_int_new(if cfg!(windows) {
+            32_766
+        } else if cfg!(target_os = "linux") {
+            15
+        } else if cfg!(target_os = "macos") {
+            63
+        } else {
+            0
+        }),
         "error"         => crate::builtins::lookup_exc_class("RuntimeError")
                                .unwrap_or_else(crate::typedef::w_object),
     },
@@ -2275,7 +2481,10 @@ crate::py_module! {
         "_shutdown"              / 0 = shutdown_threads,
         "stack_size"             / * = stack_size,
         "interrupt_main"         / * = interrupt_main,
-        "set_name"               / 1 = |_| Ok(w_none()),
+        "exit"                   / 0 = exit_thread,
+        "exit_thread"            / 0 = exit_thread,
+        "_get_name"              / 0 = get_thread_name,
+        "set_name"               / 1 = set_thread_name,
         "_excepthook"            / 1 = thread_excepthook,
         "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
         "start_joinable_thread"  / * = start_joinable_thread,

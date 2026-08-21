@@ -21,6 +21,10 @@ mod stringio;
 pub use stringio::W_StringIO;
 mod textio;
 pub use textio::W_TextIOWrapper;
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub(crate) mod winconsoleio;
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub use winconsoleio::W_WindowsConsoleIO;
 
 pub fn text_io_wrapper_type() -> PyObjectRef {
     textio::type_object()
@@ -97,7 +101,10 @@ fn iobase_internal_closed(obj: PyObjectRef) -> bool {
         })
 }
 
-fn iobase_set_internal_closed(obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
+pub(crate) fn iobase_set_internal_closed(
+    obj: PyObjectRef,
+    closed: bool,
+) -> Result<(), crate::PyError> {
     if crate::baseobjspace::setdictvalue(obj, "__iobase_closed__", w_bool_from(closed))? {
         Ok(())
     } else {
@@ -1221,7 +1228,7 @@ fn io_base_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-fn raw_iobase_type() -> PyObjectRef {
+pub(super) fn raw_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
@@ -1265,6 +1272,11 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         }
         tp as usize
     }) as PyObjectRef
+}
+
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn windows_console_io_type() -> PyObjectRef {
+    winconsoleio::type_object()
 }
 
 pub(crate) fn buffered_reader_type() -> PyObjectRef {
@@ -1440,6 +1452,20 @@ crate::py_module! {
                 pyre_object::typeobject::w_type_set_hasdict(t, true);
             }
             crate::module_ns_store(ns, name, t);
+        }
+
+        // `PyInit__io` exposes the PEP 528 raw console stream only on
+        // Windows.  PyPy's `W_WinConsoleIO` likewise derives directly from
+        // `W_RawIOBase`; the descriptor, ownership flag and UTF-8 carry buffer
+        // live on that one stream object.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            let console_io = winconsoleio::type_object();
+            unsafe {
+                pyre_object::w_type_set_acceptable_as_base_class(console_io, true);
+                pyre_object::typeobject::w_type_set_hasdict(console_io, true);
+            }
+            crate::module_ns_store(ns, "_WindowsConsoleIO", console_io);
         }
 
         // `TextIOWrapper` is a real (subclassable) type: stdlib modules such

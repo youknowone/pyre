@@ -344,6 +344,11 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
         return Err(PyError::type_error("structseq() requires class + sequence"));
     }
     let cls = args[0];
+    // A type built by [`disallow_instantiation`] has no `tp_new` upstream, so
+    // its `__new__` is `object.__new__`, which refuses it.  The descriptor is
+    // reached directly as `type(sys.flags).__new__(...)`, past the check
+    // `type.__call__` makes.
+    crate::call::check_type_instantiable(cls)?;
     let n_seq = read_class_int(cls, "n_sequence_fields").unwrap_or(0) as usize;
     let n_fields = read_class_int(cls, "n_fields").unwrap_or(n_seq as i64) as usize;
     let (name, extra_names) = {
@@ -579,6 +584,17 @@ pub fn make_struct_seq_with_extra(
     extra_field_names: &[&'static str],
 ) -> PyObjectRef {
     make_struct_seq_impl(name, field_names, extra_field_names)
+}
+
+/// Mark a structseq type `Py_TPFLAGS_DISALLOW_INSTANTIATION`, which is how
+/// `sys.flags`, `sys.version_info` and `sys.getwindowsversion` are built —
+/// their single instance is the module's own answer and there is nothing a
+/// second one could describe.  Interpreter-side construction goes through
+/// [`new_instance`], which allocates directly, so only `Type(...)` from Python
+/// is refused.
+pub fn disallow_instantiation(cls: PyObjectRef) -> PyObjectRef {
+    unsafe { pyre_object::w_type_set_disallow_instantiation(cls) };
+    cls
 }
 
 fn make_struct_seq_impl(

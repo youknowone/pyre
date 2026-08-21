@@ -6889,13 +6889,13 @@ pub(crate) fn set_crt_errno(value: i32) {
 
 /// The errno the last C runtime call reported.
 pub(crate) fn crt_errno() -> i32 {
-    #[cfg(all(windows, feature = "host_env"))]
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     {
         rustpython_host_env::os::get_errno()
     }
     // Off Windows the two are the same table, and a Windows build without the
     // host_env seam has no `_get_errno` to read.
-    #[cfg(not(all(windows, feature = "host_env")))]
+    #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
     {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
     }
@@ -17082,8 +17082,9 @@ fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate:
 /// `open()` — PyPy `pypy/module/_io/interp_io.py:open`.
 ///
 /// Keep the upstream construction order literal: validate the mode, create a
-/// `FileIO`, choose exactly one buffered class, and only then add the text
-/// wrapper.  In particular, binary unbuffered I/O returns the raw `FileIO`.
+/// raw stream (`FileIO`, or PEP 528 `_WindowsConsoleIO` for a Windows console),
+/// choose exactly one buffered class, and only then add the text wrapper.  In
+/// particular, binary unbuffered I/O returns that raw stream.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     // Every declared slot binds before the unrecognized keywords are
@@ -17304,8 +17305,21 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         'x'
     };
     let raw_mode = format!("{primary}{}", if updating { "+" } else { "" });
+    // The console stream is a host-console type, so a sandbox build — which
+    // compiles it out — keeps the plain `FileIO` construction.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    let raw_type = {
+        let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+        if crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0' {
+            crate::module::_io::windows_console_io_type()
+        } else {
+            crate::module::_io::fileio_type()
+        }
+    };
+    #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+    let raw_type = crate::module::_io::fileio_type();
     let raw = crate::call::call_function_impl_result(
-        crate::module::_io::fileio_type(),
+        raw_type,
         &[
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             w_str_new(&raw_mode),

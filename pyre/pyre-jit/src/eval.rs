@@ -4118,6 +4118,22 @@ fn build_gc() -> Box<MiniMarkGC> {
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, winapi_overlapped_destructor);
     }
+    // `_io._WindowsConsoleIO` is a PEP 528 raw stream: its own fields are the
+    // descriptor, the three mode flags and the carry buffer, but the type
+    // accepts subclasses and carries a dict, so the header prefix its marker
+    // forwards is the whole of its managed children. Append it after every
+    // existing object type so their automatic ids do not move.
+    //
+    // The interpreter gates the type on `host_env` too, but that is a default
+    // feature of `pyre-interpreter`, which `pyre-jit` takes with defaults on;
+    // only the two halves a build can actually turn off are spelled here.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_WindowsConsoleIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a

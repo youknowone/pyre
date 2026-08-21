@@ -718,6 +718,10 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // waited on through an event of its own rather than a completion port.
     #[cfg(windows)]
     (189, Some(0)),
+    // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
+    // Its append-only vtable id follows both Windows overlapped owners.
+    #[cfg(windows)]
+    (190, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

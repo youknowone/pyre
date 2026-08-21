@@ -10520,15 +10520,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // The path names itself; the argv entries do not, because
                     // each of those is converted on the sequence's behalf
                     // rather than as an argument of its own.
-                    let command =
-                        crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?.as_bytes;
-                    let command_w = wide_path(&command)?;
+                    let path = crate::gateway::fsencode_path_named_w(args[0], "execv", "path")?;
+                    let command_w = wide_path(&path.as_bytes)?;
                     let argv = exec_argv_wide(args[1], "execv")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
-                    unsafe { libc::wexecv(command_w.as_ptr(), argv_ptrs.as_ptr()) };
-                    // `wrap_oserror` names no file, so the path stays out of
-                    // the error.
-                    Err(io_err(std::io::Error::last_os_error(), ""))
+                    // The runtime's invalid parameter handler is silenced
+                    // around the call: an empty path reaches it, and its
+                    // default action ends the process where the call is
+                    // supposed to return -1 with `EINVAL` in `errno`.
+                    crate::builtins::crt_call!(libc::wexecv(
+                        command_w.as_ptr(),
+                        argv_ptrs.as_ptr()
+                    ));
+                    // `os_execv_impl` reports through `path_error`, so the
+                    // path this failed on is the error's filename.
+                    Err(errno_err_with_filename(
+                        crate::builtins::crt_errno(),
+                        path.w_path(),
+                    ))
                 },
                 2,
             ),
@@ -10540,9 +10549,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "execve",
                 |args| {
-                    let command =
-                        crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?.as_bytes;
-                    let command_w = wide_path(&command)?;
+                    let path = crate::gateway::fsencode_path_named_w(args[0], "execve", "path")?;
+                    let command_w = wide_path(&path.as_bytes)?;
                     let argv = exec_argv_wide(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
@@ -10558,12 +10566,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let env_ptrs = exec_pointer_array_wide(&env);
-                    unsafe {
-                        libc::wexecve(command_w.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
-                    };
-                    Err(io_err(std::io::Error::last_os_error(), ""))
+                    crate::builtins::crt_call!(libc::wexecve(
+                        command_w.as_ptr(),
+                        argv_ptrs.as_ptr(),
+                        env_ptrs.as_ptr()
+                    ));
+                    Err(errno_err_with_filename(
+                        crate::builtins::crt_errno(),
+                        path.w_path(),
+                    ))
                 },
                 3,
+            ),
+        );
+
+        // os.kill(pid, sig)
+        //
+        // `os_kill_impl` under `MS_WINDOWS`: the two console control events
+        // are delivered to the process group with `GenerateConsoleCtrlEvent`,
+        // and any other number is the exit code `TerminateProcess` stamps on
+        // the process it ends — there are no signals to send one.
+        crate::module_ns_store(
+            ns,
+            "kill",
+            crate::make_builtin_function_with_arity(
+                "kill",
+                |args| {
+                    let pid = crate::baseobjspace::c_int_w(args[0])?;
+                    let sig = crate::baseobjspace::c_int_w(args[1])?;
+                    let _blocked = crate::module::thread::before_external_block();
+                    host_nt::kill(pid as u32, sig as u32)
+                        .map_err(|error| fs_err_with_filename(error, pyre_object::PY_NULL))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
             ),
         );
 
@@ -10638,6 +10674,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 result.map_err(|e| fs_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
+        );
+
+        // `os.lchmod` is the named `follow_symlinks=False` operation.  Windows
+        // implements that distinction with the reparse point's own file
+        // attributes (`rustpython_host_env::nt::win32_lchmod`), so publishing
+        // the function is truthful here rather than the unsupported POSIX
+        // `lchmod(2)` stub some Unix hosts carry.
+        crate::module_ns_store(
+            ns,
+            "lchmod",
+            crate::make_builtin_function_with_arity(
+                "lchmod",
+                |args| {
+                    let path = crate::gateway::fsencode_path_or_fd_w(
+                        args[0], "lchmod", false,
+                    )?;
+                    let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
+                    let name = os_str_from_bytes(&path.as_bytes);
+                    host_nt::win32_lchmod(&name, mode, S_IWRITE)
+                        .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
         );
 
         // os.fchmod(fd, mode) -> None

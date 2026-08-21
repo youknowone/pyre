@@ -17,6 +17,13 @@ pub mod hook;
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// The collector debug word.  PyPy does not expose this frontend knob, but
+/// the 3.14 observable contract requires the value to be interpreter-owned and
+/// shared by all threads.  The moving collector has no
+/// refcount-cycle diagnostic stream to toggle; the word is nevertheless kept
+/// exactly so callers can bracket a collection and restore the prior flags.
+static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
+
 /// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
 /// has no generational allocation counters to drive, so the values are only
 /// remembered: `set_threshold` stores what it was given and `get_threshold`
@@ -1451,6 +1458,17 @@ crate::py_module! {
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
             w_int_new(0), w_int_new(0), w_int_new(0),
         ])),
+        "get_debug"     / 0 = |_| Ok(w_int_new(GC_DEBUG.load(Ordering::Relaxed))),
+        "set_debug"     / 1 = |args| {
+            // `gc_set_debug_impl` parses a C int through the index protocol.
+            // Convert before storing so a failed conversion leaves the old
+            // process-wide word untouched.
+            let flags = crate::baseobjspace::c_int_w(
+                crate::baseobjspace::space_index(args[0])?,
+            )?;
+            GC_DEBUG.store(flags as i64, Ordering::Relaxed);
+            Ok(w_none())
+        },
         "is_tracked"    / 1 = |args| {
             // CPython 3.14 `gc.is_tracked(obj)`: whether the collector
             // traverses references out of the object. Asked of the registered

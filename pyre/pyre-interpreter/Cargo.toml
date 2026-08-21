@@ -103,6 +103,7 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Media_Audio",
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
