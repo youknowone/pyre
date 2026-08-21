@@ -1215,10 +1215,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ),
                 }
             };
-            // A branch guard whose kept operand-stack slot has neither a mirror
-            // box nor an edge-move entry has no per-slot source; the gate that
-            // admitted this guard assumed the recovery covered it, so decline
-            // rather than encode the stale merge-color read.
+            // A branch guard whose kept operand-stack slot has no mirror box, no
+            // edge-move entry and no live shadow entry has no per-slot source;
+            // the gate that admitted this guard assumed a recovery covered it,
+            // so decline rather than encode the stale merge-color read.
             //
             // `get_list_of_active_boxes` (`pyjitpl.py`) has no such case:
             // it reads `self.registers_r[index]`, and the register bank IS the

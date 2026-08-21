@@ -5815,17 +5815,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         active.push(m);
                         continue;
                     }
-                    // The mirror did not supply this operand-stack slot, so the
-                    // decoded edge-move recovery below is the only other
-                    // per-slot source.  Without an entry for this color the
-                    // fallback reads the resume merge color out of the guard-pc
-                    // register file, where it is unwritten at the guard point or
-                    // reused by the regalloc — the #424 staleness the per-slot
-                    // mirror was introduced to replace.  The kept-stack gate
-                    // admits a valid mirror on the stated grounds that this
-                    // recovery covers such a slot; report the case where that is
-                    // false so the caller declines rather than encode the stale
-                    // read.
+                    // The mirror did not supply this operand-stack slot.  Two
+                    // other per-slot sources remain, and only the absence of
+                    // BOTH is a hole: the decoded edge-move recovery
+                    // (`kept_recovered`, tested below) and the virtualizable
+                    // shadow, which the resolution further down already treats
+                    // as authoritative for a slot the guard pc's color map does
+                    // not claim (`shadow_is_real` → `vbox`).  Where neither
+                    // answers, the fallback reads the resume merge color out of
+                    // the guard-pc register file, unwritten at the guard point
+                    // or reused by the regalloc — the #424 staleness the
+                    // per-slot mirror replaced; report that case so the caller
+                    // declines rather than encode the stale read.  Declining
+                    // where the shadow does answer is not free: the capture
+                    // point sits after a residual has run, so it lands as a
+                    // `fbw_rolled_back_with_effects` double-apply
+                    // (`raise_reg_unbound_jitstress`, mirror at depth 1 against
+                    // a guard resuming at depth 3).
                     //
                     // Restricted to a NONE hole, where there is demonstrably no
                     // source at all.  A NULL const-ptr is NOT declined, and that
@@ -5859,12 +5865,33 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                     // refuses to source either.  The register file draws that
                     // distinction, and upstream keeps the NULL: PyPy's MIFrame
                     // registers preserve CONST_NULL in snapshots.
+                    //
+                    // The shadow is the other source the resolution below
+                    // already consults: for an operand-stack slot the guard
+                    // pc's color map does not claim, it reads
+                    // `virtualizable_box_at(NUM_VABLE_SCALARS + sem)`.  A hole
+                    // that arm resolves must not be reported either, or the
+                    // decline lands as `fbw_rolled_back_with_effects` at a
+                    // capture point a residual has already run past — on
+                    // `raise_reg_unbound_jitstress` the walk mirror stands at
+                    // depth 1 while the branch guard resumes at depth 3, and
+                    // both kept slots read NONE from the mirror and a live
+                    // `RefOp` from the shadow.
                     if m == OpRef::NONE
                         && !kept_recovered.contains_key(&idx)
                         && guard_owned_slot != Some(sem)
                     {
-                        if let Some(first) = unrecovered_kept.as_deref_mut() {
-                            first.get_or_insert(idx);
+                        let shadow_sources_slot = trace_ctx
+                            .virtualizable_box_at(crate::virtualizable_gen::NUM_VABLE_SCALARS + sem)
+                            .is_some_and(|b| {
+                                b != OpRef::NONE
+                                    && !opref_is_null_const_ptr(b)
+                                    && b.ty() == Some(majit_ir::Type::Ref)
+                            });
+                        if !shadow_sources_slot {
+                            if let Some(first) = unrecovered_kept.as_deref_mut() {
+                                first.get_or_insert(idx);
+                            }
                         }
                     }
                 }
