@@ -3295,8 +3295,9 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 /// type, its version tag, and the descriptor's `w_function?` slot, then writes
 /// the classmethod's `__func__` as a green constant.  Because the method-load result is the plain `__func__` (not
 /// a bound `Method`), the paired [`try_walker_fold_load_method_self`] runs
-/// `compute_load_method_bound`, whose `is_type` + `is_classmethod` arm binds the
-/// type as `cls`, and the following `CALL` inlines `__func__(cls, ...)` — the
+/// `compute_load_method_bound`, whose `is_type` + `is_exact_classmethod` arm
+/// binds the type as `cls` — the same exactness this oracle applies, so the two
+/// agree on a wrapper subclass.  The following `CALL` inlines `__func__(cls, ...)` — the
 /// instance-method shape with the class in the receiver slot.
 ///
 /// Carries the inline-depth restriction

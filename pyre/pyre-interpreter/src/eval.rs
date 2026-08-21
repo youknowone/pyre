@@ -3512,7 +3512,8 @@ unsafe fn method_descriptor_bound(
 ///
 ///  - method-descriptor function surfaced unchanged by getattr → bind
 ///    instance (self); see [`method_descriptor_bound`]
-///  - classmethod → bind class (w_type)
+///  - EXACT classmethod → bind class (w_type); a wrapper subclass overriding
+///    `__get__` produced `attr` through that override and takes no binding
 ///  - everything else (staticmethod / non-method descriptors / shadowed
 ///    or arbitrary class attrs) → no binding (NULL)
 pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str) -> PyObjectRef {
@@ -3548,9 +3549,18 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
                 _ if shadowed => PY_NULL,
                 // staticmethod / classmethod wrappers: getattr already
                 // unwrapped them, so the identity fast path below can never
-                // match; classmethod keeps its explicit cls binding.
+                // match; an EXACT classmethod keeps its explicit cls binding.
+                //
+                // The classmethod test must be exact for the same reason
+                // `classmethod_on_type_fast_path` is: a wrapper SUBCLASS
+                // overriding `__get__` was resolved through that override, so
+                // `attr` is whatever the override returned and there is no raw
+                // function left for the class to be prepended to.  It falls
+                // through to `method_descriptor_bound`, whose `d != attr` test
+                // already answers no-binding.  The staticmethod arm needs no
+                // such split — it answers PY_NULL either way.
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
-                Some(d) if pyre_object::is_classmethod(d) => w_type,
+                Some(d) if pyre_object::is_exact_classmethod(d) => w_type,
                 Some(d) => method_descriptor_bound(d, attr, obj),
                 None => {
                     // Not found in type MRO → found in instance __dict__.
@@ -3579,7 +3589,8 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             }
             let raw = crate::baseobjspace::lookup_in_type(obj, name);
             match raw {
-                Some(d) if pyre_object::is_classmethod(d) => obj,
+                // Exact for the reason given on the instance arm above.
+                Some(d) if pyre_object::is_exact_classmethod(d) => obj,
                 Some(_) => PY_NULL, // found in own MRO → no binding
                 None => {
                     // Not in the type's own MRO → resolved via the
@@ -3604,7 +3615,8 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // classmethods (dict.fromkeys) were already unwrapped.
             match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
-                Some(d) if pyre_object::is_classmethod(d) => w_type.as_ptr(),
+                // Exact for the reason given on the instance arm above.
+                Some(d) if pyre_object::is_exact_classmethod(d) => w_type.as_ptr(),
                 Some(d) => method_descriptor_bound(d, attr, obj),
                 None => PY_NULL,
             }
