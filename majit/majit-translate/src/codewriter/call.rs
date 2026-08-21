@@ -4078,7 +4078,7 @@ impl CallControl {
                             self.candidate_graphs.insert(callee_path.clone());
                             todo.push(callee_path);
                         } else {
-                            // `policy.py:48-84 look_inside_graph` said no —
+                            // `policy.py look_inside_graph` said no —
                             // a `dont_look_inside` / `elidable` hint, or a
                             // loop without `unroll_safe`.  Upstream and pyre
                             // agree on this one, so it is the decline row a
