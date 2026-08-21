@@ -152,6 +152,14 @@ pub struct W_TypeObject {
     /// PyPy uses `not flag_heaptype` for this question, so the 3.14 projection
     /// needs its own field instead of overloading the PyPy owner bit.
     pub flag_cpython_immutabletype: std::sync::atomic::AtomicBool,
+    /// Suppress CPython's public `Py_TPFLAGS_BASETYPE` without changing
+    /// PyPy's load-bearing `Layout.acceptable_as_base_class` field.
+    ///
+    /// PyPy can reject subclassing in a custom metaclass while leaving the
+    /// ordinary app-level layout acceptable.  A CPython static counterpart
+    /// instead records the rejection directly in `tp_flags`; projecting that
+    /// observable difference must not perturb constructor dispatch.
+    pub flag_cpython_suppress_basetype: bool,
     /// typeobject.py `layout` — pointer to shared Layout object.
     pub layout: *const Layout,
     /// typeobject.py:179 `hasdict` — True when instances have __dict__.
@@ -427,6 +435,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         flag_cpython_heaptype: true,
         flag_cpython_static_builtin: false,
         flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(false),
+        flag_cpython_suppress_basetype: false,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -553,6 +562,7 @@ pub fn w_type_new_builtin(
         flag_cpython_heaptype: false,
         flag_cpython_static_builtin: true,
         flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(true),
+        flag_cpython_suppress_basetype: false,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -1436,6 +1446,15 @@ pub unsafe fn w_type_is_cpython_immutabletype(obj: PyObjectRef) -> bool {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Suppress CPython's public BASETYPE bit while preserving PyPy's canonical
+/// layout-level subclassability field and all of its internal readers.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_suppress_cpython_basetype(obj: PyObjectRef) {
+    (*(obj as *mut W_TypeObject)).flag_cpython_suppress_basetype = true;
+}
+
 /// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
 /// from their canonical fields on `W_TypeObject`.
 /// # Safety
@@ -1479,7 +1498,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         flags |= HEAPTYPE;
     }
 
-    if t.flag_heaptype {
+    if t.flag_cpython_heaptype {
         // [3.14-spec] `type_new_descriptors` represents a dict slot added by
         // a heap type with MANAGED_DICT (`typeobject.c`, read at v3.14.6).
         // PyPy records the same ownership boundary as
@@ -1536,7 +1555,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // flag that pyre's `type.__call__` already enforces.
         flags |= DISALLOW_INSTANTIATION;
     }
-    if w_type_get_acceptable_as_base_class(obj) {
+    if w_type_get_acceptable_as_base_class(obj) && !t.flag_cpython_suppress_basetype {
         // [3.14-spec] CPython v3.14.6 `Include/object.h:549` assigns bit 10
         // to `Py_TPFLAGS_BASETYPE`, and `Objects/typeobject.c:3638` uses that
         // same bit to accept or reject a base class. PyPy
@@ -2010,6 +2029,7 @@ mod tests {
     fn type_flags_project_managed_dict_and_inline_values_from_layout_owner() {
         const INLINE_VALUES: i64 = 1 << 2;
         const MANAGED_DICT: i64 = 1 << 4;
+        const BASETYPE: i64 = 1 << 10;
         const MASK: i64 = INLINE_VALUES | MANAGED_DICT;
 
         unsafe fn heap_type_with_layout(
@@ -2035,6 +2055,16 @@ mod tests {
             // fixed-size inline-values representation.
             let plain = heap_type_with_layout(&INSTANCE_TYPE, false);
             assert_eq!(w_type_get_flags(plain) & MASK, MASK);
+
+            // An app-level PyPy class may stand in for a CPython static
+            // builtin.  Keep its internal heap owner, but do not publish the
+            // managed-layout bits CPython only assigns to heap types.
+            w_type_set_cpython_type_flags(plain, false, true, true);
+            assert!(w_type_is_heaptype(plain));
+            assert_eq!(w_type_get_flags(plain) & MASK, 0);
+            assert_ne!(w_type_get_flags(plain) & BASETYPE, 0);
+            w_type_suppress_cpython_basetype(plain);
+            assert_eq!(w_type_get_flags(plain) & BASETYPE, 0);
 
             // A tuple subtype still owns a managed dict, but a non-zero
             // CPython tp_itemsize excludes INLINE_VALUES.

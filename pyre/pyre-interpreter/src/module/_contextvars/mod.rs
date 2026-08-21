@@ -483,6 +483,17 @@ crate::py_module! {
         );
         let context = crate::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
+        // [3.14-spec] PyPy keeps Context as the ordinary app-level class in
+        // lib_pypy/_contextvars.py (with Unsubclassable as its metaclass), and
+        // pyre keeps that owner and control-flow shape.  CPython 3.14 exposes
+        // PyContext_Type as a static immutable type instead
+        // (Python/context.c:750-770).  No @jit.*, _immutable_fields_, or
+        // runtime reader in PyPy's class definition depends on the public
+        // owner flags, so project only CPython's observable axes here.
+        unsafe {
+            pyre_object::w_type_set_cpython_type_flags(context, false, true, true);
+            pyre_object::w_type_suppress_cpython_basetype(context);
+        }
         let context_var_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(context_var) as PyObjectRef };
         unsafe {
