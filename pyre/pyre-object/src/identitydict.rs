@@ -162,7 +162,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     // while the migration builds the object map); after the store the
     // box is unreachable and the sweep reclaims it.
     let old = &*(dict.dstorage as *const IdentityDictStorage);
-    let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.len());
+    let mut new_map = crate::dictmultiobject::object_dict_storage_with_capacity(old.len());
     for (k, &v) in old.iter() {
         new_map.insert(crate::dictmultiobject::object_key_for(k.0), v);
     }

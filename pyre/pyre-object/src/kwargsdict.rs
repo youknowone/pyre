@@ -99,7 +99,7 @@ pub unsafe fn w_dict_switch_kwargs_to_object_strategy(w_dict: PyObjectRef) {
     // box is unreachable and the sweep reclaims it. `PyObjectRef` is a
     // raw pointer (Copy), so iterate by reference and copy each slot.
     let old = &*(dict.dstorage as *const KwargsDictStorage);
-    let mut new_map = crate::dictmultiobject::ObjectDictStorage::with_capacity(old.0.len());
+    let mut new_map = crate::dictmultiobject::object_dict_storage_with_capacity(old.0.len());
     for (k, v) in old.0.iter().zip(old.1.iter()) {
         new_map.insert(crate::dictmultiobject::object_key_for(*k), *v);
     }
