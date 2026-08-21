@@ -6,6 +6,32 @@ use super::typeobject::{CPyTypeObject, CPyVarObject};
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
+/// Call `callable` with `arguments` and one keyword.
+///
+/// The keyword forms an `Arguments(..., keyword_names_w=[name])`, which needs
+/// the running frame: an entry point reached with none is being called from
+/// outside any interpreter and reports that rather than guessing one.
+pub(super) fn call_keyword(
+    callable: PyObjectRef,
+    arguments: &[PyObjectRef],
+    name: &str,
+    value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let names = [(
+        rustpython_wtf8::Wtf8Buf::from_string(name.to_string()),
+        value,
+    )];
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "a cpyext entry point passed a keyword with no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, &names)
+    })
+}
+
 /// The interpreter object behind an argument, or a recorded `SystemError`.
 ///
 /// Upstream's generated wrappers reject a NULL argument with

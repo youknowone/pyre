@@ -125,6 +125,12 @@ PyAPI_FUNC(PyObject *) PyComplex_FromDoubles(double, double);
 PyAPI_FUNC(double) PyComplex_ImagAsDouble(PyObject *);
 PyAPI_FUNC(double) PyComplex_RealAsDouble(PyObject *);
 
+/* cpyext/contextvars.rs */
+PyAPI_FUNC(int) PyContextVar_Get(PyObject *, PyObject *, PyObject **);
+PyAPI_FUNC(PyObject *) PyContextVar_New(const char *, PyObject *);
+PyAPI_FUNC(int) PyContextVar_Reset(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyContextVar_Set(PyObject *, PyObject *);
+
 /* cpyext/dictobject.rs */
 PyAPI_FUNC(PyObject *) PyDictProxy_New(PyObject *);
 PyAPI_FUNC(int) PyDict_Check(PyObject *);
@@ -154,6 +160,9 @@ PyAPI_FUNC(int) PyDict_SetItemString(PyObject *, const char *, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyDict_Size(PyObject *);
 PyAPI_FUNC(int) PyDict_Update(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyDict_Values(PyObject *);
+
+/* cpyext/eval.rs */
+PyAPI_FUNC(PyObject *) PyEval_GetBuiltins(void);
 
 /* cpyext/exception.rs */
 PyAPI_FUNC(int) PyExceptionClass_Check(PyObject *);

@@ -21,7 +21,9 @@ pub mod bytesobject;
 pub mod capsule;
 pub mod cdatetime;
 pub mod complexobject;
+pub mod contextvars;
 pub mod dictobject;
+pub mod eval;
 pub mod exception;
 pub mod floatobject;
 pub mod frameobject;
@@ -819,4 +821,6 @@ pub fn ensure_linked() {
     mapping::ensure_linked();
     iterator::ensure_linked();
     buffer::ensure_linked();
+    eval::ensure_linked();
+    contextvars::ensure_linked();
 }

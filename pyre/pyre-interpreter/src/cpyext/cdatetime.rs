@@ -229,35 +229,15 @@ fn construct(
     let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let called = match fold {
         None => crate::call::call_function_impl_result(callable, &arguments),
-        Some(_) => call_with_fold(
+        // `Arguments(..., keyword_names_w=['fold'])` (`cdatetime.py:275-283`).
+        Some(_) => super::object::call_keyword(
             callable,
             &arguments,
+            "fold",
             pyre_object::gc_roots::shadow_stack_get(fold_slot),
         ),
     };
     super::object::result(called)
-}
-
-/// `Arguments(..., keyword_names_w=['fold'])` — the one keyword the two
-/// PEP 495 constructors pass (`cdatetime.py:275-283`).
-fn call_with_fold(
-    callable: PyObjectRef,
-    arguments: &[PyObjectRef],
-    w_fold: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    let names = [(
-        rustpython_wtf8::Wtf8Buf::from_string("fold".to_string()),
-        w_fold,
-    )];
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "the datetime C API was called with no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, &names)
-    })
 }
 
 /// `cdatetime.py:218-229 _PyDate_FromDate`.
