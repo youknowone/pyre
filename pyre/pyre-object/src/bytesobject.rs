@@ -105,32 +105,30 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
         ob_type: &BYTES_TYPE as *const PyType,
         w_class: get_instantiate(&BYTES_TYPE),
     };
+    let body = W_BytesObject {
+        ob_header: header,
+        data,
+        len,
+        ctypes_keepalive_refs: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
-    if !raw.is_null() {
+    let w_bytes = if !raw.is_null() {
         unsafe {
-            std::ptr::write(
-                raw as *mut W_BytesObject,
-                W_BytesObject {
-                    ob_header: header,
-                    data,
-                    len,
-                    ctypes_keepalive_refs: 0,
-                    w_dict: PY_NULL,
-                    w_weakreflifeline: PY_NULL,
-                },
-            );
+            std::ptr::write(raw as *mut W_BytesObject, body);
         }
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(W_BytesObject {
-            ob_header: header,
-            data,
-            len,
-            ctypes_keepalive_refs: 0,
-            w_dict: PY_NULL,
-            w_weakreflifeline: PY_NULL,
-        }) as PyObjectRef
-    }
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    };
+    // `buffer.py RawByteBuffer.__init__` reports only once `self._buf` holds the
+    // raw allocation: the report arms the next allocation to collect, so a
+    // payload still reachable from nothing but a local would be swept out from
+    // under the object being built.  Nothing allocates between here and the
+    // return.
+    crate::gc_storage::add_storage_memory_pressure(len);
+    w_bytes
 }
 
 /// Allocate a bytes-subclass instance in the managed heap.  PyPy's

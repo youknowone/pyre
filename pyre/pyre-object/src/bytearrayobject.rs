@@ -88,43 +88,37 @@ impl crate::lltype::GcType for W_BytearrayObject {
 fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let length = buf.len();
     let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
+    let payload = buf.capacity();
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
     let header = PyObject {
         ob_type: &BYTEARRAY_TYPE as *const PyType,
         w_class: get_instantiate(&BYTEARRAY_TYPE),
     };
+    let body = W_BytearrayObject {
+        ob_header: header,
+        data,
+        length,
+        alloc,
+        logical_offset: 0,
+        exports: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
-    if !raw.is_null() {
+    let w_bytearray = if !raw.is_null() {
         unsafe {
-            std::ptr::write(
-                raw as *mut W_BytearrayObject,
-                W_BytearrayObject {
-                    ob_header: header,
-                    data,
-                    length,
-                    alloc,
-                    logical_offset: 0,
-                    exports: 0,
-                    w_dict: PY_NULL,
-                    w_weakreflifeline: PY_NULL,
-                },
-            );
+            std::ptr::write(raw as *mut W_BytearrayObject, body);
         }
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(W_BytearrayObject {
-            ob_header: header,
-            data,
-            length,
-            alloc,
-            logical_offset: 0,
-            exports: 0,
-            w_dict: PY_NULL,
-            w_weakreflifeline: PY_NULL,
-        }) as PyObjectRef
-    }
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    };
+    // `buffer.py RawByteBuffer.__init__` reports only once the payload is held
+    // by a live object; see `w_bytes_from_bytes`.
+    crate::gc_storage::add_storage_memory_pressure(payload);
+    w_bytearray
 }
 
 /// Allocate a new bytearray filled with zeros.

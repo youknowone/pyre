@@ -2681,6 +2681,12 @@ pub fn add_memory_pressure(size: isize, object: GcRef) {
     }
 }
 
+/// `rgc.py add_memory_pressure(estimate)` — the form that names no object,
+/// for a caller whose raw allocation hangs off no single translated field.
+pub fn add_memory_pressure_estimate(size: isize) {
+    add_memory_pressure(size, GcRef::NULL);
+}
+
 pub fn total_memory_pressure() -> isize {
     ACTIVE_TOTAL_MEMORY_PRESSURE.get().map_or(0, |hook| hook())
 }
