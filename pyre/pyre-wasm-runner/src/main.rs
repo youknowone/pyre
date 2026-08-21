@@ -810,7 +810,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // PYRE_WASM_JIT_STATS, so printing them here would have kept them off
         // every gated wasm run.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 14;
+            const RING_BASE: u32 = 17;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -1073,7 +1073,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let field_pos_parent_empty = counter("pyre_jit_field_pos_parent_empty", &mut missing);
         let field_pos_rederived = counter("pyre_jit_field_pos_rederived", &mut missing);
         let field_pos_unresolved = counter("pyre_jit_field_pos_unresolved", &mut missing);
-        // Every full-body-walk tally, reached through the slot-indexed
+        // Every tally below the ring — the full-body-walk counts and the
+        // admission-gate refusals — reached through the slot-indexed
         // `pyre_fbw_diag` export rather than a counter export of its own.
         //
         // POSITIONAL MIRROR of `pyre_jit_trace::trace::fbw_diag::LABELS` — the
@@ -1107,7 +1108,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // Both arrays take their length from this one constant, so a label
         // added without a slot (or the reverse) is a compile error rather than
         // a `zip` that silently drops the tail.
-        const FBW_SLOTS: usize = 14;
+        const FBW_SLOTS: usize = 17;
         let fbw_labels: [&str; FBW_SLOTS] = [
             "fbw_walks",
             "fbw_rolled_back_with_effects",
@@ -1123,6 +1124,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "fbw_store_journal_rollback_failed",
             "fbw_blackhole_adopted_single_frame",
             "fbw_blackhole_adopted_multi_frame",
+            "gate_declined_shape",
+            "gate_declined_for_iter_region",
+            "gate_declined_function_entry",
         ];
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")

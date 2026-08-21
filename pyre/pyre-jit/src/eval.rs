@@ -8264,6 +8264,7 @@ fn eval_with_jit_inner(
         UnsupportedJitShape::CurrentFrameOnly
         | UnsupportedJitShape::NestedBreakBridgeResume
         | UnsupportedJitShape::ConstEncodingOverflow => {
+            pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
             pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
                 code as *const _ as usize,
                 unsupported_jit_shape(code).1,
@@ -9160,9 +9161,11 @@ fn maybe_compile_and_run(
     // whole-bytecode walk that used to run on every back-edge.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
     if !cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc) {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_for_iter_region();
         const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
         let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
             code as *const _ as usize,
@@ -10573,6 +10576,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // object in `CallControl.graph_jit_shapes`, so this is a pointer-keyed
     // lookup, not the whole-frame scan that charged every Python call.
     if cached_unsupported_jit_shape(code) != UnsupportedJitShape::None {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
     if dump_bytecode_enabled() {
@@ -10852,6 +10856,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // continues in `eval_loop_jit`, where its back-edges tick independently
     // and consult their own natural loop regions.
     if !cached_function_entry_trace_is_jit_safe(code) {
+        pyre_jit_trace::trace::fbw_diag::record_gate_declined_function_entry();
         return None;
     }
 

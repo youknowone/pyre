@@ -6547,6 +6547,27 @@ pub mod fbw_diag {
     /// Successful multi-frame blackhole adoptions. A fall means the walk
     /// stopped handing the interpreter an image and went back to legacy replay.
     pub const BLACKHOLE_ADOPTED_MULTI_FRAME: usize = 13;
+    /// Admissions the JIT refused before any trace existed, one slot per
+    /// deciding predicate.  Every other counter here describes something the
+    /// tracer DID; a refused frame or back edge runs interpreted and leaves
+    /// `loops_compiled`, `loops_aborted` and `guard_failures` all at the value
+    /// the refusal itself produced, so the population these count is the one
+    /// blind spot the tally set otherwise has.
+    ///
+    /// `GATE_DECLINED_SHAPE` is `unsupported_jit_shape` — a frame the tracer
+    /// cannot encode or whose resume shape it cannot express.
+    /// `GATE_DECLINED_FOR_ITER_REGION` is the back edge's FOR_ITER gate, which
+    /// judges the loop region being entered, so it counts only loops refused
+    /// for their own bodies.  `GATE_DECLINED_FUNCTION_ENTRY` is
+    /// `function_entry_trace_is_jit_safe`: a trace armed at function entry can
+    /// reach every FOR_ITER body in the code object, so it is refused for a
+    /// body no single back edge would have judged.  The frame keeps running
+    /// interpreted and its back edges still decide for themselves, which makes
+    /// that slot a count of refused traces where the other two count refused
+    /// entries.
+    pub const GATE_DECLINED_SHAPE: usize = 14;
+    pub const GATE_DECLINED_FOR_ITER_REGION: usize = 15;
+    pub const GATE_DECLINED_FUNCTION_ENTRY: usize = 16;
 
     /// The `[jit-stats]` key for each tally slot, in index order, so a slot
     /// cannot be added without naming it and no reader can print a subset of
@@ -6563,9 +6584,11 @@ pub mod fbw_diag {
     /// `_jit_stats_merged` folds every `[jit-stats]` line into one flat
     /// `key -> value` map and reads each value as an integer.
     ///
-    /// Every key is `fbw_`-prefixed for that same reason: that map is flat and
-    /// shared with every other counter, so a bare name like `portal_only`
-    /// collides with whatever else ever picks it.
+    /// Every key is prefixed for that same reason: that map is flat and shared
+    /// with every other counter, so a bare name like `portal_only` collides
+    /// with whatever else ever picks it.  The prefix names the producer —
+    /// `fbw_` for the full-body walk, `gate_` for the admission gates that run
+    /// before it.
     ///
     /// The length is `RING_BASE` because the tallies are exactly the slots
     /// below the ring.
@@ -6584,6 +6607,9 @@ pub mod fbw_diag {
         "fbw_store_journal_rollback_failed",
         "fbw_blackhole_adopted_single_frame",
         "fbw_blackhole_adopted_multi_frame",
+        "gate_declined_shape",
+        "gate_declined_for_iter_region",
+        "gate_declined_function_entry",
     ];
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
@@ -6593,7 +6619,7 @@ pub mod fbw_diag {
     ///
     /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
     /// constant (`main.rs`); the two have to move together.
-    pub const RING_BASE: usize = 14;
+    pub const RING_BASE: usize = 17;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;
@@ -6619,6 +6645,21 @@ pub mod fbw_diag {
     /// Bump one of the reachability tallies.
     pub(crate) fn bump(i: usize) {
         FBW_DIAG[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one refused admission.  The gates that decide these run in
+    /// `pyre-jit`, so they reach the tallies through named entry points rather
+    /// than a slot index no caller outside this module should be spelling.
+    pub fn record_gate_declined_shape() {
+        bump(GATE_DECLINED_SHAPE);
+    }
+
+    pub fn record_gate_declined_for_iter_region() {
+        bump(GATE_DECLINED_FOR_ITER_REGION);
+    }
+
+    pub fn record_gate_declined_function_entry() {
+        bump(GATE_DECLINED_FUNCTION_ENTRY);
     }
 
     /// Read one slot (out-of-range reads as 0).  Surfaced to the wasm host
