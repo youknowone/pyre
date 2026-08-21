@@ -3104,6 +3104,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         constructor_result,
         None,
         false,
+        false,
         None,
     )
 }
@@ -3156,6 +3157,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
+    require_bool_result: bool,
     instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -5405,6 +5407,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
+                if require_bool_result
+                    && !matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj)
+                            if std::ptr::eq(obj, pyre_object::w_bool_from(true))
+                                || std::ptr::eq(obj, pyre_object::w_bool_from(false))
+                    )
+                {
+                    // The membership-shaped routes reduce `space.is_true` to a
+                    // pointer test against `w_True`, which holds only for the two
+                    // singletons; anything else needs the `__bool__` / `__len__`
+                    // dispatch they cannot emit, so the call goes back to its
+                    // residual.  The body has already run at this point, so latch
+                    // the caller's CALL boundary first — returning the error
+                    // unlatched replays the loop from entry and runs the body a
+                    // second time.
+                    latch_abort_call_resume(
+                        code,
+                        op,
+                        ctx,
+                        call_descr,
+                        is_top_inline,
+                        unjournaled_before_subwalk,
+                        executed_effects_before,
+                        abort_flush_call_jitcode_coord,
+                    );
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                }
                 if require_exact_int_result
                     && !matches!(
                         concrete_for_shadow,
@@ -7024,6 +7054,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Some(&mut result),
         true,
+        false,
         None,
     )?;
     match (inlined, result) {
@@ -7268,6 +7299,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         false,
         None,
         None,
+        false,
         false,
         Some(foriter_green_key),
     );
@@ -7672,6 +7704,27 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// Run an effect-free straight-line dunder once, before any IR is emitted, and
+/// report whether it answered with one of the two `bool` singletons.
+///
+/// The two membership-shaped routes reduce `space.is_true` to a pointer test
+/// against `w_True`, which only holds for those singletons.  Sampling first is
+/// what lets a body that answers otherwise decline with nothing recorded to
+/// undo; `try_walker_inline_exception_string_override` samples its own override
+/// the same way, under the same `exc_override_sample_safe` gate.
+fn walker_sampled_result_is_bool(
+    method: pyre_object::PyObjectRef,
+    args: &[pyre_object::PyObjectRef],
+) -> bool {
+    let sampled = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(method, args)
+    };
+    matches!(sampled, Ok(result)
+        if std::ptr::eq(result, pyre_object::w_bool_from(true))
+            || std::ptr::eq(result, pyre_object::w_bool_from(false)))
+}
+
 /// Inline a plain Python `__contains__` after the compare specializations
 /// decline.
 ///
@@ -7753,6 +7806,22 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
         return Ok(None);
     }
 
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    // The same admission the `hash` and `str`/`repr` builtin routes take.  A
+    // body that can leave the walk other than by returning — a raise above all —
+    // has already entered its frame when that becomes known, and neither the
+    // decline nor the latched abort can undo a frame entry.
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+    if body_facts.exc_override_sample_safe
+        && !walker_sampled_result_is_bool(method, &[concrete_haystack, concrete_needle])
+    {
+        return Ok(None);
+    }
+
     let arg_concretes = vec![
         ConcreteValue::Ref(method),
         ConcreteValue::Null,
@@ -7760,15 +7829,10 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_needle),
     ];
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    // Read before the body runs, so the result check below can tell a body that
-    // applied nothing from one that did.
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let effects_before = fbw_executed_effect_count();
-    let unjournaled_before = fbw_has_unjournaled_effect();
     // The needle's class carries no dispatch decision here — unlike a
     // rich-compare rhs, whose type decides reflected-dunder priority — so it is
     // left unpinned and the callee body guards whatever it actually reads.
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let Some(inlined) = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -7795,6 +7859,13 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
         None,
         false,
         false,
+        None,
+        None,
+        false,
+        // A body answering with anything but a `bool` singleton has already run
+        // by the time this is known, so the check belongs inside, where the
+        // caller's CALL boundary can be latched before the abort.
+        true,
         None,
     )?
     else {
@@ -7827,29 +7898,14 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
         false
     } else {
         // Anything else needs the `__bool__` / `__len__` dispatch this route
-        // cannot emit.  A body that applied nothing is rewound and the whole
-        // membership test goes back to its residual — the same all-clear test
-        // the orthodox sub-walk rollback above uses, and the same one that
-        // licenses re-executing the body from the caller boundary. A body that
-        // did apply something cannot be rewound, so it keeps the abort.
-        let rewindable = fbw_executed_effect_count() == effects_before
-            && !unjournaled_before
-            && !fbw_has_unjournaled_effect();
+        // cannot emit.  Only a body the sample above could not run reaches here,
+        // so the walk is already committed and the call aborts to its residual.
         if fbw_inline_diag_enabled() {
-            eprintln!(
-                "[contains-inline-nonbool] pc={} class={} disp={}",
-                op.pc,
-                unsafe { pyre_object::typeobject::w_type_get_name(w_class) },
-                if rewindable { "rollback" } else { "abort" },
-            );
+            eprintln!("[contains-inline-nonbool] pc={} class={}", op.pc, unsafe {
+                pyre_object::typeobject::w_type_get_name(w_class)
+            });
         }
-        if !rewindable {
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
-        }
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        bool_box_truth_reset();
-        return Ok(None);
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
 
     if !result.is_constant() {
