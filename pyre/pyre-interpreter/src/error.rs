@@ -2962,7 +2962,9 @@ fn write_traceback_chain_from_tb<W: Write>(
                 (b"<unknown>".to_vec(), String::from("<unknown>"), None)
             } else {
                 let code = unsafe { &*code_obj };
-                let location = usize::try_from(lasti)
+                // `lasti` is a byte offset; `locations` is indexed by
+                // instruction.
+                let location = usize::try_from(lasti / 2)
                     .ok()
                     .and_then(|index| code.locations.get(index))
                     .map(|(start, end)| {

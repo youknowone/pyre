@@ -1215,7 +1215,12 @@ fn emit_traceback_node<Sym: WalkSym>(
             0,
         ),
         (site.frame, 1),
-        (ctx.trace_ctx.const_int(i64::from(site.last_instruction)), 2),
+        // Field 2 is `lasti`, which the slot holds in bytes.
+        (
+            ctx.trace_ctx
+                .const_int(i64::from(site.last_instruction) * 2),
+            2,
+        ),
         (w_next, 3),
         (ctx.trace_ctx.const_int(site.lineno), 4),
         (ctx.trace_ctx.const_ref(site.w_code as i64), 5),

@@ -942,7 +942,7 @@
       "dynasm": "PASS"
     },
     "test.test_raise": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_random": {
       "dynasm": "PASS"

@@ -776,7 +776,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
         if !head.is_null()
             && pyre_interpreter::pytraceback::is_pytraceback(head)
             && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
-            && pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) == last_instruction
+            && pyre_interpreter::pytraceback::w_pytraceback_get_lasti(head) == last_instruction * 2
         {
             return;
         }

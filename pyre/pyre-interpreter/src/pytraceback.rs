@@ -77,8 +77,13 @@ pub struct PyTraceback {
     /// not — the pre-hook bootstrap window — collects nothing, so a
     /// frame born there is never swept either way.
     pub frame: *mut crate::pyframe::PyFrame,
-    /// `pytraceback.py:30 self.lasti = lasti` — bytecode index at
-    /// which the exception was raised (in instruction units).
+    /// `pytraceback.py:30 self.lasti = lasti` — where in the bytecode the
+    /// exception was raised, in the units `tb_lasti` is defined in: bytes,
+    /// two per instruction.  `descr_get_tb_lasti` hands this straight out
+    /// (`pytraceback.py:45-46`), and it has to be the byte form for
+    /// `traceback._get_code_position`, which recovers the instruction with
+    /// `tb_lasti // 2`.  Pyre's own producers count instructions, so
+    /// `record_application_traceback` converts; its two readers convert back.
     pub lasti: i64,
     /// `pytraceback.py:31 self.next = next` — head pointer to the
     /// preceding traceback in the chain (caller-side); `PY_NULL`
@@ -467,7 +472,8 @@ pub unsafe fn record_application_traceback(
         // marks the previous head's frame, matching `get_traceback`.
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
         mark_traceback_escaped(prev_tb);
-        let new_tb = w_pytraceback_new(frame, last_instruction, prev_tb, lineno, w_code);
+        // `last_instruction` counts instructions; the slot holds bytes.
+        let new_tb = w_pytraceback_new(frame, last_instruction * 2, prev_tb, lineno, w_code);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
     }
 }

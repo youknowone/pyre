@@ -7487,9 +7487,7 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
 /// `TracebackType(tb_next, tb_frame, tb_lasti, tb_lineno)` — the 3.7+
 /// traceback constructor.  `args[0]` is the class; the four positional
 /// arguments follow.  `tb_next` is a traceback or `None`; `tb_frame`
-/// must be a `frame`; `tb_lasti` / `tb_lineno` are ints.  CPython's
-/// `tb_lasti` is a byte offset, so it is halved to pyre's instruction-
-/// unit form for storage (the `tb_lasti` getter multiplies back by 2).
+/// must be a `frame`; `tb_lasti` / `tb_lineno` are ints, stored as given.
 fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
         return Err(crate::PyError::type_error(format!(
@@ -7525,8 +7523,8 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let frame = w_frame as *mut crate::pyframe::PyFrame;
 
-    // tb_lasti / tb_lineno: integers.  `tb_lasti` arrives as a CPython
-    // byte offset; store the instruction-unit form (`/ 2`).
+    // tb_lasti / tb_lineno: integers, stored as given
+    // (`pytraceback.py:64-72 descr_new`).
     if !unsafe { pyre_object::is_int(w_lasti) } {
         return Err(crate::PyError::type_error(format!(
             "an integer is required (got type {})",
@@ -7539,7 +7537,7 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             type_name_of(w_lineno)
         )));
     }
-    let lasti = unsafe { pyre_object::w_int_get_value(w_lasti) } / 2;
+    let lasti = unsafe { pyre_object::w_int_get_value(w_lasti) };
     let lineno = unsafe { pyre_object::w_int_get_value(w_lineno) };
     let w_code = unsafe { (*frame).fget_f_code() };
 
@@ -7556,13 +7554,11 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             make_new_descr(traceback_descr_new),
         )
     };
-    // pytraceback.py:45-49 descr_get_tb_lasti / descr_set_tb_lasti.
-    //
-    // pyre stores `lasti` as an instruction-unit index (`PyFrame.last_instr`
-    // increments by 1 per instruction), whereas CPython's `tb_lasti` is a
-    // byte offset (2 bytes per code unit).  Report the byte-offset form so
-    // `code.co_positions()` consumers — `traceback._get_code_position` does
-    // `instruction_index // 2` — recover the right instruction.
+    // pytraceback.py:45-49 descr_get_tb_lasti / descr_set_tb_lasti — the slot
+    // is handed out and taken back as it is.  It already holds the byte offset
+    // `tb_lasti` means, so `traceback._get_code_position` recovers the
+    // instruction with its `// 2`, and a value written here reads back
+    // unchanged.
     let lasti_getter = make_builtin_function_with_arity(
         "tb_lasti",
         |args| {
@@ -7571,7 +7567,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(tb) };
-            Ok(pyre_object::w_int_new(lasti * 2))
+            Ok(pyre_object::w_int_new(lasti))
         },
         2,
     );
@@ -7583,9 +7579,8 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             if tb.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // Inverse of the getter: incoming byte offset → instruction index.
             let v = crate::baseobjspace::int_w(w_value)?;
-            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v / 2) };
+            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v) };
             Ok(pyre_object::w_none())
         },
         3,
@@ -7689,11 +7684,20 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         },
         3,
     );
+    // `del tb.tb_next` is a delete the descriptor answers itself.  Without a
+    // deleter the attribute falls through to the immutable-type path, which
+    // reports the type rather than the attribute and reports it as an
+    // AttributeError; the chain is writable, so what is wrong is the delete.
+    let next_deleter = make_builtin_function_with_arity(
+        "tb_next",
+        |_args| Err(crate::PyError::type_error("can't delete tb_next attribute")),
+        2,
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "tb_next",
-            make_getset_property_named(next_getter, next_setter, pyre_object::PY_NULL, "tb_next"),
+            make_getset_property_named(next_getter, next_setter, next_deleter, "tb_next"),
         )
     };
 
