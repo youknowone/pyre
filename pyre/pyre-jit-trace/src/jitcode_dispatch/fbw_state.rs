@@ -2077,15 +2077,18 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // callee's cell (`warmstate.py` `WarmEnterState.disable_noninlinable_function`).  The recursion-bound deny
         // in `inline_call.rs` already calls it for the callee it names;
         // this one names a callee the same way and had no reason not to.
+        // Pass the typed key so the verdict lands on the same
+        // comparekey-bearing cell consulted at the next call.
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            let key = crate::driver::make_green_key_typed(
+                callee_code_key as *const (),
+                0,
+                is_being_profiled,
+            );
             driver
                 .meta_interp_mut()
                 .warm_state_mut()
-                .disable_noninlinable_function(crate::driver::make_green_key(
-                    callee_code_key as *const (),
-                    0,
-                    is_being_profiled,
-                ));
+                .disable_noninlinable_function_for_key(&key);
         }
     }
     // The flush this latch feeds resumes the OUTERMOST caller at the CALL

@@ -2046,6 +2046,19 @@ impl WarmEnterState {
             .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
     }
 
+    /// Typed-key variant of [`Self::can_inline_callable`].
+    ///
+    /// `warmstate.py` `can_inline_callable` receives the portal greens and
+    /// reaches the `JitCell` through `get_jitcell_at_key`, whose chain walk
+    /// calls `comparekey`.  A producer that still has those greens must use
+    /// this door: reading the bucket's hash-form cell can miss the
+    /// `DONT_TRACE_HERE` flag that `dont_trace_here(*greenargs)` set on the
+    /// typed cell.
+    pub fn can_inline_callable_for_key(&self, key: &GreenKey) -> bool {
+        self.lookup_chain_with_key(key)
+            .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
+    }
+
     /// Mark a callee as a location that should no longer be inlined into
     /// surrounding traces.
     ///
@@ -3935,6 +3948,16 @@ mod tests {
     }
 
     #[test]
+    fn typed_disable_blocks_the_same_typed_inline_lookup() {
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![7, 11]);
+
+        assert!(ws.can_inline_callable_for_key(&key));
+        ws.disable_noninlinable_function_for_key(&key);
+        assert!(!ws.can_inline_callable_for_key(&key));
+    }
+
+    #[test]
     fn test_abort_too_long_then_retry_different_key() {
         // Aborting one key's trace as too long should not affect other keys.
         let mut ws = WarmEnterState::new(2);
@@ -5639,7 +5662,7 @@ mod tests {
         // force-start used to inspect different cells for one green key.
         ws.disable_noninlinable_function(bucket);
         let token = std::sync::Arc::new(JitCellToken::new(0xcafe));
-        ws.get_assembler_token_with_key::<(), _>(&key, || Ok(token.clone()))
+        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
             .expect("temporary token install");
         ws.disable_noninlinable_function_for_key(&key);
         ws.mark_force_finish_tracing_for_key(&key);

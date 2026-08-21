@@ -3529,7 +3529,7 @@ pub fn trace_and_compile_from_bridge(
 
     {
         let (driver, _) = crate::eval::driver_pair();
-        driver.clear_last_compiled_artifact_invalidation_flag();
+        driver.clear_last_compiled_artifact_token();
     }
 
     use crate::eval::build_jit_state;

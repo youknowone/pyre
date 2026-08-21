@@ -5347,8 +5347,8 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
         self.0.is_current()
     }
 
-    fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.0.register_loop_token(flag);
+    fn register_loop_token(&self, token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>) {
+        self.0.register_loop_token(token);
     }
 
     fn instance_identity(&self) -> usize {
@@ -14385,7 +14385,6 @@ mod tests {
                     RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(7, Type::Ref),
                     RebuiltValue::Box(8, Type::Ref),
-                    RebuiltValue::Box(9, Type::Ref),
                     RebuiltValue::Box(0, Type::Ref),
                     RebuiltValue::Box(1, Type::Ref),
                 ],

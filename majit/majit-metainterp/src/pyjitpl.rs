@@ -1808,18 +1808,20 @@ pub struct MetaInterp<M: Clone> {
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
     pub(crate) last_compiled_key: Option<u64>,
-    /// Invalidation flag read by the most recently compiled loop or bridge.
-    /// Dependency registration uses the artifact generation rather than
-    /// always registering the root token's flag.
-    pub(crate) last_compiled_artifact_invalidation_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// pyjitpl.py: trace position saved before compile_trace records
+    /// Owning JitCellToken of the most recently compiled loop or bridge.
+    /// `compile.py:record_loop_or_bridge` registers this token itself on every
+    /// quasi-immutable dependency, including when the dependency was found in
+    /// an attached bridge.  Backend invalidation generations are deliberately
+    /// not exposed here: they describe guard patching, not dependency owner.
+    pub(crate) last_compiled_artifact_token: Option<Arc<JitCellToken>>,
+    /// pyjitpl.py `compile_trace` position saved before it records
     /// a tentative JUMP. If compile_trace triggers retrace_needed, this
     /// becomes the retracing_from position.
     pub(crate) potential_retrace_position: Option<crate::recorder::TracePosition>,
     /// RPython compile.py (record_loop_or_bridge) parity:
     /// quasi-immutable dependencies from the last compilation — the
     /// `QuasiImmut` instances the recording resolved. After compilation, the
-    /// caller registers the loop's invalidation flag on each. Cleared on each
+    /// caller registers the owning loop token on each. Cleared on each
     /// compile attempt.
     pub last_quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// Addresses of live `SnapshotBox.opref` slots holding an inline
@@ -3391,7 +3393,7 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             internal_compile_panics: 0,
             last_compiled_key: None,
-            last_compiled_artifact_invalidation_flag: None,
+            last_compiled_artifact_token: None,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
@@ -4858,7 +4860,7 @@ impl<M: Clone> MetaInterp<M> {
 
     fn prepare_trace_start_runtime(&mut self) {
         self.last_compiled_key = None;
-        self.last_compiled_artifact_invalidation_flag = None;
+        self.last_compiled_artifact_token = None;
         // pyjitpl.py `compile_and_run_once` body, line-by-line:
         //   debug_start('jit-tracing')                  # OUTER open
         //   self.staticdata._setup_once()
@@ -4942,24 +4944,7 @@ impl<M: Clone> MetaInterp<M> {
                 .flatten()
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
-                // `force_start_tracing_for_key` has just installed (or found)
-                // this key's cell, so resolving now names it. The number that
-                // arrived is a bucket hash, and a bucket holds a chain: if any
-                // other cell already claimed that hash, the cell just marked
-                // TRACING was minted a different key. The trace, its
-                // `compiled_loops` entry, its `JitCellToken::green_key` and
-                // every `rd_loop_token` stamped off it must inherit the CELL
-                // key, or they name a cell the typed door never returns.
-                // `warmstate.py raise EnterJitAssembler(procedure_token,
-                // *execute_args)` carries the token read off the resolved cell
-                // onward for the same reason, rather than a number to re-derive
-                // it from.
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
-                })
-                .flatten()
-                .unwrap_or(green_key);
-                // RPython pyjitpl.py create_empty_history(inputargs): the
+                // RPython pyjitpl.py `create_empty_history(inputargs)`: the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
                 for value in live_values {
@@ -7734,8 +7719,8 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
-                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
-                // compile.py store_hash: assign jitcounter hashes.
+                self.last_compiled_artifact_token = Some(token.clone());
+                // compile.py `store_hash`: assign jitcounter hashes.
                 self.assign_guard_hashes(token.as_ref());
                 // compile.py send_loop_to_backend registers the token
                 // with the memory manager before record_loop_or_bridge reads it.
@@ -9119,7 +9104,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
-                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
+                self.last_compiled_artifact_token = Some(token.clone());
                 self.assign_guard_hashes(token.as_ref());
                 // `compile.py` `propagate_original_jitcell_token(new_loop)`,
                 // whose body at `:463-468` walks the trace's LABELs and sets
@@ -9445,9 +9430,8 @@ impl<M: Clone> MetaInterp<M> {
 
         match result {
             Ok(_) => {
-                self.last_compiled_artifact_invalidation_flag =
-                    source_jct.latest_bridge_invalidation_flag();
-                // compile.py store_hash for bridge guards.
+                self.last_compiled_artifact_token = Some(source_jct.clone());
+                // compile.py `store_hash` for bridge guards.
                 self.assign_bridge_guard_hashes(source_jct.as_ref(), source_trace_id, fail_index);
                 // `compile.py propagate_original_jitcell_token` — every
                 // LABEL's TargetToken in the finished trace is rebound to
@@ -10068,7 +10052,7 @@ impl<M: Clone> MetaInterp<M> {
         let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {
             Ok(_) => {
-                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
+                self.last_compiled_artifact_token = Some(token.clone());
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py record_loop_or_bridge.
@@ -10488,9 +10472,9 @@ impl<M: Clone> MetaInterp<M> {
         let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {
             Ok(_) => {
-                // compile.py record_loop_or_bridge registers every
-                // dependency against the artifact published by this compile.
-                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
+                // compile.py `record_loop_or_bridge` registers every
+                // dependency against the owning token published by this compile.
+                self.last_compiled_artifact_token = Some(token.clone());
                 if !self.last_quasi_immutable_deps.is_empty() {
                     crate::mc_diag_bump(75);
                 }
@@ -10715,17 +10699,15 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_key
     }
 
-    /// Flag read by `GUARD_NOT_INVALIDATED` in the last successful artifact.
-    pub fn last_compiled_artifact_invalidation_flag(
-        &self,
-    ) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        self.last_compiled_artifact_invalidation_flag.clone()
+    /// Owning loop token of the last successful loop/bridge artifact.
+    pub fn last_compiled_artifact_token(&self) -> Option<Arc<JitCellToken>> {
+        self.last_compiled_artifact_token.clone()
     }
 
-    /// The flag names the artifact this compilation published, so a new
+    /// The token names the artifact owner this compilation published, so a new
     /// compilation attempt starts without one.
-    pub fn clear_last_compiled_artifact_invalidation_flag(&mut self) {
-        self.last_compiled_artifact_invalidation_flag = None;
+    pub fn clear_last_compiled_artifact_token(&mut self) {
+        self.last_compiled_artifact_token = None;
     }
 
     /// Cranelift direct body-entry selector for the first compiled loop LABEL.
@@ -12204,9 +12186,10 @@ impl<M: Clone> MetaInterp<M> {
         // as `compile.py:204-207`.  What keeps it out of this method is no
         // longer the dependency type (each entry is a
         // `majit_ir::QuasiImmutHandle`, which this crate can name) but
-        // upstream's `wref`: pyre's stand-in for the loop token is the
-        // artifact's invalidation flag, and the compiling driver owns it, not
-        // the metainterp.  `last_quasi_immutable_deps` is the pyre-side analog
+        // upstream's `wref`: the concrete interpreter-side registration call
+        // lives in pyre-jit while the metainterp publishes the exact owning
+        // JitCellToken through `last_compiled_artifact_token`.
+        // `last_quasi_immutable_deps` is the pyre-side analog
         // of `loop.quasi_immutable_deps`, populated in this file from
         // `optimizer.quasi_immutable_deps` and drained by that walk.
 
@@ -13275,9 +13258,9 @@ impl<M: Clone> MetaInterp<M> {
 
         match compile_result {
             Ok(_) => {
-                // compile.py record_loop_or_bridge registers every
-                // dependency against the artifact published by this compile.
-                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
+                // compile.py `record_loop_or_bridge` registers every
+                // dependency against the owning token published by this compile.
+                self.last_compiled_artifact_token = Some(token.clone());
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py record_loop_or_bridge.
@@ -13542,7 +13525,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     ) -> bool {
-        self.last_compiled_artifact_invalidation_flag = None;
+        self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -14116,8 +14099,7 @@ impl<M: Clone> MetaInterp<M> {
 
         match result {
             Ok(_) => {
-                self.last_compiled_artifact_invalidation_flag =
-                    source_jct.latest_bridge_invalidation_flag();
+                self.last_compiled_artifact_token = Some(source_jct.clone());
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled bridge at key={}, guard={}",

@@ -1648,6 +1648,17 @@ impl std::fmt::Debug for JitCellToken {
     }
 }
 
+impl majit_ir::QuasiImmutLoopToken for JitCellToken {
+    fn invalidate_for_quasi_immut(&self) {
+        // quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
+        // followed by `cpu.invalidate_loop(looptoken)`.  `invalidate` performs both
+        // projections in pyre: the root flag makes the warm cell stop
+        // returning this token, and every bridge-generation flag activates
+        // its still-unpatched GUARD_NOT_INVALIDATED sites.
+        self.invalidate();
+    }
+}
+
 // pyre is single-threaded (no-GIL → still one JIT thread in practice,
 // matching RPython's single-interpreter assumption).  `JitCellToken`
 // embeds `Rc<RdVirtualInfo>` and `Box<dyn Any + Send>` which are not

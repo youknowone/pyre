@@ -2249,9 +2249,10 @@ mod tests {
         );
 
         let flag = Arc::new(AtomicBool::new(false));
+        let token = crate::quasiimmut::test_loop_token(&flag);
         unsafe { w_type_current_qmut_instance(obj) }
             .expect("a type resolves an instance")
-            .register_loop_token(&flag);
+            .register_loop_token(&token);
         assert!(w_type.quasi_immut_watchers.is_installed());
 
         unsafe { w_type_set_version_tag(obj, new_version_tag()) };

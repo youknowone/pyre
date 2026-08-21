@@ -4644,12 +4644,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // later sibling calls in the same trace go straight to CALL_ASSEMBLER
     // instead of starting a fresh unroll from their now-shallower framestack.
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
-    let callee_green_key = crate::driver::make_green_key(w_code, 0, is_being_profiled);
+    let callee_green_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
     if let Some((driver, _)) = crate::driver::try_driver_pair()
         && !driver
             .meta_interp_mut()
             .warm_state_mut()
-            .can_inline_callable(callee_green_key)
+            .can_inline_callable_for_key(&callee_green_key)
     {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -4673,7 +4673,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             driver
                 .meta_interp_mut()
                 .warm_state_mut()
-                .disable_noninlinable_function(callee_green_key);
+                .disable_noninlinable_function_for_key(&callee_green_key);
         }
         return resolved_inline_decline(op.pc, line!());
     }
@@ -4842,13 +4842,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the callee's `CodeObject` (self-recursive), so re-inlining
     // it rebuilds the identical framestack and reaches the identical abort —
     // the enclosing loop is retired for a decline that belongs to the callee.
-    // `warmstate.py` `disable_noninlinable_function` is the same answer:
-    // the flag it sets means "do not inline calls to this function", and the
-    // enclosing loop is left free to retrace.
+    // `WarmEnterState::disable_noninlinable_function_for_key` carries the
+    // general answer: its flag means "do not inline calls to this function",
+    // and the enclosing loop is left free to retrace.
     //
     // `bridge_rec_root_selfrec` is exempt: that admission carries its own
-    // `SELFREC_CA_FOLD_ACTIVE` exemption from the hazard arm (:2696), so its
-    // recursive residual is not what named the callee here.
+    // `SELFREC_CA_FOLD_ACTIVE` exemption from
+    // `fbw_abort_nested_unjournaled_residual`, so its recursive residual is
+    // not what named the callee here.  The warmstate verdict is deferred to
+    // this same point so its typed lookup cannot hide the exemption.
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -6636,7 +6638,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `prepare_trace_segmenting`'s permanent stamp.
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
-                callee_green_key,
+                callee_green_key.get_uhash(),
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.

@@ -2270,7 +2270,7 @@ mod quasi_immutable_dep_tests {
             true
         }
 
-        fn register_loop_token(&self, _flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+        fn register_loop_token(&self, _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>) {}
 
         fn instance_identity(&self) -> usize {
             std::sync::Arc::as_ptr(&self.0) as usize

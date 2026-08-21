@@ -6748,19 +6748,22 @@ pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -
 /// that window reports the loop invalid instead of accepting a registration
 /// nothing will ever sweep again.
 ///
-/// Lives here rather than in `record_loop_or_bridge` only because the
-/// invalidation flag is the compiling driver's, not the metainterp's.
+/// Lives here rather than in `record_loop_or_bridge` only because this layer
+/// owns the concrete interpreter-side `QuasiImmut` registration call.  The
+/// metainterp still supplies the exact `original_jitcell_token` that upstream
+/// places behind `wref`, including for an attached bridge.
 pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps = std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
     if deps.is_empty() {
         return;
     }
-    let Some(flag) = driver.last_compiled_artifact_invalidation_flag() else {
+    let Some(token) = driver.last_compiled_artifact_token() else {
         return;
     };
+    let token: std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken> = token;
     for qmut in deps {
-        qmut.register_loop_token(&flag);
+        qmut.register_loop_token(&token);
     }
 }
 
