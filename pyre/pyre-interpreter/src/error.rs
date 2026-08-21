@@ -286,9 +286,13 @@ impl OperationError {
 /// A direct `raise non_exception`, which never calls a constructor, keeps
 /// the ordinary "exceptions must derive from BaseException" wording.
 pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObjectRef) -> PyError {
+    // Read the class off `w_inst` before anything allocates: `py_repr_wtf8`
+    // runs Python and can drive a collection, and `w_inst` is whatever the
+    // constructor answered — a list moves.  `w_type` and `w_constructor` are
+    // type objects, which do not.
+    let w_type = crate::baseobjspace::exception_getclass(w_inst);
     let constructor = unsafe { crate::display::py_repr_wtf8(w_constructor) }
         .unwrap_or_else(|_| Wtf8Buf::from_string("<exception class>".to_string()));
-    let w_type = crate::baseobjspace::exception_getclass(w_inst);
     let unknown = || Wtf8Buf::from_string("<unknown type>".to_string());
     let returned_type = if w_type.is_null() {
         unknown()

@@ -1,10 +1,12 @@
 # CPython-suite gap: test_raise.TestCause.test_invalid_cause raises
 # `IndexError from 5`, whose class has no observable constructor, so no test
 # sees whether the raised class is instantiated before the cause is rejected,
-# and none raises a non-exception value with an invalid cause.
+# and none raises a non-exception value with an invalid cause; and
+# test_class_cause_nonexception_result covers a class cause that answers a
+# list but not one that answers None, nor a bad raised value alongside one.
 # parity-tests reason: pyre validated the cause where it normalized it, one
-# step ahead of `set_cause`, and the three shapes below are what that reorder
-# is observable as.
+# step ahead of `set_cause`, and judged a called cause by the rule for an
+# uncalled one; the shapes below are what those two are observable as.
 
 """`raise X from Y` validates Y only once X has been normalized.
 
@@ -16,6 +18,11 @@ none of them: the raised class runs its constructor even when the cause is
 invalid; a raised value that is not an exception reports its own TypeError
 rather than the cause's; and a cause constructor that raises propagates that
 exception instead of being read as an absent cause.
+
+A cause written as a class is judged by a second rule.  It has been called by
+the time `set_cause` looks at it, so only an exception instance will do and the
+TypeError names the class and what it answered; `None` passes only when it was
+written as `from None`, which never reaches the call.
 
 The raise runs hot so the JIT residual (`bh_normalize_raise_varargs_with_frame`)
 and the tracer answer alongside the plain interpreter.
@@ -37,6 +44,16 @@ class Raised(Exception):
 class CauseThatRaises(Exception):
     def __init__(self, *args):
         raise ValueError("cause constructor")
+
+
+class ConstructsList(BaseException):
+    def __new__(*args, **kwargs):
+        return ["mortal value"]
+
+
+class ConstructsNone(BaseException):
+    def __new__(*args, **kwargs):
+        return None
 
 
 def invalid_cause_still_builds_the_raised_class():
@@ -105,10 +122,44 @@ def valid_causes_are_unchanged():
         assert isinstance(error.__cause__, KeyError)
 
 
+def a_class_cause_must_answer_an_exception():
+    """A called cause is judged as an instance, and named in the TypeError."""
+    for constructor, answered in ((ConstructsList, "list"), (ConstructsNone, "NoneType")):
+        before = Raised.constructed
+        try:
+            raise Raised from constructor
+        except TypeError as error:
+            message = str(error)
+        else:
+            raise AssertionError(
+                f"{constructor.__name__} answered a non-exception cause unchallenged"
+            )
+        assert "should have returned an instance of BaseException" in message, message
+        assert constructor.__name__ in message, message
+        assert answered in message, message
+        assert Raised.constructed == before + 1, (
+            f"the raised class was not instantiated ({before} -> {Raised.constructed})"
+        )
+
+
+def a_bad_raised_value_outranks_a_bad_class_cause():
+    """`raise 5 from ConstructsList` is still the value's TypeError."""
+    try:
+        raise 5 from ConstructsList
+    except TypeError as error:
+        message = str(error)
+    else:
+        raise AssertionError("raising a non-exception must raise TypeError")
+    assert "should have returned an instance of BaseException" not in message, message
+    assert "cause" not in message, message
+
+
 for _ in range(ROUNDS):
     invalid_cause_still_builds_the_raised_class()
     a_bad_raised_value_reports_its_own_error()
     a_cause_constructor_error_propagates()
     valid_causes_are_unchanged()
+    a_class_cause_must_answer_an_exception()
+    a_bad_raised_value_outranks_a_bad_class_cause()
 
 print("OK")

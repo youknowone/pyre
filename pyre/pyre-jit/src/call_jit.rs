@@ -6493,14 +6493,19 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             // the cause normalized above is a fresh nursery object, so both
             // ride the bracket across the call.
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&[exc, cause.unwrap_or(std::ptr::null_mut())]);
+            let base = roots.publish(&[
+                exc,
+                cause.as_ref().map_or(std::ptr::null_mut(), |c| c.w_cause),
+            ]);
             roots.normalize(base, 2);
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
             exc = roots.get(base);
-            cause = cause.map(|_| roots.get(base + 1));
+            if let Some(c) = cause.as_mut() {
+                c.w_cause = roots.get(base + 1);
+            }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
                 Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)

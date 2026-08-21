@@ -1541,16 +1541,33 @@ unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, P
     Ok(result)
 }
 
+/// The `from` cause of a `raise X from Y`, after the class call, together with
+/// the wording owed if it turns out not to name an exception.
+pub struct RaiseCause {
+    /// The object `__cause__` receives.  Null when there is no cause.
+    pub w_cause: PyObjectRef,
+    /// `Some` when `w_cause` came out of a constructor that did not answer an
+    /// exception instance, holding the TypeError that names both the class and
+    /// what it answered.
+    ///
+    /// It is formatted here rather than where it is raised because only this
+    /// side still holds the class: the frame slot the cause came out of is
+    /// cleared by the `pop`, and keeping the class and the answer alive across
+    /// the raised value's own constructor would owe them both a root.  The
+    /// formatting itself is on the error path only.
+    invalid: Option<PyError>,
+}
+
 /// Instantiate the `from` cause of a `raise X from Y` when it is an exception
 /// class, and answer it unchanged otherwise.
 ///
-/// Whether the result derives from `BaseException` is deliberately not asked
-/// here.  `pyopcode.py:757-760` instantiates and does nothing else; the check
-/// is `error.py:376-385 set_cause`, which runs after the raised value has been
-/// popped and normalized.  Asking it early lets `raise Cls from 42` answer the
-/// cause's TypeError without ever running `Cls()`, and lets it pre-empt the
-/// raised value's own "exceptions must derive from BaseException".
-/// [`attach_raise_cause`] is where it is asked.
+/// The verdict is recorded but deliberately not raised here.
+/// `pyopcode.py:757-760` instantiates and does nothing else; the check is
+/// `error.py:376-385 set_cause`, which runs after the raised value has been
+/// popped and normalized.  Raising early lets `raise 5 from Cls` answer the
+/// cause's TypeError where every implementation answers the raised value's
+/// "exceptions must derive from BaseException".  [`attach_raise_cause`] is
+/// where it is raised.
 ///
 /// # TODO: inline back into RAISE_VARARGS
 ///
@@ -1570,9 +1587,12 @@ unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, P
 /// `pyopcode.py:704-707`), delete this standalone fn, and either route
 /// the BH path through the inlined sequence or rewrite it to match
 /// RPython's inline shape.
-pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<RaiseCause, PyError> {
     if !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(cause) } {
-        return Ok(cause);
+        return Ok(RaiseCause {
+            w_cause: cause,
+            invalid: None,
+        });
     }
     // `space.call_function(w_cause)` propagates the constructor's own error;
     // pyre's answers `PY_NULL` with the error parked in the pending-call slot,
@@ -1584,10 +1604,18 @@ pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError>
             PyError::type_error("exception causes must derive from BaseException")
         }));
     }
-    Ok(result)
+    // A constructor that answers something other than an exception instance
+    // is wrong whatever it answered: `None` is not the `from None` spelling,
+    // which never reaches this branch because `None` is not a class.
+    let invalid = (!unsafe { pyre_object::is_exception(result) })
+        .then(|| crate::error::exception_from_call_type_error(cause, result));
+    Ok(RaiseCause {
+        w_cause: result,
+        invalid,
+    })
 }
 
-pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
+pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<RaiseCause>) -> Result<(), PyError> {
     // `pypy/interpreter/pyopcode.py do_raise` /
     // `pypy/interpreter/executioncontext.py:325 _normalize_exception` —
     // when a `raise` runs while another exception is being handled,
@@ -1605,17 +1633,24 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
     crate::error::chain_context(exc, get_sys_exception());
-    if let Some(cause_obj) = cause
-        && !cause_obj.is_null()
+    if let Some(RaiseCause { w_cause, invalid }) = cause
+        && !w_cause.is_null()
     {
         // `error.py:376-385 set_cause` checks the cause here, after the raised
         // value has been normalized: `raise Cls from 42` therefore runs `Cls()`
         // first, and a raised value that is not an exception answers its own
-        // TypeError rather than this one.  The wording is
-        // `_exception_getclass(space, w_cause, "exception causes")`, not the one
-        // `descr_setcause` uses for `e.__cause__ = x`.
-        let valid =
-            unsafe { pyre_object::is_none(cause_obj) || pyre_object::is_exception(cause_obj) };
+        // TypeError rather than this one.
+        //
+        // Which check it is depends on how the cause got here.  A cause that
+        // was written as a class has already been called, and only an exception
+        // instance will do; a cause written as an object is judged by
+        // `_exception_getclass(space, w_cause, "exception causes")`, which also
+        // admits `None` and whose wording is not the one `descr_setcause` uses
+        // for `e.__cause__ = x`.
+        if let Some(err) = invalid {
+            return Err(err);
+        }
+        let valid = unsafe { pyre_object::is_none(w_cause) || pyre_object::is_exception(w_cause) };
         if !valid {
             return Err(PyError::type_error(
                 "exception causes must derive from BaseException",
@@ -1625,7 +1660,7 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
             // `interp_exceptions.py:166-174 descr_setcause` — writes
             // `w_cause` and flips `suppress_context` to True.
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_cause(exc, w_cause);
                 pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
             };
         }
@@ -3772,7 +3807,7 @@ impl OpcodeStepExecutor for PyFrame {
                 // cause; report absence as `None` so the value is never
                 // `Some(null)` (mirrors the JIT paths call_jit.rs / trace_opcode.rs).
                 let c = normalize_raise_cause(raw_cause)?;
-                let cause = if c.is_null() { None } else { Some(c) };
+                let cause = if c.w_cause.is_null() { None } else { Some(c) };
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
@@ -3782,8 +3817,8 @@ impl OpcodeStepExecutor for PyFrame {
                         // until `attach_raise_cause` reads it, and `call_function`
                         // below can drive a collection.
                         let _roots = pyre_object::gc_roots::push_roots();
-                        if let Some(c) = cause {
-                            pyre_object::gc_roots::pin_root(c);
+                        if let Some(c) = &cause {
+                            pyre_object::gc_roots::pin_root(c.w_cause);
                         }
                         // pyopcode.py:711-713 — class raise: call the type.
                         let result = instantiate_raised_class(w_value)?;
