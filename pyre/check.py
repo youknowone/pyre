@@ -145,18 +145,15 @@ WASM_TIMEOUT_SCALE = 4.0
 # below that the denominator is startup noise, and the comparison table marks
 # the ratio `~` the way the pypy gates already do.
 #
-# 4x rather than the 3x this started at, because 3x was not where the backend
-# is. Four fixtures had already been carved out of it one at a time -- fannkuch
-# 3.6, fib_recursive 3.6, raise_catch_loop 3.8, short_circuit_value_kept_stack
-# 3.7 -- every one for the same structural reason (`wasm_ratio_gate` below
-# spells it out), and more kept arriving: one main run failed
-# `if_else_jump_forward` at 3.9x and `loop_callee_shared_mutation` at 3.3x with
-# no allowance written for either. A ceiling that the fixtures above it are
-# exempted from individually is collecting exemptions rather than measuring the
-# backend. At 4x the gate means what it says, all four of those allowances come
-# out, and one stays genuinely above it
-# (`global_quasiimmut_invalidation`, 6).
-WASM_MAX_DYNASM_RATIO = 4.0
+# The number is meant to be a target the backend is held to, so it moves only
+# when the backend does, and never to bless a fixture: it started at 3x, went to
+# 4x when 3x was collecting per-fixture `max-wasm-ratio` allowances one at a
+# time (fannkuch, fib_recursive, raise_catch_loop,
+# short_circuit_value_kept_stack) rather than measuring anything, and came back
+# to 3.5 once every one of those allowances had been removed and the fixture
+# that still exceeded it -- fib_recursive, at 3.87x -- was fixed rather than
+# exempted. No fixture carries an allowance today.
+WASM_MAX_DYNASM_RATIO = 3.5
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x
