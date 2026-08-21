@@ -3107,6 +3107,19 @@ mod tests {
     }
 
     #[test]
+    fn box_code_object_preserves_owned_storage() {
+        let code = compile_exec("answer = 42\n").expect("compile failed");
+        let source_storage = code.source_path.as_ptr();
+        let instruction_storage = code.instructions.as_ptr();
+
+        let w_code = box_code_object(code);
+        let stored = unsafe { &*(w_code_get_ptr(w_code) as *const crate::CodeObject) };
+
+        assert_eq!(stored.source_path.as_ptr(), source_storage);
+        assert_eq!(stored.instructions.as_ptr(), instruction_storage);
+    }
+
+    #[test]
     fn w_code_const_shares_large_integer_and_root_walker_visits_slot() {
         let code =
             compile_exec("x = 123456789012345678901234567890123456789012345678901234567890\n")

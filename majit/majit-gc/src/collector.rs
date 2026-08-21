@@ -755,7 +755,13 @@ impl RootSet {
             self.roots.pop();
             return;
         }
-        if let Some(pos) = self.roots.iter().position(|r| *r == root) {
+        // shadowstack.py:80-106 advances one `root_stack_top` on push and
+        // decrements that same top before pop: duplicate roots are therefore
+        // retired newest-first.  The same slot can be registered by nested
+        // host brackets, so the out-of-order fallback must preserve that
+        // order too. Searching from the front leaves the newest duplicate in
+        // place and turns the following, otherwise-LIFO removals into scans.
+        if let Some(pos) = self.roots.iter().rposition(|r| *r == root) {
             self.roots.swap_remove(pos);
         }
     }
@@ -7681,6 +7687,28 @@ mod tests {
         roots.remove(a);
         assert_eq!(roots.roots, vec![b]);
         roots.remove(b);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn root_set_out_of_order_remove_prefers_the_newest_duplicate() {
+        let mut roots = RootSet::new();
+        let mut a = GcRef(1);
+        let mut b = GcRef(2);
+        let (a, b) = (&mut a as *mut GcRef, &mut b as *mut GcRef);
+        unsafe {
+            roots.add(a);
+            roots.add(b);
+            roots.add(a);
+            roots.add(b);
+        }
+
+        roots.remove(a);
+        assert_eq!(roots.roots, vec![a, b, b]);
+        roots.remove(b);
+        assert_eq!(roots.roots, vec![a, b]);
+        roots.remove(b);
+        roots.remove(a);
         assert!(roots.is_empty());
     }
 
