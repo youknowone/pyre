@@ -151,6 +151,10 @@ implementation shape. Before adding any builtin, extension, compatibility, or
 test-support module, verify that the real `pypy3` oracle imports it and locate
 its owner in `pypy/`, `rpython/`, or `lib_pypy/`. If neither exists, the module
 is not a pyre porting target unless the user explicitly expands the scope.
+This applies to builtin-type and CPython-test-suite sweeps too: exclude an
+absent module from the backlog instead of treating its skipped tests as missing
+implementation work. The goal is to complete PyPy's module/type surface in the
+PyPy way, not to reproduce CPython's private extension-module inventory.
 
 In particular, CPython-only test helpers such as `_testlimitedcapi` are not
 product modules. PyPy also has no `_datetime` extension module: it provides
