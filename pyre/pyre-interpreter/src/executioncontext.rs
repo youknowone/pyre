@@ -1278,7 +1278,7 @@ impl ExecutionContext {
         };
 
         if !w_callback.is_null() && event != "leaveframe" {
-            // PyPy's `ExecutionContext._trace` exception-event branch:
+            // `executioncontext.py _trace` exception-event branch:
             //   if operr is not None:
             //       w_value = operr.normalize_exception(space)
             //       w_arg = space.newtuple([operr.w_type, w_value,
