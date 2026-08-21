@@ -938,7 +938,7 @@ fn build_bare_gcstruct_descr_group(
                 flag: runtime_array_flag(field_type, signed),
                 virtualizable: false,
                 // A bare GcStruct has no class word.
-                is_class_word: false,
+                is_class_word: Some(false),
                 index_in_parent,
             },
         )
