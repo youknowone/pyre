@@ -9309,6 +9309,12 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // (`virtualref.py virtual_ref_during_tracing`).  This all-or-nothing gate
     // keeps a later decline from shortening the concrete frame chain before
     // the generic residual gets a chance to run.
+    //
+    // A hidden hop declines outright.  `executioncontext.py
+    // getnextframe_nohidden` skips a hidden frame WITHOUT consuming a depth
+    // level, so one raw `f_backref` per level only reproduces `getframe`'s walk
+    // on a chain that has none; the emitted traversal pins that with its
+    // per-hop `guard_false(hidden_applevel)`.
     let final_concrete_frame = {
         let mut scan = frame;
         for _ in 0..depth_value {
@@ -9343,6 +9349,9 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                 scan = referent;
             } else {
                 scan = raw;
+            }
+            if unsafe { (*scan).hide() } {
+                return Ok(None);
             }
         }
         scan
