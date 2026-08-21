@@ -6409,8 +6409,13 @@ pub(crate) fn dict_store_checked(
 /// pointer, so hashing inside the key build (`object_key_for_checked`) captures
 /// the pre-move pointer — the reason `object_key_hashed` exists. The element is
 /// rooted across the hash and reloaded, matching the add path
-/// (`builtin_set_add_items`); the set needs no rooting, being an old-gen
-/// allocation that keeps its address across a collection.
+/// (`builtin_set_add_items`).
+///
+/// The set is rooted too, but only pinned: an old-gen allocation keeps its
+/// address across a collection, so there is nothing to reload — what it needs
+/// is to stay reachable.  `CONTAINS_OP` pops the container off the operand
+/// stack before dispatching here, so on `x in {...}` the hash below runs with
+/// nothing else referring to the set at all.
 unsafe fn set_lookup_checked(
     set: PyObjectRef,
     item: PyObjectRef,
@@ -6422,6 +6427,7 @@ unsafe fn set_lookup_checked(
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(item);
+    pyre_object::gc_roots::pin_root(set);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
         .map_err(|err| {
             crate::baseobjspace::wrap_set_element_hash_error(
