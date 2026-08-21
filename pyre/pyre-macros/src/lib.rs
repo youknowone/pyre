@@ -36,7 +36,7 @@
 //! * `i64` / `i32` / `u32` / `usize` — `w_int_new`.
 //! * `f64` — `w_float_new`.
 //! * `bool` — `w_bool_from`.
-//! * `String` — `w_str_new`.
+//! * `String` — `w_str_new_managed`.
 //! * `pyre_object::PyObjectRef` — passthrough.
 //! * `Result<T, crate::PyError>` — `?`-propagated, then `T` wrapped.
 //! * `()` — `w_none()`.
@@ -934,11 +934,20 @@ fn wrap_value_expr(
             }
             "f64" => return Ok(quote! { ::pyre_object::w_float_new(#value) }),
             "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
-            "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
+            // The collectable constructor, not `w_str_new`: a builtin's
+            // return value is a dynamic string handed to the Python caller,
+            // which is the case `w_str_new_managed` documents itself as being
+            // for.  `w_str_new`'s immortal default exists for the structural
+            // strings — dict keys, code constants, type and property names —
+            // that off-GC structures hold outside the root graph, and none of
+            // those are produced here.  A builtin returning a fresh `String`
+            // in a loop otherwise leaks it: `os.getcwd()` 500,000 times grew
+            // peak RSS 65.2 MB where CPython grew none.
+            "String" => return Ok(quote! { ::pyre_object::w_str_new_managed(&#value) }),
             // A method whose text may hold a lone surrogate — a `__repr__`
             // naming a filename, say — returns the WTF-8 buffer itself
             // rather than a `String` it cannot spell.
-            "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8(#value) }),
+            "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8_managed(#value) }),
             _ => {}
         }
         // `Vec<T>` — bytes / list-of-X.

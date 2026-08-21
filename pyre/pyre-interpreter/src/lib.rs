@@ -823,16 +823,23 @@ impl PywrapKind for bool {
         ::pyre_object::w_bool_from(self)
     }
 }
+/// A borrowed `&str` in one of these macros is a literal at the call site —
+/// a field name, a flag name — so it keeps the immortal constructor the
+/// structural strings use.
 impl PywrapKind for &str {
     #[inline]
     fn into_py(self) -> ::pyre_object::PyObjectRef {
         ::pyre_object::w_str_new(self)
     }
 }
+/// An owned `String` was built at runtime, so it takes the collectable
+/// constructor.  This is also the element wrap a `#[pyre_function]` returning
+/// `Vec<String>` lowers to, which would otherwise leak one immortal string per
+/// element per call.
 impl PywrapKind for String {
     #[inline]
     fn into_py(self) -> ::pyre_object::PyObjectRef {
-        ::pyre_object::w_str_new(&self)
+        ::pyre_object::w_str_new_managed(&self)
     }
 }
 impl PywrapKind for ::pyre_object::PyObjectRef {
