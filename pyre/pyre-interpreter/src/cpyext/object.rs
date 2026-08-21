@@ -1092,11 +1092,18 @@ pub unsafe extern "C" fn PyObject_VisitManagedDict(
 }
 
 /// `PyObject_ClearManagedDict(object)` — empty the instance namespace.
+///
+/// `dictobject.c:7488-7491` states when it is called: "when the object is
+/// being freed or cleared by the GC and therefore known to have no
+/// references".  A block reached from `clear_garbage` has no interpreter
+/// object left to hold a namespace, and this reports nothing -- it returns
+/// void, so an error recorded here would be found by whoever calls next.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_ClearManagedDict(object: *mut CPyObject) {
-    let Some(object) = argument(object) else {
+    let object = unsafe { pyobject::from_ref(object) };
+    if object.is_null() {
         return;
-    };
+    }
     let dict = crate::baseobjspace::getdict_native(object);
     if !dict.is_null() {
         unsafe { pyre_object::dictmultiobject::w_dict_clear(dict) };
