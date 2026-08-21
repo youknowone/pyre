@@ -10839,14 +10839,17 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
             raw_fn as *const (),
             &[r_args[2], r_args[3]],
             &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
+            // `min` / `max` compare two exact scalars and hand back one of
+            // their own arguments, so unlike the allocating ref helpers this
+            // one really cannot collect -- which drops the gcmap bracket the
+            // plain `CannotRaise` constructor would ask every backend for.
+            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw])?;
+        // Concrete before the guard: the guard captures a resume snapshot, and
+        // a `raw` with no value yet is recorded into it without one.
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(value as usize)));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw])?;
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
         return Ok(Some(()));
     }
