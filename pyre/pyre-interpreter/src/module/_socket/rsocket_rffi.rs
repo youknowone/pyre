@@ -760,6 +760,28 @@ pub unsafe fn getsockopt(
     unsafe { ws::getsockopt(s, level, option, value.cast(), len) }
 }
 
+/// `SIO_TCP_SET_ACK_FREQUENCY`, which is what `TCP_QUICKACK` names here.
+/// It is an ioctl rather than a socket option, so `setsockopt` answers
+/// `WSAENOPROTOOPT` for it and the flag has to travel through `WSAIoctl`.
+/// Nothing reads it back: WinSock exposes no query for the current setting.
+#[cfg(windows)]
+pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
+    let mut returned: u32 = 0;
+    unsafe {
+        ws::WSAIoctl(
+            s,
+            ws::SIO_TCP_SET_ACK_FREQUENCY,
+            (&raw const flag).cast(),
+            core::mem::size_of::<libc::c_int>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut returned,
+            core::ptr::null_mut(),
+            None,
+        )
+    }
+}
+
 #[cfg(unix)]
 pub unsafe fn setsockopt(
     s: Socket,

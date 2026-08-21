@@ -650,14 +650,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // ── TCP-level ──
         cst!("TCP_NODELAY", ws::TCP_NODELAY);
         cst!("TCP_MAXSEG", ws::TCP_MAXSEG);
-        cst!("TCP_KEEPALIVE", ws::TCP_KEEPALIVE);
         cst!("TCP_KEEPIDLE", 3);
         cst!("TCP_FASTOPEN", 15);
         cst!("TCP_KEEPCNT", 16);
+        cst!("TCP_KEEPALIVE", ws::TCP_KEEPALIVE);
         cst!("TCP_KEEPINTVL", 17);
         // `SIO_TCP_SET_ACK_FREQUENCY` - the name `socketmodule.c` gives this
-        // option on Windows, which `windows-sys` does not spell.
-        cst!("TCP_QUICKACK", 0x98000017u32 as i32);
+        // option on Windows.  It is an ioctl code, not an option number, which
+        // is why `setsockopt` and `getsockopt` both special-case it.
+        cst!("TCP_QUICKACK", ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
         // ── IP-level ──
         cst!("IP_TTL", ws::IP_TTL);
         cst!("IP_TOS", ws::IP_TOS);
@@ -2609,6 +2610,11 @@ fn socket_init_state(
     socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
     socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
     socket_set_attr(obj, "_timeout", pyre_object::w_none());
+    // `sock_new` starts this at 0 on every socket object, and only
+    // `setsockopt` moves it: `SIO_TCP_SET_ACK_FREQUENCY` has no counterpart to
+    // read the live setting back with, so what was written is the answer.
+    #[cfg(windows)]
+    socket_set_attr(obj, "_quickack", pyre_object::w_int_new(0));
     // `interp_socket.py:977 usecount = 1` — start the refcount at 1 so
     // `_drop` followed by no `_reuse` closes the underlying fd exactly
     // once.
@@ -4608,6 +4614,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let level = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
             let name = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
             let val = args[3];
+            // `sock_setsockopt` sends an int for this option through
+            // `WSAIoctl` and keeps the value, because the option number is an
+            // ioctl code that `setsockopt` itself rejects.  A bytes value is
+            // not covered there either and still goes the ordinary way.
+            #[cfg(windows)]
+            if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int
+                && unsafe { pyre_object::is_int(val) }
+            {
+                let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
+                if unsafe { rffi::set_ack_frequency(fd, flag) } != 0 {
+                    return Err(socket_last_error());
+                }
+                socket_set_attr(args[0], "_quickack", pyre_object::w_int_new(flag as i64));
+                return Ok(pyre_object::w_none());
+            }
             let r = unsafe {
                 if pyre_object::is_int(val) {
                     let v = pyre_object::w_int_get_value(val) as libc::c_int;
@@ -4661,6 +4682,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             if buflen == 0 {
+                // `sock_getsockopt` answers the value `setsockopt` last wrote
+                // rather than asking WinSock, which has no call that reads an
+                // ioctl's current setting.
+                #[cfg(windows)]
+                if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int {
+                    return Ok(pyre_object::w_int_new(socket_get_attr_i64(
+                        args[0],
+                        "_quickack",
+                    )));
+                }
                 let mut v: libc::c_int = 0;
                 let mut sz = core::mem::size_of::<libc::c_int>() as rffi::SockLen;
                 let r = unsafe {
