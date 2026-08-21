@@ -40,26 +40,6 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
     crate::lltype::malloc_raw(value)
 }
 
-/// `buffer.py RawByteBuffer.__init__` — report a raw payload's bytes
-/// to the collector, the line upstream writes right after the raw malloc.
-///
-/// Upstream keeps two buffer representations. `ByteBuffer` (`buffer.py`)
-/// holds `['\0'] * n`, a GC-heap list the collector allocates and therefore
-/// counts by itself. `RawByteBuffer` puts the same bytes in raw memory and
-/// pairs the allocation with `rgc.add_memory_pressure(length)`;
-/// `rawstorage.alloc_raw_storage` spells it as `add_memory_pressure=True`.
-/// A storage box is the raw representation — the collector registers
-/// `size_of::<T>()` and never sees the container's own allocation — so it
-/// takes the same report. Without it a `BufferedReader` buffer counts as the
-/// 24 bytes of its `Vec` rather than the 128KB it holds, and a heap of them
-/// never moves the major-collection threshold.
-///
-/// `size` is the payload alone. `incminimark.py raw_malloc_memory_pressure`'s
-/// per-allocation term is added by the collector.
-pub fn add_storage_memory_pressure(size: usize) {
-    majit_gc::add_memory_pressure_estimate(size as isize);
-}
-
 /// GC-sweep destructor for a storage box built by
 /// [`gc_alloc_storage_box::<T>`].
 ///

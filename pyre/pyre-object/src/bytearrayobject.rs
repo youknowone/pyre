@@ -88,7 +88,6 @@ impl crate::lltype::GcType for W_BytearrayObject {
 fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let length = buf.len();
     let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
-    let payload = buf.capacity();
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
     let header = PyObject {
@@ -115,9 +114,6 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
     };
-    // `buffer.py RawByteBuffer.__init__` reports only once the payload is held
-    // by a live object; see `w_bytes_from_bytes`.
-    crate::gc_storage::add_storage_memory_pressure(payload);
     w_bytearray
 }
 

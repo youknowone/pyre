@@ -4235,16 +4235,31 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
     );
-    // bytes / bytearray `data` storage box (off-GC storage). A leaf
-    // `Vec<u8>` (no inner refs) shared by both types; `bytes_object_custom_trace`
-    // / `bytearray_object_custom_trace` grey it through the `data` field slot and
-    // the box tid's drop glue reclaims the buffer on sweep. Keep this id at the
-    // absolute registration tail.
+    // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
+    // refs); `bytearray_object_custom_trace` greys it through the `data` field
+    // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this
+    // id at the absolute registration tail.
     register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
         pyre_object::bytesobject::set_bytes_data_gc_type_id,
     );
+    // `bytes` `data` block — `rstr.py:1226-1228`'s `STR.chars`, an
+    // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
+    // registers with the shape `get_array_token` reads off that one ARRAY and
+    // no destructor: the payload is inside the block, so the sweep reclaims it
+    // with the block and the collector sizes it from the block's own length
+    // header. `bytes_object_custom_trace` greys it through the `data` field
+    // slot, the same edge the storage box was reached by.
+    let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
+    let bytes_block_tid = gc.register_type(TypeInfo::varsize(
+        bytes_block_token.base_size,
+        bytes_block_token.item_size,
+        bytes_block_token.len_offset,
+        false,
+        Vec::new(),
+    ));
+    pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
     // Mortal (subclass) `str` `value` WTF-8 buffer storage box (off-GC storage
     // epic S5). A leaf `Wtf8Buf` (no inner refs); the W_UnicodeObject `value`
     // gc-pointer edge greys it and the box tid's drop glue reclaims the buffer
