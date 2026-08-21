@@ -1944,102 +1944,139 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                 hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
         }
-        // Deny the named callee so the enclosing loop's next attempt
-        // residualizes that call instead of re-entering this abort.  Without
-        // it the decline is a property of the framestack, which the next
-        // attempt rebuilds identically: the abort recurs byte-for-byte until
-        // the enclosing location is retired, so the loop never compiles at
-        // all.  Upstream answers the same situation by denying the callee and
-        // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
-        if let Some((callee_code_key, _)) = hazardous_callee {
-            fbw_deny_hazardous_inline(callee_code_key);
-            let is_being_profiled = ctx.session.borrow().is_being_profiled;
-            // `fbw_deny_hazardous_inline` writes a thread-local set that only
-            // this walker reads, so the deny stayed invisible to the warm
-            // state: `dont_trace_here` counted zero on every fixture that
-            // reaches here.  The upstream answer cited above is
-            // `disable_noninlinable_function(greenkey_of_huge_function)`
-            // (`pyjitpl.py:2821`), which sets `JC_DONT_TRACE_HERE` on the
-            // callee's cell (`warmstate.py:331-337`).  The recursion-bound deny
-            // in `inline_call.rs` already calls it for the callee it names;
-            // this one names a callee the same way and had no reason not to.
-            if let Some((driver, _)) = crate::driver::try_driver_pair() {
-                driver
-                    .meta_interp_mut()
-                    .warm_state_mut()
-                    .disable_noninlinable_function(crate::driver::make_green_key(
-                        callee_code_key as *const (),
-                        0,
-                        is_being_profiled,
-                    ));
-            }
-        }
-        // The flush this latch feeds resumes the OUTERMOST caller at the CALL
-        // that entered the inline region, re-executing that call from scratch,
-        // while the walk's store journal is committed — a
-        // `WalkEndResume::Rewind` leg.  So it is sound only while the inline
-        // region has executed nothing irreversible: an executed-effect delta
-        // means the call would apply its effects a second time on top of the
-        // committed ones.  Same zero-delta gate the entry carrier applies at
-        // its own CALL (`try_walker_inline_user_call`) and the contract
-        // `FBW_EXECUTED_EFFECT_COUNT` documents.  The snapshot travels with the
-        // latch so `commit_walk_end` re-checks it at the commit point, not just
-        // here.
-        //
-        // Declining here leaves the legacy path, which is exactly-once only for
-        // the effects a journal covers.  `residual_call.rs` bumps the odometer
-        // for a non-pure residual that wrote live heap or entered a user Python
-        // frame, and neither is journaled, so a legacy drop after such a
-        // residual re-applies it.  That is not a property of this gate — the
-        // walk reaches the same state through any non-committing abort inside a
-        // sub-walk — so this gate does not attempt to repair it.
-        let (outer_resume, stack_overrides, blackhole_required) = {
-            let session = ctx.session.borrow();
-            let outermost = session
-                .framestack
-                .first()
-                .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
-            let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
-                Some(frame) => (
-                    frame.call_jitcode_pc.map(|jit_pc| {
-                        (
-                            frame.jitcode_index,
-                            jit_pc,
-                            crate::jitcode_dispatch::fbw_executed_effect_count(),
-                        )
-                    }),
-                    frame.call_stack_overrides.clone(),
-                ),
-                None => (None, Vec::new()),
-            };
-            // The aborting operation belongs to the innermost live MIFrame.
-            // If that frame has applied nothing since its CALL, discard the
-            // attempted frame and let its caller resume at the CALL.  A
-            // multi-frame blackhole conversion is required only once that
-            // frame itself has state to preserve; effects in paused ancestors
-            // are already represented by their own frame images.  This is the
-            // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
-            // it copies every `MIFrame` independently (`blackhole.py:1799-1821`).
-            // An in-flight FOR_ITER item is in no frame image, so the
-            // per-frame test above cannot see it: a body effect committed in
-            // an enclosing frame leaves the innermost frame's delta at zero
-            // while `fbw_foriter_inflight_take` refuses that very item, and
-            // the legacy path then drops it. Arm the conversion on the same
-            // signal the refusal reads, so the item is carried forward
-            // instead of lost.
-            let blackhole_required =
-                session.framestack.last().is_some_and(|frame| {
-                    fbw_executed_effect_count() != frame.entry_executed_effects
-                }) || (fbw_foriter_inflight_active() && fbw_foriter_any_body_effect_signal());
-            (outer_resume, stack_overrides, blackhole_required)
-        };
-        FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
-        FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
-            *c.borrow_mut() = stack_overrides;
-        });
-        return Err(DispatchError::callee_inline_abort(pc, blackhole_required));
+        return Err(fbw_decline_inline_callee(
+            ctx,
+            pc,
+            hazardous_callee.map(|(callee_code_key, _)| callee_code_key),
+        ));
     }
     Ok(())
+}
+
+/// Refuse the innermost inline callee: deny it for the rest of this thread's
+/// tracing, latch the outer caller's CALL coordinate, and build the decline the
+/// walk returns.
+///
+/// Shared by the hazard arm of [`fbw_abort_nested_unjournaled_residual`] and
+/// the poisoned-pc refusal in [`crate::jitcode_dispatch::walk`], which answer
+/// the same question — this callee must not be inlined HERE — from a static
+/// framestack property and from an op the walk actually reached.
+///
+/// Denying is what stops the decline being a property of the framestack, which
+/// the next attempt rebuilds identically: without it the abort recurs
+/// byte-for-byte until the enclosing location is retired, so the loop never
+/// compiles at all.  Upstream answers the same situation by denying the callee
+/// and letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
+///
+/// `callee_code_key` is `None` when no callee could be named, in which case the
+/// decline still unwinds but nothing is remembered.
+pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+    callee_code_key: Option<usize>,
+) -> DispatchError {
+    if let Some(callee_code_key) = callee_code_key {
+        fbw_deny_hazardous_inline(callee_code_key);
+        // The walk's own profiling green, not the ambient one: `make_green_key`
+        // builds the `u64` key at a site that holds no frame, and a walk-internal
+        // caller names it from `WalkSession`, seeded once per walk from the
+        // concrete frame.  Read before `try_driver_pair` so the session borrow
+        // is released across the driver call.
+        let is_being_profiled = ctx.session.borrow().is_being_profiled;
+        // `fbw_deny_hazardous_inline` writes a thread-local set that only
+        // this walker reads, so the deny stayed invisible to the warm
+        // state: `dont_trace_here` counted zero on every fixture that
+        // reaches here.  The upstream answer cited above is
+        // `disable_noninlinable_function(greenkey_of_huge_function)`
+        // (`pyjitpl.py:2821`), which sets `JC_DONT_TRACE_HERE` on the
+        // callee's cell (`warmstate.py:331-337`).  The recursion-bound deny
+        // in `inline_call.rs` already calls it for the callee it names;
+        // this one names a callee the same way and had no reason not to.
+        if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .disable_noninlinable_function(crate::driver::make_green_key(
+                    callee_code_key as *const (),
+                    0,
+                    is_being_profiled,
+                ));
+        }
+    }
+    // The flush this latch feeds resumes the OUTERMOST caller at the CALL
+    // that entered the inline region, re-executing that call from scratch,
+    // while the walk's store journal is committed — a
+    // `WalkEndResume::Rewind` leg.  So it is sound only while the inline
+    // region has executed nothing irreversible: an executed-effect delta
+    // means the call would apply its effects a second time on top of the
+    // committed ones.  Same zero-delta gate the entry carrier applies at
+    // its own CALL (`try_walker_inline_user_call`) and the contract
+    // `FBW_EXECUTED_EFFECT_COUNT` documents.  The snapshot travels with the
+    // latch so `commit_walk_end` re-checks it at the commit point, not just
+    // here.
+    //
+    // Declining here leaves the legacy path, which is exactly-once only for
+    // the effects a journal covers.  `residual_call.rs` bumps the odometer
+    // for a non-pure residual that wrote live heap or entered a user Python
+    // frame, and neither is journaled, so a legacy drop after such a
+    // residual re-applies it.  That is not a property of this gate — the
+    // walk reaches the same state through any non-committing abort inside a
+    // sub-walk — so this gate does not attempt to repair it.
+    let (outer_resume, stack_overrides, blackhole_required) = {
+        let session = ctx.session.borrow();
+        let outermost = session
+            .framestack
+            .first()
+            .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
+        let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
+            Some(frame) => (
+                frame.call_jitcode_pc.map(|jit_pc| {
+                    (
+                        frame.jitcode_index,
+                        jit_pc,
+                        crate::jitcode_dispatch::fbw_executed_effect_count(),
+                    )
+                }),
+                frame.call_stack_overrides.clone(),
+            ),
+            None => (None, Vec::new()),
+        };
+        // The aborting operation belongs to the innermost live MIFrame.
+        // If that frame has applied nothing since its CALL, discard the
+        // attempted frame and let its caller resume at the CALL.  A
+        // multi-frame blackhole conversion is required only once that
+        // frame itself has state to preserve; effects in paused ancestors
+        // are already represented by their own frame images.  This is the
+        // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
+        // it copies every `MIFrame` independently (`blackhole.py:1799-1821`).
+        // An in-flight FOR_ITER item is in no frame image, so the per-frame
+        // test above cannot see it: a body effect committed in an enclosing
+        // frame leaves the innermost frame's delta at zero while
+        // `fbw_foriter_inflight_take` refuses that very item, and the legacy
+        // path then drops it.  Arm the conversion on the same signal the
+        // refusal reads, so the item is carried forward instead of lost.
+        let blackhole_required = session
+            .framestack
+            .last()
+            .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects)
+            || (fbw_foriter_inflight_active() && fbw_foriter_any_body_effect_signal());
+        (outer_resume, stack_overrides, blackhole_required)
+    };
+    FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
+    FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
+        *c.borrow_mut() = stack_overrides;
+    });
+    DispatchError::callee_inline_abort(pc, blackhole_required)
+}
+
+/// The code key of the callee whose body the active sub-walk is recording, for
+/// the refusal to name.  This is the innermost live `MIFrame` — the same frame
+/// [`fbw_decline_inline_callee`]'s `blackhole_required` is computed from, and
+/// the entity a poisoned pc is a property of.
+pub(crate) fn fbw_innermost_inline_callee_key<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<usize> {
+    ctx.session.borrow().framestack.last().map(|f| f.w_code)
 }
 
 /// Take the outer-caller CALL JitCode coordinate stashed by
@@ -2410,7 +2447,7 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
 /// or a pyre payload ahead of the `L` — since a missed target would let a
 /// freshness claim survive a join it does not hold across.
 /// How many of a callee frame's `localsplus` slots
-/// [`fbw_callee_body_replay_safety`] tracks.  A body reaching past this keeps
+/// [`fbw_callee_body_replay_scan`] tracks.  A body reaching past this keeps
 /// working; its higher slots simply prove nothing.
 const BODY_TRACKED_FRAME_SLOTS: usize = 256;
 
@@ -2510,7 +2547,7 @@ fn body_branch_targets(body_code: &[u8]) -> Option<std::collections::HashSet<usi
 }
 
 /// Replay safety of one inline candidate's body inside a FOR_ITER body, as
-/// judged by [`fbw_callee_body_replay_safety`].
+/// judged by [`fbw_callee_body_replay_scan`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CalleeReplaySafety {
     /// No op in the body can commit a live-heap effect.
@@ -2538,6 +2575,120 @@ pub(crate) enum CalleeReplaySafety {
     DeferredCall,
     /// Carries a live-heap effect a replay would double.
     Dirty,
+}
+
+/// What [`fbw_callee_body_replay_scan`] found, kept as a set of offending
+/// jitcode pcs rather than collapsed to one verdict for the whole body.
+///
+/// The verdict form is what made an UNTAKEN branch decide the admission for the
+/// branch every iteration takes.  `operator.itemgetter.__call__` is the shape
+/// that names the cost: its multi-index arm builds a tuple with a
+/// comprehension, so the body carries a `GET_ITER` / `FOR_ITER` pair that the
+/// single-index call never reaches, and the whole callee declined at 687-730 ns
+/// per call against 0.5 on the oracle, which runs the same pure-Python body.
+///
+/// Upstream has no whole-body scan to lose this on.  `pyjitpl.py` traces the
+/// path the interpreter actually takes and meta-interprets each op as it
+/// arrives, so an arm that never executes is never seen; `look_inside_graph`
+/// (`codewriter/policy.py:48`) and `can_inline_callable` (`warmstate.py:669`)
+/// decide per CALLABLE, not per body op.  Reporting pcs restores that: the
+/// callee is admitted, and [`crate::jitcode_dispatch::walk`] refuses only if
+/// the walk actually reaches one of them.
+///
+/// `unscannable` is the residue that cannot become a pc, because it means the
+/// scan's own bookkeeping broke rather than that one op is unsafe — a body
+/// whose branch targets do not decode never performs the join resets, so its
+/// freshness and provenance sets are wrong at EVERY pc, and one whose decode
+/// stops leaves the rest of the body unexamined.  Those decline outright.
+#[derive(Clone, Debug)]
+pub(crate) struct CalleeReplayScan {
+    /// The verdict for the body with the poisoned pcs excluded.
+    pub(crate) safety: CalleeReplaySafety,
+    /// Ascending jitcode offsets of the ops the scan could not prove
+    /// replay-safe.  Ascending because the scan walks the body in pc order,
+    /// which is what lets the walk-time test binary-search it.
+    pub(crate) poison: Vec<usize>,
+    /// Ascending jitcode offsets of the ops that sit INSIDE one of the
+    /// callee's own protected regions, kept apart from `poison` because they
+    /// are not unsafe to replay — they are unsafe to be inside when a guard
+    /// deopts, which is a different question and not every caller asks it.
+    ///
+    /// The two admissions that do ask it condition on
+    /// `body_facts.has_exception_table`, a property of the whole
+    /// `CodeObject`: a handler-bearing callee must restore protected-region
+    /// state at its own precise resume point, and the caller-boundary rebuild
+    /// cannot name one.  A body whose handler covers only an arm the walk
+    /// never enters has nothing to restore, and this set is what lets the
+    /// admission say so.
+    ///
+    /// Membership is read off the jitcode rather than the Python exception
+    /// table, because the codewriter already spells it there: an op that can
+    /// raise inside a `try` is followed by its `catch_exception/L`, which is
+    /// exactly what [`crate::jitcode_dispatch::try_catch_exception_at`] answers
+    /// for the walk's own unwind.  So "covered by a handler" needs no second
+    /// encoding and no py_pc mapping.
+    pub(crate) protected: Vec<usize>,
+    /// The scan could not model the body at all; no pc set describes it.
+    pub(crate) unscannable: bool,
+}
+
+impl CalleeReplayScan {
+    fn unscannable() -> Self {
+        Self {
+            safety: CalleeReplaySafety::Dirty,
+            poison: Vec::new(),
+            protected: Vec::new(),
+            unscannable: true,
+        }
+    }
+
+    /// The pcs an admission that also drops the `has_exception_table` term must
+    /// refuse at: the unsafe ops plus every op under a handler.  Merged rather
+    /// than concatenated so the result stays ascending for the walk's
+    /// binary search.
+    pub(crate) fn poison_with_protected(&self) -> Vec<usize> {
+        let mut merged = Vec::with_capacity(self.poison.len() + self.protected.len());
+        let (mut left, mut right) = (
+            self.poison.iter().peekable(),
+            self.protected.iter().peekable(),
+        );
+        loop {
+            let next = match (left.peek(), right.peek()) {
+                (None, None) => break,
+                (Some(_), None) => *left.next().unwrap(),
+                (None, Some(_)) => *right.next().unwrap(),
+                (Some(&&l), Some(&&r)) => {
+                    if l < r {
+                        *left.next().unwrap()
+                    } else if r < l {
+                        *right.next().unwrap()
+                    } else {
+                        left.next();
+                        *right.next().unwrap()
+                    }
+                }
+            };
+            merged.push(next);
+        }
+        merged
+    }
+
+    /// The verdict a caller that cannot carry a pc set must read.  A poisoned
+    /// body is `Dirty` to such a caller, which is what the scan reported before
+    /// the pcs were kept.
+    pub(crate) fn verdict(&self) -> CalleeReplaySafety {
+        if self.unscannable || !self.poison.is_empty() {
+            CalleeReplaySafety::Dirty
+        } else {
+            self.safety
+        }
+    }
+
+    /// Whether admitting this body is a decision the walk can police.  An
+    /// unscannable body is not: there is no pc to refuse at.
+    pub(crate) fn enforceable(&self) -> bool {
+        !self.unscannable
+    }
 }
 
 /// Whether an inline callee can be replayed from its caller's CALL boundary
@@ -2635,17 +2786,40 @@ pub(crate) struct CalleeArgFact {
 /// FROM exact-numeric caller arguments — so parameter provenance is tracked
 /// slot-by-slot alongside freshness.  This matters for method-form calls:
 /// `self` is commonly nonnumeric while a later argument is an exact int.
-/// Name the body op that made [`fbw_callee_body_replay_safety`] answer
-/// [`CalleeReplaySafety::Dirty`], under `PYRE_FBW_INLINE_DIAG`.  Without it the
-/// declining instruction is invisible: the caller only sees `safety=Dirty` on
-/// the `[inline-foriter-gate]` line and every one of the return sites below
-/// looks alike.
-macro_rules! replay_dirty {
+/// Record the body op [`fbw_callee_body_replay_scan`] could not prove
+/// replay-safe, and name it under `PYRE_FBW_INLINE_DIAG`.  Without the line the
+/// offending instruction is invisible: the caller only sees `safety=Dirty` on
+/// the `[inline-foriter-gate]` line and every one of the sites below looks
+/// alike.
+///
+/// This does NOT diverge.  Each site records a pc and the scan keeps walking,
+/// so a body reports every op it must not reach rather than only the first.
+/// The state the scan carries stays correct for every pc the walk can still
+/// arrive at: an op between a poisoned pc and the next branch target is
+/// reachable only by falling through the poisoned one, where the walk has
+/// already refused, and a branch target resets the tracked sets outright.
+///
+/// The `poison` set has to be threaded through explicitly because
+/// `macro_rules!` locals are hygienic — a bare `poison` written here would not
+/// name the caller's binding.
+macro_rules! replay_poison {
+    ($poison:ident, $why:expr, $pc:expr, $opname:expr) => {{
+        if fbw_inline_diag_enabled() {
+            eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
+        }
+        $poison.push($pc);
+    }};
+}
+
+/// The three residues that cannot become a poisoned pc, because the scan's own
+/// bookkeeping broke rather than one op being unsafe.  See
+/// [`CalleeReplayScan::unscannable`].
+macro_rules! replay_unscannable {
     ($why:expr, $pc:expr, $opname:expr) => {{
         if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
-        return CalleeReplaySafety::Dirty;
+        return CalleeReplayScan::unscannable();
     }};
 }
 
@@ -2684,7 +2858,7 @@ fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
     }
 }
 
-pub(crate) fn fbw_callee_body_replay_safety(
+pub(crate) fn fbw_callee_body_replay_scan(
     body_code: &[u8],
     arg_facts: &[CalleeArgFact],
     num_regs_i: usize,
@@ -2693,10 +2867,12 @@ pub(crate) fn fbw_callee_body_replay_safety(
     constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
     callee_descr_refs: &[DescrRef],
     method_form_deferred_helpers: bool,
-) -> CalleeReplaySafety {
+) -> CalleeReplayScan {
     replay_safety_dump_body(body_code, callee_descr_refs);
+    let mut poison: Vec<usize> = Vec::new();
+    let mut protected: Vec<usize> = Vec::new();
     let Some(branch_targets) = body_branch_targets(body_code) else {
-        replay_dirty!("BranchTargetsUndecodable", 0, "-");
+        replay_unscannable!("BranchTargetsUndecodable", 0, "-");
     };
     let mut fresh_ref_regs = [false; u8::MAX as usize + 1];
     // Ref registers holding the `bool` an accepted `COMPARE_OP` produced.  A
@@ -2799,8 +2975,15 @@ pub(crate) fn fbw_callee_body_replay_safety(
             rewind_built_slots = seed_rewind_built_slots;
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            replay_dirty!("DecodeOpFailed", pc, "-");
+            replay_unscannable!("DecodeOpFailed", pc, "-");
         };
+        // The unwind reads an op's handler from the position AFTER it — the
+        // `live/` + `catch_exception/L` pair the codewriter emits there — so
+        // this asks the same question `walk`'s `SubRaise` arm asks, at the same
+        // coordinate.
+        if crate::jitcode_dispatch::try_catch_exception_at(body_code, d.next_pc).is_some() {
+            protected.push(d.pc);
+        }
         // Set by the arms below when this op's `>r` result is itself an
         // immutable builtin.
         let mut dst_exact_numeric = false;
@@ -2849,23 +3032,48 @@ pub(crate) fn fbw_callee_body_replay_safety(
             }
         }
 
-        if d.opname.starts_with("residual_call") {
-            let Some(descr_index) = residual_call_descr_index_in_body(body_code, &d) else {
-                replay_dirty!("ResidualCallDescrIndexMissing", d.pc, d.opname);
-            };
-            let Some(call_descr) = callee_descr_refs
-                .get(descr_index)
-                .and_then(|descr| descr.as_call_descr())
-            else {
-                replay_dirty!("ResidualCallDescrNotACall", d.pc, d.opname);
-            };
+        // Resolved ahead of the arm chain rather than inside it, because
+        // poisoning no longer diverges: a `let ... else` in the arm would have
+        // to fall out of it, and the only exit that leaves the rest of the arm
+        // unrun without re-indenting it is not entering it.  A residual whose
+        // descr does not resolve is poisoned here and then matches no arm — it
+        // is not a `setfield_gc`, a `setarrayitem_gc`, or any of the store
+        // forms below, so the chain runs off the end, which is the intent.
+        let residual_call_descr = if d.opname.starts_with("residual_call") {
+            match residual_call_descr_index_in_body(body_code, &d) {
+                None => {
+                    replay_poison!(poison, "ResidualCallDescrIndexMissing", d.pc, d.opname);
+                    None
+                }
+                Some(descr_index) => {
+                    let resolved = callee_descr_refs
+                        .get(descr_index)
+                        .and_then(|descr| descr.as_call_descr());
+                    if resolved.is_none() {
+                        replay_poison!(poison, "ResidualCallDescrNotACall", d.pc, d.opname);
+                    }
+                    resolved
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(call_descr) = residual_call_descr {
             let ei = call_descr.get_extra_info();
             // `ForIterNext` is deliberately not accepted here: it advances the
             // shared heap iterator irreversibly (no journal undo), so replaying
             // a callee that contains it from the caller's CALL boundary would
-            // double-consume.  A FOR_ITER-bearing body is declined anyway — its
-            // mandatory `GET_ITER` (`MayForce`) predecessor fails this scan
-            // first — so this only removes a latent landmine, not live inlines.
+            // double-consume.  Its mandatory `GET_ITER` (`MayForce`)
+            // predecessor is not accepted either.
+            //
+            // Both therefore land in the poison set, and that is what carries
+            // the loop-bearing decision now: a body whose `for` the walk never
+            // enters reaches neither pc, so the admission no longer has to ask
+            // whether a `FOR_ITER` appears ANYWHERE in the callee.  The two
+            // tests are not equivalent — `code_has_for_iter` is a property of
+            // the whole `CodeObject`, these pcs are the ops themselves — and
+            // that difference is the point.
             // `load_const` / `load_global` / `box_int` are tagged `CanRaise`
             // only to keep the `_OS_CANRAISE` invariant (effectinfo.rs); each
             // is a read or a fresh allocation, so re-running one commits
@@ -3096,7 +3304,8 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     seed_rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                     rewind_built_ref_regs = [false; u8::MAX as usize + 1];
                 } else {
-                    replay_dirty!(
+                    replay_poison!(
+                        poison,
                         format!("ResidualCallWritesLiveHeap/{:?}", ei.pyre_helper),
                         d.pc,
                         d.opname
@@ -3111,19 +3320,23 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // there is no ref register whose freshness could be proven — and
             // reading operand 0 as one would index the freshness set with an
             // int register number.
+            //
+            // Chained rather than sequential because poisoning does not
+            // diverge: reading operand 0 after the form test failed is exactly
+            // the indexing-by-int-register the test exists to prevent.
             if !d.argcodes.starts_with('r') {
-                replay_dirty!("SetfieldGcTargetNotRefReg", d.pc, d.opname);
-            }
-            let Some(&target_reg) = body_code.get(d.pc + 1) else {
-                replay_dirty!("SetfieldGcTargetRegMissing", d.pc, d.opname);
-            };
-            let descr_index = decode_descr_index(body_code, &d, 2);
-            let immutable_field = callee_descr_refs
-                .get(descr_index)
-                .and_then(|descr| descr.as_field_descr())
-                .is_some_and(|field| field.is_immutable());
-            if !fresh_ref_regs[target_reg as usize] || !immutable_field {
-                replay_dirty!("SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
+                replay_poison!(poison, "SetfieldGcTargetNotRefReg", d.pc, d.opname);
+            } else if let Some(&target_reg) = body_code.get(d.pc + 1) {
+                let descr_index = decode_descr_index(body_code, &d, 2);
+                let immutable_field = callee_descr_refs
+                    .get(descr_index)
+                    .and_then(|descr| descr.as_field_descr())
+                    .is_some_and(|field| field.is_immutable());
+                if !fresh_ref_regs[target_reg as usize] || !immutable_field {
+                    replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
+                }
+            } else {
+                replay_poison!(poison, "SetfieldGcTargetRegMissing", d.pc, d.opname);
             }
         } else if d.opname.starts_with("setarrayitem_gc") {
             // The dual of the `setfield_gc` rule: a store into an array this
@@ -3136,7 +3349,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     .get(d.pc + 1)
                     .is_some_and(|reg| fresh_ref_regs[*reg as usize]);
             if !target_fresh {
-                replay_dirty!("SetarrayitemGcTargetNotFresh", d.pc, d.opname);
+                replay_poison!(poison, "SetarrayitemGcTargetNotFresh", d.pc, d.opname);
             }
         } else if d.opname.starts_with("setinteriorfield_gc")
             || d.opname.starts_with("raw_store")
@@ -3146,13 +3359,17 @@ pub(crate) fn fbw_callee_body_replay_safety(
         {
             // Interior/raw stores and non-residual call forms cannot be proven
             // replay-safe from this single callee body.
-            replay_dirty!("UnprovableStoreOrCallForm", d.pc, d.opname);
+            replay_poison!(poison, "UnprovableStoreOrCallForm", d.pc, d.opname);
         }
 
         // The result byte is always the final operand for `>r` forms.
         if d.argcodes.ends_with(">r") {
+            // Not a poisoned pc: without the result byte the freshness and
+            // provenance sets cannot clear the register this op overwrites, so
+            // they would stay true for a value it replaced — an error in the
+            // permissive direction, which refusing at this pc does not repair.
             let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
-                replay_dirty!("ResultRegisterByteMissing", d.pc, d.opname);
+                replay_unscannable!("ResultRegisterByteMissing", d.pc, d.opname);
             };
             fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
                 || d.opname.starts_with("new_array")
@@ -3201,10 +3418,15 @@ pub(crate) fn fbw_callee_body_replay_safety(
         }
         pc = d.next_pc;
     }
-    if deferred_call {
-        CalleeReplaySafety::DeferredCall
-    } else {
-        CalleeReplaySafety::Clean
+    CalleeReplayScan {
+        safety: if deferred_call {
+            CalleeReplaySafety::DeferredCall
+        } else {
+            CalleeReplaySafety::Clean
+        },
+        poison,
+        protected,
+        unscannable: false,
     }
 }
 

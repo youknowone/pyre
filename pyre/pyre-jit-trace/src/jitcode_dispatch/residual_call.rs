@@ -3252,7 +3252,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
     // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
     // it has no nested-callee abort for these allocation helpers.  Keep this
-    // executor predicate aligned with `fbw_callee_body_replay_safety`, which
+    // executor predicate aligned with `fbw_callee_body_replay_scan`, which
     // already admits both helpers as replay-safe reads/fresh allocations.
     //
     // Disjoint from the three observed-value classes above: those name `CallFn`

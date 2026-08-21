@@ -2012,7 +2012,7 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
         return false;
     };
     matches!(
-        fbw_callee_body_replay_safety(
+        fbw_callee_body_replay_scan(
             body.code,
             &[],
             body.num_regs_i,
@@ -2021,7 +2021,8 @@ fn callee_body_commits_nothing(w_code: *const ()) -> bool {
             body.constants_r,
             &descr_refs,
             false,
-        ),
+        )
+        .verdict(),
         CalleeReplaySafety::Clean
     )
 }
@@ -3724,7 +3725,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     else {
         return resolved_inline_decline(op.pc, line!());
     };
-    // EXACT int/float only.  These feed `fbw_callee_body_replay_safety`, whose
+    // EXACT int/float only.  These feed `fbw_callee_body_replay_scan`, whose
     // question is "will the walker specialize this body's BINARY_OP to a native
     // op, leaving no residual to replay?".  The walker's specialization admits
     // only exact builtin numbers (`walker_int_specialization_operands` /
@@ -3885,8 +3886,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
     let mut foriter_dirty_raise_handler_admit = false;
+    // The pcs handed to this callee's sub-walk, set by whichever admission
+    // below admitted a body the scan could not prove clean everywhere.
+    let mut inline_poison_pcs: Option<std::sync::Arc<[usize]>> = None;
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
-        let safety = fbw_callee_body_replay_safety(
+        let scan = fbw_callee_body_replay_scan(
             body.code,
             &arg_facts,
             body.num_regs_i,
@@ -3896,6 +3900,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_descr_refs,
             method_form,
         );
+        let safety = scan.verdict();
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
@@ -4016,9 +4021,58 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 arg_facts.iter().filter(|arg| arg.numeric).count(),
             );
         }
+        // A body the verdict declined gets a second reading against the pcs the
+        // scan poisoned rather than the collapsed verdict.  Purely additive:
+        // `legacy_admit` above is unchanged, so nothing that inlined before
+        // stops, and only a body that would have residualized is reconsidered.
+        //
+        // `code_has_for_iter` is gone from this reading because the poison set
+        // subsumes it.  A `FOR_ITER` compiles to a `ForIterNext` residual and
+        // its mandatory `GET_ITER` to a `MayForce` one, neither of which the
+        // scan accepts, so both are poisoned pcs — and refusing AT them is the
+        // stronger test.  The `CodeObject` predicate asks whether a `for`
+        // appears anywhere in the callee; this asks whether the walk reached
+        // it.  `operator.itemgetter.__call__` is the difference: its
+        // multi-index arm builds a tuple with a comprehension that a
+        // single-index call never enters.
+        //
+        // `has_exception_table` goes the same way, and for the same reason.  It
+        // is not an op the walk arrives at but a REGION a guard can deopt
+        // inside, so what replaces it is not the poison set but
+        // `scan.protected` — the pcs the callee's own handlers cover.  Refusing
+        // on ENTERING one means no handler is ever in play on the walked path,
+        // which is the whole of what the `CodeObject` predicate was standing in
+        // for.
+        let poisoned = scan.poison_with_protected();
+        let poison_admit = !legacy_admit
+            && scan.enforceable()
+            && !poisoned.is_empty()
+            && match scan.safety {
+                CalleeReplaySafety::Clean => true,
+                CalleeReplaySafety::DeferredCall => {
+                    let loop_header_admitted = !body_facts.owns_loop_header
+                        || !fbw_callee_body_has_load_method_self_residual(
+                            body.code,
+                            callee_descr_refs,
+                        );
+                    entry_is_call_boundary && loop_header_admitted
+                }
+                // The scan reports this only when it could not model the body,
+                // which `enforceable` already excluded.
+                CalleeReplaySafety::Dirty => false,
+            };
+        if fbw_inline_diag_enabled() && !poisoned.is_empty() {
+            eprintln!(
+                "[inline-poison] pc={} admit={poison_admit} safety={:?} poison={:?} protected={:?}",
+                op.pc, scan.safety, scan.poison, scan.protected,
+            );
+        }
+        if poison_admit {
+            inline_poison_pcs = Some(poisoned.into());
+        }
         // A Dirty body is admitted only when the CALL boundary can seed its
         // own MIFrame. Non-call specializer entries remain residual.
-        if !legacy_admit {
+        if !legacy_admit && !poison_admit {
             return resolved_inline_decline(op.pc, line!());
         }
     }
@@ -4129,9 +4183,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Evaluated only behind the three cheaper terms, so the short-circuit order
     // is the same one the single condition had.  Keeping the class lets the
     // decline census say which admission would widen it.
-    let branchy_handler_safety =
+    let branchy_handler_scan =
         if contains_raise && !strict_inlinable && body_facts.has_exception_table {
-            Some(fbw_callee_body_replay_safety(
+            Some(fbw_callee_body_replay_scan(
                 body.code,
                 &arg_facts,
                 body.num_regs_i,
@@ -4144,8 +4198,38 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         } else {
             None
         };
+    let branchy_handler_safety = branchy_handler_scan.as_ref().map(|scan| scan.verdict());
+    // The same second reading this gate's sibling above performs, for the same
+    // reason and on the same terms: a body is kept out of the residual only
+    // because of ops the walk may never reach, so read the pcs instead of the
+    // collapsed verdict.  This is the gate the measurement named — bypassing it
+    // alone took a callee whose hot arm is branch-free from 2764.6 ns per call
+    // to 10.7, against 7.7 for the same body with the cold arm deleted.
+    //
+    // `DeferredCall` is admitted here, which `Clean`-only would not be, and
+    // what earns it is `scan.protected` rather than any new promise about
+    // residuals.  This gate's hazard is a structural abort landing after an
+    // effectful opcode WITH A HANDLER IN PLAY — that is why it conditions on
+    // `has_exception_table` at all, and why a terminal raising callee with no
+    // handler keeps its after-residual live anchor and is already admitted.
+    // Refusing on entry to every handler-covered pc removes the handler from
+    // the walked path, so the deferred residuals that remain are the ones the
+    // no-handler case already accepts.
+    let branchy_poisoned = branchy_handler_scan
+        .as_ref()
+        .map(|scan| scan.poison_with_protected())
+        .unwrap_or_default();
+    let branchy_poison_admit = branchy_handler_scan.as_ref().is_some_and(|scan| {
+        scan.enforceable()
+            && !branchy_poisoned.is_empty()
+            && scan.safety != CalleeReplaySafety::Dirty
+    });
+    if branchy_poison_admit {
+        inline_poison_pcs = Some(branchy_poisoned.into());
+    }
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
         && !foriter_dirty_raise_handler_admit
+        && !branchy_poison_admit
     {
         // Keep the legacy whole-body replay screen everywhere except the
         // re-raise shape admitted above. That shape owns a seeded callee frame
@@ -5233,6 +5317,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // Path-1: resolve scalar static-field reads off this callee's own
             // unseeded portal frame to its compile-time constants.
             inline_callee_consts: Some(inline_consts),
+            // The pcs an admission above accepted this body DESPITE.  Walking
+            // into one refuses the inline and rewinds to this CALL.
+            inline_poison_pcs: inline_poison_pcs.clone(),
             // Guards emitted inside the callee body — both the walker's own
             // and the `_nonstandard_virtualizable` PTR_EQ promote that
             // `vable_getfield_*` records internally — resume at this CALL
@@ -7494,7 +7581,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
             // does the same states its precondition outright — "sound because
             // the body is admitted only when re-running it observes and changes
             // nothing" — and the legacy route can state it because
-            // `fbw_callee_body_replay_safety` proved the body `Clean` first.
+            // `fbw_callee_body_replay_scan` proved the body `Clean` first.
             // This keyed route deliberately bypasses that classification, so
             // read the odometer instead: once the sub-walk has executed a
             // concrete effect, `cut_trace_with_snapshots` cannot undo it (it
@@ -8084,6 +8171,7 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
         let mut sub_wc = WalkContext {
             callee_shadow: None,
             inline_callee_consts: None,
+            inline_poison_pcs: None,
             // `op_pc` in this context belongs to the callee JitCode.  Never
             // project it through the root Python JitCode's pc tables: helper
             // MIFrames are distinct in RPython, while pyre's blackhole cannot

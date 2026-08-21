@@ -7491,7 +7491,7 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // CALL_FUNCTION_EX is the same MayForce call boundary as CALL and
             // CALL_KW.  The codewriter lowers it through
             // PyreHelperKind::CallFunctionEx, and
-            // fbw_callee_body_replay_safety defers CallFn, CallKw, and
+            // fbw_callee_body_replay_scan defers CallFn, CallKw, and
             // CallFunctionEx together; omitting only the starred-call spelling
             // here added no safety beyond the Layer 2 defense above.
             | I::CallFunctionEx
