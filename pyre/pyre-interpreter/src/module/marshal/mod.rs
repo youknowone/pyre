@@ -824,6 +824,14 @@ impl wire::MarshalBag for PyreMarshalBag {
     /// `make_code_with_constants`, which is what `read_code_consts` does for
     /// `code.replace(co_consts=...)`.
     fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
+        // PyPy's unmarshaller installs the already-decoded nested PyCode
+        // directly in `co_consts_w` (`marshal_impl.py:426-459`). The compiler
+        // table is only pyre's bytecode-index shape here: using `None` makes
+        // `w_code_fill_wrapped_consts` retain that exact wrapped child instead
+        // of recursively cloning its entire compiler body into a second owner.
+        if unsafe { crate::pycode::is_code(value.get()) } {
+            return Ok(ConstantData::None);
+        }
         Ok(unsafe { crate::pycode::obj_to_constant_data(value.get()) }
             .unwrap_or(ConstantData::None))
     }
@@ -1081,4 +1089,22 @@ crate::py_module! {
             Ok(result)
         }
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_code_constant_uses_the_wrapped_pycode_as_authority() {
+        let w_code = crate::pycode::w_code_new(std::ptr::null());
+        let rooted = Rooted::new(w_code);
+        let mut pending_error = None;
+        let bag = PyreMarshalBag::new(&mut pending_error);
+
+        let placeholder = wire::MarshalBag::code_constant_from_value(&bag, &rooted)
+            .expect("PyCode constant must be accepted");
+
+        assert!(matches!(placeholder, ConstantData::None));
+    }
 }

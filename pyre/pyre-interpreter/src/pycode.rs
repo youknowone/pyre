@@ -177,12 +177,15 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 
 /// Python code object wrapper.
 ///
-/// Stores an opaque pointer to the bytecode CodeObject. The pointer is
-/// `Box::into_raw`'d from a cloned CodeObject, so we own the allocation.
+/// Stores an opaque pointer to the bytecode CodeObject. A top-level body is
+/// `Box::into_raw`'d; a nested body points into that permanently-live owner,
+/// matching PyPy's one recursively-owned `co_consts_w` code graph without
+/// cloning the child graph at each wrapping boundary.
 #[repr(C)]
 pub struct PyCode {
     pub ob_header: PyObject,
-    /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
+    /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are
+    /// owned via `Box::into_raw`; nested bodies borrow from one of those boxes.
     pub code_ptr: *const (),
     /// `pycode.py self.co_firstlineno = firstlineno`. RustPython's
     /// `CodeObject.first_line_number: Option<OneIndexed>` cannot represent
@@ -576,8 +579,8 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// (interp_continuation.py:195)) construct via this entry point.
 ///
 /// # Safety
-/// `code_ptr` must be a valid pointer to a `CodeObject` obtained
-/// via `Box::into_raw`.
+/// `code_ptr` must be a valid pointer to a permanently-live `CodeObject`,
+/// either obtained via `Box::into_raw` or nested inside one such owner.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// boxes the `PyCode` through the prebuilt allocator and its per-name cache
