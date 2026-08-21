@@ -16,24 +16,30 @@ The deeper goal is to **reproduce RPython in Rust**. RPython's real value was ne
 
 ## Status
 
-pyre is under active development. Loop tracing and function inlining work, and the JIT now fires on integer-, float-, and exception-heavy loops alike. Most benchmarks run within ~1.5–3x of PyPy and several times faster than CPython; recursive-call-heavy code (fib_recursive) is the main remaining gap. Many Python features are not yet implemented.
+pyre is under active development. Loop tracing and function inlining work, and the JIT fires on integer-, float-, and exception-heavy loops alike. On the CI benchmark set the default backend runs eight of the ten programs within 2x of PyPy and one of them faster than PyPy; `fannkuch` is the widest remaining gap at 3.0x. Many Python features are not yet implemented.
 
 ## Benchmarks
 
-Measured on Apple M-series, single core:
+Copied from the `pyre/check.py (ubuntu-24.04)` job of [CI run 32434341965](https://github.com/youknowone/pyre/actions/runs/32434341965) on `main` (`6cc6de4a5`), a single-core GitHub Actions `ubuntu-24.04` runner. The figure in parentheses is check.py's ratio against PyPy.
 
-| Benchmark | pyre (JIT) | PyPy 7.3 | CPython 3.14 | vs PyPy | vs CPython |
-|-----------|-----------|----------|--------------|---------|-------------|
-| int_loop | 0.08s | 0.11s | 3.63s | parity | 45.4x faster |
-| fib_loop | 0.14s | 0.11s | 0.20s | 1.3x slower | 1.4x faster |
-| inline_helper | 0.15s | 0.16s | 5.22s | parity | 34.8x faster |
-| fib_recursive | 1.48s | 0.22s | 0.67s | 6.7x slower | 2.2x slower |
-| nbody | 0.31s | 0.15s | 1.50s | 2.1x slower | 4.8x faster |
-| fannkuch | 0.67s | 0.24s | 1.27s | 2.8x slower | 1.9x faster |
-| raise_catch | 0.79s | 0.71s | 35.26s | 1.1x slower | 44.6x faster |
-| spectral_norm | 0.05s | 0.04s | 1.12s | 1.3x slower | 22.4x faster |
+| Benchmark | CPython 3.14 | PyPy 7.3 | dynasm | cranelift | wasm |
+|-----------|--------------|----------|--------|-----------|------|
+| int_loop | – | 0.16s | 0.32s (1.5x) | 0.32s (1.5x) | 0.30s (1.8x) |
+| float_loop | – | 0.34s | 0.23s (0.5x) | 0.22s (0.4x) | 0.17s (0.4x) |
+| fib_loop | 0.14s | 0.07s | 0.20s (1.9x) | 0.18s (1.6x) | 0.16s (2.0x) |
+| inline_helper | – | 0.16s | 0.25s (1.1x) | 0.27s (1.3x) | 0.27s (1.7x) |
+| fib_recursive | 1.06s | 0.17s | 0.43s (2.1x) | 0.71s (3.8x) | 1.31s (7.8x) |
+| nested_loop | – | 0.20s | 0.34s (1.3x) | 0.36s (1.5x) | 0.42s (2.1x) |
+| raise_catch | – | 0.11s | 0.19s (1.1x) | 0.22s (1.4x) | 0.32s (3.0x) |
+| spectral_norm | – | 0.08s | 0.21s (1.8x) | 0.24s (2.3x) | 0.20s (2.5x) |
+| nbody | – | 0.16s | 0.33s (1.7x) | 0.46s (2.6x) | 0.43s (2.7x) |
+| fannkuch | 1.54s | 0.19s | 0.63s (3.0x) | 1.02s (5.1x) | 1.36s (7.2x) |
 
-The JIT now fires on integer-, float-, and exception-heavy loops alike: nbody, fannkuch, spectral_norm, and raise_catch all JIT-compile (disabling the JIT makes nbody ~70x and spectral_norm ~500x slower). Most benchmarks land within ~1.5–3x of PyPy and several times faster than CPython. The clearest remaining gap is fib_recursive, where recursive call frames still cost more than in PyPy. Sub-0.2s timings carry significant run-to-run variance and are approximate.
+`dynasm` is the default backend of the `pyre` binary; `cranelift` and `wasm` are the other two MaJIT code generators.
+
+Reading the table: the printed times are wall clock and include interpreter startup, which on that runner was 0.006s for CPython, 0.010s for PyPy, 0.082s for dynasm and cranelift, and 0.030s for wasm. The ratios divide execution-only times, so they are not the quotient of the printed columns — that startup difference is most of why `int_loop` prints twice PyPy's time at a 1.5x ratio. A `–` in the CPython column means check.py ran no CPython reference for that benchmark, not that it timed out: it measures one only where a vs-CPython gate is configured, and `--full` measures it everywhere. Sub-0.2s timings carry significant run-to-run variance.
+
+On execution-only time the default backend is within 2x of PyPy on eight of the ten, and `float_loop` beats PyPy on all three backends. `fannkuch` is the widest gap. Cranelift trails dynasm by up to ~1.8x on the call- and allocation-heavy programs (`fib_recursive`, `nbody`, `fannkuch`) and matches it elsewhere. Where CPython was measured, pyre runs `fib_recursive` ~3.0x and `fannkuch` ~2.8x faster than it, and `fib_loop` ~1.1x.
 
 Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--no-build` to skip the Cargo build phase.
 
@@ -77,7 +83,7 @@ pyre follows PyPy's meta-tracing approach:
 1. The **interpreter** (`pyre-interpreter`) executes Python bytecodes normally.
 2. When a loop or function becomes hot, **MaJIT** records the interpreter's execution as a linear trace of IR operations.
 3. The trace passes through an **8-pass optimizer** — the same pipeline as PyPy: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap.
-4. The optimized IR is compiled to **native machine code** via Cranelift.
+4. The optimized IR is compiled to **native machine code** by one of three MaJIT backends: `dynasm` (the default; x86-64 and aarch64), Cranelift, or WebAssembly.
 5. Subsequent executions of that path run the compiled code directly. Guard failures fall back to the interpreter.
 
 ### Function inlining
@@ -93,9 +99,15 @@ pyre has no Global Interpreter Lock. RPython/PyPy features that depend on the GI
 ```
 pyre/
 ├── pyre-object      # Python object types (W_IntObject, W_FloatObject, W_ListObject, ...)
-├── pyre-bytecode    # Bytecode definitions (re-exports RustPython compiler-core)
-├── pyre-interpreter # Object space, interpreter frame, eval loop, opcode dispatch
-├── pyre-jit         # JIT integration — trace recording, call bridges, inlining
+├── pyre-macros      # Proc macros for builtin module declarations (@unwrap_spec equivalent)
+├── pyre-native      # Native library backends, kept outside the LLBC extraction
+├── pyre-interpreter # Object space, interpreter frame, eval loop, opcode dispatch, bytecode
+├── pyre-module      # Optional builtin modules
+├── pyre-sandbox     # RPython-style sandbox protocol, virtual filesystem and controller
+├── pyre-jit         # JIT compiler integration for the interpreter
+├── pyre-jit-trace   # Trace-time JIT — MIFrame and tracing logic
+├── pyre-wasm        # The interpreter compiled to WebAssembly
+├── pyre-wasm-runner # Native wasmtime host satisfying the JIT host-import contract
 └── pyrex            # Executable entry point (builds the `pyre` binary)
 ```
 
@@ -124,7 +136,8 @@ pyre is a structural port of PyPy's interpreter (`pypy/interpreter/` and `pypy/o
 
 What's next, roughly in priority order:
 
-- **Recursive-call performance** — `fib_recursive` still allocates more per call frame than PyPy and is the largest remaining single-benchmark gap; closing it is the biggest performance unlock left.
+- **Trace exit cost** — `fannkuch` at 3.0x of PyPy is the largest remaining single-benchmark gap; most of what is left is paid on guard failure, transferring state into bridges, rather than inside the compiled loop.
+- **Cranelift backend parity** — cranelift trails the default dynasm backend by up to ~1.8x on call- and allocation-heavy code.
 - **Broader JIT coverage** — float and exception JIT now fire on the hot-loop benchmarks; extend that coverage to more of the language.
 - **More Python built-ins** — str methods, dict operations, list comprehensions, generators.
 - **Multi-threaded execution** — the no-GIL foundation is there; actual parallel thread scheduling is not.
