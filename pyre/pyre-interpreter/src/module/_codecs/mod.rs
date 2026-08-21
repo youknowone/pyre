@@ -1895,9 +1895,179 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_charmap)
 }
 
+/// `_PyArg_BadArgument`, which names the argument by its position rather
+/// than by the name the signature gives it.
+fn bad_argument(name: &str, position: usize, expected: &str, w_obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "{name}() argument {position} must be {expected}, not {}",
+        crate::type_methods::arg_type_name(w_obj)
+    ))
+}
+
+/// The `errors` argument the code page entry points share: `None` is
+/// `strict`, a `str` is itself, and nothing else is accepted.
+#[cfg(windows)]
+fn code_page_errors(
+    name: &str,
+    position: usize,
+    w_errors: PyObjectRef,
+) -> Result<&'static str, crate::PyError> {
+    if unsafe { pyre_object::is_none(w_errors) } {
+        return Ok("strict");
+    }
+    if !unsafe { is_str(w_errors) } {
+        return Err(bad_argument(name, position, "str or None", w_errors));
+    }
+    crate::baseobjspace::str_utf8_w(w_errors)
+}
+
+/// The code page number argument.  A negative number names no code page and
+/// is rejected before any conversion is attempted.
+#[cfg(windows)]
+fn code_page_number(w_code_page: PyObjectRef) -> Result<u32, crate::PyError> {
+    let code_page = crate::baseobjspace::c_int_w(w_code_page)?;
+    if code_page < 0 {
+        return Err(crate::PyError::value_error("invalid code page number"));
+    }
+    Ok(code_page as u32)
+}
+
+/// `_codecs.code_page_encode` - `(bytes, characters consumed)`, where the
+/// count is the whole string whatever the error handler did inside it.
+#[cfg(windows)]
+fn code_page_encode_impl(
+    name: &str,
+    position: usize,
+    code_page: u32,
+    w_str: PyObjectRef,
+    w_errors: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { is_str(w_str) } {
+        return Err(bad_argument(name, position, "str", w_str));
+    }
+    let errors = code_page_errors(name, position + 1, w_errors)?;
+    let bytes = crate::unicodehelper_win32::encode_code_page(code_page, w_str, errors)?;
+    Ok(w_tuple_new(vec![
+        pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
+        w_int_new(unsafe { w_str_len(w_str) } as i64),
+    ]))
+}
+
+/// `_codecs.code_page_decode` - `(str, bytes consumed)`.
+#[cfg(windows)]
+fn code_page_decode_impl(
+    name: &str,
+    position: usize,
+    code_page: u32,
+    w_data: PyObjectRef,
+    w_errors: PyObjectRef,
+    w_final: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = decode_input_bytes(w_data)?;
+    let errors = code_page_errors(name, position + 1, w_errors)?;
+    let is_final = crate::baseobjspace::is_true(w_final)?;
+    let (text, consumed) =
+        crate::unicodehelper_win32::decode_code_page(code_page, &data, errors, is_final)?;
+    // `final` is the caller promising that no continuation is coming, so the
+    // whole buffer reads as consumed: nothing is being held back for one.
+    let consumed = if is_final { data.len() } else { consumed };
+    Ok(w_tuple_new(vec![
+        w_str_from_wtf8_managed(text),
+        w_int_new(consumed as i64),
+    ]))
+}
+
+/// Strip the keyword marker these positional-only entry points cannot take.
+/// A variadic builtin is handed the raw slice, with a keyword call's marker
+/// dict as its last element; left in place it reads as one more positional
+/// argument.
+#[cfg(windows)]
+fn code_page_positional<'a>(
+    name: &str,
+    args: &'a [PyObjectRef],
+) -> Result<&'a [PyObjectRef], crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(format!(
+            "_codecs.{name}() takes no keyword arguments"
+        )));
+    }
+    Ok(positional)
+}
+
+/// Split `(str[, errors])` for the two encoders that name their own code page.
+#[cfg(windows)]
+fn fixed_code_page_encode(
+    name: &str,
+    code_page: u32,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let args = code_page_positional(name, args)?;
+    match args {
+        [w_str] => code_page_encode_impl(name, 1, code_page, *w_str, w_none()),
+        [w_str, w_errors] => code_page_encode_impl(name, 1, code_page, *w_str, *w_errors),
+        _ => Err(code_page_arity_error(name, 1, 2, args.len())),
+    }
+}
+
+/// Split `(data[, errors[, final]])` for the two decoders that name their own
+/// code page.
+#[cfg(windows)]
+fn fixed_code_page_decode(
+    name: &str,
+    code_page: u32,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let args = code_page_positional(name, args)?;
+    match args {
+        [w_data] => {
+            code_page_decode_impl(name, 1, code_page, *w_data, w_none(), w_bool_from(false))
+        }
+        [w_data, w_errors] => {
+            code_page_decode_impl(name, 1, code_page, *w_data, *w_errors, w_bool_from(false))
+        }
+        [w_data, w_errors, w_final] => {
+            code_page_decode_impl(name, 1, code_page, *w_data, *w_errors, *w_final)
+        }
+        _ => Err(code_page_arity_error(name, 1, 3, args.len())),
+    }
+}
+
+/// `_PyArg_CheckPositional` wording for a positional-only entry point whose
+/// trailing arguments carry defaults.
+#[cfg(windows)]
+fn code_page_arity_error(name: &str, least: usize, most: usize, given: usize) -> crate::PyError {
+    let bound = if given < least {
+        let plural = if least == 1 { "" } else { "s" };
+        format!("at least {least} argument{plural}")
+    } else {
+        format!("at most {most} arguments")
+    };
+    crate::PyError::type_error(format!("{name} expected {bound}, got {given}"))
+}
+
 crate::py_module! {
     "_codecs",
     inline_functions: {
+        fn readbuffer_encode(
+            data: PyObjectRef,
+            #[default(w_none())] errors: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            if !unsafe { pyre_object::is_none(errors) || is_str(errors) } {
+                return Err(bad_argument("readbuffer_encode", 2, "str or None", errors));
+            }
+            // `Py_buffer(accept={str, buffer})`: a str contributes its own
+            // UTF-8 bytes, anything else the buffer it exposes.
+            let bytes = if unsafe { is_str(data) } {
+                crate::baseobjspace::str_utf8_w(data)?.as_bytes().to_vec()
+            } else {
+                decode_input_bytes(data)?
+            };
+            Ok(w_tuple_new(vec![
+                pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
+                w_int_new(bytes.len() as i64),
+            ]))
+        }
         fn ascii_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
@@ -2134,5 +2304,97 @@ crate::py_module! {
         "lookup"         / 1 = lookup_codec,
         "_forget_codec"  / 1 = forget_codec,
         "charmap_build"  / 1 = charmap_build,
+    },
+    extra_init: |ns| {
+        // The code page codecs exist only where the code pages do; their
+        // absence elsewhere is what makes `encodings/mbcs.py` an ImportError
+        // rather than a codec that answers with the wrong bytes.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
+
+            fn mbcs_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                fixed_code_page_encode("mbcs_encode", CP_ACP, args)
+            }
+            fn mbcs_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                fixed_code_page_decode("mbcs_decode", CP_ACP, args)
+            }
+            fn oem_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                fixed_code_page_encode("oem_encode", CP_OEMCP, args)
+            }
+            fn oem_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                fixed_code_page_decode("oem_decode", CP_OEMCP, args)
+            }
+            fn code_page_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                let args = code_page_positional("code_page_encode", args)?;
+                match args {
+                    [w_cp, w_str] => code_page_encode_impl(
+                        "code_page_encode",
+                        2,
+                        code_page_number(*w_cp)?,
+                        *w_str,
+                        w_none(),
+                    ),
+                    [w_cp, w_str, w_errors] => code_page_encode_impl(
+                        "code_page_encode",
+                        2,
+                        code_page_number(*w_cp)?,
+                        *w_str,
+                        *w_errors,
+                    ),
+                    _ => Err(code_page_arity_error("code_page_encode", 2, 3, args.len())),
+                }
+            }
+            fn code_page_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                let args = code_page_positional("code_page_decode", args)?;
+                match args {
+                    [w_cp, w_data] => code_page_decode_impl(
+                        "code_page_decode",
+                        2,
+                        code_page_number(*w_cp)?,
+                        *w_data,
+                        w_none(),
+                        w_bool_from(false),
+                    ),
+                    [w_cp, w_data, w_errors] => code_page_decode_impl(
+                        "code_page_decode",
+                        2,
+                        code_page_number(*w_cp)?,
+                        *w_data,
+                        *w_errors,
+                        w_bool_from(false),
+                    ),
+                    [w_cp, w_data, w_errors, w_final] => code_page_decode_impl(
+                        "code_page_decode",
+                        2,
+                        code_page_number(*w_cp)?,
+                        *w_data,
+                        *w_errors,
+                        *w_final,
+                    ),
+                    _ => Err(code_page_arity_error("code_page_decode", 2, 4, args.len())),
+                }
+            }
+
+            for (name, entry) in [
+                ("mbcs_encode", mbcs_encode as crate::BuiltinCodeFn),
+                ("mbcs_decode", mbcs_decode),
+                ("oem_encode", oem_encode),
+                ("oem_decode", oem_decode),
+                ("code_page_encode", code_page_encode),
+                ("code_page_decode", code_page_decode),
+            ] {
+                crate::module_ns_store(
+                    ns,
+                    name,
+                    crate::gateway::with_module(
+                        "_codecs",
+                        crate::make_module_builtin_function(name, entry),
+                    ),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ns;
     },
 }

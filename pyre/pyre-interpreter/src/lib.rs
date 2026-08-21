@@ -161,6 +161,8 @@ pub mod stack_check;
 pub mod syntax_warnings;
 pub mod type_methods;
 pub mod typedef;
+#[cfg(windows)]
+pub mod unicodehelper_win32;
 pub mod warn;
 
 // ── Execution and import modules ──
