@@ -190,6 +190,54 @@ impl DescrSetKeys {
     }
 }
 
+/// Compact owner for the translation-only raw-set projection.
+///
+/// PyPy's `EffectInfo.__new__` needs the six frozensets while translation runs,
+/// but its own comment states that they are not part of the translated runtime
+/// object. Pyre must carry their structural image across the build/runtime
+/// boundary, so a populated image is boxed and dropped by
+/// `prepare_frozen_effect_info`; the overwhelmingly common six-empty-sets case
+/// is a zero-allocation enum value usable by `EffectInfo::const_new`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DescrSetKeysImage {
+    Empty,
+    Populated(Box<DescrSetKeys>),
+}
+
+impl From<DescrSetKeys> for DescrSetKeysImage {
+    fn from(keys: DescrSetKeys) -> Self {
+        if keys == DescrSetKeys::const_empty() {
+            Self::Empty
+        } else {
+            Self::Populated(Box::new(keys))
+        }
+    }
+}
+
+impl std::ops::Deref for DescrSetKeysImage {
+    type Target = DescrSetKeys;
+
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: DescrSetKeys = DescrSetKeys::const_empty();
+        match self {
+            Self::Empty => &EMPTY,
+            Self::Populated(keys) => keys,
+        }
+    }
+}
+
+impl std::ops::DerefMut for DescrSetKeysImage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        if matches!(self, Self::Empty) {
+            *self = Self::Populated(Box::new(DescrSetKeys::const_empty()));
+        }
+        let Self::Populated(keys) = self else {
+            unreachable!()
+        };
+        keys
+    }
+}
+
 /// `EffectInfo` with setup-time interior mutability for the bitstring
 /// fields.
 ///
@@ -545,7 +593,7 @@ pub struct EffectInfo {
     /// `EffectInfoKey::from_effect_info`; including it would split call-descr
     /// interning buckets on redundant data.
     #[serde(default)]
-    pub descr_set_keys: Option<DescrSetKeys>,
+    pub descr_set_keys: Option<DescrSetKeysImage>,
     /// effectinfo.py:185 bitstring_readonly_descrs_fields. `None` = wildcard
     /// (effectinfo.py:488-489 sets the bitstring to `None` for `EF_RANDOM_EFFECTS`).
     pub readonly_descrs_fields: Option<Vec<u8>>,
@@ -653,7 +701,7 @@ impl Default for EffectInfo {
             _write_descrs_arrays: Some(Vec::new()),
             _readonly_descrs_interiorfields: Some(Vec::new()),
             _write_descrs_interiorfields: Some(Vec::new()),
-            descr_set_keys: Some(DescrSetKeys::const_empty()),
+            descr_set_keys: Some(DescrSetKeysImage::Empty),
             // effectinfo.py: empty frozenset for elidable, but `__new__`
             // requires a non-None value for non-RandomEffects EIs. Empty Vec
             // is the bitstring equivalent (no descrs touched).
@@ -1140,7 +1188,7 @@ impl EffectInfo {
             _write_descrs_arrays: Some(Vec::new()),
             _readonly_descrs_interiorfields: Some(Vec::new()),
             _write_descrs_interiorfields: Some(Vec::new()),
-            descr_set_keys: Some(DescrSetKeys::const_empty()),
+            descr_set_keys: Some(DescrSetKeysImage::Empty),
             readonly_descrs_fields: Some(Vec::new()),
             write_descrs_fields: Some(Vec::new()),
             readonly_descrs_arrays: Some(Vec::new()),
@@ -1601,7 +1649,7 @@ impl FrozenEiCanonKey {
             extraeffect: ei.extraeffect,
             oopspecindex: ei.oopspecindex as u16,
             pyre_helper: ei.pyre_helper as u8,
-            descr_set_keys: ei.descr_set_keys.clone(),
+            descr_set_keys: ei.descr_set_keys.as_deref().cloned(),
             can_invalidate: ei.can_invalidate,
             can_collect: ei.can_collect,
             // effectinfo.py:144-146 inserts a fresh object into every
@@ -2415,21 +2463,21 @@ mod compute_bitstrings_tests {
                 EffectInfo {
                     _readonly_descrs_fields: Some(vec![f0.clone(), f1.clone()]),
                     _write_descrs_fields: Some(vec![f2.clone()]),
-                    descr_set_keys: Some(DescrSetKeys {
+                    descr_set_keys: Some(DescrSetKeysImage::from(DescrSetKeys {
                         readonly_fields: vec![k0.clone(), k1.clone()],
                         write_fields: vec![k2.clone()],
                         ..DescrSetKeys::default()
-                    }),
+                    })),
                     ..EffectInfo::default()
                 },
                 EffectInfo {
                     _readonly_descrs_fields: Some(vec![f0.clone()]),
                     _write_descrs_fields: Some(vec![f1.clone(), f2.clone()]),
-                    descr_set_keys: Some(DescrSetKeys {
+                    descr_set_keys: Some(DescrSetKeysImage::from(DescrSetKeys {
                         readonly_fields: vec![k0.clone()],
                         write_fields: vec![k1.clone(), k2.clone()],
                         ..DescrSetKeys::default()
-                    }),
+                    })),
                     ..EffectInfo::default()
                 },
             ]
@@ -2476,19 +2524,19 @@ mod compute_bitstrings_tests {
         let ka = field_member(1, "a");
         let kb = field_member(1, "b");
         let mut ordered = EffectInfo {
-            descr_set_keys: Some(DescrSetKeys {
+            descr_set_keys: Some(DescrSetKeysImage::from(DescrSetKeys {
                 readonly_fields: vec![ka.clone(), kb.clone()],
                 write_fields: vec![kb.clone()],
                 ..DescrSetKeys::default()
-            }),
+            })),
             ..EffectInfo::default()
         };
         let mut shuffled = EffectInfo {
-            descr_set_keys: Some(DescrSetKeys {
+            descr_set_keys: Some(DescrSetKeysImage::from(DescrSetKeys {
                 readonly_fields: vec![kb.clone(), ka.clone(), kb.clone()],
                 write_fields: vec![kb],
                 ..DescrSetKeys::default()
-            }),
+            })),
             ..EffectInfo::default()
         };
 

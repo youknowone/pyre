@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 /// Descriptor traits for the JIT IR.
 ///
 /// Translated from rpython/jit/metainterp/history.py (AbstractDescr)
@@ -107,7 +108,6 @@
 ///   The module-level vref descriptor constructors return the same
 ///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
 ///   same identities carried by `MetaInterp.virtualref_info`.
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -1108,35 +1108,34 @@ fn census_spec_positions(field_specs: &[SimpleFieldDescrSpec]) {
 ///   _cache_call, _cache_interiorfield
 pub struct GcCache {
     /// descr.py:18: _cache_size[STRUCT]
-    pub _cache_size: HashMap<LLType, DescrRef>,
+    pub _cache_size: IndexMap<LLType, DescrRef>,
     /// descr.py:19: _cache_field[STRUCT][fieldname]. Typed `Arc<SimpleFieldDescr>`
     /// per PyPy's concrete `FieldDescr` (descr.py `class FieldDescr(ArrayOrFieldDescr)`).
     /// Concrete-Arc return enables analyzer-side `cc.fielddescrof_concrete`
     /// to cache-hit a previously-minted runtime `__majit_register_descrs`
     /// Arc without an `Arc<dyn Descr>` → `Arc<SimpleFieldDescr>` downcast.
-    pub _cache_field: HashMap<LLType, HashMap<String, Arc<SimpleFieldDescr>>>,
+    pub _cache_field: IndexMap<LLType, IndexMap<String, Arc<SimpleFieldDescr>>>,
     /// descr.py:20: _cache_array[ARRAY_OR_STRUCT]
-    pub _cache_array: HashMap<LLType, DescrRef>,
+    pub _cache_array: IndexMap<LLType, DescrRef>,
     /// descr.py:21: _cache_arraylen[ARRAY_OR_STRUCT]
-    pub _cache_arraylen: HashMap<LLType, DescrRef>,
+    pub _cache_arraylen: IndexMap<LLType, DescrRef>,
     /// descr.py:22: _cache_call[(arg_classes, ...)]
-    pub _cache_call: HashMap<LLType, DescrRef>,
+    pub _cache_call: IndexMap<LLType, DescrRef>,
     /// descr.py:23: _cache_interiorfield[(ARRAY, name, arrayfieldname)]
-    pub _cache_interiorfield: HashMap<(LLType, String, String), DescrRef>,
+    pub _cache_interiorfield: IndexMap<(LLType, String, String), DescrRef>,
 
     // ── Creation-order tracking ──
-    // Rust HashMap iteration is non-deterministic. setup_descrs()
-    // must iterate in creation order to match PyPy's dict iteration.
-    // Each Vec records descriptors in insertion order.
-    _cache_size_order: Vec<DescrRef>,
-    _cache_field_order: Vec<DescrRef>,
-    _cache_array_order: Vec<DescrRef>,
-    _cache_arraylen_order: Vec<DescrRef>,
-    _cache_call_order: Vec<DescrRef>,
-    _cache_interiorfield_order: Vec<DescrRef>,
+    // PyPy's dicts own both lookup and insertion order. Keyed descriptors live
+    // only in the IndexMaps above; these small lists contain only legacy mint
+    // sites that still lack the LLType key PyPy always has.
+    _external_size_order: Vec<DescrRef>,
+    _external_field_order: Vec<DescrRef>,
+    _external_array_order: Vec<DescrRef>,
+    _external_arraylen_order: Vec<DescrRef>,
+    _external_interiorfield_order: Vec<DescrRef>,
 
     /// Superseded SizeDescr Arcs retired by `register_keyed_size`'s
-    /// fuller-layout upgrade. Kept out of `_cache_size_order`.
+    /// fuller-layout upgrade. Kept out of `_cache_size`.
     _size_keepalive: Vec<DescrRef>,
 
     /// `gctypelayout.py TypeLayoutBuilder.get_type_id` analog —
@@ -1163,18 +1162,17 @@ impl Default for GcCache {
 impl GcCache {
     pub fn new() -> Self {
         GcCache {
-            _cache_size: HashMap::new(),
-            _cache_field: HashMap::new(),
-            _cache_array: HashMap::new(),
-            _cache_arraylen: HashMap::new(),
-            _cache_call: HashMap::new(),
-            _cache_interiorfield: HashMap::new(),
-            _cache_size_order: Vec::new(),
-            _cache_field_order: Vec::new(),
-            _cache_array_order: Vec::new(),
-            _cache_arraylen_order: Vec::new(),
-            _cache_call_order: Vec::new(),
-            _cache_interiorfield_order: Vec::new(),
+            _cache_size: IndexMap::new(),
+            _cache_field: IndexMap::new(),
+            _cache_array: IndexMap::new(),
+            _cache_arraylen: IndexMap::new(),
+            _cache_call: IndexMap::new(),
+            _cache_interiorfield: IndexMap::new(),
+            _external_size_order: Vec::new(),
+            _external_field_order: Vec::new(),
+            _external_array_order: Vec::new(),
+            _external_arraylen_order: Vec::new(),
+            _external_interiorfield_order: Vec::new(),
             _size_keepalive: Vec::new(),
             // tid 0 is reserved as "no class" / sentinel —
             // `gctypelayout.py make_type_info_group` adds a
@@ -1192,12 +1190,17 @@ impl GcCache {
     /// defect. `setup_descrs` cannot serve — it stamps `descr_index` on every
     /// entry, so calling it merely to count would perturb the thing measured.
     pub fn all_descrs_len(&self) -> usize {
-        self._cache_size_order.len()
-            + self._cache_field_order.len()
-            + self._cache_array_order.len()
-            + self._cache_arraylen_order.len()
-            + self._cache_call_order.len()
-            + self._cache_interiorfield_order.len()
+        self._cache_size.len()
+            + self._cache_field.values().map(IndexMap::len).sum::<usize>()
+            + self._cache_array.len()
+            + self._cache_arraylen.len()
+            + self._cache_call.len()
+            + self._cache_interiorfield.len()
+            + self._external_size_order.len()
+            + self._external_field_order.len()
+            + self._external_array_order.len()
+            + self._external_arraylen_order.len()
+            + self._external_interiorfield_order.len()
     }
 
     /// descr.py setup_descrs().
@@ -1208,32 +1211,50 @@ impl GcCache {
     pub fn setup_descrs(&self) -> Vec<DescrRef> {
         let mut all_descrs: Vec<DescrRef> = Vec::new();
         // descr.py:27-29: _cache_size
-        for v in &self._cache_size_order {
+        for v in self._cache_size.values().chain(&self._external_size_order) {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
         // descr.py:30-33: _cache_field (nested)
-        for v in &self._cache_field_order {
+        for fields in self._cache_field.values() {
+            for v in fields.values() {
+                v.set_descr_index(all_descrs.len() as i32);
+                all_descrs.push(v.clone() as DescrRef);
+            }
+        }
+        for v in &self._external_field_order {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
         // descr.py:34-36: _cache_array
-        for v in &self._cache_array_order {
+        for v in self
+            ._cache_array
+            .values()
+            .chain(&self._external_array_order)
+        {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
         // descr.py:37-39: _cache_arraylen
-        for v in &self._cache_arraylen_order {
+        for v in self
+            ._cache_arraylen
+            .values()
+            .chain(&self._external_arraylen_order)
+        {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
         // descr.py:40-42: _cache_call
-        for v in &self._cache_call_order {
+        for v in self._cache_call.values() {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
         // descr.py:43-45: _cache_interiorfield
-        for v in &self._cache_interiorfield_order {
+        for v in self
+            ._cache_interiorfield
+            .values()
+            .chain(&self._external_interiorfield_order)
+        {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
         }
@@ -1257,7 +1278,7 @@ impl GcCache {
         mut register: impl FnMut(usize, Vec<usize>) -> u32,
     ) -> usize {
         let mut registered = 0;
-        for descr in &self._cache_size_order {
+        for descr in self._cache_size.values() {
             let Some(sd) = descr
                 .as_any()
                 .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
@@ -1377,7 +1398,6 @@ impl GcCache {
         let descr: DescrRef = Arc::new(sd);
         // descr.py:120: cache[STRUCT] = sizedescr
         self._cache_size.insert(key, descr.clone());
-        self._cache_size_order.push(descr.clone());
         // descr.py:123-126: gc_fielddescrs / all_fielddescrs populated
         // externally via SimpleSizeDescr::with_all_fielddescrs.  The walker
         // exists (`majit-translate codewriter::heaptracker`) but lives in the
@@ -2270,7 +2290,6 @@ impl GcCache {
         // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
         let inner = self._cache_field.entry(struct_key).or_default();
         inner.insert(field_name.to_string(), descr.clone());
-        self._cache_field_order.push(descr.clone() as DescrRef);
         descr
     }
 
@@ -2298,7 +2317,6 @@ impl GcCache {
         ));
         // descr.py:265: result.parent_descr = None (no parent)
         self._cache_arraylen.insert(key, descr.clone());
-        self._cache_arraylen_order.push(descr.clone());
         descr
     }
 
@@ -2361,7 +2379,6 @@ impl GcCache {
         let descr: DescrRef = Arc::new(ad);
         // descr.py:371: cache[ARRAY_OR_STRUCT] = arraydescr
         self._cache_array.insert(key, descr.clone());
-        self._cache_array_order.push(descr.clone());
         // descr.py:372-375: all_interiorfielddescrs for struct arrays
         // — set externally via SimpleArrayDescr::set_all_interiorfielddescrs
         descr
@@ -2440,7 +2457,6 @@ impl GcCache {
         ));
         // descr.py:437: cache[(ARRAY, name, arrayfieldname)] = descr
         self._cache_interiorfield.insert(key, descr.clone());
-        self._cache_interiorfield_order.push(descr.clone());
         descr
     }
 
@@ -2480,7 +2496,6 @@ impl GcCache {
             effect,
         ));
         self._cache_call.insert(key, descr.clone());
-        self._cache_call_order.push(descr.clone());
         descr
     }
 
@@ -2509,8 +2524,10 @@ impl GcCache {
     /// External registration for size descrs minted outside
     /// `get_size_descr`.  PyPy `descr.py` cache iteration parity.
     pub fn register_external_size(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_size_order, &descr) {
-            self._cache_size_order.push(descr);
+        if !self._cache_size.values().any(|d| Arc::ptr_eq(d, &descr))
+            && !arc_in_vec(&self._external_size_order, &descr)
+        {
+            self._external_size_order.push(descr);
         }
     }
 
@@ -2641,16 +2658,6 @@ impl GcCache {
                 self._size_keepalive.push(old.clone());
             }
             self._cache_size.insert(key.clone(), descr.clone());
-            self._cache_size_order.retain(|d| {
-                d.as_size_descr()
-                    .map(|sd| {
-                        sd.cache_key() != descr.as_size_descr().map(|s| s.cache_key()).unwrap_or(0)
-                    })
-                    .unwrap_or(true)
-            });
-            if !arc_in_vec(&self._cache_size_order, &descr) {
-                self._cache_size_order.push(descr.clone());
-            }
             if let Some(fields) = self._cache_field.get(&key) {
                 for field in fields.values() {
                     field.set_parent_descr(&descr);
@@ -2662,8 +2669,16 @@ impl GcCache {
     /// External registration for field descrs minted outside
     /// `get_field_descr`.  PyPy `descr.py`.
     pub fn register_external_field(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_field_order, &descr) {
-            self._cache_field_order.push(descr);
+        let already_keyed = self
+            ._cache_field
+            .values()
+            .flat_map(IndexMap::values)
+            .any(|field| {
+                let field: DescrRef = field.clone();
+                Arc::ptr_eq(&field, &descr)
+            });
+        if !already_keyed && !arc_in_vec(&self._external_field_order, &descr) {
+            self._external_field_order.push(descr);
         }
     }
 
@@ -2679,20 +2694,18 @@ impl GcCache {
         descr: Arc<SimpleFieldDescr>,
     ) {
         let inner = self._cache_field.entry(struct_key).or_default();
-        if let std::collections::hash_map::Entry::Vacant(e) = inner.entry(field_name) {
+        if let indexmap::map::Entry::Vacant(e) = inner.entry(field_name) {
             e.insert(descr.clone());
-            let as_ref: DescrRef = descr as DescrRef;
-            if !arc_in_vec(&self._cache_field_order, &as_ref) {
-                self._cache_field_order.push(as_ref);
-            }
         }
     }
 
     /// External registration for array descrs minted outside
     /// `get_array_descr`.  PyPy `descr.py`.
     pub fn register_external_array(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_array_order, &descr) {
-            self._cache_array_order.push(descr);
+        if !self._cache_array.values().any(|d| Arc::ptr_eq(d, &descr))
+            && !arc_in_vec(&self._external_array_order, &descr)
+        {
+            self._external_array_order.push(descr);
         }
     }
 
@@ -2700,21 +2713,18 @@ impl GcCache {
     /// populates `_cache_array[key]`.  Mirrors `descr.py:348-378
     /// get_array_descr` cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
     pub fn register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
-        // `descr.py setup_descrs` cache-iteration invariant —
-        // cache hit must NOT push the losing Arc onto `_cache_array_order`.
-        let entry = self
-            ._cache_array
-            .entry(key)
-            .or_insert_with(|| descr.clone());
-        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_array_order, &descr) {
-            self._cache_array_order.push(descr);
-        }
+        self._cache_array.entry(key).or_insert(descr);
     }
 
     /// External registration for arraylen descrs.  PyPy `descr.py:37-39`.
     pub fn register_external_arraylen(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_arraylen_order, &descr) {
-            self._cache_arraylen_order.push(descr);
+        if !self
+            ._cache_arraylen
+            .values()
+            .any(|d| Arc::ptr_eq(d, &descr))
+            && !arc_in_vec(&self._external_arraylen_order, &descr)
+        {
+            self._external_arraylen_order.push(descr);
         }
     }
 
@@ -2723,22 +2733,19 @@ impl GcCache {
     /// `descr.py get_field_arraylen_descr` cache-miss
     /// `cache[ARRAY_OR_STRUCT] = result`.
     pub fn register_keyed_arraylen(&mut self, key: LLType, descr: DescrRef) {
-        // `descr.py setup_descrs` cache-iteration invariant —
-        // cache hit must NOT push the losing Arc onto `_cache_arraylen_order`.
-        let entry = self
-            ._cache_arraylen
-            .entry(key)
-            .or_insert_with(|| descr.clone());
-        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_arraylen_order, &descr) {
-            self._cache_arraylen_order.push(descr);
-        }
+        self._cache_arraylen.entry(key).or_insert(descr);
     }
 
     /// External registration for interiorfield descrs minted outside
     /// `get_interiorfield_descr`.  PyPy `descr.py`.
     pub fn register_external_interiorfield(&mut self, descr: DescrRef) {
-        if !arc_in_vec(&self._cache_interiorfield_order, &descr) {
-            self._cache_interiorfield_order.push(descr);
+        if !self
+            ._cache_interiorfield
+            .values()
+            .any(|d| Arc::ptr_eq(d, &descr))
+            && !arc_in_vec(&self._external_interiorfield_order, &descr)
+        {
+            self._external_interiorfield_order.push(descr);
         }
     }
 
@@ -2758,16 +2765,9 @@ impl GcCache {
         arrayfieldname: String,
         descr: DescrRef,
     ) {
-        // `descr.py setup_descrs` cache-iteration invariant —
-        // cache hit must NOT push the losing Arc onto
-        // `_cache_interiorfield_order`.
-        let entry = self
-            ._cache_interiorfield
+        self._cache_interiorfield
             .entry((array_key, name, arrayfieldname))
-            .or_insert_with(|| descr.clone());
-        if Arc::ptr_eq(entry, &descr) && !arc_in_vec(&self._cache_interiorfield_order, &descr) {
-            self._cache_interiorfield_order.push(descr);
-        }
+            .or_insert(descr);
     }
 
     /// Keyed call-descr interning for production factories outside
@@ -2788,7 +2788,6 @@ impl GcCache {
         }
         let descr = make_descr();
         self._cache_call.insert(key, descr.clone());
-        self._cache_call_order.push(descr.clone());
         descr
     }
 
@@ -2799,32 +2798,54 @@ impl GcCache {
 
     /// `descr.py:27-29 _cache_size` snapshot in insertion order.
     pub fn snapshot_sizes(&self) -> Vec<DescrRef> {
-        self._cache_size_order.clone()
+        self._cache_size
+            .values()
+            .chain(&self._external_size_order)
+            .cloned()
+            .collect()
     }
 
     /// `descr.py:30-33 _cache_field` snapshot in insertion order.
     pub fn snapshot_fields(&self) -> Vec<DescrRef> {
-        self._cache_field_order.clone()
+        self._cache_field
+            .values()
+            .flat_map(IndexMap::values)
+            .cloned()
+            .map(|field| field as DescrRef)
+            .chain(self._external_field_order.iter().cloned())
+            .collect()
     }
 
     /// `descr.py:34-36 _cache_array` snapshot in insertion order.
     pub fn snapshot_arrays(&self) -> Vec<DescrRef> {
-        self._cache_array_order.clone()
+        self._cache_array
+            .values()
+            .chain(&self._external_array_order)
+            .cloned()
+            .collect()
     }
 
     /// `descr.py:37-39 _cache_arraylen` snapshot in insertion order.
     pub fn snapshot_arraylens(&self) -> Vec<DescrRef> {
-        self._cache_arraylen_order.clone()
+        self._cache_arraylen
+            .values()
+            .chain(&self._external_arraylen_order)
+            .cloned()
+            .collect()
     }
 
     /// `descr.py:40-42 _cache_call` snapshot in insertion order.
     pub fn snapshot_calls(&self) -> Vec<DescrRef> {
-        self._cache_call_order.clone()
+        self._cache_call.values().cloned().collect()
     }
 
     /// `descr.py:43-45 _cache_interiorfield` snapshot in insertion order.
     pub fn snapshot_interiorfields(&self) -> Vec<DescrRef> {
-        self._cache_interiorfield_order.clone()
+        self._cache_interiorfield
+            .values()
+            .chain(&self._external_interiorfield_order)
+            .cloned()
+            .collect()
     }
 
     /// Per-category counts for diagnostics / tests.  Tuple order:
@@ -2832,12 +2853,13 @@ impl GcCache {
     /// matching PyPy `descr.py:25-47` group iteration order.
     pub fn category_counts(&self) -> (usize, usize, usize, usize, usize, usize) {
         (
-            self._cache_size_order.len(),
-            self._cache_field_order.len(),
-            self._cache_array_order.len(),
-            self._cache_arraylen_order.len(),
-            self._cache_call_order.len(),
-            self._cache_interiorfield_order.len(),
+            self._cache_size.len() + self._external_size_order.len(),
+            self._cache_field.values().map(IndexMap::len).sum::<usize>()
+                + self._external_field_order.len(),
+            self._cache_array.len() + self._external_array_order.len(),
+            self._cache_arraylen.len() + self._external_arraylen_order.len(),
+            self._cache_call.len(),
+            self._cache_interiorfield.len() + self._external_interiorfield_order.len(),
         )
     }
 }
@@ -7720,7 +7742,7 @@ mod register_keyed_size_authority_tests {
     /// `_cache_field[key]`, spelled the way a mint site spells it: the
     /// `T<type_id>.` stand-in `get_field_descr` falls back to when the caller
     /// carries only the numeric struct identity.
-    fn shell_fields(slots: &[(&str, usize)]) -> HashMap<String, Arc<SimpleFieldDescr>> {
+    fn shell_fields(slots: &[(&str, usize)]) -> IndexMap<String, Arc<SimpleFieldDescr>> {
         slots
             .iter()
             .enumerate()

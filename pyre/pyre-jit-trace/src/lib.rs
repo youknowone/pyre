@@ -70,6 +70,58 @@
 // resolve from both sides.
 extern crate self as pyre_jit_trace;
 
+#[cfg(test)]
+mod allocation_counter {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct CountingAllocator;
+
+    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null() {
+                if new_size >= layout.size() {
+                    LIVE_BYTES.fetch_add(new_size - layout.size(), Ordering::Relaxed);
+                } else {
+                    LIVE_BYTES.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+                }
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    pub fn live_bytes() -> usize {
+        LIVE_BYTES.load(Ordering::Relaxed)
+    }
+}
+
 pub mod assembler;
 pub mod callbacks;
 pub mod descr;

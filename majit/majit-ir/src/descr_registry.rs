@@ -35,7 +35,7 @@ pub fn register_size(descr: DescrRef) {
 }
 
 /// Keyed sibling: publishes the descr to `gc_cache._cache_size[key]`
-/// AND `_cache_size_order`, so subsequent
+/// and its insertion order, so subsequent
 /// `gc_cache.get_size_descr(key, ...)` calls return the same Arc.
 /// Mirrors `descr.py get_size_descr` cache-miss
 /// `cache[STRUCT] = sizedescr` (the keyed half) for mint sites that
@@ -52,8 +52,8 @@ pub fn register_field(descr: DescrRef) {
 }
 
 /// Keyed sibling: publishes the descr to
-/// `gc_cache._cache_field[struct_key][field_name]` AND
-/// `_cache_field_order`.  Mirrors `descr.py get_field_descr`
+/// `gc_cache._cache_field[struct_key][field_name]` and its insertion order.
+/// Mirrors `descr.py::get_field_descr`
 /// cache-miss `cachedict[fieldname] = fielddescr` for mint sites that
 /// bypass `get_field_descr` proper.
 pub fn register_keyed_field(
@@ -74,8 +74,8 @@ pub fn register_array(descr: DescrRef) {
     gc_cache().lock().unwrap().register_external_array(descr);
 }
 
-/// Keyed sibling: publishes the descr to `gc_cache._cache_array[key]`
-/// AND `_cache_array_order`.  Mirrors `descr.py get_array_descr`
+/// Keyed sibling: publishes the descr to `gc_cache._cache_array[key]`.
+/// Mirrors `descr.py::get_array_descr`
 /// cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
 pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
     gc_cache().lock().unwrap().register_keyed_array(key, descr);
@@ -89,7 +89,7 @@ pub fn register_array_len(descr: DescrRef) {
 }
 
 /// Keyed sibling: publishes the descr to
-/// `gc_cache._cache_arraylen[key]` AND `_cache_arraylen_order`.
+/// `gc_cache._cache_arraylen[key]`.
 pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
     gc_cache()
         .lock()
@@ -108,9 +108,8 @@ pub fn register_interior_field(descr: DescrRef) {
 }
 
 /// Keyed sibling: publishes the descr to
-/// `gc_cache._cache_interiorfield[(array_key, name, arrayfieldname)]`
-/// AND `_cache_interiorfield_order`.  Mirrors `descr.py:404-433
-/// get_interiorfield_descr` cache-miss
+/// `gc_cache._cache_interiorfield[(array_key, name, arrayfieldname)]`.
+/// Mirrors `descr.py::get_interiorfield_descr` cache-miss
 /// `cache[(ARRAY, name, arrayfieldname)] = interiorfielddescr`.
 /// `arrayfieldname == ""` denotes PyPy `arrayfieldname=None`
 /// (the GcArray-of-Structs case, `descr.py:431-432`); a non-empty
@@ -227,7 +226,7 @@ mod tests {
     }
 
     /// Same `Arc` clone re-registered via the facade collapses to a
-    /// single `_cache_field_order` entry — `Arc::ptr_eq` dedup at the
+    /// single `_cache_field` entry — `Arc::ptr_eq` dedup at the
     /// `gc_cache.register_external_*` level.
     #[test]
     fn dedup_by_arc_identity_within_category() {

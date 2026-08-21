@@ -643,39 +643,24 @@ fn descr_layout_offsets() -> &'static [u32] {
     })
 }
 
-fn descr_layout_cells() -> &'static [OnceLock<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>>]
-{
-    static CELLS: OnceLock<
-        &'static [OnceLock<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>>],
-    > = OnceLock::new();
-    CELLS.get_or_init(|| {
-        Box::leak(
-            (0..descr_layout_offsets().len() - 1)
-                .map(|_| OnceLock::new())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        )
-    })
-}
-
 fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec> {
-    descr_layout_cells()[index]
-        .get_or_init(|| {
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
-            let offsets = descr_layout_offsets();
-            let start = offsets[index] as usize;
-            let end = offsets[index + 1] as usize;
-            std::sync::Arc::new(
-                bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
-                    panic!(
-                        "pyre-jit-trace: failed to deserialize descr_layouts.bin entry \
-                         {index} ({start}..{end} of {} bytes): {e}",
-                        BYTES.len(),
-                    )
-                }),
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let offsets = descr_layout_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    // PyPy retains the canonical `SizeDescr` in `GcCache._cache_size`, not
+    // the codewriter-to-runtime transport object that described it. Keep a
+    // layout only when the lazy opcode `BhDescr::Field` itself keeps the Arc;
+    // the eager GcCache replay drops this wire value after publication.
+    std::sync::Arc::new(
+        bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize descr_layouts.bin entry \
+             {index} ({start}..{end} of {} bytes): {e}",
+                BYTES.len(),
             )
-        })
-        .clone()
+        }),
+    )
 }
 
 fn load_descr_uncached(index: usize) -> BhDescr {
@@ -2273,7 +2258,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_field_parents_share_the_canonical_layout_object() {
+    fn frozen_field_parents_decode_the_canonical_layout_value() {
         let index = descrs_index();
         let layout_count = descr_layout_offsets().len() - 1;
         assert_eq!(index.parent_layouts.len(), descr_count());
@@ -2302,9 +2287,10 @@ mod tests {
             };
             parent_references += 1;
             if let Some(first) = first_parent_by_layout.get(&layout_index) {
-                assert!(
-                    std::sync::Arc::ptr_eq(first, &parent),
-                    "layout {layout_index} was decoded into more than one object"
+                assert_eq!(
+                    first.as_ref(),
+                    parent.as_ref(),
+                    "layout {layout_index} decoded to different transport values"
                 );
             } else {
                 first_parent_by_layout.insert(layout_index, parent);
@@ -2537,14 +2523,17 @@ mod tests {
         let _ = rss_kb();
         let _: Vec<u32> = bincode::deserialize(&[0_u8; 8]).unwrap();
         let base = rss_kb();
+        let heap_base = crate::allocation_counter::live_bytes();
         let index = descrs_index();
         let after_index = rss_kb();
+        let heap_after_index = crate::allocation_counter::live_bytes();
 
         let layout_count = descr_layout_offsets().len() - 1;
         for i in 0..layout_count {
             drop(descr_layout_at(i));
         }
         let after_layouts = rss_kb();
+        let heap_after_layouts = crate::allocation_counter::live_bytes();
 
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind == 0 {
@@ -2553,18 +2542,55 @@ mod tests {
             }
         }
         let after_noncall = rss_kb();
+        let heap_after_noncall = crate::allocation_counter::live_bytes();
+        let (category_counts, cache_lens, cache_caps, field_inner_cap, field_key_bytes) = {
+            let gc = majit_ir::descr::gc_cache().lock().unwrap();
+            (
+                gc.category_counts(),
+                (
+                    gc._cache_size.len(),
+                    gc._cache_field
+                        .values()
+                        .map(|inner| inner.len())
+                        .sum::<usize>(),
+                    gc._cache_array.len(),
+                    gc._cache_arraylen.len(),
+                    gc._cache_call.len(),
+                    gc._cache_interiorfield.len(),
+                ),
+                (
+                    gc._cache_size.capacity(),
+                    gc._cache_field.capacity(),
+                    gc._cache_array.capacity(),
+                    gc._cache_arraylen.capacity(),
+                    gc._cache_call.capacity(),
+                    gc._cache_interiorfield.capacity(),
+                ),
+                gc._cache_field
+                    .values()
+                    .map(|inner| inner.capacity())
+                    .sum::<usize>(),
+                gc._cache_field
+                    .values()
+                    .flat_map(|inner| inner.keys())
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+        };
 
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         let after_stamps = rss_kb();
+        let heap_after_stamps = crate::allocation_counter::live_bytes();
 
         for i in 0..ei_descr_mint_count() {
             let entry = load_ei_descr_mint(i);
             crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
         }
         let after_mints = rss_kb();
+        let heap_after_mints = crate::allocation_counter::live_bytes();
 
         for i in 0..effect_info_count() {
             let (translated_id, mut effect_info) = load_effect_info(i);
@@ -2572,6 +2598,8 @@ mod tests {
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
         let after_effect_infos = rss_kb();
+        let heap_after_effect_infos = crate::allocation_counter::live_bytes();
+        let frozen_effect_info_count = effect_info_count();
 
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind == 1 {
@@ -2584,37 +2612,62 @@ mod tests {
             }
         }
         let after_calls = rss_kb();
+        let heap_after_calls = crate::allocation_counter::live_bytes();
 
         eprintln!("[rss-phases] base={base} KB");
         eprintln!(
-            "[rss-phases] index          delta={} KB",
-            after_index - base
+            "[rss-phases] index          rss={} KB heap={} B",
+            after_index - base,
+            heap_after_index - heap_base,
         );
         eprintln!(
-            "[rss-phases] wire_layouts   delta={} KB",
-            after_layouts - after_index
+            "[rss-phases] wire_layouts   rss={} KB heap={} B",
+            after_layouts - after_index,
+            heap_after_layouts - heap_after_index,
         );
         eprintln!(
-            "[rss-phases] noncall_descrs delta={} KB",
-            after_noncall - after_layouts
+            "[rss-phases] noncall_descrs rss={} KB heap={} B",
+            after_noncall - after_layouts,
+            heap_after_noncall - heap_after_layouts,
         );
         eprintln!(
-            "[rss-phases] compact_stamps delta={} KB",
-            after_stamps - after_noncall
+            "[rss-phases] gccache counts={category_counts:?} lens={cache_lens:?} \
+             caps={cache_caps:?} \
+             field_inner_cap={field_inner_cap} field_key_bytes={field_key_bytes} \
+             sizeof(field,size,array)=({},{},{})",
+            std::mem::size_of::<majit_ir::descr::SimpleFieldDescr>(),
+            std::mem::size_of::<majit_ir::descr::SimpleSizeDescr>(),
+            std::mem::size_of::<majit_ir::descr::SimpleArrayDescr>(),
         );
         eprintln!(
-            "[rss-phases] raw_set_mints  delta={} KB",
-            after_mints - after_stamps
+            "[rss-phases] compact_stamps rss={} KB heap={} B",
+            after_stamps - after_noncall,
+            heap_after_stamps - heap_after_noncall,
         );
         eprintln!(
-            "[rss-phases] effect_infos   delta={} KB",
-            after_effect_infos - after_mints
+            "[rss-phases] raw_set_mints  rss={} KB heap={} B",
+            after_mints - after_stamps,
+            heap_after_mints - heap_after_stamps,
         );
         eprintln!(
-            "[rss-phases] call_descrs    delta={} KB",
-            after_calls - after_effect_infos
+            "[rss-phases] effect_infos   rss={} KB heap={} B",
+            after_effect_infos - after_mints,
+            heap_after_effect_infos - heap_after_mints,
         );
-        eprintln!("[rss-phases] TOTAL={} KB", after_calls - base);
+        eprintln!(
+            "[rss-phases] effect_info_count={frozen_effect_info_count} sizeof(EffectInfo)={} B",
+            std::mem::size_of::<majit_ir::EffectInfo>(),
+        );
+        eprintln!(
+            "[rss-phases] call_descrs    rss={} KB heap={} B",
+            after_calls - after_effect_infos,
+            heap_after_calls - heap_after_effect_infos,
+        );
+        eprintln!(
+            "[rss-phases] TOTAL={} KB heap={} B",
+            after_calls - base,
+            heap_after_calls - heap_base,
+        );
     }
 
     /// The build-time descr pool must name the same bytes `offset_of!` does.

@@ -743,7 +743,7 @@ fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef
 /// alias for the future analyzer use-import resolver (B-5 follow-up):
 /// when that lands, analyzer's `owner_root` switches to qualified
 /// form and the SAME `Arc<PyreSizeDescr>` is reachable via the
-/// qualified hash. `register_keyed_size` keeps one `_cache_size_order`
+/// qualified hash. `register_keyed_size` keeps one `_cache_size`
 /// entry per logical SizeDescr while allowing fuller-layout upgrades.
 ///
 /// `def_path` empty (or equal to `simple_name`) → single publish.
@@ -879,7 +879,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     // analyzer use-import resolver (B-5 follow-up): when that lands,
     // analyzer's `owner_root` switches to qualified form and the
     // SAME `Arc<PyreSizeDescr>` is reachable via the qualified
-    // hash. `register_keyed_size` keeps one `_cache_size_order` entry
+    // hash. `register_keyed_size` keeps one `_cache_size` entry
     // per logical SizeDescr while allowing fuller-layout upgrades.
     if !simple_name.is_empty() {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));

@@ -5121,7 +5121,7 @@ impl EffectInfoStructuralKey {
         Self {
             extraeffect: effect.extraeffect,
             oopspecindex: effect.oopspecindex,
-            descr_set_keys: effect.descr_set_keys.clone(),
+            descr_set_keys: effect.descr_set_keys.as_deref().cloned(),
             can_invalidate: effect.can_invalidate,
             can_collect: effect.can_collect,
             call_release_gil_target: effect.call_release_gil_target,
