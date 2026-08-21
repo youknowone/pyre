@@ -441,6 +441,21 @@ pub(super) fn forget_type_name(mirror: usize) {
 /// The refcount is left as [`pyobject::attach`] set it: a synthesized mirror
 /// carries the ordinary link share and is released with the type it stands for,
 /// which is what keeps a class the extension merely observed collectable.
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries.
+///
+/// The modules whose mirrors have fields of their own each answer for their
+/// own types and 0 for everything else; 0 is the plain header, which is what
+/// every other type this runtime defines gets.
+fn mirror_basicsize(w_type: PyObjectRef) -> isize {
+    [
+        super::frameobject::basicsize(w_type),
+        super::pyerrors::basicsize(w_type),
+    ]
+    .into_iter()
+    .find(|&size| size != 0)
+    .unwrap_or(0)
+}
+
 pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     let name = unsafe { pyre_object::typeobject::w_type_get_name(w_type) };
     let name = CString::new(name).unwrap_or_default();
@@ -461,7 +476,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     };
     unsafe {
         (*mirror).tp_name = pointer;
-        (*mirror).tp_basicsize = super::frameobject::basicsize(w_type);
+        (*mirror).tp_basicsize = mirror_basicsize(w_type);
         (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
             | PY_TPFLAGS_READY
             | PY_TPFLAGS_BASETYPE
@@ -2676,10 +2691,10 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     if unsafe { (*tp).tp_free.is_null() } {
         unsafe { (*tp).tp_free = PyObject_Free as *const c_void };
     }
-    // `PyType_GenericNew` builds an ordinary instance, which is not what a
-    // type derived from `type` has for one: left unset, the slot routes to
-    // `type.__new__` through the base instead.
-    if unsafe { (*tp).tp_new.is_null() } && !builds_types(interpreter_type(base)) {
+    // `PyType_GenericNew` builds an ordinary instance, which is not the
+    // storage a base that has a constructor of its own would have built: left
+    // unset, the slot routes to the base's `__new__` instead.
+    if unsafe { (*tp).tp_new.is_null() } && !base_supplies_new(base) {
         unsafe { (*tp).tp_new = PyType_GenericNew as *const c_void };
     }
 
@@ -2789,26 +2804,44 @@ fn declares_tp_new(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && DECLARED_TP_NEW.lock().contains(&(tp as usize))
 }
 
-/// Whether a type readied over `w_base` has types for its instances.
-fn builds_types(w_base: PyObjectRef) -> bool {
-    let w_type_type = crate::typedef::w_type();
+/// Whether the base has a constructor of its own, which `PyType_GenericNew`
+/// would take away.
+///
+/// `inherit_slots` answers this for a C base by copying its `tp_new`.  It
+/// cannot answer it for a class this runtime defines, whose mirror carries no
+/// slots at all, so the namespaces are compared instead.  For `object` the two
+/// constructors agree and nothing is lost; for `type` the difference is
+/// between building a class and building an instance, and for an exception it
+/// is between the storage the methods it inherits are written against and a
+/// plain one.
+fn base_supplies_new(base: *mut CPyTypeObject) -> bool {
+    let w_base = interpreter_type(base);
+    let w_object = crate::typedef::w_object();
     !w_base.is_null()
-        && !w_type_type.is_null()
-        && unsafe { crate::baseobjspace::issubtype_w(w_base, w_type_type) }
+        && !w_object.is_null()
+        && !std::ptr::eq(w_base, w_object)
+        && unsafe { crate::baseobjspace::lookup_in_type(w_base, "__new__") }
+            != unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") }
 }
 
-/// The layout a type readied over `w_base` gives its instances.
+/// The layout a type readied over `w_base` gives its instances: the base's
+/// own, which is the storage the methods it inherits are written against.
 ///
-/// Instances of a type derived from `type` are `W_TypeObject`s, so the type
-/// carries `type`'s layout rather than the general instance one — the same
-/// choice `_ctypes`' `make_ctypes_metatype` makes for its metaclasses.  A
-/// metaclass built here and then handed back through `PyType_FromMetaclass`
-/// is instantiated by both routes, and the general layout makes the Python one
-/// refuse it.
+/// Instances of a type derived from `type` are `W_TypeObject`s and instances
+/// of one derived from an exception are `W_BaseException`s — the same choice
+/// `_ctypes`' `make_ctypes_metatype` makes for its metaclasses.  The general
+/// instance layout makes every inherited method refuse the receiver it is
+/// handed, which is what a `descriptor ... requires a ... object` report from
+/// a type built here means.
 fn instance_layout(w_base: PyObjectRef) -> *const pyre_object::PyType {
-    match builds_types(w_base) {
-        true => &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
-        false => &pyre_object::pyobject::INSTANCE_TYPE as *const pyre_object::PyType,
+    let instance = &pyre_object::pyobject::INSTANCE_TYPE as *const pyre_object::PyType;
+    if w_base.is_null() {
+        return instance;
+    }
+    let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_base) };
+    match layout.is_null() {
+        true => instance,
+        false => unsafe { (*layout).typedef },
     }
 }
 

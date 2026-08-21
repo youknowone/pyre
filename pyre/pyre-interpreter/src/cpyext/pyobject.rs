@@ -167,9 +167,10 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     }
     let ob_type = type_mirror(w_obj);
     let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type));
-    // The one type whose mirror carries fields of its own; every other block
+    // The two types whose mirrors carry fields of their own; every other block
     // this runtime hands out is exactly its header.
     super::frameobject::attach(raw, w_obj);
+    super::pyerrors::attach(raw, w_obj);
     raw
 }
 
@@ -461,6 +462,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
     super::frameobject::forget_block(raw);
+    super::pyerrors::forget_block(raw);
     super::typeobject::forget_type_name(address);
     super::gc::forget(address);
     let block = block_at(address);

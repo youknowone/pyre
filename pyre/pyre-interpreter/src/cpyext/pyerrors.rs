@@ -93,6 +93,114 @@ pub(super) fn bad_argument<T>(function: &str) -> Option<T> {
     None
 }
 
+// ── the StopIteration mirror ────────────────────────────────────────────
+
+/// C-visible `PyStopIterationObject`, the twin of the struct in
+/// `include/pyre3.14t/pyerrors.h`.
+///
+/// The fields are `pyerrors.py:24 PyStopIterationObjectFields`: the header and
+/// `value`, with none of the exception words a runtime that keeps its
+/// exceptions as C structs would have between them.  An extension reads the
+/// rest through `PyException_GetTraceback` and its neighbours, so there is
+/// nothing here for them to be read out of.
+#[repr(C)]
+pub struct CPyStopIterationObject {
+    pub ob_base: CPyObject,
+    pub value: *mut CPyObject,
+}
+
+/// The layout is written out twice — here and in the header — so each offset
+/// is pinned in both, and a field added to one without the other stops
+/// compiling rather than writing somewhere unclaimed.
+///
+/// `pyre/pyrex/tests/fixtures/cpyext_stopiteration.c` carries the C half.
+const _: () = {
+    assert!(std::mem::offset_of!(CPyStopIterationObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPyStopIterationObject, value) == 3 * size_of::<usize>());
+    assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
+};
+
+type BlockSet =
+    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+
+/// The mirrors [`attach`] filled, which is what says whose `value` is a
+/// reference to release.
+///
+/// A block cannot be classified back from its own header at release time: a
+/// class derived from `StopIteration` has a type mirror of its own, and asking
+/// the size instead is what turns an unrelated C type's storage into a
+/// reference to decrement.
+static ATTACHED: super::ForkMutex<BlockSet> =
+    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe { ATTACHED.reinit_after_fork() };
+}
+
+/// The builtin `StopIteration` class, or null before it is built.
+fn stopiteration_class() -> PyObjectRef {
+    crate::builtins::lookup_exc_class("StopIteration").unwrap_or(PY_NULL)
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries —
+/// `pyerrors.py:31-35 basestruct=PyStopIterationObject.TO` for `StopIteration`
+/// and the classes derived from it, and 0 for every other type, which asks for
+/// the plain header.
+///
+/// A class derived from it in C declares its own size, and the C rule that a
+/// subclass's storage begins with its base's is what puts `value` in the same
+/// place there.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    let class = stopiteration_class();
+    let derived = !w_type.is_null()
+        && !class.is_null()
+        && unsafe { crate::baseobjspace::issubtype_w(w_type, class) };
+    match derived {
+        true => size_of::<CPyStopIterationObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill a freshly allocated mirror of `w_obj` when `w_obj` is a
+/// `StopIteration` — `pyerrors.py:37-43 stopiteration_attach`.
+///
+/// The value is a snapshot: a later `e.value = x` reaches the attribute and
+/// not this word, which is the same bargain upstream states at the assignment.
+/// What reads it is `__Pyx_PyGen_FetchStopIterationValue`, immediately after
+/// the fetch that hands the exception over.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    let w_type = match crate::typedef::r#type(w_obj) {
+        Some(w_type) => w_type.as_ptr(),
+        None => return,
+    };
+    if basicsize(w_type) == 0 {
+        return;
+    }
+    // The size is asserted rather than tested: a block that belongs to a
+    // `StopIteration` and is too small for one means `basicsize` and the
+    // allocator have come apart, and the write below would land past its end.
+    assert!(
+        unsafe { (*(*raw).ob_type).tp_basicsize } >= size_of::<CPyStopIterationObject>() as isize,
+        "a StopIteration mirror was allocated at the plain PyObject size"
+    );
+    let value = pyobject::make_ref(unsafe { crate::baseobjspace::stopiteration_value(w_obj) });
+    unsafe { (*(raw as *mut CPyStopIterationObject)).value = value };
+    ATTACHED.lock().insert(raw as usize);
+}
+
+/// Release the reference a `StopIteration` mirror owns — `pyerrors.py:45-50
+/// stopiteration_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    if !ATTACHED.lock().remove(&(raw as usize)) {
+        return;
+    }
+    let py_stopiteration = raw as *mut CPyStopIterationObject;
+    unsafe {
+        pyobject::decref((*py_stopiteration).value);
+        (*py_stopiteration).value = std::ptr::null_mut();
+    }
+}
+
 // ── the exception type mirrors ──────────────────────────────────────────
 
 macro_rules! exception_mirrors {

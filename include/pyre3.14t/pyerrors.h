@@ -10,6 +10,18 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* The one exception whose instances carry a field an extension reads through
+   the block rather than through a call: `__Pyx_PyGen_FetchStopIterationValue`
+   takes the value a generator returned straight out of it.  A snapshot taken
+   when the block is built -- a later `e.value = x` reaches the attribute and
+   not this word.
+
+   `pyre/pyre-interpreter/src/cpyext/pyerrors.rs` carries the twin. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *value;
+} PyStopIterationObject;
+
 /* Exceptions. */
 PyAPI_DATA(PyObject *) PyExc_BaseException;
 PyAPI_DATA(PyObject *) PyExc_Exception;
