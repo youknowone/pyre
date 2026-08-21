@@ -653,7 +653,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("TCP_KEEPIDLE", 3);
         cst!("TCP_FASTOPEN", 15);
         cst!("TCP_KEEPCNT", 16);
-        cst!("TCP_KEEPALIVE", ws::TCP_KEEPALIVE);
         cst!("TCP_KEEPINTVL", 17);
         // `SIO_TCP_SET_ACK_FREQUENCY` - the name `socketmodule.c` gives this
         // option on Windows.  It is an ioctl code, not an option number, which
