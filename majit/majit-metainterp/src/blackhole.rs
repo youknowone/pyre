@@ -9414,6 +9414,12 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("new_array/id>r", handler_new_array);
     builder.wire_handler("new_array_clear/id>r", handler_new_array_clear);
     builder.wire_handler("new_array_clear/cd>r", handler_new_array_clear_c);
+    // pyre-only rbuilder allocation (`majit-translate::insns::BC_NEWSTRINGBUILDER`):
+    // `newstringbuilder/d>r` carries the headerless `StringBuilder` size descr
+    // and allocates through the same `bh_new(sizedescr)` path as `new/d>r`, so
+    // it aliases `handler_new`.  Dormant until the builder-mode lift path emits
+    // `OpKind::NewStringBuilder`; wired here so the opname is handler-covered.
+    builder.wire_handler("newstringbuilder/d>r", handler_new);
 
     // String operations (blackhole.py:1200-1283)
     builder.wire_handler("strlen/r>i", handler_strlen);

@@ -726,6 +726,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
+        | OpKind::NewStringBuilder { .. }
         | OpKind::NewWithVtable { .. } => Vec::new(),
 
         OpKind::FieldRead { base, .. }

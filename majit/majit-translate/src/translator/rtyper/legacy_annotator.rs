@@ -289,6 +289,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::New { owner } => ValueType::Ref(Some(owner.clone())),
+        OpKind::NewStringBuilder { .. } => ValueType::StringBuilder,
         OpKind::NewWithVtable { owner, .. } => ValueType::Ref(Some(owner.clone())),
         // `new_array_clear` yields a `Ref` to the freshly allocated,
         // zero-cleared items array (`Ptr(GcArray(OBJECTPTR))`).

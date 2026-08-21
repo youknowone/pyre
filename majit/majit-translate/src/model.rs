@@ -754,6 +754,19 @@ pub enum OpKind {
     New {
         owner: String,
     },
+    /// rbuilder epic (#40): the `StringBuilder` value modeled as a bare
+    /// headerless `GcStruct`.  Structurally identical to [`OpKind::New`] — the
+    /// `owner` (`"stringbuilder"`) resolves the headerless size descriptor
+    /// (`pyre-jit-trace/src/descr.rs::stringbuilder_size_descr`) and the
+    /// allocation lowers to `bh_new(sizedescr)` — but carries its own opname
+    /// (`newstringbuilder/d>r`, `insns::BC_NEWSTRINGBUILDER`) so the result
+    /// keeps its distinct `StringBuilder` identity through the pipeline rather
+    /// than collapsing into a generic boxed instance.  Emitted only for lifted
+    /// builder-mode accumulators (`front::mir` builder variant); dormant until
+    /// that emission is wired, exactly like `newlist`.
+    NewStringBuilder {
+        owner: String,
+    },
     /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
     /// heap allocation of a boxed object (`pyre_object::lltype::malloc_typed`).
     /// Lowered to the `new_with_vtable` jitcode op (executor

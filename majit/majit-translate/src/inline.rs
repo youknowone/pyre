@@ -447,6 +447,9 @@ pub(crate) fn remap_op_kind(
         OpKind::New { owner } => OpKind::New {
             owner: owner.clone(),
         },
+        OpKind::NewStringBuilder { owner } => OpKind::NewStringBuilder {
+            owner: owner.clone(),
+        },
         OpKind::NewWithVtable { owner, vtable } => OpKind::NewWithVtable {
             owner: owner.clone(),
             vtable: *vtable,
@@ -930,6 +933,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
+        | OpKind::NewStringBuilder { .. }
         | OpKind::NewWithVtable { .. } => {
             vec![]
         }
@@ -1155,6 +1159,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // objects: NOT pure.  CSE must never coalesce two allocations, or
         // Python `is` object identity would break.
         OpKind::New { .. }
+        | OpKind::NewStringBuilder { .. }
         | OpKind::NewWithVtable { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. }

@@ -6228,6 +6228,7 @@ impl CallControl {
                     // `flavor='raw'` allocation, so there is no flavour test
                     // to make — every allocation op here is a GC one.
                     OpKind::New { .. }
+                    | OpKind::NewStringBuilder { .. }
                     | OpKind::NewWithVtable { .. }
                     | OpKind::NewArrayClear { .. }
                     | OpKind::NewListClear { .. } => return true,
@@ -8650,6 +8651,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
         // varsize allocation, same class.
         OpKind::New { .. }
+        | OpKind::NewStringBuilder { .. }
         | OpKind::NewWithVtable { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
@@ -9738,6 +9740,9 @@ mod tests {
         let alloc_kinds = [
             OpKind::New {
                 owner: "W_IntObject".to_string(),
+            },
+            OpKind::NewStringBuilder {
+                owner: "stringbuilder".to_string(),
             },
             OpKind::NewWithVtable {
                 owner: "W_FloatObject".to_string(),
