@@ -1906,7 +1906,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
-    // `socket.py:286 socket.dup` and `:554 fromfd` both go through
+    // `socket.py`'s `socket.dup` and `fromfd` both go through
     // `_socket.dup`, which on Windows cannot duplicate a descriptor in place:
     // a socket is not a C runtime file descriptor there.  `socket_dup` hands
     // the socket to the process it is already in with `WSADuplicateSocketW`

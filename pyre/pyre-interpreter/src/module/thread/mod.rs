@@ -1828,7 +1828,7 @@ fn spawn_thread(
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
             if let Err(mut error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
-                // `os_thread.py:136-142` reports every error but `SystemExit`,
+                // `bootstrapper.run` reports every error but `SystemExit`,
                 // which is how `_thread.exit()` ends a worker: printing an
                 // ignored-exception traceback for it would report a normal
                 // exit as a fault.
