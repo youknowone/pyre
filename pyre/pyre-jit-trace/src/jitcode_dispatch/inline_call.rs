@@ -5733,7 +5733,23 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
     let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
     if tp_new != obj_new {
-        return type_call_decline("__new__ overridden");
+        // `descr_call` does not allocate: it calls whatever `__new__` resolved
+        // to and takes the instance back from it.  So an overridden `__new__`
+        // is not the end of the road — it is a different route, one whose
+        // allocation happens inside the callee.
+        return try_walker_inline_type_call_via_new(
+            ctx,
+            op,
+            code,
+            funcptr,
+            r_args,
+            call_descr,
+            dst_bank,
+            dst,
+            w_type,
+            tp_new,
+            metaclass_to_pin,
+        );
     }
     let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__init__") };
     let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
@@ -5867,6 +5883,136 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         if fbw_inline_diag_enabled() {
             eprintln!(
                 "[type-call-rewind] pc={} class={} why=__init__ sub-walk declined",
+                op.pc,
+                unsafe { pyre_object::w_type_get_name(w_type) },
+            );
+        }
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
+}
+
+/// `type.__call__` for a class whose `__new__` is overridden Python code.
+///
+/// `typeobject.py`'s `W_TypeObject.descr_call` never allocates: it resolves `__new__`
+/// through the descriptor protocol, calls it with the class as the first
+/// argument, and takes the instance back from whatever came out. The
+/// `object.__new__` arm above can emit the allocation itself only because that
+/// one `__new__` is `w_instance_new` and nothing else; here the allocation is
+/// the callee's business, so this route is the ordinary resolved-callee inline
+/// of the `__new__` body with the class pinned.
+///
+/// A class carrying its own `__init__` as well declines: `descr_call` runs it
+/// only when the result is an instance of the class, and folding a second
+/// sub-walk under one rewind point is a separate change. A class whose
+/// `__init__` is still `object`'s has nothing to run — `object_descr_init`
+/// accepts the surplus arguments precisely because `__new__` is overridden —
+/// so the `__new__` result is already the whole of the call.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_type_call_via_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    w_type: pyre_object::PyObjectRef,
+    tp_new: Option<pyre_object::PyObjectRef>,
+    metaclass_to_pin: Option<pyre_object::PyObjectRef>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(tp_new) = tp_new else {
+        return type_call_decline("__new__ overridden but unresolvable");
+    };
+    // Type creation wraps a class's own `__new__` in `staticmethod`; `descr_call`'s
+    // `space.get` unwraps it before calling, and so must this.
+    let w_new = unsafe {
+        if pyre_object::function::is_staticmethod(tp_new) {
+            pyre_object::function::w_staticmethod_get_func(tp_new)
+        } else {
+            tp_new
+        }
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_new) }) else {
+        return type_call_decline("__new__ overridden and not inlinable");
+    };
+    let w_object = pyre_interpreter::typedef::w_object();
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    if tp_init != obj_init {
+        return type_call_decline("__new__ overridden alongside __init__");
+    }
+    // The class occupies the first parameter, so the body needs one slot per
+    // argument the call site passes on top of it.
+    if nparams != r_args.len() - 1 {
+        return type_call_decline("__new__ arity does not match the call");
+    }
+
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
+    let mut callee_args = vec![r_args[0]];
+    let mut callee_arg_concretes = vec![ConcreteValue::Ref(w_type)];
+    for (i, &arg) in r_args[2..].iter().enumerate() {
+        let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
+            return type_call_decline(&format!("argument {i} is not a concrete ref"));
+        };
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_args.push(arg);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+
+    // Everything below emits; cut back to here if the sub-walk declines, the
+    // same rewind point the `object.__new__` arm keeps.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[0], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    if let Some(w_metaclass) = metaclass_to_pin {
+        let metaclass_const = ctx.trace_ctx.const_ref(w_metaclass as i64);
+        walker_pin_type_version_tag(ctx, op.pc, metaclass_const)?;
+    }
+    if fbw_inline_diag_enabled() {
+        eprintln!("[type-call-inline] pc={} class={} via=__new__", op.pc, unsafe {
+            pyre_object::w_type_get_name(w_type)
+        });
+    }
+
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_new,
+        r_args[0],
+        w_type,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        // The callee's own return value IS the instance, unlike the `__init__`
+        // sub-walk whose result is discarded in favour of the emitted one.
+        None,
+    )?;
+    if inlined.is_none() {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[type-call-rewind] pc={} class={} why=__new__ sub-walk declined",
                 op.pc,
                 unsafe { pyre_object::w_type_get_name(w_type) },
             );
