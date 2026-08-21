@@ -709,8 +709,19 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`; `get_positive_index` then clamps to `[0, len]`
     // inside `w_list_insert`.
+    // `args` is the copy the gateway built on the stack; a minor rewrites the
+    // shadow slots and not that copy, so the receiver and the item read out of
+    // it after `__index__` has run are pre-move addresses.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let index = unsafe { crate::baseobjspace::getindex_w_index(args[1])? };
-    unsafe { pyre_object::listobject::w_list_insert(args[0], index, args[2]) };
+    unsafe {
+        pyre_object::listobject::w_list_insert(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            index,
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        )
+    };
     Ok(w_none())
 }
 
@@ -724,12 +735,17 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "pop", 1)?;
     // `@unwrap_spec(index='index')` → getindex_w(index, OverflowError): coerce
     // through `__index__`.
+    // Rooted as `list_method_insert`: the receiver read out of `args` after
+    // `__index__` has run is a pre-move address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let index = if args.len() > 1 {
         unsafe { crate::baseobjspace::getindex_w_index(args[1])? }
     } else {
         -1
     };
-    let length = unsafe { pyre_object::w_list_len(args[0]) } as i64;
+    let list = pyre_object::gc_roots::shadow_stack_get(base);
+    let length = unsafe { pyre_object::w_list_len(list) } as i64;
     if length == 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,
@@ -739,7 +755,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // listobject.py — clearly distinguish list.pop() from the
     // general list.pop(index) path.
     if index == -1 {
-        return match unsafe { pyre_object::listobject::w_list_pop_end(args[0]) } {
+        return match unsafe { pyre_object::listobject::w_list_pop_end(list) } {
             Some(v) => Ok(v),
             None => Err(crate::PyError::new(
                 crate::PyErrorKind::IndexError,
@@ -747,7 +763,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             )),
         };
     }
-    match unsafe { pyre_object::listobject::w_list_pop(args[0], index) } {
+    match unsafe { pyre_object::listobject::w_list_pop(list, index) } {
         Some(v) => Ok(v),
         None => Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,

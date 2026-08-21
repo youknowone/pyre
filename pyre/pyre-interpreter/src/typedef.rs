@@ -5392,11 +5392,17 @@ fn init_list_type(ns: PyObjectRef) {
                     // runs, so a non-index operand raises here rather than
                     // reporting NotImplemented.
                     crate::type_methods::arity_slot(args, 1)?;
+                    // `args` is the gateway's stack copy: a minor rewrites the
+                    // shadow slots and not that copy, so the list read out of
+                    // it after `__index__` is a pre-move address.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
                     let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
+                    let w_list = pyre_object::gc_roots::shadow_stack_get(base);
                     unsafe {
-                        crate::objspace::descroperation::list_inplace_repeat(args[0], w_count)?
+                        crate::objspace::descroperation::list_inplace_repeat(w_list, w_count)?
                     };
-                    Ok(args[0])
+                    Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
             ),
@@ -5484,8 +5490,14 @@ fn list_descr_mul_impl(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, 
     crate::type_methods::arity_slot(args, 1)?;
     // `wrap_indexargfunc` reduces the count through `__index__` before
     // `sq_repeat` runs, so a non-index operand raises here.
+    // `args` is the gateway's stack copy: a minor rewrites the shadow slots
+    // and not that copy, so the list read out of it after `__index__` is a
+    // pre-move address.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let w_count = crate::baseobjspace::getindex_repeat(args[1])?;
-    unsafe { crate::objspace::descroperation::list_repeat(args[0], w_count) }
+    let w_list = pyre_object::gc_roots::shadow_stack_get(base);
+    unsafe { crate::objspace::descroperation::list_repeat(w_list, w_count) }
 }
 
 // ── Str TypeDef ──────────────────────────────────────────────────────
