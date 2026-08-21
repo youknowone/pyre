@@ -143,6 +143,26 @@ The `t` is the **free-threaded** build: "CPython does X" is an answer only once 
 holds without the GIL. Correct-because-a-global-lock-serialises-it is not
 on-spec.
 
+### Module presence follows PyPy
+
+**Do not implement a module that PyPy does not have merely to unskip a CPython
+test.** Whether a module exists, and which layer owns it, is part of the PyPy
+implementation shape. Before adding any builtin, extension, compatibility, or
+test-support module, verify that the real `pypy3` oracle imports it and locate
+its owner in `pypy/`, `rpython/`, or `lib_pypy/`. If neither exists, the module
+is not a pyre porting target unless the user explicitly expands the scope.
+
+In particular, CPython-only test helpers such as `_testlimitedcapi` are not
+product modules. PyPy also has no `_datetime` extension module: it provides
+`datetime` through its pure-Python implementation, so pyre must preserve the
+working pure-Python path rather than invent an `_datetime` stub or accelerator.
+A CPython test that directly imports one of these absent private modules may
+skip or remain blocked; that is not by itself an implementation gap. If the
+public stdlib feature is broken, port PyPy's actual owner/fallback and fix that
+root cause. Never add an empty or partial module just to make the import
+succeed, because that suppresses the intended fallback and turns a clean skip
+into misleading failures.
+
 **The spec governs only what a caller can observe** — return value, exception
 type/message/attributes, identity, encoding-and-errors contract, accepted
 argument shapes. Everything else follows PyPy **unconditionally**: names, module
