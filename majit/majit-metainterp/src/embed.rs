@@ -336,6 +336,173 @@ impl fmt::Display for Census {
     }
 }
 
+/// The degraded dispatch arms recorded for `interp`, sorted by arm name.
+///
+/// The process-wide registry holds every machine's arms, so a reader that wants
+/// one machine's has to filter; sorting makes the result comparable against a
+/// written-down set whatever order the portal happened to install them in.
+///
+/// ⚠ This is NOT a windowed reading and must not be made one, which is what
+/// separates it from every counter in this module. The registry records a
+/// per-ARM fact at portal-install time and deduplicates by content, so it
+/// describes what the lowerer can express about a machine, not what one run
+/// did. Diffing it across a window would report "installed during this window",
+/// a different and far less useful property.
+pub fn degraded_dispatch_arm_names(interp: &str) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = crate::degraded_dispatch_arms()
+        .into_iter()
+        .filter(|arm| arm.interp == interp)
+        .map(|arm| arm.arm)
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// The degraded arms recorded for `interp` paired with their refusal family,
+/// sorted by arm name.
+///
+/// Strictly more than [`degraded_dispatch_arm_names`]: an arm can keep
+/// degrading under a different mechanism, which moves the family while the name
+/// set sits still. Only the FIRST refusal in each arm's reason is classified —
+/// that is the outermost blocker, the one that stopped lowering.
+pub fn degraded_dispatch_arm_causes(interp: &str) -> Vec<(&'static str, crate::RefusalKind)> {
+    let mut causes: Vec<(&'static str, crate::RefusalKind)> = crate::degraded_dispatch_arms()
+        .into_iter()
+        .filter(|arm| arm.interp == interp)
+        .map(|arm| (arm.arm, crate::refusal_kind(arm.reason)))
+        .collect();
+    causes.sort_unstable_by_key(|(arm, _)| *arm);
+    causes
+}
+
+/// The refusal reason recorded for one of `interp`'s arms, if that arm
+/// degraded.
+///
+/// Looked up by arm name rather than by position: the registry's order is the
+/// portal's install order, so an index is a pin on something nobody chose.
+pub fn degraded_dispatch_arm_reason(interp: &str, arm: &str) -> Option<&'static str> {
+    crate::degraded_dispatch_arms()
+        .into_iter()
+        .find(|entry| entry.interp == interp && entry.arm == arm)
+        .map(|entry| entry.reason)
+}
+
+/// Panic unless `interp`'s `arm` degraded AND its reason contains `needle`.
+///
+/// One level below [`assert_degraded_dispatch_arm_causes`]: the family says
+/// which MECHANISM refused the arm, and this says which SOURCE it refused on.
+/// A refusal can keep its family while moving to a different statement, which
+/// means the gap being tracked is not the one the pin was written for.
+///
+/// A substring, never the whole reason — the refusal is rendered with the
+/// lowerer's own spacing, which is not a thing a gate should be pinned to.
+pub fn assert_degraded_dispatch_arm_reason_contains(interp: &str, arm: &str, needle: &str) {
+    match degraded_dispatch_arm_reason(interp, arm) {
+        Some(reason) => assert!(
+            reason.contains(needle),
+            "`{interp}`'s `{arm}` no longer refuses on `{needle}`, so the pin \
+             tracks a gap that has moved: {reason}"
+        ),
+        None => panic!(
+            "`{interp}` has no degraded arm named `{arm}`, so there is no \
+             refusal to read `{needle}` out of. Degraded arms: {:?}",
+            degraded_dispatch_arm_names(interp)
+        ),
+    }
+}
+
+/// Panic unless `interp`'s portal was installed AND its degraded arms are
+/// EXACTLY `expected`.
+///
+/// **An equality over a named set, never an emptiness check.** A machine with a
+/// known lowering gap has a non-empty degraded set today, so demanding
+/// emptiness there fails on day one and the only available response is to
+/// weaken the gate into uselessness. Pinning the set keeps both directions
+/// live: a NEW name means an arm silently stopped lowering and every trace
+/// reaching it aborts, and a MISSING name means that arm lowers again, so the
+/// gap the pin was tracking is closed and the surrounding gate can be
+/// strengthened. An emptiness check reports only the first of those, and only
+/// where the answer is already zero.
+///
+/// Pass `&[]` for a machine that should have no degraded arm at all;
+/// [`crate::assert_no_degraded_dispatch_arms`] is that spelling.
+///
+/// The portal check is what makes an empty `expected` mean anything. An empty
+/// registry is also what a machine whose portal was never built produces — the
+/// same shape as the defect the gate exists to report, one level up — so the
+/// arm census supplies the denominator and the two failures get two different
+/// messages instead of one silent pass.
+///
+/// Call it after whatever installs the portal. The facts are recorded at
+/// install, not at trace time, so running the machine is not required — but
+/// nothing is recorded until the portal is built at least once.
+pub fn assert_degraded_dispatch_arms(interp: &str, expected: &[&str]) {
+    let arms = assert_portal_installed(interp, expected.is_empty());
+    let degraded = degraded_dispatch_arm_names(interp);
+    assert!(
+        degraded == expected,
+        "`{interp}`'s arms that lowered to an abort stub are {degraded:?}, not \
+         the pinned {expected:?} — out of the {arms} arm(s) its portal emitted. \
+         Every trace that reaches a stub aborts, once per threshold, forever. A \
+         NEW name means an arm silently stopped lowering; a MISSING name means \
+         that arm lowers again, so the pin is stale and whatever it was blocking \
+         may now be possible."
+    );
+}
+
+/// Panic unless `interp`'s portal was installed AND its degraded arms and their
+/// refusal families are EXACTLY `expected`.
+///
+/// The companion to [`assert_degraded_dispatch_arms`] and strictly stronger,
+/// since the pairs pin the names too. Both are worth asserting where a machine
+/// has a known gap: they fail for different reasons and the two messages say so
+/// — one reports that the SET moved, this one that a set which did not move is
+/// now being refused by a different mechanism.
+pub fn assert_degraded_dispatch_arm_causes(interp: &str, expected: &[(&str, crate::RefusalKind)]) {
+    assert_portal_installed(interp, expected.is_empty());
+    let causes = degraded_dispatch_arm_causes(interp);
+    let matches = causes.len() == expected.len()
+        && causes
+            .iter()
+            .zip(expected)
+            .all(|((arm, kind), (want_arm, want_kind))| arm == want_arm && kind == want_kind);
+    assert!(
+        matches,
+        "`{interp}`'s degraded dispatch arms are refused by {causes:?}, not the \
+         pinned {expected:?}. A family that moved while its arm name did not \
+         means a different mechanism is refusing that arm now; \
+         `RefusalKind::Unclassified` means a refusal family exists that nothing \
+         classifies yet."
+    );
+}
+
+/// The arm count `interp`'s portal recorded, or a panic naming the machines
+/// that did record one.
+///
+/// `expecting_none` only shapes the message: a pin that expects degraded arms
+/// would fail anyway on the empty registry, but it would fail saying "the set
+/// moved" when the truth is that nothing was ever measured.
+fn assert_portal_installed(interp: &str, expecting_none: bool) -> usize {
+    let census = crate::dispatch_arm_census();
+    match census.iter().find(|entry| entry.interp == interp) {
+        Some(entry) => entry.arms,
+        None => {
+            let consequence = if expecting_none {
+                "so an empty degraded list says nothing about it"
+            } else {
+                "so the degraded list below is empty because nothing was measured, \
+                 not because the pinned arms started lowering"
+            };
+            panic!(
+                "no dispatch-arm census for `{interp}`: its portal was never \
+                 installed in this process, {consequence}. Build the dispatch \
+                 JitCode (or run the machine) first. Recorded machines: {:?}",
+                census.iter().map(|e| e.interp).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
 /// Snapshot the abort-reason tallies as `(label, count)` pairs.
 ///
 /// [`CensusCounts::loops_aborted`] counts aborts without saying why, and the
@@ -441,6 +608,127 @@ mod tests {
         assert_eq!(
             render_abort_delta(&before, &after),
             "abrt_too_long=2 unclassified(abrt_bridge)=3"
+        );
+    }
+
+    /// Register a synthetic machine so the registry assertions have a subject.
+    ///
+    /// The registry is process-wide, deduplicated by content and never cleared,
+    /// so each test uses a name of its own rather than trying to reset it.
+    fn record_machine(
+        interp: &'static str,
+        arms: usize,
+        degraded: &[(&'static str, &'static str)],
+    ) {
+        crate::record_dispatch_arm_census(interp, arms);
+        for (arm, reason) in degraded {
+            crate::record_degraded_dispatch_arm(interp, arm, reason);
+        }
+    }
+
+    /// The finding this gate exists for, as an executable claim: a machine with
+    /// a known lowering gap can pin its set, and the emptiness-only spelling can
+    /// only fail on it.
+    #[test]
+    fn a_known_gap_is_expressible_as_a_pinned_set() {
+        record_machine(
+            "PinnedGapState",
+            4,
+            &[("PUSHARG", "arm body cannot express this statement")],
+        );
+        assert_degraded_dispatch_arms("PinnedGapState", &["PUSHARG"]);
+        assert_degraded_dispatch_arm_causes(
+            "PinnedGapState",
+            &[("PUSHARG", crate::RefusalKind::UnlowerableStmt)],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not the pinned []")]
+    fn the_zero_spelling_cannot_express_a_known_gap() {
+        record_machine(
+            "ZeroSpellingState",
+            4,
+            &[("PUSHARG", "arm body cannot express this statement")],
+        );
+        crate::assert_no_degraded_dispatch_arms("ZeroSpellingState");
+    }
+
+    /// Install order is not the pin's business, so the reader sorts.
+    #[test]
+    fn arm_names_are_sorted_whatever_order_the_portal_installed_them() {
+        record_machine(
+            "SortedState",
+            3,
+            &[
+                ("ROLL", "arm body cannot express this statement"),
+                ("ALLOCATE", "arm body cannot express this statement"),
+            ],
+        );
+        assert_eq!(
+            degraded_dispatch_arm_names("SortedState"),
+            ["ALLOCATE", "ROLL"]
+        );
+        assert_degraded_dispatch_arms("SortedState", &["ALLOCATE", "ROLL"]);
+    }
+
+    /// A machine whose portal was never built has an empty degraded list, which
+    /// is the same shape as a healthy one. The denominator is what tells them
+    /// apart, and it must do so for a NON-empty pin too — there the empty list
+    /// would otherwise read as "the pinned arms started lowering".
+    #[test]
+    #[should_panic(expected = "nothing was measured")]
+    fn an_uninstalled_portal_does_not_read_as_a_closed_gap() {
+        assert_degraded_dispatch_arms("NeverInstalledState", &["PUSHARG"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "says nothing about it")]
+    fn an_uninstalled_portal_does_not_read_as_a_clean_one() {
+        crate::assert_no_degraded_dispatch_arms("NeverInstalledEmptyState");
+    }
+
+    /// The family says which mechanism refused; the reason says which source.
+    #[test]
+    fn a_refusal_is_readable_by_arm_name_not_by_install_position() {
+        record_machine(
+            "ReasonState",
+            2,
+            &[
+                ("ROLL", "arm body cannot express this statement: pc += 1"),
+                (
+                    "ALLOCATE",
+                    "arm body cannot express this statement: regs[n]",
+                ),
+            ],
+        );
+        // Looked up by name, so the portal's install order is not a pin.
+        assert_degraded_dispatch_arm_reason_contains("ReasonState", "ALLOCATE", "regs[n]");
+        assert_degraded_dispatch_arm_reason_contains("ReasonState", "ROLL", "pc += 1");
+        assert!(degraded_dispatch_arm_reason("ReasonState", "NOSUCH").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "no degraded arm named")]
+    fn a_reason_pin_on_an_arm_that_lowers_reports_that_rather_than_a_mismatch() {
+        record_machine("LoweredArmState", 2, &[]);
+        assert_degraded_dispatch_arm_reason_contains("LoweredArmState", "ROLL", "pc += 1");
+    }
+
+    /// A family can move while the name set sits still, which is the whole
+    /// reason the causes gate is separate from the names one.
+    #[test]
+    #[should_panic(expected = "refused by")]
+    fn a_cause_that_moved_under_an_unchanged_name_is_a_failure() {
+        record_machine(
+            "MovedCauseState",
+            2,
+            &[("ALLOCATE", "arm body cannot express this statement")],
+        );
+        assert_degraded_dispatch_arms("MovedCauseState", &["ALLOCATE"]);
+        assert_degraded_dispatch_arm_causes(
+            "MovedCauseState",
+            &[("ALLOCATE", crate::RefusalKind::GreenWriteback)],
         );
     }
 

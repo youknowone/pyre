@@ -788,39 +788,16 @@ pub fn dispatch_arm_census() -> Vec<DispatchArmCensus> {
 
 /// Panic unless `interp`'s portal was installed AND none of its arms degraded.
 ///
-/// This is the gate every consumer would otherwise write, denominator and all.
-/// Reading `degraded_dispatch_arms()` alone cannot be that gate: it passes on
-/// an empty registry, and an empty registry is also what a portal that was
-/// never built produces. The census settles which one happened, so the two
-/// failures get two different messages instead of one silent pass.
+/// The zero case of [`embed::assert_degraded_dispatch_arms`], which is where
+/// the implementation and the reasoning live. Reach for the general form
+/// whenever the answer is not zero: a machine with a known lowering gap has a
+/// non-empty degraded set today, and this spelling can only fail on it.
 ///
-/// Call it after whatever installs the portal. `#[jit_interp]` records both
-/// facts at install, not at trace time, so running the machine is not required
-/// — but nothing is recorded until the portal is built at least once.
+/// Call it after whatever installs the portal. Both facts are recorded at
+/// install, not at trace time, so running the machine is not required — but
+/// nothing is recorded until the portal is built at least once.
 pub fn assert_no_degraded_dispatch_arms(interp: &str) {
-    let census = dispatch_arm_census();
-    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
-        panic!(
-            "no dispatch-arm census for `{interp}`: its portal was never \
-             installed in this process, so an empty degraded list says nothing \
-             about it. Build the dispatch JitCode (or run the machine) first. \
-             Recorded machines: {:?}",
-            census.iter().map(|e| e.interp).collect::<Vec<_>>()
-        );
-    };
-    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
-        .into_iter()
-        .filter(|e| e.interp == interp)
-        .collect();
-    assert!(
-        degraded.is_empty(),
-        "{} of `{interp}`'s {} dispatch arms lowered to an abort stub. Every \
-         trace that reaches one of these opcodes aborts, once per threshold, \
-         forever: {:#?}",
-        degraded.len(),
-        entry.arms,
-        degraded
-    );
+    embed::assert_degraded_dispatch_arms(interp, &[]);
 }
 
 /// A declared field key that no access site asked about.

@@ -4,31 +4,9 @@
 ///
 /// Greens: [pc, bytecode]
 /// Reds:   [a, regs]  (tracked via state_fields)
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use majit_metainterp::embed::Census;
 
 pub type Bytecode = [u8];
-
-/// Hot loops majit compiled. The only positive evidence the JIT tier is alive:
-/// a green suite, agreement with `interp::interpret` and an exact result are
-/// all satisfied by an interpreter answering alone.
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-
-/// Ops in the last compiled loop body after optimization.
-///
-/// `COMPILES > 0` is necessary but NOT sufficient: an entirely empty dispatch
-/// still compiles a trace — one whose whole optimized body is `Finish()`, i.e.
-/// `ops_after == 1`. A compile counter counts TRACES, not WORK. This is the
-/// term that separates a compiled loop from a compiled nothing.
-pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
-
-/// Shape of the last compiled loop body — see [`majit_metainterp::LoopBodyShape`].
-///
-/// Held as two flags rather than the struct itself so the recording stays
-/// lock-free on the compile path; the probe rebuilds the struct inside the same
-/// lock window it reads the counters in, because this is as process-global as
-/// they are.
-pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
-pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
 #[expect(
     dead_code,
@@ -90,13 +68,9 @@ const DEFAULT_THRESHOLD: u32 = 3;
 fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlrState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
-        COMPILES.fetch_add(1, Ordering::Relaxed);
-        LAST_OPS_AFTER.store(ops_after, Ordering::Relaxed);
-        let shape = majit_metainterp::LoopBodyShape::of(opcodes);
-        LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
-        LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
-    });
+    // Every counter the tier gate reads, plus the last body's op count and
+    // shape, off the driver callbacks. `Census::begin` opens a window over them.
+    Census::install(&mut driver);
     let mut pc: usize = 0;
     let _stacksize: i32 = 0;
     let mut state = TlrState {
@@ -207,7 +181,7 @@ impl JitTlrInterp {
 mod tests {
     use super::*;
     use crate::interp;
-    use majit_metainterp::{RefusalKind, refusal_kind};
+    use majit_metainterp::{RefusalKind, embed};
 
     fn square_bytecode() -> Vec<u8> {
         vec![
@@ -266,7 +240,9 @@ mod tests {
         const PASSES: i64 = 20;
 
         let narrow_bc = imm_loop_bytecode(false);
-        let (narrow_got, narrow_compiles, narrow_ops, ..) = compile_probe(&narrow_bc, PASSES);
+        let (narrow_got, narrow_counts) = compile_probe(&narrow_bc, PASSES);
+        let (narrow_compiles, narrow_ops) =
+            (narrow_counts.loops_compiled, narrow_counts.last_ops_after);
         assert_eq!(
             narrow_got,
             NARROW * PASSES,
@@ -280,7 +256,8 @@ mod tests {
         );
 
         let wide_bc = imm_loop_bytecode(true);
-        let (wide_got, wide_compiles, wide_ops, ..) = compile_probe(&wide_bc, PASSES);
+        let (wide_got, wide_counts) = compile_probe(&wide_bc, PASSES);
+        let (wide_compiles, wide_ops) = (wide_counts.loops_compiled, wide_counts.last_ops_after);
         // Decoding, not just compiling: a dropped high byte yields 2*PASSES
         // instead of 258*PASSES, and a dropped statement yields 0.
         assert_eq!(
@@ -348,7 +325,9 @@ mod tests {
         const PASSES: i64 = 20;
 
         let control_bc = realloc_loop_bytecode(false);
-        let (control_got, control_compiles, control_ops, ..) = compile_probe(&control_bc, PASSES);
+        let (control_got, control_counts) = compile_probe(&control_bc, PASSES);
+        let (control_compiles, control_ops) =
+            (control_counts.loops_compiled, control_counts.last_ops_after);
         assert_eq!(control_got, interp::interpret(&control_bc, PASSES));
         assert!(
             control_compiles >= 1,
@@ -361,7 +340,8 @@ mod tests {
         // catches a stale-mirror miscompile, and it must not be guarded by a
         // compile count that a miscompiling build would still satisfy.
         let expected = interp::interpret(&bc, PASSES);
-        let (got, compiles, ops_after, ..) = compile_probe(&bc, PASSES);
+        let (got, counts) = compile_probe(&bc, PASSES);
+        let (compiles, ops_after) = (counts.loops_compiled, counts.last_ops_after);
         assert_eq!(
             got, expected,
             "realloc-in-loop disagrees with the interpreter ({got} vs \
@@ -387,50 +367,28 @@ mod tests {
         );
     }
 
-    /// [`COMPILES`] is process-global, so under the default parallel libtest
-    /// runner a concurrent `run` lands inside [`compile_probe`]'s
-    /// store/run/load window and the probe reads someone else's compile. The
-    /// lock therefore covers *every* call that can compile, not just the
-    /// probe's own — [`run_jit`] and [`compile_probe`] are the only two ways a
-    /// test may enter the JIT, and neither may call the other (a plain mutex
-    /// re-entered on one thread deadlocks).
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// For tests that assert only on the result. They still compile, so they
-    /// must not run inside the probe's window. See [`PROBE_LOCK`].
+    /// must not run inside another test's census window — the window is what
+    /// makes [`compile_probe`]'s numbers this run's rather than the process's.
+    ///
+    /// [`Census::begin`] is the only lock here, and it is not reentrant:
+    /// [`run_jit`] and [`compile_probe`] are the only two ways a test may enter
+    /// the JIT, and neither may call the other.
     fn run_jit(bc: &[u8], initial_a: i64) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _census = Census::begin();
         JitTlrInterp::new().run(bc, initial_a)
     }
 
-    /// Run with both counters reset, returning `(result, compiles, ops_after)`.
+    /// Run inside a census window, returning `(result, counts)`.
     ///
-    /// [`LAST_OPS_AFTER`] is read here rather than at the call site, and reset
-    /// here rather than nowhere. Both counters are process-global, so both need
-    /// the same treatment [`PROBE_LOCK`] exists to give [`COMPILES`]: a load
-    /// taken after the guard drops can observe a concurrent test's compile, and
-    /// a counter that is never stored to zero retains whatever the last compile
-    /// anywhere in the process left behind. Unreset, a zero from this probe is
+    /// The window is what separates this run's compiles from every other test's:
+    /// the counters behind it are process-global, so an absolute read carries
+    /// whatever the rest of the binary left behind, and a zero from it would be
     /// indistinguishable from an inherited value.
-    fn compile_probe(
-        bc: &[u8],
-        initial_a: i64,
-    ) -> (i64, usize, usize, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        COMPILES.store(0, Ordering::Relaxed);
-        LAST_OPS_AFTER.store(0, Ordering::Relaxed);
-        LAST_HAS_JUMP.store(false, Ordering::Relaxed);
-        LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
+    fn compile_probe(bc: &[u8], initial_a: i64) -> (i64, majit_metainterp::embed::CensusCounts) {
+        let census = Census::begin();
         let got = JitTlrInterp::new().run(bc, initial_a);
-        (
-            got,
-            COMPILES.load(Ordering::Relaxed),
-            LAST_OPS_AFTER.load(Ordering::Relaxed),
-            majit_metainterp::LoopBodyShape {
-                has_jump: LAST_HAS_JUMP.load(Ordering::Relaxed),
-                has_always_fails: LAST_ALWAYS_FAILS.load(Ordering::Relaxed),
-            },
-        )
+        (got, census.counts())
     }
 
     /// A real loop body was compiled, and exactly one known arm is degraded.
@@ -463,7 +421,9 @@ mod tests {
     /// until the interpreter is entered.
     #[test]
     fn jit_tier_is_alive() {
-        let (got, compiles, ops_after, shape) = compile_probe(&square_bytecode(), 100);
+        let (got, counts) = compile_probe(&square_bytecode(), 100);
+        let (compiles, ops_after) = (counts.loops_compiled, counts.last_ops_after);
+        let shape = counts.last_loop_body_shape;
         // The body actually closes a loop — see `LoopBodyShape`. A compile
         // count and an op count together still accept a body that bails out on
         // its first pass; this is the term that does not. Sound HERE because
@@ -476,37 +436,18 @@ mod tests {
         );
         assert_eq!(got, 10_000, "square(100) must still answer 10000");
 
-        let tlr_arms: Vec<_> = majit_metainterp::degraded_dispatch_arms()
-            .into_iter()
-            .filter(|a| a.interp == "TlrState")
-            .collect();
-        let degraded: Vec<&str> = tlr_arms.iter().map(|a| a.arm).collect();
-        assert_eq!(
-            degraded,
-            ["ALLOCATE"],
-            "the degraded-arm set moved. A NEW name means an arm silently \
-             stopped lowering and every trace reaching it now aborts; a MISSING \
-             name means that arm lowers again"
+        // The set, then the mechanism refusing it, then the source it refuses
+        // on. Each is a different fact and each fails with its own message:
+        // `RefusalKind::Unclassified` at the second means majit grew a refusal
+        // family the classifier does not know — add it there, do not re-record
+        // this pin.
+        embed::assert_degraded_dispatch_arms("TlrState", &["ALLOCATE"]);
+        embed::assert_degraded_dispatch_arm_causes(
+            "TlrState",
+            &[("ALLOCATE", RefusalKind::GreenWriteback)],
         );
-
-        let causes: Vec<(&str, RefusalKind)> = tlr_arms
-            .iter()
-            .map(|a| (a.arm, refusal_kind(a.reason)))
-            .collect();
-        assert_eq!(
-            causes,
-            [("ALLOCATE", RefusalKind::GreenWriteback)],
-            "ALLOCATE still degrades but a different mechanism is refusing it. \
-             `RefusalKind::Unclassified` means majit grew a refusal family the \
-             classifier does not know — add it in `majit-metainterp`, do not \
-             re-record this pin"
-        );
-        assert!(
-            tlr_arms[0].reason.contains("pc += 1"),
-            "ALLOCATE's refusal no longer names the green write that stops \
-             lowering before the reallocation: {}",
-            tlr_arms[0].reason
-        );
+        // The green write that stops lowering before the reallocation.
+        embed::assert_degraded_dispatch_arm_reason_contains("TlrState", "ALLOCATE", "pc += 1");
 
         // Zero-vs-nonzero is the property; a later change that legitimately
         // mints more than one artifact is not this regression.
@@ -523,7 +464,9 @@ mod tests {
              lowered nothing at all"
         );
         println!(
-            "[tier-alive] square(100) = {got}, compiled {compiles} loop(s) of {ops_after} ops, degraded {degraded:?}"
+            "[tier-alive] square(100) = {got}, compiled {compiles} loop(s) of \
+             {ops_after} ops, degraded {:?}",
+            embed::degraded_dispatch_arm_names("TlrState")
         );
     }
 
