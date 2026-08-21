@@ -38,6 +38,7 @@ const PY_BUF_WRITABLE: c_int = 0x0001;
 const PY_BUF_FORMAT: c_int = 0x0004;
 const PY_BUF_ND: c_int = 0x0008;
 const PY_BUF_STRIDES: c_int = 0x0010 | PY_BUF_ND;
+const PY_BUF_READ: c_int = 0x100;
 const PY_BUF_WRITE: c_int = 0x200;
 
 /// Unsigned bytes — the format `PyBuffer_FillInfo` reports and the fallback for
@@ -499,16 +500,21 @@ pub unsafe extern "C" fn PyBuffer_IsContiguous(view: *const CPyBuffer, order: c_
     let elements = if itemsize > 0 { length / itemsize } else { 0 };
     let shape = dims(unsafe { (*view).shape }, ndim, &[elements]);
     let strides = dims(unsafe { (*view).strides }, ndim, &[itemsize]);
-    let contiguous = match order as u8 {
-        b'C' => c_contiguous(&shape, &strides, itemsize),
-        b'F' => fortran_contiguous(&shape, &strides, itemsize),
+    contiguous_in(order, &shape, &strides, itemsize) as c_int
+}
+
+/// Whether the geometry is contiguous in `order`, which is `'C'`, `'F'`ortran
+/// or `'A'`ny of the two.  An order that is none of those is not contiguous:
+/// the entry points that reject one do so before asking.
+fn contiguous_in(order: c_char, shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+    match order as u8 {
+        b'C' => c_contiguous(shape, strides, itemsize),
+        b'F' => fortran_contiguous(shape, strides, itemsize),
         b'A' => {
-            c_contiguous(&shape, &strides, itemsize)
-                || fortran_contiguous(&shape, &strides, itemsize)
+            c_contiguous(shape, strides, itemsize) || fortran_contiguous(shape, strides, itemsize)
         }
         _ => false,
-    };
-    contiguous as c_int
+    }
 }
 
 /// The number of bytes one item of `format` occupies -- `_struct.calcsize`.
@@ -876,6 +882,68 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const CPyBuffer) -> *mut
     )))
 }
 
+/// A memoryview over `object` laid out in `order` --
+/// `memoryobject.py PyMemoryView_GetContiguous`.
+///
+/// `buffertype` is `PyBUF_READ` or `PyBUF_WRITE` and says what the caller will
+/// do with the memory, not how the view is built: a writable request over a
+/// read-only exporter is refused rather than copied.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMemoryView_GetContiguous(
+    object: *mut CPyObject,
+    buffertype: c_int,
+    order: c_char,
+) -> *mut CPyObject {
+    if buffertype != PY_BUF_READ && buffertype != PY_BUF_WRITE {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "buffertype must be PyBUF_READ or PyBUF_WRITE",
+        ));
+        return std::ptr::null_mut();
+    }
+    if !matches!(order as u8, b'C' | b'F' | b'A') {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "order must be in ('C', 'F', 'A')",
+        ));
+        return std::ptr::null_mut();
+    }
+    let Some(w_obj) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let Some(mv) = super::pyerrors::trap(crate::builtins::w_memoryview_new(w_obj)) else {
+        return std::ptr::null_mut();
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(mv);
+    let view = unsafe { pyre_object::memoryview::w_memoryview_view(mv) };
+    let refuse = |kind, message: &str| {
+        super::pyerrors::set_pending_error(crate::PyError::new(kind, message.to_string()));
+        std::ptr::null_mut()
+    };
+    if buffertype == PY_BUF_WRITE && view.readonly() {
+        return refuse(
+            crate::PyErrorKind::BufferError,
+            "underlying buffer is not writable",
+        );
+    }
+    let shape = unsafe { view.native_shape() };
+    let strides = unsafe { view.native_strides() };
+    let laid_out = contiguous_in(order, &shape, &strides, view.itemsize());
+    if laid_out {
+        return pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    if buffertype == PY_BUF_WRITE {
+        return refuse(
+            crate::PyErrorKind::BufferError,
+            "writable contiguous buffer requested for a non-contiguous object.",
+        );
+    }
+    refuse(
+        crate::PyErrorKind::NotImplementedError,
+        "creating contiguous readonly buffer from non-contiguous not implemented yet",
+    )
+}
+
 fn unowned_view(
     address: usize,
     length: i64,
@@ -930,4 +998,5 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyMemoryView_FromObject as *const ());
     std::hint::black_box(PyMemoryView_FromMemory as *const ());
     std::hint::black_box(PyMemoryView_FromBuffer as *const ());
+    std::hint::black_box(PyMemoryView_GetContiguous as *const ());
 }

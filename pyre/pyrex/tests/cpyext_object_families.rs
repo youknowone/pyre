@@ -1,7 +1,8 @@
-//! `bytearray`, `complex` and `weakref` through their concrete C API.
+//! `bytearray`, `complex`, `memoryview` and `weakref` through their concrete
+//! C API.
 //!
-//! Three whole families an extension reaches for that the layer did not have,
-//! so an extension naming any of them did not compile.
+//! Whole families an extension reaches for that the layer did not have, so an
+//! extension naming any of them did not compile.
 //!
 //! Every expectation was taken from CPython 3.14.6 running this same script
 //! against this same fixture, except where noted: two rows are where CPython
@@ -200,6 +201,65 @@ fn the_complex_entry_points() {
     let fixtures = Fixtures::new("cpyext-complex");
     fixtures.compile("cpyext_object_families");
     fixtures.expect_ok(COMPLEX_SCRIPT, &[], "cpyext-complex-ok");
+}
+
+const MEMORYVIEW_SCRIPT: &str = r#"
+import cpyext_object_families as m
+
+
+def eq(name, got, want):
+    assert got == want, '%s: got %r, want %r' % (name, got, want)
+
+
+# An exporter already laid out the way the caller asked for is handed back as
+# it is, so what comes out reads the same bytes.
+view = m.mv_contiguous(b'abcdef', 'r', 'C')
+eq('a read view over bytes', bytes(view), b'abcdef')
+eq('and it is read-only', view.readonly, True)
+eq('any order accepts a one-dimensional layout',
+   bytes(m.mv_contiguous(b'abcdef', 'r', 'A')), b'abcdef')
+eq('so does Fortran order',
+   bytes(m.mv_contiguous(b'abcdef', 'r', 'F')), b'abcdef')
+
+data = bytearray(b'abcdef')
+written = m.mv_contiguous(data, 'w', 'C')
+eq('a write view is not read-only', written.readonly, False)
+written[0] = ord('z')
+eq('and it writes through to the exporter', data, bytearray(b'zbcdef'))
+
+# What the buffer type asks for is checked against the exporter, not silently
+# copied around.
+eq('a write view over bytes', m.mv_contiguous(b'abcdef', 'w', 'C'),
+   ('BufferError', 'underlying buffer is not writable'))
+
+# A strided view is contiguous in no order, and only the read side has a
+# copy to fall back on -- which is not built yet.
+strided = memoryview(bytearray(b'abcdef'))[::2]
+eq('a read view over a strided one', m.mv_contiguous(strided, 'r', 'C'),
+   ('NotImplementedError',
+    'creating contiguous readonly buffer from non-contiguous not implemented yet'))
+eq('a write view over a strided one', m.mv_contiguous(strided, 'w', 'C'),
+   ('BufferError',
+    'writable contiguous buffer requested for a non-contiguous object.'))
+
+# Both arguments are checked before the exporter is touched.
+eq('a buffer type that is neither', m.mv_contiguous(b'abcdef', '?', 'C'),
+   ('ValueError', 'buffertype must be PyBUF_READ or PyBUF_WRITE'))
+eq('an order that is none of the three', m.mv_contiguous(b'abcdef', 'r', 'X'),
+   ('ValueError', "order must be in ('C', 'F', 'A')"))
+
+# An object that exports no buffer at all fails where `memoryview` would.
+kind, _ = m.mv_contiguous(object(), 'r', 'C')
+eq('an object with no buffer to export', kind, 'TypeError')
+
+print('cpyext-memoryview-ok')
+"#;
+
+#[test]
+fn a_contiguous_view_over_an_exporter() {
+    let fixtures = Fixtures::new("cpyext-memoryview");
+    fixtures.compile("cpyext_object_families");
+    fixtures.expect_ok(MEMORYVIEW_SCRIPT, &[], "cpyext-memoryview-ok");
 }
 
 #[test]

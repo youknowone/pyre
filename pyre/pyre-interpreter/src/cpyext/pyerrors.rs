@@ -968,6 +968,101 @@ fn write_unraisable(context: Option<String>, object: *mut CPyObject) {
     );
 }
 
+/// `pyerrors.py PyErr_PrintEx` — report the pending exception through
+/// `sys.excepthook` and clear the indicator.
+///
+/// A caller that calls this with nothing pending has nothing to report, and
+/// that is the caller's mistake rather than a silent no-op.
+///
+/// `set_sys_last_vars` also leaves the exception on `sys` under the four names
+/// a post-mortem debugger reads it back from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
+    let Some(mut error) = take_pending_error() else {
+        unsafe { PyErr_BadInternalCall() };
+        return;
+    };
+    let space = pyre_object::w_none();
+    let w_value = error
+        .normalize_exception(space)
+        .unwrap_or_else(|_| error.to_exc_object());
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_value);
+    let w_type = crate::baseobjspace::exception_getclass(w_value);
+    roots.pin_root(match w_type.is_null() {
+        true => pyre_object::w_none(),
+        false => w_type,
+    });
+    let w_tb = match !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+        true => unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) },
+        false => pyre_object::PY_NULL,
+    };
+    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+    roots.pin_root(match w_tb.is_null() {
+        true => pyre_object::w_none(),
+        false => w_tb,
+    });
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+
+    let Some(sys_module) = crate::importing::get_sys_module("sys") else {
+        return;
+    };
+    let sys_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(sys_module);
+    if set_sys_last_vars != 0 {
+        // `last_exc` names the exception itself; the three beside it are the
+        // triple that predates it.  A store that fails leaves that one name
+        // alone -- the exception being reported is the one worth keeping.
+        for (name, index) in [
+            ("last_exc", 0),
+            ("last_type", 1),
+            ("last_value", 0),
+            ("last_traceback", 2),
+        ] {
+            let stored = crate::baseobjspace::setattr_str(
+                pyre_object::gc_roots::shadow_stack_get(sys_slot),
+                name,
+                reload(index),
+            );
+            drop(stored);
+        }
+    }
+    let hook = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "excepthook",
+    );
+    let Ok(w_hook) = hook else {
+        return;
+    };
+    if w_hook.is_null() || unsafe { pyre_object::is_none(w_hook) } {
+        return;
+    }
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_hook);
+    let arguments = [reload(1), reload(0), reload(2)];
+    let reported = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        &arguments,
+    );
+    if let Err(mut failure) = reported {
+        // The hook is what failed, and this entry point has no way to say so
+        // to its caller: reporting it as unraisable both names it and leaves
+        // the indicator clear, which is what the next C call needs.
+        failure.write_unraisable(
+            space,
+            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
+            pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        );
+    }
+}
+
+/// `pyerrors.py PyErr_Print` — `PyErr_PrintEx(1)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_Print() {
+    unsafe { PyErr_PrintEx(1) };
+}
+
 /// `PyErr_WriteUnraisable(object)` — report the pending exception through
 /// `sys.unraisablehook` and clear it, naming `object` as what was being
 /// operated on.
@@ -1037,6 +1132,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_ExceptionMatches as *const ());
     std::hint::black_box(PyErr_GivenExceptionMatches as *const ());
     std::hint::black_box(PyErr_Fetch as *const ());
+    std::hint::black_box(PyErr_PrintEx as *const ());
+    std::hint::black_box(PyErr_Print as *const ());
     // ── the failed syscall ──────────────────────────────────────────────────
 
     /// `PyErr_CheckSignals` — run whatever a signal handler left pending.

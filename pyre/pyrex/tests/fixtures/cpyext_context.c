@@ -1,7 +1,10 @@
 /* The interpreter state a call runs inside: the namespace a name falls back
-   to, and the context variables. */
+   to, the context variables, and reporting a failure the caller has no way to
+   hand back. */
 
 #include <Python.h>
+
+#include <string.h>
 
 /* ── the fallback namespace ───────────────────────────────────────────── */
 
@@ -80,12 +83,54 @@ static PyObject *var_get(PyObject *self, PyObject *args)
     return row;
 }
 
+/* ── reporting a failure ──────────────────────────────────────────────── */
+
+/* Raise `ValueError(message)` and report it.  `which` picks between the
+   spelling that takes the flag and the one that is `PyErr_PrintEx(1)`. */
+static PyObject *report(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *which;
+    const char *message;
+    int set_last;
+    if (!PyArg_ParseTuple(args, "ssi", &which, &message, &set_last)) {
+        return NULL;
+    }
+    PyErr_SetString(PyExc_ValueError, message);
+    if (strcmp(which, "print") == 0) {
+        PyErr_Print();
+    } else {
+        PyErr_PrintEx(set_last);
+    }
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* Reporting with nothing to report, which is the caller's own mistake. */
+static PyObject *report_nothing(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    PyErr_PrintEx(1);
+    PyObject *raised = PyErr_GetRaisedException();
+    if (raised == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject *name = PyUnicode_FromString(Py_TYPE(raised)->tp_name);
+    Py_DECREF(raised);
+    return name;
+}
+
 static PyMethodDef methods[] = {
     {"builtins", builtins, METH_NOARGS, NULL},
     {"var_new", var_new, METH_VARARGS, NULL},
     {"var_set", var_set, METH_VARARGS, NULL},
     {"var_reset", var_reset, METH_VARARGS, NULL},
     {"var_get", var_get, METH_VARARGS, NULL},
+    {"report", report, METH_VARARGS, NULL},
+    {"report_nothing", report_nothing, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {PyModuleDef_HEAD_INIT, "cpyext_context", NULL, -1,

@@ -1,4 +1,5 @@
-/* `bytearray`, `complex` and `weakref` through their concrete C API.
+/* `bytearray`, `complex`, `memoryview` and `weakref` through their concrete
+   C API.
 
    Each function answers the observable outcome, so a Python-side comparison
    against CPython running the same code says whether the two agree. */
@@ -151,6 +152,32 @@ static PyObject *cx_basicsize(PyObject *s, PyObject *unused)
                          (Py_ssize_t)sizeof(PyComplexObject));
 }
 
+/* ── memoryview ───────────────────────────────────────────────────────── */
+
+/* `mode` is 'r' or 'w' for the two buffer types, and anything else is passed
+   through so that the refusal can be observed; `order` goes through
+   untouched for the same reason. */
+static PyObject *mv_contiguous(PyObject *s, PyObject *args)
+{
+    (void)s;
+    PyObject *object;
+    const char *mode;
+    const char *order;
+    if (!PyArg_ParseTuple(args, "Oss", &object, &mode, &order)) return NULL;
+    int buffertype = mode[0] == 'r' ? PyBUF_READ : mode[0] == 'w' ? PyBUF_WRITE : 0;
+    PyObject *view = PyMemoryView_GetContiguous(object, buffertype, order[0]);
+    if (view == NULL) {
+        PyObject *raised = PyErr_GetRaisedException();
+        PyObject *text = raised == NULL ? NULL : PyObject_Str(raised);
+        PyObject *pair = Py_BuildValue("(sO)", raised == NULL ? "?" : Py_TYPE(raised)->tp_name,
+                                       text == NULL ? Py_None : text);
+        Py_XDECREF(text);
+        Py_XDECREF(raised);
+        return pair;
+    }
+    return view;
+}
+
 /* ── weakref ──────────────────────────────────────────────────────────── */
 static PyObject *wr_check(PyObject *s, PyObject *o)
 { (void)s; return PyBool_FromLong(PyWeakref_Check(o)); }
@@ -218,6 +245,8 @@ static PyMethodDef methods[] = {
     M("cx_as_ccomplex", cx_as_ccomplex), M("cx_block", cx_block),
     {"cx_from_doubles", cx_from_doubles, METH_VARARGS, NULL},
     {"cx_basicsize", cx_basicsize, METH_NOARGS, NULL},
+
+    {"mv_contiguous", mv_contiguous, METH_VARARGS, NULL},
 
     M("wr_check", wr_check), M("wr_check_ref", wr_check_ref),
     M("wr_check_proxy", wr_check_proxy), M("wr_new_ref", wr_new_ref),
