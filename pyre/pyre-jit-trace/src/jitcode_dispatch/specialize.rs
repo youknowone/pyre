@@ -12873,17 +12873,21 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     Ok(Some(new))
 }
 
-/// Walker-native `ForIterNext` for `W_IntRangeIterator`.
+/// Walker-native `ForIterNext` for an arity-two `zip` over two
+/// `W_TupleIterObject` cursors.
 ///
-/// The generic residual advances the shared iterator before an abort can
-/// occur, and forward-delivery preserves that consumed item.  This inline
-/// path keeps that deliberately irreversible advance: it never journals or
-/// rolls the cursor back.  It instead emits the `W_IntRangeIterator.next`
-/// field-update shape with a continuation guard.  Its false side resumes at
-/// the same FOR_ITER coordinate as the codewriter's ordinary exhaustion edge.
+/// The generic residual advances both shared iterators before an abort can
+/// occur, and forward-delivery preserves the consumed pair.  This inline path
+/// keeps that deliberately irreversible advance: it never journals or rolls
+/// either cursor back.  It emits both `W_TupleIterObject` index updates and a
+/// continuation guard whose false side resumes at the same FOR_ITER coordinate
+/// as the codewriter's ordinary exhaustion edge; `strict=True` routes its
+/// uneven-length arm through the generic path so the interpreter owns the
+/// authentic `ValueError`.
 ///
-/// The continuation item is a normal virtualizable `W_IntObject`; allocation
-/// removal elides it until an escaping consumer or a deopt needs a real box.
+/// The continuation item is the object pair `W_Zip.next_w` builds with
+/// `newtuple2` at arity two; allocation removal elides it until an escaping
+/// consumer or a deopt needs a real box.
 fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
