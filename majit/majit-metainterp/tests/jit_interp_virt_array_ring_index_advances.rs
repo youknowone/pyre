@@ -10,8 +10,8 @@
 //! and each failure has to resume at the boundary of the opcode that computed
 //! the index — before the eviction the same opcode still owes the chain.
 //!
-//! ⛔ OPEN DEFECT — `#[ignore]`d because it FAILS: interpreted 1992 words,
-//! compiled 201. It is the virtualizable-array face of the defect
+//! It measured 201 of 1992 before the fix. It is the virtualizable-array face
+//! of the defect
 //! `jit_interp_bridge_drops_opcode_tail` reproduces with one scalar field, and
 //! it is kept because the ring is what makes the guard fail EVERY trip: the
 //! promoted index is a different value each time, so the branch behind it never
@@ -158,7 +158,7 @@ fn run(program: &[u8], iterations: i64, threshold: u32) -> (i64, i64, i64) {
 }
 
 #[test]
-#[ignore = "open defect: a bridge traced from a mid-opcode guard drops the rest of that opcode"]
+
 fn an_advancing_ring_index_spills_every_word_it_evicts() {
     let program = program();
     // Deep enough that the ring index has cycled hundreds of times after the

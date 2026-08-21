@@ -5232,10 +5232,19 @@ impl<S: JitState> JitDriver<S> {
                     // (resume.py:1028-1038 seeded it in slot order) and resume
                     // at the CRN green pc.
                     let mut cur_exc = exc;
+                    // Where the guard's resume coordinate sits, against which
+                    // the merge point the walk stops at is compared below.
+                    // `set_position` seeds `last_opcode_position` with it, and
+                    // `run_inner` overwrites that per dispatched op, so the two
+                    // stay equal exactly when the first op the blackhole
+                    // dispatches is the one that raises CRN.
+                    let bh_start_position = bh.position;
+                    let mut bh_frames_popped = 0usize;
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
                                 Some(caller) => {
+                                    bh_frames_popped += 1;
                                     // Layout + vinfo were seeded across the
                                     // whole chain before the loop started.
                                     bh_builder.release_interp(bh);
@@ -5254,6 +5263,26 @@ impl<S: JitState> JitDriver<S> {
                     if crate::majit_log_enabled() {
                         eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
+                    // Whether the guard failed AT the merge point rather than
+                    // partway through the opcode that reaches it.
+                    //
+                    // A bridge is entered from the guard, and it is recorded
+                    // from the green pc the walk below reports — the NEXT merge
+                    // point. Everything the blackhole ran to get there is work
+                    // the guard's own opcode still owed, and a bridge that
+                    // starts after it does not contain it: the first failure
+                    // runs it here and every later one jumps into the bridge
+                    // and skips it. A `chain_push` behind a red condition, an
+                    // eviction, a store — each simply stops happening, and
+                    // nothing reports it, because the guard, the recovery
+                    // layout and this resume are all correct.
+                    //
+                    // The walk stopping on the very op it started on is what
+                    // says the opcode owed nothing, and only then may the guard
+                    // source a bridge. A walk that crossed a frame boundary
+                    // cannot be judged by one frame's coordinate, so it is not.
+                    let guard_at_merge_point =
+                        bh_frames_popped == 0 && bh.last_opcode_position == bh_start_position;
                     let mut portal_crn_handled = false;
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
@@ -5412,7 +5441,11 @@ impl<S: JitState> JitDriver<S> {
                         // from — nothing to bridge, just exit. The blackhole has
                         // already recovered `state` to the resume point, so the
                         // bridge sees the post-guard-failure values.
-                        if should_bridge && !portal_crn_handled && pc != usize::MAX {
+                        if should_bridge
+                            && guard_at_merge_point
+                            && !portal_crn_handled
+                            && pc != usize::MAX
+                        {
                             let bridge_ok =
                                 self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
                             if crate::majit_log_enabled() {

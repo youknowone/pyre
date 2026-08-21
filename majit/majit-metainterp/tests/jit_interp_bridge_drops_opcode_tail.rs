@@ -13,12 +13,12 @@
 //! computed twice: once with the threshold out of reach, which fixes the
 //! answer, and once warm.
 //!
-//! ⛔ OPEN DEFECT — this test is `#[ignore]`d because it FAILS. Measured with
-//! `N = 2000` and `CAP = 8`: interpreted 1992 words, compiled 202. The 202 are
-//! the trips before the branch earned a bridge; from the bridge onwards the
-//! call never runs again. `MAJIT_NO_BRIDGE=1` and `MAJIT_MAX_BRIDGES=0` both
-//! make it pass, which places the loss in bridge tracing rather than in the
-//! guard, the recovery layout or the blackhole resume.
+//! It measured 202 of 1992 before the fix, with `N = 2000` and `CAP = 8`: the
+//! 202 are the trips before the branch earned a bridge, and from the bridge
+//! onwards the call never ran again. `MAJIT_NO_BRIDGE=1` and
+//! `MAJIT_MAX_BRIDGES=0` both made it pass, which placed the loss in bridge
+//! tracing rather than in the guard, the recovery layout or the blackhole
+//! resume.
 //!
 //! The mechanism is a position mismatch. The failing guard's resume state is
 //! mid-opcode — its failargs carry `sp` ALREADY incremented, so the point it
@@ -151,7 +151,7 @@ fn run(program: &[u8], iterations: i64, threshold: u32) -> (i64, i64, i64) {
 }
 
 #[test]
-#[ignore = "open defect: a bridge traced from a mid-opcode guard drops the rest of that opcode"]
+
 fn a_residual_call_after_a_mid_opcode_guard_survives_a_bridge() {
     let program = vec![OP_PUSH, OP_BACK, OP_RET];
     // Deep enough that the branch is taken for far longer than the
