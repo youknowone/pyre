@@ -89,6 +89,13 @@ pub fn w_list_find_or_count(
 /// index when still within bounds (listobject.py:791 guard against
 /// `eq_w`-triggered mutations), raises `ValueError` otherwise.
 pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
+    // The scan runs the elements' `__eq__`, which is a collection point.
+    // `w_list_find_or_count` pins and reloads for its own loop, but that scope
+    // drops when it returns, so the length read and the pop below would
+    // address the list at its pre-move header.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
     let i = match w_list_find_or_count(obj, w_value, 0, i64::MAX, false)? {
         FindOrCountResult::Index(i) => i,
         FindOrCountResult::NotFound => {
@@ -100,6 +107,7 @@ pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyErr
         FindOrCountResult::Count(_) => unreachable!("find_or_count with count=false returns Count"),
     };
     // listobject.py: `if i < self.length():  # otherwise list was mutated`
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let length = unsafe { pyre_object::w_list_len(obj) } as i64;
     if i < length {
         unsafe {
