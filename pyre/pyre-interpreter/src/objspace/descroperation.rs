@@ -3581,6 +3581,13 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         // an exact-builtin right operand (the usual format argument) skips the
         // subtype probe.
         if is_str_lhs || is_bytes_lhs {
+            // Both override probes run Python, and the formatter runs more of
+            // it for every conversion.  The operands were popped off the value
+            // stack before this dispatch, so publish the pair: the receiver is
+            // immobile and only needs to stay reachable, while the operand may
+            // be a dict and is read back from its slot.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
             if !pyre_object::is_exact_builtin_instance(b)
                 && let (Some(at), Some(bt)) = (crate::typedef::r#type(a), crate::typedef::r#type(b))
                 && at != bt
@@ -3589,9 +3596,15 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             {
                 return Ok(result);
             }
-            if let Some(result) = try_subclass_binop_override(a, b, "__mod__")? {
+            if let Some(result) = try_subclass_binop_override(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+                "__mod__",
+            )? {
                 return Ok(result);
             }
+            let a = pyre_object::gc_roots::shadow_stack_get(operands);
+            let b = pyre_object::gc_roots::shadow_stack_get(operands + 1);
             return if is_str_lhs {
                 crate::objspace::std::formatting::str_format_percent(a, b)
             } else {

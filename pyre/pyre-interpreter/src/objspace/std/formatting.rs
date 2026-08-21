@@ -27,6 +27,14 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 /// positional slot if any remains, and surplus positional values are an
 /// error only when the operand is not itself a mapping.
 pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    // The conversions below run Python, and `BINARY_OP %` popped both operands
+    // before dispatching here, so neither the format string nor the operand
+    // is rooted by the frame any more.  A str is immobile and read directly
+    // once pinned; `args` may be a dict and is read back from its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(fmt);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args);
     let fmt_str = w_str_get_wtf8(fmt);
     let format = CFormatWtf8::parse_from_wtf8(fmt_str)
         .map_err(|err| PyError::value_error(err.to_string()))?;
@@ -37,11 +45,11 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     // order; any other operand is the single positional value.
     let args_is_tuple = is_tuple(args);
     let dict = if !args_is_tuple && !is_str(args) && has_getitem(args) {
-        Some(args)
+        Some(args_slot)
     } else {
         None
     };
-    let positional: Vec<PyObjectRef> = if args_is_tuple {
+    let items: Vec<PyObjectRef> = if args_is_tuple {
         let n = w_tuple_len(args);
         (0..n)
             .filter_map(|i| w_tuple_getitem(args, i as i64))
@@ -49,7 +57,11 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     } else {
         vec![args]
     };
-    let mut pos = positional.into_iter().peekable();
+    let mut pos = OperandColumn {
+        base: pyre_object::gc_roots::pin_roots(&items),
+        len: items.len(),
+        cursor: 0,
+    };
 
     let mut result = Wtf8Buf::new();
     let mut saw_specifier = false;
@@ -63,10 +75,13 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
             }) => {
                 saw_specifier = true;
                 let value = if let Some(key) = mapping_key {
-                    let Some(dict) = dict else {
+                    let Some(dict_slot) = dict else {
                         return Err(PyError::type_error("format requires a mapping"));
                     };
-                    let w_value = crate::baseobjspace::getitem(dict, w_str_from_wtf8(key))?;
+                    let w_value = crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                        w_str_from_wtf8(key),
+                    )?;
                     // A keyed spec still consumes a positional slot when one
                     // is available (`%(k)s %s` leaves nothing for the `%s`).
                     let _ = pos.next();
@@ -95,9 +110,9 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     // empty tuple / a mapping is allowed but any other non-empty operand is
     // surplus.
     let surplus = if saw_specifier {
-        pos.peek().is_some()
+        pos.has_next()
     } else {
-        !(args_is_tuple && w_tuple_len(args) == 0)
+        !(args_is_tuple && w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot)) == 0)
     };
     if dict.is_none() && surplus {
         return Err(PyError::type_error(
@@ -126,6 +141,14 @@ pub(crate) unsafe fn bytes_format_percent(fmt: PyObjectRef, args: PyObjectRef) -
 }
 
 unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
+    // As `str_format_percent`: the conversions run Python and `BINARY_OP %`
+    // popped both operands, so nothing else roots them.  `fmt` is pinned for
+    // the borrow below — a bytes-like object never moves, but an unreachable
+    // one is still swept, and the slice points into its payload.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(fmt);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args);
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
     let format = CFormatBytes::parse_from_bytes(fmt_bytes)
         .map_err(|err| PyError::value_error(err.to_string()))?;
@@ -159,8 +182,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                 CFormatPart::Literal(literal) => result.extend(literal),
                 CFormatPart::Spec(CFormatSpecKeyed { mapping_key, spec }) => {
                     let key = mapping_key.expect("mapping spec carries a key");
-                    let value =
-                        crate::baseobjspace::getitem(args, pyre_object::w_bytes_from_bytes(&key))?;
+                    let value = crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(args_slot),
+                        pyre_object::w_bytes_from_bytes(&key),
+                    )?;
                     result.extend(spec_format_bytes(&spec, value)?);
                 }
             }
@@ -168,7 +193,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
         return Ok(bytes_format_result(fmt, &result));
     }
 
-    let positional: Vec<PyObjectRef> = if pyre_object::is_tuple(args) {
+    let items: Vec<PyObjectRef> = if pyre_object::is_tuple(args) {
         let n = pyre_object::w_tuple_len(args);
         (0..n)
             .filter_map(|i| pyre_object::w_tuple_getitem(args, i as i64))
@@ -176,7 +201,11 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     } else {
         vec![args]
     };
-    let mut pos = positional.into_iter().peekable();
+    let mut pos = OperandColumn {
+        base: pyre_object::gc_roots::pin_roots(&items),
+        len: items.len(),
+        cursor: 0,
+    };
 
     for (_, part) in format {
         match part {
@@ -194,7 +223,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
         }
     }
 
-    if pos.peek().is_some() {
+    if pos.has_next() {
         Err(PyError::type_error(
             "not all arguments converted during bytes formatting",
         ))
@@ -625,8 +654,39 @@ unsafe fn has_dunder(obj: PyObjectRef, name: &str) -> bool {
 
 /// `peel_num` — a `*` field width reads its value (and, when negative, the
 /// left-align flag) from the next positional argument.
+/// The positional operands, addressed by shadow slot rather than held in a
+/// `Vec`.
+///
+/// Every conversion runs Python — `__str__`, `__repr__`, `__format__`, and a
+/// `*` width's `__index__` — so each one is a collection point.  A plain `Vec`
+/// of operands is not something the collector rewrites, so an entry still
+/// waiting its turn would be formatted at a pre-move address once it is a list
+/// or a dict.  The column is pinned once by the caller and each operand is
+/// read back from its slot when its turn comes.
+struct OperandColumn {
+    base: usize,
+    len: usize,
+    cursor: usize,
+}
+
+impl OperandColumn {
+    fn next(&mut self) -> Option<PyObjectRef> {
+        if self.cursor >= self.len {
+            return None;
+        }
+        let operand = pyre_object::gc_roots::shadow_stack_get(self.base + self.cursor);
+        self.cursor += 1;
+        Some(operand)
+    }
+
+    /// Whether any operand is still unconsumed — the `checkconsumed` test.
+    fn has_next(&self) -> bool {
+        self.cursor < self.len
+    }
+}
+
 unsafe fn update_quantity_from_tuple(
-    pos: &mut std::iter::Peekable<std::vec::IntoIter<PyObjectRef>>,
+    pos: &mut OperandColumn,
     quantity: &mut Option<CFormatQuantity>,
     flags: &mut CConversionFlags,
 ) -> Result<(), PyError> {
@@ -644,7 +704,7 @@ unsafe fn update_quantity_from_tuple(
 /// `peel_num` — a `*` precision reads its value from the next positional
 /// argument (a negative precision is treated as absent).
 unsafe fn update_precision_from_tuple(
-    pos: &mut std::iter::Peekable<std::vec::IntoIter<PyObjectRef>>,
+    pos: &mut OperandColumn,
     precision: &mut Option<CFormatPrecision>,
 ) -> Result<(), PyError> {
     if !matches!(
