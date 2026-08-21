@@ -754,6 +754,14 @@ pub struct ReconstructRecipe {
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
     pub nargs: usize,
+    /// Set only for a level that reconstructs NO frame: on the way out it
+    /// discards its callee's result and yields this box to its own caller
+    /// instead.  `typeobject.py descr_call` is the one such level — the
+    /// discard of `__init__`'s result plus `return w_newobject` is its whole
+    /// JIT-visible body, so there is no bytecode to walk and no
+    /// `locals_cells_stack_w` to rebuild.  Every other field above is unread
+    /// when this is `Some`.
+    pub return_substitute: Option<OpRef>,
 }
 
 /// The decoded inline-callee recipes for one multi-frame

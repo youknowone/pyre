@@ -1243,7 +1243,17 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 
     let mut parent_guards = Vec::new();
     let mut parent_for_current = root_frame.clone();
+    // `descr_call`'s tail, when the paused chain carries one.  It is not a
+    // Python frame: it enters no recursion chain and reconstructs nothing, so
+    // it is skipped below — but a guard this sub-walk takes inside `__init__`
+    // must still record it, which `walker_capture_multi_frame_inline_snapshot`
+    // does off the walk mode rather than off the parent chain.
+    let mut ctor_continuation_instance = OpRef::NONE;
     for parent_recipe in paused_parent_recipes {
+        if let Some(instance) = parent_recipe.return_substitute {
+            ctor_continuation_instance = instance;
+            continue;
+        }
         // `InlineFrame.w_code` is the portal green (`W_Code`) used by
         // `fbw_inline_recursion_count`, not the raw `CodeObject*` carried by
         // a reconstruction recipe.  Forward inlining pushes the wrapper too;
@@ -1290,6 +1300,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     .then_some(root_sym.last_exc_box()),
                 current_exception_seed_concrete: root_sym.last_exc_value(),
                 class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
+                ctor_continuation_instance,
                 ..Default::default()
             },
             session,

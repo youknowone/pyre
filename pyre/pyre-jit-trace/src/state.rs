@@ -8029,6 +8029,43 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         decline!("NoSnapshotPc");
     }
+    // `descr_call`'s tail reconstructs no frame.  Its jitcode has no code
+    // object, so every check below would decline it, and the whole chain with
+    // it; but its JIT-visible body is only the discard of `__init__`'s result
+    // and `ref_return` of the instance, which the drain can carry out by
+    // substituting the box on the way out.  Decode that one box here.
+    if crate::ctor_continuation::is_installed_level(frame.jitcode_index) {
+        let [instance_value] = frame.values.as_slice() else {
+            decline!("CtorTailArity");
+        };
+        let (instance, _) = bridge_decode_box(
+            ctx,
+            instance_value,
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        if instance.is_none() {
+            decline!("CtorTailBox");
+        }
+        return Some(ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: frame.jitcode_index,
+            jitcode_pc: frame.pc,
+            nlocals: 0,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: Vec::new(),
+            registers_f: Vec::new(),
+            concrete_r: Vec::new(),
+            nargs: 0,
+            return_substitute: Some(instance),
+        });
+    }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
     let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
@@ -8389,6 +8426,7 @@ fn reconstruct_inline_recipe(
                 registers_f,
                 concrete_r,
                 nargs: frame_nlocals,
+                return_substitute: None,
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = ref_values[frame_pos] else {
@@ -8528,6 +8566,7 @@ fn reconstruct_inline_recipe(
             registers_f,
             concrete_r,
             nargs: frame_nlocals,
+            return_substitute: None,
         });
     }
 
@@ -8678,6 +8717,7 @@ fn reconstruct_inline_recipe(
         registers_f,
         concrete_r,
         nargs: frame_nlocals,
+        return_substitute: None,
     })
 }
 

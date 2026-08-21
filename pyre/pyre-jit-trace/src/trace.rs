@@ -1716,6 +1716,19 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
     ctx.restore_virtualref_boxes(pre_virtualref_boxes[..restore_depth].to_vec());
 }
 
+/// How many of a carrier's recipes are real Python frames.
+///
+/// The multi-frame depth cap bounds reconstructed `PyFrame`s, so a level that
+/// reconstructs none — `descr_call`'s tail, which only substitutes its
+/// callee's result — must not consume one of its slots.
+fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
+    carrier
+        .recipes
+        .iter()
+        .filter(|recipe| recipe.return_substitute.is_none())
+        .count()
+}
+
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -1831,7 +1844,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
         // framestack missing the middles on such a guard's deopt).
         if carrier.recipes.len() >= 2
-            && carrier.recipes.len() <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
+            && carrier_py_frame_depth(carrier)
+                <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
         {
             &carrier.recipes[..carrier.recipes.len() - 1]
         } else {
@@ -1866,7 +1880,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // middle shape yields `None` and drops to the journal-rollback abort
         // epilogue below, so a carrier we cannot compile deopts cleanly.
         let n = carrier.recipes.len();
-        let want_compile = n >= 1 && n <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
+        let want_compile = n >= 1
+            && carrier_py_frame_depth(carrier)
+                <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
         let mut middles_ok = true;
         if want_compile {
             for i in (0..n.saturating_sub(1)).rev() {
@@ -1949,8 +1965,16 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let n = carrier.recipes.len();
         let middles = &carrier.recipes[..n.saturating_sub(1)];
         let middles_ok = n >= 1
-            && n <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
+            && carrier_py_frame_depth(carrier)
+                <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
             && middles.iter().rev().all(|middle| {
+                // `descr_call`'s tail has no handler and no Python frame, so an
+                // exception crossing it neither catches nor leaves a traceback
+                // entry — there is nothing here to decline over, and nothing
+                // for the crossing loop below to do either.
+                if middle.return_substitute.is_some() {
+                    return true;
+                }
                 let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
                     crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
                     return false;
@@ -1976,6 +2000,11 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             // the nodes prepend into the same chain order the interpreter
             // builds.
             for middle in middles.iter().rev() {
+                // The tail was never entered on the execution context and owns
+                // no `PyFrame`, so it is neither left nor recorded.
+                if middle.return_substitute.is_some() {
+                    continue;
+                }
                 record_carrier_crossed_frame_traceback(ctx, middle, exc, exc_concrete);
                 crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, true);
             }
@@ -2153,6 +2182,35 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
 ) -> Option<majit_ir::OpRef> {
+    // `descr_call`'s tail: no frame to reconstruct and no bytecode to walk.
+    // Discarding the child's result and answering with the instance IS its
+    // whole body, so perform it here instead of driving a frame.
+    if let Some(instance) = middle.return_substitute {
+        // `check_init_returned_none` still has to hold, and the resumed
+        // `__init__` is being walked down an arm the loop never traced — the
+        // very arm that may `return` something.  The forward inline settles
+        // this by reading the concrete result and abandoning the inline when
+        // it is not `None` (`inline_call.rs`, the `constructor_result` arm);
+        // the drain has the same reading available and makes the same call.
+        // Declining sends the carrier to the journal-rollback epilogue and
+        // the chain to the blackhole, which runs the real
+        // `bh_check_init_returned_none` and raises the faithful `TypeError`.
+        // `is_none` dereferences, so the sentinel and the null both have to be
+        // filtered before it is reached — `NO_CONCRETE` is `usize::MAX - 1`.
+        let returned_none = matches!(
+            ctx.concrete_of_opref(child_result),
+            Some(majit_ir::Value::Ref(obj))
+                if obj != majit_ir::GcRef::NO_CONCRETE
+                    && !obj.is_null()
+                    && unsafe { pyre_object::is_none(obj.as_usize() as pyre_object::PyObjectRef) }
+        );
+        if !returned_none {
+            crate::jitcode_dispatch::census_record("P2Drain::CtorTailNotNone");
+            return None;
+        }
+        crate::jitcode_dispatch::census_record("P2Drain::CtorTailSubstitute");
+        return Some(instance);
+    }
     let Some((pending, middle_argboxes_r)) =
         crate::state::setup_reconstructed_callee_frame(ctx, middle, root_ec, Vec::new())
     else {

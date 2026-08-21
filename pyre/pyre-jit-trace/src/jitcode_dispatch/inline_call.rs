@@ -3168,6 +3168,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !positional_only && vararg_slot.is_none() {
         return resolved_inline_decline(op.pc, line!());
     }
+    // A tail on the walk mode means this sub-walk IS `__init__`'s, so inlining
+    // a callee under it would put a second frame between `__init__` and the
+    // guard.  `walker_capture_multi_frame_inline_snapshot` writes the tail
+    // directly beneath whichever callee is current, and the position it needs
+    // is beneath `__init__` — so at that depth it would be recorded one frame
+    // too low, and the chain would deliver the nested callee's return into
+    // `descr_call`'s slot.  Keep the nested call residual: `__init__` stays a
+    // single frame and the tail keeps the only position it can occupy.
+    if ctx.fbw_mode.ctor_continuation_instance != OpRef::NONE {
+        return resolved_inline_decline(op.pc, line!());
+    }
     // Not every caller pins the callee function itself.  A specializer that
     // resolves an app-level method behind a builtin — `str(e)` reaching an
     // exception subclass's `__str__` — passes the CALL's own operand, which is

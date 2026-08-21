@@ -13,12 +13,36 @@
 //!
 //! — are just its jitcode, and the blackhole runs them with no special case.
 //!
-//! Pyre cannot reuse that graph.  Its counterpart is
-//! `pyre-interpreter/src/call.rs type_descr_call_impl`, and the build-time
-//! `find_all_graphs` BFS from the `eval::eval_loop_jit` portal does not reach
-//! it: `call_function_impl_raw` is in the frozen table, its callee
-//! `call_function_impl_result` is not, so the whole type-call spine below that
-//! cut is absent.  Nothing in the table can play the level.
+//! Pyre cannot reuse that graph, and this module is the ADAPTATION that
+//! stands in for it.  The counterpart of `descr_call` is
+//! `pyre-interpreter/src/call.rs type_descr_call_impl`, and two independent
+//! things keep it from playing the level:
+//!
+//!   1. Pyre never *enters* it.  `try_walker_inline_type_call`
+//!      (`jitcode_dispatch/inline_call.rs`) recognises `C(...)` while decoding
+//!      the CALL and synthesises the body itself — it resolves `__new__` and
+//!      `__init__` off the type, emits the allocation through
+//!      `helpers::emit_instance_inline`, and inlines only `__init__` as a user
+//!      call.  No pc inside `type_descr_call_impl` is ever current, so no
+//!      resume coordinate can name one.  This is the same divergence
+//!      `find_all_graphs_bfs` already documents for the builtin gateways:
+//!      pyre's opcode walker lowers a Python CALL directly instead of through
+//!      the source-level dispatch graph.
+//!   2. The graph is not in the frozen table either.  The build-time
+//!      `find_all_graphs` BFS from the `eval::eval_loop_jit` portal stops
+//!      above it — `call_function_impl_raw` is present, its callee
+//!      `call_function_impl_result` is not — so the whole type-call spine
+//!      below that cut is absent.
+//!
+//! CONVERGENCE PATH: (2) is a seed away — `find_all_graphs_bfs` already takes
+//! explicit extra seeds — but fixing it alone changes nothing, because (1) is
+//! what decides that the graph is never run.  Converging means retiring the
+//! opcode-level recogniser and inlining `type_descr_call_impl`'s generated
+//! jitcode as an ordinary callee frame, the way upstream traces through
+//! `descr_call`.  Then `__init__` is a frame inside a frame, the discard and
+//! the None check are that graph's own jitcode, and this module deletes.
+//! Until then the stand-in is deliberately the smallest thing that can hold a
+//! resume coordinate: three ops, entered only by resume, never compiled.
 //!
 //! Without such a level the constructor route cannot be seeded at all.  A
 //! blackhole level's return kind is decided by the `*_return` op the callee
@@ -86,21 +110,33 @@ pub extern "C" fn bh_check_init_returned_none(init_result: i64) {
     }
 }
 
+thread_local! {
+    static LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
+        const { std::cell::OnceCell::new() };
+}
+
 /// `(jitcode index, resume pc)` of the shared tail, built on first use.
 ///
 /// Thread-local because `MetaInterpStaticData` is: the index it hands back
 /// names a slot in this thread's `jitcodes`.
 fn level() -> Option<(i32, usize)> {
-    thread_local! {
-        static LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
-            const { std::cell::OnceCell::new() };
-    }
     LEVEL.with(|cell| *cell.get_or_init(build))
 }
 
 /// The jitcode index of the tail, or `None` when it could not be built.
 pub(crate) fn jitcode_index() -> Option<i32> {
     level().map(|(index, _)| index)
+}
+
+/// Whether `index` names the tail, WITHOUT building it.
+///
+/// A reader that only asks "is this resumed level the tail?" must not be the
+/// thing that mints it: [`level`] installs a jitcode into
+/// `MetaInterpStaticData.jitcodes`, so calling it from a decode path would
+/// append that slot in every process that ever decodes a resume section,
+/// shifting the index space for programs that never inline a constructor.
+pub(crate) fn is_installed_level(index: i32) -> bool {
+    LEVEL.with(|cell| matches!(cell.get(), Some(&Some((installed, _))) if installed == index))
 }
 
 /// The byte offset the tail's resume section must name.
@@ -235,5 +271,14 @@ mod tests {
         cell.with(|c| c.set(0));
         bh_check_init_returned_none(pyre_object::w_none() as i64);
         assert_eq!(cell.with(|c| c.get()), 0, "a None result must not raise");
+
+        bh_check_init_returned_none(pyre_object::w_int_new(1) as i64);
+        assert_ne!(
+            cell.with(|c| c.get()),
+            0,
+            "a non-None result must publish the TypeError where \
+             `handler_residual_call_r_v` reads it",
+        );
+        cell.with(|c| c.set(0));
     }
 }
