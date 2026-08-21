@@ -981,17 +981,59 @@ fn build_bare_gcstruct_descr_group(
 /// with `malloc(STRINGPIECE)` (a GC alloc), so it must be a traced edge — the
 /// `Ref` flag puts it into `gc_fielddescrs`, and the runtime tid's
 /// `gc_ptr_offsets = [32]` mirrors that so the collector reclaims the chain. The
-/// 40-byte body must match `size_of::<StringBuilderBox>()`.
+/// body size and field offsets are the `pyre_object::rbuilder` constants that
+/// `pyre-jit::eval` pins to `StringBuilderBox` with `offset_of!` const asserts.
 static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::rbuilder as rb;
     build_bare_gcstruct_descr_group(
-        40,
-        pyre_object::rbuilder::stringbuilder_gc_type_id(),
+        rb::STRINGBUILDER_SIZE,
+        rb::stringbuilder_gc_type_id(),
         &[
-            ("current_buf", 0, 8, Type::Int, true, false, false),
-            ("current_pos", 8, 8, Type::Int, true, false, false),
-            ("current_end", 16, 8, Type::Int, true, false, false),
-            ("total_size", 24, 8, Type::Int, true, false, false),
-            ("extra_pieces", 32, 8, Type::Ref, false, false, false),
+            (
+                "current_buf",
+                rb::STRINGBUILDER_CURRENT_BUF_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "current_pos",
+                rb::STRINGBUILDER_CURRENT_POS_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "current_end",
+                rb::STRINGBUILDER_CURRENT_END_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "total_size",
+                rb::STRINGBUILDER_TOTAL_SIZE_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "extra_pieces",
+                rb::STRINGBUILDER_EXTRA_PIECES_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "stringbuilder",
     )
@@ -1014,12 +1056,29 @@ pub fn stringbuilder_size_descr() -> DescrRef {
 /// (offset 8) is a `Ref` edge to the previous node, so it is traced
 /// (`gc_fielddescrs = [8]`, tid `gc_ptr_offsets = [8]`). 16-byte body.
 static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::rbuilder as rb;
     build_bare_gcstruct_descr_group(
-        16,
-        pyre_object::rbuilder::stringpiece_gc_type_id(),
+        rb::STRINGPIECE_SIZE,
+        rb::stringpiece_gc_type_id(),
         &[
-            ("buf", 0, 8, Type::Int, true, false, false),
-            ("prev_piece", 8, 8, Type::Ref, false, false, false),
+            (
+                "buf",
+                rb::STRINGPIECE_BUF_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "prev_piece",
+                rb::STRINGPIECE_PREV_PIECE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "stringpiece",
     )
@@ -6000,11 +6059,15 @@ mod tests {
         // would (a small dynamic id, NOT the truncated `cache_key as u32`
         // placeholder), then force the group. A resolved tid keeps the
         // unresolved-struct walker from re-stamping a destructor-less tid.
-        let fake_tid = 0x00AB_CDEF_u32;
-        pyre_object::rbuilder::set_stringbuilder_gc_type_id(fake_tid);
+        let published_tid = 0x00AB_CDEF_u32;
+        pyre_object::rbuilder::set_stringbuilder_gc_type_id(published_tid);
 
         let size = stringbuilder_size_descr();
         let sd = size.as_size_descr().expect("stringbuilder is a SizeDescr");
+        // The group binds the published tid once, at first force; read it back so
+        // the tid assertions reflect what the group actually captured, not a
+        // locally chosen constant a competing first-forcer could diverge from.
+        let published_tid = pyre_object::rbuilder::stringbuilder_gc_type_id();
 
         // Body layout mirrors `size_of::<StringBuilderBox>()` and the analyzer's
         // layer-2a structural layout (current_buf@0 .. extra_pieces@32).
@@ -6028,7 +6091,7 @@ mod tests {
         );
         assert_eq!(
             sd.type_id(),
-            fake_tid,
+            published_tid,
             "descr must carry the published box tid",
         );
         assert_eq!(
@@ -6051,7 +6114,7 @@ mod tests {
             .as_size_descr()
             .expect("resolved stringbuilder entry is a SizeDescr");
         assert_eq!(resolved.size(), 40);
-        assert_eq!(resolved.type_id(), fake_tid);
+        assert_eq!(resolved.type_id(), published_tid);
         let resolved_traced: Vec<usize> = resolved
             .gc_fielddescrs()
             .iter()
@@ -6065,11 +6128,15 @@ mod tests {
         // rbuilder epic task #48. The `extra_pieces` chain node, registered the
         // same way as the builder: a headered bare GcStruct resolved via
         // `New{"stringpiece"}` (the grow path's `malloc(STRINGPIECE)`).
-        let fake_tid = 0x00BE_EF01_u32;
-        pyre_object::rbuilder::set_stringpiece_gc_type_id(fake_tid);
+        let published_tid = 0x00BE_EF01_u32;
+        pyre_object::rbuilder::set_stringpiece_gc_type_id(published_tid);
 
         let size = stringpiece_size_descr();
         let sd = size.as_size_descr().expect("stringpiece is a SizeDescr");
+        // Read the group-captured tid back (see the builder test) so the tid
+        // assertions do not hardcode a constant a competing first-forcer could
+        // diverge from.
+        let published_tid = pyre_object::rbuilder::stringpiece_gc_type_id();
 
         // Body layout mirrors `size_of::<StringPieceBox>()`: buf@0, prev_piece@8.
         assert_eq!(sd.size(), 16, "stringpiece body must be 16 bytes");
@@ -6086,7 +6153,7 @@ mod tests {
         );
         assert_eq!(
             sd.type_id(),
-            fake_tid,
+            published_tid,
             "descr must carry the published node tid"
         );
         assert_eq!(
@@ -6107,7 +6174,7 @@ mod tests {
             .as_size_descr()
             .expect("resolved stringpiece entry is a SizeDescr");
         assert_eq!(resolved.size(), 16);
-        assert_eq!(resolved.type_id(), fake_tid);
+        assert_eq!(resolved.type_id(), published_tid);
         let resolved_traced: Vec<usize> = resolved
             .gc_fielddescrs()
             .iter()
