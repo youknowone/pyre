@@ -93,7 +93,7 @@ pub struct CPyAsyncMethods {
     pub am_send: *const c_void,
 }
 
-/// `PyBufferProcs`, declared for its offsets: nothing reads these yet.
+/// `PyBufferProcs`.
 #[repr(C)]
 pub struct CPyBufferProcs {
     pub bf_getbuffer: *const c_void,
@@ -1208,6 +1208,14 @@ macro_rules! async_entry {
     };
 }
 
+macro_rules! buffer_entry {
+    ($field:ident) => {
+        suite_entry!(tp_as_buffer, CPyBufferProcs, $field, |tp, _, slot| unsafe {
+            (*table_of!(tp, tp_as_buffer, CPyBufferProcs)).$field = slot
+        })
+    };
+}
+
 /// The `tp_` slots this runtime fills to reach a method it answers for
 /// itself, and the method whose presence on the type earns each one.
 const UNARY_SLOTS: [(
@@ -1425,6 +1433,30 @@ fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
             scalar_entry!(tp_descr_set),
             interp_tp_descr_set as *const c_void,
         );
+    }
+    // `slotdefs.py make_bf_getbuffer` earns the buffer slots from the type's
+    // own declaration for a type this runtime defines, and the `__buffer__`
+    // slotdef earns them from the method for a class written in Python --
+    // which is the only one of the two a heap type can satisfy, so a heap
+    // type that defines no `__buffer__` keeps whatever its base handed down.
+    let exports_buffer = match heaptype {
+        true => unsafe { crate::baseobjspace::lookup_where(w_type, "__buffer__") }
+            .is_some_and(|(owner, _)| owner == w_type),
+        false => super::buffer::declares_buffer(w_type),
+    };
+    if exports_buffer {
+        for (function, access) in [
+            (
+                super::buffer::interp_bf_getbuffer as *const c_void,
+                buffer_entry!(bf_getbuffer),
+            ),
+            (
+                super::buffer::interp_bf_releasebuffer as *const c_void,
+                buffer_entry!(bf_releasebuffer),
+            ),
+        ] {
+            (access.write)(mirror, w_type, function);
+        }
     }
     // Both names, because one slot answers for the assignment and the
     // deletion and there is no spelling for having only one of them.

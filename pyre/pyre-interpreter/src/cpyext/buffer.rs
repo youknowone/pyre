@@ -14,7 +14,7 @@ use super::pyobject::{self, CPyObject};
 use super::typeobject::{CPyTypeObject, pending_or, slot_of};
 use parking_lot::Mutex;
 use pyre_object::PyObjectRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -38,6 +38,9 @@ const PY_BUF_WRITABLE: c_int = 0x0001;
 const PY_BUF_FORMAT: c_int = 0x0004;
 const PY_BUF_ND: c_int = 0x0008;
 const PY_BUF_STRIDES: c_int = 0x0010 | PY_BUF_ND;
+const PY_BUF_C_CONTIGUOUS: c_int = 0x0020 | PY_BUF_STRIDES;
+const PY_BUF_F_CONTIGUOUS: c_int = 0x0040 | PY_BUF_STRIDES;
+const PY_BUF_ANY_CONTIGUOUS: c_int = 0x0080 | PY_BUF_STRIDES;
 const PY_BUF_READ: c_int = 0x100;
 const PY_BUF_WRITE: c_int = 0x200;
 
@@ -151,9 +154,22 @@ fn fortran_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
 
 // ── `bf_getbuffer` as a `memoryview` ────────────────────────────────────
 
+/// The `bf_getbuffer` of a **C** exporter, or null.
+///
+/// A slot filled with [`interp_bf_getbuffer`] is not one: that trampoline
+/// answers by acquiring a `memoryview`, which is where this lookup is made
+/// from, so following it would call straight back into the caller.
+fn c_getbuffer_of(w_obj: PyObjectRef) -> *const c_void {
+    let slot = slot_of(w_obj, getbuffer_of);
+    match std::ptr::eq(slot, interp_bf_getbuffer as *const c_void) {
+        true => std::ptr::null(),
+        false => slot,
+    }
+}
+
 /// Does `w_obj`'s type export a buffer through a C `bf_getbuffer`?
 pub fn exports_buffer(w_obj: PyObjectRef) -> bool {
-    !slot_of(w_obj, getbuffer_of).is_null()
+    !c_getbuffer_of(w_obj).is_null()
 }
 
 /// The view a C exporter's `bf_getbuffer` produces, or `None` when `w_obj`'s
@@ -162,7 +178,7 @@ pub fn buffer_view(
     w_obj: PyObjectRef,
     flags: c_int,
 ) -> Option<Result<PyObjectRef, crate::PyError>> {
-    let slot = slot_of(w_obj, getbuffer_of);
+    let slot = c_getbuffer_of(w_obj);
     if slot.is_null() {
         return None;
     }
@@ -316,6 +332,207 @@ pub unsafe fn release_view(mv: PyObjectRef, backing: PyObjectRef) -> bool {
         release_c_view(view);
     }
     true
+}
+
+// ── the buffer slots of a synthesized type mirror ───────────────────────
+
+/// Does `w_type` declare that its instances export a buffer?
+///
+/// The counterpart of `TypeDef.__buffer`, which each type declares beside
+/// itself and which reaches exactly one reader, `make_bf_getbuffer`, as a
+/// plain yes/no -- the `'read'` / `'read-write'` vocabulary it is written in
+/// is never consulted.  A type that declares nothing takes its bases'
+/// declaration, so the answer follows the hierarchy rather than exact
+/// identity and a class derived from `bytearray` exports what `bytearray`
+/// does.
+pub(super) fn declares_buffer(w_type: PyObjectRef) -> bool {
+    let derived = |key: *const pyre_object::pyobject::PyType| {
+        crate::typedef::gettypefor(key).is_some_and(|class| unsafe {
+            crate::baseobjspace::issubtype_w(w_type, class.as_ptr())
+        })
+    };
+    // `bytes` is the read-only one; the rest export writable storage.
+    if derived(&pyre_object::bytesobject::BYTES_TYPE)
+        || derived(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
+        || derived(&pyre_object::memoryview::MEMORYVIEW_TYPE)
+        || derived(&pyre_object::interp_array::ARRAY_TYPE)
+    {
+        return true;
+    }
+    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+    if derived(<crate::module::mmap::interp_mmap::W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE)
+    {
+        return true;
+    }
+    false
+}
+
+/// What one export by [`interp_bf_getbuffer`] owns beyond the words it wrote
+/// into the caller's `Py_buffer`.
+///
+/// The geometry vectors are here because a `Py_buffer` only points at its
+/// format, shape and strides; upstream keeps them in fields of its own
+/// declaration of the structure, which is not open to a runtime whose
+/// extensions were compiled against the canonical one.
+///
+/// `view` is an owning reference to the `memoryview` the acquisition
+/// produced.  It is what holds the export open: until it is released the
+/// exporter refuses to be resized, which is what keeps the address handed to
+/// C pointing at the bytes it was taken from.
+struct Export {
+    view: *mut CPyObject,
+    format: Vec<u8>,
+    shape: Vec<isize>,
+    strides: Vec<isize>,
+}
+
+/// The live [`Export`] blocks, so a release frees one this layer wrote and
+/// leaves a C exporter's own `internal` word alone.
+fn geometries() -> &'static Mutex<HashSet<usize>> {
+    static GEOMETRIES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    GEOMETRIES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// What a request asks of the layout that this export does not answer, if
+/// anything -- `memory_getbuf`'s contiguity checks, in its order.
+///
+/// `contiguous` is whether the export is contiguous in C and in Fortran
+/// order.
+fn contiguity_refusal(flags: c_int, contiguous: (bool, bool)) -> Option<&'static str> {
+    let requires = |mask| flags & mask == mask;
+    let (c_order, fortran) = contiguous;
+    if requires(PY_BUF_C_CONTIGUOUS) && !c_order {
+        return Some("memoryview: underlying buffer is not C-contiguous");
+    }
+    if requires(PY_BUF_F_CONTIGUOUS) && !fortran {
+        return Some("memoryview: underlying buffer is not Fortran contiguous");
+    }
+    if requires(PY_BUF_ANY_CONTIGUOUS) && !(c_order || fortran) {
+        return Some("memoryview: underlying buffer is not contiguous");
+    }
+    // A request with no strides in it reads the address as one contiguous
+    // run, which a strided export is not.
+    match requires(PY_BUF_STRIDES) || c_order {
+        true => None,
+        false => Some("memoryview: underlying buffer is not C-contiguous"),
+    }
+}
+
+/// `slotdefs.py slot_from_buffer_w` -- the `bf_getbuffer` of a type this
+/// runtime defines, and of a class written in Python that defines
+/// `__buffer__`.
+///
+/// Both reach the same acquisition, because the `memoryview` constructor is
+/// already the one place that knows how each exporter answers.
+pub(super) unsafe extern "C" fn interp_bf_getbuffer(
+    object: *mut CPyObject,
+    view: *mut CPyBuffer,
+    flags: c_int,
+) -> c_int {
+    // A request with no structure to fill asks for nothing.
+    if view.is_null() {
+        return 0;
+    }
+    let Some(w_obj) = argument(object) else {
+        return -1;
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_obj);
+    let acquired = crate::builtins::w_memoryview_new_with_flags(w_obj, flags);
+    let Some(w_view) = super::pyerrors::trap(acquired) else {
+        return -1;
+    };
+    let view_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_view);
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    let contiguous = unsafe { crate::builtins::memoryview_contiguity(reload(view_slot)) };
+    if let Some(message) = contiguity_refusal(flags, contiguous) {
+        release_acquired(reload(view_slot));
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::BufferError,
+            message,
+        ));
+        return -1;
+    }
+    // Both references first: minting one can move what the other names.
+    let holder = pyobject::make_ref(reload(view_slot));
+    let exporter = pyobject::make_ref(reload(obj_slot));
+    let carrier = unsafe { pyre_object::memoryview::w_memoryview_view(reload(view_slot)) };
+    let mut format = unsafe { carrier.format_str() }.as_bytes().to_vec();
+    format.push(0);
+    let widen = |dims: Vec<i64>| dims.into_iter().map(|extent| extent as isize).collect();
+    let mut export = Box::new(Export {
+        view: holder,
+        format,
+        shape: widen(unsafe { carrier.native_shape() }),
+        strides: widen(unsafe { carrier.native_strides() }),
+    });
+    // The exporter's own storage, which the collector does not move: the
+    // address stays the one C was handed for as long as the export is open.
+    let first = unsafe { carrier.backing().as_bytes() }.as_ptr() as usize;
+    unsafe {
+        (*view).buf = (first + carrier.offset() as usize) as *mut c_void;
+        (*view).obj = exporter;
+        (*view).len = carrier.length() as isize;
+        (*view).itemsize = carrier.itemsize() as isize;
+        (*view).readonly = carrier.readonly() as c_int;
+        (*view).ndim = carrier.ndim() as c_int;
+        (*view).format = match flags & PY_BUF_FORMAT == PY_BUF_FORMAT {
+            true => export.format.as_mut_ptr() as *mut c_char,
+            false => std::ptr::null_mut(),
+        };
+        (*view).shape = match flags & PY_BUF_ND == PY_BUF_ND {
+            true => export.shape.as_mut_ptr(),
+            false => std::ptr::null_mut(),
+        };
+        (*view).strides = match flags & PY_BUF_STRIDES == PY_BUF_STRIDES {
+            true => export.strides.as_mut_ptr(),
+            false => std::ptr::null_mut(),
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = Box::into_raw(export) as *mut c_void;
+        geometries().lock().insert((*view).internal as usize);
+    }
+    0
+}
+
+/// `slotdefs.py make_bf_releasebuffer` -- end what [`interp_bf_getbuffer`]
+/// began.
+///
+/// Upstream fills this slot only for a type that defines
+/// `__release_buffer__`, because its acquisition holds nothing to give back.
+/// This one always does: releasing the `memoryview` is what drops the
+/// exporter's count, and it runs the `__release_buffer__` of a class written
+/// in Python on the way.
+pub(super) unsafe extern "C" fn interp_bf_releasebuffer(
+    _object: *mut CPyObject,
+    view: *mut CPyBuffer,
+) {
+    if view.is_null() {
+        return;
+    }
+    let internal = unsafe { (*view).internal } as usize;
+    if internal == 0 || !geometries().lock().remove(&internal) {
+        return;
+    }
+    unsafe { (*view).internal = std::ptr::null_mut() };
+    let export = unsafe { Box::from_raw(internal as *mut Export) };
+    release_acquired(unsafe { pyobject::from_ref(export.view) });
+    unsafe { pyobject::decref(export.view) };
+}
+
+/// Release a `memoryview` this layer acquired.  A release failure belongs to
+/// no operation the caller can be told about -- the slot answers nothing --
+/// so it is reported the way an unraisable is.
+fn release_acquired(w_view: PyObjectRef) {
+    if let Err(mut error) = crate::builtins::memoryview_release(&[w_view]) {
+        error.write_unraisable(
+            pyre_object::w_none(),
+            rustpython_wtf8::Wtf8::new("Exception ignored in __release_buffer__:"),
+            w_view,
+        );
+    }
 }
 
 // ── `PyObject_GetBuffer` and its snapshot ───────────────────────────────

@@ -1617,8 +1617,14 @@ static PyObject *m_writable_buffer(PyObject *self, PyObject *args)
     (void)self;
     Py_buffer target;
     if (PyArg_ParseTuple(args, "w*", &target)) {
+        /* The write proves the view is the exporter's own storage rather
+           than a copy that would swallow it. */
+        if (target.len > 0) {
+            ((char *)target.buf)[0] = 'W';
+        }
+        Py_ssize_t length = target.len;
         PyBuffer_Release(&target);
-        Py_RETURN_NONE;
+        return PyLong_FromSsize_t(length);
     }
     if (!PyErr_ExceptionMatches(PyExc_BufferError)) {
         return NULL;

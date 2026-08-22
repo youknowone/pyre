@@ -1292,9 +1292,59 @@ static PyObject *blob_read(PyObject *self, PyObject *source)
     return copy;
 }
 
+/* A writable export: fill every byte of whatever was handed in. */
+static PyObject *blob_fill(PyObject *self, PyObject *args)
+{
+    PyObject *target = NULL;
+    int value = 0;
+    if (!PyArg_ParseTuple(args, "Oi", &target, &value)) {
+        return NULL;
+    }
+    Py_buffer view;
+    if (PyObject_GetBuffer(target, &view, PyBUF_WRITABLE) < 0) {
+        return NULL;
+    }
+    memset(view.buf, value, (size_t)view.len);
+    Py_ssize_t written = view.len;
+    PyBuffer_Release(&view);
+    return PyLong_FromSsize_t(written);
+}
+
+/* The geometry a full request reports, so the caller can check each field. */
+static PyObject *blob_describe(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_FULL_RO) < 0) {
+        return NULL;
+    }
+    PyObject *described = Py_BuildValue(
+        "(nnisnn)", view.len, view.itemsize, view.ndim,
+        view.format == NULL ? "" : view.format,
+        view.shape == NULL ? (Py_ssize_t)-1 : view.shape[0],
+        view.strides == NULL ? (Py_ssize_t)-1 : view.strides[0]);
+    PyBuffer_Release(&view);
+    return described;
+}
+
+/* The address a request reports, so two exports of one object can be
+   compared: a live window answers the same address twice, a copy does not. */
+static PyObject *blob_address(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    PyObject *address = PyLong_FromVoidPtr(view.buf);
+    PyBuffer_Release(&view);
+    return address;
+}
+
 static PyMethodDef blob_methods[] = {
     {"exports", blob_exports, METH_NOARGS, "live export count"},
     {"read", blob_read, METH_O, "PyObject_GetBuffer over any exporter"},
+    {"fill", blob_fill, METH_VARARGS, "write through a PyBUF_WRITABLE export"},
+    {"describe", blob_describe, METH_O, "the geometry a full request reports"},
+    {"address", blob_address, METH_O, "the address a request reports"},
     {NULL, NULL, 0, NULL},
 };
 

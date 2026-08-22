@@ -549,8 +549,12 @@ except TypeError:
     pass
 else:
     raise AssertionError("'y*' accepted a str")
-# 'w*' asks for a writable view, which an interpreter object never exports.
-assert m.writable_buffer(bytearray(b'ab')) == 'read-only'
+# 'w*' asks for a writable view: an exporter with writable storage answers
+# one and the write lands in the object, and read-only storage refuses.
+target = bytearray(b'ab')
+assert m.writable_buffer(target) == 2
+assert target == bytearray(b'Wb')
+assert m.writable_buffer(b'ab') == 'read-only'
 
 # ── the argument formats that hand over a pointer ──────────────────────
 # Every row here was taken from CPython 3.14.6 running this same table against

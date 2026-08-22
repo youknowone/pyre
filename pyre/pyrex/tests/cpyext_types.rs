@@ -508,6 +508,82 @@ except TypeError:
 else:
     raise AssertionError('a non-exporter was accepted')
 
+# ── the buffer slots of an interpreter type ────────────────────────────
+# A writable request reaches the exporter's own storage, so what C writes
+# through it is what Python reads back.
+import array
+driver = m.Blob(b'')
+target = bytearray(b'....')
+assert driver.fill(target, ord('Z')) == 4
+assert target == bytearray(b'ZZZZ')
+window = memoryview(bytearray(b'....'))
+assert driver.fill(window, ord('Q')) == 4
+assert bytes(window) == b'QQQQ'
+numbers = array.array('i', [1, 2, 3])
+assert driver.fill(numbers, 0) == 12
+assert list(numbers) == [0, 0, 0]
+
+# Read-only storage refuses a writable request rather than handing out a
+# copy that would swallow the write.
+for immutable in (b'abcd', memoryview(b'abcd')):
+    try:
+        driver.fill(immutable, ord('Z'))
+    except BufferError:
+        pass
+    else:
+        raise AssertionError('a writable export of read-only storage')
+
+# The address is the exporter's, so two exports of one object name it.
+held = bytearray(b'abcdef')
+assert driver.address(held) == driver.address(held)
+assert driver.address(held) != driver.address(bytearray(b'abcdef'))
+
+# The geometry each exporter reports: (len, itemsize, ndim, format,
+# shape[0], strides[0]).
+assert driver.describe(b'abcdef') == (6, 1, 1, 'B', 6, 1)
+assert driver.describe(bytearray(b'abc')) == (3, 1, 1, 'B', 3, 1)
+assert driver.describe(array.array('i', [1, 2])) == (8, 4, 1, 'i', 2, 4)
+assert driver.describe(memoryview(b'abcd')[1:]) == (3, 1, 1, 'B', 3, 1)
+
+# A strided export is refused by a request that cannot describe one.
+try:
+    driver.read(memoryview(b'abcdef')[::2])
+except BufferError:
+    pass
+else:
+    raise AssertionError('a strided export answered a contiguous request')
+
+# The export the acquisition holds is given back, so the exporter can be
+# resized again once C releases it.
+resizable = bytearray(b'ab')
+assert driver.read(resizable) == b'ab'
+resizable.append(ord('c'))
+assert resizable == bytearray(b'abc')
+
+# A class written in Python earns the slots from `__buffer__`, and keeps
+# its base's when it defines none.
+class Forwarding:
+    def __init__(self, payload):
+        self.payload = payload
+    def __buffer__(self, flags):
+        return memoryview(self.payload)
+
+assert driver.read(Forwarding(bytearray(b'via __buffer__'))) == b'via __buffer__'
+assert driver.fill(Forwarding(bytearray(b'..')), ord('Y')) == 2
+
+class DerivedArray(bytearray):
+    pass
+
+assert driver.read(DerivedArray(b'derived')) == b'derived'
+
+# A type that exports nothing is refused, not snapshotted.
+try:
+    driver.read([1, 2, 3])
+except TypeError:
+    pass
+else:
+    raise AssertionError('a list answered a buffer request')
+
 # ── the async table ────────────────────────────────────────────────────
 ticker = m.Ticker(3)
 assert list(ticker.__await__()) == [3, 2, 1]
