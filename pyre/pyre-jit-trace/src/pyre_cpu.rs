@@ -23,9 +23,10 @@ use std::sync::{Arc, OnceLock};
 use majit_ir::operand::Operand;
 use majit_ir::{ArrayDescr, Descr, FieldDescr, GcRef, Type};
 use majit_metainterp::cpu::{Cpu, DefaultCpu};
+use pyre_object::rutf8::Utf8IndexStorage;
 use pyre_object::unicodeobject::{
-    UNICODE_BYTE_LEN_OFFSET, UNICODE_LEN_OFFSET, UNICODE_VALUE_OFFSET, W_UNICODE_GC_TYPE_ID,
-    W_UNICODE_OBJECT_SIZE,
+    UNICODE_BYTE_LEN_OFFSET, UNICODE_INDEX_STORAGE_OFFSET, UNICODE_LEN_OFFSET,
+    UNICODE_VALUE_OFFSET, W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE,
 };
 use rustpython_wtf8::Wtf8Buf;
 
@@ -238,10 +239,16 @@ impl Cpu for PyreCpu {
     }
 
     fn bh_unicodegetitem(&self, unicode: GcRef, index: i64) -> Option<i64> {
-        // RPython UNICODE is codepoint-indexed; UNICODEGETITEM returns
-        // the codepoint value.  Pyre's `W_UnicodeObject` stores WTF-8, so
-        // walk codepoints via `code_points().nth(index)`; `to_u32`
-        // yields the ordinal (including lone surrogates D800-DFFF).
+        // RPython UNICODE is codepoint-indexed; UNICODEGETITEM returns the
+        // codepoint value, `to_u32` (including lone surrogates D800-DFFF).
+        // Pyre's `W_UnicodeObject` stores WTF-8, where a codepoint index is a
+        // byte offset only for an ASCII payload, so this resolves it the two
+        // ways `w_str_codepoint_at` does.
+        //
+        // Neither arm builds the index table: a blackhole runs inside a deopt,
+        // so it reads a table that is already there and otherwise walks. The
+        // walk is the cost the table exists to remove, and it is the one
+        // upstream's array read never pays.
         if unicode.is_null() {
             return None;
         }
@@ -252,7 +259,22 @@ impl Cpu for PyreCpu {
         }
         let s = unsafe { &*value_ptr };
         let i = index as usize;
-        s.code_points().nth(i).map(|c| c.to_u32() as i64)
+        let len = unsafe { *((unicode.0 + UNICODE_LEN_OFFSET) as *const usize) };
+        if i >= len {
+            return None;
+        }
+        let byte_len = unsafe { *((unicode.0 + UNICODE_BYTE_LEN_OFFSET) as *const usize) };
+        // `w_str_is_ascii` — one byte per codepoint, so the index is the offset.
+        if len == byte_len {
+            return Some(s.as_bytes()[i] as i64);
+        }
+        let storage = unsafe {
+            *((unicode.0 + UNICODE_INDEX_STORAGE_OFFSET) as *const *const Utf8IndexStorage)
+        };
+        if storage.is_null() {
+            return s.code_points().nth(i).map(|c| c.to_u32() as i64);
+        }
+        Some(pyre_object::rutf8::codepoint_at_index(s, unsafe { &*storage }, i).to_u32() as i64)
     }
 }
 
@@ -263,4 +285,65 @@ pub fn shared() -> Arc<dyn Cpu> {
     static CELL: OnceLock<Arc<dyn Cpu>> = OnceLock::new();
     CELL.get_or_init(|| Arc::new(PyreCpu::new()) as Arc<dyn Cpu>)
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustpython_wtf8::CodePoint;
+
+    /// Every arm of `bh_unicodegetitem` must answer what a codepoint walk
+    /// answers. The arms are chosen by two facts about the operand — whether
+    /// it is ASCII, and whether its index table has been built — so each case
+    /// below puts a string in one of those states and compares the whole
+    /// index range against the walk.
+    fn agrees_with_walk(obj: pyre_object::PyObjectRef) {
+        let cpu = PyreCpu::new();
+        let gc = GcRef(obj as usize);
+        let walk: Vec<i64> = unsafe { pyre_object::w_str_get_wtf8(obj) }
+            .code_points()
+            .map(|c| c.to_u32() as i64)
+            .collect();
+        for (i, expected) in walk.iter().enumerate() {
+            assert_eq!(cpu.bh_unicodegetitem(gc, i as i64), Some(*expected), "index {i}");
+        }
+        assert_eq!(cpu.bh_unicodegetitem(gc, walk.len() as i64), None, "one past the end");
+        assert_eq!(cpu.bh_unicodegetitem(gc, -1), None, "negative index");
+    }
+
+    #[test]
+    fn bh_unicodegetitem_ascii_reads_the_byte() {
+        let obj = pyre_object::w_str_new("hello");
+        assert!(unsafe { pyre_object::unicodeobject::w_str_is_ascii(obj) });
+        agrees_with_walk(obj);
+    }
+
+    #[test]
+    fn bh_unicodegetitem_wide_without_a_table_walks() {
+        let obj = pyre_object::w_str_new("héllo wörld ☃");
+        assert!(!unsafe { pyre_object::unicodeobject::w_str_is_ascii(obj) });
+        agrees_with_walk(obj);
+    }
+
+    #[test]
+    fn bh_unicodegetitem_wide_with_a_table_reads_the_table() {
+        // Long enough to span more than one 64-codepoint group, so the read
+        // exercises `baseindex` selection rather than only the first entry.
+        let obj = pyre_object::w_str_new(&"ábç".repeat(60));
+        // Force the lazy build the blackhole arm refuses to do itself.
+        assert!(unsafe { pyre_object::w_str_codepoint_at(obj, 100) }.is_some());
+        agrees_with_walk(obj);
+    }
+
+    #[test]
+    fn bh_unicodegetitem_yields_a_lone_surrogate() {
+        let mut buf = rustpython_wtf8::Wtf8Buf::new();
+        buf.push(CodePoint::from_char('a'));
+        buf.push(CodePoint::from_u32(0xD800).unwrap());
+        buf.push(CodePoint::from_char('b'));
+        let obj = pyre_object::unicodeobject::w_str_from_wtf8(buf);
+        let cpu = PyreCpu::new();
+        assert_eq!(cpu.bh_unicodegetitem(GcRef(obj as usize), 1), Some(0xD800));
+        agrees_with_walk(obj);
+    }
 }
