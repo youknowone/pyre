@@ -22,6 +22,12 @@ struct _object {
 #define PyObject_HEAD PyObject ob_base;
 #define PyObject_HEAD_INIT(type) { 0, 0, type },
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
+
+/* `Py_TYPE` is exported as well as spelled here, because an extension that
+   declares the prototype itself rather than including this header still has to
+   find a symbol.  The declaration comes before the macro that replaces it, the
+   way `lock.h` declares `PyMutex_Lock` ahead of its own inline fast path. */
+PyAPI_FUNC(PyTypeObject *) Py_TYPE(PyObject *);
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
 #define Py_IS_TYPE(ob, type) (Py_TYPE(ob) == (type))
 /* bpo-39573: writing `ob_type` and `ob_size` goes through these. */

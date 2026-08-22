@@ -47,6 +47,7 @@ pub mod pymem;
 pub mod pyobject;
 pub mod pystate;
 pub mod pystrtod;
+pub mod pythonrun;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
@@ -796,6 +797,7 @@ pub fn ensure_linked() {
     pyobject::ensure_linked();
     pystate::ensure_linked();
     pystrtod::ensure_linked();
+    pythonrun::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
     cdatetime::ensure_linked();

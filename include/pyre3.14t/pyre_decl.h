@@ -179,6 +179,7 @@ PyAPI_FUNC(void) PyException_SetArgs(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyException_SetCause(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyException_SetContext(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyException_SetTraceback(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicodeDecodeError_Create(const char *, const char *, Py_ssize_t, Py_ssize_t, Py_ssize_t, const char *);
 
 /* cpyext/floatobject.rs */
 PyAPI_FUNC(double) PyFloat_AS_DOUBLE(PyObject *);
@@ -254,6 +255,8 @@ PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *);
 PyAPI_FUNC(int) PyList_Sort(PyObject *);
 
 /* cpyext/lock.rs */
+PyAPI_FUNC(void) PyCriticalSection_Begin(PyCriticalSection *, PyObject *);
+PyAPI_FUNC(void) PyCriticalSection_End(PyCriticalSection *);
 PyAPI_FUNC(int) PyThread_acquire_lock(PyThread_type_lock, int);
 PyAPI_FUNC(PyLockStatus) PyThread_acquire_lock_timed(PyThread_type_lock, PY_TIMEOUT_T, int);
 PyAPI_FUNC(PyThread_type_lock) PyThread_allocate_lock(void);
@@ -496,6 +499,7 @@ PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetRaisedException(PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
 PyAPI_FUNC(void) PyErr_WriteUnraisable(PyObject *);
+PyAPI_FUNC(int) PyTraceBack_Print(PyObject *, PyObject *);
 PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *, int);
 PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
 PyAPI_FUNC(void) _PyPyre_WriteUnraisable(PyObject *, PyObject *);
@@ -515,6 +519,8 @@ PyAPI_FUNC(void *) PyMem_Realloc(void *, size_t);
 PyAPI_FUNC(void) Py_DecRef(PyObject *);
 PyAPI_FUNC(void) Py_IncRef(PyObject *);
 PyAPI_FUNC(Py_ssize_t) _PyPyre_RefCount(PyObject *);
+PyAPI_FUNC(void) _Py_DecRef(PyObject *);
+PyAPI_FUNC(void) _Py_IncRef(PyObject *);
 PyAPI_FUNC(void) _Py_SetRefcnt(PyObject *, Py_ssize_t);
 
 /* cpyext/pystate.rs */
@@ -543,6 +549,10 @@ PyAPI_FUNC(PyThreadState *) _PyThreadState_UncheckedGet(void);
 
 /* cpyext/pystrtod.rs */
 PyAPI_FUNC(double) PyOS_string_to_double(const char *, char **, PyObject *);
+
+/* cpyext/pythonrun.rs */
+PyAPI_FUNC(int) Py_IsFinalizing(void);
+PyAPI_FUNC(int) Py_IsInitialized(void);
 
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);

@@ -1228,6 +1228,20 @@ pub unsafe extern "C" fn PyObject_Realloc(block: *mut c_void, size: usize) -> *m
     unsafe { pyobject::reallocate_raw(block, size) }
 }
 
+/// `Py_TYPE(object)` as a call, which is what an extension reaches when it
+/// declares the prototype itself instead of expanding the header's macro.
+///
+/// The answer is the field, not [`crate::typedef::r#type`]: the macro reads
+/// `ob_type` and hands the block back borrowed, so a mirror whose type is not
+/// linked yet must answer NULL here exactly as it does there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_TYPE(object: *mut CPyObject) -> *mut CPyTypeObject {
+    if object.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*object).ob_type }
+}
+
 /// `Py_TYPE(object)`, borrowed — the mirror a type mirror is.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Type(object: *mut CPyObject) -> *mut CPyObject {
@@ -1389,6 +1403,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyCallable_Check as *const ());
     std::hint::black_box(PyObject_IsInstance as *const ());
     std::hint::black_box(PyObject_Type as *const ());
+    std::hint::black_box(Py_TYPE as *const ());
     std::hint::black_box(PyObject_GenericGetAttr as *const ());
     std::hint::black_box(PyObject_GenericSetAttr as *const ());
     std::hint::black_box(PyObject_GenericGetDict as *const ());

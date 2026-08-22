@@ -1066,6 +1066,24 @@ pub unsafe extern "C" fn _Py_SetRefcnt(object: *mut CPyObject, refcnt: isize) {
     unsafe { (*object).ob_refcnt = refcnt };
 }
 
+/// The entry point `Py_INCREF` is a call to on a stable ABI from 3.12 on.
+///
+/// An extension compiled against the stable ABI expands the macro to this
+/// rather than touching `ob_refcnt`, so the two names have to be two symbols
+/// even though they do the same thing; `refcount.h` here spells the macro over
+/// [`Py_IncRef`], and an extension that declares the prototype itself -- as
+/// PyO3 does, which never reads these headers -- reaches this one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_IncRef(object: *mut CPyObject) {
+    unsafe { incref(object) };
+}
+
+/// The `Py_DECREF` half of [`_Py_IncRef`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_DecRef(object: *mut CPyObject) {
+    unsafe { decref(object) };
+}
+
 /// The C-visible reference count, with the interpreter's own share removed —
 /// `Py_REFCNT` as a test can read it without depending on the link share.
 #[unsafe(no_mangle)]
@@ -1079,6 +1097,8 @@ pub unsafe extern "C" fn _PyPyre_RefCount(object: *mut CPyObject) -> isize {
 pub(super) fn ensure_linked() {
     std::hint::black_box(Py_IncRef as *const ());
     std::hint::black_box(Py_DecRef as *const ());
+    std::hint::black_box(_Py_IncRef as *const ());
+    std::hint::black_box(_Py_DecRef as *const ());
     std::hint::black_box(_PyPyre_RefCount as *const ());
     std::hint::black_box(_Py_SetRefcnt as *const ());
 }

@@ -159,6 +159,7 @@ STRUCTS = {
     "CPyFrameObject": "PyFrameObject",
     "CPyInterpreterState": "PyInterpreterState",
     "CPyMutex": "PyMutex",
+    "CPyCriticalSection": "PyCriticalSection",
     "CPyUnicodeWriter": "PyUnicodeWriter",
     "CPyDateTimeCAPI": "PyDateTime_CAPI",
 }
