@@ -649,29 +649,6 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Constant fold int_between(a, b, c) => a <= b < c.
-    fn optimize_int_between(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-        let arg2 = op.arg(2);
-
-        if let (Some(a), Some(b), Some(c)) = (
-            ctx.resolve_operand_operand_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_operand_operand_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_operand_operand_opt(&arg2)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            let result = (a <= b && b < c) as i64;
-            let b = ctx.materialize_operand_at(op.pos.get());
-            ctx.make_constant_box(&b, Value::Int(result));
-            return OptimizationResult::Remove;
-        }
-
-        OptimizationResult::PassOn
-    }
-
     // ── Comparisons ──
 
     /// Comparison folds (constant folds, knownbits eq/ne, eq_zero /
@@ -1917,7 +1894,6 @@ impl Optimization for OptRewrite {
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
-            OpCode::IntBetween => self.optimize_int_between(op, ctx),
             OpCode::IntMul => self.optimize_int_mul_range_test(op, ctx),
 
             // ── Comparisons ──
