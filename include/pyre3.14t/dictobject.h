@@ -10,7 +10,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* dict. */
+/* dict.  `PyDict_Next` keeps the keys it walks on this side rather than
+   in the mirror, so the field is only what makes the block a struct. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *_tmpkeys; /* a private place to put keys during PyDict_Next */
+} PyDictObject;
 
 #define PyDoc_STRVAR(name, str) static const char name[] = str
 #define PyDoc_STR(str) str

@@ -222,6 +222,7 @@ struct PyMemberDef {
 #define Py_T_FLOAT 3
 #define Py_T_DOUBLE 4
 #define Py_T_STRING 5
+#define _Py_T_OBJECT 6
 #define Py_T_OBJECT_EX 16
 #define Py_T_CHAR 7
 #define Py_T_BYTE 8
@@ -229,11 +230,15 @@ struct PyMemberDef {
 #define Py_T_USHORT 10
 #define Py_T_UINT 11
 #define Py_T_ULONG 12
+#define Py_T_STRING_INPLACE 13
 #define Py_T_BOOL 14
 #define Py_T_LONGLONG 17
 #define Py_T_ULONGLONG 18
 #define Py_T_PYSSIZET 19
+#define _Py_T_NONE 20
 #define Py_READONLY 1
+#define Py_AUDIT_READ 2
+#define Py_RELATIVE_OFFSET 8
 /* Type flags.  `Py_TPFLAGS_DEFAULT` is 0 here as it is upstream, where it
    reduces to `Py_TPFLAGS_HAVE_STACKLESS_EXTENSION | 0` and that half is 0 off
    Stackless.

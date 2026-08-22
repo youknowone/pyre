@@ -49,6 +49,7 @@
 #include "objimpl.h"
 #include "methodobject.h"
 #include "structmember.h"
+#include "descrobject.h"
 #include "moduleobject.h"
 #include "pyerrors.h"
 /* The `%`-format engine and the three variadic entry points over it. It
