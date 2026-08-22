@@ -408,6 +408,7 @@ impl<'c> Lowerer<'c> {
         slot: CondCallEffectSlot,
         is_inferred: bool,
         inferred_policy_check: Option<TokenStream>,
+        word_result_addr: Option<TokenStream>,
     ) -> TokenStream {
         let static_slot_token = slot.token();
         // For `Infer` mode, the helper's `_jit_helper_policy` byte is
@@ -500,8 +501,12 @@ impl<'c> Lowerer<'c> {
                 );
             }
         } else {
+            // An int-result target is registered through its widening shim;
+            // see `word_result_addr_tokens`.  A void- or ref-result target has
+            // no narrow return to widen and registers its own address.
+            let target_addr = word_result_addr.unwrap_or_else(|| quote! { #func as *const () });
             quote! {
-                let __fn_idx = __builder.add_fn_ptr_with_slot(#func as *const (), #slot_expr);
+                let __fn_idx = __builder.add_fn_ptr_with_slot(#target_addr, #slot_expr);
             }
         }
     }

@@ -916,6 +916,7 @@ impl<'c> Lowerer<'c> {
             slot,
             is_inferred,
             inferred_policy_check,
+            None,
         );
         self.emit_op(
             OpMeta::linear(OpKind::Call, arg_regs, vec![]),
@@ -1062,6 +1063,7 @@ impl<'c> Lowerer<'c> {
             slot,
             is_inferred,
             inferred_policy_check,
+            word_result_addr_for_kind(value_kind, func_path, func_args.len()),
         );
         self.emit_op(
             OpMeta::linear(
@@ -1279,6 +1281,7 @@ impl<'c> Lowerer<'c> {
             slot,
             is_inferred,
             inferred_policy_check,
+            word_result_addr_for_kind(result_binding.kind, func_path, args.len() - 2),
         );
         let result_typed = Register::new(result_binding.kind, result_reg);
         let mut reads = Vec::with_capacity(arg_regs.len() + 1);
@@ -1463,6 +1466,7 @@ impl<'c> Lowerer<'c> {
             arg_bindings.push(binding);
         }
         let func = &call.func;
+        let word_result_addr = word_result_addr_tokens(func, arg_bindings.len());
         // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
         // not precede it.  Decide here whether the explicit arm below needs a
         // trailing marker; the inferred arm emits its own runtime-conditional
@@ -1767,7 +1771,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::int(throwaway_reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1796,7 +1800,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::int(throwaway_reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1819,7 +1823,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(throwaway_reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             __builder.residual_call_int_canonical_via_target_with_effect_info(
                                 __fn_idx,
                                 #typed_args,
@@ -1866,7 +1870,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(throwaway_reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             #call_stmt
                         },
                     );

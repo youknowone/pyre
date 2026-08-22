@@ -952,6 +952,7 @@ impl<'c> Lowerer<'c> {
 
         let reg = self.alloc_reg();
         let func = &call.func;
+        let word_result_addr = word_result_addr_tokens(func, arg_bindings.len());
         let mut result_kind = BindingKind::Int;
         // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
         // not precede it.  Decide here whether the explicit arm below needs a
@@ -1025,7 +1026,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::new(result_kind, reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1054,7 +1055,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::new(result_kind, reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1072,7 +1073,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             __builder.residual_call_int_canonical_via_target_with_effect_info(
                                 __fn_idx,
                                 #typed_args,
@@ -1111,7 +1112,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             #call_stmt
                         },
                     );
@@ -1822,6 +1823,7 @@ impl<'c> Lowerer<'c> {
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
                 let __arg_regs: Vec<Register> =
                     arg_bindings.iter().map(Register::from_binding).collect();
+                let word_result_addr = word_result_addr_tokens(&func_path, arg_bindings.len());
                 let call_stmt = match kind {
                     crate::jit_interp::CallPolicyKind::ElidableInt => quote! {
                         __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
@@ -1841,7 +1843,7 @@ impl<'c> Lowerer<'c> {
                         vec![Register::new(result_kind, reg)],
                     ),
                     quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                        let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                         #call_stmt
                     },
                 );

@@ -634,3 +634,41 @@ pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
     };
     Some(Ident::new(name, proc_macro2::Span::call_site()))
 }
+
+/// The address of a shim that returns `func`'s result as a machine word.
+///
+/// Registered addresses are dispatched through
+/// `majit_backend::call_stub::bh_call_i_dispatch`, which transmutes them to
+/// `extern "C" fn(..) -> i64` and reads the whole return register. A callee
+/// whose result is narrower than a word leaves the bits above it undefined —
+/// see [`majit_ir::CallResultWord`] for what that costs — so the register is
+/// not readable as an `i64` unless the callee is known to fill it. Registering
+/// a shim rather than the callee itself makes that true of every target.
+///
+/// The shim's parameter types come from `func` itself: the annotation supplies
+/// the `extern`-free `fn` shape and the call in the body resolves each hole, so
+/// no argument type has to be spelled here. `arity` counts the receiver for a
+/// method path.
+pub(super) fn word_result_addr_tokens(func: &impl ToTokens, arity: usize) -> TokenStream {
+    let params: Vec<Ident> = (0..arity).map(|i| format_ident!("__majit_a{i}")).collect();
+    let holes: Vec<TokenStream> = (0..arity).map(|_| quote! { _ }).collect();
+    quote! {
+        {
+            let __majit_word_shim: fn(#(#holes),*) -> i64 = |#(#params),*| {
+                majit_ir::CallResultWord::into_call_word(#func(#(#params),*))
+            };
+            __majit_word_shim as *const ()
+        }
+    }
+}
+
+/// [`word_result_addr_tokens`] for a target whose result kind is `kind`, and
+/// `None` for a kind that has no narrow result to widen: a ref result is a
+/// pointer, which already fills the register, and a void result is never read.
+pub(super) fn word_result_addr_for_kind(
+    kind: BindingKind,
+    func: &impl ToTokens,
+    arity: usize,
+) -> Option<TokenStream> {
+    matches!(kind, BindingKind::Int).then(|| word_result_addr_tokens(func, arity))
+}
