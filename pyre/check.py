@@ -2158,6 +2158,39 @@ def build_input_paths():
     return sorted(set(paths))
 
 
+def build_recipe_digest():
+    """A digest of the options an artefact is built *with*.
+
+    The input set above is the files a build reads; this is the command run
+    over them. `--no-default-features --features dynasm`, the wasm link args,
+    the toolchain and the build-std flags each select what lands in the
+    artefact, and none of them is a file under a member directory — this
+    script is a build input by no path rule, so editing `--growable-table` out
+    of `WASM_RUSTFLAGS` moved nothing in the fingerprint and a later
+    `--no-build` run approved a module built with it still in.
+
+    The whole table at once rather than the row for one backend: a stamp
+    naming only its own row could not be compared without also recording which
+    row it was, the table drives every artefact, and an edit to it is rare
+    enough that rebuilding all of them is the cheaper mistake.
+
+    What it does not cover is an option spelled inline in the build functions
+    rather than held here — `--target wasm32-unknown-unknown` is the one such
+    literal today. Hashing this script whole would cover those and would also
+    make every comment edit invalidate every artefact, which in a tree where
+    the script is edited far more often than the recipe is the worse trade.
+    """
+    recipe = "\0".join((
+        repr(CARGO_CONFIG),
+        WASM_RUSTFLAGS,
+        repr(WASM_CARGO_TOOLCHAIN),
+        repr(WASM_BUILD_STD_FLAGS),
+        WASM_BUILD_OUTPUT,
+        WASM_MODULE_PATH,
+    ))
+    return hashlib.sha256(recipe.encode("utf-8")).hexdigest()
+
+
 # Sentinel distinguishing "not computed yet" from "computed, and there is no
 # answer": a `None` result must be cached too, or one unenumerable call would
 # leave a later call free to answer differently within the same run.
@@ -2196,7 +2229,17 @@ def build_inputs_fingerprint():
     if paths is None:
         _BUILD_INPUTS_FINGERPRINT = None
         return None
+    _BUILD_INPUTS_FINGERPRINT = digest_input_paths(paths)
+    return _BUILD_INPUTS_FINGERPRINT
+
+
+def digest_input_paths(paths):
+    """A digest over the named paths' contents, and over the build recipe."""
     digest = hashlib.sha256()
+    # The recipe first: an artefact is what its inputs and its build options
+    # together produce, and neither alone identifies it.
+    digest.update(build_recipe_digest().encode("ascii"))
+    digest.update(b"\0")
     for path in paths:
         # The name goes in before the bytes are read, so a file that is
         # tracked but unreadable is distinguishable both from one that is
@@ -2221,8 +2264,48 @@ def build_inputs_fingerprint():
                 content.update(chunk)
         digest.update(b"\1")
         digest.update(content.digest())
-    _BUILD_INPUTS_FINGERPRINT = digest.hexdigest()
-    return _BUILD_INPUTS_FINGERPRINT
+    return digest.hexdigest()
+
+
+# The one input `cargo` itself rewrites during a build. A build window is
+# judged with it left out, because a lock file the build resolved is the build
+# doing its job rather than the tree moving underneath it.
+CARGO_WRITTEN_INPUTS = ("Cargo.lock",)
+
+# What `inputs` says in a stamp whose artefact was built over a tree that
+# changed while it was building. It is not a digest and can equal none, so the
+# comparison refuses it; `require_fresh_artefacts` names it to say why.
+STAMP_TREE_MOVED = "tree-moved-during-build"
+
+_BUILD_WINDOW_WITNESS = None
+
+
+def build_window_witness():
+    """A digest of the inputs a build is about to read, cargo's own aside.
+
+    Uncached, unlike [`build_inputs_fingerprint`]: the whole point is to be
+    read twice and compared, so a memoised second read would answer with the
+    first.
+    """
+    paths = build_input_paths()
+    if paths is None:
+        return None
+    return digest_input_paths([p for p in paths if p not in CARGO_WRITTEN_INPUTS])
+
+
+def open_build_window():
+    """Note the tree state a build is starting from.
+
+    `build_inputs_fingerprint` is read *after* a build, so that it describes
+    the `Cargo.lock` the build may have resolved. That ordering is what lets an
+    edit landing mid-build be recorded against an artefact compiled before it:
+    the stamp would then name a tree the binary does not contain, and a later
+    `--no-build` run would find them in agreement and measure it. Reading the
+    tree here as well makes that window observable, which is the only way to
+    tell the two orders apart.
+    """
+    global _BUILD_WINDOW_WITNESS
+    _BUILD_WINDOW_WITNESS = build_window_witness()
 
 
 def invalidate_build_inputs_fingerprint():
@@ -2273,6 +2356,17 @@ def stamp_artefact_inputs(artefact):
     fingerprint = build_inputs_fingerprint()
     if fingerprint is None:
         return
+    if _BUILD_WINDOW_WITNESS is not None and _BUILD_WINDOW_WITNESS != build_window_witness():
+        # Some input changed while cargo was reading them, so the artefact
+        # holds neither the tree the build started from nor the one that is
+        # here now. Stamping the current tree against it would make a later
+        # `--no-build` run agree with a binary that does not contain it.
+        print(
+            f"  warning: the tree changed while {artefact} was building, so "
+            "its inputs are not\n           the tree that is here now; it is "
+            "stamped as unusable for --no-build."
+        )
+        fingerprint = STAMP_TREE_MOVED
     content = artefact_content_digest(artefact)
     if content is None:
         print(f"  warning: could not read {artefact} to stamp it")
@@ -2343,6 +2437,9 @@ def require_fresh_artefacts(artefacts, reason, remedy):
         recorded_inputs, recorded_content = recorded
         if recorded_content != artefact_content_digest(artefact):
             fault = "has been rebuilt since it was stamped, so what it contains is unknown."
+        elif recorded_inputs == STAMP_TREE_MOVED:
+            fault = ("was built while the tree was changing, so which sources "
+                     "it contains was never established.")
         elif recorded_inputs != fingerprint:
             fault = ("was built from different sources, so it does not contain "
                      "the current tree.")
@@ -2966,6 +3063,7 @@ class Check:
         if cfg.get("wasm"):
             return self.build_wasm_backend()
         print(f"Building {cfg['bin']} (release, backend={backend})...")
+        open_build_window()
         cmd = [
             "cargo", "build", "--release", "-p", "pyrex",
             "--bin", cfg["bin"], *cfg["extra"],
@@ -3040,6 +3138,7 @@ class Check:
         produced: the wasm module (needs the export-table / custom-getrandom
         flags) and the host runner binary.
         """
+        open_build_window()
         steps = [
             (
                 "pyre-wasm (wasm32, --features wasm-host)",
