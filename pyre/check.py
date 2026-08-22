@@ -202,6 +202,14 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # carried nine short benches whose baseline was pinned to EXEC_TIME_FLOOR_S over
 # their gates at once.  The estimate has to come from the same load conditions
 # as the run it is subtracted from.
+#
+# That last condition is the one this measurement cannot enforce, so the median
+# is printed with the samples it was drawn from ([min..max]).  Startup is
+# measured once, upfront, and then subtracted from benches that run for the
+# rest of the job, so it can come from a load window the benches never saw:
+# one macos job read every interpreter's startup at about twice the
+# neighbouring job's (dynasm 0.151s against 0.066s) while its raw bench times
+# moved by a fifth of that, and a median printed alone shows none of it.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # `exec` is `bench - startup`, and startup is a measured median rather than a
@@ -2041,11 +2049,12 @@ class Check:
     def measure_startups(self):
         """Measure each timed interpreter/backend's empty-program user-CPU cost.
 
-        Runs an empty script STARTUP_SAMPLES times per interpreter and records
-        the median user-CPU in self.startup. This is the fixed per-process cost
-        (interpreter init; for wasm, wasmtime recompiling the module) added to
-        every bench regardless of workload; subtracting it yields an
-        execution-only comparison. No-op under --no-startup-subtract.
+        Runs an empty script STARTUP_SAMPLES times per interpreter, records
+        the median user-CPU in self.startup and prints it beside the range its
+        samples spanned. This is the fixed per-process cost (interpreter init;
+        for wasm, wasmtime recompiling the module) added to every bench
+        regardless of workload; subtracting it yields an execution-only
+        comparison. No-op under --no-startup-subtract.
         """
         if self.args.no_startup_subtract:
             return
@@ -2076,10 +2085,16 @@ class Check:
                     samples.append(elapsed)
                 startup = statistics.median(samples) if samples else 0.0
                 self.startup[key] = startup
-                parts.append(f"{key}={startup:.3f}s")
+                spread = (
+                    f"[{min(samples):.3f}..{max(samples):.3f}]"
+                    if samples else ""
+                )
+                parts.append(f"{key}={startup:.3f}s{spread}")
             print(dim(
-                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}; "
-                f"ratios/gates are execution-only): " + " ".join(parts)
+                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}, "
+                f"shown as median[min..max]; ratios/gates are "
+                f"execution-only): "
+                + " ".join(parts)
             ))
         finally:
             try:
