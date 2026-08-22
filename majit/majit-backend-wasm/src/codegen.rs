@@ -2235,6 +2235,12 @@ pub struct InlineTripProbe {
     pub trip_fn_ptr: i64,
     /// The callback's only argument: which deferred merge to install.
     pub pending_id: i64,
+    /// Address of the owner's live `bridge_cells_base`, read at trip time
+    /// rather than baked, because re-emitting the owner moves the array.
+    /// Zero here, or a zero read out of it, leaves the cell alone.
+    pub cells_base_ptr: u32,
+    /// This bridge's cell in that array.
+    pub dispatch_cell_index: u32,
 }
 
 /// Owned inputs for one wasm module build.  A loop retains this after its
@@ -6616,6 +6622,22 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     sink.i64_const(probe.threshold as i64);
     sink.i64_eq();
     sink.if_(BlockType::Empty);
+    // Zero the source guard's dispatch cell, so its next failure leaves the
+    // guest instead of calling in here. Without it the host is not reached
+    // again until the owner's loop finishes, and the merge lands after every
+    // crossing it was meant to remove.
+    if probe.cells_base_ptr != 0 {
+        sink.i32_const(probe.cells_base_ptr as i32);
+        sink.i32_load(memarg(0, 2));
+        sink.if_(BlockType::Empty);
+        sink.i32_const(probe.cells_base_ptr as i32);
+        sink.i32_load(memarg(0, 2));
+        sink.i32_const((probe.dispatch_cell_index * 4) as i32);
+        sink.i32_add();
+        sink.i32_const(0);
+        sink.i32_store(memarg(0, 2));
+        sink.end();
+    }
     sink.i64_const(probe.pending_id);
     sink.i32_const(probe.trip_fn_ptr as i32);
     sink.call_indirect(0, type_idx);

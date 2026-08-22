@@ -1374,9 +1374,16 @@ fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i6
 /// again after. The counter is what separates a region worth its owner's
 /// re-emission from one that is crossed a few thousand times and never pays it
 /// back, so both halves of "exactly once, at the threshold" are the point.
+///
+/// The same entry zeroes the source guard's dispatch cell, which is what gets
+/// the host back: without it the owner's loop can run to completion before the
+/// merge is installed.
 #[test]
 fn a_deferred_merge_trips_once_at_its_threshold() {
     const COUNTER_ADDR: u32 = 0x10000;
+    const CELLS_BASE_PTR: u32 = 0x10100;
+    const CELLS_BASE: u32 = 0x10200;
+    const CELL_INDEX: u32 = 2;
     const THRESHOLD: u64 = 3;
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
@@ -1397,6 +1404,8 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
         // rather than calling the wrong function.
         trip_fn_ptr: 1,
         pending_id: 77,
+        cells_base_ptr: CELLS_BASE_PTR,
+        dispatch_cell_index: CELL_INDEX,
     });
 
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
@@ -1428,12 +1437,30 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
     linker
         .define("env", "__indirect_function_table", table)
         .unwrap();
+    // The array the owner's guards dispatch through, reached the way the probe
+    // reaches it: through the base the owner keeps, not a baked address.
+    memory
+        .write(
+            &mut store,
+            CELLS_BASE_PTR as usize,
+            &CELLS_BASE.to_le_bytes(),
+        )
+        .unwrap();
+    let cell_addr = (CELLS_BASE + CELL_INDEX * 4) as usize;
+    memory
+        .write(&mut store, cell_addr, &7u32.to_le_bytes())
+        .unwrap();
     let instance = linker
         .instantiate_and_start(&mut store, &module)
         .expect("the armed module instantiates");
     let trace = instance
         .get_typed_func::<i32, i32>(&store, "trace")
         .unwrap();
+    let cell = |store: &Store<Vec<i64>>| {
+        let mut buf = [0u8; 4];
+        memory.read(store, cell_addr, &mut buf).unwrap();
+        u32::from_le_bytes(buf)
+    };
 
     let counter = |store: &Store<Vec<i64>>| {
         let mut buf = [0u8; 8];
@@ -1448,6 +1475,11 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
             store.data().len(),
             fired,
             "the callback fires on entry {THRESHOLD} and on no other"
+        );
+        assert_eq!(
+            cell(&store),
+            if fired == 1 { 0 } else { 7 },
+            "the dispatch cell is cleared by the same entry that fires"
         );
     }
     assert_eq!(store.data(), &[77], "the callback names its own merge");

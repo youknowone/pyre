@@ -1793,9 +1793,6 @@ struct PendingInline {
     /// `set_constants_pool` clears and refills the backend's pool per trace, so
     /// by the time the callback fires it describes some unrelated trace.
     constants: indexmap::IndexMap<u32, i64>,
-    /// The bridge module reads and writes this counter by address, so it must
-    /// not move while the module can still run.
-    _counter: Box<u64>,
 }
 
 thread_local! {
@@ -1828,17 +1825,20 @@ pub fn take_tripped_inlines() -> Vec<i64> {
 }
 
 /// Record a deferred merge and describe the probe the bridge standing in for
-/// it carries. The counter is boxed rather than pulled from the module's own
-/// storage so it outlives the module: a merge that never trips leaves the
-/// entry alive for the process, which is the same lifetime the bridge itself
-/// has.
+/// it carries.
+///
+/// ⛔ The counter is leaked rather than owned by the entry below: the bridge
+/// module increments it on every entry and outlives the merge, which takes its
+/// entry out of the map. One `u64` per deferred merge, and the alternative is a
+/// live module writing to freed memory.
 fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
     constants: indexmap::IndexMap<u32, i64>,
+    cells_base_ptr: u32,
 ) -> codegen::InlineTripProbe {
-    let counter = Box::new(0u64);
-    let counter_addr = counter.as_ref() as *const u64 as usize as u32;
+    let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
+    let dispatch_cell_index = region.source_fail_index;
     let pending_id = NEXT_PENDING_INLINE_ID.with(|next| {
         let id = next.get();
         next.set(id + 1);
@@ -1851,7 +1851,6 @@ fn register_pending_inline(
                 owner,
                 region,
                 constants,
-                _counter: counter,
             },
         )
     });
@@ -1860,6 +1859,8 @@ fn register_pending_inline(
         threshold: INLINE_TRIP_THRESHOLD,
         trip_fn_ptr: inline_trip_helper_slot() as i64,
         pending_id,
+        cells_base_ptr,
+        dispatch_cell_index,
     }
 }
 
@@ -2139,7 +2140,41 @@ impl WasmBackend {
             constants,
             ..
         } = pending;
-        self.install_inline_region(&owner, region, constants);
+        let source_fail_index = region.source_fail_index;
+        if !self.install_inline_region(&owner, region, constants) {
+            // The probe cleared the dispatch cell to get here. A merge that
+            // does not install leaves the out-of-line bridge as the only route
+            // to that guard, so put the cell back rather than leave the guard
+            // bailing to the host for the rest of the run.
+            Self::restore_dispatch_cell(&owner, source_fail_index);
+        }
+    }
+
+    /// Re-point a guard's dispatch cell at the bridge `bridge_slots` still
+    /// names for it.
+    fn restore_dispatch_cell(owner: &JitCellToken, source_fail_index: u32) {
+        let Some(source_loop) = owner
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        else {
+            return;
+        };
+        let cells_base = source_loop.bridge_cells_base.get();
+        let Some(slot) = source_loop
+            .bridge_slots
+            .borrow()
+            .get(&source_fail_index)
+            .copied()
+        else {
+            return;
+        };
+        let _ = (cells_base, slot);
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if cells_base != 0 {
+            let cell = (cells_base as usize + source_fail_index as usize * 4) as *mut u32;
+            unsafe { core::ptr::write(cell, slot) };
+        }
     }
 
     /// Rebuild `owner` with `region` merged into it. `false` leaves the owner
@@ -3891,7 +3926,17 @@ impl majit_backend::Backend for WasmBackend {
                 gc_table_base,
                 constants: self.constants.clone(),
             };
-            register_pending_inline(owner, region, self.constants.clone())
+            // The cell the owner's guard consults, by address of the field
+            // rather than by value: a later re-emission reallocates the array
+            // and the probe has to reach the live one.
+            let cells_base_ptr = owner
+                .compiled
+                .get()
+                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                .map_or(0, |loop_| {
+                    &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32
+                });
+            register_pending_inline(owner, region, self.constants.clone(), cells_base_ptr)
         });
 
         // This bridge's exit indices come from the global fail-index space,
