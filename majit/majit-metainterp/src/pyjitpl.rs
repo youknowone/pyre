@@ -4470,13 +4470,18 @@ impl<M: Clone> MetaInterp<M> {
                 // extra_reds..., vable_scalars..., array_items...]. The
                 // canonical source of `vable_input_offset` is the active
                 // jitdriver's `num_red_args - 1` (excluding frame).
-                // Today's slot-0 jitdriver carries empty reds so
-                // `num_reds == 0` and the offset is `0` — matching the
-                // legacy `[frame, vable_scalars...]` layout. Once the
-                // real reds spec is populated
-                // (`['frame', 'ec']`) and the macro flip lands the
-                // `extra_reds = { ec: Ref }` block, this expression
-                // returns `1` automatically.
+                // The portal driver declares `reds = ['frame', 'ec']`, so
+                // `num_reds == 2` and the offset is `1` — the vable scalars
+                // start at flat slot 2, past the `ec` slot that
+                // `extra_reds = { ec: Ref }` declares ahead of them.
+                // That coordinate is `read_boxes`'s `startindex`:
+                // `initialize_virtualizable` passes `len(original_boxes) -
+                // num_green_args` and appends the vable tail after all the
+                // reds, deriving the same slot as plain `num_reds`, which
+                // `1 + (num_reds - 1)` matches at every red count.
+                //
+                // The `1 +` encodes "the virtualizable is the FIRST red";
+                // `index_of_virtualizable` locates it among the reds instead.
                 let num_reds = ctx.driver_descriptor().map(|d| d.num_reds()).unwrap_or(0);
                 config.vable_input_offset = num_reds.saturating_sub(1);
                 config

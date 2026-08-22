@@ -274,8 +274,15 @@ pub struct BlackholeInterpreter {
     /// only raw frame/exception references; portal integrations install the
     /// callback that understands their frame and JitCode-PC layouts.
     pub record_caught_exception: Option<extern "C" fn(i64, i64, i64, i64)>,
-    /// blackhole.py bhimpl_getfield_vable_*: pointer to the virtualizable
-    /// object (e.g. PyFrame). Used by jitcode::BC_GETFIELD_VABLE_* bytecodes.
+    /// Pointer to this level's virtualizable object.
+    ///
+    /// The vable bytecodes do NOT read this. `handler_getfield_vable_*` and
+    /// `handler_setfield_vable_*` take the struct as their own `r` operand at
+    /// their own pc, the shape `bhimpl_getfield_vable_r` has; correspondingly
+    /// `BlackholeInterpreter` carries no virtualizable field at all. This one
+    /// serves only readers that have no operand to read — `record_frame_traceback`
+    /// and the `on_enter_level` / `on_leave_level` rooting callbacks — so a
+    /// wrong value here corrupts a traceback or a root, never a vable access.
     /// Set during blackhole setup from the guard failure's virtualizable ptr.
     pub virtualizable_ptr: i64,
     /// Pointer to the VirtualizableInfo describing field offsets.
