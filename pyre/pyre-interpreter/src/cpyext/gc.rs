@@ -223,7 +223,8 @@ pub unsafe extern "C" fn PyObject_GC_UnTrack(object: *mut CPyObject) {
 ///
 /// A `tp_traverse` is not the only place a reference from one mirror to another
 /// lives, so [`super::pyobject::borrowed_edges`] adds the ones this layer holds
-/// on C's behalf.
+/// on C's behalf and [`super::typeobject::type_mirror_edges`] the ones a type
+/// mirror keeps in its own fields.
 ///
 /// Runs with the collector borrowed, so nothing it reaches may allocate. Only
 /// mirror blocks are read, and those never move.
@@ -242,6 +243,7 @@ pub(super) fn c_edges() -> Vec<(usize, Vec<usize>)> {
         }
     }
     super::pyobject::borrowed_edges(&mut edges);
+    super::typeobject::type_mirror_edges(&mut edges);
     edges
 }
 

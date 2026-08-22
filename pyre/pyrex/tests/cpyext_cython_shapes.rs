@@ -3,9 +3,10 @@
 //! Every case here was found by building SQLAlchemy's `cyextension` package
 //! against these headers and importing it: a callable whose `tp_call` is
 //! `PyVectorcall_Call`, a `cdef class` laid out against its base's ancestry
-//! tuples, and a `set` subclass whose `add` calls `PySet_Add`.  Each reached a
-//! field or an entry point that was not there, and the first two recursed
-//! until the stack ran out rather than failing.
+//! tuples, a `set` subclass whose `add` calls `PySet_Add`, and a deallocator
+//! that ends in its base's.  Each reached a field or an entry point that was
+//! not there; the first two recursed until the stack ran out, and the last
+//! called through address zero.
 
 #![cfg(all(
     feature = "cpyext",
@@ -18,6 +19,9 @@ mod cpyext_fixture;
 use cpyext_fixture::Fixtures;
 
 const SCRIPT: &str = r#"
+import gc
+import weakref
+
 import cpyext_cython_shapes as m
 
 def eq(name, got, want):
@@ -100,6 +104,37 @@ eq('exactness(subclass)', m.exactness(Loud()), (False, False, False, True))
 eq('exactness(list)', m.exactness([]), (False, False, False, False))
 
 eq('recursive_call', m.recursive_call(None), 'entered-and-left')
+
+# ── the chain a deallocator walks ─────────────────────────────────────
+# A deallocator written for a type derived from a builtin ends in the
+# base's, so the base has to carry one.
+eq('base deallocators', m.base_deallocs(), (True, True, True))
+
+Sub = m.dict_subclass()
+made = m.instantiate(Sub)
+made['a'] = 1
+eq('the instance is a mapping', dict(made), {'a': 1})
+eq('the chain has not run', m.chain_count(), 0)
+del made
+for _ in range(4):
+    if m.chain_count():
+        break
+    gc.collect()
+eq('the chain ran once', m.chain_count(), 1)
+
+# Reading a class's ancestry from C does not make it outlive the last
+# reference to it, which the tuples the read mints would otherwise see to:
+# an MRO names its own type.  A type an extension defined is immortal by
+# construction, so the class asked here is one written in Python.
+watched = type('Watched', (), {})
+eq('ancestry(Watched)', m.ancestry(watched), (1, 2))
+watch = weakref.ref(watched)
+del watched
+for _ in range(4):
+    if watch() is None:
+        break
+    gc.collect()
+eq('the class was collected', watch(), None)
 
 print('cpyext-cython-shapes-ok')
 "#;

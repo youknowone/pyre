@@ -560,6 +560,46 @@ pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
     }
 }
 
+/// `type_traverse`'s `visit(tp_dict)`, `visit(tp_mro)`, `visit(tp_bases)` and
+/// `visit(tp_base)`, read as [`super::gc::c_edges`] reads a `tp_traverse`.
+///
+/// A type's MRO names the type itself, so the tuple minted for `tp_mro` refers
+/// back through the mirror holding it: the tuple's count roots the tuple, the
+/// tuple roots the type, and the type's mirror is what would give the count
+/// back.  Reporting the reference is what lets a collection tell it from one an
+/// extension holds, and it is the reason `type_traverse` reports these fields
+/// at all.
+///
+/// Only the fields [`forget_type_mirror`] releases are reported, so an edge is
+/// exactly a reference this mirror's death gives back.
+pub(super) fn type_mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
+    let names = TYPE_NAMES.lock();
+    edges.reserve(names.len());
+    for &block in names.keys() {
+        let mirror = block as *mut CPyTypeObject;
+        let base = unsafe { (*mirror).tp_base };
+        let base = match is_heap_type(mirror) && !base.is_null() {
+            true => unsafe { &raw mut (*base).ob_base.ob_base },
+            false => std::ptr::null_mut(),
+        };
+        let referents: Vec<usize> = unsafe {
+            [
+                (*mirror).tp_dict,
+                (*mirror).tp_bases,
+                (*mirror).tp_mro,
+                base,
+            ]
+        }
+        .into_iter()
+        .filter(|raw| !raw.is_null())
+        .map(|raw| raw as usize)
+        .collect();
+        if !referents.is_empty() {
+            edges.push((block, referents));
+        }
+    }
+}
+
 /// Fill a synthesized mirror for an interpreter type.
 ///
 /// `tp_basicsize` stays 0 for all but one type: an instance of a pyre type is
@@ -726,6 +766,11 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         // from a C type is handed to a C allocator and has to carry the pair.
         (*mirror).tp_alloc = PyType_GenericAlloc as *const c_void;
         (*mirror).tp_free = PyObject_Free as *const c_void;
+        // `type_attach`'s `pto.c_tp_dealloc`, which it fills for every type it
+        // builds.  A deallocator written for a type derived from a builtin
+        // ends in its base's, and a null slot there is a call through address
+        // zero rather than a field merely left unset.
+        (*mirror).tp_dealloc = object_dealloc as *const c_void;
     }
     // `finish_type_1`'s `c_tp_bases` and `finish_type_2`'s `c_tp_mro` -- the
     // two fields a reader walks a type's ancestry with from C.  Cython's
@@ -5795,6 +5840,39 @@ pub unsafe extern "C" fn PyObject_Free(object: *mut std::ffi::c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Del(object: *mut std::ffi::c_void) {
     unsafe { PyObject_Free(object) };
+}
+
+/// `object.c _Py_object_dealloc` — the `tp_dealloc` a mirror carries, and the
+/// end of the chain a deallocator written in C walks up.
+///
+/// A type derived from a builtin finishes its own `tp_dealloc` by calling its
+/// base's; Cython spells that `__Pyx_PyType_GetSlot((&PyDict_Type), tp_dealloc,
+/// destructor)(o)` for a `cdef class` derived from `dict`.  The base of such a
+/// type is a mirror, so the slot has to hold a function on every type an
+/// extension can name as one, not only on the types that declare a deallocator
+/// of their own.
+///
+/// Nothing but the block is released here.  What a builtin's deallocator frees
+/// is the storage its instances carry, and that storage is the interpreter
+/// object this block is linked to rather than anything the block owns; the
+/// reference the block holds in its type is released by `pyobject::dealloc`
+/// once this returns, which is where upstream's trailing `Py_DECREF(pto)` went.
+unsafe extern "C" fn object_dealloc(object: *mut CPyObject) {
+    if object.is_null() {
+        return;
+    }
+    let tp = unsafe { (*object).ob_type };
+    let slot = match tp.is_null() {
+        true => std::ptr::null(),
+        false => unsafe { (*tp).tp_free },
+    };
+    // A block whose type reserves no `tp_free` still has to be handed back,
+    // and `PyObject_Free` is what a mirror's slot holds in any case.
+    let free: unsafe extern "C" fn(*mut std::ffi::c_void) = match slot.is_null() {
+        true => PyObject_Free,
+        false => unsafe { std::mem::transmute(slot) },
+    };
+    unsafe { free(object as *mut std::ffi::c_void) };
 }
 
 /// `PyObject_Init` — stamp a block's header and make it an object.

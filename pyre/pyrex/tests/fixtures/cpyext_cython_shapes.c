@@ -158,8 +158,81 @@ static PyObject *c_recursive_call(PyObject *self, PyObject *object)
     return PyUnicode_FromString("entered-and-left");
 }
 
+/* ── the chain a deallocator walks ───────────────────────────────────────
+   A `cdef class` derived from a builtin ends its own `tp_dealloc` in the
+   base's, read straight off the base's block:
+   `__Pyx_PyType_GetSlot((&PyDict_Type), tp_dealloc, destructor)(o)`.  A slot
+   left null there is a call through address zero. */
+typedef struct {
+    PyDictObject base;
+} Derived;
+
+static long chained;
+
+static PyTypeObject *builtin_type(PyObject *probe)
+{
+    PyTypeObject *type = probe ? Py_TYPE(probe) : NULL;
+    Py_XDECREF(probe);
+    return type;
+}
+
+static void derived_dealloc(PyObject *self)
+{
+    destructor base = builtin_type(PyDict_New())->tp_dealloc;
+    chained += 1;
+    base(self);
+}
+
+static PyType_Slot derived_slots[] = {
+    {Py_tp_dealloc, (void *)derived_dealloc},
+    {0, NULL}};
+
+static PyType_Spec derived_spec = {
+    "cpyext_cython_shapes.Derived", (int)sizeof(Derived), 0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, derived_slots};
+
+static PyObject *c_dict_subclass(PyObject *self, PyObject *unused)
+{
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)builtin_type(PyDict_New()));
+    PyObject *type;
+    (void)self; (void)unused;
+    if (bases == NULL) return NULL;
+    type = PyType_FromSpecWithBases(&derived_spec, bases);
+    Py_DECREF(bases);
+    return type;
+}
+
+/* Built from C, the way a Cython constructor builds one: an instance Python
+   made never crosses this boundary and so never runs the chain. */
+static PyObject *c_instantiate(PyObject *self, PyObject *type)
+{
+    (void)self;
+    return PyObject_CallNoArgs(type);
+}
+
+static PyObject *c_chain_count(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    return PyLong_FromLong(chained);
+}
+
+/* The three the generated C names by address as a base. */
+static PyObject *c_base_deallocs(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    return Py_BuildValue(
+        "(NNN)",
+        PyBool_FromLong(builtin_type(PyDict_New())->tp_dealloc != NULL),
+        PyBool_FromLong(builtin_type(PyList_New(0))->tp_dealloc != NULL),
+        PyBool_FromLong(builtin_type(PyTuple_New(0))->tp_dealloc != NULL));
+}
+
 static PyMethodDef methods[] = {
     {"ancestry", c_ancestry, METH_O, NULL},
+    {"dict_subclass", c_dict_subclass, METH_NOARGS, NULL},
+    {"instantiate", c_instantiate, METH_O, NULL},
+    {"chain_count", c_chain_count, METH_NOARGS, NULL},
+    {"base_deallocs", c_base_deallocs, METH_NOARGS, NULL},
     {"first_base", c_first_base, METH_O, NULL},
     {"set_add", c_set_add, METH_VARARGS, NULL},
     {"set_contains", c_set_contains, METH_VARARGS, NULL},

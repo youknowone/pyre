@@ -596,6 +596,12 @@ pub(super) unsafe fn reallocate_raw(
 /// # Safety
 /// `raw` must be a block this module entered, and must not be used afterwards.
 pub(super) unsafe fn free_block(raw: *mut CPyObject) {
+    // The tracked set is keyed by address, so a block that stops existing has
+    // to leave it here rather than only where a deallocator started: a
+    // `tp_dealloc` may re-track the block it is tearing down -- Cython's does,
+    // between its `PyObject_GC_UnTrack` and the base deallocator it ends in --
+    // and the collector would then read a freed address.
+    super::gc::forget(raw as usize);
     super::gc::forget_finalized(raw as usize);
     let Some(block) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
         return;
