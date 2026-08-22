@@ -159,9 +159,14 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 /// the emitted `GUARD_CLASS INT` would not match it), unbox it
 /// (`GUARD_CLASS INT` + `getfield intval`) and record `int_is_true`, stamping
 /// the folded concrete truth.  Returns the raw truth `OpRef` on success;
-/// `None` when the operand is not a concrete non-bool int — the caller then
-/// falls through to the generic may-force residual, preserving `__bool__` /
-/// `__len__` semantics.
+/// `None` when the operand is not a concrete int — the caller then falls
+/// through to the generic may-force residual, which runs `__bool__` /
+/// `__len__`.
+///
+/// Declining a subclass on the *recorded* operand is not enough: `is_int`
+/// and the `GUARD_CLASS` below both read `ob_type`, so a trace compiled from
+/// an exact int still admits a subclass that arrives later.  The `w_class`
+/// pin is what rejects it.
 ///
 /// Eliding the `CALL_MAY_FORCE` here also removes its `GUARD_NOT_FORCED` /
 /// `GUARD_NO_EXCEPTION`, whose kept-stack blackhole resume reads NULL peeled
@@ -183,6 +188,7 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
     };
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, operand, walker_numeric_builtin_class(obj))?;
     let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));

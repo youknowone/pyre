@@ -156,6 +156,11 @@ class Slotted:
     __slots__ = ("x",)
 
 
+class LiarBool(int):
+    def __bool__(self):
+        return True
+
+
 def warm_then_swap_compare_int(n):
     out = None
     for a in [0] * n + [LiarInt(0)]:
@@ -191,8 +196,38 @@ def warm_then_swap_store_attr(n):
     return type(holder.x).__name__
 
 
+# `truth_int` reaches the same hole from the branch side rather than the value
+# side: `POP_JUMP_IF_*` and the short-circuit operators read the truth of a
+# payload the `GUARD_CLASS INT` admits, so a `__bool__` override on a zero-payload
+# subclass is skipped and the branch is taken the wrong way. `bool(a)` does not
+# reach the fold and stays correct either way, so it is the control.
+def warm_then_swap_truth_if(n):
+    hits = 0
+    for a in [0] * n + [LiarBool(0)]:
+        if a:
+            hits += 1
+    return hits
+
+
+def warm_then_swap_truth_and(n):
+    out = None
+    for a in [0] * n + [LiarBool(0)]:
+        out = a and "yes"
+    return out
+
+
+def truth_bool_call_control(n):
+    out = None
+    for a in [0] * n + [LiarBool(0)]:
+        out = bool(a)
+    return out
+
+
 print(warm_then_swap_compare_int(N))
 print(warm_then_swap_compare_float(N))
 print(warm_then_swap_store_subscr(N))
 print(warm_then_swap_newlist(N))
 print(warm_then_swap_store_attr(N))
+print(warm_then_swap_truth_if(N))
+print(warm_then_swap_truth_and(N))
+print(truth_bool_call_control(N))
