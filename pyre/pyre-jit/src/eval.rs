@@ -7748,6 +7748,24 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                     | I::SetUpdate { .. }
                     | I::DictUpdate { .. }
                     | I::DictMerge { .. }
+                    // `LOAD_BUILD_CLASS` pushes `frame.get_builtin()` and
+                    // touches nothing else. `codewriter.rs` lowers it as a
+                    // frame-only Ref read under a compile-time assert that
+                    // `HONOR_BUILTINS` is false, so which frame asks does not
+                    // change the answer. A loop body that defines a class
+                    // holds one.
+                    //
+                    // `DELETE_NAME` and `DELETE_GLOBAL` deliberately stay out,
+                    // even though they reach the same
+                    // `try_walker_force_quasi_immut_namespace_write` as the
+                    // two stores above. A repeated store settles: after the
+                    // first write `store_would_bump_version` stops bumping and
+                    // the loop compiles. A delete removes the cell, so it
+                    // bumps every iteration and forces every iteration --
+                    // `x = i * 2; total += x` compiles with 0 aborts, and the
+                    // same loop with `del x` appended traces 5 times and
+                    // aborts all 5 on the force, compiling nothing.
+                    | I::LoadBuildClass
             )
             || ((!body_has_call || for_iter_call_body_admitted())
                 && matches!(body_instr, I::ListAppend { .. }));
@@ -13769,6 +13787,53 @@ mod tests {
             assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
+    }
+
+    #[test]
+    fn for_iter_body_defining_a_class_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec(
+            "def f(n):\n    c = 0\n    for i in range(n):\n        class C:\n            v = i\n        c += C.v\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_body_deleting_a_namespace_name_is_refused() {
+        // The counterpart to the `STORE_NAME` and `STORE_GLOBAL` admission: a
+        // store settles after its first version bump, a delete bumps on every
+        // iteration and forces the trace every time, so the loop it would
+        // admit never compiles. Only a module or class frame spells
+        // `DELETE_NAME` -- a function's `del x` is `DELETE_FAST`, which stays
+        // admitted, so the store-only loop below has to keep passing.
+        use pyre_interpreter::compile_exec;
+        let stores =
+            compile_exec("total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n")
+                .expect("test code should compile");
+        assert!(function_entry_trace_is_jit_safe(&stores));
+
+        let deletes = compile_exec(
+            "total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n    del x\n",
+        )
+        .expect("test code should compile");
+        assert!(!function_entry_trace_is_jit_safe(&deletes));
+
+        let del_global = compile_exec(
+            "g = 0\ndef f(n):\n    global g\n    c = 0\n    for i in range(n):\n        g = i\n        c += g\n        del g\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&del_global, "f");
+        assert!(!function_entry_trace_is_jit_safe(&code));
+
+        let del_fast = compile_exec(
+            "def f(n):\n    c = 0\n    for i in range(n):\n        x = i * 2\n        c += x\n        del x\n    return c\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&del_fast, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
