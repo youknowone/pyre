@@ -83,8 +83,9 @@ fn simple_weak_set_type() -> PyObjectRef {
 /// key, so what is stashed for it is the module entry that would *shadow*
 /// builtins — `0` while there is none.  A caller who assigns
 /// `__globals__["TypeError"]` moves it off `0` and the comparison declines,
-/// which is the mutation this guards.  Rebinding `builtins.TypeError` itself is
-/// a process-wide change this does not pretend to cover.
+/// which is the mutation this guards.  The builtins binding the name falls
+/// through to is checked where it is consulted, on the handler's own arm in
+/// [`simple_weak_set_contains`].
 ///
 /// What is stored is not those four addresses but a weak reference to each,
 /// [`weak_lifeline`], read back through [`installed_contains_identity`].  A
@@ -139,6 +140,52 @@ fn installed_contains_identity() -> Option<(usize, usize, usize, usize)> {
         *word = referent as usize;
     }
     Some((words[0], words[1], words[2], words[3]))
+}
+
+/// The weak reference naming the class `TypeError` resolved to at module init,
+/// as [`weak_lifeline`] records it.
+static BUILTIN_TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// What `TypeError` names in the builtins the body falls through to.
+///
+/// `None` while there is no reachable builtins module or it holds no such key.
+/// The lookup is the fallback leg of `LOAD_GLOBAL` itself — `space.builtin`
+/// under the default `honor__builtins__=False`, not the `__builtins__` entry of
+/// the module dict.
+fn builtin_type_error() -> Option<PyObjectRef> {
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        return None;
+    }
+    let w_builtin = unsafe { (*ec).get_builtin() };
+    if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
+        return None;
+    }
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+    if w_dict.is_null() {
+        return None;
+    }
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, "TypeError") }
+}
+
+fn record_builtin_type_error() {
+    if let Some(installed) = builtin_type_error()
+        && let Some(lifeline) = weak_lifeline(installed)
+    {
+        let _ = BUILTIN_TYPE_ERROR.set(lifeline);
+    }
+}
+
+/// Whether `TypeError` still names the class it named when this module loaded.
+///
+/// `false` also when nothing was recorded, which costs a decline rather than an
+/// answer taken on a binding never established.
+fn type_error_names_the_installed_class() -> bool {
+    let Some(&lifeline) = BUILTIN_TYPE_ERROR.get() else {
+        return false;
+    };
+    let installed = crate::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
+    !installed.is_null() && builtin_type_error().is_some_and(|now| std::ptr::eq(now, installed))
 }
 
 /// The installed `__contains__`, the code object it currently holds and its two
@@ -258,6 +305,18 @@ fn simple_weak_set_contains(
     ) {
         Ok(probe) => probe,
         Err(err) if matches!(err.kind, crate::error::PyErrorKind::TypeError) => {
+            // `except TypeError` resolves the name where the handler runs, so
+            // the binding matters on this arm and nowhere else.  A shadowing
+            // module entry already moved an identity word and declined above,
+            // which leaves the builtins entry the name falls through to:
+            // rebound, the handler `app_abc.py` spells need not match what the
+            // constructor raised, and answering `False` here would catch what
+            // the body would have let out.  Hand the test back instead of
+            // deciding it.  `ref` on an item that refuses one raises without
+            // running anything observable, so re-running it costs the raise.
+            if !type_error_names_the_installed_class() {
+                return Ok(None);
+            }
             return Ok(Some(false));
         }
         Err(err) => return Err(err),
@@ -973,6 +1032,7 @@ crate::py_module! {
             if recorded {
                 let _ = SIMPLE_WEAK_SET_CONTAINS.set(lifelines);
             }
+            record_builtin_type_error();
         }
     },
 }

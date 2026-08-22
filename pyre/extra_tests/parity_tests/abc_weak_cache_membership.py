@@ -322,6 +322,42 @@ def a_shadowed_typeerror_global_is_consulted():
     assert 'weak reference' in message, message
 
 
+def a_rebound_builtin_typeerror_is_consulted():
+    import builtins
+
+    class Caught(metaclass=ABCMeta):
+        pass
+
+    class Impl(Caught):
+        pass
+
+    class Claims:
+        __class__ = 3
+
+    assert isinstance(Impl(), Caught) is True
+
+    class Missing(Exception):
+        pass
+
+    # The other half of the shadowed-global arm.  With no module entry to find,
+    # `except TypeError` reaches the builtins binding, so rebinding it there
+    # leaves the handler naming something the weakref failure is not, and the
+    # failure escapes instead of becoming a `False`.  `except original` rather
+    # than `except TypeError`, because the name in this frame resolves through
+    # the same rebound builtins.
+    original = builtins.TypeError
+    builtins.TypeError = Missing
+    try:
+        isinstance(Claims(), Caught)
+    except original as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('an unweakreferenceable class was accepted')
+    finally:
+        builtins.TypeError = original
+    assert 'weak reference' in message, message
+
+
 empty_collection_answers_then_fills()
 unweakreferenceable_class_reaches_the_subclass_check()
 a_raising_hash_runs_once()
@@ -335,4 +371,5 @@ if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     a_non_function_contains_declines()
     a_mutated_ref_global_is_consulted()
     a_shadowed_typeerror_global_is_consulted()
+    a_rebound_builtin_typeerror_is_consulted()
 print('OK')
