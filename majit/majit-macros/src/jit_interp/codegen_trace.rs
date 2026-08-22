@@ -48,6 +48,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.inlined_prefix,
         &config.native_int_binops,
         &config.native_tag_small,
+        &config.native_identity,
         config.split_dispatch,
         config.switch_dispatch,
     );

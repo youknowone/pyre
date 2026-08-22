@@ -399,6 +399,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     int_fields: &[crate::jit_interp::IntFieldEntry],
     native_int_binops: &[(Path, Ident)],
     native_tag_small: &[Path],
+    native_identity: &[Path],
     headerless_structs: &[Path],
     inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
@@ -439,6 +440,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         && int_fields.is_empty()
         && native_int_binops.is_empty()
         && native_tag_small.is_empty()
+        && native_identity.is_empty()
         && headerless_structs.is_empty()
         && inlined_prefix.is_empty()
     {
@@ -450,6 +452,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             int_fields,
             native_int_binops,
             native_tag_small,
+            native_identity,
             headerless_structs,
             inlined_prefix,
         ))
