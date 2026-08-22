@@ -1083,6 +1083,27 @@ def _jit_stats_merged(stderr):
     return fields if seen else None
 
 
+def _jit_stats_field(stderr, field):
+    """One integer counter off the merged map, or `None`.
+
+    `None` covers a run that printed no `[jit-stats]` line, one that printed
+    no such key, and one whose value does not read as an integer. None of
+    those is the same answer as a printed zero, which is why the caller
+    distinguishes them.
+
+    The unfiltered map and not the snapshot, for the reason
+    [`_jit_stats_merged`] gives: a non-vacuity check reads a counter precisely
+    because it is not part of the recorded surface.
+    """
+    fields = _jit_stats_merged(stderr or "")
+    if not fields or field not in fields:
+        return None
+    try:
+        return int(fields[field])
+    except ValueError:
+        return None
+
+
 def _jit_stats_snapshot(stderr, ungated=()):
     """Return every jit-stats line merged into normalized key/value text.
 
@@ -1895,6 +1916,29 @@ def synth_selfcheck(path):
         path,
         "# pyre-check: selfcheck",
         "synthetic selfcheck marker takes no value",
+    )
+
+
+def synth_selfcheck_interpreted(path):
+    """Read an optional per-fixture JIT-floor opt-out from its header:
+        # pyre-check: selfcheck-interpreted
+
+    A selfcheck fixture asserts its own invariant, so it passes whenever the
+    invariant holds — including on a run where the JIT compiled nothing at all,
+    which for a guard against a *compiled* mis-admission is a pass that
+    establishes nothing. `run_selfcheck` therefore requires the run to have
+    compiled a loop, and this is how a fixture says its invariant is not about
+    compiled code: the two that carry it (`oserror_errno_fields_regression`,
+    `posix_replace_regression`) guard interpreter-level behaviour and measure
+    `loops_compiled=0` on every backend.
+
+    An opt-out rather than an opt-in, so a fixture that quietly stops being
+    compiled is reported rather than passing on in silence.
+    """
+    return _synth_header_flag(
+        path,
+        "# pyre-check: selfcheck-interpreted",
+        "synthetic selfcheck-interpreted marker takes no value",
     )
 
 
@@ -3936,7 +3980,8 @@ class Check:
 
     # ── self-checking regression guard ──
 
-    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=()):
+    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
+                      require_jit=True):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -3947,6 +3992,14 @@ class Check:
         *skip_backends* names backends the guard does not apply to (e.g. a
         `time`-module timing guard cannot run on the wasm guest, which has no
         `time` module).
+
+        With *require_jit* the run must also have compiled at least one loop.
+        A self-asserted invariant is satisfied by an interpreted run, so
+        without this a fixture guarding a compiled mis-admission passes while
+        establishing nothing — and it would go on passing if the shape it
+        guards stopped reaching the JIT, which is the change most likely to
+        make the guard vacuous. `synth_selfcheck_interpreted` turns it off for
+        a fixture whose invariant is not about compiled code.
         """
         print(f"  {name}")
         for backend in ALL_BACKENDS:
@@ -3987,6 +4040,19 @@ class Check:
                 _dump_failed_run(output, stderr)
                 self._append_comparison(backend, name, "-", "-", "FAIL")
                 continue
+            if require_jit:
+                compiled = _jit_stats_field(stderr, "loops_compiled")
+                if compiled is None or compiled < 1:
+                    seen = "no [jit-stats] line" if compiled is None else "loops_compiled=0"
+                    detail = (
+                        f"the guard ran interpreted ({seen}), so its assertion "
+                        "says nothing about compiled code"
+                    )
+                    self._record(backend, False, name, detail)
+                    print(f"{red('FAIL')}  {detail}")
+                    _dump_failed_run(output, stderr)
+                    self._append_comparison(backend, name, "-", "-", "FAIL")
+                    continue
             self._record(backend, True, name, "")
             print(f"{green('PASS')}  {elapsed:.2f}s")
             self._append_comparison(backend, name, "-", "-", f"{elapsed:.2f}s")
@@ -4251,6 +4317,7 @@ class Check:
                     str(path),
                     self.args.synthetic_timeout,
                     skip_backends=skip_backends,
+                    require_jit=not synth_selfcheck_interpreted(path),
                 )
             else:
                 self.run_synthetic_bench(
