@@ -668,8 +668,13 @@ impl PyreMarshalBag {
         constants: Vec<Rooted>,
         raw_code_bytes: Option<Vec<u8>>,
     ) -> Result<Rooted, wire::MarshalError> {
-        let code = Rooted::new(crate::pycode::box_code_constant(&code));
-        // `box_code_constant` allocates, so read each constant out of its
+        // Hand the decoded object over rather than copying it: `code` is owned
+        // here and dropped immediately after, so `box_code_constant`'s borrow
+        // form duplicated the whole recursive constants graph and then threw
+        // the original away — once per code object in every unmarshalled
+        // module.
+        let code = Rooted::new(crate::pycode::box_code_object(code));
+        // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
         // list to `PyCode.__init__`; replace the compiler-boundary eager values
         // with those exact marshal objects.
@@ -755,7 +760,9 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
-        Ok(Rooted::new(crate::pycode::box_code_constant(&code)))
+        // Owned here and used nowhere else — hand it over rather than copying
+        // the recursive constants graph, as in `make_runtime_code`.
+        Ok(Rooted::new(crate::pycode::box_code_object(code)))
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
