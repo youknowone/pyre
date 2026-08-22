@@ -3274,6 +3274,31 @@ fn build_function(
             "wasm backend: a preamble-sourced inline region is placed inside the loop".into(),
         ));
     }
+    // A region's block closes where its own ops begin, so a guard branching
+    // into it must sit before them. That one inequality is what makes a
+    // region's ordinal usable as a branch depth (`emit_guard_exit` counts it
+    // from the family's still-open blocks), and it is also what refuses the two
+    // structurally impossible attachments: a region reached from a guard in a
+    // LATER region of the same family, and a body region reached from a guard
+    // in an outside one, whose header `loop` has already closed.
+    {
+        let mut start = bridge_start;
+        for bridge in inlined_bridges {
+            let guard_pos = exit_op_index(ops, bridge.source_fail_index).ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge source guard is outside the merged stream".into(),
+                )
+            })?;
+            if guard_pos >= start {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: an inline region is reached from a guard at or past its \
+                     own ops, so the block it branches to has already closed"
+                        .into(),
+                ));
+            }
+            start += bridge.ops.len();
+        }
+    }
     let outside_start = bridge_start
         + inlined_bridges[..body_region_count]
             .iter()
@@ -3377,7 +3402,7 @@ fn build_function(
             // Blocks open in reverse attach order, making region 0 of each
             // family innermost. The guard `if` contributes the final +1 in
             // `emit_guard_if_exit`.
-            branch_depth: if region < body_region_count {
+            region_ordinal: if region < body_region_count {
                 region as u32
             } else {
                 (region - body_region_count) as u32
@@ -3393,6 +3418,8 @@ fn build_function(
         param_type_indices: bridge_param_type_indices,
         inline_guards: &inline_guards,
         outside_region_base: 0,
+        closed_body_regions: 0,
+        closed_outside_regions: 0,
         ref_homes,
         frame,
     };
@@ -3802,6 +3829,8 @@ fn build_function(
             block_exit_depth - open_outside_blocks - u32::from(resume_dispatch);
         let guard_dispatch = BridgeDispatch {
             outside_region_base,
+            closed_body_regions: started_body_regions as u32,
+            closed_outside_regions: started_outside_regions as u32,
             ..guard_dispatch
         };
         // The guard whose condition the previous op already pushed and tested.
@@ -7091,11 +7120,13 @@ fn emit_array_addr(
 struct InlineGuard<'a> {
     guard_idx: u32,
     inputargs: &'a [InputArg],
-    /// Ordinal within this region's family of blocks, region 0 innermost. For a
-    /// body region that is already the branch depth at loop-body statement
-    /// level; a preamble region adds `BridgeDispatch::outside_region_base`,
-    /// which depends on where the branching guard sits.
-    branch_depth: u32,
+    /// Ordinal within this region's family, region 0 attached first. NOT a
+    /// branch depth on its own: a family's blocks close one per region as the
+    /// walk reaches each region's ops, so the depth of region N's block is this
+    /// ordinal less however many of the family have already closed where the
+    /// branching guard sits. `BridgeDispatch` carries that running count, and
+    /// `emit_guard_exit` does the subtraction.
+    region_ordinal: u32,
     outside_loop: bool,
 }
 
@@ -7112,6 +7143,12 @@ struct BridgeDispatch<'a> {
     /// Depth of the innermost still-open preamble-region block, at the
     /// statement level of the operation being emitted.
     outside_region_base: u32,
+    /// Regions of each family whose block has already been closed at the
+    /// operation being emitted — one closes at each region's first op. A guard
+    /// in the owner's own stream sees zero of both; a guard nested inside
+    /// region P sees P+1 of P's family.
+    closed_body_regions: u32,
+    closed_outside_regions: u32,
     ref_homes: &'a RefHomes,
     frame: FrameGeometry,
 }
@@ -7298,10 +7335,21 @@ fn emit_guard_exit(
         );
         // The target depth is measured outside this failing `if`; include the
         // `if` itself before selecting the enclosing bridge block.
-        let depth = if inline.outside_loop {
-            dispatch.outside_region_base + inline.branch_depth
+        //
+        // A family's blocks close one per region as the walk reaches each
+        // region's ops, so the ordinal counts from whichever of them are still
+        // open here. `build_function` refuses any region whose source guard
+        // does not precede its own ops, which is what keeps this subtraction
+        // from going negative.
+        let ordinal = if inline.outside_loop {
+            inline.region_ordinal - dispatch.closed_outside_regions
         } else {
-            inline.branch_depth
+            inline.region_ordinal - dispatch.closed_body_regions
+        };
+        let depth = if inline.outside_loop {
+            dispatch.outside_region_base + ordinal
+        } else {
+            ordinal
         };
         sink.br(depth + 1);
         return;
