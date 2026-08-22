@@ -1280,26 +1280,19 @@ fn test_empty_trace() {
     assert!(guards[0].is_finish);
 }
 
-#[test]
-fn inlined_bridge_without_owner_loop_label_declines() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let guard = make_guard(
-        OpCode::GuardTrue,
-        &[OpRef::input_arg_int(0)],
-        &[OpRef::input_arg_int(0)],
-    );
-    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
-    let inputs = codegen::ModuleBuildInputs {
+/// The `ModuleBuildInputs` shape every inline-region test shares: a fixed
+/// frame, no nursery, no census, and every base at zero.  Only the owner trace
+/// and the regions merged into it vary between them, so a new field lands here
+/// once instead of at each call site.
+fn inline_region_inputs(
+    inputargs: &[InputArg],
+    ops: Vec<Op>,
+    inlined_bridges: Vec<codegen::InlinedBridge>,
+) -> codegen::ModuleBuildInputs {
+    codegen::ModuleBuildInputs {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-        ops: vec![guard, finish],
-        inlined_bridges: vec![codegen::InlinedBridge {
-            source_fail_index: 0,
-            trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 1)],
-            ops: vec![Op::new(OpCode::Finish, &[])],
-            gc_table_base: 0,
-            constants: indexmap::IndexMap::new(),
-        }],
+        ops,
+        inlined_bridges,
         constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
@@ -1318,7 +1311,30 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
-    };
+    }
+}
+
+#[test]
+fn inlined_bridge_without_owner_loop_label_declines() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    let inputs = inline_region_inputs(
+        &inputargs,
+        vec![guard, finish],
+        vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 1)],
+            ops: vec![Op::new(OpCode::Finish, &[])],
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+    );
 
     let error = match codegen::build_wasm_module(&inputs) {
         Ok(_) => panic!("a label-less owner cannot accept an inlined bridge"),
@@ -3008,10 +3024,10 @@ fn build_owner_with_region_closing_at(
     ];
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+    let inputs = inline_region_inputs(
+        &inputargs,
         ops,
-        inlined_bridges: vec![codegen::InlinedBridge {
+        vec![codegen::InlinedBridge {
             source_fail_index: 0,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
@@ -3019,25 +3035,7 @@ fn build_owner_with_region_closing_at(
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
         }],
-        constants: indexmap::IndexMap::new(),
-        vtable_offset: Some(0),
-        classptr_to_typeid: HashMap::new(),
-        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
-        nursery: None,
-        invalidated_flag_addr: 0,
-        gc_table_base: 0,
-        fail_index_base: 0,
-        bridge_cells_base: 0,
-        bridge_entry_arity: None,
-        bridge_param_dispatch: false,
-        trace_entry_census: None,
-        external_jump_slot: 0,
-        external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
-        ca: codegen::CaParams::default(),
-    };
+    );
     codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
 }
 
@@ -3200,10 +3198,10 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
     if with_ref {
         inputargs.push(InputArg::from_type(Type::Ref, 6));
     }
-    let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+    let inputs = inline_region_inputs(
+        &inputargs,
         ops,
-        inlined_bridges: vec![codegen::InlinedBridge {
+        vec![codegen::InlinedBridge {
             source_fail_index: 0,
             trace_id: 1,
             inputargs: if with_ref {
@@ -3218,25 +3216,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
         }],
-        constants: indexmap::IndexMap::new(),
-        vtable_offset: Some(0),
-        classptr_to_typeid: HashMap::new(),
-        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
-        nursery: None,
-        invalidated_flag_addr: 0,
-        gc_table_base: 0,
-        fail_index_base: 0,
-        bridge_cells_base: 0,
-        bridge_entry_arity: None,
-        bridge_param_dispatch: false,
-        trace_entry_census: None,
-        external_jump_slot: 0,
-        external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
-        ca: codegen::CaParams::default(),
-    };
+    );
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
     validate_wasm(&bytes);
 
@@ -3667,10 +3647,10 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
     ];
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+    let inputs = inline_region_inputs(
+        &inputargs,
         ops,
-        inlined_bridges: vec![codegen::InlinedBridge {
+        vec![codegen::InlinedBridge {
             source_fail_index: 0,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
@@ -3678,25 +3658,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
         }],
-        constants: indexmap::IndexMap::new(),
-        vtable_offset: Some(0),
-        classptr_to_typeid: HashMap::new(),
-        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
-        nursery: None,
-        invalidated_flag_addr: 0,
-        gc_table_base: 0,
-        fail_index_base: 0,
-        bridge_cells_base: 0,
-        bridge_entry_arity: None,
-        bridge_param_dispatch: false,
-        trace_entry_census: None,
-        external_jump_slot: 0,
-        external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
-        ca: codegen::CaParams::default(),
-    };
+    );
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
     validate_wasm(&bytes);
 
@@ -3834,10 +3796,10 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
     ];
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+    let inputs = inline_region_inputs(
+        &inputargs,
         ops,
-        inlined_bridges: vec![
+        vec![
             codegen::InlinedBridge {
                 source_fail_index: 0,
                 trace_id: 1,
@@ -3855,25 +3817,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 constants: indexmap::IndexMap::new(),
             },
         ],
-        constants: indexmap::IndexMap::new(),
-        vtable_offset: Some(0),
-        classptr_to_typeid: HashMap::new(),
-        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
-        nursery: None,
-        invalidated_flag_addr: 0,
-        gc_table_base: 0,
-        fail_index_base: 0,
-        bridge_cells_base: 0,
-        bridge_entry_arity: None,
-        bridge_param_dispatch: false,
-        trace_entry_census: None,
-        external_jump_slot: 0,
-        external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
-        ca: codegen::CaParams::default(),
-    };
+    );
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("two non-header regions merge");
     validate_wasm(&bytes);
 
@@ -3965,29 +3909,7 @@ fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
     ];
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-        ops,
-        inlined_bridges: vec![],
-        constants: indexmap::IndexMap::new(),
-        vtable_offset: Some(0),
-        classptr_to_typeid: HashMap::new(),
-        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
-        nursery: None,
-        invalidated_flag_addr: 0,
-        gc_table_base: 0,
-        fail_index_base: 0,
-        bridge_cells_base: 0,
-        bridge_entry_arity: None,
-        bridge_param_dispatch: false,
-        trace_entry_census: None,
-        external_jump_slot: 0,
-        external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
-        ca: codegen::CaParams::default(),
-    };
+    let inputs = inline_region_inputs(&inputargs, ops, vec![]);
     assert!(codegen::inline_source_guard_precedes_loop_label(&inputs, 0));
     assert!(!codegen::inline_source_guard_precedes_loop_label(
         &inputs, 1
