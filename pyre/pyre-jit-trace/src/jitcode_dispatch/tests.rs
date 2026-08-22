@@ -916,7 +916,7 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
 /// trace never pinned.
 ///
 /// The abort itself never fires on the synth corpus (measured: 0, against
-/// `VableEscapedDuringResidualCall`'s 123 aborts across 18 fixtures — the
+/// `VableEscapedDuringResidualCall`'s 149 events over 20 of 446 fixtures — the
 /// `[fbw-census]` rows count events, not fixtures, and exist only for a
 /// fixture that declined at least once, so they carry no corpus-wide
 /// denominator).
