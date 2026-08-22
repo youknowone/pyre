@@ -409,12 +409,22 @@ fn new_token(
     var: PyObjectRef,
     old_value: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let token = w_instance_new(token_type());
-    crate::baseobjspace::setattr_str(token, "_context", context)?;
-    crate::baseobjspace::setattr_str(token, "_var", var)?;
-    crate::baseobjspace::setattr_str(token, "_old_value", old_value)?;
-    crate::baseobjspace::setattr_str(token, "_used", w_bool_from(false))?;
-    Ok(token)
+    // The three values arrive as native words and outlive the allocation
+    // below and four attribute stores, each of which can collect; `old_value`
+    // is whatever the caller last set, a list or a dict included.  The token
+    // takes a slot of its own for liveness: an instance never moves, but one
+    // nothing refers to yet is still swept.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[context, var, old_value]);
+    let token_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_instance_new(token_type()));
+    let token = || pyre_object::gc_roots::shadow_stack_get(token_slot);
+    let value_at = |offset: usize| pyre_object::gc_roots::shadow_stack_get(base + offset);
+    crate::baseobjspace::setattr_str(token(), "_context", value_at(0))?;
+    crate::baseobjspace::setattr_str(token(), "_var", value_at(1))?;
+    crate::baseobjspace::setattr_str(token(), "_old_value", value_at(2))?;
+    crate::baseobjspace::setattr_str(token(), "_used", w_bool_from(false))?;
+    Ok(token())
 }
 
 fn token_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
