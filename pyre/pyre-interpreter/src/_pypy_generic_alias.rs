@@ -232,13 +232,13 @@ fn ga_call(args: &[PyObjectRef]) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(self_) };
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_);
-    pyre_object::gc_roots::pin_root(origin);
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let _ = pyre_object::gc_roots::pin_root(origin);
     let result = crate::builtins::call_forwarding_args(
         unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 1) },
         &args[1..],
     )?;
-    pyre_object::gc_roots::pin_root(result);
+    let _ = pyre_object::gc_roots::pin_root(result);
     crate::call::set_orig_class(
         unsafe { pyre_object::gc_roots::shadow_stack_get(root_base + 2) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(root_base) },
@@ -263,15 +263,15 @@ fn ga_getattribute(args: &[PyObjectRef]) -> crate::PyResult {
 fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(self_);
+    let self_ = pyre_object::gc_roots::pin_root(self_);
     let starred = make_starred(self_)?;
     let starred_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(starred);
+    let _ = pyre_object::gc_roots::pin_root(starred);
     let singleton = w_tuple_new(vec![unsafe {
         pyre_object::gc_roots::shadow_stack_get(starred_slot)
     }]);
     let singleton_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(singleton);
+    let _ = pyre_object::gc_roots::pin_root(singleton);
     crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(singleton_slot) })
 }
 
@@ -370,13 +370,13 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // and `items` is read back before each element fetch.
     let _roots = pyre_object::gc_roots::push_roots();
     let items_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(items);
+    let _ = pyre_object::gc_roots::pin_root(items);
     let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     let n = unsafe { w_tuple_len(items()) };
     let mut newarg_slots: Vec<usize> = Vec::new();
     let mut push_newarg = |value: PyObjectRef, slots: &mut Vec<usize>| {
         slots.push(pyre_object::gc_roots::shadow_stack_len());
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     };
     for i in 0..n {
         let Some(arg) = (unsafe { w_tuple_getitem(items(), i as i64) }) else {
@@ -467,10 +467,10 @@ pub(crate) fn subs_parameters(
     // reloads them afterwards; mirror that ownership explicitly.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_);
-    pyre_object::gc_roots::pin_root(args);
-    pyre_object::gc_roots::pin_root(params);
-    pyre_object::gc_roots::pin_root(items);
+    let self_ = pyre_object::gc_roots::pin_root(self_);
+    let args = pyre_object::gc_roots::pin_root(args);
+    let params = pyre_object::gc_roots::pin_root(params);
+    let items = pyre_object::gc_roots::pin_root(items);
     let current_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let current_args = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let current_params = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
@@ -489,17 +489,17 @@ pub(crate) fn subs_parameters(
     // argument live on the shadow stack and are reread after anything that
     // can collect.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(self_);
+    let _ = pyre_object::gc_roots::pin_root(self_);
     let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(args);
+    let _ = pyre_object::gc_roots::pin_root(args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(params);
+    let _ = pyre_object::gc_roots::pin_root(params);
     let params_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // `items = _unpack_args(items)` flattens unpacked `tuple[...]` aliases.
     // `__typing_prepare_subst__` then reshapes `items` for
     // `ParamSpec`/`TypeVarTuple` parameters — honoured per param, missing
     // attribute (the `None` default) skips it.
-    pyre_object::gc_roots::pin_root(items);
+    let _ = pyre_object::gc_roots::pin_root(items);
     let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let unpacked = unpack_args(pyre_object::gc_roots::shadow_stack_get(items_slot))?;
     pyre_object::gc_roots::shadow_stack_set(items_slot, unpacked);
@@ -513,7 +513,7 @@ pub(crate) fn subs_parameters(
             continue;
         };
         let param_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(param);
+        let _ = pyre_object::gc_roots::pin_root(param);
         // `prepare = getattr(param, '__typing_prepare_subst__', None)` then
         // `if prepare is not None`: a missing attribute and an attribute
         // explicitly set to `None` both skip the reshape.
@@ -595,13 +595,13 @@ pub(crate) fn subs_parameters(
     } else {
         w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(items_slot)])
     };
-    pyre_object::gc_roots::pin_root(argitems);
+    let _ = pyre_object::gc_roots::pin_root(argitems);
     let argitems_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Slots rather than values: each entry has to survive every later
     // iteration's allocations before the caller builds the result from them.
     let mut newarg_slots: Vec<usize> = Vec::new();
     let mut push_newarg = |value: PyObjectRef, slots: &mut Vec<usize>| {
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
         slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
     };
     let args_are_tuple = unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(args_slot)) };
@@ -624,7 +624,7 @@ pub(crate) fn subs_parameters(
             push_newarg(old_arg, &mut newarg_slots);
             continue;
         }
-        pyre_object::gc_roots::pin_root(old_arg);
+        let old_arg = pyre_object::gc_roots::pin_root(old_arg);
         let old_arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // CPython 3.14 `_Py_subs_parameters`: lists and tuples containing
         // parameters are recursively substituted, preserving their shape.
@@ -663,7 +663,7 @@ pub(crate) fn subs_parameters(
             Err(e) => return Err(e),
         };
         let arg = if !unsafe { pyre_object::is_none(meth) } {
-            pyre_object::gc_roots::pin_root(meth);
+            let _ = pyre_object::gc_roots::pin_root(meth);
             let meth_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let iparam = tuple_index(
                 pyre_object::gc_roots::shadow_stack_get(params_slot),
@@ -689,7 +689,7 @@ pub(crate) fn subs_parameters(
             )?
         };
         if unpack {
-            pyre_object::gc_roots::pin_root(arg);
+            let arg = pyre_object::gc_roots::pin_root(arg);
             let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // GH-138497: an unpacked `__typing_subst__` must return a tuple.
             // (authority = CPython 3.14)
@@ -767,7 +767,7 @@ fn subs_tvars(
             }
         } else {
             subarg_slots.push(pyre_object::gc_roots::shadow_stack_len());
-            pyre_object::gc_roots::pin_root(arg);
+            let _ = pyre_object::gc_roots::pin_root(arg);
         }
     }
     let subargs: Vec<PyObjectRef> = subarg_slots
@@ -883,8 +883,8 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let input_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(x);
-    pyre_object::gc_roots::pin_root(y);
+    let _ = pyre_object::gc_roots::pin_root(x);
+    let _ = pyre_object::gc_roots::pin_root(y);
     // CPython 3.14 `_Py_union_type_or`: initialize a unionbuilder, then add
     // the operands in order.  The builder, rather than an eager `x == y`,
     // decides duplicates inside the construction-time hash partition.
@@ -892,7 +892,7 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(input_base),
         pyre_object::gc_roots::shadow_stack_get(input_base + 1),
     ]);
-    pyre_object::gc_roots::pin_root(raw_args);
+    let _ = pyre_object::gc_roots::pin_root(raw_args);
     let raw_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let parameters = collect_parameters(pyre_object::gc_roots::shadow_stack_get(raw_args_slot))?;
     build_union(
@@ -919,7 +919,7 @@ pub(crate) fn union_from_items(items: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let item_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in items {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let current_items = || {
         (0..items.len())
@@ -927,7 +927,7 @@ pub(crate) fn union_from_items(items: &[PyObjectRef]) -> crate::PyResult {
             .collect::<Vec<_>>()
     };
     let raw_args = w_tuple_new(current_items());
-    pyre_object::gc_roots::pin_root(raw_args);
+    let _ = pyre_object::gc_roots::pin_root(raw_args);
     let raw_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let parameters = collect_parameters(pyre_object::gc_roots::shadow_stack_get(raw_args_slot))?;
     build_union(&current_items(), parameters)
@@ -942,11 +942,11 @@ pub(crate) fn typing_type_convert(arg: PyObjectRef) -> crate::PyResult {
         return Ok(arg);
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(arg);
+    let _ = pyre_object::gc_roots::pin_root(arg);
     let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let typing = crate::importing::check_sys_modules("typing")
         .ok_or_else(|| crate::PyError::type_error("typing module is not initialized"))?;
-    pyre_object::gc_roots::pin_root(typing);
+    let _ = pyre_object::gc_roots::pin_root(typing);
     let typing_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Module getattr may execute Python and collect.  Reload both the module
     // and operand from their PyPy-shaped roots before the call.
@@ -954,7 +954,7 @@ pub(crate) fn typing_type_convert(arg: PyObjectRef) -> crate::PyResult {
         pyre_object::gc_roots::shadow_stack_get(typing_slot),
         "_type_convert",
     )?;
-    pyre_object::gc_roots::pin_root(convert);
+    let _ = pyre_object::gc_roots::pin_root(convert);
     let convert_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(convert_slot),
@@ -975,7 +975,7 @@ impl UnionBuilder {
     fn new() -> Self {
         let hashable_set = pyre_object::w_set_new();
         let hashable_set_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(hashable_set);
+        let _ = pyre_object::gc_roots::pin_root(hashable_set);
         Self {
             hashable_set_slot,
             member_slots: Vec::new(),
@@ -986,12 +986,12 @@ impl UnionBuilder {
     fn add(&mut self, arg: PyObjectRef) -> Result<(), crate::PyError> {
         let arg = normalize_none(arg);
         if unsafe { pyre_object::is_union(arg) } {
-            pyre_object::gc_roots::pin_root(arg);
+            let _ = pyre_object::gc_roots::pin_root(arg);
             let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let inner = unsafe {
                 pyre_object::w_union_get_args(pyre_object::gc_roots::shadow_stack_get(arg_slot))
             };
-            pyre_object::gc_roots::pin_root(inner);
+            let _ = pyre_object::gc_roots::pin_root(inner);
             let inner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let n = unsafe {
                 pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(inner_slot))
@@ -1014,7 +1014,7 @@ impl UnionBuilder {
         // duplicate leaves one unused slot, matching the temporary strong
         // reference held by CPython's builder call and avoiding a nested root
         // scope that would also discard newly accepted member slots.
-        pyre_object::gc_roots::pin_root(arg);
+        let arg = pyre_object::gc_roots::pin_root(arg);
         let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let unhashable = match crate::builtins::try_hash_value(
             pyre_object::gc_roots::shadow_stack_get(arg_slot),
@@ -1107,11 +1107,11 @@ impl UnionBuilder {
 
 fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(parameters);
+    let _ = pyre_object::gc_roots::pin_root(parameters);
     let parameters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let item_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in items {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let mut builder = UnionBuilder::new();
     for i in 0..items.len() {
@@ -1125,9 +1125,9 @@ fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResul
 pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(a);
+        let a = pyre_object::gc_roots::pin_root(a);
         let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(b);
+        let b = pyre_object::gc_roots::pin_root(b);
         let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let ah = w_union_get_hashable_args(a);
         let bh = w_union_get_hashable_args(b);
@@ -1139,9 +1139,9 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
         if aa.is_null() || bb.is_null() {
             return Ok(aa.is_null() && bb.is_null());
         }
-        pyre_object::gc_roots::pin_root(aa);
+        let _ = pyre_object::gc_roots::pin_root(aa);
         let aa_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(bb);
+        let _ = pyre_object::gc_roots::pin_root(bb);
         let bb_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let na = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(aa_slot));
         let nb = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(bb_slot));
@@ -1196,11 +1196,11 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
 pub(crate) fn union_hash_value(union: PyObjectRef) -> Result<i64, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(union);
+        let union = pyre_object::gc_roots::pin_root(union);
         let union_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let unhashable = w_union_get_unhashable_args(union);
         if !unhashable.is_null() {
-            pyre_object::gc_roots::pin_root(unhashable);
+            let unhashable = pyre_object::gc_roots::pin_root(unhashable);
             let unhashable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(unhashable_slot));
             for i in 0..n {
@@ -1444,13 +1444,13 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
 pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     use rustpython_wtf8::Wtf8Buf;
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let origin = w_generic_alias_get_origin(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-    pyre_object::gc_roots::pin_root(origin);
+    let _ = pyre_object::gc_roots::pin_root(origin);
     let origin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let args = w_generic_alias_get_args(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-    pyre_object::gc_roots::pin_root(args);
+    let _ = pyre_object::gc_roots::pin_root(args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let current_args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
     let n = w_tuple_len(current_args());
@@ -1531,7 +1531,7 @@ unsafe fn repr_items_list(list: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf,
     // list is re-read from the shadow stack before every fetch.
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(list);
+    let _ = pyre_object::gc_roots::pin_root(list);
     let list = || pyre_object::gc_roots::shadow_stack_get(list_slot);
     let n = w_list_len(list());
     let mut parts = Vec::with_capacity(n);
@@ -1554,7 +1554,7 @@ pub(crate) unsafe fn repr_item(
     it: PyObjectRef,
 ) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(it);
+    let _ = pyre_object::gc_roots::pin_root(it);
     let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let current_item = || pyre_object::gc_roots::shadow_stack_get(item_slot);
     if is_ellipsis(current_item()) {
@@ -1588,7 +1588,7 @@ pub(crate) unsafe fn repr_item(
 
 fn is_collections_abc_callable(origin: PyObjectRef) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(origin);
+    let _ = pyre_object::gc_roots::pin_root(origin);
     let origin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let module = crate::importing::check_sys_modules("collections.abc")
         .or_else(|| crate::importing::check_sys_modules("_collections_abc"));
@@ -1601,7 +1601,7 @@ fn is_collections_abc_callable(origin: PyObjectRef) -> Result<bool, crate::PyErr
 
 fn is_typing_generic_alias(obj: PyObjectRef) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let Some(typing) = crate::importing::check_sys_modules("typing") else {
         return Ok(false);
@@ -1621,7 +1621,7 @@ fn is_typing_generic_alias(obj: PyObjectRef) -> Result<bool, crate::PyError> {
 /// tuple, while `Concatenate` is covered by `is_typing_generic_alias`.
 fn is_param_spec(obj: PyObjectRef) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let Some(typing) = crate::importing::check_sys_modules("_typing") else {
         return Ok(false);

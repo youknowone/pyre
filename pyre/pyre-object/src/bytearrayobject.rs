@@ -164,7 +164,7 @@ pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
 pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_class);
+    let _ = crate::gc_roots::pin_root(w_class);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         <W_BytearrayObject as crate::lltype::GcType>::type_id(),
         <W_BytearrayObject as crate::lltype::GcType>::SIZE,

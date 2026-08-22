@@ -1470,8 +1470,8 @@ pub mod unpack_iter {
         // iterator, never an unrooted caller-local pointer.
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(format);
-        pyre_object::gc_roots::pin_root(buffer);
+        let format = pyre_object::gc_roots::pin_root(format);
+        let buffer = pyre_object::gc_roots::pin_root(buffer);
         let buf = unsafe { readbuf(pyre_object::gc_roots::shadow_stack_get(sp + 1))? };
         if size <= 0 {
             return Err(struct_error(format!(

@@ -123,8 +123,8 @@ pub fn w_memoryview_alloc_header(released: bool, owns_export: bool) -> PyObjectR
 pub fn w_buffer_wrapper_new(w_mv: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let sp = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_mv);
-    crate::gc_roots::pin_root(w_obj);
+    let _ = crate::gc_roots::pin_root(w_mv);
+    let _ = crate::gc_roots::pin_root(w_obj);
     W_BufferWrapper::allocate_stable(W_BufferWrapper {
         ob: PyObject {
             ob_type: std::ptr::null(),

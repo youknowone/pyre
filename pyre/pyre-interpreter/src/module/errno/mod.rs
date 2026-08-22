@@ -32,7 +32,7 @@ crate::py_module! {
         // stays valid across the same run.
         let roots = pyre_object::gc_roots::push_roots();
         let errorcode_slot = roots.base();
-        roots.pin_root(pyre_object::w_dict_new());
+        let _ = roots.pin_root(pyre_object::w_dict_new());
         crate::module_ns_store(ns, "errorcode", roots.get(errorcode_slot));
         let mut store = |name: &str, value: i64| {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(value));

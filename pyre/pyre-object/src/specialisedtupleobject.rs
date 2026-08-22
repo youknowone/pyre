@@ -191,9 +191,8 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
     // variants take unboxed i64/f64 and need no bracket here.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value0);
-    crate::gc_roots::pin_root(value1);
-
+    let _ = crate::gc_roots::pin_root(value0);
+    let _ = crate::gc_roots::pin_root(value1);
     let header = PyObject {
         ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),

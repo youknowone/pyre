@@ -907,8 +907,8 @@ impl W_TextIOWrapper {
             ..Self::default()
         });
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
-        pyre_object::gc_roots::pin_root(buffer);
+        let obj = pyre_object::gc_roots::pin_root(obj);
+        let buffer = pyre_object::gc_roots::pin_root(buffer);
         // `app_main.py create_stdio:494`
         // `newline = None if sys.platform == 'win32' else '\n'`.  Universal
         // newline mode must never be on for POSIX stdio — '\r\n' in stdin does
@@ -1266,7 +1266,7 @@ impl W_TextIOWrapper {
         // and detach this wrapper.
         let buffer = self.w_buffer;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(buffer);
+        let _ = pyre_object::gc_roots::pin_root(buffer);
         let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let closed = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(buffer_slot),
@@ -1297,7 +1297,7 @@ impl W_TextIOWrapper {
             if let Some(mut flush_error) = flush_error {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let flush_obj = flush_error.to_exc_object();
-                pyre_object::gc_roots::pin_root(flush_obj);
+                let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let close_obj = close_error.to_exc_object();
                 unsafe {
@@ -1368,7 +1368,7 @@ impl W_TextIOWrapper {
         let mut chars_to_skip = self.decoded.upos as u64;
         let saved_state = super::call_method_result(self.w_decoder, "getstate", &[])?;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(saved_state);
+        let _ = pyre_object::gc_roots::pin_root(saved_state);
         let saved_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         let result = (|| -> Result<PyObjectRef, crate::PyError> {

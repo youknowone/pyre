@@ -679,11 +679,11 @@ impl PyError {
             None
         } else {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(self.exc_object);
+            let _ = pyre_object::gc_roots::pin_root(self.exc_object);
             Some(slot)
         };
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let w_name = pyre_object::w_str_new(name);
         if let Some(slot) = exc_slot {
             self.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -742,7 +742,7 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new_wtf8(ExcKind::SyntaxError, &message);
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(exc);
+        let _ = pyre_object::gc_roots::pin_root(exc);
         // Build the `(filename, lineno, offset, text, end_lineno, end_offset)`
         // details tuple element by element. Each is pinned as it is created and
         // reloaded before the tuple is assembled: an int / str allocation for a
@@ -750,24 +750,25 @@ impl PyError {
         // young element (the filename or text string, or an uncached line/col
         // int), leaving its raw local pointing at the old address.
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(filename.to_wtf8_buf()));
+        let _ =
+            pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(filename.to_wtf8_buf()));
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
         let offset_slot = pyre_object::gc_roots::shadow_stack_len();
         // CPython 3.14 keeps the start offset numeric even for the tokenizer's
         // two sentinel values: 0 for an encoding-cookie range beginning
         // before the first character, and -1 for a location-less codec
         // failure.  Only absent *end* positions use `None` below.
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(offset));
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(match text {
+        let _ = pyre_object::gc_roots::pin_root(match text {
             Some(t) => pyre_object::w_str_new(t),
             None => pyre_object::w_none(),
         });
         let end_lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(wrap_pos(end_lineno));
+        let _ = pyre_object::gc_roots::pin_root(wrap_pos(end_lineno));
         let end_offset_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(wrap_pos(end_offset));
+        let _ = pyre_object::gc_roots::pin_root(wrap_pos(end_offset));
         let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_syntax_filename(
@@ -806,10 +807,10 @@ impl PyError {
         // Root the details tuple across the message allocation below before it
         // becomes `args[1]`.
         let details_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(details);
+        let _ = pyre_object::gc_roots::pin_root(details);
         let w_msg = pyre_object::w_str_from_wtf8(message.clone());
         let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_msg);
+        let _ = pyre_object::gc_roots::pin_root(w_msg);
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_syntax_msg(
                 pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -855,8 +856,8 @@ impl PyError {
         }
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.exc_object);
-        pyre_object::gc_roots::pin_root(w_filename);
+        let _ = pyre_object::gc_roots::pin_root(self.exc_object);
+        let _ = pyre_object::gc_roots::pin_root(w_filename);
         let storage = unsafe {
             pyre_object::interp_exceptions::w_exception_get_args_storage(
                 pyre_object::gc_roots::shadow_stack_get(base),
@@ -874,12 +875,12 @@ impl PyError {
         if unsafe { !pyre_object::is_tuple(details) || pyre_object::w_tuple_len(details) < 6 } {
             return;
         }
-        pyre_object::gc_roots::pin_root(w_msg);
+        let _ = pyre_object::gc_roots::pin_root(w_msg);
         for index in 1..6 {
             let Some(item) = (unsafe { pyre_object::w_tuple_getitem(details, index) }) else {
                 return;
             };
-            pyre_object::gc_roots::pin_root(item);
+            let _ = pyre_object::gc_roots::pin_root(item);
         }
         let rebuilt_details = pyre_object::w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -889,7 +890,7 @@ impl PyError {
             pyre_object::gc_roots::shadow_stack_get(base + 6),
             pyre_object::gc_roots::shadow_stack_get(base + 7),
         ]);
-        pyre_object::gc_roots::pin_root(rebuilt_details);
+        let _ = pyre_object::gc_roots::pin_root(rebuilt_details);
         let rebuilt_args = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::gc_roots::shadow_stack_get(base + 2),
             pyre_object::gc_roots::shadow_stack_get(base + 8),
@@ -987,7 +988,7 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let key_slot = pyre_object::gc_roots::shadow_stack_len();
         if !key.is_null() {
-            pyre_object::gc_roots::pin_root(key);
+            let _ = pyre_object::gc_roots::pin_root(key);
         }
         let message = if key.is_null() {
             Wtf8Buf::from_string("<null>".to_string())
@@ -996,7 +997,7 @@ impl PyError {
                 .unwrap_or_else(|_| Wtf8Buf::from_string("<unrepresentable>".to_string()))
         };
         let exc = w_exception_new_wtf8(ExcKind::KeyError, &message);
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         if !key.is_null() {
             // Reload the key after the repr / exception allocations: the pin
             // keeps it alive, but a minor collection may have relocated the
@@ -1142,13 +1143,13 @@ impl PyError {
                 return None;
             }
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(obj);
+            let _ = pyre_object::gc_roots::pin_root(obj);
             Some(slot)
         };
         let filename_slot = pin(w_filename);
         let filename2_slot = pin(w_filename2);
         let exc = w_exception_new(exc_kind, &message);
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         // Retag to the errno subclass through `w_class`, like
         // `os_error_family_new`: the subclasses share OSError's layout, so
         // the ExcKind stays OSError and only the class differs.
@@ -1227,7 +1228,7 @@ impl PyError {
         // exception before `w_exception_set_args` writes through it.
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new(exc_kind, &strerror);
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             pyre_object::w_int_new(errno as i64),
             pyre_object::w_str_new(&strerror),
@@ -1277,7 +1278,7 @@ impl PyError {
         // exception before `w_exception_set_args` writes through it.
         let _roots = pyre_object::gc_roots::push_roots();
         let exc = w_exception_new_wtf8(exc_kind, &message);
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
                 (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
@@ -1328,14 +1329,14 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_name.is_null() {
-            pyre_object::gc_roots::pin_root(w_name);
+            let _ = pyre_object::gc_roots::pin_root(w_name);
         }
         let path_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_path.is_null() {
-            pyre_object::gc_roots::pin_root(w_path);
+            let _ = pyre_object::gc_roots::pin_root(w_path);
         }
         let exc = w_exception_new_wtf8(ExcKind::ImportError, &message);
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
         // slot; the prebuilt-instance path bypasses it, so stamp it here.
         let w_msg = if message.is_empty() {
@@ -1426,11 +1427,11 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let name_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_name_context.is_null() {
-            pyre_object::gc_roots::pin_root(self.w_name_context);
+            let _ = pyre_object::gc_roots::pin_root(self.w_name_context);
         }
         let obj_ctx_slot = pyre_object::gc_roots::shadow_stack_len();
         if !self.w_obj_context.is_null() {
-            pyre_object::gc_roots::pin_root(self.w_obj_context);
+            let _ = pyre_object::gc_roots::pin_root(self.w_obj_context);
         }
         // `w_exception_new_empty`, not `w_exception_new`: the message block
         // below builds `args_w` itself (it must keep the message object in a
@@ -1442,11 +1443,11 @@ impl PyError {
         // below: `exc` lives only in this Rust local while `w_list_new` (and the
         // setters) run, so a collection there could sweep the unrooted
         // (non-moving oldgen) exception before it is written through.
-        pyre_object::gc_roots::pin_root(exc);
+        let exc = pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_from_wtf8(self.message.clone());
-            pyre_object::gc_roots::pin_root(msg);
+            let msg = pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
@@ -1992,7 +1993,7 @@ pub fn write_exception<W: Write>(
         // rather than re-deriving a flat header here.
         let _roots = pyre_object::gc_roots::push_roots();
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(err.exc_object);
+        let _ = pyre_object::gc_roots::pin_root(err.exc_object);
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let mut context = ExceptionPrintContext::new(exc);
         return write_exception_object_recursive(writer, exc, &mut context);
@@ -2019,9 +2020,9 @@ pub fn write_exception_from_parts<W: Write>(
 ) -> std::io::Result<()> {
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_value_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc_value);
+    let _ = pyre_object::gc_roots::pin_root(exc_value);
     let exc_tb_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc_tb);
+    let _ = pyre_object::gc_roots::pin_root(exc_tb);
     let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_value_slot);
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         if !exc_value.is_null() && unsafe { pyre_object::is_none(exc_value) } {
@@ -2076,7 +2077,7 @@ pub fn write_syntax_error<W: Write>(writer: &mut W, err: &PyError) -> std::io::R
 fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let exc = pyre_object::gc_roots::pin_root(exc);
     let attr = |name: &str| {
         let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         crate::baseobjspace::syntax_error_attr(exc, name)
@@ -2194,7 +2195,7 @@ fn write_exception_object_recursive<W: Write>(
     // GC pointers: formatting calls arbitrary `__str__` / attribute code.
     let _roots = pyre_object::gc_roots::push_roots();
     let first_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let _ = pyre_object::gc_roots::pin_root(exc);
     let mut chain: Vec<(usize, Option<&'static str>)> = Vec::new();
     let mut current_slot = first_slot;
     loop {
@@ -2256,8 +2257,7 @@ fn pin_unseen_exception(
         return None;
     }
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(candidate);
-    let candidate = pyre_object::gc_roots::shadow_stack_get(slot);
+    let candidate = pyre_object::gc_roots::pin_root(candidate);
     let identity = pyre_object::gc_hook::gc_identity_hash(candidate as usize);
     context.seen.insert(identity).then_some(slot)
 }
@@ -2296,8 +2296,7 @@ fn exception_group_item_slots(exc_slot: usize) -> Option<Vec<usize>> {
     let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let exceptions = crate::baseobjspace::getattr_str(exc, "exceptions").ok()?;
     let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exceptions);
-    let exceptions = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
+    let exceptions = pyre_object::gc_roots::pin_root(exceptions);
     if !unsafe { pyre_object::is_tuple(exceptions) } {
         return None;
     }
@@ -2307,7 +2306,7 @@ fn exception_group_item_slots(exc_slot: usize) -> Option<Vec<usize>> {
         let exceptions = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
         let child = unsafe { pyre_object::w_tuple_getitem(exceptions, index as i64) }?;
         let child_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(child);
+        let _ = pyre_object::gc_roots::pin_root(child);
         slots.push(child_slot);
     }
     Some(slots)
@@ -2506,8 +2505,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
-    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let exc = pyre_object::gc_roots::pin_root(exc);
     let notes = match crate::baseobjspace::getattr_str(exc, "__notes__") {
         Ok(v) if !v.is_null() => v,
         Ok(_) => return Ok(()),
@@ -2517,7 +2515,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
             // failures raised by a custom `__notes__` descriptor as a
             // synthetic note instead of silently discarding the diagnostic.
             let err_obj = err.to_exc_object();
-            pyre_object::gc_roots::pin_root(err_obj);
+            let _ = pyre_object::gc_roots::pin_root(err_obj);
             let err_obj = pyre_object::gc_roots::shadow_stack_get(
                 pyre_object::gc_roots::shadow_stack_len() - 1,
             );
@@ -2529,8 +2527,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         }
     };
     let notes_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(notes);
-    let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
+    let notes = pyre_object::gc_roots::pin_root(notes);
     let is_list = unsafe { crate::baseobjspace::isinstance_list_w(notes) };
     let is_tuple = unsafe {
         pyre_object::is_tuple(notes)
@@ -2560,7 +2557,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
                 .unwrap_or(pyre_object::PY_NULL);
                 if !item.is_null() {
                     let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(item);
+                    let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(item_slot);
                 }
             }
@@ -2569,7 +2566,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
             if let Ok(items) = crate::builtins::collect_iterable(notes) {
                 for item in items {
                     let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(item);
+                    let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(item_slot);
                 }
             }
@@ -2611,7 +2608,7 @@ fn notes_is_abc_sequence(notes_slot: usize) -> bool {
         return false;
     };
     let sequence_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(sequence);
+    let _ = pyre_object::gc_roots::pin_root(sequence);
     let notes = pyre_object::gc_roots::shadow_stack_get(notes_slot);
     let sequence = pyre_object::gc_roots::shadow_stack_get(sequence_slot);
     crate::baseobjspace::isinstance(notes, sequence).unwrap_or(false)
@@ -2650,7 +2647,7 @@ fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let _ = pyre_object::gc_roots::pin_root(exc);
     render_rooted_exc_object_wtf8(exc_slot)
 }
 
@@ -2760,7 +2757,7 @@ fn traceback_last_frame(tb: PyObjectRef) -> Option<*mut crate::pyframe::PyFrame>
         return None;
     }
     let tb_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(tb);
+    let _ = pyre_object::gc_roots::pin_root(tb);
     let mut current = pyre_object::gc_roots::shadow_stack_get(tb_slot);
     let mut last = pyre_object::PY_NULL;
     while !current.is_null() && unsafe { crate::pytraceback::is_pytraceback(current) } {
@@ -2779,7 +2776,7 @@ fn traceback_self_is(tb: PyObjectRef, obj: PyObjectRef) -> bool {
         return false;
     }
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let Some(frame) = traceback_last_frame(tb) else {
         return false;
     };
@@ -2788,8 +2785,7 @@ fn traceback_self_is(tb: PyObjectRef, obj: PyObjectRef) -> bool {
         return false;
     };
     let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(locals);
-    let locals = pyre_object::gc_roots::shadow_stack_get(locals_slot);
+    let locals = pyre_object::gc_roots::pin_root(locals);
     let Some(self_obj) = (unsafe { pyre_object::w_dict_getitem_str(locals, "self") }) else {
         return false;
     };
@@ -2802,12 +2798,10 @@ fn object_dir_strings(obj: PyObjectRef) -> Option<Vec<String>> {
         return None;
     }
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
-    let obj = pyre_object::gc_roots::shadow_stack_get(slot);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let names = crate::builtins::builtin_dir(&[obj]).ok()?;
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(names);
-    let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+    let names = pyre_object::gc_roots::pin_root(names);
     let items = crate::builtins::collect_iterable(names).ok()?;
     Some(
         items
@@ -2833,10 +2827,10 @@ fn stdlib_module_name(name: &str) -> bool {
         return false;
     }
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(names);
+    let _ = pyre_object::gc_roots::pin_root(names);
     let name = pyre_object::w_str_new(name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(name);
+    let _ = pyre_object::gc_roots::pin_root(name);
     let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
     let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
     crate::baseobjspace::contains(names, name).unwrap_or(false)
@@ -2871,7 +2865,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
         None
     } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(tb);
+        let _ = pyre_object::gc_roots::pin_root(tb);
         Some(slot)
     };
     let suggestion = match kind {
@@ -2879,8 +2873,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
             let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             let obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc) };
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(obj);
-            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let obj = pyre_object::gc_roots::pin_root(obj);
             object_dir_strings(obj).and_then(|mut names| {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let tb = tb_slot
@@ -2932,13 +2925,11 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
             let mut names = Vec::new();
             if let Ok(locals) = unsafe { &mut *anchor.live() }.getdictscope() {
                 let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(locals);
-                let locals = pyre_object::gc_roots::shadow_stack_get(locals_slot);
+                let locals = pyre_object::gc_roots::pin_root(locals);
                 dict_string_keys(locals, &mut names);
                 if let Some(self_obj) = unsafe { pyre_object::w_dict_getitem_str(locals, "self") } {
                     let self_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(self_obj);
-                    let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
+                    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
                     if crate::baseobjspace::getattr_str(self_obj, &wrong_name).is_ok() {
                         return Some(format!(". Did you mean: 'self.{wrong_name}'?"));
                     }
@@ -3017,7 +3008,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(tb);
+        tb = pyre_object::gc_roots::pin_root(tb);
         let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
         if !unsafe { crate::pytraceback::is_pytraceback(current_tb) } {
             break;
@@ -3565,11 +3556,11 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     // `alloc_dict_object` re-reads `dstorage` across its header malloc.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
-    _roots.pin_root(w_type);
+    let _ = _roots.pin_root(w_type);
     // `w_str_new`'s buffer-taking sibling: same allocation policy, and it is
     // the one that accepts a lone surrogate.
     let w_message = pyre_object::w_str_from_wtf8(message.clone());
-    _roots.pin_root(w_message);
+    let _ = _roots.pin_root(w_message);
     let (w_type, w_message) = (_roots.get(base), _roots.get(base + 1));
     operation_error_from_instance(
         crate::call::call_function_impl_result(w_type, &[w_message]),
@@ -3633,7 +3624,7 @@ fn expected_fmt_arg(format: char) -> &'static str {
 fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> Wtf8Buf {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = _roots.base();
-    _roots.pin_root(obj);
+    let _ = _roots.pin_root(obj);
     let obj = || _roots.get(obj_slot);
 
     let (rendered, fallback) = if format == 'R' {
@@ -3829,11 +3820,11 @@ pub fn exception_from_errno(
     // slot rather than this frame's copy of the pointer.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
-    _roots.pin_root(w_type);
+    let w_type = _roots.pin_root(w_type);
     let w_errno = pyre_object::w_int_new(errno as i64);
-    _roots.pin_root(w_errno);
+    let w_errno = _roots.pin_root(w_errno);
     let w_msg = pyre_object::w_str_new(&msg);
-    _roots.pin_root(w_msg);
+    let w_msg = _roots.pin_root(w_msg);
     let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
     operation_error_from_instance(
         crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]),
@@ -3900,17 +3891,17 @@ pub fn new_exception_class(
         )]),
         Some(w_bases) if unsafe { !pyre_object::is_tuple(w_bases) } => {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            _roots.pin_root(w_bases);
+            let _ = _roots.pin_root(w_bases);
             pyre_object::w_tuple_new(vec![_roots.get(slot)])
         }
         Some(w_bases) => w_bases,
     };
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-    _roots.pin_root(w_bases);
+    let _ = _roots.pin_root(w_bases);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    _roots.pin_root(w_dict.unwrap_or_else(pyre_object::w_dict_new));
+    let _ = _roots.pin_root(w_dict.unwrap_or_else(pyre_object::w_dict_new));
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    _roots.pin_root(pyre_object::w_str_new(name));
+    let _ = _roots.pin_root(pyre_object::w_str_new(name));
     let args = [
         _roots.get(name_slot),
         _roots.get(bases_slot),
@@ -3931,11 +3922,11 @@ pub fn new_exception_class(
     // falsy upstream, so the attribute is left alone rather than set to `""`.
     if let Some(module) = module.filter(|module| !module.is_empty()) {
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        _roots.pin_root(w_exc);
+        let _ = _roots.pin_root(w_exc);
         // Pinned like every other operand here: `setattr_str` allocates, and a
         // collection rewrites the root SLOT rather than this frame's copy.
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        _roots.pin_root(pyre_object::w_str_new(module));
+        let _ = _roots.pin_root(pyre_object::w_str_new(module));
         // `space.setattr` propagates its failure through the same bare-return
         // channel as the class call above.
         if let Err(err) = crate::baseobjspace::setattr_str(
@@ -4016,11 +4007,11 @@ pub fn wrap_oserror2(
     // pointer.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
-    _roots.pin_root(w_exc);
-    _roots.pin_root(pyre_object::w_int_new(errno as i64));
-    _roots.pin_root(pyre_object::w_str_new(&msg));
-    _roots.pin_root(w_filename.unwrap_or_else(pyre_object::w_none));
-    _roots.pin_root(w_filename2.unwrap_or_else(pyre_object::w_none));
+    let _ = _roots.pin_root(w_exc);
+    let _ = _roots.pin_root(pyre_object::w_int_new(errno as i64));
+    let _ = _roots.pin_root(pyre_object::w_str_new(&msg));
+    let _ = _roots.pin_root(w_filename.unwrap_or_else(pyre_object::w_none));
+    let _ = _roots.pin_root(w_filename2.unwrap_or_else(pyre_object::w_none));
     // The five the constructor takes, in `_wrap_oserror2_impl`'s order.  A
     // subclass reading `filename2` sees the argument it declares rather than a
     // short call.
@@ -4066,7 +4057,7 @@ pub fn wrap_oserror(
     // from its slot afterwards.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
-    _roots.pin_root(pyre_object::w_str_new(filename));
+    let _ = _roots.pin_root(pyre_object::w_str_new(filename));
     let w_filename2 = filename2.map(pyre_object::w_str_new);
     wrap_oserror2(
         space,

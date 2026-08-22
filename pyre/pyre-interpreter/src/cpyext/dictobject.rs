@@ -104,9 +104,9 @@ pub unsafe extern "C" fn PyDict_SetItemString(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(value);
+    let _ = roots.pin_root(value);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -406,11 +406,11 @@ pub unsafe extern "C" fn PyDict_SetDefaultRef(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(key);
+    let _ = roots.pin_root(key);
     let default_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(default_value);
+    let _ = roots.pin_root(default_value);
     // The key is looked for once, so which of the two things happened is read
     // off the size either side of it.  Asking the dict whether it holds the key
     // would run the key's `__hash__` and `__eq__` a second time, and a key that
@@ -472,10 +472,9 @@ unsafe fn pop_from(dict: PyObjectRef, key: PyObjectRef, result: *mut *mut CPyObj
     }
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(key);
-    let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+    let key = roots.pin_root(key);
     let found = unsafe {
         pyre_object::dictmultiobject::w_dict_pop_checked(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -552,7 +551,7 @@ fn view_list(
         return std::ptr::null_mut();
     };
     let roots = pyre_object::gc_roots::push_roots();
-    roots.pin_root(dict);
+    let dict = roots.pin_root(dict);
     pyobject::make_ref(pyre_object::listobject::w_list_new(part(dict)))
 }
 
@@ -637,8 +636,8 @@ pub unsafe extern "C" fn PyDict_Merge(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(target);
-    roots.pin_root(source);
+    let _ = roots.pin_root(target);
+    let _ = roots.pin_root(source);
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
     let source_now = pyre_object::gc_roots::shadow_stack_get(base + 1);
 
@@ -677,7 +676,7 @@ pub unsafe extern "C" fn PyDict_Merge(
             None => return -1,
         };
         let keys_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(keys);
+        let _ = roots.pin_root(keys);
         let keys = match trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
             keys_slot,
         ))) {
@@ -696,8 +695,8 @@ pub unsafe extern "C" fn PyDict_Merge(
                 Some(value) => value,
                 None => return -1,
             };
-            roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
-            roots.pin_root(value);
+            let _ = roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
+            let _ = roots.pin_root(value);
         }
         (pairs, keys.len())
     };
@@ -753,8 +752,8 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(target);
-    roots.pin_root(sequence);
+    let _ = roots.pin_root(target);
+    let sequence = roots.pin_root(sequence);
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
 
     let Some(pairs) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
@@ -771,7 +770,7 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     for index in 0..pairs.len() {
         let pair_roots = pyre_object::gc_roots::push_roots();
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-        pair_roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
+        let _ = pair_roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
         let Some(items) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
             pair_slot,
         ))) else {
@@ -851,7 +850,7 @@ pub unsafe extern "C" fn PyDict_Next(
 
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
 
     let snapshot = if index == 0 {
         let keys: Vec<PyObjectRef> = unsafe {
@@ -892,7 +891,7 @@ pub unsafe extern "C" fn PyDict_Next(
     // The lookup below can collect, so the key is pinned first and both it and
     // the value are read back from the shadow stack afterwards.
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_key);
+    let _ = roots.pin_root(w_key);
     let Some(w_value) = trap(crate::baseobjspace::getitem(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         pyre_object::gc_roots::shadow_stack_get(key_slot),
@@ -900,7 +899,7 @@ pub unsafe extern "C" fn PyDict_Next(
         return 0;
     };
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_value);
+    let _ = roots.pin_root(w_value);
     unsafe { *pos = index + 1 };
     if !key.is_null() {
         unsafe {

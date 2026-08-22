@@ -1749,9 +1749,9 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // and can move young objects; pin and re-read them for the delegated call.
     let _roots = pyre_object::gc_roots::push_roots();
     let string_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(string);
+    let _ = pyre_object::gc_roots::pin_root(string);
     let format_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(format);
+    let _ = pyre_object::gc_roots::pin_root(format);
     let w_mod = match crate::importing::get_sys_module("_strptime") {
         Some(m) => m,
         None => crate::importing::importhook(
@@ -1792,10 +1792,10 @@ pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let name = positional[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(name);
+    let _ = pyre_object::gc_roots::pin_root(name);
     let info = crate::module::sys::vm::new_simple_namespace_instance()?;
     let info_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(info);
+    let _ = pyre_object::gc_roots::pin_root(info);
     // `_get_time_info` overwrites implementation/monotonic/adjustable/resolution
     // on success and raises `ValueError("unknown clock")` otherwise, so the
     // app-level default fields are redundant.

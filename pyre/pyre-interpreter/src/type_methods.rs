@@ -618,7 +618,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // between iterator steps.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(list);
+            let list = pyre_object::gc_roots::pin_root(list);
             let items = pyre_object::w_set_items(other);
             pyre_object::gc_roots::pin_roots(&items);
             pyre_object::listobject::w_list_resize_for_extend(
@@ -640,13 +640,13 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // exception from a later `next()` does not roll back the prefix.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(list);
-            pyre_object::gc_roots::pin_root(other);
+            let _ = pyre_object::gc_roots::pin_root(list);
+            let _ = pyre_object::gc_roots::pin_root(other);
             // CPython 3.14 `list_extend_iter_lock_held` obtains the iterator
             // before asking the original iterable for its length hint.
             let iterator =
                 crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
-            pyre_object::gc_roots::pin_root(iterator);
+            let _ = pyre_object::gc_roots::pin_root(iterator);
             // listobject.py _extend_from_iterable — consult the length
             // hint before iterating.  A `__length_hint__` returning a negative
             // value raises ValueError, and one exceeding a C ssize_t raises
@@ -688,7 +688,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 };
                 let _item_roots = pyre_object::gc_roots::push_roots();
                 let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(item);
+                let _ = pyre_object::gc_roots::pin_root(item);
                 pyre_object::listobject::w_list_append_preallocated(
                     pyre_object::gc_roots::shadow_stack_get(root_base),
                     pyre_object::gc_roots::shadow_stack_get(item_slot),
@@ -830,8 +830,8 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // two roots adjacent so one base covers both.
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
-    pyre_object::gc_roots::pin_root(
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let _ = pyre_object::gc_roots::pin_root(
         crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none),
     );
 
@@ -875,8 +875,8 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // reload after the coercion.
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(list);
-    pyre_object::gc_roots::pin_root(value);
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let _ = pyre_object::gc_roots::pin_root(value);
     let (raw_start, raw_stop) = crate::sliceobject::index_bounds_not_none(w_start, w_stop)?;
     let list = pyre_object::gc_roots::shadow_stack_get(sp);
     let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -1666,9 +1666,9 @@ fn format_render(
     let _roots = pyre_object::gc_roots::push_roots();
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
     let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(kwargs_dict.unwrap_or(pyre_object::PY_NULL));
+    let _ = pyre_object::gc_roots::pin_root(kwargs_dict.unwrap_or(pyre_object::PY_NULL));
     let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(mapping.unwrap_or(pyre_object::PY_NULL));
+    let _ = pyre_object::gc_roots::pin_root(mapping.unwrap_or(pyre_object::PY_NULL));
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if mapping.is_some() {
             // `newformat.format_method(... w_mapping, True)` resolves
@@ -1813,7 +1813,7 @@ fn format_render(
             // into its own roots) and read `val` back once it returns.
             let inner = pyre_object::gc_roots::push_roots();
             let val_slot = inner.base();
-            inner.pin_root(val);
+            let mut val = inner.pin_root(val);
             let reloaded: Vec<PyObjectRef> = (0..positional.len())
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
                 .collect();
@@ -6426,8 +6426,8 @@ unsafe fn set_lookup_checked(
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(item);
-    pyre_object::gc_roots::pin_root(set);
+    let _ = pyre_object::gc_roots::pin_root(item);
+    let set = pyre_object::gc_roots::pin_root(set);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
         .map_err(|err| {
             crate::baseobjspace::wrap_set_element_hash_error(
@@ -6588,7 +6588,7 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
                 let k = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
                 let v = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
                 let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
+                let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
                 built.push(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
             }
             built
@@ -6631,8 +6631,8 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     // frame still holds its raw pointer.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(dict);
-    pyre_object::gc_roots::pin_root(w_data);
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(w_data);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     unsafe {
@@ -6683,8 +6683,8 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     };
                     let _iteration_roots = pyre_object::gc_roots::push_roots();
                     let iteration_roots = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(k);
-                    pyre_object::gc_roots::pin_root(v);
+                    let _ = pyre_object::gc_roots::pin_root(k);
+                    let _ = pyre_object::gc_roots::pin_root(v);
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     match hashed {
@@ -6718,13 +6718,13 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 let keys = crate::builtins::collect_iterable(w_keys_view)?;
                 let keys_base = pyre_object::gc_roots::shadow_stack_len();
                 for &key in &keys {
-                    pyre_object::gc_roots::pin_root(key);
+                    let _ = pyre_object::gc_roots::pin_root(key);
                 }
                 for i in 0..keys.len() {
                     let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
                     let v = crate::baseobjspace::getitem(data(), k)?;
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(v);
+                    let _ = pyre_object::gc_roots::pin_root(v);
                     let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
                     let v = pyre_object::gc_roots::shadow_stack_get(value_slot);
                     dict_store_checked(dict(), k, v)?;
@@ -6736,7 +6736,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 let pairs = crate::builtins::collect_iterable(data())?;
                 let pairs_base = pyre_object::gc_roots::shadow_stack_len();
                 for &pair in &pairs {
-                    pyre_object::gc_roots::pin_root(pair);
+                    let _ = pyre_object::gc_roots::pin_root(pair);
                 }
                 for idx in 0..pairs.len() {
                     let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
@@ -6748,8 +6748,8 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                         )));
                     }
                     let entry_base = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(entries[0]);
-                    pyre_object::gc_roots::pin_root(entries[1]);
+                    let _ = pyre_object::gc_roots::pin_root(entries[0]);
+                    let _ = pyre_object::gc_roots::pin_root(entries[1]);
                     let k = pyre_object::gc_roots::shadow_stack_get(entry_base);
                     let v = pyre_object::gc_roots::shadow_stack_get(entry_base + 1);
                     dict_store_checked(dict(), k, v)?;
@@ -6771,8 +6771,7 @@ fn dict_update_pair_entries(
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pair);
-    let pair = pyre_object::gc_roots::shadow_stack_get(pair_slot);
+    let pair = pyre_object::gc_roots::pin_root(pair);
     unsafe {
         if is_exact_list(pair) {
             let len = w_list_len(pair);
@@ -6850,7 +6849,7 @@ pub fn dict_init_or_update(
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     for &arg in args {
-        pyre_object::gc_roots::pin_root(arg);
+        let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let rooted_args = (0..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + i))
@@ -7166,8 +7165,8 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(tup);
-        pyre_object::gc_roots::pin_root(value);
+        let tup = pyre_object::gc_roots::pin_root(tup);
+        let value = pyre_object::gc_roots::pin_root(value);
         let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
         let mut i = start.max(0);
         while i < stop {
@@ -7206,8 +7205,8 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(tup);
-        pyre_object::gc_roots::pin_root(value);
+        let tup = pyre_object::gc_roots::pin_root(tup);
+        let value = pyre_object::gc_roots::pin_root(value);
         let mut i = 0i64;
         loop {
             let tup = pyre_object::gc_roots::shadow_stack_get(sp);

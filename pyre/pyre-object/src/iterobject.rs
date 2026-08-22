@@ -96,9 +96,7 @@ fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    let seq_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(seq);
-    let seq = crate::gc_roots::shadow_stack_get(seq_slot);
+    let seq = crate::gc_roots::pin_root(seq);
     let tp = seq_iter_type_for(seq);
     let value = W_SeqIterObject {
         ob: PyObject {
@@ -115,7 +113,7 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
 
 pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(seq);
+    let seq = crate::gc_roots::pin_root(seq);
     W_ListIterObject::allocate_stable(W_ListIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -128,7 +126,7 @@ pub fn w_list_iter_new(seq: PyObjectRef) -> PyObjectRef {
 
 pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: i64) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(seq);
+    let seq = crate::gc_roots::pin_root(seq);
     W_ListReverseIterObject::allocate_stable(W_ListReverseIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -141,7 +139,7 @@ pub fn w_list_reverse_iter_new(seq: PyObjectRef, index: i64) -> PyObjectRef {
 
 pub fn w_tuple_iter_new(seq: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(seq);
+    let seq = crate::gc_roots::pin_root(seq);
     W_TupleIterObject::allocate_stable(W_TupleIterObject {
         ob: PyObject {
             ob_type: std::ptr::null(),

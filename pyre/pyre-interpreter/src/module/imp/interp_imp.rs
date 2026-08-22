@@ -590,7 +590,7 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
         let _root = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_code);
+        let w_code = pyre_object::gc_roots::pin_root(w_code);
         frozen_cache_store(key, &source, w_code);
     }
     Ok(w_code)
@@ -728,7 +728,7 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&bytes);
     let _roots = pyre_object::gc_roots::push_roots();
     let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_bytes);
+    let _ = pyre_object::gc_roots::pin_root(w_bytes);
     let mv_type = crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
     crate::module::_pickle::call_fn(
         mv_type,
@@ -833,11 +833,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let code = frozen_code(entry)?;
                 let _roots = pyre_object::gc_roots::push_roots();
                 let code_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(code);
+                let _ = pyre_object::gc_roots::pin_root(code);
                 let ec = crate::call::getexecutioncontext();
                 let w_globals = unsafe { &*ec }.fresh_module_globals();
                 let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(w_globals);
+                let _ = pyre_object::gc_roots::pin_root(w_globals);
                 // The name string is allocated before the store so the mapping
                 // it writes into is read after that allocation, not before it.
                 let w_name = pyre_object::w_str_new(&name);
@@ -876,7 +876,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     };
                 }
                 let module_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(pyre_object::w_module_new_aliasing_dict(
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_module_new_aliasing_dict(
                     &name,
                     pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 ));
@@ -937,13 +937,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             };
             let _roots = pyre_object::gc_roots::push_roots();
             let data_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(if withdata {
+            let _ = pyre_object::gc_roots::pin_root(if withdata {
                 frozen_data(entry)?
             } else {
                 pyre_object::w_none()
             });
             let origname_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(
+            let _ = pyre_object::gc_roots::pin_root(
                 entry
                     .origname
                     .map(pyre_object::w_str_new)

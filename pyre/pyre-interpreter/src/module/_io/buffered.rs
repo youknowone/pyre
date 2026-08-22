@@ -47,7 +47,7 @@ pub(super) fn raw_readinto_size(
             // conversion TypeError as the explicit cause.
             let _roots = pyre_object::gc_roots::push_roots();
             let cause_obj = cause.to_exc_object();
-            pyre_object::gc_roots::pin_root(cause_obj);
+            let _ = pyre_object::gc_roots::pin_root(cause_obj);
             let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let mut outer = crate::PyError::os_error("raw readinto() returned invalid length");
             let outer_obj = outer.to_exc_object();
@@ -213,8 +213,8 @@ impl W_BufferedReader {
     fn raw_read(&mut self, start: usize, length: usize) -> Result<usize, crate::PyError> {
         let temp = pyre_object::bytearrayobject::w_bytearray_new(length);
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self.self_obj());
-        pyre_object::gc_roots::pin_root(temp);
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(temp);
         let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
         let result = super::call_method_result(
             self.w_raw,
@@ -343,8 +343,8 @@ impl W_BufferedReader {
             let block = self.buffer_size as usize * (remaining / self.buffer_size as usize);
             let temp = pyre_object::bytearrayobject::w_bytearray_new(block);
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(self.self_obj());
-            pyre_object::gc_roots::pin_root(temp);
+            let _ = pyre_object::gc_roots::pin_root(self.self_obj());
+            let _ = pyre_object::gc_roots::pin_root(temp);
             let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
             let result = super::call_method_result(
                 self.w_raw,
@@ -439,8 +439,8 @@ impl W_BufferedReader {
                     let requested = size as usize;
                     let temp = pyre_object::bytearrayobject::w_bytearray_new(requested);
                     let _roots = pyre_object::gc_roots::push_roots();
-                    pyre_object::gc_roots::pin_root(this.self_obj());
-                    pyre_object::gc_roots::pin_root(temp);
+                    let _ = pyre_object::gc_roots::pin_root(this.self_obj());
+                    let _ = pyre_object::gc_roots::pin_root(temp);
                     let temp_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     let result = super::call_method_result(
                         this.w_raw,
@@ -511,8 +511,8 @@ impl W_BufferedReader {
                 if remaining > this.buffer_size as usize {
                     let temp = pyre_object::bytearrayobject::w_bytearray_new(remaining);
                     let _roots = pyre_object::gc_roots::push_roots();
-                    pyre_object::gc_roots::pin_root(this.self_obj());
-                    pyre_object::gc_roots::pin_root(temp);
+                    let _ = pyre_object::gc_roots::pin_root(this.self_obj());
+                    let _ = pyre_object::gc_roots::pin_root(temp);
                     let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
                     let result = super::call_method_result(
                         this.w_raw,
@@ -598,7 +598,7 @@ impl W_BufferedReader {
             ));
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_raw);
+        let _ = pyre_object::gc_roots::pin_root(w_raw);
         let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let buffer = pyre_object::bytearrayobject::w_bytearray_new(buffer_size as usize);
         self.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
@@ -849,7 +849,7 @@ impl W_BufferedReader {
                 // earlier flush exception as the close exception's context.
                 let _roots = pyre_object::gc_roots::push_roots();
                 let flush_obj = flush_error.to_exc_object();
-                pyre_object::gc_roots::pin_root(flush_obj);
+                let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let close_obj = close_error.to_exc_object();
                 unsafe {

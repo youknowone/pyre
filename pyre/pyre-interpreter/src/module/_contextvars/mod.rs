@@ -201,15 +201,17 @@ fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let value = || pyre_object::gc_roots::shadow_stack_get(args_base + 1);
 
     let context_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(current_context(true)?.expect("create=true returns a Context"));
+    let _ = pyre_object::gc_roots::pin_root(
+        current_context(true)?.expect("create=true returns a Context"),
+    );
     let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
 
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
     let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
 
     let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(match crate::baseobjspace::getitem(data(), var()) {
+    let _ = pyre_object::gc_roots::pin_root(match crate::baseobjspace::getitem(data(), var()) {
         Ok(value) => value,
         Err(err) if err.kind == crate::PyErrorKind::KeyError => token_missing(),
         Err(err) => return Err(err),
@@ -251,7 +253,7 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )));
     }
     let token_var_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_var")?);
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_var")?);
     let token_var = || pyre_object::gc_roots::shadow_stack_get(token_var_slot);
     if !std::ptr::eq(token_var(), var()) {
         return Err(crate::PyError::value_error(
@@ -259,7 +261,9 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         ));
     }
     let context_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(current_context(true)?.expect("create=true returns a Context"));
+    let _ = pyre_object::gc_roots::pin_root(
+        current_context(true)?.expect("create=true returns a Context"),
+    );
     let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
     if !std::ptr::eq(
         crate::baseobjspace::getattr_str(token(), "_context")?,
@@ -270,10 +274,11 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         ));
     }
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
     let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
     let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_old_value")?);
+    let _ =
+        pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_old_value")?);
     let old_value = || pyre_object::gc_roots::shadow_stack_get(old_value_slot);
     let updated_data = if std::ptr::eq(old_value(), token_missing()) {
         call_method_result(data(), "delete", &[token_var()])?
@@ -409,12 +414,22 @@ fn new_token(
     var: PyObjectRef,
     old_value: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let token = w_instance_new(token_type());
-    crate::baseobjspace::setattr_str(token, "_context", context)?;
-    crate::baseobjspace::setattr_str(token, "_var", var)?;
-    crate::baseobjspace::setattr_str(token, "_old_value", old_value)?;
-    crate::baseobjspace::setattr_str(token, "_used", w_bool_from(false))?;
-    Ok(token)
+    // The three values arrive as native words and outlive the allocation
+    // below and four attribute stores, each of which can collect; `old_value`
+    // is whatever the caller last set, a list or a dict included.  The token
+    // takes a slot of its own for liveness: an instance never moves, but one
+    // nothing refers to yet is still swept.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[context, var, old_value]);
+    let token_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_instance_new(token_type()));
+    let token = || pyre_object::gc_roots::shadow_stack_get(token_slot);
+    let value_at = |offset: usize| pyre_object::gc_roots::shadow_stack_get(base + offset);
+    crate::baseobjspace::setattr_str(token(), "_context", value_at(0))?;
+    crate::baseobjspace::setattr_str(token(), "_var", value_at(1))?;
+    crate::baseobjspace::setattr_str(token(), "_old_value", value_at(2))?;
+    crate::baseobjspace::setattr_str(token(), "_used", w_bool_from(false))?;
+    Ok(token())
 }
 
 fn token_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

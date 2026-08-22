@@ -26,7 +26,7 @@ fn has_method(object: *mut CPyObject, name: &str) -> c_int {
 fn is_stop_iteration(error: &mut crate::PyError) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(error.to_exc_object());
+    let _ = roots.pin_root(error.to_exc_object());
     let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
         return false;
     };
@@ -43,7 +43,7 @@ fn is_stop_iteration(error: &mut crate::PyError) -> bool {
 fn returned_value(error: &mut crate::PyError) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(error.to_exc_object());
+    let _ = roots.pin_root(error.to_exc_object());
     crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         "value",
@@ -179,8 +179,8 @@ pub unsafe extern "C" fn PyIter_Send(
     } else {
         let roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(w_iterator);
-        roots.pin_root(sent);
+        let _ = roots.pin_root(w_iterator);
+        let _ = roots.pin_root(sent);
         let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
         crate::baseobjspace::getattr_str(reload(0), "send")
             .and_then(|send| crate::call::call_function_impl_result(send, &[reload(1)]))

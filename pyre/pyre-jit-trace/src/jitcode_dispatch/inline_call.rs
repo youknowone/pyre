@@ -4775,7 +4775,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let arg_roots = pyre_object::gc_roots::push_roots();
             let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
             for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
-                pyre_object::gc_roots::pin_root(concrete.to_pyobj());
+                let _ = pyre_object::gc_roots::pin_root(concrete.to_pyobj());
             }
             let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
@@ -7287,13 +7287,13 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
 
     let _roots = pyre_object::gc_roots::push_roots();
     let iter_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(iter_obj);
+    let _ = pyre_object::gc_roots::pin_root(iter_obj);
     let type_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_type);
+    let _ = pyre_object::gc_roots::pin_root(w_type);
     let next_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_next);
+    let _ = pyre_object::gc_roots::pin_root(w_next);
     let code_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
 
     let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);

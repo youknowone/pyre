@@ -174,7 +174,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
     let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     reject_kwargs(kwargs)?;
@@ -229,17 +229,17 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         None
     } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(callback);
+        let _ = pyre_object::gc_roots::pin_root(callback);
         Some(slot)
     };
     // Building the instance allocates, so what gets stored on it is read back
     // out of a root slot once it exists.
     let paramflags_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(paramflags);
+    let _ = pyre_object::gc_roots::pin_root(paramflags);
     #[cfg(windows)]
     let iid_slot = {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(if com_iid.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(if com_iid.is_null() {
             pyre_object::w_none()
         } else {
             com_iid
@@ -252,12 +252,12 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         &[],
     )?;
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), addr)?;
     if !callback.is_null() {
         let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let d = crate::baseobjspace::getdict_native(current_obj);
-        pyre_object::gc_roots::pin_root(d);
+        let _ = pyre_object::gc_roots::pin_root(d);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let callback = pyre_object::gc_roots::shadow_stack_get(callback_slot.unwrap());
         unsafe {
@@ -556,11 +556,11 @@ fn apply_errcheck(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     for value in [self_obj, result, errcheck] {
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
     let arguments = pyre_object::w_tuple_new(inargs.to_vec());
     let arguments_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(arguments);
+    let _ = pyre_object::gc_roots::pin_root(arguments);
     let value = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(base + 2),
         &[
@@ -589,7 +589,7 @@ fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::
     // rootless.
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(d);
+    let _ = pyre_object::gc_roots::pin_root(d);
     let psize = host_ctypes::pointer_size();
     let ba = pyre_object::w_bytearray_new(psize);
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
@@ -768,10 +768,10 @@ pub(super) fn funcptr_addr(obj: PyObjectRef) -> usize {
 pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let w_addr = pyre_object::w_int_new(addr as i64);
     let addr_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_addr);
+    let _ = pyre_object::gc_roots::pin_root(w_addr);
     let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let d = crate::baseobjspace::getdict_native(current_obj);
     if d.is_null() {
@@ -779,7 +779,7 @@ pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), cr
             "CFuncPtr instance has no instance dict",
         ));
     }
-    pyre_object::gc_roots::pin_root(d);
+    let _ = pyre_object::gc_roots::pin_root(d);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
         pyre_object::w_dict_setitem_str(
@@ -1160,7 +1160,7 @@ fn build_callargs(
                 get_arg(&mut index, name.as_deref(), defval, passed, kwargs)?
             }
         };
-        pyre_object::gc_roots::pin_root(value);
+        let value = pyre_object::gc_roots::pin_root(value);
         out.args.push(value);
     }
     for (i, arg) in out.args.iter_mut().enumerate() {
@@ -1236,7 +1236,7 @@ fn build_result(result: PyObjectRef, callargs: &CallArgs) -> Result<PyObjectRef,
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     for &arg in &callargs.args {
-        pyre_object::gc_roots::pin_root(arg);
+        let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let returned_base = pyre_object::gc_roots::shadow_stack_len();
     let mut returned = 0;
@@ -1249,7 +1249,7 @@ fn build_result(result: PyObjectRef, callargs: &CallArgs) -> Result<PyObjectRef,
         } else {
             continue;
         };
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
         returned += 1;
         if returned == callargs.numretvals as usize {
             break;

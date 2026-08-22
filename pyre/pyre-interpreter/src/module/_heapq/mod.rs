@@ -52,7 +52,7 @@ fn less_than(left: PyObjectRef, right: PyObjectRef) -> Result<bool, crate::PyErr
 /// this argument, is what holds the forwarded object afterwards.
 fn pin(value: PyObjectRef) -> usize {
     let slot = shadow_stack_len();
-    pin_root(value);
+    let _ = pin_root(value);
     slot
 }
 

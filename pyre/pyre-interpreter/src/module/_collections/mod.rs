@@ -145,8 +145,7 @@ fn deque_len(self_obj: PyObjectRef) -> i64 {
 fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let Some(deque) = W_Deque::from_obj(self_obj) else {
@@ -195,8 +194,7 @@ fn store(self_obj: PyObjectRef, items: Vec<PyObjectRef>) {
 fn clear_blocks(self_obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let new_block = deque_block::new(PY_NULL, PY_NULL);
@@ -383,7 +381,7 @@ pub mod deque_iter {
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(deque);
+        let deque = pyre_object::gc_roots::pin_root(deque);
         W_DequeIter::allocate_stable(W_DequeIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
@@ -503,7 +501,7 @@ pub mod deque_rev_iter {
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(deque);
+        let deque = pyre_object::gc_roots::pin_root(deque);
         W_DequeRevIter::allocate_stable(W_DequeRevIter {
             ob: PyObject {
                 ob_type: std::ptr::null(),
@@ -540,7 +538,7 @@ fn extend_from_iterable(
     let items = crate::builtins::collect_iterable(iterable)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let deque_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
     let item_base = pyre_object::gc_roots::pin_roots(&items);
     for index in 0..items.len() {
         append(
@@ -555,8 +553,8 @@ fn extend_from_iterable(
 fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    pyre_object::gc_roots::pin_root(item);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(item);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
@@ -586,8 +584,8 @@ fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
 fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    pyre_object::gc_roots::pin_root(item);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(item);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
@@ -617,8 +615,7 @@ fn append_left(self_obj: PyObjectRef, item: PyObjectRef) {
 fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let deque = W_Deque::from_obj(self_obj).expect("deque");
@@ -649,8 +646,7 @@ fn pop_right(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
     let _deque_guard = unsafe { w_deque_lock(self_obj) };
     let self_obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     let deque = W_Deque::from_obj(self_obj).expect("deque");
@@ -1246,7 +1242,7 @@ impl W_Deque {
         }
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(copy);
+        let _ = pyre_object::gc_roots::pin_root(copy);
         for item in snapshot(other) {
             append_right(pyre_object::gc_roots::shadow_stack_get(root_base), item);
         }

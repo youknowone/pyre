@@ -104,7 +104,7 @@ pub unsafe extern "C" fn PyLong_FromString(
     let text = raw.to_string_lossy().into_owned();
     let roots = pyre_object::gc_roots::push_roots();
     let source_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(&text));
+    let _ = roots.pin_root(pyre_object::w_str_new(&text));
     let parsed = crate::builtins::parse_int_from_str(
         pyre_object::gc_roots::shadow_stack_get(source_slot),
         &text,

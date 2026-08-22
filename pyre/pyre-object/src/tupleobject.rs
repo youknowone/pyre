@@ -158,8 +158,8 @@ pub unsafe fn w_tuple_setitem_initializing(
 ) -> bool {
     let roots = crate::gc_roots::push_roots();
     let base = roots.base();
-    roots.pin_root(obj);
-    roots.pin_root(value);
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(value);
     crate::gc_hook::try_gc_write_barrier_managed(roots.get(base) as *mut u8);
     let obj = roots.get(base);
     let value = roots.get(base + 1);
@@ -294,7 +294,7 @@ fn w_tuple_new_array_backed_impl(
     let save_point = crate::gc_roots::shadow_stack_len();
     let len = items.len();
     for &item in &items {
-        crate::gc_roots::pin_root(item);
+        let _ = crate::gc_roots::pin_root(item);
     }
 
     // The only allocations that may collect: the type's lazy instantiate
@@ -331,7 +331,7 @@ fn w_tuple_new_array_backed_impl(
                 user_layout,
             );
         }
-        crate::gc_roots::pin_root(raw as PyObjectRef);
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         Some(crate::gc_roots::shadow_stack_len() - 1)
     };
 
@@ -356,7 +356,7 @@ fn w_tuple_new_array_backed_impl(
         None
     } else {
         let s = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(items_block as PyObjectRef);
+        let _ = crate::gc_roots::pin_root(items_block as PyObjectRef);
         Some(s)
     };
     let raw = raw_slot

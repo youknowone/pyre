@@ -46,7 +46,7 @@ pub(crate) unsafe fn try_call_dunder_obj(
         // the descriptor rejects that as an instance of the wrong type.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some(method) = crate::baseobjspace::lookup(obj(), name) else {
             return Ok(None);
@@ -54,7 +54,7 @@ pub(crate) unsafe fn try_call_dunder_obj(
         if method.is_null() {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(method);
+        let _ = pyre_object::gc_roots::pin_root(method);
         let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         // A raising `__repr__`/`__str__` propagates; a non-string return is a
         // TypeError (`object.c slot_tp_repr` / `slot_tp_str`).
@@ -81,7 +81,7 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some((src, method)) =
             crate::baseobjspace::lookup_where_with_method_cache(w_type.as_ptr(), name)
@@ -91,7 +91,7 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(method);
+        let _ = pyre_object::gc_roots::pin_root(method);
         let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let result =
             crate::baseobjspace::get_and_call_function(method(), obj(), w_type.as_ptr(), &[])?;
@@ -333,7 +333,7 @@ pub unsafe fn list_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // walk; re-read it from the shadow stack before every element fetch.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let n = pyre_object::w_list_len(obj());
     let mut out = Wtf8Buf::new();
@@ -368,7 +368,7 @@ pub unsafe fn tuple_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // Same as `list_repr`: an item's `__repr__` moves the tuple under the walk.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let n = pyre_object::w_tuple_len(obj());
     let mut out = Wtf8Buf::new();
@@ -501,7 +501,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
         else {
@@ -517,7 +517,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if std::ptr::eq(src, w_object) {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(found);
+        let _ = pyre_object::gc_roots::pin_root(found);
         let found = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         // A raising override propagates; a non-string return is a TypeError.
         let r = crate::builtins::call_and_check(found(), &[obj()])?;
@@ -551,7 +551,7 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some((src, method)) =
             crate::baseobjspace::lookup_where_with_method_cache(metaclass.as_ptr(), name)
@@ -563,7 +563,7 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(method);
+        let _ = pyre_object::gc_roots::pin_root(method);
         let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let result = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(result) {
@@ -598,7 +598,7 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some((src, method)) =
             crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
@@ -622,7 +622,7 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(method);
+        let _ = pyre_object::gc_roots::pin_root(method);
         let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let r = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(r) {
@@ -655,7 +655,7 @@ unsafe fn module_user_dunder_obj(
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
         let Some((src, method)) =
             crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
@@ -668,7 +668,7 @@ unsafe fn module_user_dunder_obj(
         {
             return Ok(None);
         }
-        pyre_object::gc_roots::pin_root(method);
+        let _ = pyre_object::gc_roots::pin_root(method);
         let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         let r = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(r) {
@@ -715,7 +715,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         // a static type, so it survives the moves the object itself makes.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let mut obj = obj;
         let tp = (*obj).ob_type;
         // A builtin leaf subclass keeps `ob_type` at the canonical storage
@@ -956,7 +956,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 // read back through the pinned tuple.
                 let _args_roots = pyre_object::gc_roots::push_roots();
                 let args_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(args_obj);
+                let _ = pyre_object::gc_roots::pin_root(args_obj);
                 let args_obj = || pyre_object::gc_roots::shadow_stack_get(args_slot);
                 let n = pyre_object::w_tuple_len(args_obj());
                 if n == 1 {
@@ -1866,7 +1866,7 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
 unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if initial.is_null() || pyre_object::is_none(initial) {
@@ -1971,7 +1971,7 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
 unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if initial.is_null() || pyre_object::is_none(initial) {
@@ -2048,7 +2048,7 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
 unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
         if initial.is_null() || pyre_object::is_none(initial) {

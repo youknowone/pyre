@@ -26,8 +26,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
     // the slot; we read the relocated address back after the malloc.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value);
-
+    let _ = crate::gc_roots::pin_root(value);
     let header = PyObject {
         ob_type: &CELL_TYPE as *const PyType,
         w_class: get_instantiate(&CELL_TYPE),

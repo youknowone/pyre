@@ -196,17 +196,17 @@ impl W_Random {
         let random_type = type_object();
         crate::typedef::check_user_subclass(random_type, cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(cls);
-        pyre_object::gc_roots::pin_root(w_anything);
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let _ = pyre_object::gc_roots::pin_root(w_anything);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
         let seed_slot = cls_slot + 1;
         // `interp_random.py:21` builds the generator before anything can reach
         // it through the wrapper, so each allocation has to hold the previous
         // one down: the twister across the wrapper's allocation, the wrapper
         // across `seed`'s.
-        pyre_object::gc_roots::pin_root(Random::new_instance());
+        let _ = pyre_object::gc_roots::pin_root(Random::new_instance());
         let rnd_slot = seed_slot + 1;
-        pyre_object::gc_roots::pin_root(W_Random::allocate_stable(W_Random::default()));
+        let _ = pyre_object::gc_roots::pin_root(W_Random::allocate_stable(W_Random::default()));
         let obj_slot = rnd_slot + 1;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         crate::typedef::tag_subclass_instance(obj, unsafe {

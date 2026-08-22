@@ -353,9 +353,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // read each back at its own call.
                 let arg_roots = pyre_object::gc_roots::push_roots();
                 let args_base = arg_roots.base();
-                arg_roots.pin_root(args[0]);
-                arg_roots.pin_root(args[1]);
-                arg_roots.pin_root(args[2]);
+                let _ = arg_roots.pin_root(args[0]);
+                let _ = arg_roots.pin_root(args[1]);
+                let _ = arg_roots.pin_root(args[2]);
                 let rfds = collect_fds(arg_roots.get(args_base))?;
                 let wfds = collect_fds(arg_roots.get(args_base + 1))?;
                 let xfds = collect_fds(arg_roots.get(args_base + 2))?;
@@ -479,9 +479,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // is built.
                 let roots = pyre_object::gc_roots::push_roots();
                 let ready_base = roots.base();
-                roots.pin_root(build_ready(&mut rset, &rfds));
-                roots.pin_root(build_ready(&mut wset, &wfds));
-                roots.pin_root(build_ready(&mut xset, &xfds));
+                let _ = roots.pin_root(build_ready(&mut rset, &rfds));
+                let _ = roots.pin_root(build_ready(&mut wset, &wfds));
+                let _ = roots.pin_root(build_ready(&mut xset, &xfds));
                 Ok(pyre_object::w_tuple_new(vec![
                     roots.get(ready_base),
                     roots.get(ready_base + 1),

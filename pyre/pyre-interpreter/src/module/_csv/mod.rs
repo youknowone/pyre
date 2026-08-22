@@ -353,7 +353,7 @@ fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
     let d = pyre_object::w_instance_new(dialect_class::type_object());
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(d);
+    let _ = gc_roots::pin_root(d);
     let set = |name: &str, val: PyObjectRef| -> Result<(), PyError> {
         let d = gc_roots::shadow_stack_get(slot);
         crate::baseobjspace::setattr_str(d, name, val)?;
@@ -645,7 +645,7 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     let _roots = gc_roots::push_roots();
     let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(self_obj);
     crate::baseobjspace::setattr_str(
         gc_roots::shadow_stack_get(self_slot),
         "_reading",
@@ -678,9 +678,9 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 
     let _roots = gc_roots::push_roots();
     let iter_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(crate::baseobjspace::getattr_str(self_obj, "_iterator")?);
+    let _ = gc_roots::pin_root(crate::baseobjspace::getattr_str(self_obj, "_iterator")?);
     let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(self_obj);
 
     let mut fields: Vec<(String, bool, usize)> = Vec::new();
     let mut field = String::new();
@@ -836,7 +836,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 
     let result = pyre_object::listobject::w_list_new(Vec::new());
     let result_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(result);
+    let _ = gc_roots::pin_root(result);
     for (s, unquoted, len) in fields {
         // `parse_save_field` quoting conversions: an empty unquoted field is
         // `None` under QUOTE_NOTNULL / QUOTE_STRINGS; a non-empty unquoted
@@ -929,10 +929,10 @@ fn writer_writerow_impl(
     // remaining type queries.
     let _roots = pyre_object::gc_roots::push_roots();
     let write_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_filewrite);
+    let _ = pyre_object::gc_roots::pin_root(w_filewrite);
     let row_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &row {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
 
     for i in 0..n {
@@ -1058,9 +1058,9 @@ fn writer_writerows_impl(
     let it = crate::baseobjspace::iter(w_seqseq)?;
     let _roots = gc_roots::push_roots();
     let it_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(it);
+    let _ = gc_roots::pin_root(it);
     let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(self_obj);
     loop {
         let it = gc_roots::shadow_stack_get(it_slot);
         let row = match crate::baseobjspace::next(it) {
@@ -1196,9 +1196,9 @@ crate::py_module! {
             let r = pyre_object::w_instance_new(reader_class::type_object());
             let _roots = gc_roots::push_roots();
             let slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(r);
-            gc_roots::pin_root(dialect_obj);
-            gc_roots::pin_root(w_iter);
+            let _ = gc_roots::pin_root(r);
+            let _ = gc_roots::pin_root(dialect_obj);
+            let _ = gc_roots::pin_root(w_iter);
             crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
             crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_iterator", gc_roots::shadow_stack_get(slot + 2))?;
             crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "line_num", pyre_object::w_int_new(0))?;
@@ -1236,9 +1236,9 @@ crate::py_module! {
             let w = pyre_object::w_instance_new(writer_class::type_object());
             let _roots = gc_roots::push_roots();
             let slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(w);
-            gc_roots::pin_root(dialect_obj);
-            gc_roots::pin_root(w_write);
+            let _ = gc_roots::pin_root(w);
+            let _ = gc_roots::pin_root(dialect_obj);
+            let _ = gc_roots::pin_root(w_write);
             crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
             crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_write", gc_roots::shadow_stack_get(slot + 2))?;
             Ok(gc_roots::shadow_stack_get(slot))

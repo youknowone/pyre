@@ -698,7 +698,7 @@ pub(crate) fn encode_text_codec(
     // Rooted for the same window as `decode_text_codec`: the lookup runs
     // Python while `w_obj` is still whatever the caller handed over.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let w_codec_info = lookup_text_codec("encode", encoding)?;
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
@@ -727,7 +727,7 @@ pub(crate) fn decode_text_codec(
     // swept mid-lookup and the decoder is handed a reused box.  Bytes do not
     // move, so the pin is for liveness alone and the value is used as it is.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let w_codec_info = lookup_text_codec("decode", encoding)?;
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;

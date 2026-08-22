@@ -54,9 +54,9 @@ pub fn w_list_find_or_count(
     // locals re-read each iteration, so pin them on the shadow stack.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let item_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_item);
+    let _ = pyre_object::gc_roots::pin_root(w_item);
     while i < stop
         && i < unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot)) }
             as i64
@@ -95,7 +95,7 @@ pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyErr
     // address the list at its pre-move header.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let i = match w_list_find_or_count(obj, w_value, 0, i64::MAX, false)? {
         FindOrCountResult::Index(i) => i,
         FindOrCountResult::NotFound => {

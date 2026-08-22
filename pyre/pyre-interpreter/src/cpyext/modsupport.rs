@@ -148,9 +148,9 @@ fn convert_method_defs(
     }
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_module_name);
+    let _ = roots.pin_root(w_module_name);
     let mut index = 0isize;
     loop {
         let method = unsafe { methods.offset(index) };
@@ -170,7 +170,7 @@ fn convert_method_defs(
             pyre_object::gc_roots::shadow_stack_get(name_slot),
         )?;
         let function_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(function);
+        let _ = roots.pin_root(function);
         store(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             &name,
@@ -211,7 +211,7 @@ fn populate_module(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
 
     set_field(reload(module_slot), |fields| fields.md_def = def as usize);
@@ -219,13 +219,13 @@ fn populate_module(
     if let Some(path) = path {
         let value = crate::gateway::fsdecode_os_str(path.as_os_str());
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(value);
+        let _ = roots.pin_root(value);
         store(reload(module_slot), "__file__", reload(value_slot));
     }
 
     let w_name = pyre_object::w_str_new(name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_name);
+    let _ = roots.pin_root(w_name);
     convert_method_defs(
         reload(module_slot),
         unsafe { (*def).m_methods },
@@ -236,7 +236,7 @@ fn populate_module(
     if !doc.is_empty() {
         let value = pyre_object::w_str_new(&doc);
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(value);
+        let _ = roots.pin_root(value);
         store(reload(module_slot), "__doc__", reload(value_slot));
     }
 
@@ -299,7 +299,7 @@ pub unsafe extern "C" fn PyModule_Create2(
     let module = pyre_object::w_module_new_managed(name);
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     let Some(module) = trap(populate_module(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
         def,
@@ -310,7 +310,7 @@ pub unsafe extern "C" fn PyModule_Create2(
     };
     if unsafe { (*def).m_size } > 0 {
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(module);
+        let _ = roots.pin_root(module);
         if trap(allocate_module_state(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             unsafe { (*def).m_size },
@@ -396,7 +396,7 @@ pub(super) fn create_module_from_def_and_spec(
 
     let roots = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(spec);
+    let _ = roots.pin_root(spec);
     let module = if create.is_null() {
         pyre_object::w_module_new_managed(name)
     } else {
@@ -410,7 +410,7 @@ pub(super) fn create_module_from_def_and_spec(
         super::from_c_result(result)?
     };
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     if !unsafe { pyre_object::module::is_module(module) } {
         if unsafe { (*def).m_size } > 0
             || unsafe { !(*def).m_traverse.is_null() }
@@ -462,7 +462,7 @@ pub(super) fn exec_def(module: PyObjectRef) -> Result<(), crate::PyError> {
 fn exec_def_of(module: PyObjectRef, def: *mut CPyModuleDef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     // The state block is allocated before the first slot runs, both because
     // `PyModule_GetState` is what an exec slot is there to fill and because its
     // address is the marker that keeps a second exec from running.
@@ -606,7 +606,7 @@ pub unsafe extern "C" fn PyModule_AddIntConstant(
     let key = text_or_empty(name);
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let value = pyre_object::w_int_new(value as i64);
     store(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -633,7 +633,7 @@ pub unsafe extern "C" fn PyModule_AddStringConstant(
     let text = text_or_empty(value);
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let value = pyre_object::w_str_new(&text);
     store(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -653,12 +653,12 @@ pub unsafe extern "C" fn PyModule_AddStringConstant(
 fn new_module(w_name: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_name);
+    let _ = roots.pin_root(w_name);
     // The empty name is the anonymous-module sentinel, so the name is attached
     // afterwards rather than through the allocation.
     let module = pyre_object::w_module_new_managed("");
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
     unsafe { pyre_object::w_module_set_name(reload(module_slot), reload(name_slot)) };
     store(reload(module_slot), "__name__", reload(name_slot));
@@ -818,7 +818,7 @@ pub unsafe extern "C" fn PyModule_SetDocString(
     let text = text_or_empty(doc);
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let value = pyre_object::w_str_new(&text);
     store(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -839,7 +839,7 @@ pub unsafe extern "C" fn PyModule_AddFunctions(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let Some(name) = module_name_object(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
         "PyModule_AddFunctions",
@@ -847,7 +847,7 @@ pub unsafe extern "C" fn PyModule_AddFunctions(
         return -1;
     };
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(name);
+    let _ = roots.pin_root(name);
     if trap(convert_method_defs(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
         methods,
@@ -896,7 +896,7 @@ pub unsafe extern "C" fn PyModule_FromDefAndSpec2(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_spec);
+    let _ = roots.pin_root(w_spec);
     let Some(name) = trap(
         crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(spec_slot),

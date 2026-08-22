@@ -53,8 +53,8 @@ pub unsafe fn slot_set(
     }
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
-    crate::gc_roots::pin_root(value);
+    let _ = crate::gc_roots::pin_root(obj);
+    let _ = crate::gc_roots::pin_root(value);
     if slots.is_null() {
         let new_slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
         let obj = crate::gc_roots::shadow_stack_get(root_base);

@@ -14924,7 +14924,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 }
                 _ => PY_NULL,
             };
-            pyre_object::gc_roots::pin_root(obj);
+            let _ = pyre_object::gc_roots::pin_root(obj);
         }
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..locals_boxes.len())
             .map(|k| pyre_object::gc_roots::shadow_stack_get(arg_root_base + k))
@@ -14968,8 +14968,8 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // op becomes its trace root.
     let concrete_roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
-    pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
     for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
         let value = match captured {
             majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
@@ -14981,7 +14981,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
             majit_ir::Value::Void => pyre_object::PY_NULL,
             _ => return None,
         };
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
     let closure = if stack_base == nlocals {
         pyre_object::PY_NULL
@@ -14990,7 +14990,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
             .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
             .collect();
         let closure = pyre_object::w_tuple_new(cells);
-        pyre_object::gc_roots::pin_root(closure);
+        let closure = pyre_object::gc_roots::pin_root(closure);
         closure
     };
     let closure_root = (stack_base != nlocals).then_some(root_base + 2 + stack_base);

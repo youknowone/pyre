@@ -686,14 +686,13 @@ pub(crate) fn function_new_impl(
     // collection point.
     let _roots = pyre_object::gc_roots::push_roots();
     let closure_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(closure);
+    let _ = pyre_object::gc_roots::pin_root(closure);
     let code_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(code as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(code as PyObjectRef);
     // `function.py self.w_func_globals = w_globals` stores the dict
     // object directly as the function's sole globals carrier.
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_func_globals_obj);
-
+    let w_func_globals_obj = pyre_object::gc_roots::pin_root(w_func_globals_obj);
     // CPython 3.14 `_PyDict_LoadBuiltinsFromGlobals` at function construction:
     // retain the selected mapping identity even if the globals entry changes
     // later.  Its `_Py_dict_lookup_threadsafe_stackref` reads the native dict
@@ -732,8 +731,7 @@ pub(crate) fn function_new_impl(
         }
     };
     let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_builtins);
-
+    let _ = pyre_object::gc_roots::pin_root(w_builtins);
     // Resolving the caller vref and later allocations may collect.  Reload every
     // pinned input before embedding it in the new Function; the original raw
     // locals are not rewritten when the shadow-stack slots are forwarded.
@@ -1269,18 +1267,18 @@ pub unsafe fn descr_fixed_code_reduce(obj: PyObjectRef) -> crate::PyResult {
     let owner = unsafe { fget_func_objclass(obj)? };
     let _roots = pyre_object::gc_roots::push_roots();
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(owner);
+    let _ = pyre_object::gc_roots::pin_root(owner);
     let name = pyre_object::w_str_new(unsafe { function_get_name(obj) });
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(name);
+    let _ = pyre_object::gc_roots::pin_root(name);
     let getattr = crate::baseobjspace::builtin_callable("getattr");
     let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(getattr);
+    let _ = pyre_object::gc_roots::pin_root(getattr);
     let args = pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(owner_slot),
         pyre_object::gc_roots::shadow_stack_get(name_slot),
     ]);
-    pyre_object::gc_roots::pin_root(args);
+    let _ = pyre_object::gc_roots::pin_root(args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(getattr_slot),
@@ -1483,7 +1481,7 @@ pub unsafe fn fget_func_qualname(obj: PyObjectRef) -> PyObjectRef {
                 function_get_name(obj).to_owned()
             };
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let value = pyre_object::w_str_new(&qualname);
         function_set_qualname(pyre_object::gc_roots::shadow_stack_get(obj_slot), value);
@@ -1530,7 +1528,7 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
         // itself lives in the off-GC `Box<String>` and does not move.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_roots::pin_root(obj);
         let w_qualname = pyre_object::w_str_new(function_get_name(obj));
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
@@ -1595,7 +1593,7 @@ pub unsafe fn function_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
         // name itself lives in off-GC storage and does not move.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let obj = pyre_object::gc_roots::pin_root(obj);
         let w_name = pyre_object::w_str_new(function_get_name(obj));
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_set_name_obj(obj, w_name);
@@ -3613,26 +3611,26 @@ pub fn funccall_valuestack(
         // the same live-variable set on pyre's shadow stack before doing so.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
-        _roots.pin_root(code as PyObjectRef);
+        let _ = _roots.pin_root(code as PyObjectRef);
         match nargs {
             0 => {}
             1 => {
-                _roots.pin_root(frame.peekvalue(0));
+                let _ = _roots.pin_root(frame.peekvalue(0));
             }
             2 => {
-                _roots.pin_root(frame.peekvalue(1));
-                _roots.pin_root(frame.peekvalue(0));
+                let _ = _roots.pin_root(frame.peekvalue(1));
+                let _ = _roots.pin_root(frame.peekvalue(0));
             }
             3 => {
-                _roots.pin_root(frame.peekvalue(2));
-                _roots.pin_root(frame.peekvalue(1));
-                _roots.pin_root(frame.peekvalue(0));
+                let _ = _roots.pin_root(frame.peekvalue(2));
+                let _ = _roots.pin_root(frame.peekvalue(1));
+                let _ = _roots.pin_root(frame.peekvalue(0));
             }
             4 => {
-                _roots.pin_root(frame.peekvalue(3));
-                _roots.pin_root(frame.peekvalue(2));
-                _roots.pin_root(frame.peekvalue(1));
-                _roots.pin_root(frame.peekvalue(0));
+                let _ = _roots.pin_root(frame.peekvalue(3));
+                let _ = _roots.pin_root(frame.peekvalue(2));
+                let _ = _roots.pin_root(frame.peekvalue(1));
+                let _ = _roots.pin_root(frame.peekvalue(0));
             }
             _ => unreachable!(),
         }
@@ -3714,10 +3712,10 @@ pub fn funccall_valuestack(
         // for the call.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
-        _roots.pin_root(code as PyObjectRef);
-        _roots.pin_root(w_obj);
+        let _ = _roots.pin_root(code as PyObjectRef);
+        let _ = _roots.pin_root(w_obj);
         for &w_arg in &rest {
-            _roots.pin_root(w_arg);
+            let _ = _roots.pin_root(w_arg);
         }
         frame.dropvalues(dropvalues);
         let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();

@@ -1421,7 +1421,7 @@ fn clear_shutdown_modules(
             builtins_module_slot = Some(index);
         }
         names.push(name);
-        pyre_object::gc_roots::pin_root(module);
+        let _ = pyre_object::gc_roots::pin_root(module);
     }
     // `finalize_runtime` sweeps immediately before detaching the import cache,
     // and every module that detach handed over is pinned just above — so a
@@ -1611,7 +1611,7 @@ fn run_module(module: &str, no_site: bool) {
     // Module.getdict()).
     let w_globals = execution_context.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_globals);
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     unsafe {
         pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
     };
@@ -1755,12 +1755,12 @@ fn path_hook_accepts(
 
     let _roots = push_roots();
     let filename_slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_new(filename));
+    let _ = pin_root(pyre_object::w_str_new(filename));
     // A hook call runs arbitrary Python and can drive a collection, which moves
     // the iterator that has to survive it. A Rust local is not walked, so
     // publish it in a shadow-stack slot and read it back for the next step.
     let iterator_slot = shadow_stack_len();
-    pin_root(iterator);
+    let _ = pin_root(iterator);
     loop {
         let hook = match pyre_interpreter::baseobjspace::next(shadow_stack_get(iterator_slot)) {
             Ok(hook) => hook,
@@ -1818,7 +1818,7 @@ fn prepare_main_module(
 ) -> (pyre_object::PyObjectRef, pyre_object::PyObjectRef) {
     let w_globals = execution_context.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_globals);
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
             w_globals,
@@ -1897,7 +1897,7 @@ fn eval_source_in_main(
     // allocation.  RPython keeps a local holding a GC object alive through the
     // translated shadow stack; publish it explicitly for the same span.
     let _main_frame_root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
 
     // Seed the module-identity attributes every `__main__` namespace carries
     // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a

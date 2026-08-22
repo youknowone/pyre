@@ -2472,7 +2472,7 @@ impl SharedOpcodeHandler for PyFrame {
         // Python — and the failing branch below still has to read its type.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
-        roots.pin_root(obj);
+        let obj = roots.pin_root(obj);
         getattr_str(obj, name).map_err(|error| {
             if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 // Keep this write on the live virtualizable red frame.  The
@@ -2760,7 +2760,7 @@ impl StackOpcodeHandler for PyFrame {
         // thing out here and read `w_top` back.
         let roots = pyre_object::gc_roots::push_roots();
         let top_slot = roots.base();
-        roots.pin_root(w_top);
+        let _ = roots.pin_root(w_top);
         self.settopvalue(w_other, 0);
         self.settopvalue(roots.get(top_slot), depth - 1);
         Ok(())
@@ -3040,7 +3040,7 @@ impl IterOpcodeHandler for PyFrame {
             let iter = if pyre_object::is_dict_proxy(iter) {
                 let roots = pyre_object::gc_roots::push_roots();
                 let mapping_slot = roots.base();
-                roots.pin_root(pyre_object::w_dict_proxy_get_mapping(iter));
+                let _ = roots.pin_root(pyre_object::w_dict_proxy_get_mapping(iter));
                 let tos = self.valuestackdepth - 1;
                 self.set_locals_w(tos, roots.get(mapping_slot));
                 roots.get(mapping_slot)
@@ -3932,7 +3932,7 @@ impl OpcodeStepExecutor for PyFrame {
                         // below can drive a collection.
                         let _roots = pyre_object::gc_roots::push_roots();
                         if let Some(c) = &cause {
-                            pyre_object::gc_roots::pin_root(c.w_cause);
+                            let _ = pyre_object::gc_roots::pin_root(c.w_cause);
                         }
                         // pyopcode.py:711-713 — class raise: call the type.
                         let result = instantiate_raised_class(w_value)?;
@@ -4196,9 +4196,9 @@ impl OpcodeStepExecutor for PyFrame {
                 // function to its target.
                 let roots = pyre_object::gc_roots::push_roots();
                 let func_slot = roots.base();
-                roots.pin_root(func);
+                let _ = roots.pin_root(func);
                 let attr_slot = func_slot + 1;
-                roots.pin_root(attr);
+                let _ = roots.pin_root(attr);
                 let mut qualname =
                     unsafe { crate::function::function_get_qualname(roots.get(func_slot)) };
                 qualname.push_str(".__annotate__");
@@ -4851,7 +4851,7 @@ impl OpcodeStepExecutor for PyFrame {
             );
             let cause_obj = cause.to_exc_object();
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(cause_obj);
+            let _ = pyre_object::gc_roots::pin_root(cause_obj);
             let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let mut error = crate::PyError::type_error(message);
             let error_obj = error.to_exc_object();
@@ -4969,7 +4969,7 @@ impl OpcodeStepExecutor for PyFrame {
         // live frame.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
-        roots.pin_root(obj);
+        let obj = roots.pin_root(obj);
         let anchor = FrameAnchor::new(self);
         let attr = crate::baseobjspace::getattr_str(obj, name)?;
         let obj = roots.get(obj_slot);
@@ -5015,7 +5015,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the cache lookup, which runs arbitrary Python on a cache miss.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
-        roots.pin_root(obj);
+        let obj = roots.pin_root(obj);
         let pycode = self.pycode as PyObjectRef;
         let anchor = FrameAnchor::new(self);
         let w_value = unsafe {

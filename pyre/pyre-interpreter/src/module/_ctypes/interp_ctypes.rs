@@ -804,9 +804,9 @@ fn comerror_init(
     // store.  Pin the three before that store and read them back at each use.
     let roots = pyre_object::gc_roots::push_roots();
     let args_slot = roots.base();
-    roots.pin_root(*hresult);
-    roots.pin_root(*text);
-    roots.pin_root(*details);
+    let _ = roots.pin_root(*hresult);
+    let _ = roots.pin_root(*text);
+    let _ = roots.pin_root(*details);
     crate::baseobjspace::setattr_str(w_self, "hresult", roots.get(args_slot))?;
     crate::baseobjspace::setattr_str(w_self, "text", roots.get(args_slot + 1))?;
     crate::baseobjspace::setattr_str(w_self, "details", roots.get(args_slot + 2))?;
@@ -1006,7 +1006,7 @@ pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_obje
         // inline slot read would precede that allocation and go stale.
         let roots = pyre_object::gc_roots::push_roots();
         let dict_slot = roots.base();
-        roots.pin_root(d);
+        let _ = roots.pin_root(d);
         let ptr = pyre_object::w_int_new(addr as i64);
         unsafe {
             pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_ptr", ptr);

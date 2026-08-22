@@ -1615,7 +1615,7 @@ fn mmap_new_object(
 ) -> pyre_object::PyObjectRef {
     let backend = Box::into_raw(Box::new(backend));
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(cls);
+    let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let obj = W_MMap::allocate_stable(W_MMap {
         ob: pyre_object::PyObject {

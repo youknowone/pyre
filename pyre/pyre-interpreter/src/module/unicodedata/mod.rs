@@ -436,7 +436,7 @@ crate::py_module! {
         // Installing the module attribute can allocate; keep the freshly
         // allocated instance rooted until the namespace owns it.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(ucd);
+        let _ = pyre_object::gc_roots::pin_root(ucd);
         let ucd = pyre_object::gc_roots::shadow_stack_get(
             pyre_object::gc_roots::shadow_stack_len() - 1,
         );

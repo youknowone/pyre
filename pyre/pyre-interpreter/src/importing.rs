@@ -850,7 +850,7 @@ fn init_string_module(ns: PyObjectRef) {
             // but nothing else refers to it while the parts below allocate:
             // one liveness pin covers it to the end of the call.
             let roots = pyre_object::gc_roots::push_roots();
-            roots.pin_root(first);
+            let first = roots.pin_root(first);
             let rest = parts
                 .into_iter()
                 .map(|part| match part {
@@ -904,7 +904,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
             // left to right, so the key and value are bound before that read.
             let roots = pyre_object::gc_roots::push_roots();
             let vars_slot = roots.base();
-            roots.pin_root(pyre_object::w_dict_new());
+            let _ = roots.pin_root(pyre_object::w_dict_new());
             let so_ext = extension_abi_suffix();
             unsafe {
                 for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
@@ -1186,7 +1186,7 @@ fn init_sysconfigdata(ns: PyObjectRef) {
 
     let _roots = pyre_object::gc_roots::push_roots();
     let vars_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
     // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
     // The lower-case `abiflags` that forms the include and site-packages
     // directory names is a separate variable, read from `sys.abiflags`
@@ -1450,7 +1450,7 @@ fn init_scproxy(ns: PyObjectRef) {
             // The `dict` moves across the allocations each store makes.
             let roots = pyre_object::gc_roots::push_roots();
             let d_slot = roots.base();
-            roots.pin_root(pyre_object::w_dict_new());
+            let _ = roots.pin_root(pyre_object::w_dict_new());
             unsafe {
                 let w_key = pyre_object::w_str_new("exclude_simple");
                 let w_value = pyre_object::w_bool_from(false);
@@ -1484,9 +1484,9 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_dict);
+    let w_dict = pyre_object::gc_roots::pin_root(w_dict);
     let name_obj = pyre_object::w_str_new(name);
-    pyre_object::gc_roots::pin_root(name_obj);
+    let _ = pyre_object::gc_roots::pin_root(name_obj);
     // Set __name__ (PyPy: Module.__init__ sets __name__)
     crate::module_ns_store(
         w_dict,
@@ -1591,7 +1591,7 @@ pub(crate) fn create_builtin_module(
     let Some(module) = load_builtin_module(name) else {
         return Ok(None);
     };
-    pyre_object::gc_roots::pin_root(module);
+    let _ = pyre_object::gc_roots::pin_root(module);
     set_sys_module(name, pyre_object::gc_roots::shadow_stack_get(module_slot));
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
     startup_builtin_module_impl(name, module, execution_context, false)?;
@@ -1622,9 +1622,9 @@ fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate:
 
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
-    pin_root(module);
+    let _ = pin_root(module);
     let boot_slot = shadow_stack_len();
-    pin_root(bootstrap);
+    let _ = pin_root(bootstrap);
 
     // Best-effort throughout: a builtin imported while `_bootstrap` is still
     // executing sees a partially-initialised module whose `BuiltinImporter` /
@@ -1636,17 +1636,17 @@ fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate:
         return Ok(());
     };
     let importer_slot = shadow_stack_len();
-    pin_root(importer);
+    let _ = pin_root(importer);
     let Ok(find_spec) =
         crate::baseobjspace::getattr_str(shadow_stack_get(importer_slot), "find_spec")
     else {
         return Ok(());
     };
     let find_spec_slot = shadow_stack_len();
-    pin_root(find_spec);
+    let _ = pin_root(find_spec);
     let w_name = pyre_object::w_str_new(name);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let Ok(spec) = crate::call::call_function_impl_result(
         shadow_stack_get(find_spec_slot),
         &[shadow_stack_get(name_slot)],
@@ -1657,7 +1657,7 @@ fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate:
         return Ok(());
     }
     let spec_slot = shadow_stack_len();
-    pin_root(spec);
+    let _ = pin_root(spec);
 
     // _init_module_attrs(spec, module)
     let Ok(init) =
@@ -1666,7 +1666,7 @@ fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate:
         return Ok(());
     };
     let init_slot = shadow_stack_len();
-    pin_root(init);
+    let _ = pin_root(init);
     let _ = crate::call::call_function_impl_result(
         shadow_stack_get(init_slot),
         &[shadow_stack_get(spec_slot), shadow_stack_get(mod_slot)],
@@ -1717,20 +1717,20 @@ fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
     };
     let _roots = push_roots();
     let ext_slot = shadow_stack_len();
-    pin_root(ext);
+    let _ = pin_root(ext);
     let Ok(from_location) =
         crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "spec_from_file_location")
     else {
         return pyre_object::PY_NULL;
     };
     let from_location_slot = shadow_stack_len();
-    pin_root(from_location);
+    let _ = pin_root(from_location);
     let w_name = pyre_object::w_str_new(name);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let w_path = crate::gateway::fsdecode_os_str(pathname.as_os_str());
     let path_slot = shadow_stack_len();
-    pin_root(w_path);
+    let _ = pin_root(w_path);
     // A suffix `_get_supported_file_loaders` does not know yields `None`; that
     // is the same "no spec" answer as a missing bootstrap.
     let Ok(spec) = crate::call::call_function_impl_result(
@@ -1762,11 +1762,11 @@ fn set_extension_module_spec(
 
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
-    pin_root(module);
+    let _ = pin_root(module);
     let boot_slot = shadow_stack_len();
-    pin_root(bootstrap);
+    let _ = pin_root(bootstrap);
     let ext_slot = shadow_stack_len();
-    pin_root(ext);
+    let _ = pin_root(ext);
 
     let Ok(from_location) =
         crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "spec_from_file_location")
@@ -1774,13 +1774,13 @@ fn set_extension_module_spec(
         return Ok(());
     };
     let from_location_slot = shadow_stack_len();
-    pin_root(from_location);
+    let _ = pin_root(from_location);
     let w_name = pyre_object::w_str_new(name);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let w_path = crate::gateway::fsdecode_os_str(pathname.as_os_str());
     let path_slot = shadow_stack_len();
-    pin_root(w_path);
+    let _ = pin_root(w_path);
 
     // A suffix `_get_supported_file_loaders` does not know yields `None`; that
     // is the same "leave it alone" answer as a missing bootstrap.
@@ -1794,7 +1794,7 @@ fn set_extension_module_spec(
         return Ok(());
     }
     let spec_slot = shadow_stack_len();
-    pin_root(spec);
+    let _ = pin_root(spec);
 
     let Ok(init) =
         crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
@@ -1802,7 +1802,7 @@ fn set_extension_module_spec(
         return Ok(());
     };
     let init_slot = shadow_stack_len();
-    pin_root(init);
+    let _ = pin_root(init);
     let _ = crate::call::call_function_impl_result(
         shadow_stack_get(init_slot),
         &[shadow_stack_get(spec_slot), shadow_stack_get(mod_slot)],
@@ -1833,20 +1833,20 @@ fn fix_up_source_module_spec(
 
     let _roots = push_roots();
     let ns_slot = shadow_stack_len();
-    pin_root(ns);
+    let _ = pin_root(ns);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let ext_slot = shadow_stack_len();
-    pin_root(ext);
+    let _ = pin_root(ext);
     let w_path = pyre_object::w_str_from_wtf8(pathname.to_wtf8_buf());
     let path_slot = shadow_stack_len();
-    pin_root(w_path);
+    let _ = pin_root(w_path);
     let w_cpath = match cpathname {
         Some(c) => pyre_object::w_str_new(c),
         None => pyre_object::w_none(),
     };
     let cpath_slot = shadow_stack_len();
-    pin_root(w_cpath);
+    let _ = pin_root(w_cpath);
 
     // Best-effort: `_bootstrap_external` itself is a source module, and its
     // spec is fixed up (during partial-init) before its body defines
@@ -1858,7 +1858,7 @@ fn fix_up_source_module_spec(
         return Ok(false);
     };
     let fix_slot = shadow_stack_len();
-    pin_root(fix);
+    let _ = pin_root(fix);
     // An error raised by `_fix_up_module` itself propagates — the appexec
     // at importing.py:293-298 does not shield the call.
     crate::call::call_function_impl_result(
@@ -1901,7 +1901,7 @@ fn startup_builtin_module_impl(
 
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
-    pin_root(module);
+    let _ = pin_root(module);
 
     let startup = BUILTIN_MODULES
         .lock()
@@ -2664,7 +2664,7 @@ pub fn add_sys_path(dir: &Path) {
     // path is allocation-free until the pinned entry reaches `w_list_append`.
     let _roots = push_roots();
     let slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
+    let _ = pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
     let Some(sys_mod) = get_sys_module("sys") else {
         return;
     };
@@ -2714,7 +2714,7 @@ pub fn add_sys_path_0() {
     // dict lookup allocate) can relocate it — `add_sys_path` parity.
     let _roots = push_roots();
     let slot = shadow_stack_len();
-    pin_root(crate::gateway::fsdecode_os_str(&entry));
+    let _ = pin_root(crate::gateway::fsdecode_os_str(&entry));
     let Some(sys_mod) = get_sys_module("sys") else {
         return;
     };
@@ -2852,7 +2852,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     if !dict.is_null() {
         let roots = pyre_object::gc_roots::push_roots();
         let dict_slot = roots.base();
-        roots.pin_root(dict);
+        let _ = roots.pin_root(dict);
         let w_key = pyre_object::w_str_new(name);
         unsafe {
             pyre_object::w_dict_store(roots.get(dict_slot), w_key, module);
@@ -3289,7 +3289,7 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     // and may grow the dict.
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     // Populate with all modules already in the cache.
     for (name, &module) in SYS_MODULES.lock().unwrap().iter() {
         let w_key = pyre_object::w_str_new(name);
@@ -3792,7 +3792,7 @@ pub fn appleveldef_install_seeded(
     }
     let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let _root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_app_globals);
+    let w_app_globals = pyre_object::gc_roots::pin_root(w_app_globals);
     for &(name, value) in seed {
         unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
     }
@@ -3876,7 +3876,7 @@ fn load_source_module(
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
     // Root before any allocation (fresh_module_globals, the cache write) can
     // collect the freshly boxed code out from under us.
-    pyre_object::gc_roots::pin_root(w_code);
+    let w_code = pyre_object::gc_roots::pin_root(w_code);
     if let (true, Some(key)) = (store, cache_key) {
         crate::module::imp::interp_imp::frozen_cache_store(key, &source, w_code);
     }
@@ -3886,8 +3886,7 @@ fn load_source_module(
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
-    pyre_object::gc_roots::pin_root(w_globals);
-
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
     // the module's w_dict.  `w_module_new_aliasing_dict` below does that
     // via `w_dict_setitem_str("__name__", ...)`, so an explicit store
@@ -4055,19 +4054,19 @@ fn install_importlib_bootstrap(
 
     let _roots = push_roots();
     let module_slot = shadow_stack_len();
-    pin_root(module);
+    let _ = pin_root(module);
 
     let w_sys = absolute_import("sys", pyre_object::PY_NULL, execution_context)?;
     let sys_slot = shadow_stack_len();
-    pin_root(w_sys);
+    let _ = pin_root(w_sys);
 
     let w_imp = absolute_import("_imp", pyre_object::PY_NULL, execution_context)?;
     let imp_slot = shadow_stack_len();
-    pin_root(w_imp);
+    let _ = pin_root(w_imp);
 
     let install = crate::baseobjspace::getattr_str(shadow_stack_get(module_slot), "_install")?;
     let install_slot = shadow_stack_len();
-    pin_root(install);
+    let _ = pin_root(install);
     let args = [shadow_stack_get(sys_slot), shadow_stack_get(imp_slot)];
     crate::call::call_function_impl_result(shadow_stack_get(install_slot), &args)?;
 
@@ -4106,11 +4105,11 @@ fn install_importlib_bootstrap(
     // zipimport` path — rather than failing the whole bootstrap.
     if let Ok(w_zipimport) = absolute_import("zipimport", pyre_object::PY_NULL, execution_context) {
         let zipimport_slot = shadow_stack_len();
-        pin_root(w_zipimport);
+        let _ = pin_root(w_zipimport);
         let w_zipimporter =
             crate::baseobjspace::getattr_str(shadow_stack_get(zipimport_slot), "zipimporter")?;
         let zipimporter_slot = shadow_stack_len();
-        pin_root(w_zipimporter);
+        let _ = pin_root(w_zipimporter);
         let w_path_hooks =
             crate::baseobjspace::getattr_str(shadow_stack_get(sys_slot), "path_hooks")?;
         unsafe {
@@ -4135,26 +4134,26 @@ fn set_frozen_alias_metadata(
 
     let _roots = push_roots();
     let module_slot = shadow_stack_len();
-    pin_root(module);
+    let _ = pin_root(module);
     let bootstrap_slot = shadow_stack_len();
-    pin_root(bootstrap);
+    let _ = pin_root(bootstrap);
 
     let loader =
         crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "FrozenImporter")?;
     let loader_slot = shadow_stack_len();
-    pin_root(loader);
+    let _ = pin_root(loader);
     let find_spec = crate::baseobjspace::getattr_str(shadow_stack_get(loader_slot), "find_spec")?;
     let find_spec_slot = shadow_stack_len();
-    pin_root(find_spec);
+    let _ = pin_root(find_spec);
     let w_name = pyre_object::w_str_new(name);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let spec = crate::call::call_function_impl_result(
         shadow_stack_get(find_spec_slot),
         &[shadow_stack_get(name_slot)],
     )?;
     let spec_slot = shadow_stack_len();
-    pin_root(spec);
+    let _ = pin_root(spec);
 
     crate::baseobjspace::setattr_str(
         shadow_stack_get(module_slot),
@@ -4214,8 +4213,7 @@ fn load_namespace_package(
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_globals);
-
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     unsafe {
         pyre_object::w_dict_setitem_str(
             w_globals,
@@ -4304,14 +4302,14 @@ fn load_part(
         FindInfo::ExtensionFile { pathname } => {
             let roots = pyre_object::gc_roots::push_roots();
             let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(extension_module_spec(modulename, &pathname));
+            let _ = roots.pin_root(extension_module_spec(modulename, &pathname));
             let module = crate::cpyext::load_extension_module(
                 modulename,
                 &pathname,
                 pyre_object::gc_roots::shadow_stack_get(spec_slot),
             )?;
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(module);
+            let _ = roots.pin_root(module);
             set_extension_module_spec(
                 modulename,
                 &pathname,
@@ -4331,14 +4329,14 @@ fn load_part(
         FindInfo::ExtensionPackage { dirpath, pathname } => {
             let roots = pyre_object::gc_roots::push_roots();
             let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(extension_module_spec(modulename, &pathname));
+            let _ = roots.pin_root(extension_module_spec(modulename, &pathname));
             let module = crate::cpyext::load_extension_module(
                 modulename,
                 &pathname,
                 pyre_object::gc_roots::shadow_stack_get(spec_slot),
             )?;
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(module);
+            let _ = roots.pin_root(module);
             set_extension_module_spec(
                 modulename,
                 &pathname,
@@ -4346,14 +4344,14 @@ fn load_part(
             )?;
             let path = crate::gateway::fsdecode_os_str(dirpath.as_os_str());
             let path_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(path);
+            let _ = roots.pin_root(path);
             // `__path__` is re-stamped after the spec: the loader derives it
             // from the file name, and the directory found here is the same
             // answer spelled without that dependency.
             // The store below allocates, so the fresh list is pinned rather
             // than held in a local across it.
             let list_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(pyre_object::w_list_new(vec![
+            let _ = roots.pin_root(pyre_object::w_list_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(path_slot),
             ]));
             let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
@@ -4608,14 +4606,14 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     };
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
-    pin_root(w_module);
+    let _ = pin_root(w_module);
     let Some(w_spec) =
         crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
     else {
         return Ok(None);
     };
     let spec_slot = shadow_stack_len();
-    pin_root(w_spec);
+    let _ = pin_root(w_spec);
     if let Some(w_initializing) =
         crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
         && crate::baseobjspace::is_true(w_initializing)?
@@ -4624,7 +4622,7 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
             return Ok(None);
         };
         let bootstrap_slot = shadow_stack_len();
-        pin_root(w_bootstrap);
+        let _ = pin_root(w_bootstrap);
         let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
             shadow_stack_get(bootstrap_slot),
             "_lock_unlock_module",
@@ -4633,9 +4631,9 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
             return Ok(None);
         };
         let lock_unlock_slot = shadow_stack_len();
-        pin_root(w_lock_unlock);
+        let _ = pin_root(w_lock_unlock);
         let name_slot = shadow_stack_len();
-        pin_root(pyre_object::w_str_new(name));
+        let _ = pin_root(pyre_object::w_str_new(name));
         crate::call::call_function_impl_result(
             shadow_stack_get(lock_unlock_slot),
             &[shadow_stack_get(name_slot)],
@@ -4690,11 +4688,11 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
         // its own walk.
         let _roots = push_roots();
         let exc_slot = shadow_stack_len();
-        pin_root(exc);
+        let exc = pin_root(exc);
         let tb_slot = shadow_stack_len();
-        pin_root(w_exception_get_traceback(exc));
+        let _ = pin_root(w_exception_get_traceback(exc));
         let code_slot = shadow_stack_len();
-        pin_root(pyre_object::PY_NULL);
+        let _ = pin_root(pyre_object::PY_NULL);
         loop {
             let tb = shadow_stack_get(tb_slot);
             if tb.is_null() || is_none(tb) {
@@ -4769,21 +4767,21 @@ fn handle_fromlist_fast(
 
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
-    pin_root(w_mod);
+    let _ = pin_root(w_mod);
     let fromlist_slot = shadow_stack_len();
-    pin_root(w_fromlist);
+    let _ = pin_root(w_fromlist);
     let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
         return Ok(None);
     };
     let bootstrap_slot = shadow_stack_len();
-    pin_root(w_bootstrap);
+    let _ = pin_root(w_bootstrap);
     let Some(w_handle) =
         crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "_handle_fromlist")?
     else {
         return Ok(None);
     };
     let handle_slot = shadow_stack_len();
-    pin_root(w_handle);
+    let _ = pin_root(w_handle);
     // `space.w_default_importlib_import` is the importer `_handle_fromlist`
     // calls for a name the package does not already carry.  It is the space's
     // own captured copy, so rebinding `builtins.__import__` or
@@ -4792,7 +4790,7 @@ fn handle_fromlist_fast(
         return Ok(None);
     };
     let import_slot = shadow_stack_len();
-    pin_root(w_import);
+    let _ = pin_root(w_import);
     crate::call::call_function_impl_result(
         shadow_stack_get(handle_slot),
         &[
@@ -4826,19 +4824,19 @@ pub fn dunder_import(
 
     let _roots = push_roots();
     let globals_slot = shadow_stack_len();
-    pin_root(if w_globals.is_null() {
+    let _ = pin_root(if w_globals.is_null() {
         pyre_object::w_none()
     } else {
         w_globals
     });
     let locals_slot = shadow_stack_len();
-    pin_root(if w_locals.is_null() {
+    let _ = pin_root(if w_locals.is_null() {
         pyre_object::w_none()
     } else {
         w_locals
     });
     let fromlist_slot = shadow_stack_len();
-    pin_root(if w_fromlist.is_null() {
+    let _ = pin_root(if w_fromlist.is_null() {
         pyre_object::w_none()
     } else {
         w_fromlist
@@ -4855,7 +4853,7 @@ pub fn dunder_import(
             !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
         if let Some(w_mod) = gcd_import_fast(name)? {
             let mod_slot = shadow_stack_len();
-            pin_root(w_mod);
+            let _ = pin_root(w_mod);
             if !have_fromlist {
                 let dotindex = rpython_str_find_char(name, '.', 0);
                 if dotindex < 0 {
@@ -4903,12 +4901,12 @@ pub fn dunder_import(
     // Slow path: the app-level `_bootstrap.__import__`.
     if let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") {
         let bootstrap_slot = shadow_stack_len();
-        pin_root(w_bootstrap);
+        let _ = pin_root(w_bootstrap);
         if let Some(w_import) =
             crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
         {
             let import_slot = shadow_stack_len();
-            pin_root(w_import);
+            let _ = pin_root(w_import);
             // `PyImport_ImportModuleLevelObject`: a relative import with an
             // empty fromlist hands back the head package named by the *resolved
             // absolute name*, and the imported module itself when `name` carries
@@ -4975,21 +4973,21 @@ fn call_bootstrap_import(
 
     let _roots = push_roots();
     let import_slot = shadow_stack_len();
-    pin_root(w_import);
+    let _ = pin_root(w_import);
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let globals_slot = shadow_stack_len();
-    pin_root(w_globals);
+    let _ = pin_root(w_globals);
     let locals_slot = shadow_stack_len();
-    pin_root(w_locals);
+    let _ = pin_root(w_locals);
     let fromlist_slot = shadow_stack_len();
-    pin_root(if w_fromlist.is_null() {
+    let _ = pin_root(if w_fromlist.is_null() {
         pyre_object::w_tuple_new(vec![])
     } else {
         w_fromlist
     });
     let level_slot = shadow_stack_len();
-    pin_root(pyre_object::w_int_new(level));
+    let _ = pin_root(pyre_object::w_int_new(level));
     crate::call::call_function_impl_result(
         shadow_stack_get(import_slot),
         &[
@@ -5020,15 +5018,15 @@ pub fn dunder_import_name_obj(
 
     let _roots = push_roots();
     let name_slot = shadow_stack_len();
-    pin_root(w_name);
+    let _ = pin_root(w_name);
     let globals_slot = shadow_stack_len();
-    pin_root(if w_globals.is_null() {
+    let _ = pin_root(if w_globals.is_null() {
         pyre_object::w_none()
     } else {
         w_globals
     });
     let locals_slot = shadow_stack_len();
-    pin_root(if w_locals.is_null() {
+    let _ = pin_root(if w_locals.is_null() {
         pyre_object::w_none()
     } else {
         w_locals
@@ -5039,11 +5037,11 @@ pub fn dunder_import_name_obj(
     } else {
         w_fromlist
     };
-    pin_root(w_fromlist);
+    let _ = pin_root(w_fromlist);
 
     let bootstrap = if let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") {
         let bootstrap_slot = shadow_stack_len();
-        pin_root(w_bootstrap);
+        let _ = pin_root(w_bootstrap);
         crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
     } else {
         None
@@ -5088,38 +5086,38 @@ fn relative_import_head(
 
     let _roots = push_roots();
     let bootstrap_slot = shadow_stack_len();
-    pin_root(w_bootstrap);
+    let _ = pin_root(w_bootstrap);
     // `_bootstrap.__import__` — `globals_ = globals if globals is not None else {}`.
     let globals_slot = shadow_stack_len();
-    pin_root(if w_globals.is_null() || unsafe { is_none(w_globals) } {
+    let _ = pin_root(if w_globals.is_null() || unsafe { is_none(w_globals) } {
         pyre_object::w_dict_new()
     } else {
         w_globals
     });
     let name_slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_new(name));
+    let _ = pin_root(pyre_object::w_str_new(name));
     let level_slot = shadow_stack_len();
-    pin_root(pyre_object::w_int_new(level));
+    let _ = pin_root(pyre_object::w_int_new(level));
 
     // `_bootstrap.__import__` — `package = _calc___package__(globals_)`.
     let w_calc =
         crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_calc___package__")?;
     let calc_slot = shadow_stack_len();
-    pin_root(w_calc);
+    let _ = pin_root(w_calc);
     let w_package = crate::call::call_function_impl_result(
         shadow_stack_get(calc_slot),
         &[shadow_stack_get(globals_slot)],
     )
     .map_err(strip_bootstrap_traceback_frames)?;
     let package_slot = shadow_stack_len();
-    pin_root(w_package);
+    let _ = pin_root(w_package);
 
     // `_bootstrap.__import__` — `module = _gcd_import(name, package, level)`.
     // `_sanity_check` / `_resolve_name` validate `package` and `level` in there,
     // so running it before the slice below keeps their diagnostics first.
     let w_gcd = crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_gcd_import")?;
     let gcd_slot = shadow_stack_len();
-    pin_root(w_gcd);
+    let _ = pin_root(w_gcd);
     let w_module = crate::call::call_function_impl_result(
         shadow_stack_get(gcd_slot),
         &[
@@ -5130,7 +5128,7 @@ fn relative_import_head(
     )
     .map_err(strip_bootstrap_traceback_frames)?;
     let module_slot = shadow_stack_len();
-    pin_root(w_module);
+    let _ = pin_root(w_module);
 
     // No dot in `name`: the imported module is already the head.
     let Some(dot) = name.find('.') else {
@@ -5142,7 +5140,7 @@ fn relative_import_head(
     let w_resolve =
         crate::baseobjspace::getattr_str(shadow_stack_get(bootstrap_slot), "_resolve_name")?;
     let resolve_slot = shadow_stack_len();
-    pin_root(w_resolve);
+    let _ = pin_root(w_resolve);
     let w_abs_name = crate::call::call_function_impl_result(
         shadow_stack_get(resolve_slot),
         &[
@@ -5153,7 +5151,7 @@ fn relative_import_head(
     )
     .map_err(strip_bootstrap_traceback_frames)?;
     let abs_slot = shadow_stack_len();
-    pin_root(w_abs_name);
+    let _ = pin_root(w_abs_name);
     // Owned: the slicing below outlives the allocations that follow it.
     let abs_name = crate::baseobjspace::utf8_w(shadow_stack_get(abs_slot))?.to_string();
     let cut_off = name.len() - dot;
@@ -5164,7 +5162,7 @@ fn relative_import_head(
         .unwrap_or(abs_name.as_str());
 
     let head_slot = shadow_stack_len();
-    pin_root(pyre_object::w_str_new(head));
+    let _ = pin_root(pyre_object::w_str_new(head));
     // The raw `sys.modules` entry, `None` sentinel included: only a *missing*
     // key is the KeyError.
     let w_modules = sys_modules_dict();
@@ -5409,7 +5407,7 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
     // pin the spec and read it back before the `origin` lookup.
     let _scope = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_spec);
+    let w_spec = pyre_object::gc_roots::pin_root(w_spec);
     let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "has_location") {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
@@ -5488,7 +5486,7 @@ pub(crate) fn module_shadow_info(
     if let Some(sys_mod) = get_sys_module("sys") {
         let _scope = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_name);
+        let w_name = pyre_object::gc_roots::pin_root(w_name);
         let w_names = match crate::baseobjspace::getattr_str(sys_mod, "stdlib_module_names") {
             Ok(v) => v,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => pyre_object::w_none(),
@@ -5603,7 +5601,7 @@ pub fn import_from(
     // The `__file__` lookup below can run a descriptor or `__getattr__` and so
     // collect; the name string is young and movable, so pin it and read it
     // back from the slot afterwards.
-    pyre_object::gc_roots::pin_root(w_pkgname);
+    let _ = pyre_object::gc_roots::pin_root(w_pkgname);
     // pypy/module/imp/importing.py get_path — a non-str `__file__`
     // (including None) reports the location as unknown.
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
@@ -5616,7 +5614,7 @@ pub fn import_from(
     };
     // Pin the path string across the spec lookups below (which allocate) too.
     let pkgpath_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_pkgpath);
+    let _ = pyre_object::gc_roots::pin_root(w_pkgpath);
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     // Own the name so the spec lookups below (which allocate) cannot dangle it.
     let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) }.to_string();
@@ -5625,7 +5623,7 @@ pub fn import_from(
     // reports the circular-import cause, then an unset submodule slot.
     let w_spec = get_spec(module)?;
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_spec);
+    let w_spec = pyre_object::gc_roots::pin_root(w_spec);
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let (origin, is_shadowing, is_shadowing_stdlib) = module_shadow_info(w_spec, w_pkgname)?;
     let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);

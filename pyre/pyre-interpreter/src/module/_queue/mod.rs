@@ -101,7 +101,7 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     // from the argument, which a move would have left stale.
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(item);
+    let _ = roots.pin_root(item);
     let mut guard = queue_lock(&queue.queue);
     guard.push_back(pyre_object::gc_roots::shadow_stack_get(base));
     drop(guard);

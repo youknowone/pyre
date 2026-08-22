@@ -40,10 +40,9 @@ pub fn w_super_new(
     // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(super_type);
-    crate::gc_roots::pin_root(obj_type);
-    crate::gc_roots::pin_root(obj);
-
+    let _ = crate::gc_roots::pin_root(super_type);
+    let _ = crate::gc_roots::pin_root(obj_type);
+    let _ = crate::gc_roots::pin_root(obj);
     let header = PyObject {
         ob_type: &SUPER_TYPE as *const PyType,
         w_class: get_instantiate(&SUPER_TYPE),
@@ -211,10 +210,9 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
     // barrier (`set_doc`/`set_name`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(fget);
-    crate::gc_roots::pin_root(fset);
-    crate::gc_roots::pin_root(fdel);
-
+    let _ = crate::gc_roots::pin_root(fget);
+    let _ = crate::gc_roots::pin_root(fset);
+    let _ = crate::gc_roots::pin_root(fdel);
     let header = PyObject {
         ob_type: &PROPERTY_TYPE as *const PyType,
         w_class: get_instantiate(&PROPERTY_TYPE),

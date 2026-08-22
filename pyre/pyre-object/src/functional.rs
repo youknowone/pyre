@@ -51,8 +51,8 @@ pub fn w_enumerate_new(
     w_index: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iter_or_list);
-    crate::gc_roots::pin_root(w_index);
+    let w_iter_or_list = crate::gc_roots::pin_root(w_iter_or_list);
+    let w_index = crate::gc_roots::pin_root(w_index);
     W_Enumerate::allocate_stable(W_Enumerate {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -173,7 +173,7 @@ pub struct W_ReversedIterator {
 /// caller.
 pub fn w_reversed_new(w_sequence: PyObjectRef, remaining: i64) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_sequence);
+    let w_sequence = crate::gc_roots::pin_root(w_sequence);
     W_ReversedIterator::allocate_stable(W_ReversedIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -256,8 +256,8 @@ pub struct W_Map {
 /// iterators (`build_iterators_from_args`).
 pub fn w_map_new(w_fun: PyObjectRef, w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_fun);
-    crate::gc_roots::pin_root(w_iterators);
+    let w_fun = crate::gc_roots::pin_root(w_fun);
+    let w_iterators = crate::gc_roots::pin_root(w_iterators);
     W_Map::allocate_stable(W_Map {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -341,9 +341,9 @@ pub struct W_Filter {
 pub fn w_filter_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     if !w_predicate.is_null() {
-        crate::gc_roots::pin_root(w_predicate);
+        let _ = crate::gc_roots::pin_root(w_predicate);
     }
-    crate::gc_roots::pin_root(w_iterable);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     W_Filter::allocate_stable(W_Filter {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -409,7 +409,7 @@ pub struct W_Zip {
 /// iterators (`build_iterators_from_args`).
 pub fn w_zip_new(w_iterators: PyObjectRef, strict: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterators);
+    let w_iterators = crate::gc_roots::pin_root(w_iterators);
     W_Zip::allocate_stable(W_Zip {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -706,9 +706,9 @@ pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
 )]
 pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(start);
-    crate::gc_roots::pin_root(stop);
-    crate::gc_roots::pin_root(step);
+    let start = crate::gc_roots::pin_root(start);
+    let stop = crate::gc_roots::pin_root(stop);
+    let step = crate::gc_roots::pin_root(step);
     let length = unsafe {
         let len_big = range_length_big(
             &range_obj_to_bigint(start),
@@ -717,7 +717,7 @@ pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
         );
         range_bigint_to_obj(len_big)
     };
-    crate::gc_roots::pin_root(length);
+    let length = crate::gc_roots::pin_root(length);
     W_Range::allocate_stable(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -916,11 +916,11 @@ pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
         let len_b = range_obj_to_bigint(len_obj);
         let lastitem = &start_b + (&len_b - BigInt::one()) * &step_b;
         let _roots = crate::gc_roots::push_roots();
-        crate::gc_roots::pin_root(len_obj);
+        let len_obj = crate::gc_roots::pin_root(len_obj);
         let w_lastitem = range_bigint_to_obj(lastitem);
-        crate::gc_roots::pin_root(w_lastitem);
+        let w_lastitem = crate::gc_roots::pin_root(w_lastitem);
         let w_negstep = range_bigint_to_obj(-step_b);
-        crate::gc_roots::pin_root(w_negstep);
+        let w_negstep = crate::gc_roots::pin_root(w_negstep);
         w_long_range_iter_new(w_lastitem, w_negstep, len_obj)
     }
 }
@@ -1070,11 +1070,11 @@ pub fn w_long_range_iter_new(
     len: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(start);
-    crate::gc_roots::pin_root(step);
-    crate::gc_roots::pin_root(len);
+    let start = crate::gc_roots::pin_root(start);
+    let step = crate::gc_roots::pin_root(step);
+    let len = crate::gc_roots::pin_root(len);
     let index = crate::intobject::w_int_new(0);
-    crate::gc_roots::pin_root(index);
+    let index = crate::gc_roots::pin_root(index);
     W_LongRangeIterator::allocate_stable(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -1169,10 +1169,10 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         // RPython's GC transform roots this local automatically.
         let value = RBigIntGcRoot::new(start + index.translated_alias() * step);
         let _roots = crate::gc_roots::push_roots();
-        crate::gc_roots::pin_root(obj);
+        let _ = crate::gc_roots::pin_root(obj);
         let iter_slot = crate::gc_roots::shadow_stack_len() - 1;
         let next_index = range_bigint_to_obj(index + BigInt::from(1));
-        crate::gc_roots::pin_root(next_index);
+        let next_index = crate::gc_roots::pin_root(next_index);
         let it = crate::gc_roots::shadow_stack_get(iter_slot) as *mut W_LongRangeIterator;
         (*it).index = next_index;
         crate::gc_hook::try_gc_write_barrier(it as *mut u8);

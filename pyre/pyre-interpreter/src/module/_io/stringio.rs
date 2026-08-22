@@ -47,7 +47,7 @@ impl W_StringIO {
     }
 
     fn pin_self(&self) -> usize {
-        pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
         pyre_object::gc_roots::shadow_stack_len() - 1
     }
 
@@ -187,7 +187,7 @@ impl W_StringIO {
         } else {
             super::call_method_result(this.w_decoder, "decode", &[w_obj, w_bool_from(true)])?
         };
-        pyre_object::gc_roots::pin_root(decoded);
+        let mut decoded = pyre_object::gc_roots::pin_root(decoded);
         let decoded_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let this = Self::from_slot(slot);
         if !this.writenl.is_null() {
@@ -239,7 +239,7 @@ impl W_StringIO {
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let buffer = pyre_object::interp_array::w_array_new(b'w', 4);
-        pyre_object::gc_roots::pin_root(buffer);
+        let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let obj = W_StringIO::allocate_stable(W_StringIO {
             buffer: pyre_object::gc_roots::shadow_stack_get(slot),
@@ -265,7 +265,7 @@ impl W_StringIO {
         } else {
             Self::decode_string(slot, w_initvalue)?
         };
-        pyre_object::gc_roots::pin_root(decoded);
+        let _ = pyre_object::gc_roots::pin_root(decoded);
         let decoded =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         Self::reset_buffer_from(slot, decoded)?;
@@ -279,11 +279,11 @@ impl W_StringIO {
         // interp_stringio.py:264-296.
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let input_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let decoded =
             Self::decode_string(slot, pyre_object::gc_roots::shadow_stack_get(input_slot))?;
-        pyre_object::gc_roots::pin_root(decoded);
+        let decoded = pyre_object::gc_roots::pin_root(decoded);
         let original_size = unsafe {
             pyre_object::w_str_len(pyre_object::gc_roots::shadow_stack_get(input_slot)) as i64
         };
@@ -507,13 +507,13 @@ impl W_StringIO {
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.self_obj());
-        pyre_object::gc_roots::pin_root(self.getvalue()?);
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(self.getvalue()?);
         let own_dict =
             crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(sp));
-        pyre_object::gc_roots::pin_root(own_dict);
+        let own_dict = pyre_object::gc_roots::pin_root(own_dict);
         let copied = super::call_method_result(own_dict, "copy", &[])?;
-        pyre_object::gc_roots::pin_root(copied);
+        let _ = pyre_object::gc_roots::pin_root(copied);
         let this = Self::from_slot(sp);
         let readnl = if unsafe { pyre_object::is_none(this.readnl) } {
             w_none()
@@ -522,9 +522,9 @@ impl W_StringIO {
                 pyre_object::w_str_get_wtf8(this.readnl).to_wtf8_buf()
             })
         };
-        pyre_object::gc_roots::pin_root(readnl);
+        let _ = pyre_object::gc_roots::pin_root(readnl);
         let pos = Self::from_slot(sp).pos;
-        pyre_object::gc_roots::pin_root(w_int_new(pos));
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(pos));
         Ok(w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             pyre_object::gc_roots::shadow_stack_get(sp + 4),
@@ -547,7 +547,7 @@ impl W_StringIO {
             )));
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_state);
+        let _ = pyre_object::gc_roots::pin_root(w_state);
         let slot = self.pin_self();
         let state_slot = slot - 1;
         let state = pyre_object::gc_roots::shadow_stack_get(state_slot);

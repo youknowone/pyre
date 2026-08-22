@@ -6,7 +6,7 @@ use pyre_object::*;
 const VERSION_ATTR: &str = "_filters_version_state";
 
 fn pin_root_slot(value: PyObjectRef) -> usize {
-    pyre_object::gc_roots::pin_root(value);
+    let _ = pyre_object::gc_roots::pin_root(value);
     pyre_object::gc_roots::shadow_stack_len() - 1
 }
 

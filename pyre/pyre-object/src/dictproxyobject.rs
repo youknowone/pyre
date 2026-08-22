@@ -77,7 +77,7 @@ pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
     // it so the young mapping is forwarded on the first minor collection.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_mapping);
+    let _ = crate::gc_roots::pin_root(w_mapping);
     let header = PyObject {
         ob_type: &MAPPING_PROXY_TYPE as *const PyType,
         w_class: get_instantiate(&MAPPING_PROXY_TYPE),

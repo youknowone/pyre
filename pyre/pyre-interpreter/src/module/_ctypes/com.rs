@@ -226,25 +226,25 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let details_base = pyre_object::gc_roots::shadow_stack_len();
     for bstr in [info.description, info.source, info.help_file] {
-        pyre_object::gc_roots::pin_root(bstr_str(bstr));
+        let _ = pyre_object::gc_roots::pin_root(bstr_str(bstr));
     }
-    pyre_object::gc_roots::pin_root(pyre_object::w_int_new(info.help_context as i64));
-    pyre_object::gc_roots::pin_root(prog_id(&info.guid));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(info.help_context as i64));
+    let _ = pyre_object::gc_roots::pin_root(prog_id(&info.guid));
     let details = pyre_object::w_tuple_new(
         (0..5)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(details_base + i))
             .collect(),
     );
     let details_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(details);
+    let _ = pyre_object::gc_roots::pin_root(details);
     let text = match host_ctypes::format_error_message(Some(hresult as u32)) {
         Some(message) => pyre_object::w_str_new(&message),
         None => pyre_object::w_none(),
     };
     let text_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(text);
+    let _ = pyre_object::gc_roots::pin_root(text);
     let hresult_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_int_new(hresult as i64));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(hresult as i64));
     // Without the class there is nothing to raise but the report the id-less
     // form would have given, which is the same status by another name.
     let win32_error = || {
@@ -261,7 +261,7 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
     match crate::call::type_call_instantiate(cls, &args) {
         Ok(instance) => {
             let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(instance);
+            let _ = pyre_object::gc_roots::pin_root(instance);
             let mut error = win32_error();
             error.exc_object = pyre_object::gc_roots::shadow_stack_get(instance_slot);
             error

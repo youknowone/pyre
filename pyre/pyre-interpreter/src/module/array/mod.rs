@@ -192,9 +192,9 @@ fn array_extend_iterable(
     // allocations, so neither address goes stale; what the scope buys is that
     // an unmarked block is not swept out from under the loop.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
-    pyre_object::gc_roots::pin_root(w_iter);
+    let w_iter = pyre_object::gc_roots::pin_root(w_iter);
     loop {
         match crate::baseobjspace::next(w_iter) {
             Ok(w_item) => array_append(obj, w_item)?,
@@ -302,7 +302,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     // Nothing refers to the fresh array yet and every initializer below runs
     // Python.  An array is stable, so the local stays a valid address; the pin
     // is what stops a major cycle sweeping it as unreachable.
-    pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } && !std::ptr::eq(cls, canonical) {
         crate::typedef::tag_subclass_instance(obj, cls);

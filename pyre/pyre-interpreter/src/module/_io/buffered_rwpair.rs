@@ -78,8 +78,8 @@ impl W_BufferedRWPair {
         self.w_writer = PY_NULL;
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_reader);
-        pyre_object::gc_roots::pin_root(w_writer);
+        let _ = pyre_object::gc_roots::pin_root(w_reader);
+        let _ = pyre_object::gc_roots::pin_root(w_writer);
         let input_sp = pyre_object::gc_roots::shadow_stack_len() - 2;
         let reader_size = w_int_new(buffer_size);
         let reader = crate::call::call_function_impl_result(
@@ -89,7 +89,7 @@ impl W_BufferedRWPair {
                 reader_size,
             ],
         )?;
-        pyre_object::gc_roots::pin_root(reader);
+        let _ = pyre_object::gc_roots::pin_root(reader);
         let reader_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let writer_size = w_int_new(buffer_size);
         let writer = crate::call::call_function_impl_result(
@@ -145,7 +145,7 @@ impl W_BufferedRWPair {
             if let Some(mut context) = writer_error {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let context_obj = context.to_exc_object();
-                pyre_object::gc_roots::pin_root(context_obj);
+                let _ = pyre_object::gc_roots::pin_root(context_obj);
                 let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let reader_obj = reader_error.to_exc_object();
                 unsafe {

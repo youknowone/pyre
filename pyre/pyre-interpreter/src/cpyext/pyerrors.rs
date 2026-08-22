@@ -202,9 +202,9 @@ exception_mirrors! {
 fn normalized(w_type: PyObjectRef, w_value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_type);
+    let _ = roots.pin_root(w_type);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_value);
+    let w_value = roots.pin_root(w_value);
     if !w_value.is_null()
         && unsafe { pyre_object::is_exception(w_value) }
         && crate::baseobjspace::isinstance(
@@ -683,7 +683,7 @@ fn set_import_error(
     let import_error = crate::builtins::lookup_exc_class("ImportError")?;
     let roots = pyre_object::gc_roots::push_roots();
     let class_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(class);
+    let class = roots.pin_root(class);
     if !trap(crate::baseobjspace::issubclass(class, import_error))? {
         set_pending_error(crate::PyError::type_error(
             "expected a subclass of ImportError",
@@ -791,12 +791,12 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(instance);
+    let instance = roots.pin_root(instance);
     let Some(w_class) = crate::typedef::r#type(instance) else {
         return;
     };
     let class_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_class.as_ptr());
+    let _ = roots.pin_root(w_class.as_ptr());
     let value_ref = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(instance_slot));
     let type_ref = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(class_slot));
     unsafe {
@@ -965,11 +965,11 @@ pub(super) fn ensure_linked() {
         };
         let roots = pyre_object::gc_roots::push_roots();
         let class_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(class);
+        let _ = roots.pin_root(class);
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(unsafe { pyobject::from_ref(filename) });
+        let _ = roots.pin_root(unsafe { pyobject::from_ref(filename) });
         let second_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(unsafe { pyobject::from_ref(second_filename) });
+        let _ = roots.pin_root(unsafe { pyobject::from_ref(second_filename) });
 
         let mut arguments = vec![
             pyre_object::w_int_new(code as i64),

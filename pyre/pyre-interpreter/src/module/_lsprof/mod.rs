@@ -145,7 +145,7 @@ impl ProfilerSubEntry {
     fn stats(&self, factor: f64) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.frame);
+        let _ = pyre_object::gc_roots::pin_root(self.frame);
         W_StatsSubEntry::allocate_stable(W_StatsSubEntry {
             ob: PyObject::default(),
             frame: pyre_object::gc_roots::shadow_stack_get(frame_slot),
@@ -186,13 +186,13 @@ impl ProfilerEntry {
     fn stats(&self, factor: f64) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.frame);
+        let _ = pyre_object::gc_roots::pin_root(self.frame);
         let w_sublist = if self.calls.is_empty() {
             w_none()
         } else {
             let root_base = pyre_object::gc_roots::shadow_stack_len();
             for subentry in &self.calls {
-                pyre_object::gc_roots::pin_root(subentry.stats(factor));
+                let _ = pyre_object::gc_roots::pin_root(subentry.stats(factor));
             }
             let items = (root_base..pyre_object::gc_roots::shadow_stack_len())
                 .map(pyre_object::gc_roots::shadow_stack_get)
@@ -203,7 +203,7 @@ impl ProfilerEntry {
         // each subentry pinned above sits between them, so `frame_slot + 1` is
         // the first subentry whenever there is one.
         let sublist_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_sublist);
+        let _ = pyre_object::gc_roots::pin_root(w_sublist);
         W_StatsEntry::allocate_stable(W_StatsEntry {
             ob: PyObject::default(),
             frame: pyre_object::gc_roots::shadow_stack_get(frame_slot),
@@ -612,11 +612,11 @@ impl W_Profiler {
     fn enter_builtin_call(&mut self, self_obj: PyObjectRef, w_arg: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self_obj);
-        pyre_object::gc_roots::pin_root(w_arg);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_arg);
         let (w_func, w_type, w_frame) =
             prepare_spec(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
-        pyre_object::gc_roots::pin_root(w_frame);
+        let _ = pyre_object::gc_roots::pin_root(w_frame);
         let this = W_Profiler::from_obj(pyre_object::gc_roots::shadow_stack_get(root_base))
             .expect("profile hook owns a live Profiler");
         if let Some(entry_index) = this.get_or_make_builtin_entry(
@@ -654,7 +654,7 @@ impl W_Profiler {
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         for entry in &self.entries {
             if entry.callcount != 0 {
-                pyre_object::gc_roots::pin_root(entry.stats(factor));
+                let _ = pyre_object::gc_roots::pin_root(entry.stats(factor));
             }
         }
         let items = (root_base..pyre_object::gc_roots::shadow_stack_len())
@@ -705,7 +705,7 @@ mod profiler_methods {
             };
             let _roots = pyre_object::gc_roots::push_roots();
             let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(callable);
+            let _ = pyre_object::gc_roots::pin_root(callable);
             let obj = W_Profiler::allocate_stable(W_Profiler {
                 ob: PyObject::default(),
                 subcalls: subcalls != 0,

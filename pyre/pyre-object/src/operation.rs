@@ -44,8 +44,8 @@ pub struct _CallableIterator {
 /// Allocate a `_CallableIterator` for `iter(callable, sentinel)`.
 pub fn w_callable_iterator_new(callable: PyObjectRef, sentinel: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(callable);
-    crate::gc_roots::pin_root(sentinel);
+    let callable = crate::gc_roots::pin_root(callable);
+    let sentinel = crate::gc_roots::pin_root(sentinel);
     _CallableIterator::allocate_stable(_CallableIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),

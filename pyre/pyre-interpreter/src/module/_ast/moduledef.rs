@@ -157,9 +157,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // of its slot at every use.
         let roots = pyre_object::gc_roots::push_roots();
         let dict_slot = roots.base();
-        roots.pin_root(pyre_object::w_dict_new());
+        let _ = roots.pin_root(pyre_object::w_dict_new());
         let field_types_slot = dict_slot + 1;
-        roots.pin_root(pyre_object::w_dict_new());
+        let _ = roots.pin_root(pyre_object::w_dict_new());
         // The value arrives already built.  Call arguments evaluate left to
         // right, so reading a dict slot inline with an allocating value
         // expression would read the slot first and hand over a pre-move word.
@@ -167,7 +167,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let put = |target_slot: usize, key: &str, value: PyObjectRef| -> crate::PyResult {
             let value_roots = pyre_object::gc_roots::push_roots();
             let value_slot = value_roots.base();
-            value_roots.pin_root(value);
+            let _ = value_roots.pin_root(value);
             let key = pyre_object::w_str_new(key);
             crate::baseobjspace::setitem(roots.get(target_slot), key, value_roots.get(value_slot))
         };

@@ -390,8 +390,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(bases);
-    crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(bases);
+    let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
@@ -408,7 +408,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     } else {
         let name =
             crate::gc_storage::gc_alloc_storage_box(name_value.clone(), name_storage_gc_type_id());
-        crate::gc_roots::pin_root(name as PyObjectRef);
+        let _ = crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
             crate::gc_storage::gc_alloc_storage_box(name_value, name_storage_gc_type_id());
         let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
@@ -539,8 +539,8 @@ pub fn w_type_new_builtin(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(bases);
-    crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(bases);
+    let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
 
     let bases = crate::gc_roots::shadow_stack_get(save_point);
     let dict_ptr = crate::gc_roots::shadow_stack_get(save_point + 1) as *mut u8;
@@ -1192,7 +1192,7 @@ pub unsafe fn w_type_get_bases(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_bases(obj: PyObjectRef, bases: PyObjectRef) {
-    crate::gc_roots::pin_root(bases);
+    let bases = crate::gc_roots::pin_root(bases);
     crate::gc_roots::mark_prebuilt_roots_dirty();
     (*(obj as *mut W_TypeObject)).bases = bases;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);

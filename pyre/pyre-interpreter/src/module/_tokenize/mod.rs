@@ -110,8 +110,8 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
         (this.readline, this.encoding.clone())
     };
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(self_obj);
-    gc_roots::pin_root(readline);
+    let _ = gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(readline);
     let raw = match crate::builtins::call_and_check(
         gc_roots::shadow_stack_get(gc_roots::shadow_stack_len() - 1),
         &[],
@@ -168,7 +168,7 @@ fn prepare_tokens(self_obj: PyObjectRef) {
 
 fn tokenizer_next(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(self_obj);
     let slot = gc_roots::shadow_stack_len() - 1;
     loop {
         let self_obj = gc_roots::shadow_stack_get(slot);
@@ -736,8 +736,8 @@ fn positioned_syntax_error(
         return crate::PyError::syntax_error(message);
     };
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(class);
-    gc_roots::pin_root(w_str_new(message));
+    let _ = gc_roots::pin_root(class);
+    let _ = gc_roots::pin_root(w_str_new(message));
     let base = gc_roots::shadow_stack_len() - 2;
     let exc = match crate::builtins::call_and_check(
         gc_roots::shadow_stack_get(base),
@@ -746,7 +746,7 @@ fn positioned_syntax_error(
         Ok(exc) => exc,
         Err(_) => return crate::PyError::syntax_error(message),
     };
-    gc_roots::pin_root(exc);
+    let _ = gc_roots::pin_root(exc);
     let exc_slot = gc_roots::shadow_stack_len() - 1;
     for (name, value) in [("lineno", line as i64), ("offset", offset as i64)] {
         let value = w_int_new(value);
@@ -866,23 +866,23 @@ fn make_token_tuple(
     let line = line.to_owned();
     let _roots = gc_roots::push_roots();
     let base = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(w_int_new(token_type as i64));
-    gc_roots::pin_root(w_str_new(&text));
-    gc_roots::pin_root(w_int_new(start_line as i64));
-    gc_roots::pin_root(w_int_new(start_col as i64));
-    gc_roots::pin_root(w_int_new(end_line as i64));
-    gc_roots::pin_root(w_int_new(end_col as i64));
-    gc_roots::pin_root(w_str_new(&line));
+    let _ = gc_roots::pin_root(w_int_new(token_type as i64));
+    let _ = gc_roots::pin_root(w_str_new(&text));
+    let _ = gc_roots::pin_root(w_int_new(start_line as i64));
+    let _ = gc_roots::pin_root(w_int_new(start_col as i64));
+    let _ = gc_roots::pin_root(w_int_new(end_line as i64));
+    let _ = gc_roots::pin_root(w_int_new(end_col as i64));
+    let _ = gc_roots::pin_root(w_str_new(&line));
     let start = w_tuple_new(vec![
         gc_roots::shadow_stack_get(base + 2),
         gc_roots::shadow_stack_get(base + 3),
     ]);
-    gc_roots::pin_root(start);
+    let _ = gc_roots::pin_root(start);
     let end = w_tuple_new(vec![
         gc_roots::shadow_stack_get(base + 4),
         gc_roots::shadow_stack_get(base + 5),
     ]);
-    gc_roots::pin_root(end);
+    let _ = gc_roots::pin_root(end);
     w_tuple_new(vec![
         gc_roots::shadow_stack_get(base),
         gc_roots::shadow_stack_get(base + 1),

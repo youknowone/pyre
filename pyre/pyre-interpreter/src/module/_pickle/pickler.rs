@@ -41,7 +41,7 @@ struct PinnedRef {
 impl PinnedRef {
     fn new(value: PyObjectRef, movable: bool) -> Self {
         let slot = if movable {
-            pyre_object::gc_roots::pin_root(value);
+            let _ = pyre_object::gc_roots::pin_root(value);
             Some(pyre_object::gc_roots::shadow_stack_len() - 1)
         } else {
             None
@@ -181,12 +181,12 @@ impl PickleCtx {
 /// `when serializing test.pickletester.REX object`.
 fn pickle_type_name(w_obj: PyObjectRef) -> Result<String, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_type = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
         .ok_or_else(|| PyError::type_error("object has no type"))?
         .as_ptr();
-    pyre_object::gc_roots::pin_root(w_type);
+    let _ = pyre_object::gc_roots::pin_root(w_type);
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_module = crate::baseobjspace::getattr_str(
@@ -220,9 +220,9 @@ fn add_pickle_object_note(
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_exc = err.to_exc_object();
-    pyre_object::gc_roots::pin_root(w_exc);
+    let _ = pyre_object::gc_roots::pin_root(w_exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if let Ok(type_name) = pickle_type_name(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
@@ -230,13 +230,13 @@ fn add_pickle_object_note(
             format!("when serializing {type_name} "),
             role
         ));
-        pyre_object::gc_roots::pin_root(w_note);
+        let _ = pyre_object::gc_roots::pin_root(w_note);
         let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if let Ok(w_add_note) = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
             "add_note",
         ) {
-            pyre_object::gc_roots::pin_root(w_add_note);
+            let _ = pyre_object::gc_roots::pin_root(w_add_note);
             let add_note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // The original exception remains authoritative. A pathological
             // overridden `add_note` must not turn serializer context handling
@@ -332,7 +332,7 @@ impl Framer {
             // Pin the freshly-built bytes and re-read both it and the
             // cached callable from their roots before arbitrary Python.
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_bytes);
+            let _ = pyre_object::gc_roots::pin_root(w_bytes);
             let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if let Some(write_slot) = self.write_slot {
                 call_fn(
@@ -400,7 +400,7 @@ impl Framer {
                 // Pin the freshly-built payload and re-read the cached
                 // callable from its outer root before arbitrary Python.
                 let _roots = pyre_object::gc_roots::push_roots();
-                pyre_object::gc_roots::pin_root(w_payload);
+                let _ = pyre_object::gc_roots::pin_root(w_payload);
                 let payload_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 if let Some(write_slot) = self.write_slot {
                     call_fn(
@@ -464,15 +464,15 @@ impl W_Pickler {
         // `_pickle.c:711-721` BEGIN/END_USING_PICKLER.  In particular,
         // `file.write` lookup and protocol coercion may execute Python.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self as *mut W_Pickler as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(self as *mut W_Pickler as PyObjectRef);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(file);
+        let file = pyre_object::gc_roots::pin_root(file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(protocol);
+        let protocol = pyre_object::gc_roots::pin_root(protocol);
         let protocol_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(fix_imports);
+        let _ = pyre_object::gc_roots::pin_root(fix_imports);
         let fix_imports_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(buffer_callback);
+        let buffer_callback = pyre_object::gc_roots::pin_root(buffer_callback);
         let buffer_callback_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if cur_pickler(self_slot).running {
             return Err(PyError::runtime_error("Pickler object is already used"));
@@ -493,7 +493,7 @@ impl W_Pickler {
         else {
             return Err(PyError::type_error("file must have a 'write' attribute"));
         };
-        pyre_object::gc_roots::pin_root(w_write);
+        let _ = pyre_object::gc_roots::pin_root(w_write);
         let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if !unsafe {
             pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(
@@ -532,7 +532,7 @@ impl W_Pickler {
         // `UnpicklerMemoProxy::clear` already has this shape.
         let self_obj = self as *mut W_Pickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let empty = pyre_object::listobject::w_list_new(Vec::new());
         let me = cur_pickler(slot);
@@ -546,7 +546,7 @@ impl W_Pickler {
         // pickler's active memo/framer state.
         let self_ptr = self as *mut W_Pickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_ptr);
+        let _ = pyre_object::gc_roots::pin_root(self_ptr);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let (
             proto,
@@ -594,17 +594,17 @@ impl W_Pickler {
         // `reducer_override` / `dispatch_table` lookups below: each runs Python
         // (a property / `__getattr__` / `copyreg` import) and can relocate
         // objects under the moving GC.
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_file);
+        let _ = pyre_object::gc_roots::pin_root(w_file);
         let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_write);
+        let _ = pyre_object::gc_roots::pin_root(w_write);
         let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_memo);
+        let _ = pyre_object::gc_roots::pin_root(w_memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(buffer_callback);
+        let _ = pyre_object::gc_roots::pin_root(buffer_callback);
         let cb_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_dispatch_table);
+        let _ = pyre_object::gc_roots::pin_root(w_dispatch_table);
         let configured_dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         // `persistent_id` resolves to a subclass method override or the
@@ -621,14 +621,14 @@ impl W_Pickler {
             "persistent_id",
         )?
         .unwrap_or(pyre_object::PY_NULL);
-        pyre_object::gc_roots::pin_root(pers_func);
+        let _ = pyre_object::gc_roots::pin_root(pers_func);
         let pers_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let reducer_override = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(self_slot),
             "reducer_override",
         )?
         .unwrap_or(pyre_object::PY_NULL);
-        pyre_object::gc_roots::pin_root(reducer_override);
+        let _ = pyre_object::gc_roots::pin_root(reducer_override);
         let reducer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // `interp_pickle.py:686-690` — the internal `dispatch_table` field,
         // else a dynamically-resolved `dispatch_table` attribute (a subclass
@@ -647,7 +647,7 @@ impl W_Pickler {
         } else {
             copyreg_dispatch_table()
         };
-        pyre_object::gc_roots::pin_root(dispatch_table);
+        let _ = pyre_object::gc_roots::pin_root(dispatch_table);
         let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         // Re-read every pinned value: the lookups / `copyreg` import above may
@@ -736,17 +736,17 @@ impl W_Pickler {
             return Ok(self.w_pers_func);
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self as *const W_Pickler as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(self as *const W_Pickler as PyObjectRef);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let cls = type_object();
-        pyre_object::gc_roots::pin_root(cls);
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let descr = crate::runtime_ops::type_dict_lookup(
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
             "__persistent_id_default",
         )
         .ok_or_else(|| PyError::runtime_error("lost Pickler.persistent_id descriptor"))?;
-        pyre_object::gc_roots::pin_root(descr);
+        let _ = pyre_object::gc_roots::pin_root(descr);
         let descr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         Ok(pyre_object::w_method_new(
             pyre_object::gc_roots::shadow_stack_get(descr_slot),
@@ -772,7 +772,7 @@ impl W_Pickler {
     fn memo(&self) -> PyObjectRef {
         let self_obj = self as *const W_Pickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
         let proxy = PicklerMemoProxy::allocate_stable(PicklerMemoProxy {
@@ -804,7 +804,7 @@ impl W_Pickler {
     fn set_memo(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
         let self_obj = self as *mut W_Pickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_dict = if PicklerMemoProxy::from_obj(w_value).is_some() {
             call_meth(w_value, "copy", &[])?
@@ -816,7 +816,7 @@ impl W_Pickler {
                 crate::baseobjspace::object_functionstr_type_name(w_value),
             )));
         };
-        pyre_object::gc_roots::pin_root(w_dict);
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // No GC between reading the items and `w_list_new` (which re-pins them).
         let items = unsafe {
@@ -891,10 +891,10 @@ mod memo_proxy {
         fn copy(&self) -> Result<PyObjectRef, PyError> {
             let w_memo = unsafe { &*(self.w_pickler as *const W_Pickler) }.w_memo;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_memo);
+            let _ = pyre_object::gc_roots::pin_root(w_memo);
             let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let result = pyre_object::dictmultiobject::w_dict_new();
-            pyre_object::gc_roots::pin_root(result);
+            let _ = pyre_object::gc_roots::pin_root(result);
             let res_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let n = unsafe {
                 pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
@@ -922,7 +922,7 @@ mod memo_proxy {
                     pyre_object::w_int_new(i as i64),
                     obj,
                 ]);
-                pyre_object::gc_roots::pin_root(tup);
+                let _ = pyre_object::gc_roots::pin_root(tup);
                 let tup_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 // id(obj) read from the (relocated) tuple element.
                 let cur_obj = unsafe {
@@ -933,7 +933,7 @@ mod memo_proxy {
                 }
                 .unwrap();
                 let key = pyre_object::w_int_new(cur_obj as i64);
-                pyre_object::gc_roots::pin_root(key);
+                let _ = pyre_object::gc_roots::pin_root(key);
                 let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 // The IndexMap insert allocates via `std::alloc` (no collection), so
                 // the freshly read addresses stay valid through it.
@@ -952,7 +952,7 @@ mod memo_proxy {
         fn clear(&self) {
             let w_pickler = self.w_pickler;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_pickler);
+            let _ = pyre_object::gc_roots::pin_root(w_pickler);
             let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let empty = pyre_object::listobject::w_list_new(Vec::new());
             let p =
@@ -1057,7 +1057,7 @@ fn pickle_core_impl(
     reducer_override: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let pers_func = PinnedRef::new(pers_func, !pers_func.is_null());
     let buffer_callback = PinnedRef::new(
         buffer_callback,
@@ -1070,7 +1070,7 @@ fn pickle_core_impl(
     let reducer_override = PinnedRef::new(reducer_override, !reducer_override.is_null());
     // Pin the memo list and index its existing entries (a reused `Pickler`
     // carries memo state across `dump` calls until `clear_memo`).
-    pyre_object::gc_roots::pin_root(w_memo);
+    let w_memo = pyre_object::gc_roots::pin_root(w_memo);
     let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
     let n = unsafe { pyre_object::listobject::w_list_len(w_memo) };
@@ -1106,13 +1106,13 @@ fn pickle_core_impl(
     let file_slot = if w_file.is_null() {
         None
     } else {
-        pyre_object::gc_roots::pin_root(w_file);
+        let _ = pyre_object::gc_roots::pin_root(w_file);
         Some(pyre_object::gc_roots::shadow_stack_len() - 1)
     };
     let write_slot = if w_write.is_null() {
         None
     } else {
-        pyre_object::gc_roots::pin_root(w_write);
+        let _ = pyre_object::gc_roots::pin_root(w_write);
         Some(pyre_object::gc_roots::shadow_stack_len() - 1)
     };
     let mut fr = Framer::new(file_slot, write_slot);
@@ -1206,7 +1206,7 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     // Committing streams to the file (arbitrary Python), and the `persistent_id`
     // hook below is too, so pin `w_obj` across both and read it from the pin.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     buf.commit_frame(false)?;
     let pers_func = ctx.pers_func.get();
@@ -1337,7 +1337,7 @@ fn dispatch_save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> R
     let reducer_override = ctx.reducer_override.get();
     if !reducer_override.is_null() {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_rv = call_fn(
             reducer_override,
@@ -1371,7 +1371,7 @@ fn save_global_or_reduce(
     // two consumers that sit after one of those calls.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     // CPython 3.14 pickle.py dispatch[type] = save_type: only a class whose
     // exact metaclass is `type` takes this built-in dispatch entry. A class
     // with a custom metaclass must consult dispatch_table first.
@@ -1406,7 +1406,7 @@ fn save_global_or_reduce(
         Some(reduce_ex) => {
             // A bound method the lookup minted has no other referrer, and
             // boxing the protocol number allocates before the call reaches it.
-            pyre_object::gc_roots::pin_root(reduce_ex);
+            let reduce_ex = pyre_object::gc_roots::pin_root(reduce_ex);
             call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?
         }
         None => match crate::baseobjspace::findattr_result(
@@ -1442,13 +1442,13 @@ fn save_type(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
     };
 
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_type = builtin_attr("type")?;
-    pyre_object::gc_roots::pin_root(w_type);
+    let _ = pyre_object::gc_roots::pin_root(w_type);
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_args = pyre_object::tupleobject::w_tuple_new(vec![singleton]);
-    pyre_object::gc_roots::pin_root(w_args);
+    let _ = pyre_object::gc_roots::pin_root(w_args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     save_reduce(
         ctx,
@@ -1471,9 +1471,9 @@ fn save_reduce_value(
     w_rv: PyObjectRef,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_rv);
+    let _ = pyre_object::gc_roots::pin_root(w_rv);
     let rv_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_rv = pyre_object::gc_roots::shadow_stack_get(rv_slot);
@@ -1553,15 +1553,15 @@ fn dispatch_table_reduce(
     let type_fn = crate::module::_pickle::lookup_builtin("type")
         .ok_or_else(|| pickling_error("type builtin unavailable"))?;
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(dt);
+    let _ = pyre_object::gc_roots::pin_root(dt);
     let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_type = call_fn(
         type_fn,
         &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
     )?;
-    pyre_object::gc_roots::pin_root(w_type);
+    let _ = pyre_object::gc_roots::pin_root(w_type);
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let dt = pyre_object::gc_roots::shadow_stack_get(dt_slot);
     let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
@@ -1692,7 +1692,7 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
     // so the trailing `memoize` reads it at its post-write address.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if n <= 0xff {
         buf.push(op::SHORT_BINBYTES);
@@ -1719,7 +1719,7 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
     // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
     // so the trailing `memoize` reads it at its post-write address.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if ctx.bin {
         // The binary opcodes carry the string's `surrogatepass` UTF-8, which is
@@ -1793,7 +1793,7 @@ fn save_tuple(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     // re-read each one (and the tuple itself for the memo) from the
     // GC-walked tuple right before it is used.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let elem = |i: usize| unsafe {
         pyre_object::tupleobject::w_tuple_getitem(
@@ -1862,7 +1862,7 @@ fn save_list(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
     // The list itself is a GC-walked Python `list`; pin it and append by
     // re-reading each element, so a relocation during a recursive save is
     // observed instead of dereferencing a stale snapshot.
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let fast_token = fast_save_enter(ctx, slot)?;
     if ctx.bin {
@@ -1883,7 +1883,7 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
     // Pin the dict so `memoize` sees its current address. PyPy passes the live
     // `dict.items()` view to `_batch_setitems`; retaining that iterator shape
     // is what detects mutation from a persistent-id callback.
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let fast_token = fast_save_enter(ctx, dict_slot)?;
     if ctx.bin {
@@ -1898,7 +1898,7 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
         "items",
         &[],
     )?;
-    pyre_object::gc_roots::pin_root(w_items);
+    let _ = pyre_object::gc_roots::pin_root(w_items);
     let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let result = batch_setitems(ctx, buf, items_slot, Some(dict_slot));
     fast_save_leave(ctx, fast_token, dict_slot);
@@ -1922,7 +1922,7 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
     // members into a pinned Python `list` re-read per save (a recursive save
     // can relocate them).
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let set_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let fast_token = fast_save_enter(ctx, set_slot)?;
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(set_slot));
@@ -2005,7 +2005,7 @@ fn save_frozenset(
     // re-read per save (a recursive save can relocate them); the frozenset
     // itself is re-read for the memo check after the saves.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let fs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let items = unsafe {
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(fs_slot))
@@ -2057,7 +2057,7 @@ fn save_bytearray(
     // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
     // so the trailing `memoize` reads it at its post-write address.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BYTEARRAY8];
@@ -2116,7 +2116,7 @@ fn save_picklebuffer(
         // `_save_bytearray_data`), so a repeated reference becomes a GET. A
         // large payload streams via `file.write`; pin `w_obj` for the memoize.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if readonly {
             save_raw_bytes(ctx, buf, &data)?;
@@ -2182,7 +2182,7 @@ fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) -> Result<(), PyError> {
 /// element even after the recursive `save` calls below trigger collections.
 fn pin_items(items: Vec<PyObjectRef>) -> usize {
     let w_list = pyre_object::listobject::w_list_new(items);
-    pyre_object::gc_roots::pin_root(w_list);
+    let _ = pyre_object::gc_roots::pin_root(w_list);
     pyre_object::gc_roots::shadow_stack_len() - 1
 }
 
@@ -2206,7 +2206,7 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
     match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
         Ok(item) => {
-            pyre_object::gc_roots::pin_root(item);
+            let _ = pyre_object::gc_roots::pin_root(item);
             Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1))
         }
         Err(e) if e.matches_stop_iteration() => Ok(None),
@@ -2222,7 +2222,7 @@ fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
 fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
     let snapshot_slot = pin_items(Vec::new());
     let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(source_slot))?;
-    pyre_object::gc_roots::pin_root(w_iter);
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
         let item =
@@ -2233,7 +2233,7 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
             };
         {
             let _item_root = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(item);
+            let _ = pyre_object::gc_roots::pin_root(item);
             let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             unsafe {
                 pyre_object::listobject::w_list_append(
@@ -2278,7 +2278,7 @@ fn batch_appends(
     }
 
     let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
-    pyre_object::gc_roots::pin_root(w_iter);
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut index = 0usize;
 
@@ -2356,7 +2356,7 @@ fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
         Err(e) if e.matches_stop_iteration() => return Ok(None),
         Err(e) => return Err(e),
     };
-    pyre_object::gc_roots::pin_root(item);
+    let _ = pyre_object::gc_roots::pin_root(item);
     let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
     if !unsafe { pyre_object::is_tuple(item) }
@@ -2411,7 +2411,7 @@ fn batch_setitems(
     obj_slot: Option<usize>,
 ) -> Result<(), PyError> {
     let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(slot))?;
-    pyre_object::gc_roots::pin_root(w_iter);
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if !ctx.bin {
@@ -2519,7 +2519,7 @@ fn pickling_error_with_context(
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_context = context.to_exc_object();
-    pyre_object::gc_roots::pin_root(w_context);
+    let _ = pyre_object::gc_roots::pin_root(w_context);
     let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut error = pickling_error(message);
     let w_error = error.to_exc_object();
@@ -2549,7 +2549,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     // in between runs arbitrary Python; keep the object in a shadow-stack slot
     // so a relocation cannot leave those reads holding a stale address.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if name.split('.').any(|s| s == "<locals>") {
         let obj_repr = unsafe {
@@ -2583,9 +2583,10 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
         Some(ModuleName::Utf8(mn)) => mn,
         Some(ModuleName::Surrogate(w_module_name)) => {
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let _ =
+                pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            pyre_object::gc_roots::pin_root(w_module_name);
+            let _ = pyre_object::gc_roots::pin_root(w_module_name);
             let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let modules = crate::importing::sys_modules_dict();
             let module = unsafe {
@@ -2627,7 +2628,9 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                 // name as an owned String — GC-independent), then scan via the
                 // pinned slots. The snapshot loop itself triggers no collection.
                 let _roots = pyre_object::gc_roots::push_roots();
-                pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+                    obj_slot,
+                ));
                 let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let mut candidates: Vec<(String, usize)> = Vec::new();
                 for (w_modname, w_module) in
@@ -2643,7 +2646,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                     if modname == "__main__" || modname == "__mp_main__" {
                         continue;
                     }
-                    pyre_object::gc_roots::pin_root(w_module);
+                    let _ = pyre_object::gc_roots::pin_root(w_module);
                     candidates.push((modname, pyre_object::gc_roots::shadow_stack_len() - 1));
                 }
                 for (modname, mod_slot) in candidates {
@@ -2746,9 +2749,9 @@ fn save_global(
     // `whichmodule` imports the home module (to verify the reference), so pin
     // `w_obj` / `w_name` and re-read them afterwards.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_name);
+    let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
@@ -2764,7 +2767,7 @@ fn save_global(
     let module_name = match module_name {
         ModuleName::Utf8(module_name) => module_name,
         ModuleName::Surrogate(w_module_name) => {
-            pyre_object::gc_roots::pin_root(w_module_name);
+            let _ = pyre_object::gc_roots::pin_root(w_module_name);
             let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             return save_global_surrogate_module(ctx, buf, obj_slot, name_slot, module_slot);
         }
@@ -2875,7 +2878,7 @@ fn save_global_surrogate_name(
         }
         _ => pyre_object::w_str_new("__main__"),
     };
-    pyre_object::gc_roots::pin_root(w_module_name);
+    let _ = pyre_object::gc_roots::pin_root(w_module_name);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let module_name = unsafe {
         pyre_object::unicodeobject::w_str_get_value_opt(pyre_object::gc_roots::shadow_stack_get(
@@ -2953,10 +2956,10 @@ fn identifier_encoding_error(
     proto: i64,
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_identifier);
+    let _ = pyre_object::gc_roots::pin_root(w_identifier);
     let identifier_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let context_obj = context.to_exc_object();
-    pyre_object::gc_roots::pin_root(context_obj);
+    let _ = pyre_object::gc_roots::pin_root(context_obj);
     let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let identifier_repr = unsafe {
         crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(identifier_slot))
@@ -2968,7 +2971,7 @@ fn identifier_encoding_error(
         format!(" using pickle protocol {proto}")
     ));
     let exc = error.to_exc_object();
-    pyre_object::gc_roots::pin_root(exc);
+    let _ = pyre_object::gc_roots::pin_root(exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     crate::error::chain_context(
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -2994,10 +2997,10 @@ fn save_toplevel_by_name(
     let encoding = if ctx.proto < 3 { "ascii" } else { "utf-8" };
     let _roots = pyre_object::gc_roots::push_roots();
     let w_module_name = pyre_object::w_str_new(&module_name);
-    pyre_object::gc_roots::pin_root(w_module_name);
+    let _ = pyre_object::gc_roots::pin_root(w_module_name);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_name = pyre_object::w_str_new(&name);
-    pyre_object::gc_roots::pin_root(w_name);
+    let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let module_bytes = crate::type_methods::encode_object(
         pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -3091,7 +3094,7 @@ fn save_reduce(
     // stub into the slot and every later read of it would return the stub.
     let w_obj_slot = match w_obj_opt {
         Some(o) => {
-            pyre_object::gc_roots::pin_root(o);
+            let _ = pyre_object::gc_roots::pin_root(o);
             Some(pyre_object::gc_roots::shadow_stack_len() - 1)
         }
         None => None,
@@ -3148,7 +3151,7 @@ fn save_reduce(
     let func_name = func_name_str(rv_get(0))?;
 
     // Pin the args tuple; its elements are re-read per save.
-    pyre_object::gc_roots::pin_root(rv_get(1));
+    let _ = pyre_object::gc_roots::pin_root(rv_get(1));
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let args_get = |i: usize| unsafe {
         pyre_object::tupleobject::w_tuple_getitem(
@@ -3190,7 +3193,7 @@ fn save_reduce(
                 "__class__",
             )?;
             if !crate::baseobjspace::is_w(args_get(0), w_class) {
-                pyre_object::gc_roots::pin_root(w_class);
+                let _ = pyre_object::gc_roots::pin_root(w_class);
                 let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let cls_repr = unsafe { crate::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
@@ -3248,7 +3251,7 @@ fn save_reduce(
             // inside the partial is observable in both reconstruction and
             // the nested PEP 678 notes emitted while the partial is saved.
             let w_new = crate::baseobjspace::getattr_str(args_get(0), "__new__")?;
-            pyre_object::gc_roots::pin_root(w_new);
+            let _ = pyre_object::gc_roots::pin_root(w_new);
             let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
             let functools = import_module("functools")?;
@@ -3284,7 +3287,7 @@ fn save_reduce(
                 &partial_args,
                 &kwargs,
             )?;
-            pyre_object::gc_roots::pin_root(w_func);
+            let _ = pyre_object::gc_roots::pin_root(w_func);
             let func_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if let Err(err) = save(ctx, buf, pyre_object::gc_roots::shadow_stack_get(func_slot)) {
                 return Err(add_reduce_note(
@@ -3314,7 +3317,7 @@ fn save_reduce(
                 "__class__",
             )?;
             if !crate::baseobjspace::is_w(args_get(0), w_class) {
-                pyre_object::gc_roots::pin_root(w_class);
+                let _ = pyre_object::gc_roots::pin_root(w_class);
                 let class_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let cls_repr = unsafe { crate::display::py_repr_wtf8(args_get(0))? };
                 let obj_class_repr = unsafe {
@@ -3332,7 +3335,7 @@ fn save_reduce(
         }
         let w_newargs =
             pyre_object::tupleobject::w_tuple_new((1..args_len).map(&args_get).collect());
-        pyre_object::gc_roots::pin_root(w_newargs);
+        let _ = pyre_object::gc_roots::pin_root(w_newargs);
         let newargs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if let Err(err) = save(ctx, buf, args_get(0)) {
             return Err(add_reduce_note(
@@ -3382,12 +3385,12 @@ fn save_reduce(
     }
 
     if has_listitems {
-        pyre_object::gc_roots::pin_root(rv_get(3));
+        let _ = pyre_object::gc_roots::pin_root(rv_get(3));
         let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         batch_appends(ctx, buf, items_slot, w_obj_slot)?;
     }
     if has_dictitems {
-        pyre_object::gc_roots::pin_root(rv_get(4));
+        let _ = pyre_object::gc_roots::pin_root(rv_get(4));
         let pairs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         batch_setitems(ctx, buf, pairs_slot, w_obj_slot)?;
     }

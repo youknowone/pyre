@@ -455,7 +455,7 @@ pub unsafe fn w_gc_weakref_box_retarget(obj: PyObjectRef, target: PyObjectRef) -
     // livevar explicitly: `w_weakref_new` may collect and relocate the box.
     let _roots = crate::gc_roots::push_roots();
     let box_root = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
+    let _ = crate::gc_roots::pin_root(obj);
     let rooted_obj = crate::gc_roots::shadow_stack_get(box_root);
     if !unsafe { is_gc_weakref_box(rooted_obj) } {
         return false;

@@ -177,7 +177,7 @@ pub fn w_pytraceback_new(
         // The fresh block is a root before `get_instantiate` below can enter
         // an allocation of its own, matching `FrameBox::new`'s pin of its own
         // result.  The block is non-moving, so `raw` stays the address.
-        pyre_object::gc_roots::pin_root(raw as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(raw as PyObjectRef);
     }
 
     // Every input is read back through the bracket's own cell rather than

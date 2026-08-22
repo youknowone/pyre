@@ -461,7 +461,7 @@ fn allocate_ssl_socket(
         owner,
         server_hostname,
     ] {
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
     let first = pyre_object::gc_roots::shadow_stack_len() - SLOT_COUNT;
     for slot in [SOCKET_SLOT, OWNER_SLOT] {
@@ -507,7 +507,7 @@ fn allocate_ssl_session(backend: *mut pyre_native::ssl::NativeSession) -> PyObje
 fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
     let _ = certificate_methods::type_object();
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&der));
+    let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&der));
     let der_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     W_Certificate::allocate_stable(W_Certificate {
         ob: PyObject {
@@ -546,7 +546,7 @@ mod context_methods {
         backend: *mut pyre_native::ssl::Context,
     ) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(cls);
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let obj = W_SSLContext::allocate_stable(W_SSLContext {
             ob: PyObject {
@@ -1343,7 +1343,7 @@ mod memory_bio_methods {
             }
             crate::typedef::check_user_subclass(type_object(), cls)?;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(cls);
+            let _ = pyre_object::gc_roots::pin_root(cls);
             let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let obj = W_MemoryBIO::allocate_stable(W_MemoryBIO {
                 ob: PyObject {
@@ -2483,7 +2483,7 @@ mod cert_store {
             }
             match convert(&*context) {
                 Ok(item) => {
-                    pyre_object::gc_roots::pin_root(item);
+                    let _ = pyre_object::gc_roots::pin_root(item);
                     count += 1;
                 }
                 Err(error) => {
@@ -2547,9 +2547,10 @@ mod cert_store {
                     // the tuple that consumes them roots them itself.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let trust_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(trust.unwrap_or_else(|| w_bool_from(true)));
+                    let _ =
+                        pyre_object::gc_roots::pin_root(trust.unwrap_or_else(|| w_bool_from(true)));
                     let cert_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(w_bytes_from_bytes(
+                    let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(
                         std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize),
                     ));
                     let encoding = encoding_type(cert.dwCertEncodingType);
@@ -2571,10 +2572,9 @@ mod cert_store {
                 // The CRL bytes are live across the encoding value's allocation.
                 let _roots = pyre_object::gc_roots::push_roots();
                 let crl_slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(w_bytes_from_bytes(std::slice::from_raw_parts(
-                    crl.pbCrlEncoded,
-                    crl.cbCrlEncoded as usize,
-                )));
+                let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(
+                    std::slice::from_raw_parts(crl.pbCrlEncoded, crl.cbCrlEncoded as usize),
+                ));
                 let encoding = encoding_type(crl.dwCertEncodingType);
                 Ok(w_tuple_new(vec![
                     pyre_object::gc_roots::shadow_stack_get(crl_slot),

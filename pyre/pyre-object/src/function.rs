@@ -48,9 +48,9 @@ pub fn w_method_new(
     // young members survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_function);
-    crate::gc_roots::pin_root(w_self);
-    crate::gc_roots::pin_root(w_class);
+    let _ = crate::gc_roots::pin_root(w_function);
+    let _ = crate::gc_roots::pin_root(w_self);
+    let _ = crate::gc_roots::pin_root(w_class);
     let header = PyObject {
         ob_type: &METHOD_TYPE as *const PyType,
         w_class: get_instantiate(&METHOD_TYPE),
@@ -204,8 +204,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(func);
-
+    let _ = crate::gc_roots::pin_root(func);
     let header = PyObject {
         ob_type: &STATICMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&STATICMETHOD_TYPE),
@@ -390,8 +389,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(func);
-
+    let _ = crate::gc_roots::pin_root(func);
     let header = PyObject {
         ob_type: &CLASSMETHOD_TYPE as *const PyType,
         w_class: get_instantiate(&CLASSMETHOD_TYPE),

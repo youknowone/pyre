@@ -386,8 +386,8 @@ impl W_PickleBuffer {
         }
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.w_obj);
-        pyre_object::gc_roots::pin_root(self.w_release_exporter);
+        let _ = pyre_object::gc_roots::pin_root(self.w_obj);
+        let _ = pyre_object::gc_roots::pin_root(self.w_release_exporter);
         let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         if self.export_active {
             self.export_active = false;
@@ -494,13 +494,13 @@ fn acquire_pickle_buffer(obj: PyObjectRef) -> Result<(PyObjectRef, bool, PyObjec
 
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
             crate::baseobjspace::BUF_FULL_RO as i64,
         ));
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
         if let Some(w_impl) = crate::baseobjspace::lookup(r_obj, "__buffer__") {
-            pyre_object::gc_roots::pin_root(w_impl);
+            let _ = pyre_object::gc_roots::pin_root(w_impl);
             let w_type = crate::typedef::r#type(r_obj).map_or(r_obj, |p| p.as_ptr());
             let w_result = crate::baseobjspace::get_and_call_function(
                 pyre_object::gc_roots::shadow_stack_get(sp + 2),

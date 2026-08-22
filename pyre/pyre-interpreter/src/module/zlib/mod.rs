@@ -201,7 +201,7 @@ static ZDECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLoc
 /// those PyPy type names and add only the observable namespace entry.
 fn publish_cpython_module(ns: PyObjectRef) {
     let roots = pyre_object::gc_roots::push_roots();
-    roots.pin_root(ns);
+    let _ = roots.pin_root(ns);
     let slot = roots.base();
     let module = pyre_object::w_str_new("zlib");
     unsafe {
@@ -406,7 +406,7 @@ fn allocate_compress(
 ) -> Result<PyObjectRef, crate::PyError> {
     let backend = Box::into_raw(Box::new(Mutex::new(backend)));
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(cls);
+    let _ = gc_roots::pin_root(cls);
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_Compress::allocate_stable(W_Compress {
         ob: PyObject::default(),
@@ -664,7 +664,7 @@ fn allocate_decompress(
 ) -> Result<PyObjectRef, crate::PyError> {
     let backend = Box::into_raw(Box::new(Mutex::new(backend)));
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(cls);
+    let _ = gc_roots::pin_root(cls);
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_Decompress::allocate_stable(W_Decompress {
         ob: PyObject::default(),
@@ -733,7 +733,7 @@ fn allocate_zdecompress(
 ) -> Result<PyObjectRef, crate::PyError> {
     let backend = Box::into_raw(Box::new(Mutex::new(backend)));
     let _roots = gc_roots::push_roots();
-    gc_roots::pin_root(cls);
+    let _ = gc_roots::pin_root(cls);
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_ZlibDecompressor::allocate_stable(W_ZlibDecompressor {
         ob: PyObject::default(),

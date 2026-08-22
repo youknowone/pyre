@@ -87,8 +87,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     // `is_in_nursery` filter in the walker (`majit-gc/src/collector.rs`)
     // keeps the built-in static `PyType` case (e.g. `INT_TYPE`) untouched.
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_type);
-
+    let w_type = crate::gc_roots::pin_root(w_type);
     let obj = alloc_instance_object(W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,

@@ -6811,8 +6811,8 @@ fn drive_unpack_iterable_trace(
         // scope guard truncates both entries on the way out; `pin_root` without
         // one grows `ln`'s shadow stack by two per jd1 crossing.
         let _enter_roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_iterator);
-        pyre_object::gc_roots::pin_root(items);
+        let _ = pyre_object::gc_roots::pin_root(w_iterator);
+        let items = pyre_object::gc_roots::pin_root(items);
         let before = unsafe { pyre_object::listobject::w_list_len(items) };
         // A drain-time error that is not the loop-exit StopIteration has to
         // travel out of the unpack; `ln` cannot re-derive it, because calling

@@ -130,7 +130,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     let data = unsafe { std::slice::from_raw_parts(pointer as *const u8, length) }.to_vec();
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+    let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&data));
     let refcnt = unsafe { (*raw).ob_refcnt };
     pyobject::link_allocated(
         pyre_object::gc_roots::shadow_stack_get(slot),
@@ -351,7 +351,7 @@ pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
         }
     };
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(iterator);
+    let _ = roots.pin_root(iterator);
     let mut data = Vec::new();
     loop {
         let item =
@@ -464,9 +464,9 @@ fn concatenated(left: PyObjectRef, right: PyObjectRef) -> Result<PyObjectRef, cr
         || crate::PyError::type_error(format!("can't concat {right_name} to {left_name}"));
     let roots = pyre_object::gc_roots::push_roots();
     let left_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(left);
+    let _ = roots.pin_root(left);
     let right_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(right);
+    let _ = roots.pin_root(right);
     let Some(tail) = concat_bytes(pyre_object::gc_roots::shadow_stack_get(right_slot))? else {
         return Err(refusal());
     };

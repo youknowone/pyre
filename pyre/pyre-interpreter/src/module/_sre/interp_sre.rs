@@ -798,7 +798,7 @@ struct RootedObject(usize);
 impl RootedObject {
     fn pin(obj: PyObjectRef) -> Self {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         Self(slot)
     }
 
@@ -1425,7 +1425,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                         "sub: replacement must be bytes-like or callable",
                     ));
                 };
-                pyre_object::gc_roots::pin_root(w_bytes);
+                let w_bytes = pyre_object::gc_roots::pin_root(w_bytes);
                 (
                     unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) },
                     true,

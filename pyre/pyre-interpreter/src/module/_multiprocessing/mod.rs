@@ -84,14 +84,14 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
     let boxed_slot = obj_slot + 1;
-    pyre_object::gc_roots::pin_root(w_int_new(value));
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(value));
     let dict =
         crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     if dict.is_null() {
         return;
     }
     let dict_slot = boxed_slot + 1;
-    pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(dict);
     unsafe {
         w_dict_setitem_str(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -575,7 +575,7 @@ fn semlock_instance(
     let obj = w_instance_new(w_subtype);
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     // `getdict_native` materialises the instance dict, so it can collect and
     // move `obj`; read the receiver back from its slot the way every store
     // below does, rather than handing over the pre-pin copy.
@@ -586,7 +586,7 @@ fn semlock_instance(
             "SemLock instance has no storage",
         ));
     }
-    pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(dict);
     macro_rules! store {
         ($name:literal, $value:expr) => {{
             let value = $value;

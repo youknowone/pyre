@@ -274,7 +274,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     // so no kind that moves reaches `key_items`.
     let _roots = pyre_object::gc_roots::push_roots();
     let subject_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(subject);
+    let _ = pyre_object::gc_roots::pin_root(subject);
     // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
     // before it binds anything; track keys already looked up and raise on
     // a duplicate. Each key is looked up with `map.get(key, sentinel)`
@@ -284,11 +284,11 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     // `object()` (match_keys `dummy = object()`), so a value present in the
     // subject can never be mistaken for the absent marker.
     let seen_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_set_new());
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_set_new());
     let sentinel_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(crate::typedef::gettypeobject(
-        &pyre_object::pyobject::INSTANCE_TYPE,
-    )));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(
+        crate::typedef::gettypeobject(&pyre_object::pyobject::INSTANCE_TYPE),
+    ));
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut value_count = 0usize;
     let mut all_match = true;
@@ -320,7 +320,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
             all_match = false;
             break;
         }
-        pyre_object::gc_roots::pin_root(w_value);
+        let _ = pyre_object::gc_roots::pin_root(w_value);
         value_count += 1;
     }
     Ok(if all_match {
@@ -357,9 +357,9 @@ pub fn match_class_value(
     // makes the collector walk it, so its name slots are forwarded too.
     let roots = pyre_object::gc_roots::push_roots();
     let subject_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(subject);
+    let _ = roots.pin_root(subject);
     let kwd_attrs_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(kwd_attrs);
+    let _ = roots.pin_root(kwd_attrs);
     let subject = || roots.get(subject_slot);
     let kwd_attrs = || roots.get(kwd_attrs_slot);
 
@@ -429,7 +429,7 @@ pub fn match_class_value(
                 match crate::baseobjspace::getattr_str(subject(), attr_name) {
                     Ok(v) => {
                         extracted.push(pyre_object::gc_roots::shadow_stack_len());
-                        roots.pin_root(v);
+                        let _ = roots.pin_root(v);
                     }
                     Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                         return Ok(pyre_object::w_none());
@@ -473,7 +473,7 @@ pub fn match_class_value(
         match crate::baseobjspace::getattr_str(subject(), name) {
             Ok(v) => {
                 extracted.push(pyre_object::gc_roots::shadow_stack_len());
-                roots.pin_root(v);
+                let _ = roots.pin_root(v);
             }
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 return Ok(pyre_object::w_none());
@@ -582,8 +582,8 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             // digest keys the store, so the element is hashed once.
             let _roots = pyre_object::gc_roots::push_roots();
             let sp = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(set);
-            pyre_object::gc_roots::pin_root(value);
+            let _ = pyre_object::gc_roots::pin_root(set);
+            let value = pyre_object::gc_roots::pin_root(value);
             let hash = crate::builtins::try_hash_value(value).map_err(|err| {
                 crate::baseobjspace::wrap_set_element_hash_error(
                     pyre_object::gc_roots::shadow_stack_get(sp + 1),
@@ -616,10 +616,10 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
             let items = crate::builtins::collect_iterable(iterable)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let sp = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(set);
+            let set = pyre_object::gc_roots::pin_root(set);
             let item_base = sp + 1;
             for item in items {
-                pyre_object::gc_roots::pin_root(item);
+                let _ = pyre_object::gc_roots::pin_root(item);
             }
             let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
             for i in 0..item_len {
@@ -666,9 +666,9 @@ pub fn map_add_value(
         // `set_add_value`.
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(dict);
-        pyre_object::gc_roots::pin_root(key);
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        let key = pyre_object::gc_roots::pin_root(key);
+        let _ = pyre_object::gc_roots::pin_root(value);
         let hash = crate::builtins::try_hash_value(key)
             .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
         let dict = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -694,7 +694,7 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             // its own loop for the same reason.
             let _roots = pyre_object::gc_roots::push_roots();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(dict);
+            let _ = pyre_object::gc_roots::pin_root(dict);
             let entries = pyre_object::w_dict_items(source);
             let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
             let pair_base = pyre_object::gc_roots::pin_roots(&flat);
@@ -731,11 +731,11 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
         // move them.
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(dict);
-        pyre_object::gc_roots::pin_root(source);
+        let dict = pyre_object::gc_roots::pin_root(dict);
+        let source = pyre_object::gc_roots::pin_root(source);
         let key_base = sp + 2;
         for key in keys {
-            pyre_object::gc_roots::pin_root(key);
+            let _ = pyre_object::gc_roots::pin_root(key);
         }
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
         for i in 0..key_len {
@@ -744,7 +744,7 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             let val = crate::baseobjspace::getitem(source, key)?;
             let _val_root = pyre_object::gc_roots::push_roots();
             let val_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(val);
+            let _ = pyre_object::gc_roots::pin_root(val);
             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
             let hash = crate::builtins::try_hash_value(key)
                 .map_err(|err| crate::baseobjspace::wrap_dict_key_hash_error(key, err))?;
@@ -778,9 +778,9 @@ pub fn dict_merge_value(
     // above brackets the same walk.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(dict);
-    pyre_object::gc_roots::pin_root(source);
-    pyre_object::gc_roots::pin_root(w_callable);
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(source);
+    let _ = pyre_object::gc_roots::pin_root(w_callable);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
@@ -820,8 +820,8 @@ pub fn dict_merge_value(
             let items = unsafe { pyre_object::w_dict_items(source()) };
             let items_base = pyre_object::gc_roots::shadow_stack_len();
             for &(k, v) in &items {
-                pyre_object::gc_roots::pin_root(k);
-                pyre_object::gc_roots::pin_root(v);
+                let _ = pyre_object::gc_roots::pin_root(k);
+                let _ = pyre_object::gc_roots::pin_root(v);
             }
             for index in 0..items.len() {
                 unsafe {
@@ -853,18 +853,18 @@ pub fn dict_merge_value(
         Err(e) => return Err(e),
     };
     let keys_method_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(keys_method);
+    let _ = pyre_object::gc_roots::pin_root(keys_method);
     let keys_obj = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(keys_method_slot),
         &[],
     )?;
     let keys_obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(keys_obj);
+    let _ = pyre_object::gc_roots::pin_root(keys_obj);
     let keys =
         crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
     let keys_base = pyre_object::gc_roots::shadow_stack_len();
     for &key in &keys {
-        pyre_object::gc_roots::pin_root(key);
+        let _ = pyre_object::gc_roots::pin_root(key);
     }
     for index in 0..keys.len() {
         let key = || pyre_object::gc_roots::shadow_stack_get(keys_base + index);
@@ -874,7 +874,7 @@ pub fn dict_merge_value(
         // fixed-size.
         let _iteration_roots = pyre_object::gc_roots::push_roots();
         let val_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(val);
+        let _ = pyre_object::gc_roots::pin_root(val);
         if crate::baseobjspace::contains(dict(), key())? {
             let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
             return Err(crate::argument::raise_type_error(

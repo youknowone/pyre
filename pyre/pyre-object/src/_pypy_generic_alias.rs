@@ -46,9 +46,9 @@ pub fn w_generic_alias_new(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(origin);
-    crate::gc_roots::pin_root(args);
-    crate::gc_roots::pin_root(parameters);
+    let _ = crate::gc_roots::pin_root(origin);
+    let _ = crate::gc_roots::pin_root(args);
+    let _ = crate::gc_roots::pin_root(parameters);
     // Allocate with empty pointer fields, then reload the GC-forwarded roots
     // and install them.  Building the payload before `allocate` retained the
     // pre-minor-collection addresses even though the shadow-stack slots were
@@ -206,19 +206,19 @@ pub fn w_union_from_parts(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(hashable_args);
-    crate::gc_roots::pin_root(unhashable_args);
-    crate::gc_roots::pin_root(parameters);
+    let _ = crate::gc_roots::pin_root(hashable_args);
+    let _ = crate::gc_roots::pin_root(unhashable_args);
+    let _ = crate::gc_roots::pin_root(parameters);
     let member_base = crate::gc_roots::shadow_stack_len();
     for member in members {
-        crate::gc_roots::pin_root(member);
+        let _ = crate::gc_roots::pin_root(member);
     }
     let args = crate::w_tuple_new(
         (member_base..crate::gc_roots::shadow_stack_len())
             .map(crate::gc_roots::shadow_stack_get)
             .collect(),
     );
-    crate::gc_roots::pin_root(args);
+    let _ = crate::gc_roots::pin_root(args);
     let args_slot = crate::gc_roots::shadow_stack_len() - 1;
     // CPython's unionobject is GC-owned and traverses all four object fields.
     // The stable managed bridge preserves that ownership while interpreter
