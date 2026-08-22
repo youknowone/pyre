@@ -327,6 +327,25 @@ mod tests {
         assert_eq!(cpu.bh_unicodegetitem(gc, -1), None, "negative index");
     }
 
+    /// The offset conversion refuses what it cannot represent, rather than
+    /// wrapping into range. A wrapped index passes the bounds test that
+    /// follows it and reads some other element, which is a wrong answer where
+    /// the refusal is a `None` the caller already handles.
+    #[test]
+    fn an_index_that_does_not_fit_the_targets_usize_is_refused() {
+        assert_eq!(item_index(0), Some(0));
+        assert_eq!(item_index(7), Some(7));
+        assert_eq!(item_index(-1), None);
+        assert_eq!(item_index(i64::MIN), None);
+        // `as usize` truncates this to 0 where `usize` is 32 bits, which is
+        // the wasm32 target.
+        const PAST_U32: i64 = 1 << 32;
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(item_index(PAST_U32), None);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(item_index(PAST_U32), Some(PAST_U32 as usize));
+    }
+
     #[test]
     fn bh_unicodegetitem_ascii_reads_the_byte() {
         let obj = pyre_object::w_str_new("hello");
