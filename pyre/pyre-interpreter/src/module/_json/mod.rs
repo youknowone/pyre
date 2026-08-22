@@ -989,7 +989,7 @@ fn encode_sequence(
     // back out of the slot; capturing the parameter would name the pre-move
     // address and report the type of whatever now occupies that cell.
     let obj_slot = gc_roots::shadow_stack_len();
-    let _ = gc_roots::pin_root(obj);
+    let obj = gc_roots::pin_root(obj);
     let iter = crate::baseobjspace::iter(obj)?;
     let iter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(iter);
@@ -1088,7 +1088,7 @@ fn encode_dict(
     // back where it is used.
     let _roots = gc_roots::push_roots();
     let obj_slot = gc_roots::shadow_stack_len();
-    let _ = gc_roots::pin_root(obj);
+    let obj = gc_roots::pin_root(obj);
     let items = crate::call::call_function_impl_result(
         crate::baseobjspace::getattr_str(obj, "items")?,
         &[],
