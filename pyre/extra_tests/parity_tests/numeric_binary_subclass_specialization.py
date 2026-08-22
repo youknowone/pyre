@@ -109,4 +109,62 @@ assert lhs_truediv(tail(7.0, FloatOperand(7.0))) == ("truediv", 7.0, 2.0)
 assert rhs_add(tail(True, IntOperand(3))) == ("radd", 7, 3)
 assert rhs_floordiv(tail(True, IntOperand(3))) == ("rfloordiv", 7, 3)
 
+
+# ── `__float__` coercion at a hot site ──────────────────────────────────────
+# The float coercions are the same exact-class question one layer down. Reading
+# an int's payload is the answer only for an exact builtin: `PyNumber_Float`
+# (the `float()` constructor) and `PyFloat_AsDouble` (the `math` entry points)
+# both dispatch `nb_float` for a non-float, so a subclass override decides.
+# The layout predicates read `ob_type`, which the subclass shares, so both the
+# interpreter fast path and the trace guard admitted it and read the payload.
+import math
+
+
+class ToFloat(int):
+    def __float__(self):
+        return 99.0
+
+
+class ToFloatFromFloat(float):
+    def __float__(self):
+        return 99.0
+
+
+def coerce_hot(operands, fn):
+    out = None
+    for operand in operands:
+        out = fn(operand)
+    return out
+
+
+# `float()` honors the override for both bases: `PyNumber_Float` short-circuits
+# only `PyFloat_CheckExact`.
+assert coerce_hot(tail(4, ToFloat(4)), float) == 99.0
+assert coerce_hot(tail(4.0, ToFloatFromFloat(4.0)), float) == 99.0
+
+# `math` uses `PyFloat_AsDouble`, whose short-circuit is `PyFloat_Check` — so a
+# FLOAT subclass keeps its payload while an INT subclass takes the override.
+assert coerce_hot(tail(4, ToFloat(4)), math.sqrt) == math.sqrt(99.0)
+assert coerce_hot(tail(4.0, ToFloatFromFloat(4.0)), math.sqrt) == 2.0
+assert coerce_hot(tail(4, ToFloat(4)), math.cos) == math.cos(99.0)
+assert coerce_hot(tail(4, ToFloat(4)), math.frexp) == math.frexp(99.0)
+assert coerce_hot(tail(4, ToFloat(4)), lambda a: math.ldexp(a, 1)) == 198.0
+
+# `complex()` reaches the same real-number ladder.
+assert coerce_hot(tail(4, ToFloat(4)), complex) == complex(99.0, 0.0)
+
+# A float presentation code formats the `PyNumber_Float` conversion.
+assert coerce_hot(tail(4, ToFloat(4)), lambda a: format(a, ".2f")) == "99.00"
+
+# `loghelper` is the exception that proves the rule: it converts EVERY
+# `PyLong_Check` operand from its payload, subclass included, for both the
+# argument and the base. Routing either through the general coercion would
+# answer a different logarithm.
+assert coerce_hot(tail(4, ToFloat(4)), math.log) == math.log(4)
+assert math.log(100, ToFloat(10)) == 2.0
+
+# `__index__`-based entry points are likewise payload-only.
+assert coerce_hot(tail(16, ToFloat(16)), math.isqrt) == 4
+assert coerce_hot(tail(0, ToFloat(0)), lambda a: math.ldexp(1.0, a)) == 1.0
+
 print("OK")

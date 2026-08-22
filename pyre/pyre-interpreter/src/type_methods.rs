@@ -3081,8 +3081,19 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 return format_char(big, spec);
             }
             // A float presentation code formats the `f64` conversion (`n` and
-            // the integer bases keep full integer precision instead).
+            // the integer bases keep full integer precision instead).  That
+            // conversion is `PyNumber_Float`, so a subclass overriding
+            // `__float__` decides the digits; reading the payload is the answer
+            // only when the receiver's Python class is the builtin.
             if matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
+                if !pyre_object::is_exact_builtin_instance(val) {
+                    let w_float = crate::builtins::builtin_float(&[val])?;
+                    let f = pyre_object::floatobject::w_float_get_value(w_float);
+                    if f.is_nan() || f.is_infinite() {
+                        return format_nonfinite(f, spec);
+                    }
+                    return format_finite_float(f, spec);
+                }
                 let f = pyre_object::jit_bigint_to_f64_or_inf(big);
                 if f.is_infinite() {
                     return Err(crate::PyError::overflow_error(

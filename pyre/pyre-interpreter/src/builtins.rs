@@ -18877,10 +18877,12 @@ pub(crate) fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyEr
         if is_bool(obj) {
             return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
         }
-        if is_int(obj) {
+        if is_int(obj) && is_exact_builtin_instance(obj) {
             return Ok((w_int_get_value(obj) as f64, 0.0));
         }
         if is_long(obj) {
+            // `float_w` applies the same exactness rule to the payload arms,
+            // so a strict subclass overriding `__float__` is honored there.
             return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
         }
         if is_float(obj) {

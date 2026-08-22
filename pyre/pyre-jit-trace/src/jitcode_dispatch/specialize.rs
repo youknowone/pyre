@@ -9813,6 +9813,14 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     // Coerce the argument to a raw float (int → guard_class + unbox +
     // CastIntToFloat; float → guard_class + unbox).
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    if is_int {
+        // The interpreter's `try_get_double` reads an int payload only for an
+        // exact builtin: a subclass may override `__float__`, and the unbox
+        // guard proves only `ob_type`, which the subclass shares.  The float
+        // arm needs no pin -- that coercion short-circuits on the float layout
+        // and ignores an override there too.
+        walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(arg_obj))?;
+    }
     // `ll_math_sqrt` domain guards: `if x < 0.0` (FloatLt pinned false) and
     // `if isfinite(x)` (FloatSub(x,x) == 0 pinned true — excludes NaN/±inf).
     let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
@@ -9925,6 +9933,14 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
             .replace_box(callable_op, expected);
     }
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    if is_int {
+        // The interpreter's `try_get_double` reads an int payload only for an
+        // exact builtin: a subclass may override `__float__`, and the unbox
+        // guard proves only `ob_type`, which the subclass shares.  The float
+        // arm needs no pin -- that coercion short-circuits on the float layout
+        // and ignores an override there too.
+        walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(arg_obj))?;
+    }
     let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
     if is_log {
         walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[zero, x], true)?;
@@ -10026,6 +10042,14 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
             .replace_box(callable_op, expected);
     }
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, x_value, false)?;
+    if is_int {
+        // The interpreter's `try_get_double` reads an int payload only for an
+        // exact builtin: a subclass may override `__float__`, and the unbox
+        // guard proves only `ob_type`, which the subclass shares.  The float
+        // arm needs no pin -- that coercion short-circuits on the float layout
+        // and ignores an override there too.
+        walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(arg_obj))?;
+    }
     let mantissa = ctx.trace_ctx.call_float_typed_with_effect(
         pyre_interpreter::module::math::interp_math::jit_math_frexp_mantissa as *const (),
         &[x],
@@ -10150,6 +10174,14 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
             .replace_box(callable_op, expected);
     }
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], x_obj, x_is_int, x_value, false)?;
+    if x_is_int {
+        // The interpreter's `try_get_double` reads an int payload only for an
+        // exact builtin: a subclass may override `__float__`, and the unbox
+        // guard proves only `ob_type`, which the subclass shares.  The float
+        // arm needs no pin -- that coercion short-circuits on the float layout
+        // and ignores an override there too.
+        walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(x_obj))?;
+    }
     let (exp_type_addr, exp_descr) = crate::state::int_or_bool_unbox_type_descr(exp_obj);
     let exp = walker_unbox_int_typed(ctx, op.pc, r_args[3], exp_type_addr, exp_descr)?;
     ctx.trace_ctx
@@ -11287,6 +11319,11 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     if is_int {
         // int/bool → CastIntToFloat + inline wrapfloat (no residual call).
         let raw = walker_coerce_operand_to_float(ctx, op.pc, arg_op, arg_obj, true, val, false)?;
+        // `builtin_float` reads an int payload only for an exact builtin, so an
+        // `int` subclass overriding `__float__` must side-exit; the unbox guard
+        // proves only `ob_type`, which the subclass shares.  The float arm below
+        // pins its own `w_class` for the same reason.
+        walker_guard_exact_w_class(ctx, op.pc, arg_op, walker_numeric_builtin_class(arg_obj))?;
         let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
         ctx.trace_ctx.set_opref_concrete(
             boxed,
