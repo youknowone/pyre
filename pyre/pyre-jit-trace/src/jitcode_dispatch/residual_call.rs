@@ -3921,16 +3921,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 .find(|(_, a)| *a == func_ptr as i64)
                 .map(|(n, _)| *n);
             eprintln!(
-                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
-                 entered_frame={} fn={:?}/{:#x}",
+                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} extraeffect={:?} \
+                 writes_live={writes_live_heap} entered_frame={} fn={:?}/{:#x}",
                 call_descr.result_type(),
+                ei.extraeffect,
                 heap_write_odometer_before
                     .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
                 name,
                 func_ptr as usize,
             );
         }
-        fbw_bump_executed_effect();
+        fbw_bump_executed_effect("residual");
     }
     match exec_result {
         Ok(result_i64) => {
@@ -6641,7 +6642,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         }
                         WalkerStoreAttrSpecialization::Direct => {
                             fbw_mark_foriter_body_effect_since_consume();
-                            fbw_bump_executed_effect();
+                            fbw_bump_executed_effect("store_attr_direct");
                             return Ok((DispatchOutcome::Continue, op.next_pc));
                         }
                     }
