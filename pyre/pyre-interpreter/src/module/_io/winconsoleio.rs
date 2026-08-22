@@ -235,7 +235,12 @@ impl W_WindowsConsoleIO {
                     "Cannot use closefd=False with file name",
                 ));
             }
-            let path = crate::gateway::fsencode_path_w(name_obj)?;
+            // `closefd` is whatever the caller passed, so `is_true` can run a
+            // `__bool__` and a moving collection with it: the name comes back
+            // out of its slot rather than from the borrow taken above.
+            let path = crate::gateway::fsencode_path_w(pyre_object::gc_roots::shadow_stack_get(
+                name_slot,
+            ))?;
             let os_name = crate::gateway::os_string_from_fs_bytes(&path.as_bytes);
             let mut kind = host_nt::console_type_from_name(&os_name.to_string_lossy());
             if kind == 'x' {
@@ -293,8 +298,10 @@ impl W_WindowsConsoleIO {
         // `W_IOBase.__init__` installs the per-instance closed flag.  A
         // successful second `__init__` reopens the same object, so its base
         // flush/close methods must observe the new live state as well as this
-        // payload's fd-backed `closed` property.
-        super::iobase_set_internal_closed(this.self_obj(), false)?;
+        // payload's fd-backed `closed` property.  Storing `name` allocates
+        // the instance dict, so the receiver is read back out of its slot
+        // rather than taken from the borrow held across that store.
+        super::iobase_set_internal_closed(Self::from_slot(self_slot).self_obj(), false)?;
         Ok(())
     }
 
