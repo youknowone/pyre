@@ -2263,7 +2263,31 @@ fn lower_fun_decl_builder_variant_from_body(
 fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
     let n_locals = u.locals.locals.len();
     let arg_count = u.locals.arg_count as usize;
-    (arg_count + 1..n_locals).any(|c| is_builder_mode_accumulator(u, llbc, c))
+    // A fresh builder accumulator's sole def is a `Wtf8Buf` / `String`
+    // `new` / `with_capacity` CALL terminator ([`is_fresh_str_builder`] sets
+    // its `ctor_def` flag only in the call-terminator arm), so only such a
+    // call's destination local can ever qualify.  Scan the body once for
+    // those dests and run the full check on each, instead of paying an
+    // O(body) [`is_fresh_str_builder`] scan for every one of `n_locals`
+    // locals — the vast majority of which have no ctor def and can never be
+    // accumulators.  Resolved on demand from the body, no per-local side
+    // table; a local that is not such a ctor dest would decline
+    // [`is_fresh_str_builder`] anyway, so restricting to ctor dests is
+    // behaviour-preserving.
+    for bb in &u.body {
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && let PlaceKind::Local(i) = call.dest.kind
+            && (arg_count + 1..n_locals).contains(&(i as usize))
+            && matches!(
+                wtf8buf_method_leaf(llbc, &call),
+                Some("new") | Some("with_capacity")
+            )
+            && is_builder_mode_accumulator(u, llbc, i as usize)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
