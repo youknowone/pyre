@@ -305,12 +305,13 @@ pub unsafe extern "C" fn PyCFunction_GetSelf(object: *mut CPyObject) -> *mut CPy
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
-    (!object.is_null() && unsafe {
-        crate::baseobjspace::issubtype_w(
-            (*object).w_class,
-            super::typeobject::method_descriptor_type(),
-        )
-    }) as c_int
+    (!object.is_null()
+        && unsafe {
+            crate::baseobjspace::issubtype_w(
+                (*object).w_class,
+                super::typeobject::method_descriptor_type(),
+            )
+        }) as c_int
 }
 
 /// `PyMethodDescr_CheckExact(op)`.
@@ -321,8 +322,7 @@ pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
 pub unsafe extern "C" fn PyMethodDescr_CheckExact(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
     (!object.is_null()
-        && unsafe { (*object).w_class } == super::typeobject::method_descriptor_type())
-        as c_int
+        && unsafe { (*object).w_class } == super::typeobject::method_descriptor_type()) as c_int
 }
 
 /// `methodobject.py PyDescr_NewMethod(type, method)`.

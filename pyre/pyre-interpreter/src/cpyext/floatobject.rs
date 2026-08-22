@@ -47,7 +47,10 @@ pub unsafe extern "C" fn PyFloat_FromString(object: *mut CPyObject) -> *mut CPyO
         return std::ptr::null_mut();
     };
     let float_type = crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE);
-    super::object::result(crate::call::call_function_impl_result(float_type, &[object]))
+    super::object::result(crate::call::call_function_impl_result(
+        float_type,
+        &[object],
+    ))
 }
 
 pub(super) fn ensure_linked() {
