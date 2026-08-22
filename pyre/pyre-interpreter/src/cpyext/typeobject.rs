@@ -793,16 +793,31 @@ macro_rules! table_of {
 // below resolve the same name on the receiver's own type instead, so an
 // override reaches a slot its base filled.
 
-/// `w_type.lookup(method)` for the receiver's own type.
-fn slot_method(w_self: PyObjectRef, method: &str) -> Result<PyObjectRef, crate::PyError> {
-    let Some(w_type) = crate::typedef::r#type(w_self) else {
-        return Err(crate::PyError::type_error(format!(
-            "a receiver with no type reached {method}"
-        )));
+/// `w_type.lookup(method)`, on `w_owner` where the slot names one.
+///
+/// A null owner is the shared trampoline, which has no channel to be told
+/// whose slot it is and so answers for the receiver's own type.  A bound
+/// thunk names the type that owns the slot, which is what
+/// `get_slot_tp_function`'s factories close over.
+fn slot_method(
+    w_owner: PyObjectRef,
+    w_self: PyObjectRef,
+    method: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let w_type = match w_owner.is_null() {
+        false => w_owner,
+        true => match crate::typedef::r#type(w_self) {
+            Some(w_type) => w_type.as_ptr(),
+            None => {
+                return Err(crate::PyError::type_error(format!(
+                    "a receiver with no type reached {method}"
+                )));
+            }
+        },
     };
     // The fill installs a slot only for a name the type has, so a miss here
     // is the type having lost it since.
-    unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), method) }
+    unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }
         .ok_or_else(|| crate::PyError::type_error(format!("the type no longer defines {method}")))
 }
 
@@ -811,6 +826,7 @@ fn slot_method(w_self: PyObjectRef, method: &str) -> Result<PyObjectRef, crate::
 /// A type lookup, not an attribute one: an instance dict entry of the same
 /// name is not what a slot answers with.
 fn call_slot_method(
+    w_owner: PyObjectRef,
     w_self: PyObjectRef,
     method: &str,
     arguments: &[PyObjectRef],
@@ -821,8 +837,15 @@ fn call_slot_method(
     for &argument in arguments {
         roots.pin_root(argument);
     }
+    // Last, so the indices above keep naming what they named.
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_owner);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
-    let function = slot_method(reload(0), method)?;
+    let function = slot_method(
+        pyre_object::gc_roots::shadow_stack_get(owner_slot),
+        reload(0),
+        method,
+    )?;
     let function_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(function);
     let mut call = Vec::with_capacity(arguments.len() + 1);
@@ -836,14 +859,18 @@ fn call_slot_method(
 }
 
 /// `slotdefs.py make_unary_slot` — the method called with the receiver alone.
+fn unary_body(w_owner: PyObjectRef, raw: *mut CPyObject, method: &str) -> *mut CPyObject {
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(call_slot_method(w_owner, w_self, method, &[]))
+}
+
 macro_rules! unary_slots {
     ($(($rust:ident, $method:literal),)*) => {
         $(
             unsafe extern "C" fn $rust(raw: *mut CPyObject) -> *mut CPyObject {
-                let Some(w_self) = super::object::argument(raw) else {
-                    return std::ptr::null_mut();
-                };
-                super::object::result(call_slot_method(w_self, $method, &[]))
+                unary_body(pyre_object::PY_NULL, raw, $method)
             }
         )*
     };
@@ -866,6 +893,15 @@ unary_slots! {
 
 /// `slotdefs.py slot_tp_iter` — `iter(self)` for a type this runtime defines.
 unsafe extern "C" fn interp_tp_iter(raw: *mut CPyObject) -> *mut CPyObject {
+    interp_tp_iter_body(pyre_object::PY_NULL, raw)
+}
+
+fn interp_tp_iter_body(w_owner: PyObjectRef, raw: *mut CPyObject) -> *mut CPyObject {
+    // A bound slot names the type that owns `__iter__`, so it resolves there;
+    // the shared trampoline has no owner and takes the receiver's protocol.
+    if !w_owner.is_null() {
+        return unary_body(w_owner, raw, "__iter__");
+    }
     let Some(w_self) = super::object::argument(raw) else {
         return std::ptr::null_mut();
     };
@@ -877,10 +913,20 @@ unsafe extern "C" fn interp_tp_iter(raw: *mut CPyObject) -> *mut CPyObject {
 /// Exhaustion is NULL with the indicator clear, which is what a caller that
 /// read this slot off the type distinguishes from a failure.
 unsafe extern "C" fn interp_tp_iternext(raw: *mut CPyObject) -> *mut CPyObject {
+    interp_tp_iternext_body(pyre_object::PY_NULL, raw)
+}
+
+fn interp_tp_iternext_body(w_owner: PyObjectRef, raw: *mut CPyObject) -> *mut CPyObject {
     let Some(w_self) = super::object::argument(raw) else {
         return std::ptr::null_mut();
     };
-    match crate::baseobjspace::next(w_self) {
+    // Exhaustion has to stay NULL-with-the-indicator-clear on the bound path
+    // too, so the owner's `__next__` is called through the same arm.
+    let stepped = match w_owner.is_null() {
+        true => crate::baseobjspace::next(w_self),
+        false => call_slot_method(w_owner, w_self, "__next__", &[]),
+    };
+    match stepped {
         Ok(w_item) => pyobject::make_ref(w_item),
         Err(mut error) => {
             if !super::iterator::is_stop_iteration(&mut error) {
@@ -893,6 +939,18 @@ unsafe extern "C" fn interp_tp_iternext(raw: *mut CPyObject) -> *mut CPyObject {
 
 /// `slotdefs.py make_binary_slot` — the method called with the receiver and
 /// the operand the slot was handed.
+fn binary_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    operand: *mut CPyObject,
+    method: &str,
+) -> *mut CPyObject {
+    let Some([w_self, w_operand]) = super::object::arguments([raw, operand]) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(call_slot_method(w_owner, w_self, method, &[w_operand]))
+}
+
 macro_rules! binary_slots {
     ($(($rust:ident, $method:literal),)*) => {
         $(
@@ -900,10 +958,7 @@ macro_rules! binary_slots {
                 raw: *mut CPyObject,
                 operand: *mut CPyObject,
             ) -> *mut CPyObject {
-                let Some([w_self, w_operand]) = super::object::arguments([raw, operand]) else {
-                    return std::ptr::null_mut();
-                };
-                super::object::result(call_slot_method(w_self, $method, &[w_operand]))
+                binary_body(pyre_object::PY_NULL, raw, operand, $method)
             }
         )*
     };
@@ -928,20 +983,32 @@ binary_slots! {
 
 /// `slotdefs.py make_binary_slot_int` — the count the slot was handed,
 /// passed on as the `int` the method takes.
+fn ssize_arg_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    index: isize,
+    method: &str,
+) -> *mut CPyObject {
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_owner);
+    // Minting the index can collect, so both are read back.
+    let w_index = pyre_object::w_int_new(index as i64);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(slot);
+    let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
+    super::object::result(call_slot_method(w_owner, w_self, method, &[w_index]))
+}
+
 macro_rules! ssize_arg_slots {
     ($(($rust:ident, $method:literal),)*) => {
         $(
             unsafe extern "C" fn $rust(raw: *mut CPyObject, index: isize) -> *mut CPyObject {
-                let Some(w_self) = super::object::argument(raw) else {
-                    return std::ptr::null_mut();
-                };
-                let roots = pyre_object::gc_roots::push_roots();
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                roots.pin_root(w_self);
-                // Minting the index can collect, so the receiver is read back.
-                let w_index = pyre_object::w_int_new(index as i64);
-                let w_self = pyre_object::gc_roots::shadow_stack_get(slot);
-                super::object::result(call_slot_method(w_self, $method, &[w_index]))
+                ssize_arg_body(pyre_object::PY_NULL, raw, index, $method)
             }
         )*
     };
@@ -962,6 +1029,15 @@ unsafe extern "C" fn interp_nb_power(
     operand: *mut CPyObject,
     modulus: *mut CPyObject,
 ) -> *mut CPyObject {
+    interp_nb_power_body(pyre_object::PY_NULL, raw, operand, modulus)
+}
+
+fn interp_nb_power_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    operand: *mut CPyObject,
+    modulus: *mut CPyObject,
+) -> *mut CPyObject {
     unsafe { pyobject::realize(modulus) };
     let Some([w_self, w_operand]) = super::object::arguments([raw, operand]) else {
         return std::ptr::null_mut();
@@ -970,19 +1046,29 @@ unsafe extern "C" fn interp_nb_power(
         true => pyre_object::w_none(),
         false => unsafe { pyobject::from_ref(modulus) },
     };
-    super::object::result(call_slot_method(w_self, "__pow__", &[w_operand, w_modulus]))
+    super::object::result(call_slot_method(
+        w_owner,
+        w_self,
+        "__pow__",
+        &[w_operand, w_modulus],
+    ))
 }
 
 /// `slotdefs.py make_sq_set_item` and `make_sq_ass_item` — one slot for the
 /// assignment and the deletion both, told apart by the value being NULL.
-fn interp_assign_item(raw: *mut CPyObject, w_key: PyObjectRef, value: *mut CPyObject) -> c_int {
+fn interp_assign_item(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    w_key: PyObjectRef,
+    value: *mut CPyObject,
+) -> c_int {
     let Some(w_self) = super::object::argument(raw) else {
         return -1;
     };
     let assigned = match value.is_null() {
-        true => call_slot_method(w_self, "__delitem__", &[w_key]),
+        true => call_slot_method(w_owner, w_self, "__delitem__", &[w_key]),
         false => match super::object::argument(value) {
-            Some(w_value) => call_slot_method(w_self, "__setitem__", &[w_key, w_value]),
+            Some(w_value) => call_slot_method(w_owner, w_self, "__setitem__", &[w_key, w_value]),
             None => return -1,
         },
     };
@@ -997,12 +1083,21 @@ unsafe extern "C" fn interp_mp_ass_subscript(
     key: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
+    interp_mp_ass_subscript_body(pyre_object::PY_NULL, raw, key, value)
+}
+
+fn interp_mp_ass_subscript_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    key: *mut CPyObject,
+    value: *mut CPyObject,
+) -> c_int {
     unsafe { pyobject::realize(key) };
     unsafe { pyobject::realize(value) };
     let Some(w_key) = super::object::argument(key) else {
         return -1;
     };
-    interp_assign_item(raw, w_key, value)
+    interp_assign_item(w_owner, raw, w_key, value)
 }
 
 unsafe extern "C" fn interp_sq_ass_item(
@@ -1010,25 +1105,38 @@ unsafe extern "C" fn interp_sq_ass_item(
     index: isize,
     value: *mut CPyObject,
 ) -> c_int {
+    interp_sq_ass_item_body(pyre_object::PY_NULL, raw, index, value)
+}
+
+fn interp_sq_ass_item_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    index: isize,
+    value: *mut CPyObject,
+) -> c_int {
     unsafe { pyobject::realize(value) };
-    interp_assign_item(raw, pyre_object::w_int_new(index as i64), value)
+    interp_assign_item(w_owner, raw, pyre_object::w_int_new(index as i64), value)
 }
 
 /// `slotdefs.py make_unary_slot_int` — the method's answer read as an
 /// integer, with -1 the failure a caller checks the indicator for.
+fn length_body(w_owner: PyObjectRef, raw: *mut CPyObject, method: &str) -> isize {
+    let Some(w_self) = super::object::argument(raw) else {
+        return -1;
+    };
+    let counted =
+        call_slot_method(w_owner, w_self, method, &[]).and_then(crate::baseobjspace::int_w);
+    match super::pyerrors::trap(counted) {
+        Some(count) => count as isize,
+        None => -1,
+    }
+}
+
 macro_rules! length_slots {
     ($(($rust:ident, $method:literal),)*) => {
         $(
             unsafe extern "C" fn $rust(raw: *mut CPyObject) -> isize {
-                let Some(w_self) = super::object::argument(raw) else {
-                    return -1;
-                };
-                let counted = call_slot_method(w_self, $method, &[])
-                    .and_then(crate::baseobjspace::int_w);
-                match super::pyerrors::trap(counted) {
-                    Some(count) => count as isize,
-                    None => -1,
-                }
+                length_body(pyre_object::PY_NULL, raw, $method)
             }
         )*
     };
@@ -1105,12 +1213,21 @@ unsafe extern "C" fn interp_tp_call(
     args: *mut CPyObject,
     kwds: *mut CPyObject,
 ) -> *mut CPyObject {
+    interp_tp_call_body(pyre_object::PY_NULL, raw, args, kwds)
+}
+
+fn interp_tp_call_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> *mut CPyObject {
     unsafe { pyobject::realize(args) };
     unsafe { pyobject::realize(kwds) };
     let Some(w_self) = super::object::argument(raw) else {
         return std::ptr::null_mut();
     };
-    let called = slot_method(w_self, "__call__")
+    let called = slot_method(w_owner, w_self, "__call__")
         .and_then(|callable| call_slot_arguments(callable, w_self, args, kwds));
     super::object::result(called)
 }
@@ -1122,12 +1239,21 @@ unsafe extern "C" fn interp_tp_init(
     args: *mut CPyObject,
     kwds: *mut CPyObject,
 ) -> c_int {
+    interp_tp_init_body(pyre_object::PY_NULL, raw, args, kwds)
+}
+
+fn interp_tp_init_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> c_int {
     unsafe { pyobject::realize(args) };
     unsafe { pyobject::realize(kwds) };
     let Some(w_self) = super::object::argument(raw) else {
         return -1;
     };
-    let started = slot_method(w_self, "__init__")
+    let started = slot_method(w_owner, w_self, "__init__")
         .and_then(|callable| call_slot_arguments(callable, w_self, args, kwds));
     match super::pyerrors::trap(started) {
         Some(_) => 0,
@@ -1145,12 +1271,28 @@ unsafe extern "C" fn interp_tp_new(
     args: *mut CPyObject,
     kwds: *mut CPyObject,
 ) -> *mut CPyObject {
+    interp_tp_new_body(pyre_object::PY_NULL, raw, args, kwds)
+}
+
+fn interp_tp_new_body(
+    w_owner: PyObjectRef,
+    raw: *mut CPyTypeObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> *mut CPyObject {
     unsafe { pyobject::realize(args) };
     unsafe { pyobject::realize(kwds) };
     let Some(w_class) = super::object::argument(raw as *mut CPyObject) else {
         return std::ptr::null_mut();
     };
-    let made = crate::baseobjspace::getattr_str(w_class, "__new__")
+    // The constructor is read off the type that owns the slot where there is
+    // one; the class being built stays the first argument, because that is
+    // what `cls.__new__(cls, ...)` passes and what the allocator sizes for.
+    let w_read = match w_owner.is_null() {
+        true => w_class,
+        false => w_owner,
+    };
+    let made = crate::baseobjspace::getattr_str(w_read, "__new__")
         .and_then(|callable| call_slot_arguments(callable, w_class, args, kwds));
     super::object::result(made)
 }
@@ -1158,6 +1300,15 @@ unsafe extern "C" fn interp_tp_new(
 /// `slotdefs.py make_tp_descr_get` — a NULL receiver is the class access,
 /// which reaches `__get__` as `None`.
 unsafe extern "C" fn interp_tp_descr_get(
+    raw: *mut CPyObject,
+    object: *mut CPyObject,
+    of_type: *mut CPyObject,
+) -> *mut CPyObject {
+    interp_tp_descr_get_body(pyre_object::PY_NULL, raw, object, of_type)
+}
+
+fn interp_tp_descr_get_body(
+    w_owner: PyObjectRef,
     raw: *mut CPyObject,
     object: *mut CPyObject,
     of_type: *mut CPyObject,
@@ -1171,13 +1322,27 @@ unsafe extern "C" fn interp_tp_descr_get(
         true => pyre_object::w_none(),
         false => unsafe { pyobject::from_ref(raw) },
     };
-    let got = call_slot_method(w_self, "__get__", &[or_none(object), or_none(of_type)]);
+    let got = call_slot_method(
+        w_owner,
+        w_self,
+        "__get__",
+        &[or_none(object), or_none(of_type)],
+    );
     super::object::result(got)
 }
 
 /// `slotdefs.py make_tp_descr_set` — one slot for the assignment and the
 /// deletion both, told apart by the value being NULL.
 unsafe extern "C" fn interp_tp_descr_set(
+    raw: *mut CPyObject,
+    object: *mut CPyObject,
+    value: *mut CPyObject,
+) -> c_int {
+    interp_tp_descr_set_body(pyre_object::PY_NULL, raw, object, value)
+}
+
+fn interp_tp_descr_set_body(
+    w_owner: PyObjectRef,
     raw: *mut CPyObject,
     object: *mut CPyObject,
     value: *mut CPyObject,
@@ -1191,9 +1356,9 @@ unsafe extern "C" fn interp_tp_descr_set(
         return -1;
     };
     let assigned = match value.is_null() {
-        true => call_slot_method(w_self, "__delete__", &[w_object]),
+        true => call_slot_method(w_owner, w_self, "__delete__", &[w_object]),
         false => match super::object::argument(value) {
-            Some(w_value) => call_slot_method(w_self, "__set__", &[w_object, w_value]),
+            Some(w_value) => call_slot_method(w_owner, w_self, "__set__", &[w_object, w_value]),
             None => return -1,
         },
     };
@@ -1201,6 +1366,376 @@ unsafe extern "C" fn interp_tp_descr_set(
         Some(_) => 0,
         None => -1,
     }
+}
+
+// ── bound slots ────────────────────────────────────────────────────────
+//
+// `slotdefs.py get_slot_tp_function` is `@specialize.memo()` over a
+// translation-time typedef, and `func_renamer` emits one C function per
+// (typedef, slot).  Each closes over `w_type.lookup(attr)` -- the method of
+// the type that OWNS the slot -- so a subclass reaching its base's slot runs
+// the base's method.  A shared `extern "C"` function cannot do that: its only
+// channel is its arguments, the owner is not among them, and re-resolving on
+// the receiver sends `base->tp_slot(self)` from a subclass back to itself.
+//
+// The pool below is that channel.  Each thunk is one monomorphisation, so it
+// carries an address of its own, and that address is what the mirror's slot
+// holds; the index recovers the owner.  Where RPython enumerates the pairs at
+// translation time this assigns them on demand, because a type of this
+// runtime's is minted while it runs rather than declared in a closed table.
+//
+// The population is closed all the same.  Only a type this runtime defines
+// reaches the fill -- a type an extension readied never does -- and an entry
+// is keyed by the type that OWNS the method rather than by the type carrying
+// the slot.  Both resolve the same method, because the lookup that found it
+// landed on the owner, and a measured stdlib import needs 674 entries where
+// per-type keying would need 1555.
+
+const BOUND_ROW: usize = 16;
+
+/// The type a bound thunk resolves its method on, and the name to resolve.
+///
+/// The owner is held as its mirror: that address is fixed for the mirror's
+/// life, where the object it stands for is free to move.
+#[derive(Clone, Copy)]
+struct BoundSlot {
+    owner: *mut CPyObject,
+    method: &'static str,
+}
+
+/// What one pool holds: its entries, the thunks that name them, and the index
+/// each `(owner, method)` was given.
+struct BoundFamily {
+    entries: &'static [std::sync::atomic::AtomicPtr<BoundSlot>],
+    // Reached through a function rather than held as a table: a `static` may
+    // not hold a `*const c_void`, which is not `Sync`, and a pointer may not
+    // be cast to an address while the table is being built.  Each family's
+    // own table is typed with its own signature, which is a function pointer
+    // and so is `Sync`.
+    thunk_at: fn(usize) -> *const c_void,
+    taken: super::ForkMutex<BoundNames>,
+}
+
+/// Every address handed out of a pool.
+///
+/// Only an assigned thunk can appear in a slot, so this is what
+/// [`is_bound_thunk`] asks rather than walking the tables.
+static BOUND_MINTED: super::ForkMutex<BoundAddresses> = super::ForkMutex::new(
+    BoundAddresses::with_hasher(std::hash::BuildHasherDefault::new()),
+);
+
+type BoundAddresses =
+    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+
+type BoundNames = std::collections::HashMap<
+    (usize, &'static str),
+    usize,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+>;
+
+/// The entry behind a thunk's index, or `None` for one never assigned.
+///
+/// Read without the lock: an entry is published once and never rewritten, so
+/// a reader finds either null or a block that outlives it.
+fn bound_slot(family: &BoundFamily, index: usize) -> Option<BoundSlot> {
+    let entry = family
+        .entries
+        .get(index)?
+        .load(std::sync::atomic::Ordering::Acquire);
+    match entry.is_null() {
+        true => None,
+        false => Some(unsafe { *entry }),
+    }
+}
+
+/// The thunk standing for `(owner, method)`, minting one on first ask -- or
+/// `None` once the pool is spent, which leaves the caller with the shared
+/// trampoline it would have installed before this existed.
+fn bind_slot(
+    family: &'static BoundFamily,
+    owner: *mut CPyObject,
+    method: &'static str,
+) -> Option<*const c_void> {
+    let mut taken = family.taken.lock();
+    if let Some(&index) = taken.get(&(owner as usize, method)) {
+        return Some((family.thunk_at)(index));
+    }
+    let index = taken.len();
+    if index >= family.entries.len() {
+        return None;
+    }
+    // Published before the index is recorded, so a reader reaching a thunk
+    // through the table always finds its entry filled.
+    family.entries[index].store(
+        Box::into_raw(Box::new(BoundSlot { owner, method })),
+        std::sync::atomic::Ordering::Release,
+    );
+    taken.insert((owner as usize, method), index);
+    let thunk = (family.thunk_at)(index);
+    BOUND_MINTED.lock().insert(thunk as usize);
+    Some(thunk)
+}
+
+/// One row of a pool's thunk table.
+///
+/// A row rather than a flat table because `macro_rules!` cannot nest two
+/// repetitions its input does not nest: the inner list is written out here
+/// and the outer one names the rows.
+macro_rules! bound_row {
+    ($thunk:ident, $hi:literal) => {
+        bound_row!(@row $thunk, $hi, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    };
+    (@row $thunk:ident, $hi:literal, [$($lo:literal),*]) => {
+        &[$( $thunk::<{ $hi * BOUND_ROW + $lo }> ),*]
+    };
+}
+
+/// Declare one pool: its entries, the thunk that indexes them, the table of
+/// thunk addresses, and the family tying the three together.
+///
+/// The index reaches the shared dispatcher as an ARGUMENT, never through a
+/// table read inside the thunk.  A body that only indexes a table the program
+/// has not written yet folds to the same code for every index, and
+/// identical-code-folding merges the whole pool into a single address -- which
+/// would bind every slot in the process to one entry, and say nothing.
+/// `every_thunk_has_an_address_of_its_own` is what holds this.
+macro_rules! bound_pool {
+    (
+        $family:ident, $entries:ident, $thunks:ident, $at:ident, $thunk:ident,
+        $dispatch:ident, $rows:literal,
+        ($($arg:ident: $argty:ty),*) -> $ret:ty, ($($pass:ident),*),
+        [$($hi:literal),* $(,)?]
+    ) => {
+        static $entries: [std::sync::atomic::AtomicPtr<BoundSlot>; $rows * BOUND_ROW] =
+            [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) };
+                $rows * BOUND_ROW];
+
+        unsafe extern "C" fn $thunk<const K: usize>($($arg: $argty),*) -> $ret {
+            $dispatch(K, $($pass),*)
+        }
+
+        static $thunks: &[&[unsafe extern "C" fn($($argty),*) -> $ret]] =
+            &[$( bound_row!($thunk, $hi) ),*];
+
+        fn $at(index: usize) -> *const c_void {
+            $thunks[index / BOUND_ROW][index % BOUND_ROW] as *const c_void
+        }
+
+        static $family: BoundFamily = BoundFamily {
+            entries: &$entries,
+            thunk_at: $at,
+            taken: super::ForkMutex::new(BoundNames::with_hasher(
+                std::hash::BuildHasherDefault::new(),
+            )),
+        };
+    };
+}
+
+bound_pool!(
+    UNARY_BOUND, UNARY_ENTRIES, UNARY_THUNKS, unary_thunk_at, bound_unary, dispatch_unary, 32,
+    (raw: *mut CPyObject) -> *mut CPyObject, (raw),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+);
+
+bound_pool!(
+    LENGTH_BOUND, LENGTH_ENTRIES, LENGTH_THUNKS, length_thunk_at, bound_length, dispatch_length, 8,
+    (raw: *mut CPyObject) -> isize, (raw),
+    [0, 1, 2, 3, 4, 5, 6, 7]
+);
+
+bound_pool!(
+    BINARY_BOUND, BINARY_ENTRIES, BINARY_THUNKS, binary_thunk_at, bound_binary, dispatch_binary, 16,
+    (raw: *mut CPyObject, operand: *mut CPyObject) -> *mut CPyObject, (raw, operand),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+);
+
+bound_pool!(
+    SSIZE_BOUND, SSIZE_ENTRIES, SSIZE_THUNKS, ssize_thunk_at, bound_ssize, dispatch_ssize, 4,
+    (raw: *mut CPyObject, index: isize) -> *mut CPyObject, (raw, index),
+    [0, 1, 2, 3]
+);
+
+bound_pool!(
+    TERNARY_BOUND, TERNARY_ENTRIES, TERNARY_THUNKS, ternary_thunk_at, bound_ternary, dispatch_ternary, 24,
+    (raw: *mut CPyObject, second: *mut CPyObject, third: *mut CPyObject) -> *mut CPyObject, (raw, second, third),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+     16, 17, 18, 19, 20, 21, 22, 23]
+);
+
+bound_pool!(
+    TERNINT_BOUND, TERNINT_ENTRIES, TERNINT_THUNKS, ternint_thunk_at, bound_ternint, dispatch_ternint, 8,
+    (raw: *mut CPyObject, second: *mut CPyObject, third: *mut CPyObject) -> c_int, (raw, second, third),
+    [0, 1, 2, 3, 4, 5, 6, 7]
+);
+
+bound_pool!(
+    ASSIGN_BOUND, ASSIGN_ENTRIES, ASSIGN_THUNKS, assign_thunk_at, bound_assign, dispatch_assign, 4,
+    (raw: *mut CPyObject, index: isize, value: *mut CPyObject) -> c_int, (raw, index, value),
+    [0, 1, 2, 3]
+);
+
+/// Every pool, for the questions asked of all of them at once.
+static BOUND_FAMILIES: &[&BoundFamily] = &[
+    &UNARY_BOUND,
+    &LENGTH_BOUND,
+    &BINARY_BOUND,
+    &SSIZE_BOUND,
+    &TERNARY_BOUND,
+    &TERNINT_BOUND,
+    &ASSIGN_BOUND,
+];
+
+/// Whether `slot` is a thunk out of any pool -- the question
+/// [`is_interpreter_slot`] asks of the shared trampolines.
+fn is_bound_thunk(slot: *const c_void) -> bool {
+    BOUND_MINTED.lock().contains(&(slot as usize))
+}
+
+/// The pool a shared trampoline belongs to, by its C signature.
+///
+/// Matched against the tables rather than told: a trampoline this does not
+/// name simply keeps re-resolving on the receiver, which is what every one of
+/// them did before the pools existed.
+fn bound_family_of(function: *const c_void) -> Option<&'static BoundFamily> {
+    let named = |candidate: *const c_void| std::ptr::eq(function, candidate);
+    let in_table = |table: &[(&str, *const c_void)]| table.iter().any(|&(_, entry)| named(entry));
+    if UNARY_SLOTS
+        .iter()
+        .any(|&(_, entry, _)| named(entry as *const c_void))
+    {
+        return Some(&UNARY_BOUND);
+    }
+    if LENGTH_SLOTS
+        .iter()
+        .any(|&(_, entry, _)| named(entry as *const c_void))
+    {
+        return Some(&LENGTH_BOUND);
+    }
+    if BINARY_SLOTS
+        .iter()
+        .any(|&(_, entry, _)| named(entry as *const c_void))
+    {
+        return Some(&BINARY_BOUND);
+    }
+    if SSIZE_ARG_SLOTS
+        .iter()
+        .any(|&(_, entry, _)| named(entry as *const c_void))
+    {
+        return Some(&SSIZE_BOUND);
+    }
+    let _ = in_table;
+    if named(interp_nb_power as *const c_void)
+        || named(interp_tp_call as *const c_void)
+        || named(interp_tp_new as *const c_void)
+        || named(interp_tp_descr_get as *const c_void)
+    {
+        return Some(&TERNARY_BOUND);
+    }
+    if named(interp_tp_init as *const c_void)
+        || named(interp_tp_descr_set as *const c_void)
+        || named(interp_mp_ass_subscript as *const c_void)
+    {
+        return Some(&TERNINT_BOUND);
+    }
+    if named(interp_sq_ass_item as *const c_void) {
+        return Some(&ASSIGN_BOUND);
+    }
+    None
+}
+
+// ── the dispatchers ────────────────────────────────────────────────────
+//
+// One per C signature.  An index with no entry is a thunk reached before it
+// was assigned, which cannot happen through a slot this layer wrote; the
+// failure answer is the one the shared trampoline gives a bad receiver.
+
+fn dispatch_unary(index: usize, raw: *mut CPyObject) -> *mut CPyObject {
+    let Some(slot) = bound_slot(&UNARY_BOUND, index) else {
+        return std::ptr::null_mut();
+    };
+    let w_owner = unsafe { pyobject::from_ref(slot.owner) };
+    match slot.method {
+        // Exhaustion is NULL with the indicator clear, which only this arm
+        // answers with.
+        "__next__" => interp_tp_iternext_body(w_owner, raw),
+        method => unary_body(w_owner, raw, method),
+    }
+}
+
+fn dispatch_length(index: usize, raw: *mut CPyObject) -> isize {
+    let Some(slot) = bound_slot(&LENGTH_BOUND, index) else {
+        return -1;
+    };
+    length_body(unsafe { pyobject::from_ref(slot.owner) }, raw, slot.method)
+}
+
+fn dispatch_binary(index: usize, raw: *mut CPyObject, operand: *mut CPyObject) -> *mut CPyObject {
+    let Some(slot) = bound_slot(&BINARY_BOUND, index) else {
+        return std::ptr::null_mut();
+    };
+    binary_body(
+        unsafe { pyobject::from_ref(slot.owner) },
+        raw,
+        operand,
+        slot.method,
+    )
+}
+
+fn dispatch_ssize(index: usize, raw: *mut CPyObject, at: isize) -> *mut CPyObject {
+    let Some(slot) = bound_slot(&SSIZE_BOUND, index) else {
+        return std::ptr::null_mut();
+    };
+    ssize_arg_body(
+        unsafe { pyobject::from_ref(slot.owner) },
+        raw,
+        at,
+        slot.method,
+    )
+}
+
+fn dispatch_ternary(
+    index: usize,
+    raw: *mut CPyObject,
+    second: *mut CPyObject,
+    third: *mut CPyObject,
+) -> *mut CPyObject {
+    let Some(slot) = bound_slot(&TERNARY_BOUND, index) else {
+        return std::ptr::null_mut();
+    };
+    let w_owner = unsafe { pyobject::from_ref(slot.owner) };
+    match slot.method {
+        "__pow__" => interp_nb_power_body(w_owner, raw, second, third),
+        "__call__" => interp_tp_call_body(w_owner, raw, second, third),
+        "__new__" => interp_tp_new_body(w_owner, raw as *mut CPyTypeObject, second, third),
+        _ => interp_tp_descr_get_body(w_owner, raw, second, third),
+    }
+}
+
+fn dispatch_ternint(
+    index: usize,
+    raw: *mut CPyObject,
+    second: *mut CPyObject,
+    third: *mut CPyObject,
+) -> c_int {
+    let Some(slot) = bound_slot(&TERNINT_BOUND, index) else {
+        return -1;
+    };
+    let w_owner = unsafe { pyobject::from_ref(slot.owner) };
+    match slot.method {
+        "__init__" => interp_tp_init_body(w_owner, raw, second, third),
+        // One slot answers for the assignment and the deletion both, so the
+        // name recorded here says which slot it is, not which of the two.
+        "__set__" | "__delete__" => interp_tp_descr_set_body(w_owner, raw, second, third),
+        _ => interp_mp_ass_subscript_body(w_owner, raw, second, third),
+    }
+}
+
+fn dispatch_assign(index: usize, raw: *mut CPyObject, at: isize, value: *mut CPyObject) -> c_int {
+    let Some(slot) = bound_slot(&ASSIGN_BOUND, index) else {
+        return -1;
+    };
+    interp_sq_ass_item_body(unsafe { pyobject::from_ref(slot.owner) }, raw, at, value)
 }
 
 /// The two halves of reaching one slot: what it holds, and how it is written.
@@ -1386,6 +1921,9 @@ const SSIZE_ARG_SLOTS: [(
 /// those are the scalar ones -- a suite is never handed down whole.
 fn is_interpreter_slot(slot: *const c_void) -> bool {
     let named = |function| std::ptr::eq(slot, function);
+    if is_bound_thunk(slot) {
+        return true;
+    }
     UNARY_SLOTS
         .iter()
         .any(|&(_, function, _)| named(function as *const c_void))
@@ -1416,7 +1954,7 @@ fn install_slot(
     mirror: *mut CPyTypeObject,
     w_type: PyObjectRef,
     heaptype: bool,
-    method: &str,
+    method: &'static str,
     access: SlotAccess,
     function: *const c_void,
 ) {
@@ -1436,11 +1974,39 @@ fn install_slot(
     let value = match inherited.is_null() {
         // Nothing to inherit, so the trampoline is the slot -- but only where
         // the type has the method at all.
-        true if owned => function,
+        true if owned => bound_or_shared(heaptype, found, method, function),
         true => return,
         false => inherited,
     };
     (access.write)(mirror, w_type, value);
+}
+
+/// The slot to install for a method the type answers for itself: a thunk
+/// bound to the type that owns the method, or the shared trampoline.
+///
+/// A class written in Python takes the shared one, and that is not a
+/// shortfall.  Its method is resolved on the receiver by the language itself,
+/// which is what `slot_tp_*` does for the same reason; `update_all_slots`
+/// hands such a class the very same `slot_apifunc`.  Only a type this runtime
+/// defines needs the owner recorded, because only its slot stands where a
+/// concrete C function would stand for CPython.
+fn bound_or_shared(
+    heaptype: bool,
+    found: Option<(PyObjectRef, PyObjectRef)>,
+    method: &'static str,
+    function: *const c_void,
+) -> *const c_void {
+    let Some((w_owner, _)) = found.filter(|_| !heaptype) else {
+        return function;
+    };
+    let Some(family) = bound_family_of(function) else {
+        return function;
+    };
+    // The mirror, because the pool outlives any one call and the object it
+    // stands for is free to move.  A type's mirror is immortal, so the
+    // reference this takes is never given back.
+    let owner = pyobject::make_ref(w_owner);
+    bind_slot(family, owner, method).unwrap_or(function)
 }
 
 /// `typeobject.py update_all_slots` and `update_all_slots_builtin` — fill the
@@ -5665,6 +6231,53 @@ pub(super) fn ensure_linked() {
 
 #[cfg(test)]
 mod tests {
+    /// Every thunk in every pool must have an address of its own.
+    ///
+    /// The address is the only channel telling a thunk which `(owner, method)`
+    /// it stands for, so two that share one are two slots bound to a single
+    /// entry -- a wrong answer with nothing to show for it.  Identical bodies
+    /// are what identical-code-folding merges, and a body that reads its index
+    /// out of a table the program has not written yet compiles to the same
+    /// code for every index.  Passing the index to the dispatcher as an
+    /// argument is what keeps the bodies apart, and this is what says so.
+    #[test]
+    fn every_thunk_has_an_address_of_its_own() {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0;
+        for family in super::BOUND_FAMILIES {
+            for index in 0..family.entries.len() {
+                total += 1;
+                let thunk = (family.thunk_at)(index) as usize;
+                assert!(
+                    seen.insert(thunk),
+                    "two thunks share the address {thunk:#x}; the pool cannot tell them apart"
+                );
+            }
+        }
+        assert_eq!(seen.len(), total);
+        assert!(
+            total >= 674,
+            "the pools are smaller than a stdlib import needs: {total}"
+        );
+    }
+
+    /// A pool hands out each `(owner, method)` once and answers with the same
+    /// thunk the second time, so a mirror refilled reuses what it had.
+    #[test]
+    fn binding_the_same_pair_twice_answers_with_one_thunk() {
+        let owner = 0x1000 as *mut super::CPyObject;
+        let first = super::bind_slot(&super::UNARY_BOUND, owner, "__repr__");
+        let again = super::bind_slot(&super::UNARY_BOUND, owner, "__repr__");
+        let other = super::bind_slot(&super::UNARY_BOUND, owner, "__str__");
+        assert!(first.is_some());
+        assert_eq!(first, again);
+        assert_ne!(first, other);
+        assert!(super::is_bound_thunk(first.unwrap()));
+        assert!(!super::is_bound_thunk(
+            super::interp_tp_repr as *const std::ffi::c_void
+        ));
+    }
+
     /// `PyType_FromSpec` reads the numbers an extension compiled against
     /// `typeslots.h` wrote into its slot array, so the two tables are one ABI
     /// in two places.  This walks the header and rejects any identifier whose
