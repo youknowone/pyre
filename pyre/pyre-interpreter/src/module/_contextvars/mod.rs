@@ -124,22 +124,30 @@ fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             args.len()
         )));
     }
+    // The lookup runs the Context mapping's `__getitem__`, which is
+    // application-level Python.  The default handed back below it is whatever
+    // the caller passed -- a list or a dict included -- and the gateway's
+    // argument array is a native copy a collection does not rewrite, so both
+    // operands are read back from their slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let var = || pyre_object::gc_roots::shadow_stack_get(args_base);
     if let Some(context) = current_context(false)? {
-        match crate::baseobjspace::getitem(context, args[0]) {
+        match crate::baseobjspace::getitem(context, var()) {
             Ok(value) => return Ok(value),
             Err(err) if err.kind == crate::PyErrorKind::KeyError => {}
             Err(err) => return Err(err),
         }
     }
-    if let Some(&default) = args.get(1) {
+    if args.len() > 1 {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(args_base + 1));
+    }
+    if let Some(default) = crate::baseobjspace::findattr_result(var(), "_default")? {
         return Ok(default);
     }
-    if let Some(default) = crate::baseobjspace::findattr_result(args[0], "_default")? {
-        return Ok(default);
-    }
-    Err(crate::PyError::lookup_error(context_var_repr_string(
-        args[0],
-    )?))
+    Err(crate::PyError::lookup_error(
+        context_var_repr_string(var())?,
+    ))
 }
 
 fn call_method_result(
@@ -177,30 +185,42 @@ fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // PyPy lib_pypy/_contextvars.py ContextVar.set, line by line: read the
     // old binding, persistently replace Context._data, and return a token
     // tied to this exact Context.
-    let context = current_context(true)?.expect("create=true returns a Context");
-    let data = crate::baseobjspace::getattr_str(context, "_data")?;
-    let old_value = match crate::baseobjspace::getitem(data, args[0]) {
+    // Every step here runs Python, so each value takes its root slot before
+    // the call it has to outlive rather than after.  Pinning afterwards
+    // publishes a word a minor has already moved, and the collector then walks
+    // that slot as if it named an object.
+    //
+    // The gateway hands this function a native array it rebuilt from its own
+    // roots, so `args` is not rewritten by a collection either: the variable
+    // and the value are read back too.  The value is whatever the caller
+    // passed, a list or a dict included, and the token at the end is the only
+    // thing that will ever hold the old binding.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let var = || pyre_object::gc_roots::shadow_stack_get(args_base);
+    let value = || pyre_object::gc_roots::shadow_stack_get(args_base + 1);
+
+    let context_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(current_context(true)?.expect("create=true returns a Context"));
+    let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
+
+    let data_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
+
+    let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(match crate::baseobjspace::getitem(data(), var()) {
         Ok(value) => value,
         Err(err) if err.kind == crate::PyErrorKind::KeyError => token_missing(),
         Err(err) => return Err(err),
-    };
-    // The replacement and the store both run Python, and the token below is
-    // the only thing that will ever hold the old binding — nothing roots it
-    // across those two calls, and it is whatever the caller last set, a list
-    // or a dict included.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[context, data, old_value]);
-    let updated_data = call_method_result(
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-        "set",
-        &[args[0], args[1]],
-    )?;
-    let context = pyre_object::gc_roots::shadow_stack_get(base);
-    crate::baseobjspace::setattr_str(context, "_data", updated_data)?;
+    });
+
+    let updated_data = call_method_result(data(), "set", &[var(), value()])?;
+    crate::baseobjspace::setattr_str(context(), "_data", updated_data)?;
     new_token(
-        pyre_object::gc_roots::shadow_stack_get(base),
-        args[0],
-        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        context(),
+        var(),
+        pyre_object::gc_roots::shadow_stack_get(old_value_slot),
     )
 }
 
@@ -212,34 +232,56 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             crate::type_methods::arg_type_name(token),
         )));
     }
-    if crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token, "_used")?)? {
+    // Each attribute read and each mapping call is application-level Python.
+    // Both identity tests below compare addresses, so an operand that moved
+    // under one of these calls does not merely crash -- it reports a token as
+    // belonging to a different ContextVar or Context.  Everything that
+    // outlives a call is therefore read back from its slot, `args` included:
+    // the gateway rebuilt that array from its own roots, so a collection does
+    // not rewrite it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(&[args[0], token]);
+    let var = || pyre_object::gc_roots::shadow_stack_get(args_base);
+    let token = || pyre_object::gc_roots::shadow_stack_get(args_base + 1);
+
+    if crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token(), "_used")?)? {
         return Err(crate::PyError::runtime_error(crate::display::wtf8_format!(
-            token_repr_string(token)?,
+            token_repr_string(token())?,
             " has already been used once",
         )));
     }
-    let token_var = crate::baseobjspace::getattr_str(token, "_var")?;
-    if !std::ptr::eq(token_var, args[0]) {
+    let token_var_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_var")?);
+    let token_var = || pyre_object::gc_roots::shadow_stack_get(token_var_slot);
+    if !std::ptr::eq(token_var(), var()) {
         return Err(crate::PyError::value_error(
             "Token was created by a different ContextVar",
         ));
     }
-    let context = current_context(true)?.expect("create=true returns a Context");
-    let token_context = crate::baseobjspace::getattr_str(token, "_context")?;
-    if !std::ptr::eq(token_context, context) {
+    let context_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(current_context(true)?.expect("create=true returns a Context"));
+    let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
+    if !std::ptr::eq(
+        crate::baseobjspace::getattr_str(token(), "_context")?,
+        context(),
+    ) {
         return Err(crate::PyError::value_error(
             "Token was created in a different Context",
         ));
     }
-    let data = crate::baseobjspace::getattr_str(context, "_data")?;
-    let old_value = crate::baseobjspace::getattr_str(token, "_old_value")?;
-    let updated_data = if std::ptr::eq(old_value, token_missing()) {
-        call_method_result(data, "delete", &[token_var])?
+    let data_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
+    let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_old_value")?);
+    let old_value = || pyre_object::gc_roots::shadow_stack_get(old_value_slot);
+    let updated_data = if std::ptr::eq(old_value(), token_missing()) {
+        call_method_result(data(), "delete", &[token_var()])?
     } else {
-        call_method_result(data, "set", &[token_var, old_value])?
+        call_method_result(data(), "set", &[token_var(), old_value()])?
     };
-    crate::baseobjspace::setattr_str(context, "_data", updated_data)?;
-    crate::baseobjspace::setattr_str(token, "_used", w_bool_from(true))?;
+    crate::baseobjspace::setattr_str(context(), "_data", updated_data)?;
+    crate::baseobjspace::setattr_str(token(), "_used", w_bool_from(true))?;
     Ok(w_none())
 }
 
