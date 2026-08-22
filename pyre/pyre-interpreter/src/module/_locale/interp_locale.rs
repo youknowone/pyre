@@ -20,6 +20,48 @@ type CollationArg = Vec<u16>;
 #[cfg(not(windows))]
 type CollationArg = std::ffi::CString;
 
+/// `_Py_GetLocaleEncoding` — the codeset the active `LC_CTYPE` names.
+///
+/// `locale.py` takes `_locale.getencoding` when the module carries it and
+/// falls back to `sys.getfilesystemencoding()` when it does not, and the two
+/// are different answers wherever the filesystem encoding is not the locale
+/// one — every Windows host, where PEP 529 makes the filesystem utf-8.
+#[cfg(all(windows, not(feature = "sandbox")))]
+fn locale_encoding() -> String {
+    // The active ANSI code page, spelled `cp<n>` whatever it is: code page
+    // 65001 answers `cp65001`, not `utf-8`.
+    format!("cp{}", unsafe {
+        windows_sys::Win32::Globalization::GetACP()
+    })
+}
+
+#[cfg(all(
+    unix,
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+))]
+fn locale_encoding() -> String {
+    match rustpython_host_env::locale::nl_langinfo_codeset() {
+        // An empty codeset answers utf-8: `nl_langinfo` returns one on macOS
+        // when the `LC_CTYPE` locale is not supported.
+        Some(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+        _ => "utf-8".to_string(),
+    }
+}
+
+#[cfg(not(any(all(windows, not(feature = "sandbox")), all(
+    unix,
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+))))]
+fn locale_encoding() -> String {
+    // No host locale to ask, which is the answer `_Py_FORCE_UTF8_LOCALE`
+    // builds give without asking one.
+    "utf-8".to_string()
+}
+
 fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::PyError> {
     let text = crate::baseobjspace::str_utf8_w(obj)?.to_string();
     #[cfg(windows)]
@@ -599,12 +641,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    // `_locale.getencoding` — `_Py_GetLocaleEncodingObject`.
     crate::module_ns_store(
         ns,
         "getencoding",
         crate::make_builtin_function_with_arity(
             "getencoding",
-            |_| Ok(pyre_object::w_str_new("utf-8")),
+            |_| Ok(pyre_object::w_str_new(&locale_encoding())),
             0,
         ),
     );
