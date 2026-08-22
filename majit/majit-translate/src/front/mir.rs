@@ -12464,10 +12464,26 @@ impl<'a> Lowering<'a> {
         if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
             return Ok(false);
         }
-        let op = match leaf.as_str() {
-            "wrapping_add" => "add",
-            "wrapping_sub" => "sub",
-            "wrapping_mul" => "mul",
+        // `wrapping_div` / `wrapping_rem` are the C-truncating primitives, so
+        // they are `llop.int_floordiv` / `llop.int_mod` the same way
+        // `wrapping_add` is `llop.int_add`: `jtransform.py`
+        // `rewrite_op_int_floordiv` / `rewrite_op_int_mod` route those two to
+        // `support.py` `_ll_2_int_floordiv` / `_ll_2_int_mod`, whose bodies are
+        // these same wrapping primitives. Left as a `Call`, the leaf is Opaque
+        // in the LLBC and every division becomes a symbolic host call the
+        // caller must guard for an exception it cannot raise.
+        //
+        // Unsigned does not follow here. The rename table that folds
+        // `uint_{add,sub,mul}` back onto `int_*` — one machine op under two
+        // rtyper dispatches — has no entry for `uint_floordiv` / `uint_mod`,
+        // which really are different instructions, so an unsigned receiver
+        // keeps the `Call` form.
+        let (op, signed_only) = match leaf.as_str() {
+            "wrapping_add" => ("add", false),
+            "wrapping_sub" => ("sub", false),
+            "wrapping_mul" => ("mul", false),
+            "wrapping_div" => ("floordiv", true),
+            "wrapping_rem" => ("mod", true),
             _ => return Ok(false),
         };
         let [lhs, rhs] = args else {
@@ -12487,6 +12503,9 @@ impl<'a> Lowering<'a> {
         let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
         let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
         if !signed_word && !unsigned_word {
+            return Ok(false);
+        }
+        if signed_only && !signed_word {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];

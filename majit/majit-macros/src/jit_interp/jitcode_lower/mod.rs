@@ -261,6 +261,10 @@ pub struct LowererConfig {
     /// Pure unary tag-small helpers.  Key = canonical func path segments.
     /// `lower_native_tag_small_call` emits `(x << 1) | 1` directly.
     pub(super) native_tag_small: Vec<Vec<String>>,
+    /// Unary helpers that return their argument unchanged.  Key = canonical
+    /// func path segments.  `lower_native_identity_call` hands the argument's
+    /// binding to the consumer and emits nothing.
+    pub(super) native_identity: Vec<Vec<String>>,
     /// Source: `JitInterpConfig.split_dispatch`.  When set, the dispatch lowerer
     /// routes pure forward-advancing green-pc arms through the per-arm
     /// sub-JitCode path with a pc-returning `inline_call_<types>_i` instead of
@@ -967,6 +971,7 @@ impl LowererConfig {
         int_fields: &[crate::jit_interp::IntFieldEntry],
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
+        native_identity: &[syn::Path],
         headerless_structs: &[syn::Path],
         inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
     ) -> Self {
@@ -1029,6 +1034,10 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
+            native_identity: native_identity
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
             split_dispatch: false,
             switch_dispatch: false,
         }
@@ -1059,6 +1068,7 @@ impl LowererConfig {
         inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
+        native_identity: &[Path],
         split_dispatch: bool,
         switch_dispatch: bool,
     ) -> Self {
@@ -1305,6 +1315,10 @@ impl LowererConfig {
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
                 .collect(),
             native_tag_small: native_tag_small
+                .iter()
+                .map(canonical_path_segments)
+                .collect(),
+            native_identity: native_identity
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
@@ -2885,9 +2899,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs,
-            // inlined_prefix — the surface these tests assert is the call
-            // encoding, which none of them participate in.
+            // native_int_binops, native_tag_small, native_identity,
+            // headerless_structs, inlined_prefix — the surface these tests
+            // assert is the call encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2904,6 +2919,44 @@ mod tests {
         assert!(!body.contains("inline_call_with_typed_args"));
     }
 
+    /// A `native_identity` helper leaves no call behind: the argument's
+    /// binding is what the consumer reads.  The call policies are empty, so a
+    /// recognizer that failed to fire would reach the inference-failure panic
+    /// before any assertion below runs.
+    #[test]
+    fn inline_helper_codegen_drops_a_native_identity_call() {
+        let identity: syn::Path = syn::parse_str("unwrap_word").expect("path");
+        let helper = generate_inline_helper_jitcode_with_calls(
+            &parse_fn(
+                r#"
+                fn outer(arg: i64) -> i64 {
+                    unwrap_word(arg)
+                }
+                "#,
+            ),
+            &[],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small.
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&identity),
+            // headerless_structs, inlined_prefix.
+            &[],
+            &[],
+        )
+        .expect("jit_inline lowering should succeed")
+        .expect("helper should lower");
+        let body = helper.body.to_string();
+        assert!(
+            !body.contains("call"),
+            "a native_identity call must not reach the jitcode: {body}"
+        );
+    }
+
     #[test]
     fn inline_helper_codegen_uses_canonical_ir_surface() {
         let helper = generate_inline_helper_jitcode_with_calls(
@@ -2916,9 +2969,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs,
-            // inlined_prefix — the surface these tests assert is the call
-            // encoding, which none of them participate in.
+            // native_int_binops, native_tag_small, native_identity,
+            // headerless_structs, inlined_prefix — the surface these tests
+            // assert is the call encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2947,9 +3001,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs,
-            // inlined_prefix — the surface these tests assert is the call
-            // encoding, which none of them participate in.
+            // native_int_binops, native_tag_small, native_identity,
+            // headerless_structs, inlined_prefix — the surface these tests
+            // assert is the call encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],

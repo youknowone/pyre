@@ -63,6 +63,13 @@ enum Nullness {
     Unknown,
 }
 
+/// Which end of a range a comparison against a constant pins down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RangeBound {
+    Lower,
+    Upper,
+}
+
 /// Rewrite operations into equivalent, cheaper forms.
 ///
 /// Handles:
@@ -76,6 +83,7 @@ enum Nullness {
 /// - Pointer equality on same OpRef
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
+/// - Range-test fusion (two constant-bounded comparisons multiplied together)
 pub struct OptRewrite {
     /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, populated by
     /// optimize_comparison. Upstream has no bool_result_cache; find_rewritable_bool
@@ -87,6 +95,18 @@ pub struct OptRewrite {
     /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
     /// would entrench a structure upstream does not have.
     bool_result_cache: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
+    /// Result OpRef → the comparison that produced it, the reverse of
+    /// `bool_result_cache` and populated from the same arm.
+    ///
+    /// A fold that reaches back from a consumer to its comparison operands
+    /// cannot use `get_producing_op`: that reports a producer only once it is
+    /// in `emitted_operations`, and `OptHeap` — last in the pipeline — holds
+    /// the most recent comparison in `postponed_op` instead of emitting it.
+    /// The comparison immediately preceding a consumer is therefore invisible
+    /// there, which is the common case rather than a corner one. This map is
+    /// written as the comparison passes through this pass, so nothing
+    /// downstream can hide it.
+    comparison_by_result: indexmap::IndexMap<OpRef, (OpCode, Operand, Operand)>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
@@ -100,6 +120,7 @@ impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
             bool_result_cache: indexmap::IndexMap::new(),
+            comparison_by_result: indexmap::IndexMap::new(),
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
         }
@@ -662,8 +683,107 @@ impl OptRewrite {
         let arg1 = op.arg(1);
         self.bool_result_cache
             .insert((op.opcode, arg0.to_opref(), arg1.to_opref()), op.pos.get());
+        self.comparison_by_result
+            .insert(op.pos.get(), (op.opcode, arg0, arg1));
 
         OptimizationResult::PassOn
+    }
+
+    /// One side of a range test: the value compared, its bound, and whether
+    /// the bound is the lower or the upper one.
+    ///
+    /// `IntGe(v, C)` is `v >= C`, so `C` is a lower bound; `IntGe(C, v)` is
+    /// `C >= v`, so `C` is an upper bound. A comparison of two constants is
+    /// not a range test side — constant folding owns it.
+    fn range_bound_of(
+        &self,
+        entry: &(OpCode, Operand, Operand),
+        ctx: &mut OptContext,
+    ) -> Option<(RangeBound, Operand, i64)> {
+        let (opcode, ref arg0, ref arg1) = *entry;
+        if opcode != OpCode::IntGe {
+            return None;
+        }
+        let const_of = |ctx: &mut OptContext, o: &Operand| {
+            ctx.resolve_operand_operand_opt(o)
+                .and_then(|b| ctx.get_constant_int_box(&b))
+        };
+        match (const_of(ctx, arg0), const_of(ctx, arg1)) {
+            (None, Some(lo)) => Some((RangeBound::Lower, arg0.clone(), lo)),
+            (Some(hi), None) => Some((RangeBound::Upper, arg1.clone(), hi)),
+            _ => None,
+        }
+    }
+
+    /// Fuse a pair of constant-bounded comparisons multiplied together into a
+    /// single unsigned compare.
+    ///
+    /// `IntMul(IntGe(v, LO), IntGe(HI, v))` is `LO <= v <= HI` computed as a
+    /// branchless product of two 0/1 results. The same predicate is one
+    /// unsigned compare against a constant span, `uint_lt(v - LO, HI+1-LO)`,
+    /// exact for every `v` because the subtraction wraps. The emitted shape
+    /// is the expansion `pyjitpl.py opimpl_int_between` performs, down to its
+    /// collapse to `int_eq` on a span of one, so the two spellings of the
+    /// predicate optimize to the same operations.
+    ///
+    /// Only the multiply is rewritten; both comparisons are left in the
+    /// trace. A guard's failargs may name one, and one that nothing reads
+    /// costs nothing to leave — the backend skips a pure op with no live
+    /// result rather than encoding it.
+    fn optimize_int_mul_range_test(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let lhs = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+        let rhs = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
+        let (Some(lhs_entry), Some(rhs_entry)) = (
+            self.comparison_by_result.get(&lhs).cloned(),
+            self.comparison_by_result.get(&rhs).cloned(),
+        ) else {
+            return OptimizationResult::PassOn;
+        };
+        let (Some(left), Some(right)) = (
+            self.range_bound_of(&lhs_entry, ctx),
+            self.range_bound_of(&rhs_entry, ctx),
+        ) else {
+            return OptimizationResult::PassOn;
+        };
+        // One bound of each kind, both against the same value. Two lower
+        // bounds (or two upper ones) are a different predicate entirely.
+        let ((var, lo), (other, hi)) = match (left, right) {
+            ((RangeBound::Lower, v, lo), (RangeBound::Upper, o, hi))
+            | ((RangeBound::Upper, o, hi), (RangeBound::Lower, v, lo)) => ((v, lo), (o, hi)),
+            _ => return OptimizationResult::PassOn,
+        };
+        if var.to_opref() != other.to_opref() {
+            return OptimizationResult::PassOn;
+        }
+        // An empty range is a constant-false predicate this fold does not
+        // spell, and a span that does not fit an i64 has no constant to
+        // compare against.
+        let Some(span) = hi
+            .checked_sub(lo)
+            .filter(|d| *d >= 0)
+            .and_then(|d| d.checked_add(1))
+        else {
+            return OptimizationResult::PassOn;
+        };
+        // The value rides on the inline-Const OpRef tag, so a bound needs no
+        // producing operation of its own.
+        let lo_operand = ctx.materialize_operand_at(majit_ir::OpRef::const_int(lo));
+        // opimpl_int_between: `a <= b < a+1` is `b == a`.
+        let mut fused = if span == 1 {
+            Op::new(OpCode::IntEq, &[var, lo_operand])
+        } else {
+            let offset = ctx.send_extra_operation(Op::new(OpCode::IntSub, &[var, lo_operand]));
+            let offset_operand = ctx.materialize_operand_at(offset);
+            let span_operand = ctx.materialize_operand_at(majit_ir::OpRef::const_int(span));
+            Op::new(OpCode::UintLt, &[offset_operand, span_operand])
+        };
+        fused.pos.set(op.pos.get());
+        // Re-dispatched from the head of the chain, not handed to the next
+        // pass: the bound of the fused result is what lets a later
+        // `OptIntBounds` rule keep the arithmetic that reads it on the
+        // unchecked opcodes. Skipping that pass leaves the result unbounded
+        // and promotes every such consumer to an overflow-checked form.
+        OptimizationResult::Restart(fused)
     }
 
     // ── Guards ──
@@ -1798,6 +1918,7 @@ impl Optimization for OptRewrite {
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
             OpCode::IntBetween => self.optimize_int_between(op, ctx),
+            OpCode::IntMul => self.optimize_int_mul_range_test(op, ctx),
 
             // ── Comparisons ──
             OpCode::IntLt
@@ -2333,6 +2454,7 @@ impl Optimization for OptRewrite {
         // maintained cross-pass by propagate_from_pass_range +
         // emit_operation — no per-pass setup needed.
         self.bool_result_cache.clear();
+        self.comparison_by_result.clear();
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();
     }
@@ -2688,6 +2810,178 @@ mod tests {
 
         let new_ops: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
         (new_ops, ctx)
+    }
+
+    /// `2025 <= v <= 5625` spelled as a product of two comparisons, the shape
+    /// a guest program produces when it has no range primitive of its own.
+    /// Both bounds are constants, so the fused form compares against a
+    /// constant span and the multiply disappears.
+    fn range_test_specs(lo: i64, hi: i64) -> (Vec<OpSpec>, Vec<(OpRef, Value)>) {
+        let specs = vec![
+            same_i(),                    // 0: v
+            same_i(),                    // 1: LO
+            same_i(),                    // 2: HI
+            bin_i(OpCode::IntGe, 0, 1),  // 3: v >= LO
+            bin_i(OpCode::IntGe, 2, 0),  // 4: HI >= v
+            bin_i(OpCode::IntMul, 3, 4), // 5: both
+        ];
+        let constants = vec![
+            (OpRef::int_op(1), Value::Int(lo)),
+            (OpRef::int_op(2), Value::Int(hi)),
+        ];
+        (specs, constants)
+    }
+
+    fn opcodes_of(ops: &[Op]) -> Vec<OpCode> {
+        ops.iter().map(|op| op.opcode).collect()
+    }
+
+    /// Like `run_one`, but every op from `num_inputs` on transits the chain,
+    /// so a fold that reads what an earlier op recorded is exercised. The
+    /// leading input ops are emitted directly, as `run_one` does — routing a
+    /// constant-valued placeholder through the chain would ask the executor
+    /// to fold it.
+    ///
+    /// Returns the emitted ops and, separately, the ops a pass parked in
+    /// `extra_operations_after`. Production propagates those through the
+    /// remaining passes and `Optimizer::emit_operation` lands each one ahead
+    /// of its consumer via `flush_queued_producer`; only the whole optimizer
+    /// drives that, so here they are reported rather than emitted.
+    fn run_rewrite_after_inputs(
+        specs: &[OpSpec],
+        num_inputs: usize,
+        constants: &[(OpRef, Value)],
+    ) -> (Vec<Op>, Vec<Op>) {
+        let ops = build_specs(specs);
+        let mut ctx = OptContext::new(ops.len());
+        for op in &ops[..num_inputs] {
+            ctx.emit((**op).clone());
+        }
+        for &(opref, value) in constants {
+            let b = ctx.materialize_operand_at(opref);
+            ctx.make_constant_box(&b, value);
+        }
+        let mut passes = test_pass_chain();
+        let mut queued: Vec<Op> = Vec::new();
+        for op in &ops[num_inputs..] {
+            let mut resolved = (**op).clone();
+            resolve_op_args_in_ctx(&mut resolved, &mut ctx);
+            let op_rc = std::rc::Rc::new(resolved.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+            let mut result = OptimizationResult::PassOn;
+            for pass in passes.iter_mut() {
+                result = pass.propagate_forward(&resolved, &op_rc, &mut ctx);
+                if !matches!(result, OptimizationResult::PassOn) {
+                    break;
+                }
+            }
+            while let Some((_, extra)) = ctx.extra_operations_after.pop_front() {
+                queued.push((*extra).clone());
+            }
+            match result {
+                OptimizationResult::Emit(op)
+                | OptimizationResult::Replace(op)
+                | OptimizationResult::Restart(op) => {
+                    ctx.emit(op);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::InvalidLoop(reason) => panic!("invalid loop: {reason}"),
+            }
+        }
+        let emitted = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
+        (emitted, queued)
+    }
+
+    #[test]
+    fn a_multiplied_pair_of_constant_bounded_comparisons_becomes_one_unsigned_compare() {
+        let (specs, constants) = range_test_specs(2025, 5625);
+        let (ops, queued) = run_rewrite_after_inputs(&specs, 3, &constants);
+        let opcodes = opcodes_of(&ops);
+
+        assert!(
+            !opcodes.contains(&OpCode::IntMul),
+            "the multiply must be replaced, got {opcodes:?}"
+        );
+        let sub = queued
+            .iter()
+            .find(|op| op.opcode == OpCode::IntSub)
+            .unwrap_or_else(|| panic!("the offset subtraction must be queued, got {queued:?}"));
+        assert_eq!(sub.arg(1).const_int(), Some(2025), "offset is `v - LO`");
+        let cmp = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::UintLt)
+            .expect("the fused compare must be emitted");
+        assert_eq!(
+            cmp.arg(0).to_opref(),
+            sub.pos.get(),
+            "the compare reads the queued offset"
+        );
+        // `HI + 1 - LO`, the exclusive span opimpl_int_between compares against.
+        assert_eq!(cmp.arg(1).const_int(), Some(3601));
+    }
+
+    /// The fold rewrites the multiply and nothing else. A comparison whose
+    /// result a guard names in its failargs is still needed to rebuild the
+    /// interpreter state, so removing it here would corrupt the deopt.
+    #[test]
+    fn a_fused_range_test_leaves_both_comparisons_in_the_trace() {
+        let (specs, constants) = range_test_specs(2025, 5625);
+        let (ops, _queued) = run_rewrite_after_inputs(&specs, 3, &constants);
+
+        assert_eq!(
+            opcodes_of(&ops)
+                .iter()
+                .filter(|opcode| **opcode == OpCode::IntGe)
+                .count(),
+            2,
+            "both bound comparisons must survive the fold"
+        );
+    }
+
+    /// opimpl_int_between collapses `a <= b < a+1` to `b == a`; a range whose
+    /// bounds meet is that case.
+    #[test]
+    fn a_range_test_of_one_value_becomes_an_equality() {
+        let (specs, constants) = range_test_specs(7, 7);
+        let (ops, queued) = run_rewrite_after_inputs(&specs, 3, &constants);
+        let opcodes = opcodes_of(&ops);
+
+        assert!(opcodes.contains(&OpCode::IntEq), "got {opcodes:?}");
+        assert!(!opcodes.contains(&OpCode::UintLt), "no span compare needed");
+        assert!(queued.is_empty(), "no offset needed, got {queued:?}");
+    }
+
+    /// Two bounds of the same kind are a different predicate, and an empty
+    /// range is not one this fold spells. Neither may be rewritten.
+    #[test]
+    fn only_an_opposed_pair_over_a_nonempty_range_fuses() {
+        let two_lower = vec![
+            same_i(),
+            same_i(),
+            same_i(),
+            bin_i(OpCode::IntGe, 0, 1),
+            bin_i(OpCode::IntGe, 0, 2),
+            bin_i(OpCode::IntMul, 3, 4),
+        ];
+        let constants = vec![
+            (OpRef::int_op(1), Value::Int(10)),
+            (OpRef::int_op(2), Value::Int(20)),
+        ];
+        assert!(
+            opcodes_of(&run_rewrite_after_inputs(&two_lower, 3, &constants).0)
+                .contains(&OpCode::IntMul),
+            "two lower bounds are not a range test"
+        );
+
+        let (specs, empty_range) = range_test_specs(100, 20);
+        assert!(
+            opcodes_of(&run_rewrite_after_inputs(&specs, 3, &empty_range).0)
+                .contains(&OpCode::IntMul),
+            "an empty range must not be rewritten"
+        );
     }
 
     // ── Binary integer operation tests (consolidated) ──

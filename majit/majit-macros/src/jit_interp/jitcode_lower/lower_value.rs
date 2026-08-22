@@ -309,6 +309,13 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_tag_small_call(call) {
                     return Some(binding);
                 }
+                // A helper that hands its argument straight back is opened by
+                // the inliner upstream and its residue dropped by
+                // `jtransform.py` `rewrite_op_same_as`; the LLBC tracer sees
+                // the call, so drop it here instead.
+                if let Some(binding) = self.lower_native_identity_call(call) {
+                    return Some(binding);
+                }
                 // Raw native-memory load intrinsic `majit_raw_load_iXX(base, ea)`
                 // → raw_load_i (jtransform.py rewrite_op_raw_load).
                 if let Some(binding) = self.lower_raw_load_call(call) {
@@ -2043,6 +2050,23 @@ impl<'c> Lowerer<'c> {
             depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
             struct_type: None,
         })
+    }
+
+    /// Recognize a unary function call registered in `native_identity` and
+    /// bind its argument in place of the call, emitting nothing.
+    ///
+    /// The argument is still lowered, so a receiver that mutates state keeps
+    /// running; only the wrapper around its result goes away.
+    fn lower_native_identity_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        let config = self.config?;
+        let func_segments = canonical_expr_segments(&call.func)?;
+        if !config.native_identity.contains(&func_segments) {
+            return None;
+        }
+        if call.args.len() != 1 {
+            return None;
+        }
+        self.lower_value_expr(&call.args[0])
     }
 
     /// Recognize a unary function call registered in `native_tag_small` and

@@ -5001,6 +5001,7 @@ where
             jitcode::insns::BC_UINT_LE => self.trace_binop_i(ctx, OpCode::UintLe),
             jitcode::insns::BC_UINT_GT => self.trace_binop_i(ctx, OpCode::UintGt),
             jitcode::insns::BC_UINT_GE => self.trace_binop_i(ctx, OpCode::UintGe),
+            jitcode::insns::BC_INT_BETWEEN => self.trace_int_between(ctx),
             jitcode::insns::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
             jitcode::insns::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
             jitcode::insns::BC_INT_IS_TRUE => self.trace_unary_i(ctx, OpCode::IntIsTrue),
@@ -9068,13 +9069,28 @@ where
             let dst = frame.next_reg() as usize;
             (lhs_idx, rhs_idx, dst)
         };
-        let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
-        let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
+        let lhs = self.read_int_reg(lhs_idx);
+        let rhs = self.read_int_reg(rhs_idx);
+        let (opref, value) = self.execute_binop_i(ctx, opcode, lhs, rhs);
+        self.set_int_reg(dst, Some(opref), Some(value));
+    }
+
+    /// `pyjitpl.py MIFrame.execute(opnum, b1, b2)` over two int boxes.
+    ///
+    /// Returns the result box paired with the value the traced iteration
+    /// produced, which is what an opimpl that chains several of these needs
+    /// in order to test an intermediate for constancy.
+    fn execute_binop_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        opcode: OpCode,
+        (lhs, lhs_value): (OpRef, i64),
+        (rhs, rhs_value): (OpRef, i64),
+    ) -> (OpRef, i64) {
         if lhs == rhs
             && let Some(fast) = fastpath_same_boxes(opcode)
         {
-            self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
-            return;
+            return (ctx.const_int(fast), fast);
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
         // pyjitpl.py `_record_helper_pure`: a pure op whose args are all
@@ -9082,14 +9098,43 @@ where
         // nothing.  Every opcode routed here is a pure int/uint arithmetic or
         // comparison, so an all-constant pair yields a constant destination.
         if lhs.is_constant() && rhs.is_constant() {
-            self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
-            return;
+            return (ctx.const_int(value), value);
         }
         let opref = ctx.record_op(opcode, &[lhs, rhs]);
         // `Box(value)` parity: stamp the result OpRef with its
         // runtime concrete so downstream `box_value(opref)` consumers
         // see the value (matches PyPy `BoxInt(value)` carrier).
         ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        (opref, value)
+    }
+
+    /// `pyjitpl.py opimpl_int_between` — `a <= b < c`, expanded here into
+    /// `uint_lt(b - a, c - a)`, or into `int_eq(b, a)` when the span is one.
+    ///
+    /// The three-argument form is a jitcode op with no resop behind it: the
+    /// tracer never records one, which is why no backend has to lower it.
+    /// `blackhole.py bhimpl_int_between` evaluates the jitcode op directly,
+    /// so the op itself stays.
+    fn trace_int_between(&mut self, ctx: &mut TraceCtx) {
+        // `[a][b][c][dst]` matching the `bhhandler_iii_i!` decoder.
+        let (a_idx, b_idx, c_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let a_idx = frame.next_reg() as usize;
+            let b_idx = frame.next_reg() as usize;
+            let c_idx = frame.next_reg() as usize;
+            let dst = frame.next_reg() as usize;
+            (a_idx, b_idx, c_idx, dst)
+        };
+        let a = self.read_int_reg(a_idx);
+        let b = self.read_int_reg(b_idx);
+        let c = self.read_int_reg(c_idx);
+        let span = self.execute_binop_i(ctx, OpCode::IntSub, c, a);
+        let (opref, value) = if span.0.is_constant() && span.1 == 1 {
+            self.execute_binop_i(ctx, OpCode::IntEq, b, a)
+        } else {
+            let offset = self.execute_binop_i(ctx, OpCode::IntSub, b, a);
+            self.execute_binop_i(ctx, OpCode::UintLt, offset, span)
+        };
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 

@@ -195,6 +195,17 @@ pub struct JitInterpConfig {
     pub native_int_binops: Vec<(Path, Ident)>,
     /// native_tag_small = { jit_retag_small } — unary fns lowered to (x<<1)|1 native IR.
     pub native_tag_small: Vec<Path>,
+    /// Pure function → its own argument.  `native_identity = { unwrap_word }`.
+    /// A call whose path matches one of these is replaced by the binding of
+    /// its single argument, so the trace never sees a call at all.  RPython
+    /// needs no such declaration: `backendopt/inline.py` opens a helper this
+    /// small before the codewriter runs, and `jtransform.py`
+    /// `rewrite_op_same_as` drops the identity residue it leaves behind.  The
+    /// LLBC tracer still sees the Rust call, so the drop is declared here.
+    /// Declaring a function whose argument and result do not share a register
+    /// class is a miscompile — the argument's binding is handed straight to
+    /// the consumer.
+    pub native_identity: Vec<Path>,
     /// Opt-in: route pure forward-advancing dispatch arms (those whose body
     /// only does work then `pc += N`, with no back-edge / `can_enter_jit!` /
     /// early return) through the per-arm sub-JitCode path with a pc-returning
@@ -702,6 +713,7 @@ impl Parse for JitInterpConfig {
         let mut inlined_prefix: Vec<InlinedPrefixEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
+        let mut native_identity: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
         let mut switch_dispatch = false;
 
@@ -783,6 +795,9 @@ impl Parse for JitInterpConfig {
                 "native_tag_small" => {
                     native_tag_small = parse_native_tag_small_list(input)?;
                 }
+                "native_identity" => {
+                    native_identity = parse_path_set(input)?;
+                }
                 "split_dispatch" => {
                     split_dispatch = input.parse::<LitBool>()?.value;
                 }
@@ -849,6 +864,7 @@ impl Parse for JitInterpConfig {
             inlined_prefix,
             native_int_binops,
             native_tag_small,
+            native_identity,
             split_dispatch,
             switch_dispatch,
         })

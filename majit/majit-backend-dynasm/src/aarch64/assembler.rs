@@ -2215,10 +2215,28 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::PtrNe
             | OpCode::InstancePtrEq
             | OpCode::InstancePtrNe => {
+                // Only the right-hand operand has an immediate form, so a
+                // comparison whose constant sits on the left materializes it
+                // into a scratch register first. Swapping the operands folds
+                // it back into the `cmp` — but a comparison is not symmetric,
+                // so the swap has to move into the condition, which is what
+                // `resoperation.py`'s reflex table answers. `prepare_int_ri`
+                // already swaps a leading immediate for the symmetric
+                // arithmetic ops, where no condition follows the operands.
+                let mut opcode = op.opcode;
                 if arglocs.len() >= 2 {
-                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_))
+                        && !matches!(arglocs[1], Loc::Immed(_))
+                        && let Some(reflexed) = opcode.bool_reflex()
+                    {
+                        opcode = reflexed;
+                        (&arglocs[1], &arglocs[0])
+                    } else {
+                        (&arglocs[0], &arglocs[1])
+                    };
+                    self.emit_cmp_loc_loc(cmp0, cmp1);
                 }
-                let cc = Self::opcode_to_cc(op.opcode);
+                let cc = Self::opcode_to_cc(opcode);
                 self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
