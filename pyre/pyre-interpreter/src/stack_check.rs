@@ -287,22 +287,32 @@ pub fn configure_current_thread_stack_size(size: usize) {
     reset_stack_base();
 }
 
-#[cfg(unix)]
-fn platform_stack_size() -> usize {
-    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } != 0 {
-        return 0;
+/// rpython/translator/c/src/stack.c:23-36 `_ll_stack_os_limit`. Size in
+/// bytes of this thread's C stack as the OS sees it, or 0 when
+/// unknown/unlimited. Computed once and cached: this is not on a hot
+/// path, but `test.support.infinite_recursion()` toggles the recursion
+/// limit in a loop, so caching keeps repeated calls free.
+#[cfg(not(any(windows, target_arch = "wasm32")))]
+fn stack_os_limit() -> usize {
+    static CACHED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != usize::MAX {
+        return cached;
     }
-    let limit = unsafe { limit.assume_init() }.rlim_cur;
-    if limit == libc::RLIM_INFINITY || limit == 0 {
-        0
-    } else {
-        usize::try_from(limit).unwrap_or(usize::MAX)
-    }
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    let limit = match unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } {
+        0 if rl.rlim_cur != libc::RLIM_INFINITY && rl.rlim_cur != 0 => rl.rlim_cur as usize,
+        _ => 0,
+    };
+    CACHED.store(limit, Ordering::Relaxed);
+    limit
 }
 
-#[cfg(not(unix))]
-fn platform_stack_size() -> usize {
+/// Windows before `GetCurrentThreadStackLimits` (Windows 8) and wasm32
+/// have no runtime query, so no clamp applies — matching the
+/// `#ifdef` fallthrough at stack.c:36-45.
+#[cfg(any(windows, target_arch = "wasm32"))]
+fn stack_os_limit() -> usize {
     0
 }
 
@@ -315,7 +325,7 @@ fn platform_stack_size() -> usize {
 /// than abandoned when it does not fit — darwin's stops at 65520 KiB, a
 /// hair under 64 MiB, and refusing there would leave the interpreter on the
 /// default 8 MiB.  `usize::MAX` reports an unlimited stack, which is what
-/// [`platform_stack_size`] declines to describe.
+/// [`stack_os_limit`] declines to describe.
 #[cfg(unix)]
 pub fn raise_main_thread_stack_limit(size: usize) -> usize {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
@@ -360,7 +370,7 @@ fn effective_stack_length() -> usize {
     let os_size = TL_OS_STACK_SIZE.with(|slot| {
         let installed = slot.get();
         if installed == 0 {
-            platform_stack_size()
+            stack_os_limit()
         } else {
             installed
         }
