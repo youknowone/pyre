@@ -30,5 +30,28 @@ del lazarus
 gc.collect()
 print(len(storage))
 
+# A generator's finalizer is the collector's too: `close` counts as the run, so
+# a generator that resurrects itself from a `finally` block reads back the same
+# way.  The cycle is generator -> frame -> box -> generator, so only the
+# collector can reach it.
+def resurrect(box):
+    try:
+        yield 1
+    finally:
+        storage.append(box[0])
+
+
+box = []
+gen = resurrect(box)
+next(gen)
+box.append(gen)
+print(gc.is_finalized(gen))
+
+del gen, box
+gc.collect()
+
+gen = storage.pop()
+print(gc.is_finalized(gen))
+
 # An object no collector tracks is never finalized.
 print(gc.is_finalized(3))

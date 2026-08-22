@@ -2646,6 +2646,29 @@ impl UserDelAction {
         }
     }
 
+    /// Defer this finalizer under `gc.disable()`, and otherwise record that it
+    /// ran.  Returns whether the caller should go on and run it.
+    ///
+    /// The queue the object arrives on is the collector's, so the run is
+    /// recorded where `finalize_garbage` sets `_PyGC_SET_FINALIZED` — before
+    /// the call, not after it the way the refcount path's
+    /// `PyObject_CallFinalizer` does.  `gc.is_finalized` reads it back for an
+    /// object its own finalizer resurrected.  A deferred finalizer has not run
+    /// and is not recorded.
+    ///
+    /// Every branch of [`Self::_call_finalizer`] that runs a `tp_finalize`
+    /// equivalent comes through here: the async-generator awaitables, the
+    /// generators and coroutines, and `__del__`.  The remaining branches
+    /// release a buffer export, which `tp_dealloc` does and `tp_finalize`
+    /// does not.
+    fn begin_finalizer(&mut self, w_obj: PyObjectRef) -> bool {
+        if self.gc_disabled(w_obj) {
+            return false;
+        }
+        majit_gc::gc_mark_finalizer_run(w_obj as usize);
+        true
+    }
+
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -2674,14 +2697,14 @@ impl UserDelAction {
             // user-defined app-level function defers under `gc.disable()`.
             // This one emits a RuntimeWarning, so it reaches the overridable
             // `warnings` machinery, exactly like the generator branch below.
-            if self.gc_disabled(current()) {
+            if !self.begin_finalizer(current()) {
                 return;
             }
             crate::baseobjspace::async_gen_awaitable_finalize(current());
             return;
         }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {
-            if self.gc_disabled(current()) {
+            if !self.begin_finalizer(current()) {
                 return;
             }
             if let Err(mut error) = crate::baseobjspace::generator_finalize(current()) {
@@ -2730,7 +2753,7 @@ impl UserDelAction {
         else {
             return;
         };
-        if self.gc_disabled(current()) {
+        if !self.begin_finalizer(current()) {
             return;
         }
         // `__del__` runs arbitrary Python, so it can collect and move the
@@ -2739,12 +2762,6 @@ impl UserDelAction {
         let _ = pyre_object::gc_roots::pin_root(w_del);
         let del_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let del = || pyre_object::gc_roots::shadow_stack_get(del_slot);
-        // The queue this object arrives on is the collector's, so record the
-        // run where `finalize_garbage` sets `_PyGC_SET_FINALIZED` — before the
-        // call, not after it the way the refcount path's
-        // `PyObject_CallFinalizer` does.  `gc.is_finalized` reads it back for
-        // an object that `__del__` resurrected.
-        majit_gc::gc_mark_finalizer_run(current() as usize);
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
         if let Err(error) = unsafe {
