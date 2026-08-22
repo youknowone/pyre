@@ -30,6 +30,13 @@ pub unsafe extern "C" fn PyFloat_CheckExact(object: *mut CPyObject) -> c_int {
     (!object.is_null() && super::object::is_exactly(object, &pyre_object::FLOAT_TYPE)) as c_int
 }
 
+/// `floatobject.py PyFloat_AS_DOUBLE` — the read [`PyFloat_AsDouble`] makes,
+/// under a name whose macro spelling promises no error checking.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyFloat_AS_DOUBLE(object: *mut CPyObject) -> c_double {
+    unsafe { PyFloat_AsDouble(object) }
+}
+
 /// `floatobject.py PyFloat_FromString` — `float(o)`.
 ///
 /// The argument is named `str` upstream and read as one, but nothing here
@@ -47,6 +54,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyFloat_FromDouble as *const ());
     std::hint::black_box(PyFloat_AsDouble as *const ());
     std::hint::black_box(PyFloat_FromString as *const ());
+    std::hint::black_box(PyFloat_AS_DOUBLE as *const ());
     std::hint::black_box(PyFloat_Check as *const ());
     std::hint::black_box(PyFloat_CheckExact as *const ());
     std::hint::black_box(PyFloat_Pack2 as *const ());

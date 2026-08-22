@@ -298,6 +298,118 @@ pub unsafe extern "C" fn PyCFunction_GetSelf(object: *mut CPyObject) -> *mut CPy
     }
 }
 
+/// `PyMethodDescr_Check(op)` — a descriptor built from a `PyMethodDef` row.
+///
+/// # Safety
+/// `object` must be null or a live reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && unsafe {
+        crate::baseobjspace::issubtype_w(
+            (*object).w_class,
+            super::typeobject::method_descriptor_type(),
+        )
+    }) as c_int
+}
+
+/// `PyMethodDescr_CheckExact(op)`.
+///
+/// # Safety
+/// `object` must be null or a live reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMethodDescr_CheckExact(object: *mut CPyObject) -> c_int {
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null()
+        && unsafe { (*object).w_class } == super::typeobject::method_descriptor_type())
+        as c_int
+}
+
+/// `methodobject.py PyDescr_NewMethod(type, method)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDescr_NewMethod(
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+) -> *mut CPyObject {
+    unsafe {
+        descriptor_over(
+            super::typeobject::method_descriptor_type(),
+            tp,
+            method,
+            "PyDescr_NewMethod",
+        )
+    }
+}
+
+/// `methodobject.py PyDescr_NewClassMethod(type, method)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDescr_NewClassMethod(
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+) -> *mut CPyObject {
+    unsafe {
+        descriptor_over(
+            super::typeobject::classmethod_descriptor_type(),
+            tp,
+            method,
+            "PyDescr_NewClassMethod",
+        )
+    }
+}
+
+/// The descriptor `carrier_type` makes of `method` declared in `tp`, which is
+/// everything the two entry points above share.
+///
+/// # Safety
+/// `tp` must be null or a live type mirror, and `method` null or a live row.
+unsafe fn descriptor_over(
+    carrier_type: PyObjectRef,
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+    entry_point: &str,
+) -> *mut CPyObject {
+    let w_type = unsafe { pyobject::from_ref(tp as *mut CPyObject) };
+    if method.is_null() || w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("bad argument to {entry_point}"),
+        ));
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(super::typeobject::new_method_descriptor(
+        carrier_type,
+        w_type,
+        method,
+    ))
+}
+
+/// `methodobject.py PyClassMethod_New(f)` — `classmethod(f)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyClassMethod_New(function: *mut CPyObject) -> *mut CPyObject {
+    unsafe { wrapped_in(function, &pyre_object::function::CLASSMETHOD_TYPE) }
+}
+
+/// `methodobject.py PyStaticMethod_New(f)` — `staticmethod(f)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyStaticMethod_New(function: *mut CPyObject) -> *mut CPyObject {
+    unsafe { wrapped_in(function, &pyre_object::function::STATICMETHOD_TYPE) }
+}
+
+/// `wrapper(function)` — the two above differ only in which class wraps.
+///
+/// # Safety
+/// `function` must be null or a live reference.
+unsafe fn wrapped_in(
+    function: *mut CPyObject,
+    wrapper: &'static pyre_object::pyobject::PyType,
+) -> *mut CPyObject {
+    let Some(function) = super::object::argument(function) else {
+        return std::ptr::null_mut();
+    };
+    let wrapper = crate::typedef::gettypeobject(wrapper);
+    super::object::result(crate::call::call_function_impl_result(wrapper, &[function]))
+}
+
 /// `PyCFunction_New(ml, self)` — the callable a `PyMethodDef` row describes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCFunction_New(
@@ -649,4 +761,11 @@ pub(super) fn call_method_def_in_class(
     )
 }
 
-pub(super) fn ensure_linked() {}
+pub(super) fn ensure_linked() {
+    std::hint::black_box(PyMethodDescr_Check as *const ());
+    std::hint::black_box(PyMethodDescr_CheckExact as *const ());
+    std::hint::black_box(PyDescr_NewMethod as *const ());
+    std::hint::black_box(PyDescr_NewClassMethod as *const ());
+    std::hint::black_box(PyClassMethod_New as *const ());
+    std::hint::black_box(PyStaticMethod_New as *const ());
+}

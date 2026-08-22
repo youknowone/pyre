@@ -1264,6 +1264,46 @@ pub unsafe extern "C" fn PyUnicode_Join(
     super::object::result(super::object::call_method(separator, "join", &[sequence]))
 }
 
+/// `unicodeobject.py PyUnicode_Split` — `string.split(separator, maxsplit)`.
+///
+/// A null separator is the `None` that splits on runs of whitespace; any other
+/// one must be a string, which is what `ensure_unicode` asks of both operands.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Split(
+    string: *mut CPyObject,
+    separator: *mut CPyObject,
+    maxsplit: isize,
+) -> *mut CPyObject {
+    let Some(string) = str_argument(string, must_be_str) else {
+        return std::ptr::null_mut();
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let string_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(string);
+    let separator = match separator.is_null() {
+        true => pyre_object::PY_NULL,
+        false => match str_argument(separator, must_be_str) {
+            Some(separator) => separator,
+            None => return std::ptr::null_mut(),
+        },
+    };
+    let separator_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(separator);
+    // Minting the count may collect, so both arguments are read back after.
+    let count_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_int_new(maxsplit as i64));
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    let separator = match reload(separator_slot) {
+        separator if separator.is_null() => pyre_object::w_none(),
+        separator => separator,
+    };
+    super::object::result(super::object::call_method(
+        reload(string_slot),
+        "split",
+        &[separator, reload(count_slot)],
+    ))
+}
+
 /// `unicodeobject.py:1515 PyUnicode_FindChar` — the index of `ch`, -1 when it
 /// is not there and -2 on a bad argument.
 ///
@@ -1474,6 +1514,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_AppendAndDel as *const ());
     std::hint::black_box(PyUnicode_Substring as *const ());
     std::hint::black_box(PyUnicode_Join as *const ());
+    std::hint::black_box(PyUnicode_Split as *const ());
     std::hint::black_box(PyUnicode_FindChar as *const ());
     std::hint::black_box(PyUnicode_Contains as *const ());
     std::hint::black_box(PyUnicode_Compare as *const ());

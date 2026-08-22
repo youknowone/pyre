@@ -120,6 +120,61 @@ pub struct CPyGetSetDef {
     pub closure: *mut c_void,
 }
 
+/// `PyDescrObject` — what every descriptor block opens with.
+#[repr(C)]
+pub struct CPyDescrObject {
+    pub ob_base: CPyObject,
+    pub d_type: *mut CPyTypeObject,
+    pub d_name: *mut CPyObject,
+    pub d_qualname: *mut CPyObject,
+}
+
+/// `PyMethodDescrObject`.
+///
+/// `PyMemberDescrObject` and `PyGetSetDescrObject` are this same block: the
+/// one word past the common header is the row the descriptor was built from,
+/// and only its declared type differs.
+#[repr(C)]
+pub struct CPyMethodDescrObject {
+    pub d_common: CPyDescrObject,
+    pub d_method: *mut super::methodobject::CPyMethodDef,
+}
+
+/// `struct wrapperbase` — what a slot wrapper carries beside the slot.
+#[repr(C)]
+pub struct CPyWrapperBase {
+    pub name: *const c_char,
+    pub offset: c_int,
+    pub function: *mut c_void,
+    pub wrapper: *mut c_void,
+    pub doc: *const c_char,
+    pub flags: c_int,
+    pub name_strobj: *mut CPyObject,
+}
+
+/// `PyWrapperDescrObject`.
+#[repr(C)]
+pub struct CPyWrapperDescrObject {
+    pub d_common: CPyDescrObject,
+    pub d_base: *mut CPyWrapperBase,
+    pub d_wrapped: *mut c_void,
+}
+
+impl CPyWrapperBase {
+    /// The all-zero block `wrapperdescr_attach` hands out.
+    const fn empty() -> Self {
+        Self {
+            name: std::ptr::null(),
+            offset: 0,
+            function: std::ptr::null_mut(),
+            wrapper: std::ptr::null_mut(),
+            doc: std::ptr::null(),
+            flags: 0,
+            name_strobj: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// `PyTypeObject`, in the CPython 3.14 field order.
 ///
 /// Every slot is a raw pointer here: the ones this slice reads are typed at
@@ -414,14 +469,19 @@ type_mirrors! {
     // `builtin_function_or_method`, which no symbol here names, and
     // `PyCFunction_Check` answers no for it; `methodobject`'s
     // `pycfunction_type` says why that is the safe half of the gap.
+    //
+    // `PyMethodDescr_Type` and `PyClassMethodDescr_Type` are the same split
+    // and the same half: a descriptor the interpreter built for one of its
+    // own types carries no `PyMethodDef`, and reading one off the block is
+    // what every caller that asks does next.
     PyCFunction_Type => super::methodobject::pycfunction_type(),
     PyCMethod_Type => super::methodobject::pycmethod_type(),
-    PyClassMethodDescr_Type => builtin_type(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
+    PyClassMethodDescr_Type => classmethod_descriptor_type(),
     PyClassMethod_Type => builtin_type(&pyre_object::function::CLASSMETHOD_TYPE),
     PyFunction_Type => builtin_type(&crate::function::FUNCTION_TYPE),
     PyGetSetDescr_Type => builtin_type(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE),
     PyMemberDescr_Type => builtin_type(&pyre_object::typedef::MEMBER_TYPE),
-    PyMethodDescr_Type => builtin_type(&crate::function::METHOD_DESCRIPTOR_TYPE),
+    PyMethodDescr_Type => method_descriptor_type(),
     PyMethod_Type => builtin_type(&pyre_object::function::METHOD_TYPE),
     PyProperty_Type => builtin_type(&pyre_object::descriptor::PROPERTY_TYPE),
     PyStaticMethod_Type => builtin_type(&pyre_object::function::STATICMETHOD_TYPE),
@@ -613,6 +673,7 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
         super::pyerrors::basicsize(w_type),
         super::cdatetime::basicsize(w_type),
         super::complexobject::basicsize(w_type),
+        descriptor_basicsize(w_type),
     ]
     .into_iter()
     .find(|&size| size != 0)
@@ -1792,6 +1853,22 @@ fn new_carrier(
     reload(carrier_slot)
 }
 
+/// `methodobject.py PyDescr_NewMethod` — the descriptor a `tp_methods` row
+/// of `w_type` becomes, built on demand for a caller that has the row.
+pub(super) fn new_method_descriptor(
+    carrier_type: PyObjectRef,
+    w_type: PyObjectRef,
+    method: *mut super::methodobject::CPyMethodDef,
+) -> PyObjectRef {
+    new_carrier(
+        carrier_type,
+        method as usize,
+        unsafe { (*method).ml_name },
+        unsafe { (*method).ml_doc },
+        w_type,
+    )
+}
+
 fn descriptor_type(
     cell: &OnceLock<usize>,
     name: &'static str,
@@ -1808,6 +1885,7 @@ fn descriptor_type(
 }
 
 static METHOD_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
+static CLASSMETHOD_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
 static MEMBER_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
 static GETSET_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
 
@@ -1815,7 +1893,7 @@ static GETSET_DESCRIPTOR_TYPE: OnceLock<usize> = OnceLock::new();
 ///
 /// Unlike the module-level carrier it is a descriptor: the receiver is the
 /// instance the attribute was read through, which `__get__` binds.
-fn method_descriptor_type() -> PyObjectRef {
+pub(super) fn method_descriptor_type() -> PyObjectRef {
     descriptor_type(&METHOD_DESCRIPTOR_TYPE, "method_descriptor", |ns| unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -1833,6 +1911,37 @@ fn method_descriptor_type() -> PyObjectRef {
             crate::make_builtin_function_with_arity("__repr__", method_descr_repr, 1),
         );
     })
+}
+
+/// `methodobject.py W_PyCClassMethodObject` — a definition reached through
+/// the class rather than through an instance.
+///
+/// What it binds is the whole of the difference from
+/// [`method_descriptor_type`], so the two share the row they were built from.
+pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
+    descriptor_type(
+        &CLASSMETHOD_DESCRIPTOR_TYPE,
+        "classmethod_descriptor",
+        |ns| unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__get__",
+                crate::make_builtin_function("__get__", classmethod_descr_get),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__call__",
+                crate::make_builtin_function("__call__", classmethod_descr_call),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__repr__",
+                // `PyClassMethodDescr_Type` names `method_repr` too: the two
+                // descriptors report themselves the same way.
+                crate::make_builtin_function_with_arity("__repr__", method_descr_repr, 1),
+            );
+        },
+    )
 }
 
 fn member_descriptor_type() -> PyObjectRef {
@@ -1914,13 +2023,19 @@ fn defining_class(
 /// `attribute` for the getset.
 fn descr_repr(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let owner = carrier_objclass(carrier)
-        .map(|owner| unsafe { pyre_object::typeobject::w_type_get_name(owner) }.to_string())
-        .unwrap_or_else(|| "?".to_string());
+    let owner = owner_name(carrier);
     Ok(pyre_object::w_str_new(&format!(
         "<{kind} '{}' of '{owner}' objects>",
         descriptor_name(carrier)
     )))
+}
+
+/// The name of the type a descriptor was declared in, which is what its repr
+/// and every refusal below name it by.
+fn owner_name(carrier: PyObjectRef) -> String {
+    carrier_objclass(carrier)
+        .map(|owner| unsafe { pyre_object::typeobject::w_type_get_name(owner) }.to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 fn method_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2000,6 +2115,101 @@ fn method_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         instance,
         pyre_object::w_none(),
         defining_class(carrier, method),
+    )
+}
+
+/// The class a class-method descriptor binds, having checked that the
+/// descriptor applies to it — `descrobject.c classmethod_get`'s three
+/// refusals, in the order it makes them.
+///
+/// `named` is the `type` argument of `__get__`; where the call left it out,
+/// the instance's own class is what the descriptor was reached through.
+fn classmethod_owner(
+    carrier: PyObjectRef,
+    named: PyObjectRef,
+    instance: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let owner = match !named.is_null() && !unsafe { pyre_object::is_none(named) } {
+        true => named,
+        false => match instance {
+            Some(instance) => unsafe { (*instance).w_class },
+            None => {
+                return Err(crate::PyError::type_error(format!(
+                    "descriptor '{}' for type '{}' needs either an object or a type",
+                    descriptor_name(carrier),
+                    owner_name(carrier)
+                )));
+            }
+        },
+    };
+    if !unsafe { pyre_object::is_type(owner) } {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{}' for type '{}' needs a type, not a '{}' as arg 2",
+            descriptor_name(carrier),
+            owner_name(carrier),
+            crate::type_methods::arg_type_name(owner)
+        )));
+    }
+    if let Some(declared) = carrier_objclass(carrier)
+        && !unsafe { crate::baseobjspace::issubtype_w(owner, declared) }
+    {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{}' requires a subtype of '{}' but received '{}'",
+            descriptor_name(carrier),
+            owner_name(carrier),
+            unsafe { pyre_object::typeobject::w_type_get_name(owner) }
+        )));
+    }
+    Ok(owner)
+}
+
+/// The row behind a class-method descriptor, or the error a carrier that lost
+/// it answers with.
+fn classmethod_def(
+    carrier: PyObjectRef,
+) -> Result<*mut super::methodobject::CPyMethodDef, crate::PyError> {
+    let method = carrier_def(carrier) as *mut super::methodobject::CPyMethodDef;
+    match method.is_null() {
+        true => Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "cpyext class method descriptor lost its definition",
+        )),
+        false => Ok(method),
+    }
+}
+
+fn classmethod_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let carrier = args[0];
+    let named = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    let owner = classmethod_owner(carrier, named, bound_instance(args))?;
+    let method = classmethod_def(carrier)?;
+    super::methodobject::new_pycfunction_in_class(
+        method,
+        owner,
+        pyre_object::w_none(),
+        defining_class(carrier, method),
+    )
+}
+
+/// `descr.__call__(cls, *args)`, the unbound spelling.
+fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let carrier = args[0];
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let Some(&named) = positional.first() else {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{}' of '{}' object needs an argument",
+            descriptor_name(carrier),
+            owner_name(carrier)
+        )));
+    };
+    let owner = classmethod_owner(carrier, named, None)?;
+    let method = classmethod_def(carrier)?;
+    super::methodobject::call_method_def_in_class(
+        method,
+        owner,
+        defining_class(carrier, method),
+        &positional[1..],
+        kwargs,
     )
 }
 
@@ -3309,6 +3519,159 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 }
 
+// ── the block a descriptor is mirrored into ──────────────────────
+
+/// A filled block, against the address of the [`CPyWrapperBase`] allocated for
+/// it -- 0 for every family that has none.  An address rather than a pointer
+/// because the table is shared across threads and a raw pointer is not.
+type BlockSet = std::collections::HashMap<
+    usize,
+    usize,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+>;
+
+/// The blocks [`descriptor_attach`] filled, and so the ones whose references
+/// are this module's to release.
+static DESCRIPTOR_BLOCKS: super::ForkMutex<BlockSet> =
+    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+
+/// Whether `w_type` is one of this module's descriptor carriers.
+///
+/// A carrier that has not been built can have no instance to mirror, so the
+/// cells are read rather than initialised: asking would build all four the
+/// first time any type at all was described.
+fn is_descriptor_carrier(w_type: PyObjectRef) -> bool {
+    !w_type.is_null()
+        && [
+            &METHOD_DESCRIPTOR_TYPE,
+            &CLASSMETHOD_DESCRIPTOR_TYPE,
+            &MEMBER_DESCRIPTOR_TYPE,
+            &GETSET_DESCRIPTOR_TYPE,
+        ]
+        .into_iter()
+        .any(|cell| cell.get() == Some(&(w_type as usize)))
+}
+
+/// Whether `w_type` is `wrapper_descriptor`, whose blocks carry a slot and the
+/// [`CPyWrapperBase`] beside it rather than a `PyMethodDef` row.
+fn is_wrapper_carrier(w_type: PyObjectRef) -> bool {
+    !w_type.is_null() && w_type == builtin_type(&crate::function::SLOT_WRAPPER_TYPE)
+}
+
+/// What `tp_basicsize` a descriptor carrier's mirror carries — the fields a
+/// caller casting the block to one of the `PyDescrObject` shapes reads off it.
+fn descriptor_basicsize(w_type: PyObjectRef) -> isize {
+    if is_wrapper_carrier(w_type) {
+        return size_of::<CPyWrapperDescrObject>() as isize;
+    }
+    match is_descriptor_carrier(w_type) {
+        true => size_of::<CPyMethodDescrObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill the common header every descriptor block opens with — `typeobject.py
+/// init_descr`.
+///
+/// `d_qualname` is left as the allocation found it, which is where
+/// `init_descr` leaves it.
+fn init_descr(raw: *mut CPyObject, w_type: PyObjectRef, w_name: PyObjectRef) {
+    // Minting either reference may collect and move the other, so both are
+    // pinned and read back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_type);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_name);
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    let d_type = pyobject::make_ref(reload(type_slot)) as *mut CPyTypeObject;
+    let d_name = pyobject::make_ref(reload(name_slot));
+    let descr = raw as *mut CPyDescrObject;
+    unsafe {
+        (*descr).d_type = d_type;
+        (*descr).d_name = d_name;
+    }
+}
+
+/// Fill a freshly allocated descriptor block — `typeobject.py
+/// methoddescr_attach` and `wrapperdescr_attach`, which share `init_descr`
+/// and differ in the one field past it.
+pub(super) fn descriptor_attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    let w_class = unsafe { (*w_obj).w_class };
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    // The block was sized from the carrier's own mirror, so a block smaller
+    // than the shape below is not that carrier's.
+    let room = |wanted: usize| unsafe { (*tp).tp_basicsize } >= wanted as isize;
+
+    let base = if is_wrapper_carrier(w_class) {
+        if !room(size_of::<CPyWrapperDescrObject>()) {
+            return;
+        }
+        let w_type = unsafe { crate::function::fget_func_objclass(w_obj) }.unwrap_or(PY_NULL);
+        let w_name = unsafe { crate::function::fget_func_name(w_obj) };
+        init_descr(raw, w_type, w_name);
+        // Nothing here has anything to put in the block, but a source that
+        // rewrites a slot's `__doc__` copies it before writing its own, so it
+        // has to be there to be copied.
+        let base = Box::into_raw(Box::new(CPyWrapperBase::empty()));
+        let descr = raw as *mut CPyWrapperDescrObject;
+        unsafe {
+            (*descr).d_base = base;
+            // The slot a wrapper the interpreter built for one of its own
+            // types wraps is a body rather than an address an extension may
+            // call, which is the same half of the split `pycfunction_type`
+            // describes.
+            (*descr).d_wrapped = std::ptr::null_mut();
+        }
+        base as usize
+    } else {
+        if !is_descriptor_carrier(w_class) || !room(size_of::<CPyMethodDescrObject>()) {
+            return;
+        }
+        let definition = carrier_def(w_obj);
+        init_descr(
+            raw,
+            carrier_objclass(w_obj).unwrap_or(PY_NULL),
+            carrier_get(w_obj, NAME_KEY).unwrap_or(PY_NULL),
+        );
+        unsafe {
+            (*(raw as *mut CPyMethodDescrObject)).d_method =
+                definition as *mut super::methodobject::CPyMethodDef;
+        }
+        0
+    };
+    DESCRIPTOR_BLOCKS.lock().insert(raw as usize, base);
+}
+
+/// Release what a descriptor block owns — `typeobject.py descr_dealloc` and
+/// `wrapper_dealloc`, which frees the wrapper block on top of it.
+pub(super) fn forget_descriptor_block(raw: *mut CPyObject) {
+    let Some(base) = DESCRIPTOR_BLOCKS.lock().remove(&(raw as usize)) else {
+        return;
+    };
+    let descr = raw as *mut CPyDescrObject;
+    unsafe {
+        pyobject::decref((*descr).d_type as *mut CPyObject);
+        pyobject::decref((*descr).d_name);
+        (*descr).d_type = std::ptr::null_mut();
+        (*descr).d_name = std::ptr::null_mut();
+    }
+    if base == 0 {
+        return;
+    }
+    // The block is freed only while it is still the one that was allocated
+    // here.  A source that rewrites a slot's `__doc__` leaves a block of its
+    // own in the field, and that storage is the source's.
+    let wrapper = raw as *mut CPyWrapperDescrObject;
+    if unsafe { (*wrapper).d_base } as usize == base {
+        unsafe { (*wrapper).d_base = std::ptr::null_mut() };
+        drop(unsafe { Box::from_raw(base as *mut CPyWrapperBase) });
+    }
+}
+
 // ── `PyType_Ready` ──────────────────────────────────────────────────────
 
 fn store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
@@ -4556,6 +4919,19 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
     value as *mut c_void
 }
 
+/// `src/typeobject.c PyType_GetDict` — the namespace behind `tp_dict`, owned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetDict(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    if tp.is_null() {
+        return std::ptr::null_mut();
+    }
+    let dict = unsafe { (*tp).tp_dict };
+    if !dict.is_null() {
+        unsafe { pyobject::incref(dict) };
+    }
+    dict
+}
+
 /// `_PyType_Name(type)` — the tail of `tp_name` after the last dot, which is
 /// the name without the module qualifying it.
 ///
@@ -5189,6 +5565,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyType_IsSubtype as *const ());
     std::hint::black_box(PyType_GetFlags as *const ());
     std::hint::black_box(_PyType_Name as *const ());
+    std::hint::black_box(PyType_GetDict as *const ());
     std::hint::black_box(PyType_FromSpec as *const ());
     std::hint::black_box(PyType_FromSpecWithBases as *const ());
     std::hint::black_box(PyType_FromModuleAndSpec as *const ());

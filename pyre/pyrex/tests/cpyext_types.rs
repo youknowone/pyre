@@ -654,6 +654,72 @@ except ImportError:
 else:
     raise AssertionError('a missing module imported')
 
+# ── the descriptors a namespace holds ──────────────────────────────────
+
+point = m.Point(3, 4)
+
+
+def eq(name, got, want):
+    assert got == want, '%s: got %r, want %r' % (name, got, want)
+
+
+# `PyMethodDescr_Check`, and the two fields the callers that agree read off
+# the block straight afterwards.
+eq('a tp_methods row is one', m.descr_facts(m.Point.receiver),
+   (1, 'cpyext_types.Point', 'receiver'))
+eq('a bound method is not', m.descr_facts(point.receiver), (0, None, None))
+eq('a python function is not', m.descr_facts(eq), (0, None, None))
+eq('the name it carries', m.descr_name(m.Point.receiver), 'receiver')
+
+# The row reached the ordinary way binds the instance.
+eq('reached through an instance', point.receiver(), ('cpyext_types.Point', '-'))
+
+made = m.new_method_descr()
+eq('a descriptor built by hand', m.descr_facts(made),
+   (1, 'cpyext_types.Point', 'receiver'))
+eq('and it binds an instance', made.__get__(point, m.Point)(),
+   ('cpyext_types.Point', '-'))
+eq('unbound, the instance is the argument', made(point),
+   ('cpyext_types.Point', '-'))
+
+# The class-method spelling of the same row binds the class instead.
+classy = m.new_classmethod_descr()
+eq('bound to the class', classy.__get__(point, m.Point)(),
+   ('type', 'cpyext_types.Point'))
+eq('bound with no instance', classy.__get__(None, m.Point)(),
+   ('type', 'cpyext_types.Point'))
+eq('unbound, the class is the argument', classy(m.Point),
+   ('type', 'cpyext_types.Point'))
+
+try:
+    classy.__get__(None, int)
+except TypeError as error:
+    eq('a type it does not apply to', 'requires a subtype of' in str(error), True)
+else:
+    raise AssertionError('a descriptor reached through a foreign type must refuse')
+
+# A type argument that is not a type is refused rather than cast, which is
+# what makes this a `SystemError` instead of a descriptor whose `d_type` is
+# not a type at all.
+eq('a type argument that is not one', m.new_descr_bad_type(), 'SystemError')
+
+# ── classmethod and staticmethod over whatever was handed in ───────────
+
+
+def plain(*args):
+    return args
+
+
+class Holder:
+    pass
+
+
+Holder.classy = m.class_method_new(plain)
+Holder.staticy = m.static_method_new(plain)
+eq('a class method binds the class', Holder.classy(1), (Holder, 1))
+eq('a static method binds nothing', Holder.staticy(1), (1,))
+eq('reached through an instance too', Holder().classy(2), (Holder, 2))
+
 print('cpyext-types-ok')
 "#;
 

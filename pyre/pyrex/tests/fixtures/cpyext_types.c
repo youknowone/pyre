@@ -160,7 +160,17 @@ static PyObject *point_declared_in(PyObject *self, PyTypeObject *cls,
     return Py_BuildValue("sinn", cls->tp_name, point->x, nargs, named);
 }
 
+/* A row that reads nothing off its receiver, so the same definition answers
+   whether it was reached through an instance or through the class. */
+static PyObject *point_receiver(PyObject *self, PyObject *unused)
+{
+    (void)unused;
+    return Py_BuildValue("(ss)", Py_TYPE(self)->tp_name,
+                         PyType_Check(self) ? ((PyTypeObject *)self)->tp_name : "-");
+}
+
 static PyMethodDef point_methods[] = {
+    {"receiver", point_receiver, METH_NOARGS, "what this row was reached through"},
     {"translate", (PyCFunction)point_translate, METH_VARARGS, "shift in place"},
     {"norm", (PyCFunction)point_norm, METH_NOARGS, "squared length"},
     {"named", (PyCFunction)(void (*)(void))point_named, METH_VARARGS | METH_KEYWORDS,
@@ -1873,7 +1883,89 @@ static PyObject *m_freeze(PyObject *self, PyObject *type)
     Py_RETURN_NONE;
 }
 
+/* ── the descriptors a namespace holds ────────────────────────────────── */
+
+/* `PyMethodDescr_Check`, together with the two fields a caller that agrees
+   reads off the block straight afterwards. */
+static PyObject *m_descr_facts(PyObject *self, PyObject *value)
+{
+    PyMethodDescrObject *descr;
+    (void)self;
+    if (!PyMethodDescr_Check(value)) {
+        return Py_BuildValue("(iOO)", 0, Py_None, Py_None);
+    }
+    descr = (PyMethodDescrObject *)value;
+    return Py_BuildValue("(isz)", 1, descr->d_common.d_type->tp_name,
+                         descr->d_method->ml_name);
+}
+
+/* The name a descriptor block carries, through the accessor rather than the
+   field. */
+static PyObject *m_descr_name(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return Py_NewRef(PyDescr_NAME(value));
+}
+
+/* `PyDescr_NewMethod(Point, point_methods[0])`. */
+static PyObject *m_new_method_descr(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return PyDescr_NewMethod(&PointType, &point_methods[0]);
+}
+
+/* `PyDescr_NewClassMethod` over the same row, which binds the class. */
+static PyObject *m_new_classmethod_descr(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return PyDescr_NewClassMethod(&PointType, &point_methods[0]);
+}
+
+/* What either of them answers when the type argument is not a type: the class
+   name of the exception it left behind, or `None` when it left none. */
+static PyObject *m_new_descr_bad_type(PyObject *self, PyObject *unused)
+{
+    PyObject *made, *raised, *name;
+    (void)self;
+    (void)unused;
+    made = PyDescr_NewClassMethod((PyTypeObject *)Py_None, &point_methods[0]);
+    if (made != NULL) {
+        Py_DECREF(made);
+        Py_RETURN_NONE;
+    }
+    raised = PyErr_GetRaisedException();
+    if (raised == NULL) {
+        Py_RETURN_NONE;
+    }
+    name = PyUnicode_FromString(Py_TYPE(raised)->tp_name);
+    Py_DECREF(raised);
+    return name;
+}
+
+/* `PyClassMethod_New` and `PyStaticMethod_New`, over whatever was handed in. */
+static PyObject *m_class_method_new(PyObject *self, PyObject *function)
+{
+    (void)self;
+    return PyClassMethod_New(function);
+}
+
+static PyObject *m_static_method_new(PyObject *self, PyObject *function)
+{
+    (void)self;
+    return PyStaticMethod_New(function);
+}
+
 static PyMethodDef methods[] = {
+    {"descr_facts", m_descr_facts, METH_O, "PyMethodDescr_Check and the block"},
+    {"descr_name", m_descr_name, METH_O, "PyDescr_NAME"},
+    {"new_method_descr", m_new_method_descr, METH_NOARGS, "PyDescr_NewMethod"},
+    {"new_classmethod_descr", m_new_classmethod_descr, METH_NOARGS,
+     "PyDescr_NewClassMethod"},
+    {"new_descr_bad_type", m_new_descr_bad_type, METH_NOARGS, "a type that is not one"},
+    {"class_method_new", m_class_method_new, METH_O, "PyClassMethod_New"},
+    {"static_method_new", m_static_method_new, METH_O, "PyStaticMethod_New"},
     {"type_owner", m_type_owner, METH_O, "the module a spec type belongs to"},
     {"type_token", m_type_token, METH_O, "PyType_GetBaseByToken three ways"},
     {"type_token_null", m_type_token_null, METH_O, "a NULL token is an error"},

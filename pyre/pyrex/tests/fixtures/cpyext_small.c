@@ -260,7 +260,86 @@ static PyObject *refcount_immortal(PyObject *self, PyObject *unused)
     return Py_BuildValue("(ii)", before == after, after > 1);
 }
 
+/* ── the number a prefix of a string reads as ─────────────────────────── */
+
+/* `PyOS_string_to_double(text, endptr, overflow)`.  `keep_tail` chooses
+   whether an `endptr` is passed at all, which is what decides whether a
+   remainder is an error; `overflow` names the class a magnitude too large
+   for the type is reported through. */
+static PyObject *string_to_double(PyObject *self, PyObject *args)
+{
+    const char *text;
+    int keep_tail;
+    PyObject *overflow = Py_None;
+    char *tail = NULL;
+    double value;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "si|O", &text, &keep_tail, &overflow)) {
+        return NULL;
+    }
+    value = PyOS_string_to_double(text, keep_tail ? &tail : NULL,
+                                  overflow == Py_None ? NULL : overflow);
+    if (value == -1.0 && PyErr_Occurred()) {
+        return pending();
+    }
+    return Py_BuildValue("(dsO)", value, tail == NULL ? "" : tail, Py_None);
+}
+
+/* `PyFloat_AS_DOUBLE`, which asks no questions. */
+static PyObject *float_as_double(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return PyFloat_FromDouble(PyFloat_AS_DOUBLE(value));
+}
+
+/* `PyFloat_FromString`, which reads whatever `float()` reads. */
+static PyObject *float_from_string(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return outcome(PyFloat_FromString(value));
+}
+
+/* `PyUnicode_Split(s, sep, maxsplit)`, with `None` for the separator that
+   splits on runs of whitespace. */
+static PyObject *split(PyObject *self, PyObject *args)
+{
+    PyObject *string, *separator;
+    Py_ssize_t maxsplit;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "OOn", &string, &separator, &maxsplit)) {
+        return NULL;
+    }
+    return outcome(PyUnicode_Split(string, separator == Py_None ? NULL : separator,
+                                   maxsplit));
+}
+
+/* `PyType_GetDict`, and whether what it answers is the type's own namespace
+   rather than a copy of it. */
+static PyObject *type_dict(PyObject *self, PyObject *type)
+{
+    PyObject *dict, *again, *same;
+    (void)self;
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "type_dict wants a type");
+        return NULL;
+    }
+    dict = PyType_GetDict((PyTypeObject *)type);
+    if (dict == NULL) {
+        return pending();
+    }
+    again = PyType_GetDict((PyTypeObject *)type);
+    same = Py_BuildValue("(Oi)", dict, again == dict);
+    Py_DECREF(dict);
+    Py_XDECREF(again);
+    return same;
+}
+
 static PyMethodDef methods[] = {
+    {"string_to_double", string_to_double, METH_VARARGS, NULL},
+    {"float_as_double", float_as_double, METH_O, NULL},
+    {"float_from_string", float_from_string, METH_O, NULL},
+    {"split", split, METH_VARARGS, NULL},
+    {"type_dict", type_dict, METH_O, NULL},
     {"type_names", type_names, METH_O, NULL},
     {"repr_guard", repr_guard, METH_O, NULL},
     {"guarded_repr", guarded_repr, METH_O, NULL},

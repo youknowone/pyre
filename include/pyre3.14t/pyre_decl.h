@@ -179,6 +179,7 @@ PyAPI_FUNC(void) PyException_SetContext(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyException_SetTraceback(PyObject *, PyObject *);
 
 /* cpyext/floatobject.rs */
+PyAPI_FUNC(double) PyFloat_AS_DOUBLE(PyObject *);
 PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *);
 PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
@@ -323,6 +324,12 @@ PyAPI_FUNC(PyObject *) PyCFunction_New(PyMethodDef *, PyObject *);
 PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *, PyObject *);
 PyAPI_FUNC(PyTypeObject *) PyCMethod_GetClass(PyObject *);
 PyAPI_FUNC(PyObject *) PyCMethod_New(PyMethodDef *, PyObject *, PyObject *, PyTypeObject *);
+PyAPI_FUNC(PyObject *) PyClassMethod_New(PyObject *);
+PyAPI_FUNC(PyObject *) PyDescr_NewClassMethod(PyTypeObject *, PyMethodDef *);
+PyAPI_FUNC(PyObject *) PyDescr_NewMethod(PyTypeObject *, PyMethodDef *);
+PyAPI_FUNC(int) PyMethodDescr_Check(PyObject *);
+PyAPI_FUNC(int) PyMethodDescr_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyStaticMethod_New(PyObject *);
 
 /* cpyext/modsupport.rs */
 PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *);
@@ -520,6 +527,9 @@ PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
 PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *);
 PyAPI_FUNC(PyThreadState *) _PyThreadState_UncheckedGet(void);
 
+/* cpyext/pystrtod.rs */
+PyAPI_FUNC(double) PyOS_string_to_double(const char *, char **, PyObject *);
+
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PySequence_Concat(PyObject *, PyObject *);
@@ -595,6 +605,7 @@ PyAPI_FUNC(PyObject *) PyType_FromSpecWithBases(PyType_Spec *, PyObject *);
 PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyType_GenericNew(PyTypeObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PyType_GetBaseByToken(PyTypeObject *, void *, PyTypeObject **);
+PyAPI_FUNC(PyObject *) PyType_GetDict(PyTypeObject *);
 PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *);
 PyAPI_FUNC(PyObject *) PyType_GetFullyQualifiedName(PyTypeObject *);
 PyAPI_FUNC(PyObject *) PyType_GetModule(PyTypeObject *);
@@ -661,6 +672,7 @@ PyAPI_FUNC(unsigned int) PyUnicode_MAX_CHAR_VALUE(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_New(Py_ssize_t, Py_UCS4);
 PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyUnicode_RichCompare(PyObject *, PyObject *, int);
+PyAPI_FUNC(PyObject *) PyUnicode_Split(PyObject *, PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyUnicode_Substring(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
 
