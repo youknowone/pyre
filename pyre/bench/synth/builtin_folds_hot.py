@@ -1,11 +1,41 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=12
 # pyre-check: skip-cpython
-# Fitted between the two arms as check.py itself reads them on darwin-arm64
-# at load 18.  With every fold in place: 5.0x, 4.4x, 4.5x.  With
-# PYRE_FBW_NO_SPECIALIZE=builtin_fold1,builtin_fold2 putting the same loops
-# back on the residual: 52.9x and 61.4x.  The gate sits 60% above the first
-# arm, which is room for a busy box, and still more than six times below the
-# second, so what it reads is a lost fold.
+# Fitted between the two arms.  With every fold in place the three runners read
+# 4.6x / 4.7x on darwin-arm64, 7.2x / 7.6x on ubuntu-24.04 and 9.2x / 10.0x on
+# windows -- the spread is pypy's, not ours: these loops are pure fixed cost to
+# a JIT that elides them, so its baseline stays near the execution floor and the
+# ratio reads the runner as much as the tree.  With
+# PYRE_FBW_NO_SPECIALIZE=builtin_fold1,builtin_fold2 putting the same loops back
+# on the residual, darwin-arm64 reads 52.9x and 61.4x -- eleven times the folded
+# arm on that host.  The gate clears the highest folded reading by 20% and still
+# sits an order of magnitude under the residual arm scaled to it.
+#
+# pyre-check: max-wasm-ratio=10
+# pyre-check: spec-folds=builtin_fold1,builtin_fold2
+# The wasm ceiling is fitted to the highest reading observed plus 15%:
+# ubuntu-24.04 reads 8.2x (wasm 5.66s against dynasm 0.69s) and darwin-arm64
+# 8.7x (3.39s against 0.50s).  Two architectures under two load regimes land
+# within half a count of each other, so what the ceiling has to clear is
+# structural rather than a busy runner.
+#
+# The structure is the host crossing.  A JIT-emitted trace is its own wasm
+# module, so a call leaving it reaches the interpreter through the
+# `env.jit_call` trampoline, which marshals func_ptr and arguments through the
+# frame call area in shared linear memory and dispatches through the main
+# module's indirect function table.  What the fold removes is the frame force,
+# the argument rooting, the execution-context resolution and the gateway
+# binding; the crossing itself stays, because every fold here still lowers to
+# a call into a raw helper.  The tree carries its own contrast: on the same
+# ubuntu run `math_folds_hot`, whose folds lower to inline arithmetic instead,
+# reads 3.3x.  Every loop below is nothing but folded builtin calls, so the
+# crossing is the whole measurement.  The alternative to this allowance is to
+# give the trace module direct imports for the raw helpers rather than one
+# generic trampoline.
+#
+# `spec-folds` is the exact instrument neither ratio is.  Six loops sum into
+# one number, so retiring one channel moves it by less than the span this
+# fixture reads across the runners; the census gates each fold's coverage
+# instead, and it reads the same on every host.
 #
 # Every builtin the generic walker fold covers, one hot loop per channel.
 #
