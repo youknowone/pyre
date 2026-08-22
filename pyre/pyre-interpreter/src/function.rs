@@ -218,6 +218,25 @@ pub struct Function {
 #[repr(C)]
 pub struct FunctionQuasiImmutSlots([QuasiImmutField; QUASI_IMMUT_SLOT_COUNT]);
 
+impl FunctionQuasiImmutSlots {
+    fn new() -> Self {
+        // Not `[const { QuasiImmutField::new() }; N]`: Charon rejects the
+        // pointer-null Cast that const-repeat lowers. Length is checked
+        // against [`QUASI_IMMUT_SLOT_COUNT`].
+        Self([
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+            QuasiImmutField::new(),
+        ])
+    }
+}
+
 /// Number of `?` entries in `function.py:34-42 _immutable_fields_`.
 pub const QUASI_IMMUT_SLOT_COUNT: usize = 9;
 
@@ -304,9 +323,7 @@ pub unsafe fn function_current_qmut_instance(
     let cell = unsafe { &(*f).mutate_slots };
     let mut slots = cell.load(Ordering::Acquire);
     if slots.is_null() {
-        let fresh = Box::into_raw(Box::new(FunctionQuasiImmutSlots(
-            [const { QuasiImmutField::new() }; QUASI_IMMUT_SLOT_COUNT],
-        )));
+        let fresh = Box::into_raw(Box::new(FunctionQuasiImmutSlots::new()));
         match cell.compare_exchange(
             std::ptr::null_mut(),
             fresh,
