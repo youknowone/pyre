@@ -8136,6 +8136,30 @@ fn run_compiled_code_inner(
 
     // llmodel.py:306-315: set arguments in frame
     unsafe { inputs.write_into(jf_ptr.add(header_words)) };
+    // The one repeatable part of a compiled entry's call. Everything past this
+    // point runs the trace and cannot be made to happen twice, but allocating
+    // the frame and writing the arguments into it produces a frame NOTHING has
+    // entered, so it can be done N more times and thrown away. Scoped to the
+    // Rust-heap arm: the nursery arm would be allocating collectable frames
+    // that no root names, which is a different question and an unsafe way to
+    // ask it. Each pass drops its frame before the next, so the pool cycles one
+    // buffer and the loop prices a build rather than a pool miss.
+    #[cfg(feature = "execute-stage-probe")]
+    if !use_gc_alloc {
+        let repeats = majit_backend::deadframe::frame_build_repeats();
+        majit_backend::deadframe::count_frame_build_passes(repeats);
+        for _ in 0..repeats {
+            const HEADER_WORDS: usize = majit_gc::header::GcHeader::SIZE / 8;
+            let mut scratch = FrameHeapOwner::new(HEADER_WORDS + jf_total, jitframe_pool_enabled());
+            unsafe {
+                let base = scratch.as_mut_ptr().add(HEADER_WORDS);
+                *((base as usize + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
+                inputs.write_into(base.add(header_words));
+            }
+            // Without this the writes are dead and the loop prices nothing.
+            std::hint::black_box(&mut scratch);
+        }
+    }
     if majit_ir::debug::have_debug_prints() {
         let preview: Vec<i64> = (0..inputs.len().min(10)).map(|i| inputs.raw(i)).collect();
         majit_ir::debug::log_one("jit-running", &format!("pre-call-inputs {preview:?}"));

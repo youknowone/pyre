@@ -19,6 +19,12 @@ jit-audits = ["majit-ir/jit-audits"]
 # selects them. See `jitdriver::BackEdgeStageRepeats`, which also says which
 # stages CANNOT be amplified and are therefore left in the residual.
 back-edge-stage-probe = []
+# The second half of the same split, and never a shipping feature either. It
+# amplifies the two repeatable stages of `execute_assembler_at_dispatch_key`
+# and clocks the one that cannot repeat, and forwards to the cranelift arm
+# that repeats the frame build. See `pyjitpl::ExecuteStageRepeats`, which
+# says which numbers are amplified and which is single-shot.
+execute-stage-probe = ["majit-backend-cranelift?/execute-stage-probe"]
 
 [dependencies]
 majit-ir = { workspace = true }

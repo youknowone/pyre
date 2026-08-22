@@ -7,7 +7,7 @@
 //! (`llmodel.py:411-419`) does the same for `jf_descr`.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{DescrRef, GcRef};
@@ -237,6 +237,57 @@ fn seed_jitframe_pool_arm() -> bool {
     let on = std::env::var_os("MAJIT_JITFRAME_POOL").is_none_or(|v| v != "0");
     set_jitframe_pool(on);
     on
+}
+
+// ── compiled-entry frame-build probe ─────────────────────────────────────
+//
+// The count lives here, one crate below the backend that reads it and one
+// below the metainterp that sets it, because those two do not see each other:
+// `majit-metainterp` depends on a backend, never the reverse. The LOOP it
+// drives is gated by the reading backend's own feature; this side is a handful
+// of atomics that cost nothing until something loads them.
+
+/// Extra frame builds per compiled entry, for splitting what the entry spends
+/// before it reaches compiled code.
+///
+/// The compiled call cannot be repeated — it runs the trace — but its PREFIX
+/// can: allocating the jitframe and writing the input arguments into it
+/// produces a frame nothing has entered, which is thrown away. That is the only
+/// part of the call this can price, and it is the part upstream pays
+/// differently (`jitframe_allocate` bump-allocates out of the nursery).
+static FRAME_BUILD_REPEATS: AtomicU32 = AtomicU32::new(0);
+
+/// Frame builds the probe actually performed. The witness that an armed count
+/// reached the allocation rather than being set on a path nothing ran.
+static FRAME_BUILD_PASSES: AtomicU64 = AtomicU64::new(0);
+
+/// Set the extra frame builds per compiled entry, answering what it was.
+///
+/// Process-wide for the reason [`set_jitframe_pool`] is: it selects a strategy,
+/// and a harness flipping arms between two timed batches wants the flip to hold
+/// for whichever thread the next entry runs on.
+pub fn set_frame_build_repeats(repeats: u32) -> u32 {
+    FRAME_BUILD_REPEATS.swap(repeats, Ordering::Relaxed)
+}
+
+/// One relaxed load on the entry path, which both arms pay.
+#[inline]
+pub fn frame_build_repeats() -> u32 {
+    FRAME_BUILD_REPEATS.load(Ordering::Relaxed)
+}
+
+/// Tally a call's worth of extra frame builds. Once per entry, not once per
+/// pass, so the read-modify-write does not scale with the repeat count.
+#[inline]
+pub fn count_frame_build_passes(passes: u32) {
+    if passes != 0 {
+        FRAME_BUILD_PASSES.fetch_add(u64::from(passes), Ordering::Relaxed);
+    }
+}
+
+/// Extra frame builds performed since the process started.
+pub fn frame_build_passes() -> u64 {
+    FRAME_BUILD_PASSES.load(Ordering::Relaxed)
 }
 
 /// Where a held deadframe keeps its jitframe pointer.

@@ -167,6 +167,149 @@ fn guardlog_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
 }
 
+// ── compiled-run stage probe ─────────────────────────────────────────────
+//
+// A measurement arm, never a shipping one, behind a cargo feature so a default
+// build has neither the load below nor the loops it feeds. Inside the feature
+// the arms are selected at RUN time, because what one stage costs against
+// another is a difference that has to be taken inside ONE binary.
+
+/// Extra passes of one stage of `execute_assembler_at_dispatch_key`.
+///
+/// That function is the residual the entry split left behind — the largest
+/// single term in a compiled entry — and it is NOT one thing. Two of its parts
+/// answer the same thing every time they are asked and can be amplified; one
+/// runs the trace and can never be.
+///
+/// ⚠ THE TWO KINDS OF NUMBER THIS PRODUCES ARE NOT COMPARABLE, and a reader
+/// must be told which is which:
+///
+/// * `prologue` and `decode` are AMPLIFIED. Run k extra times, subtract the
+///   barrier, divide by k. The usual reading, and a lower bound: the passes
+///   after the first find the caches the first one filled.
+/// * `call_shot` is SINGLE-SHOT. The compiled call cannot be repeated — it runs
+///   the trace, consumes the inputs and produces a deadframe, so a second pass
+///   would execute the program again from state the first one advanced. It is
+///   instead CLOCKED, one reading per entry, accumulated. Two `Instant::now()`
+///   calls land inside the entry when this arm is armed, so the arm's own
+///   whole-entry figure is inflated and must not be quoted; only the
+///   accumulated call figure is, and [`execute_stage_clock_floor_ns`] is what
+///   the clock's own cost is subtracted with.
+///
+/// The frame build and the input-argument writes are the repeatable PREFIX of
+/// that call and are amplified on the backend's side of the boundary instead —
+/// `majit_backend::deadframe::set_frame_build_repeats`, whose loop lives in
+/// `run_compiled_code_inner`, because that is where the frame is.
+#[cfg(feature = "execute-stage-probe")]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ExecuteStageRepeats {
+    /// Extra `compiled_loops` probes and meta clones, plus
+    /// `prepare_compiled_run_io`. All answer the same thing on one entry.
+    pub prologue: u16,
+    /// Extra deadframe decodes: `get_latest_descr_arc`, the four descr reads,
+    /// `fail_arg_types`, and `decode_exit_slots`. These read the frame the run
+    /// returned and build two fresh lists; they do not touch it, so they
+    /// repeat.
+    pub decode: u16,
+    /// Extra passes of the same loop with NO stage in it.
+    pub barrier: u16,
+    /// Nonzero clocks the compiled call itself, once per entry. SINGLE-SHOT —
+    /// see the type's own note.
+    pub call_shot: u16,
+}
+
+#[cfg(feature = "execute-stage-probe")]
+impl ExecuteStageRepeats {
+    fn pack(self) -> u64 {
+        (self.prologue as u64)
+            | (self.decode as u64) << 16
+            | (self.barrier as u64) << 32
+            | (self.call_shot as u64) << 48
+    }
+
+    fn unpack(packed: u64) -> Self {
+        Self {
+            prologue: packed as u16,
+            decode: (packed >> 16) as u16,
+            barrier: (packed >> 32) as u16,
+            call_shot: (packed >> 48) as u16,
+        }
+    }
+}
+
+/// Four counts packed into one word, so the compiled-run path takes exactly ONE
+/// relaxed load that every arm pays and which therefore cancels out of the
+/// difference between two of them.
+#[cfg(feature = "execute-stage-probe")]
+static EXECUTE_STAGE_REPEATS: AtomicU64 = AtomicU64::new(0);
+
+/// Amplified passes actually performed, `[prologue, decode, barrier]`.
+#[cfg(feature = "execute-stage-probe")]
+static EXECUTE_STAGE_PASSES: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Nanoseconds accumulated across single-shot readings of the compiled call,
+/// and how many readings that is.
+#[cfg(feature = "execute-stage-probe")]
+static CALL_SHOT_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "execute-stage-probe")]
+static CALL_SHOT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Set the repeat counts for subsequent compiled runs, answering what they were.
+#[cfg(feature = "execute-stage-probe")]
+pub fn set_execute_stage_repeats(repeats: ExecuteStageRepeats) -> ExecuteStageRepeats {
+    ExecuteStageRepeats::unpack(EXECUTE_STAGE_REPEATS.swap(repeats.pack(), Ordering::Relaxed))
+}
+
+/// `[prologue, decode, barrier]` amplified passes since the process started.
+#[cfg(feature = "execute-stage-probe")]
+pub fn execute_stage_passes() -> [u64; 3] {
+    [
+        EXECUTE_STAGE_PASSES[0].load(Ordering::Relaxed),
+        EXECUTE_STAGE_PASSES[1].load(Ordering::Relaxed),
+        EXECUTE_STAGE_PASSES[2].load(Ordering::Relaxed),
+    ]
+}
+
+/// `(nanoseconds, readings)` accumulated by the single-shot call arm.
+///
+/// The mean is the call PLUS one clock pair's own cost; subtract
+/// [`execute_stage_clock_floor_ns`] to get the call.
+#[cfg(feature = "execute-stage-probe")]
+pub fn call_shot_totals() -> (u64, u64) {
+    (
+        CALL_SHOT_NS.load(Ordering::Relaxed),
+        CALL_SHOT_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the single-shot accumulators, so a harness can bracket one measured
+/// window rather than reading the whole process's history.
+#[cfg(feature = "execute-stage-probe")]
+pub fn reset_call_shot_totals() {
+    CALL_SHOT_NS.store(0, Ordering::Relaxed);
+    CALL_SHOT_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// What an empty `Instant::now()` / `elapsed()` pair reads on this box, in
+/// nanoseconds — the floor under every single-shot figure.
+///
+/// Measured HERE rather than in the harness so it is the same clock, the same
+/// crate and the same optimization settings as the reading it corrects. Taking
+/// the minimum rather than the mean: the pair cannot run faster than it is, so
+/// the smallest of many readings is the least contaminated one, and subtracting
+/// a mean inflated by scheduler noise would under-report the call.
+#[cfg(feature = "execute-stage-probe")]
+pub fn execute_stage_clock_floor_ns() -> f64 {
+    let mut best = u128::MAX;
+    for _ in 0..4096 {
+        let start = std::time::Instant::now();
+        let seen = start.elapsed().as_nanos();
+        best = best.min(seen);
+    }
+    best as f64
+}
+
 /// compile.py `forget_optimization_info` — discard optimizer-only
 /// forwarding state before handing a trace to the backend.  The
 /// `reset_values` arm is unported because neither send-to-backend call site
@@ -11068,12 +11211,53 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompileResult<M>> {
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
 
+        // Read once per run, ahead of every stage, so no stage's difference
+        // carries it. See [`ExecuteStageRepeats`]; a default build has neither
+        // this load nor the loops it feeds.
+        #[cfg(feature = "execute-stage-probe")]
+        let stage_repeats =
+            ExecuteStageRepeats::unpack(EXECUTE_STAGE_REPEATS.load(Ordering::Relaxed));
+        #[cfg(feature = "execute-stage-probe")]
+        {
+            if stage_repeats.prologue != 0 {
+                EXECUTE_STAGE_PASSES[0]
+                    .fetch_add(u64::from(stage_repeats.prologue), Ordering::Relaxed);
+            }
+            for _ in 0..stage_repeats.prologue {
+                let repeat_meta = self.compiled_loops.get(&green_key).map(|c| c.meta.clone());
+                Self::prepare_compiled_run_io();
+                std::hint::black_box(repeat_meta);
+            }
+            // The same loop and the same barrier with no stage in them, so what
+            // the amplification itself costs is subtracted rather than reported
+            // as a stage.
+            if stage_repeats.barrier != 0 {
+                EXECUTE_STAGE_PASSES[2]
+                    .fetch_add(u64::from(stage_repeats.barrier), Ordering::Relaxed);
+            }
+            for _ in 0..stage_repeats.barrier {
+                std::hint::black_box(&green_key);
+            }
+        }
+
         Self::prepare_compiled_run_io();
+        // SINGLE-SHOT, and the only stage here that is: the call runs the
+        // trace, so it is clocked once rather than repeated. Both arms take the
+        // same branch shape; only the armed one pays the two clock reads, and
+        // that cost stays inside the figure this accumulates rather than
+        // leaking into the amplified stages above.
+        #[cfg(feature = "execute-stage-probe")]
+        let call_started = (stage_repeats.call_shot != 0).then(std::time::Instant::now);
         let frame = self.backend.execute_token_with_dispatch_key(
             procedure_token,
             live_values,
             dispatch_key,
         );
+        #[cfg(feature = "execute-stage-probe")]
+        if let Some(started) = call_started {
+            CALL_SHOT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CALL_SHOT_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -11097,6 +11281,32 @@ impl<M: Clone> MetaInterp<M> {
         // The exit slots are read for both outcomes, so they are decoded before
         // the split rather than once in each arm.
         let (values, typed_values) = Self::decode_exit_slots(&self.backend, &frame, exit_types);
+        // The deadframe decode, amplified. It READS the frame the run returned
+        // and builds two fresh lists; it does not touch the frame, so it
+        // repeats. Each pass drops what it built, which is the same drop the
+        // shipping pass eventually pays for its own.
+        #[cfg(feature = "execute-stage-probe")]
+        {
+            if stage_repeats.decode != 0 {
+                EXECUTE_STAGE_PASSES[1]
+                    .fetch_add(u64::from(stage_repeats.decode), Ordering::Relaxed);
+            }
+            for _ in 0..stage_repeats.decode {
+                let repeat_descr = self.backend.get_latest_descr_arc(&frame);
+                let repeat_fail = repeat_descr
+                    .as_fail_descr()
+                    .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+                let repeat_types: &[Type] = repeat_fail.fail_arg_types();
+                let decoded = Self::decode_exit_slots(&self.backend, &frame, repeat_types);
+                std::hint::black_box((
+                    repeat_fail.fail_index(),
+                    repeat_fail.trace_id(),
+                    repeat_fail.is_finish(),
+                    repeat_fail.is_exit_frame_with_exception(),
+                    &decoded,
+                ));
+            }
+        }
 
         // `warmstate.py:404-418`: "First, a fast path to avoid raising and
         // immediately catching a DoneWithThisFrame exception". On a final

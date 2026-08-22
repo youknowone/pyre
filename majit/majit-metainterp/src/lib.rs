@@ -203,7 +203,17 @@ pub use jitdriver::{
 // set from outside and the door is left the shipping one.
 #[cfg(feature = "back-edge-stage-probe")]
 pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_stage_repeats};
+// The compiled-run split, which reaches one crate further down than the rest of
+// this probe: the frame build it prices is the backend's, so the count for that
+// one arm is set through `majit_backend` and only its loop is in the backend.
 pub use majit_backend::CompiledTraceInfo;
+#[cfg(feature = "execute-stage-probe")]
+pub use majit_backend::deadframe::{frame_build_passes, set_frame_build_repeats};
+#[cfg(feature = "execute-stage-probe")]
+pub use pyjitpl::{
+    ExecuteStageRepeats, call_shot_totals, execute_stage_clock_floor_ns, execute_stage_passes,
+    reset_call_shot_totals, set_execute_stage_repeats,
+};
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted
 // state-field JIT setup (e.g. `__JitMeta_<fn>::install_canonical_liveness`)
