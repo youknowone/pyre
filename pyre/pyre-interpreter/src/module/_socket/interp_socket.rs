@@ -3488,10 +3488,41 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 socket_init_state(obj, fd, family, ty, proto);
                 return Ok(pyre_object::w_none());
             }
+            let fileno_obj = fileno_obj.unwrap();
+            // A socket handed over by `share` arrives as the bytes of the
+            // `WSAPROTOCOL_INFOW` that wrote it, and re-opening it is what
+            // `WSASocketW` under `FROM_PROTOCOL_INFO` does.  The three
+            // arguments the caller gave are not read at all: the structure
+            // names the family, type and protocol itself, so `fromshare`
+            // reaches this with `socket(0, 0, 0, info)`.
+            #[cfg(all(windows, feature = "host_env"))]
+            if unsafe { pyre_object::is_bytes(fileno_obj) } {
+                // Copied out before the interpreter is released: the borrow
+                // would not survive a collection running in another thread.
+                let data = unsafe { pyre_object::bytesobject::w_bytes_data(fileno_obj) }.to_vec();
+                let size = rustpython_host_env::socket::protocol_info_size();
+                if data.len() != size {
+                    return Err(crate::PyError::value_error(format!(
+                        "socket descriptor string has wrong size, should be {size} bytes."
+                    )));
+                }
+                let shared = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    rustpython_host_env::socket::socket_from_share_data(&data)
+                }
+                .map_err(socket_io_err)?;
+                socket_init_state(
+                    obj,
+                    shared.raw,
+                    shared.family,
+                    shared.socket_type,
+                    shared.protocol,
+                );
+                return Ok(pyre_object::w_none());
+            }
             // `interp_socket.py:253-265` — wrap an existing fd.  A float
             // fileno is a TypeError, a negative fd a ValueError, and any
             // -1 family/type/proto is derived from the descriptor itself.
-            let fileno_obj = fileno_obj.unwrap();
             if unsafe { pyre_object::is_float(fileno_obj) } {
                 return Err(crate::PyError::type_error(
                     "integer argument expected, got float",
@@ -5046,6 +5077,35 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 Some(returned) => Ok(pyre_object::w_int_new(i64::from(returned))),
                 None => Err(socket_last_error()),
             }
+        }),
+    ) };
+
+    // `sock_share` sits beside `ioctl`, published on the same Windows-only
+    // footing: `WSADuplicateSocketW` writes a `WSAPROTOCOL_INFOW` describing
+    // the socket for the process named, and the bytes of that structure are
+    // the whole answer.  `socket.py` grows `fromshare` as soon as the method
+    // exists, and hands the blob straight back to the constructor.
+    #[cfg(all(windows, feature = "host_env"))]
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+        ns,
+        "share",
+        crate::make_builtin_function("share", |args| {
+            // `METH_O`, so a wrong count is reported by the call machinery
+            // rather than by a converter naming the method.
+            if args.len() != 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "function takes exactly 1 argument ({} given)",
+                    args.len().saturating_sub(1)
+                )));
+            }
+            let fd = socket_fd(args[0])?;
+            let process_id = masked_ulong_w(args[1])?;
+            let info = {
+                let _blocked = crate::module::thread::before_external_block();
+                rustpython_host_env::socket::share_socket(fd, process_id)
+            }
+            .map_err(socket_io_err)?;
+            Ok(pyre_object::w_bytes_from_bytes(&info))
         }),
     ) };
 
