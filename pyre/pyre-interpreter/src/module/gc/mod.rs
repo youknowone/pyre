@@ -1298,7 +1298,13 @@ fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 crate::py_module! {
     "gc",
     interpleveldefs: {
-        "callbacks"           => w_list_new(vec![]),
+        // No `callbacks`.  `moduledef.py` defines none, and the collector-side
+        // hook contract keeps its calls allocation-free, so nothing here can
+        // run an app-level callback around a collection the way
+        // `invoke_gc_callback` does.  Binding an empty list would satisfy
+        // `hasattr` and then never call it, which is a silent failure where the
+        // missing attribute is a loud one; `gc.hooks` is the notification
+        // surface that does fire.
         "garbage"             => w_list_new(vec![]),
         "DEBUG_STATS"         => w_int_new(1),
         "DEBUG_COLLECTABLE"   => w_int_new(2),
