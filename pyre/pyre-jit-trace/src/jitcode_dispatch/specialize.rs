@@ -3948,9 +3948,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                 let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
-        // A subclass shares the builtin's `ob_type`, which is all the unbox
-        // guard proves; the operand gate read `w_class`, so pin that too.
-        walker_guard_exact_w_class(
+                // A subclass shares the builtin's `ob_type`, which is all the unbox
+                // guard proves; the operand gate read `w_class`, so pin that too.
+                walker_guard_exact_w_class(
                     ctx,
                     op_pc,
                     value,
@@ -3965,9 +3965,9 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
-        // A subclass shares the builtin's `ob_type`, which is all the unbox
-        // guard proves; the operand gate read `w_class`, so pin that too.
-        walker_guard_exact_w_class(
+                // A subclass shares the builtin's `ob_type`, which is all the unbox
+                // guard proves; the operand gate read `w_class`, so pin that too.
+                walker_guard_exact_w_class(
                     ctx,
                     op_pc,
                     value,
@@ -14395,7 +14395,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // The list gets an exact-`w_class` guard above; the VALUE needs its own,
         // because the unbox proves only `ob_type` and a subclass shares it —
         // storing its payload would drop the element's Python class.
-        walker_guard_exact_w_class(ctx, op_pc, value_op, walker_numeric_builtin_class(value_obj))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            value_op,
+            walker_numeric_builtin_class(value_obj),
+        )?;
         let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(elem));
@@ -14408,7 +14413,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         );
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
         let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
-        walker_guard_exact_w_class(ctx, op_pc, value_op, walker_numeric_builtin_class(value_obj))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            value_op,
+            walker_numeric_builtin_class(value_obj),
+        )?;
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
