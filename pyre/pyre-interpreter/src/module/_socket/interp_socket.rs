@@ -2728,37 +2728,36 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
     Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
 }
 
-/// `k` — the low `unsigned long` of an integer, which is what
-/// `PyArg_ParseTuple` stores for that code: the conversion is
-/// `PyLong_AsUnsignedLongMask`, so a command outside the range wraps into it
-/// rather than being reported, and only a value with no `__index__` at all is
-/// turned away.
+/// `PyLong_AsUnsignedLongMask`: `PyNumber_Index` first, so `__index__`
+/// decides the value and `__int__` is never asked for one, and then the low
+/// bits of what it answered.  This is `ioctl`'s `I` code, the `k` code behind
+/// its `PyIndex_Check`, and the `unsigned_long(bitwise=True)` converter
+/// `share` reads its process id through — one width on a host where
+/// `unsigned int`, `unsigned long` and `DWORD` are all 32 bits.  Carrying no
+/// `PyIndex_Check` of its own, it names an object answering neither the way
+/// `PyNumber_Index` does rather than by giving the argument's position.
 #[cfg(windows)]
-fn ioctl_command_w(obj: pyre_object::PyObjectRef) -> Result<u32, crate::PyError> {
+fn masked_ulong_w(obj: pyre_object::PyObjectRef) -> Result<u32, crate::PyError> {
+    Ok(crate::baseobjspace::truncatedint_w(crate::baseobjspace::space_index(obj)?)? as u32)
+}
+
+/// `k` — [`masked_ulong_w`] behind a `PyIndex_Check` that reports the
+/// argument it was reading.  `converttuple` nests the position, so an item of
+/// the `(kkk)` group names itself as `argument 2, item 0`.
+#[cfg(windows)]
+fn ioctl_command_w(
+    obj: pyre_object::PyObjectRef,
+    argument: &str,
+) -> Result<u32, crate::PyError> {
     if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
         && unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_none()
     {
         return Err(crate::PyError::type_error(format!(
-            "ioctl() argument 1 must be int, not {}",
+            "ioctl() {argument} must be int, not {}",
             crate::type_methods::clinic_arg_type_name(obj)
         )));
     }
-    Ok(crate::baseobjspace::truncatedint_w(obj)? as u32)
-}
-
-/// `I` — the low `unsigned int`, masked the same way and reported with the
-/// message `PyNumber_Index` raises rather than one naming the position.
-#[cfg(windows)]
-fn ioctl_value_w(obj: pyre_object::PyObjectRef) -> Result<u32, crate::PyError> {
-    if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
-        && unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_none()
-    {
-        return Err(crate::PyError::type_error(format!(
-            "'{}' object cannot be interpreted as an integer",
-            crate::type_methods::arg_type_name(obj)
-        )));
-    }
-    Ok(crate::baseobjspace::truncatedint_w(obj)? as u32)
+    masked_ulong_w(obj)
 }
 
 /// `(kkk)` — the three fields `tcp_keepalive` carries.  A parenthesised group
@@ -2796,7 +2795,10 @@ fn ioctl_keepalive_w(obj: pyre_object::PyObjectRef) -> Result<[u32; 3], crate::P
     }
     let mut values = [0u32; 3];
     for (index, value) in values.iter_mut().enumerate() {
-        *value = ioctl_value_w(pyre_object::gc_roots::shadow_stack_get(base + index))?;
+        *value = ioctl_command_w(
+            pyre_object::gc_roots::shadow_stack_get(base + index),
+            &format!("argument 2, item {index}"),
+        )?;
     }
     Ok(values)
 }
@@ -5005,10 +5007,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 )));
             }
             let fd = socket_fd(args[0])?;
-            let cmd = ioctl_command_w(args[1])?;
+            let cmd = ioctl_command_w(args[1], "argument 1")?;
             let returned = match cmd {
                 ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
-                    let value = ioctl_value_w(args[2])?;
+                    let value = masked_ulong_w(args[2])?;
                     unsafe {
                         rffi::wsa_ioctl(
                             fd,

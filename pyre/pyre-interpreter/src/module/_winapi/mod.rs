@@ -80,7 +80,10 @@ fn masked_int_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Resu
             IntArg::Element => format!("argument must be int, not {got}"),
         }));
     }
-    crate::baseobjspace::truncatedint_w(w_value)
+    // `PyLong_AsNativeBytes` reads the value under
+    // `Py_ASNATIVEBYTES_ALLOW_INDEX`, so `__index__` decides it and `__int__`
+    // is never asked for one.
+    crate::baseobjspace::truncatedint_w(crate::baseobjspace::space_index(w_value)?)
 }
 
 /// [`masked_int_w`] for a `HANDLE` parameter.
