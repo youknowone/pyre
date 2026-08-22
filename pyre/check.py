@@ -1992,7 +1992,13 @@ def workspace_member_dirs():
     the line anchor, which is what keeps `default-members = [` above from
     being read as this array.
     """
-    manifest = Path("Cargo.toml").read_text(encoding="utf-8")
+    try:
+        manifest = Path("Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        # No readable manifest is no member list, which the caller already
+        # treats as an unenumerable tree and fails open on. Letting the read
+        # raise instead would abort the whole run on a traceback.
+        return []
     listing = re.search(r"^\s*members\s*=\s*\[(.*?)\]", manifest, re.S | re.M)
     if not listing:
         return []
