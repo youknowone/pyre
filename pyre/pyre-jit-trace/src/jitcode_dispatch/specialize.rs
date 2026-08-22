@@ -8530,9 +8530,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    // The modelled reads answer from `virtualizable_boxes`, which describe the
-    // PORTAL frame only.  An inline sub-walk publishes a different concrete
-    // frame whose locals live in the callee shadow, not in those boxes.
+    // A pre-filter for the frame-identity test below, which is what actually
+    // decides this shape: `locals()` reports on `gettopframe_nohidden()`, and
+    // inside an inline sub-walk or an inlined callee body that frame is not
+    // the standard virtualizable the modelled reads answer from, so the test
+    // below declines the same shapes one step later.  Refusing here as well
+    // keeps a sub-walk from emitting this fold's guards at all, the property
+    // `walker_inline_guard_resumes_in_callee` qualifies for the folds that do
+    // run under one.
     if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
         return Ok(None);
     }

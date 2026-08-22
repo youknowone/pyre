@@ -16,24 +16,11 @@
 
 use pyre_object::PyObjectRef;
 
-/// PyPy `oefmt(..., "%T", w_obj)` — resolves the wrapped object's
-/// type name for diagnostic messages, mirroring
-/// `space.type(w_obj).getname(space)`.  Used by the `*args` /
-/// `**kwargs` parity messages below ("argument after * must be an
-/// iterable, not %T", "argument after ** must be a mapping, not %T",
-/// "keywords must be strings, not '%T'").
-fn type_name_of(w_obj: PyObjectRef) -> String {
-    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
-        return "int".to_string();
-    }
-    unsafe {
-        match crate::typedef::r#type(w_obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*w_obj).ob_type).name.to_string(),
-        }
-    }
-}
+/// The `%T` conversion `oefmt` applies, for the `*args` / `**kwargs` parity
+/// messages below ("argument after * must be an iterable, not %T", "argument
+/// after ** must be a mapping, not %T", "keywords must be strings, not '%T'")
+/// — which are `oefmt(..., "%T", w_obj)` upstream.
+use crate::error::type_name_of;
 
 /// pypy/interpreter/argument.py `raise_type_error`.
 ///

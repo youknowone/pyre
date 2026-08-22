@@ -3473,26 +3473,29 @@ pub fn get_converted_unexpected_exception(
 
 /// pypy/interpreter/error.py `decompose_valuefmt`.
 ///
-/// Upstream splits on `'%'` and asserts `len(parts) == len(formats) + 1`:
-/// every format code has a literal part on each side, so a format string that
-/// ends in one still contributes a trailing empty part.  `_compute_value`
-/// relies on that — it walks the parts and the formats in lockstep.
+/// Every format code has a literal part on each side, so a format string that
+/// ends in one still contributes a trailing empty part. `_compute_value`
+/// relies on that — it walks the parts and the formats in lockstep — and
+/// `get_operrcls2` asserts the resulting relationship.
 pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
+    const FMTS: &str = "8NRSTds";
+
     let mut strings = Vec::new();
     let mut formats = Vec::new();
     let mut current = String::new();
 
-    let mut iter = valuefmt.chars().peekable();
+    let mut iter = valuefmt.chars();
     while let Some(ch) = iter.next() {
         if ch == '%' {
-            if let Some('%') = iter.peek() {
-                let _ = iter.next();
-                current.push('%');
-                continue;
-            }
-            strings.push(std::mem::take(&mut current));
-            if let Some(spec) = iter.next() {
-                formats.push(spec.to_string());
+            match iter.next() {
+                Some('%') => current.push('%'),
+                Some(spec) if FMTS.contains(spec) => {
+                    strings.push(std::mem::take(&mut current));
+                    formats.push(spec.to_string());
+                }
+                Some(_) | None => {
+                    panic!("invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)")
+                }
             }
         } else {
             current.push(ch);
@@ -3503,11 +3506,13 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
     // that makes `strings` one longer than `formats`.
     strings.push(current);
 
+    assert!(!formats.is_empty(), "unsupported: no % command found");
     (strings, formats)
 }
 
 pub fn get_operrcls2(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
-    let (strings, _formats) = decompose_valuefmt(valuefmt);
+    let (strings, formats) = decompose_valuefmt(valuefmt);
+    assert_eq!(strings.len(), formats.len() + 1);
     (std::ptr::null_mut(), strings)
 }
 
@@ -3580,18 +3585,114 @@ fn operation_error_from_class(w_type: PyObjectRef, message: &str) -> OperationEr
 /// is left is the step upstream takes in both arms — build the error **from
 /// `w_type`**.
 ///
-/// The arguments arrive rendered, one per format code, because the format
-/// codes themselves (`%T`, `%N`, `%R`, …) name object-space spellings a
-/// `Display` already carries.  They stay a sequence rather than one joined
-/// value: a single `Display` handed to a `valuefmt` with several codes reports
-/// the same text in every one of them.
-pub fn oefmt(
-    w_type: PyObjectRef,
-    valuefmt: &str,
-    args: &[&dyn std::fmt::Display],
-) -> OperationError {
-    use std::fmt::Write as _;
+/// Each format code keeps the operand kind that
+/// `get_operrcls2.OpErrFmt._compute_value` expects, so conversion is selected
+/// by the code rather than by one common display implementation.
+pub enum FmtArg<'a> {
+    /// `%s`: text copied as-is.
+    Text(&'a str),
+    /// `%d`: an integer rendered in decimal.
+    Int(i64),
+    /// `%8`: raw bytes decoded as UTF-8 with replacement.
+    Bytes(&'a [u8]),
+    /// `%R`, `%S`, `%T`, and `%N`: a wrapped object.
+    Obj(PyObjectRef),
+}
 
+impl FmtArg<'_> {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "Text",
+            Self::Int(_) => "Int",
+            Self::Bytes(_) => "Bytes",
+            Self::Obj(_) => "Obj",
+        }
+    }
+}
+
+fn expected_fmt_arg(format: char) -> &'static str {
+    match format {
+        's' => "Text",
+        'd' => "Int",
+        '8' => "Bytes",
+        'R' | 'S' | 'T' | 'N' => "Obj",
+        _ => unreachable!("decompose_valuefmt accepted an unknown format code"),
+    }
+}
+
+/// The shared `%R` / `%S` conversion and rescue from
+/// `get_operrcls2.OpErrFmt._compute_value`.
+fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.base();
+    _roots.pin_root(obj);
+    let obj = || _roots.get(obj_slot);
+
+    let (rendered, fallback) = if format == 'R' {
+        (
+            unsafe { crate::display::py_repr_wtf8(obj()) },
+            "<repr raised>",
+        )
+    } else {
+        (
+            unsafe { crate::display::py_str_wtf8(obj()) },
+            "<str raised>",
+        )
+    };
+    match rendered {
+        // `space.utf8_w(w_s)` hands back the string's own buffer, which is what
+        // `py_repr_wtf8` already returned, so only a repr or str that *raised*
+        // takes the rescue below.  Reading it back through a `&str` view
+        // instead would divert a lone surrogate — legal in that buffer — into
+        // the rescue as well, reporting `<repr raised>` for a repr that
+        // succeeded.  The surrogate itself does not survive the last step: the
+        // message this builds is a Rust `String`.
+        Ok(rendered) => rendered.to_string_lossy().into_owned(),
+        Err(mut error) => {
+            error.write_unraisable(
+                pyre_object::w_none(),
+                rustpython_wtf8::Wtf8::new("exception formatting: "),
+                obj(),
+            );
+            fallback.to_owned()
+        }
+    }
+}
+
+/// `W_Root.getname`: read `__name__` and answer `?` when the lookup raises —
+/// for any `OperationError`, not just the two an attribute miss produces.
+///
+/// The name is read off the string's own buffer for the reason
+/// [`format_obj_as_utf8`] gives: a `&str` view would turn a lone surrogate in
+/// `__name__` into a raise, and this function reports a raise as `?`.
+fn format_obj_name(obj: PyObjectRef) -> String {
+    match crate::baseobjspace::getattr_str(obj, "__name__")
+        .and_then(crate::baseobjspace::text_wtf8_w)
+    {
+        Ok(name) => name.to_string_lossy().into_owned(),
+        Err(_) => "?".to_owned(),
+    }
+}
+
+/// `space.type(w_obj).getname(space)` — the `%T` spelling.
+///
+/// The Python-visible type, which is `w_class`; `ob_type` names the storage a
+/// value is laid out as, and a class deriving from a builtin shares its
+/// storage while presenting its own name.
+pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
+    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
+        return "int".to_string();
+    }
+    unsafe {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+            None => (*(*w_obj).ob_type).name.to_string(),
+        }
+    }
+}
+
+pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.
     let message = if args.is_empty() {
@@ -3601,14 +3702,62 @@ pub fn oefmt(
         // `_compute_value` makes over them: a literal part, the argument
         // belonging to the format code that followed it, and so on to the
         // trailing part `decompose_valuefmt` guarantees.
-        let (_op_err_fmt, strings) = get_operr_class(valuefmt);
-        let mut message = String::new();
-        for (i, part) in strings.iter().enumerate() {
-            message.push_str(part);
-            if let Some(arg) = args.get(i) {
-                let _ = write!(message, "{arg}");
+        let (strings, formats) = decompose_valuefmt(valuefmt);
+        assert_eq!(
+            args.len(),
+            formats.len(),
+            "oefmt argument count mismatch: {} format codes but {} arguments",
+            formats.len(),
+            args.len()
+        );
+
+        // Pin every object before the first object-space conversion can move
+        // any later operand. The argument slice itself contains raw pointers
+        // and is not a GC root.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut rooted_obj_count = 0;
+        for arg in args {
+            if let FmtArg::Obj(obj) = arg {
+                _roots.pin_root(*obj);
+                rooted_obj_count += 1;
             }
         }
+        let first_obj_slot = _roots.base();
+        let mut next_obj_slot = first_obj_slot;
+        let mut message = String::new();
+        for (i, part) in strings[..formats.len()].iter().enumerate() {
+            message.push_str(part);
+            let format = formats[i].chars().next().unwrap();
+            let arg = &args[i];
+            let rendered = match (format, arg) {
+                ('d', FmtArg::Int(value)) => value.to_string(),
+                ('s', FmtArg::Text(value)) => (*value).to_owned(),
+                ('8', FmtArg::Bytes(value)) => String::from_utf8_lossy(value).into_owned(),
+                ('T', FmtArg::Obj(_)) => {
+                    let obj = _roots.get(next_obj_slot);
+                    next_obj_slot += 1;
+                    type_name_of(obj)
+                }
+                ('N', FmtArg::Obj(_)) => {
+                    let obj = _roots.get(next_obj_slot);
+                    next_obj_slot += 1;
+                    format_obj_name(obj)
+                }
+                ('R' | 'S', FmtArg::Obj(_)) => {
+                    let obj = _roots.get(next_obj_slot);
+                    next_obj_slot += 1;
+                    format_obj_as_utf8(obj, format)
+                }
+                _ => panic!(
+                    "oefmt format %{format} requires {} argument, got {}",
+                    expected_fmt_arg(format),
+                    arg.kind_name()
+                ),
+            };
+            message.push_str(&rendered);
+        }
+        debug_assert_eq!(next_obj_slot - first_obj_slot, rooted_obj_count);
+        message.push_str(&strings[formats.len()]);
         message
     };
     operation_error_from_class(w_type, &message)
@@ -3748,7 +3897,14 @@ pub fn new_exception_class(
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         _roots.pin_root(w_exc);
         let w_module = pyre_object::w_str_new(module);
-        let _ = crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module);
+        // `space.setattr` propagates its failure through the same bare-return
+        // channel as the class call above.
+        if let Err(err) =
+            crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module)
+        {
+            crate::call::set_call_error(err);
+            return std::ptr::null_mut();
+        }
         return _roots.get(exc_slot);
     }
     w_exc
@@ -3899,8 +4055,6 @@ mod tests {
             "cannot do %s to %s",
             "%s leads",
             "trails %s",
-            "no format codes",
-            "",
             "%N takes %R and %T",
         ] {
             let (strings, formats) = super::decompose_valuefmt(valuefmt);
@@ -3910,6 +4064,22 @@ mod tests {
                 "{valuefmt:?} -> {strings:?} / {formats:?}"
             );
         }
+    }
+
+    #[test]
+    fn decompose_valuefmt_rejects_no_format_command() {
+        for valuefmt in ["no format codes", ""] {
+            let panic = std::panic::catch_unwind(|| super::decompose_valuefmt(valuefmt));
+            assert!(panic.is_err(), "accepted {valuefmt:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)"
+    )]
+    fn decompose_valuefmt_rejects_an_invalid_code() {
+        let _ = super::decompose_valuefmt("cannot use %q");
     }
 
     #[test]
@@ -3928,7 +4098,11 @@ mod tests {
 
     #[test]
     fn oefmt_interleaves_the_rendered_argument() {
-        let err = super::oefmt(std::ptr::null_mut(), "cannot add %s", &[&"int"]);
+        let err = super::oefmt(
+            std::ptr::null_mut(),
+            "cannot add %s",
+            &[super::FmtArg::Text("int")],
+        );
         assert_eq!(err.render_exception(), "RuntimeError: cannot add int");
     }
 
@@ -3939,11 +4113,44 @@ mod tests {
         let err = super::oefmt(
             std::ptr::null_mut(),
             "cannot add %s to %s",
-            &[&"int", &"str"],
+            &[super::FmtArg::Text("int"), super::FmtArg::Text("str")],
         );
         assert_eq!(
             err.render_exception(),
             "RuntimeError: cannot add int to str"
+        );
+    }
+
+    #[test]
+    fn oefmt_applies_scalar_conversion_per_format_code() {
+        let err = super::oefmt(
+            std::ptr::null_mut(),
+            "%d %s",
+            &[super::FmtArg::Int(-42), super::FmtArg::Text("items")],
+        );
+        assert_eq!(err.render_exception(), "RuntimeError: -42 items");
+    }
+
+    #[test]
+    fn oefmt_replaces_invalid_utf8_for_percent_8() {
+        let err = super::oefmt(
+            std::ptr::null_mut(),
+            "bad bytes: %8",
+            &[super::FmtArg::Bytes(b"left\xffright")],
+        );
+        assert_eq!(
+            err.render_exception(),
+            "RuntimeError: bad bytes: left\u{fffd}right"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "oefmt format %d requires Int argument, got Text")]
+    fn oefmt_rejects_an_operand_of_the_wrong_kind() {
+        let _ = super::oefmt(
+            std::ptr::null_mut(),
+            "count: %d",
+            &[super::FmtArg::Text("not an integer")],
         );
     }
 
