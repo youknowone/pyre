@@ -24065,19 +24065,17 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             "decode() argument 'errors' must be str, not {tn}",
         )));
     }
+    // `str_utf8_w` hands back the string object's own buffer, and both
+    // objects stay rooted for the call, so neither name needs a copy.
     let encoding = match w_encoding {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            crate::baseobjspace::str_utf8_w(e)?.to_string()
-        }
-        _ => "utf-8".to_string(),
+        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
+        _ => "utf-8",
     };
     let errors = match w_errors {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            crate::baseobjspace::str_utf8_w(e)?.to_string()
-        }
-        _ => "strict".to_string(),
+        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
+        _ => "strict",
     };
-    let s = decode_bytes_to_wtf8(data, &encoding, errors.as_str())?;
+    let s = decode_bytes_to_wtf8(data, encoding, errors)?;
     Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
@@ -24089,10 +24087,21 @@ pub(crate) fn decode_bytes_to_wtf8(
     errors: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
-    let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    // The codec name is matched with case folded and `_` read as `-`.  Every
+    // caller inside the runtime, and `bytes.decode`'s own default, already
+    // spells it that way, so the rewrite is the exception and only it pays
+    // for a buffer.
+    let enc_lower: std::borrow::Cow<'_, str> = if encoding
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        std::borrow::Cow::Owned(encoding.to_ascii_lowercase().replace('_', "-"))
+    } else {
+        std::borrow::Cow::Borrowed(encoding)
+    };
     if crate::importing::dev_mode_flag()
         && matches!(
-            enc_lower.as_str(),
+            enc_lower.as_ref(),
             "utf-8"
                 | "utf8"
                 | "u8"
@@ -24114,7 +24123,7 @@ pub(crate) fn decode_bytes_to_wtf8(
     {
         crate::module::_codecs::validate_error_handler(errors)?;
     }
-    let s = match enc_lower.as_str() {
+    let s = match enc_lower.as_ref() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
             let mut out = Wtf8Buf::new();
