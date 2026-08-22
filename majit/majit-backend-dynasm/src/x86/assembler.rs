@@ -2958,10 +2958,25 @@ impl<'a> Assembler386<'a> {
             | OpCode::PtrNe
             | OpCode::InstancePtrEq
             | OpCode::InstancePtrNe => {
+                let mut opcode = op.opcode;
                 if arglocs.len() >= 2 {
-                    self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
+                    // `cmp` reaches an immediate only on its right, so a
+                    // constant on the left is moved through a scratch
+                    // register first. Swapping the operands folds it back
+                    // into the instruction, and the order the swap destroys
+                    // is carried by `resoperation.py`'s reflex table.
+                    let (cmp0, cmp1) = if matches!(arglocs[0], Loc::Immed(_))
+                        && !matches!(arglocs[1], Loc::Immed(_))
+                        && let Some(reflexed) = op.opcode.bool_reflex()
+                    {
+                        opcode = reflexed;
+                        (&arglocs[1], &arglocs[0])
+                    } else {
+                        (&arglocs[0], &arglocs[1])
+                    };
+                    self.emit_cmp_loc_loc(cmp0, cmp1);
                 }
-                let cc = Self::opcode_to_cc(op.opcode);
+                let cc = Self::opcode_to_cc(opcode);
                 self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
