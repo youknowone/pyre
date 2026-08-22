@@ -5840,15 +5840,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
                         let guard_pc_proves_slot = guard_owned_slot == Some(s_idx);
                         if guard_pc_proves_slot {
-                            // The proof is what makes the register the upstream
-                            // read, and `registers_r[index]` preserves a NULL
-                            // box in a snapshot.  Skipping it to the shadow
-                            // here would answer a slot the guard already
-                            // settled with the one source it was chosen over.
-                            walk_box
-                                .filter(|&v| v != OpRef::NONE)
-                                .or(vbox)
-                                .unwrap_or_else(fallback)
+                            walk_real.or(vbox).unwrap_or_else(fallback)
                         } else if shadow_is_real {
                             vbox.unwrap_or_else(fallback)
                         } else {
