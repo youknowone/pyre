@@ -18,6 +18,7 @@ import platform
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1871,28 +1872,81 @@ def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
             )
 
 
-def touch_and_note(target: Path, own_writes: dict[tuple[int, int], int]) -> None:
-    """`touch` a path and record the mtime that touch produced.
+def charon_host_triple(charon_bin: Path, root: Path) -> str:
+    """The target triple Charon's `cargo` passes as `--target`.
 
-    Every touch of a closure input must go through this rather than
-    `Path.touch()`. `window_writes` tells the extractor's own writes from a
-    peer's by comparing against the exact mtime recorded here, so a touch that
-    is not recorded is reported as a candidate on every clean run. Repeated
-    false positives would make the report unactionable.
-
-    Pairing the write with its record in ONE call is what keeps them from
-    drifting. There are already two touch sites (the crate root before the
-    charon build, and again before each cross-target layout build), the second
-    is easy to miss, and the failure it causes is a permanent false positive
-    rather than an error.
-
-    Keyed by `(st_dev, st_ino)` rather than by path so it cannot be defeated by
-    two spellings of one file, and in nanoseconds because `st_mtime` is a float
-    whose rounding makes exact equality unreliable.
+    `charon cargo` always names the host explicitly so its driver can tell
+    build scripts and proc macros (host units) from the crate it translates,
+    which is why the extraction lands under `target/<host-triple>/debug`
+    rather than `target/debug`. Read it from Charon's own rustc: the build
+    toolchain can be a different host spelling on the same machine.
     """
-    target.touch()
-    st = target.stat()
-    own_writes[(st.st_dev, st.st_ino)] = st.st_mtime_ns
+    toolchain = Path(run_capture([str(charon_bin), "toolchain-path"], cwd=root).strip())
+    rustc = toolchain / "bin" / ("rustc.exe" if os.name == "nt" else "rustc")
+    for line in run_capture([str(rustc), "-vV"], cwd=root).splitlines():
+        if line.startswith("host:"):
+            return line[len("host:"):].strip()
+    raise SystemExit(f"extract-llbc.py: {rustc} -vV printed no `host:` line")
+
+
+def cargo_unit_location(crate_dir: Path) -> tuple[Path, str]:
+    """`(target_directory, package_name)` for the crate Charon builds in `crate_dir`.
+
+    Resolved through `cargo metadata --no-deps` from the crate's own directory
+    rather than the workspace root: a crate outside the workspace (`corpus`
+    carries its own `Cargo.lock`) has its own `target/`, and the package name
+    is what cargo spells the `.fingerprint/<name>-<hash>` entry with, which is
+    the manifest `name`, not the driver's spec key.
+    """
+    result = json.loads(
+        run_capture(
+            ["cargo", "metadata", "--no-deps", "--locked", "--format-version=1"],
+            cwd=crate_dir,
+        )
+    )
+    manifest = (crate_dir / "Cargo.toml").resolve()
+    for package in result["packages"]:
+        if Path(package["manifest_path"]).resolve() == manifest:
+            return Path(result["target_directory"]), package["name"]
+    raise SystemExit(
+        f"extract-llbc.py: `cargo metadata --no-deps` in {crate_dir} lists no "
+        f"package whose manifest is {manifest}"
+    )
+
+
+def invalidate_cargo_unit(target_dir: Path, triple: str, package: str) -> int:
+    """Drop cargo's fingerprint for `package` in the `<triple>/debug` layout.
+
+    Charon writes the `.ullbc` only while rustc actually compiles the crate,
+    and a warm cache makes the inner `cargo build` skip rustc and emit
+    nothing. The fingerprint is the one record cargo consults to decide that,
+    so removing it forces exactly this unit to recompile — every feature
+    variant of it, since the hash in the directory name is not known here —
+    while its dependencies stay cached.
+
+    This replaces a `touch` of the crate root. cargo's freshness check is
+    mtime-based, so the touch also re-staled the same sources for every OTHER
+    layout on disk (the host units beside this one, each cross-target layout,
+    and the stable build's `target/release`), and their dependents with them:
+    one extraction recompiled the majit stack six times over an unchanged
+    tree. A missing fingerprint is local to one layout and touches no input.
+
+    Returns the number of fingerprint entries removed; zero on a cold cache,
+    which needs no forcing.
+    """
+    fingerprints = target_dir / triple / "debug" / ".fingerprint"
+    removed = 0
+    if not fingerprints.is_dir():
+        return removed
+    for entry in fingerprints.glob(f"{package}-*"):
+        # `<name>-<hash>`: the hash is 16 hex digits, so a package whose name
+        # extends this one (`pyre-jit` vs `pyre-jit-trace`) cannot match.
+        suffix = entry.name[len(package) + 1 :]
+        if len(suffix) != 16 or not all(c in "0123456789abcdef" for c in suffix):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def window_writes(
@@ -1900,7 +1954,6 @@ def window_writes(
     root: Path,
     lo_ns: int,
     hi_ns: int,
-    own_writes: dict[tuple[int, int], int],
 ) -> tuple[list[tuple[int, Path]], int, list[str]]:
     """Closure inputs written while this crate was being extracted.
 
@@ -1922,10 +1975,12 @@ def window_writes(
 
     KNOWN LIMITS, printed by the caller rather than filed elsewhere:
       * An mtime-preserving restore (`cp -p`) defeats it completely.
-      * A write that landed before this crate's own `touch` of the same file is
-        overwritten by that touch and cannot be seen.
       * It has never produced a real-world true positive; it is proven to fire
         on a constructed edit-and-restore only.
+
+    The extractor itself writes no closure input: it forces Charon's recompile
+    through cargo's fingerprint (`invalidate_cargo_unit`), so every candidate
+    reported here is a peer's write.
     """
     candidates: list[tuple[int, Path]] = []
     unresolved: list[str] = []
@@ -1939,11 +1994,51 @@ def window_writes(
             continue
         if not lo_ns <= st.st_mtime_ns <= hi_ns:
             continue
-        if own_writes.get((st.st_dev, st.st_ino)) == st.st_mtime_ns:
-            continue  # the extractor's own touch, to the nanosecond
         candidates.append((st.st_mtime_ns, rel))
     candidates.sort()
     return candidates, len(inputs) - len(unresolved), unresolved
+
+
+def finish_charon_pass(proc: subprocess.Popen, command: list[str], dest: Path) -> None:
+    """Wait for a Charon pass and refuse a run that produced no artefact."""
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command)
+    # Fail loud rather than letting a missing artefact surface later
+    # as an opaque build.rs panic ("build/llbc/ is missing …").
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise SystemExit(
+            f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
+            "  the crate compiled but produced no MIR — "
+            "inspect the Charon output above"
+        )
+
+
+def physical_memory_bytes() -> int | None:
+    """Installed RAM, or None where the platform does not say (Windows)."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def layout_passes_in_parallel() -> bool:
+    """Whether a crate's cross-target layout pass runs beside its host pass.
+
+    Each Charon pass over `pyre-interpreter` peaks near 5 GB and is
+    single-threaded, so two at once want a second core to spare and ~10 GB
+    headroom over whatever else the box is doing. Hosted CI runners (4 cores,
+    and 7 GB on macOS) stay sequential; a developer machine goes parallel.
+    `LLBC_PARALLEL_LAYOUTS=0|1` overrides the guess either way.
+    """
+    override = os.environ.get("LLBC_PARALLEL_LAYOUTS")
+    if override in ("0", "1"):
+        return override == "1"
+    if override is not None:
+        raise SystemExit(
+            f"extract-llbc.py: LLBC_PARALLEL_LAYOUTS={override!r}; expected 0 or 1"
+        )
+    memory = physical_memory_bytes()
+    return (os.cpu_count() or 1) >= 8 and memory is not None and memory >= 16 << 30
 
 
 def extract(eng: Engine, args: argparse.Namespace) -> None:
@@ -2005,6 +2100,16 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     ]
 
     prepared_std: set[str] = set()
+    host_triple = charon_host_triple(charon_bin, eng.root)
+    parallel_layouts = layout_passes_in_parallel()
+    if parallel_layouts and any(
+        crate_layout_targets(eng, eng.spec(crate))
+        for crate in args.crates or eng.default_crates
+    ):
+        print(
+            "layout passes run beside the host pass (LLBC_PARALLEL_LAYOUTS=0"
+            " to serialise them)"
+        )
 
     for crate in args.crates or eng.default_crates:
         spec = eng.spec(crate)
@@ -2069,26 +2174,19 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # argument: a bound supplied by a caller is a bound nobody can
         # check, and a guessed one reads exactly like a measured one.
         window_lo_ns = time.time_ns()
-        own_writes: dict[tuple[int, int], int] = {}
         dirty_status_before, dirty_entries_before = git_dirty(eng.root)
         dirty_before = (
             len(dirty_entries_before) if dirty_status_before == "ok" else None
         )
 
         print(f"=== extracting {crate} -> {dest} ===")
-        # Charon writes the `.ullbc` only while rustc actually compiles
-        # the crate. Once the fingerprint skip above is past, the artefact
-        # is known absent or stale and must be (re)generated — but a warm
-        # `target/<host-triple>/` cache (e.g. `build/` was wiped while the
-        # build cache survived) makes the inner `cargo build` skip rustc
-        # and emit nothing, leaving `dest` missing. Touch the crate root
-        # to dirty just this unit's fingerprint so it always recompiles
-        # and re-emits; dependency crates stay cached (their MIR reaches
-        # Charon via rlib metadata), so re-runs remain cheap.
-        crate_root = path / "src" / "lib.rs"
-        if not crate_root.exists():
-            crate_root = path / "src" / "main.rs"
-        touch_and_note(crate_root, own_writes)
+        # Once the fingerprint skip above is past, the artefact is known
+        # absent or stale and must be (re)generated, so this unit must reach
+        # rustc whatever cargo's cache says; see `invalidate_cargo_unit`.
+        # Dependency crates stay cached (their MIR reaches Charon via rlib
+        # metadata), so re-runs remain cheap.
+        target_dir, package = cargo_unit_location(path)
+        invalidate_cargo_unit(target_dir, host_triple, package)
 
         host_env = {**env, **host_config_env}
         command = [
@@ -2102,15 +2200,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             *flags,
             *host_config,
         ]
-        subprocess.run(command, cwd=path, env=host_env, check=True)
-        # Fail loud rather than letting a missing artefact surface later
-        # as an opaque build.rs panic ("build/llbc/ is missing …").
-        if not dest.exists() or dest.stat().st_size == 0:
-            raise SystemExit(
-                f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
-                "  the crate compiled but produced no MIR — "
-                "inspect the Charon output above"
-            )
+        host_pass = subprocess.Popen(command, cwd=path, env=host_env)
 
         # One extra extraction per cross target, reduced to its type
         # declarations. Charon's own `--targets` aggregation would fold
@@ -2121,37 +2211,76 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # artefact's bodies untouched, and dropping everything but
         # `type_decls` from the cross-target one leaves only what a
         # cross-target build actually lacks — its own field offsets.
-        layout_tables: dict[str, set[Path]] = {}
+        #
+        # The cross-target pass does not depend on the host one, and each is
+        # a single-threaded Charon translation of the same crate (the bulk of
+        # the pass), so on a machine with the cores and memory for two they
+        # run side by side; see `layout_passes_in_parallel`. A parallel pass
+        # gets its own target directory: cargo locks each layout's
+        # `.cargo-lock`, and both passes would otherwise serialise on the
+        # host layout they share for build scripts and proc macros.
+        layout_passes: list[tuple[str, Path, Path, subprocess.Popen | None]] = []
         for target in crate_layout_targets(eng, spec):
             if target not in prepared_std:
                 ensure_charon_std(charon_bin, [target], eng.root)
                 prepared_std.add(target)
             sidecar = dest_dir / spec.layout_sidecar_name(target)
-            print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
+            full = sidecar.with_suffix(sidecar.suffix + ".full")
             layout_env = dict(env)
             if eng.layout_target_rustflags:
                 layout_env["RUSTFLAGS"] = (
                     layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
                 ).strip()
-            full = sidecar.with_suffix(sidecar.suffix + ".full")
-            touch_and_note(crate_root, own_writes)
-            subprocess.run(
-                [
-                    str(charon_bin),
-                    "cargo",
-                    "--ullbc",
-                    "--dest-file",
-                    str(full),
-                    "--targets",
-                    target,
-                    *charon_flags,
-                    "--",
-                    *layout_flags,
-                ],
-                cwd=path,
-                env=layout_env,
-                check=True,
-            )
+            layout_target_dir = target_dir
+            if parallel_layouts:
+                layout_target_dir = target_dir / "llbc-layouts"
+                layout_env["CARGO_TARGET_DIR"] = str(layout_target_dir)
+            invalidate_cargo_unit(layout_target_dir, target, package)
+            layout_command = [
+                str(charon_bin),
+                "cargo",
+                "--ullbc",
+                "--dest-file",
+                str(full),
+                "--targets",
+                target,
+                *charon_flags,
+                "--",
+                *layout_flags,
+            ]
+            print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
+            if parallel_layouts:
+                # Output is held back and printed only on failure: two
+                # interleaved cargo streams are unreadable, and the host
+                # pass is the one whose progress a reader follows.
+                proc = subprocess.Popen(
+                    layout_command,
+                    cwd=path,
+                    env=layout_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                layout_passes.append((target, sidecar, full, proc))
+            else:
+                layout_passes.append((target, sidecar, full, None))
+                # Sequential: the host pass holds the shared layout's lock,
+                # so run this one only after it has finished.
+                if host_pass is not None:
+                    finish_charon_pass(host_pass, command, dest)
+                    host_pass = None
+                subprocess.run(layout_command, cwd=path, env=layout_env, check=True)
+
+        if host_pass is not None:
+            finish_charon_pass(host_pass, command, dest)
+            host_pass = None
+
+        layout_tables: dict[str, set[Path]] = {}
+        for target, sidecar, full, proc in layout_passes:
+            if proc is not None:
+                output, _ = proc.communicate()
+                if proc.returncode != 0:
+                    sys.stdout.write(output.decode("utf-8", errors="replace"))
+                    raise subprocess.CalledProcessError(proc.returncode, proc.args)
             if not full.exists() or full.stat().st_size == 0:
                 raise SystemExit(
                     f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
@@ -2250,7 +2379,6 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             eng.root,
             window_lo_ns,
             time.time_ns(),
-            own_writes,
         )
         print(
             f"    window writes: {len(moved)} candidate(s) over {covered} of"
