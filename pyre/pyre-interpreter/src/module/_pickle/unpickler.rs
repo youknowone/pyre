@@ -1620,8 +1620,7 @@ fn read_line_bytes(slot: usize) -> Result<Vec<u8>, PyError> {
 
 fn read_line(slot: usize) -> Result<String, PyError> {
     let bytes = read_line_bytes(slot)?;
-    String::from_utf8(bytes)
-        .map_err(|err| crate::typedef::utf8_decode_error(err.as_bytes()))
+    String::from_utf8(bytes).map_err(|err| crate::typedef::utf8_decode_error(err.as_bytes()))
 }
 
 /// Read a newline-terminated decimal integer argument (GET / PUT in the

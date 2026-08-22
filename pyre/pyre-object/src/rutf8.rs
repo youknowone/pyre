@@ -521,8 +521,14 @@ mod tests {
     fn check_utf8_reports_the_offending_sequences_position() {
         assert_eq!(check_utf8(b"ab\x80", true), Err(CheckError { pos: 2 }));
         assert_eq!(check_utf8(b"ab\xc2", true), Err(CheckError { pos: 2 }));
-        assert_eq!(check_utf8(b"ab\xe0\x80\x80", true), Err(CheckError { pos: 2 }));
-        assert_eq!(check_utf8(b"ab\xf4\x90\x80\x80", true), Err(CheckError { pos: 2 }));
+        assert_eq!(
+            check_utf8(b"ab\xe0\x80\x80", true),
+            Err(CheckError { pos: 2 })
+        );
+        assert_eq!(
+            check_utf8(b"ab\xf4\x90\x80\x80", true),
+            Err(CheckError { pos: 2 })
+        );
         assert_eq!(check_utf8(b"ab\xf5", true), Err(CheckError { pos: 2 }));
         assert_eq!(check_utf8(b"ab\xc1\x81", true), Err(CheckError { pos: 2 }));
     }

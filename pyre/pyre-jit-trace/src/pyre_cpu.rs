@@ -305,9 +305,17 @@ mod tests {
             .map(|c| c.to_u32() as i64)
             .collect();
         for (i, expected) in walk.iter().enumerate() {
-            assert_eq!(cpu.bh_unicodegetitem(gc, i as i64), Some(*expected), "index {i}");
+            assert_eq!(
+                cpu.bh_unicodegetitem(gc, i as i64),
+                Some(*expected),
+                "index {i}"
+            );
         }
-        assert_eq!(cpu.bh_unicodegetitem(gc, walk.len() as i64), None, "one past the end");
+        assert_eq!(
+            cpu.bh_unicodegetitem(gc, walk.len() as i64),
+            None,
+            "one past the end"
+        );
         assert_eq!(cpu.bh_unicodegetitem(gc, -1), None, "negative index");
     }
 
