@@ -467,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn surrogate_bytes_names_exactly_what_the_allowance_admits() {
+        // The decoder's span arms read `surrogate_bytes` after
+        // `invalid_byte_2_of_3` has already passed, and take it to mean "the
+        // allowance is why this pair got through". That holds only if the
+        // predicate names precisely the pairs the two `allow_surrogates`
+        // answers disagree on.
+        for ch1 in 0xE0..=0xEFu8 {
+            for ch2 in 0..=0xFFu8 {
+                let admitted_by_the_allowance =
+                    invalid_byte_2_of_3(ch1, ch2, false) && !invalid_byte_2_of_3(ch1, ch2, true);
+                assert_eq!(
+                    admitted_by_the_allowance,
+                    surrogate_bytes(ch1, ch2) && !invalid_cont_byte(ch2),
+                    "{ch1:#04x} {ch2:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn check_utf8_and_wtf8_from_bytes_agree() {
         // Every two-byte buffer, every three-byte buffer whose lead byte can
         // begin a three-byte sequence, and the four-byte leads around the two
