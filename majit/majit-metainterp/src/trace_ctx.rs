@@ -1362,6 +1362,57 @@ impl TraceCtx {
         self.virtualref_boxes.last().copied()
     }
 
+    /// The current concrete address of one `virtualref_boxes` entry.
+    ///
+    /// The `usize` beside each box is the address the object had when the pair
+    /// was pushed, and the object it names is movable: a minor collection
+    /// relocates it and forwards the stamp, leaving the pushed copy naming the
+    /// old address.  `opimpl_virtual_ref_finish` documents the same hazard on
+    /// the same list.  Read the address back through `concrete_of_opref` —
+    /// pyre's `getref_base()` — so a pair that has moved still matches, and
+    /// keep the pushed copy only for an entry carrying no stamp at all.
+    fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
+        match self.concrete_of_opref(entry.0) {
+            Some(Value::Ref(r)) => r.as_usize(),
+            _ => entry.1,
+        }
+    }
+
+    /// Resolve a live tracing-time vref back to its `[virtualbox, vrefbox]`
+    /// pair.  This is the paired walk `vrefs_after_residual_call` makes over
+    /// `MetaInterp.virtualref_boxes` (`pyjitpl.py`): callers that execute
+    /// `jit_force_virtual(vref)` need the paired virtual box that
+    /// `stop_tracking_virtualref` publishes through `VIRTUAL_REF_FINISH`.
+    ///
+    /// Search from the innermost pair because frame-chain vrefs are nested in
+    /// the same order as `virtualref_boxes`.  A stopped pair has had its vref
+    /// entry replaced by `CONST_NULL`, exactly as upstream, so it cannot match.
+    pub fn live_virtualref_pair_for_ptr(&self, vref_ptr: usize) -> Option<(OpRef, OpRef)> {
+        if vref_ptr == 0 {
+            return None;
+        }
+        self.virtualref_boxes
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| self.virtualref_entry_ptr(pair[1]) == vref_ptr)
+            .map(|pair| (pair[0].0, pair[1].0))
+    }
+
+    /// Find the virtual box for a concrete object named by either a live or an
+    /// already-stopped vref pair. `stop_tracking_virtualref` replaces only
+    /// `virtualref_boxes[i + 1]` with `CONST_NULL`; the adjacent virtual box
+    /// remains in the upstream list until `virtual_ref_finish` pops the scope.
+    pub fn virtualref_virtual_for_object_ptr(&self, object_ptr: usize) -> Option<OpRef> {
+        if object_ptr == 0 {
+            return None;
+        }
+        self.virtualref_boxes
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| self.virtualref_entry_ptr(pair[0]) == object_ptr)
+            .map(|pair| pair[0].0)
+    }
+
     /// `pyjitpl.py rebuild_state_after_failure`'s
     /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
     /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard
@@ -5184,6 +5235,59 @@ impl TraceCtx {
             concrete,
             live_null_push,
         )
+    }
+
+    /// The array half of `virtualizable.py write_boxes`, emitted into the trace
+    /// for one array field of the STANDARD virtualizable.
+    ///
+    /// `pyjitpl.py synchronize_virtualizable` runs that write-back after every
+    /// vable store, but only against the recording-time virtualizable: upstream
+    /// readers of a virtualizable array are traced through and read the boxes,
+    /// so the compiled trace never needs the array itself to be current.  A
+    /// consumer that reads the array at run time instead needs the same writes
+    /// emitted, which is what this records.
+    ///
+    /// `items` is `(element index, box)` pairs; only the listed slots are
+    /// written, so a caller covering a sub-range of the array leaves the rest
+    /// alone.  The emission shape is `gen_store_back_in_vable`'s array loop —
+    /// one `getfield_gc_r` of `array_pointer_field_descr` followed by a
+    /// `setarrayitem_gc` per item under `array_item_descr`.  Neither the token
+    /// store nor `forced_virtualizable` is touched: this writes the image out,
+    /// it does not force the virtualizable.
+    ///
+    /// The shadow is left alone — it already holds these values and stays
+    /// authoritative for the rest of the trace.
+    pub fn vable_array_region_write_back(
+        &mut self,
+        vable_opref: OpRef,
+        array_index: usize,
+        items: &[(i64, OpRef)],
+    ) -> bool {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return false;
+        };
+        if array_index >= info.array_fields.len() {
+            return false;
+        }
+        let field_descr = info.array_pointer_field_descr(array_index);
+        let array_descr = info.array_item_descr(array_index);
+        let array_opref = self.vable_getfield_ref_descr(vable_opref, field_descr.clone());
+        // `executor.execute` for the read: the array base has to carry its
+        // concrete half, or the consumer below reaches the backend with an
+        // operand no producer answers for.  Same step every other recorded
+        // vable array-base read takes.
+        let vable_concrete = self.concrete_of_opref(vable_opref);
+        self.stamp_vable_array_base(array_opref, vable_concrete, &field_descr);
+        self.heapcache_getfield_now_known(vable_opref, field_descr.index(), array_opref);
+        for &(item_index, value) in items {
+            let index = self.const_int(item_index);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
+            self.vable_setarrayitem_descr(array_opref, index, value, array_descr.clone());
+        }
+        true
     }
 
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`

@@ -847,20 +847,21 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 ///
 /// `try_walker_specialize_sys_getframe`
 /// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
-/// traced-through form for the one level it can resolve — depth 0 at the top
-/// walk level, where the answer IS the portal virtualizable — so those call
-/// sites reach neither this function nor its force. Over the `getframe_*`
-/// corpus that took `loops_aborted` 155 → 71 and `loops_compiled` 6 → 22.
+/// traced-through depth-0 form for either the portal or an inline MIFrame.  It
+/// also resolves a guarded positive-depth inline chain when the exact portal
+/// result is immediately consumed by `f_locals`; `fast2locals` is
+/// `@jit.unroll_safe`, so upstream reaches that mapping by reading the
+/// virtualizable boxes instead of forcing, and the specialized `f_locals`
+/// writes the locals region back out of the image in the dropped force's
+/// place.
 ///
 /// Every other shape still arrives here, and the force stays load-bearing for
-/// it. A call site inside an INLINED callee is the one the arm must keep
-/// declining: that frame carries `last_instr = -1`
-/// (`pyre-jit-trace/src/helpers.rs`) with nothing updating it through the body,
-/// so folding it would compile a `_getframe().f_lineno` reporting the `def`
-/// line where the residual's force answers correctly today. The `*_declined`
-/// fixtures under `pyre/bench/synth` hold each folded shape's escape at a read
-/// the arm does not cover — `_getframe(0).f_locals`, whose getset forces the
-/// portal on its own — so the machinery behind this force keeps its coverage.
+/// it.  In particular, generic positive-depth consumers and inline
+/// `_getframe().f_lineno` / `f_lasti` remain residual until each app-level frame
+/// getter carries the same per-frame red identity and resume coordinate.  The
+/// guarded positive-depth specialization admits only its completed immediate
+/// `f_locals` slice, so it cannot bake a stale inline `last_instr` into those
+/// other getters.
 pub fn getframe(depth: i64) -> crate::PyResult {
     let ec = current_execution_context();
     let mut current = if ec.is_null() {

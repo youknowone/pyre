@@ -2557,6 +2557,65 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Write the standard virtualizable's locals region into the array a folded
+/// `f_locals` hands out.
+///
+/// `pyframe.py fast2locals` — the body behind `getdictscope`, and so behind
+/// `f_locals` — is `@jit.unroll_safe`, and the `locals_cells_stack_w[i]` reads
+/// it unrolls are `getarrayitem_vable_r` against the virtualizable BOXES.  The
+/// getter therefore neither forces the virtualizable nor reads its array, which
+/// is what makes folding it legitimate at all.
+///
+/// pyre answers `f_locals` with the 3.14 `FrameLocalsProxy`, which reads the
+/// frame's array lazily instead of copying out of it at the call, so the values
+/// have to be IN that array by the time the proxy is handed out.
+/// `pyjitpl.py synchronize_virtualizable` (`virtualizable.py write_boxes`) is
+/// the write-back that puts them there.  Upstream runs it against the
+/// recording-time virtualizable after every vable store; both halves are
+/// needed here, because the values have to be in the array for the walk's own
+/// read of the proxy AND for the compiled run's.  So this mirrors the region
+/// onto the concrete frame and emits the same store into the trace.  Without
+/// it the residual getter's read barrier was the only thing writing the region
+/// out, and folding the getter silently dropped every local the traced body
+/// had assigned.
+///
+/// Only the locals/cells region is written back.  `write_boxes` covers the
+/// whole array, but the operand-stack region above `nlocals` is not reachable
+/// through the proxy and its shadow slots read NULL outside a merge point
+/// (see [`crate::state::flush_locals_region_to_frame`]), so writing those back
+/// would destroy the values the walk is holding.
+///
+/// A slot the shadow cannot answer declines the whole write-back, and with it
+/// the fold, leaving the residual force in place.  The validation pass runs
+/// before the first emission, so a decline emits nothing.
+fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_op: OpRef,
+    concrete_frame: usize,
+) -> bool {
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return false;
+    };
+    let base = info.num_static_extra_boxes;
+    let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
+        return false;
+    };
+    // `Value::Void` is the shadow's "no concrete half" sentinel rather than an
+    // unbound local, so a slot carrying it cannot be written back.
+    let mut slots = Vec::with_capacity(nlocals);
+    for slot in 0..nlocals {
+        match ctx.trace_ctx.virtualizable_entry_at(base + slot) {
+            Some((_, majit_ir::Value::Void)) | None => return false,
+            Some((value, _)) => slots.push((slot as i64, value)),
+        }
+    }
+    if !crate::state::flush_locals_region_to_frame(ctx.trace_ctx, concrete_frame) {
+        return false;
+    }
+    ctx.trace_ctx
+        .vable_array_region_write_back(frame_op, 0, &slots)
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -2614,13 +2673,28 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // CPython 3.14 exposes an optimized frame's locals as a fresh
     // `FrameLocalsProxy`.  Constructing that proxy does not read fast locals;
     // its operations synchronize through the frame when they are actually
-    // used.  Keep the inline callee's own red frame as the proxy owner instead
-    // of residualizing the getter, whose explicit read barrier would force the
-    // outer standard virtualizable while this MIFrame is still active.
+    // used.  Keep the exact per-MIFrame red receiver as the proxy owner instead
+    // of residualizing the getter, whose explicit read barrier would force a
+    // live virtualizable while an inline MIFrame is still active.
+    //
+    // There are two identities the walker can prove here: the current inline
+    // callee's shadow frame, whose locals region the walk flushes itself at the
+    // escape, or the standard portal frame, gated by BOTH its red box and its
+    // concrete pointer.  For the portal the dropped force was also what wrote
+    // the locals region out of the virtualizable image, so the fold has to
+    // write that region itself.
     let inline_frame = current_inline_concrete_frame();
-    if name == "f_locals"
-        && inline_frame != 0
+    let is_inline_frame = inline_frame != 0
         && concrete_obj as usize == inline_frame
+        && ctx
+            .callee_shadow
+            .as_ref()
+            .is_some_and(|shadow| shadow.concrete_frame == inline_frame && shadow.frame_box == obj);
+    let is_standard_frame = ctx.trace_ctx.standard_virtualizable_box() == Some(obj)
+        && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize);
+
+    if name == "f_locals"
+        && (is_inline_frame || is_standard_frame)
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
             (*(concrete_obj as *const pyre_interpreter::PyFrame))
@@ -2628,15 +2702,16 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 .flags
                 .contains(pyre_interpreter::CodeFlags::OPTIMIZED)
         }
-        && ctx
-            .callee_shadow
-            .as_ref()
-            .is_some_and(|shadow| shadow.concrete_frame == inline_frame && shadow.frame_box == obj)
     {
         let w_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
         let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
         if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+            return Ok(None);
+        }
+        if is_standard_frame
+            && !walker_write_back_standard_frame_locals(ctx, obj, concrete_obj as usize)
+        {
             return Ok(None);
         }
         let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
@@ -9006,11 +9081,13 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// frame is always the portal, so the residual always escapes.  Removing it
 /// removes the force with it, and nothing has to replace it: `last_instr` is
 /// published onto the portal frame at every may-force boundary
-/// (`LiveLastInstrGuard`), and every getset that reads a virtualizable field
-/// off the handed-out frame (`f_locals`, and `f_lasti` / `f_lineno` through
-/// their own `jit_getattr` residual) is itself such a boundary.  Of those only
-/// `f_locals` also FORCES: measured against this fold, swapping a fixture's
-/// forcing read for `f_lasti` or `f_lineno` leaves `loops_aborted` at 0.
+/// (`LiveLastInstrGuard`).  Generic `f_lasti` / `f_lineno` readers retain that
+/// residual boundary.  An exact optimized-frame `f_locals` read is specialized
+/// below instead: `pyframe.py fast2locals` is `@jit.unroll_safe`, so upstream
+/// traces through it and reads the virtualizable boxes rather than forcing.
+/// The force it drops was also the only writer of the frame's locals region,
+/// which pyre's `FrameLocalsProxy` reads; the fold therefore performs that
+/// write-back itself (`walker_write_back_standard_frame_locals`).
 ///
 /// Emitted shape, following `getframe`'s body line by line:
 /// `guard_value(callable)`; `guard_class` + exact-class + `getfield_gc_i` on
@@ -9053,6 +9130,78 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// forced `f_backref` is null, or a hop whose result is hidden.
 /// Declines after emission rewind to the pre-specialization trace position and
 /// reset the heap cache before falling through.
+fn next_op_is_f_locals_for_getframe_result<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_, Sym>,
+    getframe_dst: usize,
+) -> bool {
+    let Some(mut next) = crate::jitcode_runtime::decode_op_at(code, op.next_pc) else {
+        return false;
+    };
+    while next.opname == "live"
+        || next.opname.starts_with("setarrayitem_vable")
+        || next.opname.starts_with("setfield_vable")
+    {
+        let Some(after_bookkeeping) = crate::jitcode_runtime::decode_op_at(code, next.next_pc)
+        else {
+            return false;
+        };
+        next = after_bookkeeping;
+    }
+    let helper_kind = residual_call::residual_call_descr_index_in_body(code, &next)
+        .and_then(|index| ctx.descr_refs.at(index))
+        .and_then(|descr| {
+            descr
+                .as_call_descr()
+                .map(|call| call.get_extra_info().pyre_helper)
+        });
+    if next.key != "residual_call_ir_r/iIRd>r"
+        || helper_kind != Some(majit_ir::PyreHelperKind::LoadAttr)
+    {
+        return false;
+    }
+
+    // `iIRd>r`: funcbox, Int var-list, Ref var-list, descr, result.  The
+    // LoadAttr helper's lists are `[name_idx]` and `[obj, code]`.
+    let Some(&i_len_byte) = code.get(next.pc + 2) else {
+        return false;
+    };
+    let i_len = i_len_byte as usize;
+    if i_len != 1 {
+        return false;
+    }
+    let Some(&name_reg) = code.get(next.pc + 3) else {
+        return false;
+    };
+    let r_len_pc = next.pc + 3 + i_len;
+    if code.get(r_len_pc) != Some(&2) {
+        return false;
+    }
+    let (Some(&obj_reg), Some(&code_reg)) = (code.get(r_len_pc + 1), code.get(r_len_pc + 2)) else {
+        return false;
+    };
+    if obj_reg as usize != getframe_dst {
+        return false;
+    }
+    let (Some(&name_op), Some(&code_op)) = (
+        ctx.registers_i.get(name_reg as usize),
+        ctx.registers_r.get(code_reg as usize),
+    ) else {
+        return false;
+    };
+    let (Some(majit_ir::Value::Int(name_idx)), Some(majit_ir::Value::Ref(w_code))) = (
+        ctx.trace_ctx.box_value(name_op),
+        ctx.trace_ctx.box_value(code_op),
+    ) else {
+        return false;
+    };
+    if name_idx < 0 || w_code.as_usize() == 0 {
+        return false;
+    }
+    walker_load_name_from_code(w_code.as_usize(), name_idx as usize).as_deref() == Some("f_locals")
+}
+
 pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -9120,14 +9269,12 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // virtual frame upstream.
     let inline_ptr = current_inline_concrete_frame();
     let inline_level = ctx.fbw_mode.inline_subwalk || inline_ptr != 0;
-    // A depth-zero lookup returns this MIFrame's own red frame directly.  A
-    // positive depth has to force each intervening virtual reference through
-    // `_do_jit_force_virtual`; until the inline walker carries that operation
-    // with the same per-level resume state, keep the established residual path
-    // instead of treating the concrete recording-time chain as its substitute.
-    if inline_level && depth_value != 0 {
+    let (Some(standard_vable_op), Some(standard_vable_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) else {
         return Ok(None);
-    }
+    };
     let (vable_op, vable_ptr) = if inline_level {
         let Some(shadow) = ctx.callee_shadow.as_ref() else {
             return Ok(None);
@@ -9138,13 +9285,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
         (shadow.frame_box, inline_ptr)
     } else {
-        let (Some(op), Some(ptr)) = (
-            ctx.trace_ctx.standard_virtualizable_box(),
-            ctx.trace_ctx.standard_virtualizable_ptr(),
-        ) else {
-            return Ok(None);
-        };
-        (op, ptr)
+        (standard_vable_op, standard_vable_ptr)
     };
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
@@ -9168,27 +9309,89 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
         frame
     };
-    // A hop whose `f_backref` is a live `JitVirtualRef` names another INLINED
-    // frame, and this walk publishes a forced pair only for the level it owns
-    // (`pyjitpl.py vrefs_after_residual_call`).  The emitted
-    // `jit_force_virtual` then reaches a vref the optimizer materialises with a
-    // null `forced` field, so the hop lands on whatever that read produces
-    // rather than on the caller's frame.  Scan the record-time chain for one
-    // before anything is emitted: the seed below forces the walk's own vref for
-    // real and finishes its pair, so a later decline would leave the residual
-    // `getframe` a shorter chain than the interpreter's.  Non-virtual slots
-    // hold the frame pointer itself (`_jit_vref.py:40`), so following them here
-    // forces nothing.
-    {
+    // Validate the entire concrete chain before emitting or forcing anything.
+    // A tracing-time `JitVirtualRef` is admissible only when it is still one of
+    // `MetaInterp.virtualref_boxes`: that is the pair
+    // `vrefs_after_residual_call` will publish if this walk forces it.  Reading
+    // `forced` here does not force or change the token; vrefs created during
+    // tracing already carry the real recording-time frame there
+    // (`virtualref.py virtual_ref_during_tracing`).  This all-or-nothing gate
+    // keeps a later decline from shortening the concrete frame chain before
+    // the generic residual gets a chance to run.
+    //
+    // A hidden hop declines outright.  `executioncontext.py
+    // getnextframe_nohidden` skips a hidden frame WITHOUT consuming a depth
+    // level, so one raw `f_backref` per level only reproduces `getframe`'s walk
+    // on a chain that has none; the emitted traversal pins that with its
+    // per-hop `guard_false(hidden_applevel)`.
+    let final_concrete_frame = {
         let mut scan = frame;
         for _ in 0..depth_value {
             let raw = unsafe { (*scan).f_backref };
-            if raw.is_null()
-                || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) }
-            {
+            if raw.is_null() {
                 return Ok(None);
             }
-            scan = raw;
+            if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) } {
+                let referent = unsafe {
+                    majit_metainterp::virtualref::vref_forced(raw as *const u8)
+                        as *mut pyre_interpreter::PyFrame
+                };
+                if referent.is_null()
+                    || (ctx
+                        .trace_ctx
+                        .live_virtualref_pair_for_ptr(raw as usize)
+                        .is_none()
+                        && ctx
+                            .trace_ctx
+                            .virtualref_virtual_for_object_ptr(referent as usize)
+                            .is_none())
+                {
+                    if fbw_debug_abort_enabled() {
+                        let pairs = ctx.trace_ctx.snapshot_virtualref_boxes();
+                        eprintln!(
+                            "[getframe-decline] depth={depth_value} vref {:#x} referent={:#x} has no pair; tracked={pairs:?}",
+                            raw as usize, referent as usize,
+                        );
+                    }
+                    return Ok(None);
+                }
+                scan = referent;
+            } else {
+                scan = raw;
+            }
+            if unsafe { (*scan).hide() } {
+                return Ok(None);
+            }
+        }
+        scan
+    };
+
+    // Until every app-level frame getter is lowered through its own red frame,
+    // admitting an arbitrary positive-depth result would expose it to a
+    // generic residual whose single live-coordinate slot cannot describe a
+    // nested caller chain.  The completed slice is the outer standard frame
+    // immediately consumed by `f_locals`: that getter is specialized below and
+    // its locals write-back names the same frame, so it crosses no such
+    // residual boundary.  Preflight its whole static shape before emitting any
+    // part of `_getframe`.
+    if inline_level && depth_value > 0 {
+        let standard_frame = final_concrete_frame as usize == standard_vable_ptr
+            && unsafe { (*final_concrete_frame).ob_header.ob_type }
+                == &pyre_interpreter::pyframe::FRAME_TYPE
+            && unsafe {
+                (*final_concrete_frame)
+                    .code()
+                    .flags
+                    .contains(pyre_interpreter::CodeFlags::OPTIMIZED)
+            };
+        let w_type =
+            pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+        if !standard_frame
+            || unsafe { (*final_concrete_frame).ob_header.w_class } != w_type
+            || unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0
+            || !next_op_is_f_locals_for_getframe_result(code, op, ctx, dst)
+        {
+            return Ok(None);
         }
     }
 
@@ -9271,36 +9474,111 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
         );
 
-        let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
-        if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
+        let raw_is_vref =
+            unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw_ptr as *const u8) };
+        let (next_op, next_ptr) = if raw_is_vref {
+            // `_do_jit_force_virtual` sees the vref box as a known
+            // non-standard virtualizable and returns None, so
+            // `do_residual_call` executes the may-force call.  Run the exact
+            // vref bracket around that concrete force: the post half records
+            // `VIRTUAL_REF_FINISH(vref, virtual)` before the CALL and replaces
+            // the tracked vref with CONST_NULL (`pyjitpl.py`).  The optimizer
+            // can then forward JIT_FORCE_VIRTUAL to the paired frame instead
+            // of materialising a vref whose `forced` field is null.
+            let live_pair = ctx.trace_ctx.live_virtualref_pair_for_ptr(raw_ptr as usize);
+            let referent = unsafe {
+                majit_metainterp::virtualref::vref_forced(raw_ptr as *const u8)
+                    as *mut pyre_interpreter::PyFrame
+            };
+            let virtual_op = live_pair.map(|pair| pair.0).unwrap_or_else(|| {
+                ctx.trace_ctx
+                    .virtualref_virtual_for_object_ptr(referent as usize)
+                    .expect("the pre-emission frame-chain census accepted this stopped vref")
+            });
+            // A field read can produce an alias box even though its concrete
+            // value is the tracked vref.  Upstream's heapcache normally hands
+            // `_do_jit_force_virtual` the tracked box directly.  Preserve
+            // that identity for the optimizer after proving the alias at
+            // runtime; `VIRTUAL_REF_FINISH` and JIT_FORCE_VIRTUAL must name
+            // the same vref box for `optimize_jit_force_virtual` to forward
+            // the result to `virtual_op`.
+            let force_arg = if let Some((_, vref_op)) = live_pair {
+                if raw_op != vref_op {
+                    let is_tracked_vref =
+                        ctx.trace_ctx.record_op(OpCode::PtrEq, &[raw_op, vref_op]);
+                    ctx.trace_ctx
+                        .set_opref_concrete(is_tracked_vref, majit_ir::Value::Int(1));
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op.pc,
+                        OpCode::GuardTrue,
+                        &[is_tracked_vref],
+                    )?;
+                }
+                vref_op
+            } else {
+                raw_op
+            };
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            ctx.trace_ctx.vrefs_before_residual_call();
+            let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+            ctx.trace_ctx.vrefs_after_residual_call();
+            let force_fn = crate::helpers::jit_force_vref as *const ();
+            let forced_op = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallMayForceR,
+                force_fn,
+                &[force_arg],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Ref,
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+                    majit_ir::OopSpecIndex::JitForceVirtual,
+                ),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                forced_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
+            );
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            // `VirtualRefFinish(vref, virtual)` immediately before the call is
+            // the optimizer proof that `forced_op == virtual_op`.  Preserve
+            // the orthodox force in IR while letting the source walker follow
+            // the same forwarded box immediately.
+            (virtual_op, next_ptr)
+        } else if raw_ptr as usize == standard_vable_ptr {
+            // `_do_jit_force_virtual`: the standard virtualizable identity
+            // short-circuits before residual-call preparation.  Heapcache
+            // normally gives us the same OpRef; keep the runtime proof for an
+            // alias box, matching its PTR_EQ + implement_guard_value arm.
+            if raw_op != standard_vable_op {
+                let is_standard = ctx
+                    .trace_ctx
+                    .record_op(OpCode::PtrEq, &[raw_op, standard_vable_op]);
+                ctx.trace_ctx
+                    .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op.pc,
+                    OpCode::GuardTrue,
+                    &[is_standard],
+                )?;
+            }
+            (standard_vable_op, raw_ptr)
+        } else {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[getframe-decline] depth={depth_value} non-vref hop {:#x} != standard {standard_vable_ptr:#x}",
+                    raw_ptr as usize
+                );
+            }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
+        };
+        if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
+            unreachable!("the pre-emission frame-chain census accepted this hop")
         }
-
-        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
-        let force_fn = crate::helpers::jit_force_vref as *const ();
-        let next_op = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallMayForceR,
-            force_fn,
-            &[raw_op],
-            &[majit_ir::Type::Ref],
-            majit_ir::Type::Ref,
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
-                majit_ir::OopSpecIndex::JitForceVirtual,
-            ),
-        );
-        ctx.trace_ctx.set_opref_concrete(
-            next_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
-        );
-        // `pyjitpl.py:2163-2165` short-circuits a known non-standard
-        // virtualizable to `None`; the caller turns that into this residual
-        // `jit_force_virtual` call, so the ptr_eq/guard_value half is not
-        // emitted for hop results.
-        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[next_op])?;
 
         let code_op = crate::state::opimpl_getfield_gc_r(
@@ -9354,8 +9632,25 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // the ordinary residual force path flushes, without forcing the outer
     // portal virtualizable or aborting its trace.
     if inline_level && depth_value == 0 {
-        maybe_record_inline_callee_last_instr(ctx, op.pc);
+        residual_call::record_and_publish_inline_callee_last_instr(ctx, op.pc);
         disarm_folded_inline_callee_after_escape(ctx, op.pc)?;
+    }
+
+    // A positive-depth inline walk can land on the standard portal frame.
+    // Its symbolic `last_instr` is already current in `virtualizable_boxes`
+    // (the caller CALL boundary was mirrored there before descending), and
+    // residual-call preparation will emit that shadow's store before any
+    // runtime frame reader.  Keep the recording-time concrete frame in step
+    // with the same value so a getter executed while recording observes the
+    // coordinate the compiled trace will publish, rather than baking the
+    // frame's stale pre-inline heap value into the trace.
+    if cur_op == standard_vable_op
+        && cur_ptr as usize == standard_vable_ptr
+        && let Some((_, majit_ir::Value::Int(last_instr))) = ctx
+            .trace_ctx
+            .virtualizable_entry_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)
+    {
+        unsafe { (*cur_ptr).last_instr = last_instr as isize };
     }
 
     // `f.mark_as_escaped()` — vm.py.  `escaped` is not one of the six fields

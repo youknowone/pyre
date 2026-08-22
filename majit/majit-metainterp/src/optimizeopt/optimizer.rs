@@ -4618,7 +4618,22 @@ impl Optimizer {
         // innermost level may absorb what the current propagate queues.
         ctx.extra_pending.push(pending);
         let result = self.drain_innermost_pending(ctx);
-        ctx.extra_pending.pop();
+        let unfinished = ctx
+            .extra_pending
+            .pop()
+            .expect("the active extra-operation drain level must remain installed");
+        if result.is_err() {
+            // `InvalidLoop` unwinds the recursive Rust drain in place of
+            // RPython's ordinary exception unwinding.  Keep both operations
+            // emitted by the failing propagation and the untouched tail from
+            // this level available to the caller's unwind.  Each outer level
+            // appends its own untouched tail in turn, so no parked producer is
+            // silently discarded and a reused context never observes a
+            // half-drained scheduling state.
+            ctx.extra_operations_after.extend(unfinished);
+        } else {
+            debug_assert!(unfinished.is_empty());
+        }
         result
     }
 
@@ -6176,6 +6191,30 @@ mod tests {
         }
     }
 
+    struct QueueExtraThenInvalidate;
+
+    impl Optimization for QueueExtraThenInvalidate {
+        fn propagate_forward(
+            &mut self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            ctx: &mut OptContext,
+        ) -> OptimizationResult {
+            if op.opcode == OpCode::IntAdd {
+                ctx.emit_extra(
+                    ctx.current_pass_idx,
+                    Op::new(OpCode::IntMul, &[op.arg(0), op.arg(1)]),
+                );
+                ctx.signal_invalid_loop("test invalid loop while draining extras");
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "queue_extra_then_invalidate"
+        }
+    }
+
     #[test]
     fn test_optimizer_passthrough() {
         let mut opt = Optimizer::new();
@@ -6190,6 +6229,28 @@ mod tests {
             opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn invalid_loop_preserves_queued_and_unprocessed_extra_operations() {
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(QueueExtraThenInvalidate));
+        let mut ctx = OptContext::new(2);
+        let lhs = rooted_resop_operand(Type::Int, 0);
+        let rhs = rooted_resop_operand(Type::Int, 1);
+        ctx.emit_extra_at(0, Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()]));
+        ctx.emit_extra_at(0, Op::new(OpCode::IntSub, &[lhs, rhs]));
+
+        let result = opt.drain_extra_operations_from(0, &mut ctx);
+
+        assert!(result.is_err());
+        assert!(ctx.extra_pending.is_empty());
+        let queued: Vec<_> = ctx
+            .extra_operations_after
+            .iter()
+            .map(|(_, op)| op.opcode)
+            .collect();
+        assert_eq!(queued, [OpCode::IntMul, OpCode::IntSub]);
     }
 
     #[test]

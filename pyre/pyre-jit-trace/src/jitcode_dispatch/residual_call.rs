@@ -4451,7 +4451,7 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     jit_pc: usize,
 ) {
-    maybe_record_inline_callee_last_instr(ctx, jit_pc);
+    record_and_publish_inline_callee_last_instr(ctx, jit_pc);
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 

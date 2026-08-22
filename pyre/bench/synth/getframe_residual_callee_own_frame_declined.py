@@ -1,25 +1,13 @@
 # pyre-check: max-pypy-ratio=32
-# Companion to getframe_residual_callee_own_frame,
-# carrying that file's shape at a force the constant-depth
-# `sys._getframe` arm DECLINES, so the machinery it documents stays
-# covered now that its own call site folds.
+# Historical `_declined` companion to `getframe_residual_callee_own_frame`.
+# Exact `_getframe(0).f_locals` now remains traced and owns the callee's exact
+# red frame, so it neither forces that frame nor clears the caller's
+# virtualizable token.
 #
-# `try_walker_specialize_sys_getframe` (jitcode_dispatch/specialize.rs) takes
-# only depth 0 at the top walk level, where `getframe`'s answer IS the portal
-# virtualizable and no force is needed.
-# The `_getframe` call itself folds here; the added `.f_locals` read is the
-# forcing residual, and it forces the SAME frame, so the shape below is
-# unchanged apart from where the force comes from.
-#
-# The counters recorded for this file are the ones its original
-# carried before the fold; a diff against them is a real change in the escape
-# machinery, not in the arm.
-#
-# Regression guard: a residual (may-force) callee that inspects its OWN frame
-# via sys._getframe() must not clear the traced CALLER's virtualizable tracing
-# token. Clearing it raised a spurious frame-escape with no committed resume pc,
-# replaying the loop body from entry and double-applying the callee's
-# non-journaled STORE_ATTR side effect -- a JIT-only wrong answer (c.n > loops).
+# The recorded shape is two loops, no bridge, no forcings, no virtualizable
+# forcings, and no aborts.  The observable regression guard remains the
+# non-journaled `STORE_ATTR`: frame inspection must execute `bump` exactly once
+# per iteration, so `c.n` must stay equal to the loop count.
 import sys
 
 

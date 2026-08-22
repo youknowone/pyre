@@ -7666,7 +7666,11 @@ mod tests {
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
         let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
         let pop = ctx2
-            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
+            .with_ptr_info_mut(&obj_box, |info| {
+                info.take_preamble_field(crate::optimizeopt::heap::OptHeap::field_slot_index(
+                    &field_descr,
+                ))
+            })
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
@@ -7777,7 +7781,11 @@ mod tests {
         // the Const as the body-visible Box.
         let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
         let pop = ctx2
-            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
+            .with_ptr_info_mut(&obj_box, |info| {
+                info.take_preamble_field(crate::optimizeopt::heap::OptHeap::field_slot_index(
+                    &field_descr,
+                ))
+            })
             .flatten();
         assert!(
             pop.is_some(),

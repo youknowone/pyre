@@ -1,43 +1,10 @@
-# Companion to getframe_root_loop_force_blackhole_crn_nonidempotent,
-# carrying that file's shape at a force the constant-depth
-# `sys._getframe` arm DECLINES, so the machinery it documents stays
-# covered now that its own call site folds.
+# Historical `_declined` companion to the non-idempotent blackhole CRN
+# regression.  Exact portal `_getframe(0).f_locals` is now force-free, so this
+# upstream shape stays in the compiled loop and never enters that handoff.
 #
-# `try_walker_specialize_sys_getframe` (jitcode_dispatch/specialize.rs) takes
-# depth 0 at the top walk level, where `getframe`'s answer IS the portal
-# virtualizable and no force is needed, so the CALL folds here as well. The
-# force this file needs comes from the `.f_locals` getset on the folded
-# result: it reads the virtualizable's own fields, so it routes through
-# `force_frame_before_locals_read` on the portal and escapes it.
-#
-# A nonzero depth does NOT serve. `getframe` forces only the frame it RETURNS,
-# and one below the portal is not the traced virtualizable, so nothing escapes.
-#
-# The counters recorded for this file are the ones its original
-# carried before the fold; a diff against them is a real change in the escape
-# machinery, not in the arm.
-#
-# Regression guard: a blackhole drive that is declined after the fact must not
-# hand its already-executed region back to a replay.
-#
-# Same shape as `getframe_root_loop_force_blackhole_crn`: the walk roots at
-# `main`, whose portal jitcode carries a jit_merge_point at the loop header, and
-# a sys._getframe force inside the loop latches a blackhole image that drives to
-# the back edge and raises ContinueRunningNormally there.
-#
-# The difference is the effect in the driven region.  The sibling accumulates
-# into a local and adds an already-present element to a set, so BOTH halves of a
-# post-drive decline are invisible once the frame is restored: the local comes
-# back with the undo, and re-running `set.add` of the same string changes
-# nothing.  A list append does not have that property.  With the CRN arm forced
-# to decline, that sibling prints its correct 199990000 while this file prints
-# 20005 appends for 20000 iterations — one extra per declined drive.
-#
-# That is the measurement behind `adopt_blackhole_crn`: a decline taken after
-# the drive cannot be repaired by any frame-level undo, because the residual
-# calls the drive ran are heap effects and not frame state.  So the CRN handoff
-# resumes on the frame the blackhole already wrote instead of validating a
-# rebuilt register image that could reject it.
+# PyPy reports one loop, no bridge, no forcings, no virtualizable forcings, and
+# no aborts.  The list append remains a strong observable guard: eliminating
+# the unnecessary force must still append exactly once per Python iteration.
 import sys
 
 

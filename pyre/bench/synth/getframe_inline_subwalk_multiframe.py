@@ -9,43 +9,21 @@
 # `base`.  Residualizing the depth-zero lookup instead forces the published
 # callee during tracing and prevents this loop from compiling.  The specialized
 # path therefore records the callee frame and creates its `FrameLocalsProxy`
-# without forcing the outer standard virtualizable; positive-depth lookup stays
-# on the established virtual-reference walk.
+# without forcing the outer standard virtualizable.  The positive-depth walk
+# must carry each frame's own red box, close the corresponding live
+# `virtual_ref` pair around `jit_force_virtual`, and let the optimizer forward
+# the force to that pair's virtual frame.
 #
 # A real PyPy run compiles one loop with no bridges, forcings, virtualizable
 # forcings, or aborts.  Pyre must print the same value, compile one loop, and
 # report no escape abort or frame-blackhole adoption for this fixture.
 #
-# The positive-depth clause has a measured cost, and the recorded counters
-# encode it rather than endorse it.  `leaf`'s `_getframe(2)` reaches `main`'s
-# frame, which is the virtualizable of `main`'s compiled loop, and materializes
-# it.  `mid(i)` stays a residual `CallMayForce` in that loop, so the
-# `GuardNotForced` behind it fails on every machine-code entry: `MAJIT_STATS=1`
-# reports `mc_entered` equal to `guard_failures`, with `back_edge_polls=0` and
-# `bridges_compiled=0`, so the compiled loop leaves for the blackhole before it
-# ever crosses its back edge.  The attribution is a one-run check -- a `leaf`
-# holding only the depth-zero read records `guard_failures=1`, one holding only
-# the `_getframe(2)` read reproduces the full count.
-#
-# The count is a known shortfall, not a number to preserve -- but it will not
-# come down from the `sys._getframe` arm.  Letting the inline level take that
-# arm's own per-level lowering, by deleting the decline in front of it, was
-# measured: the fixture still answers correctly, `guard_failures` stays at
-# exactly the recorded value, and the `Finish` trace gains three
-# `GuardNotForced`s, because the lowering forces once per hop rather than not
-# at all.  Reaching `main`'s frame object from `leaf` means materializing it
-# however the walk is spelled.
-#
-# What removes the cost is inlining `mid` -> `leaf` into `main`'s loop, where
-# the depth-2 lookup lands on the trace's own virtualizable and needs no force:
-# `PYPYLOG=jit-summary:<file> pypy3 -P` on this file reports one loop, no
-# bridges, `forcings: 0` and no aborts, against the two traces pyre records.
-#
-# `loops_compiled` counts those two traces: `main`'s loop, and a linear
-# `Finish` trace for the inlined `mid` -> `leaf` chain, whose own four
-# `GuardNotForced`s never fail.  The wasm baseline records `guard_failures=1`
-# instead because that backend always materializes the virtualizable, which
-# makes `GuardNotForced` a no-op there.
+# The remaining single guard failure is also present in the depth-zero-only
+# control; the positive-depth frame walk itself compiles without an abort,
+# bridge, forcing, or blackhole adoption.  In the optimized loop, the temporary
+# `JIT_FORCE_VIRTUAL`/`GUARD_NOT_FORCED` pair emitted for the orthodox residual
+# bracket is gone: `VIRTUAL_REF_FINISH` lets the optimizer forward it to the
+# paired virtual frame, just as in PyPy.
 import sys
 
 
