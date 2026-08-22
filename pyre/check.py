@@ -921,6 +921,22 @@ def effective_wasm_module():
     return os.environ.get("PYRE_WASM_MODULE") or WASM_MODULE_PATH
 
 
+def same_file(one, other):
+    """Whether two paths name one file, tolerating a missing one.
+
+    The override is compared against the built module to decide whether the
+    build settled the question, and it is written by a caller who may spell it
+    absolutely, through a symlink, or relative to a different directory.
+    `os.path.samefile` answers that but raises when either side is absent,
+    which here is not an error: a missing file is simply not the built one, and
+    the existence check above has already spoken for the module itself.
+    """
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
+
 def _dump_failed_run(output, stderr, limit=40):
     """Print the tail of a failed run's captured streams.
 
@@ -2291,7 +2307,7 @@ def read_artefact_stamp(stamp):
     return fields["inputs"], fields["artefact"]
 
 
-def require_fresh_artefacts(backend, artefacts):
+def require_fresh_artefacts(artefacts, reason, remedy):
     """Refuse to measure an artefact that was built from different sources.
 
     `--no-build` skips every artefact of a backend, and wasm has two: the
@@ -2299,6 +2315,12 @@ def require_fresh_artefacts(backend, artefacts):
     an earlier build produces a fully green run — and a set of recorded
     baselines — for code that is not in it, with nothing in the output saying
     so.
+
+    `reason` names the circumstance that put the artefact under question and
+    `remedy` says what closes it, because skipping the build is not the only
+    way to arrive here: `PYRE_WASM_MODULE` names the module the runner loads
+    whether or not a build ran, so a normal run can measure a module this
+    invocation did not produce.
 
     Each build stamps its artefact with `build_inputs_fingerprint` and with the
     artefact's own content digest; an artefact carrying no stamp was built
@@ -2320,23 +2342,13 @@ def require_fresh_artefacts(backend, artefacts):
             continue
         recorded_inputs, recorded_content = recorded
         if recorded_content != artefact_content_digest(artefact):
-            print(
-                f"ERROR: --no-build requested for backend '{backend}', but "
-                f"{artefact}\n"
-                f"       has been rebuilt since it was stamped, so what it "
-                f"contains is unknown.\n"
-                f"       Re-run without --no-build to rebuild it."
-            )
-            sys.exit(1)
-        if recorded_inputs == fingerprint:
+            fault = "has been rebuilt since it was stamped, so what it contains is unknown."
+        elif recorded_inputs != fingerprint:
+            fault = ("was built from different sources, so it does not contain "
+                     "the current tree.")
+        else:
             continue
-        print(
-            f"ERROR: --no-build requested for backend '{backend}', but "
-            f"{artefact}\n"
-            f"       was built from different sources, so it does not contain "
-            f"the current tree.\n"
-            f"       Re-run without --no-build to rebuild it."
-        )
+        print(f"ERROR: {reason}, but {artefact}\n       {fault}\n       {remedy}")
         sys.exit(1)
 
 
@@ -4506,9 +4518,12 @@ def main():
                 )
             sys.exit(1)
         wasm_module = effective_wasm_module() if backend == "wasm" else None
-        if backend == "wasm" and args.no_build and not Path(wasm_module).is_file():
+        # Asked whether or not a build ran: `PYRE_WASM_MODULE` names the module
+        # the runner loads, and a build cannot supply one that is not there.
+        if backend == "wasm" and not Path(wasm_module).is_file():
+            skipped = "--no-build requested" if args.no_build else "PYRE_WASM_MODULE set"
             print(
-                "ERROR: --no-build requested for backend 'wasm', but the "
+                f"ERROR: {skipped} for backend 'wasm', but the "
                 f"wasm-host module is missing: {wasm_module}"
             )
             sys.exit(1)
@@ -4522,7 +4537,21 @@ def main():
             if backend == "wasm":
                 artefacts.append(wasm_module)
             if artefacts:
-                require_fresh_artefacts(backend, artefacts)
+                require_fresh_artefacts(
+                    artefacts,
+                    f"--no-build requested for backend '{backend}'",
+                    "Re-run without --no-build to rebuild it.",
+                )
+        elif backend == "wasm" and not same_file(wasm_module, WASM_MODULE_PATH):
+            # The build above produced `WASM_MODULE_PATH` and stamped it, but
+            # the override names something else, so that is what the benchmarks
+            # will load and what any baseline they record describes. Building a
+            # module nothing runs is not a freshness check on the one that does.
+            require_fresh_artefacts(
+                [wasm_module],
+                f"PYRE_WASM_MODULE names the module backend '{backend}' will load",
+                "Unset PYRE_WASM_MODULE to run the module this build produced.",
+            )
         chk._set_pyre(backend, pyre_bin)
 
     print()
