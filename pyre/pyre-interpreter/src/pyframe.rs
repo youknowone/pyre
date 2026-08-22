@@ -4525,6 +4525,16 @@ impl PyFrame {
             }
         }
 
+        // `_PyFrame_GetLocals`: a frame that is not optimized and has no hidden
+        // locals hands back its mapping as it stands.  Its namespace is
+        // authoritative -- every binding that belongs there arrived by
+        // `STORE_NAME` -- so a cell holds nothing the mapping is missing, and
+        // copying one in publishes a name the body never bound.  A class body
+        // carries `__classdict__` as a cell whose value is the namespace
+        // itself, and writing that back leaves the namespace holding itself.
+        if !code.flags.contains(CodeFlags::OPTIMIZED) {
+            return Ok(());
+        }
         let pure_cells: Vec<&_> = code
             .cellvars
             .iter()
@@ -4537,12 +4547,7 @@ impl PyFrame {
             })
             .collect();
         let npure = pure_cells.len();
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
-        let freevarnames_len = if include_freevars {
-            npure + code.freevars.len()
-        } else {
-            npure
-        };
+        let freevarnames_len = npure + code.freevars.len();
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
                 pure_cells[i].as_ref()
@@ -4560,14 +4565,9 @@ impl PyFrame {
                 };
                 if !w_value.is_null() {
                     setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
-                } else if code.flags.contains(CodeFlags::OPTIMIZED) {
-                    // Optimized (function) frames own their cellvars in the
-                    // cell, so an empty cell means the local is unbound and its
-                    // locals entry must be removed.  Module/class frames are
-                    // namespace-authoritative: a cellvar can hold its binding in
-                    // `w_locals` via STORE_NAME while its cell stays empty
-                    // (`__conditional_annotations__`), so an empty cell there
-                    // must not erase the STORE_NAME binding.
+                } else {
+                    // A function frame owns its cellvars in the cell, so an
+                    // empty cell means the local is unbound and its entry goes.
                     delitem_str_object(locals_roots.get(locals_slot), name)?;
                 }
             }
