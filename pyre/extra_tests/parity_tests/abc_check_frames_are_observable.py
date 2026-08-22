@@ -133,7 +133,51 @@ def the_cache_membership_body_is_not_a_frame():
     assert names[-1] == '__hash__', names
 
 
+def the_declined_membership_body_is_not_a_frame():
+    class Shape(metaclass=abc.ABCMeta):
+        pass
+
+    class Circle(Shape):
+        pass
+
+    circle = Circle()
+    assert isinstance(circle, Shape) is True
+
+    collection = type(Shape._abc_cache)
+    namespace = collection.__contains__.__globals__
+
+    class Missing(Exception):
+        pass
+
+    seen = []
+
+    def record(frame, event, arg):
+        if event == 'call':
+            seen.append(frame.f_code.co_name)
+        return None
+
+    # A shadowing module entry is one of the things that makes the native
+    # answer decline, so this is the run where the app-level body really
+    # executes.  It is still not a frame: the body being reached is a fact
+    # about which implementation answers, and the frame's absence is a fact
+    # about whose code it is.
+    namespace['TypeError'] = Missing
+    sys.settrace(record)
+    try:
+        isinstance(circle, Shape)
+    finally:
+        sys.settrace(None)
+        del namespace['TypeError']
+
+    assert seen.count('__contains__') == 0, seen
+
+
 instancecheck_is_a_traced_call()
 a_failure_behind_the_check_names_the_frames()
 the_cache_membership_body_is_not_a_frame()
+# The last arm names a collection this implementation spells as a class
+# attribute; where it is not spellable there is nothing to shadow and the arm
+# does not apply.
+if hasattr(abc.ABCMeta('_Probe', (), {}), '_abc_cache'):
+    the_declined_membership_body_is_not_a_frame()
 print('OK')
