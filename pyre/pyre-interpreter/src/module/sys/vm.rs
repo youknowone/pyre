@@ -3787,6 +3787,31 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
         args.iter().find(|&&a| !a.is_null() && unsafe { is_str(a) }).copied()
     }
+    /// The error a `write` call that handed over no `str` owes.
+    ///
+    /// `W_TextIOWrapper.write_w` rejects a non-`str` argument, and code in the
+    /// wild depends on it: `click._compat._is_binary_writer` decides whether a
+    /// stream is the binary layer by calling `stream.write(b"")` and seeing
+    /// whether it raises, then wraps `sys.stdout` in its own text layer when it
+    /// does not — and everything written after that is lost.  Returning a
+    /// zero-length count is indistinguishable from a successful empty write.
+    ///
+    /// The value can only be named positionally, for the same reason
+    /// `pick_str` above scans: the receiver may or may not be prepended, and
+    /// the text is the last element either way.  A call that passed nothing
+    /// leaves only the receiver there, which is why an empty argument list and
+    /// a bare receiver both fall to the arity message.
+    fn reject_non_str(args: &[PyObjectRef]) -> crate::PyError {
+        match args.last() {
+            Some(&arg) if !arg.is_null() && unsafe { !is_str(arg) } => {
+                crate::PyError::type_error(format!(
+                    "unicode argument expected, got '{}'",
+                    crate::type_methods::arg_type_name(arg)
+                ))
+            }
+            _ => crate::PyError::type_error("write() takes exactly one argument (0 given)"),
+        }
+    }
     // `write` here is an instance builtin that encodes straight to the
     // descriptor instead of going through `TextIOWrapper.write`, so it
     // substitutes the line separator itself — on the text, before encoding,
@@ -3869,7 +3894,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
-            Ok(w_int_new(0))
+            Err(reject_non_str(args))
         })
     } else {
         crate::make_builtin_function("write", |args| {
@@ -3897,7 +3922,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
-            Ok(w_int_new(0))
+            Err(reject_non_str(args))
         })
     };
     crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
