@@ -183,6 +183,7 @@ PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *);
 PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
+PyAPI_FUNC(PyObject *) PyFloat_FromString(PyObject *);
 PyAPI_FUNC(int) PyFloat_Pack2(double, char *, int);
 PyAPI_FUNC(int) PyFloat_Pack4(double, char *, int);
 PyAPI_FUNC(int) PyFloat_Pack8(double, char *, int);
