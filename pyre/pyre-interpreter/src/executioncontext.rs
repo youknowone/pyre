@@ -573,6 +573,7 @@ impl ExecutionContext {
     /// and `hide()`, and `hide()` goes through `pyframe_get_pycode`, a plain
     /// field read.  Consumers that hand the frame to app code call
     /// [`force_frame`] themselves.
+    #[majit_macros::unroll_safe]
     pub fn gettopframe_nohidden(&self) -> *mut PyFrame {
         let mut frame = force_vref(self.topframeref);
         while !frame.is_null() {
@@ -592,6 +593,7 @@ impl ExecutionContext {
     /// `executioncontext.py getnextframe_nohidden` — the same walk from an
     /// arbitrary frame.
     /// Force-free for the reason given on [`gettopframe_nohidden`].
+    #[majit_macros::unroll_safe]
     pub fn getnextframe_nohidden(mut frame: *mut PyFrame) -> *mut PyFrame {
         while !frame.is_null() {
             // SAFETY: caller provides a valid frame chain or null.
