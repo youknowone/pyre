@@ -95,6 +95,18 @@ with assert_raises(OverflowError):
 with assert_raises(OverflowError):
     abc_with_tpflags(-(1 << 130))
 
+
+# The value is taken out before the conversion runs, so even the raising case
+# leaves nothing behind. `abc_with_tpflags` cannot show that: the class it would
+# return is discarded along with the exception.
+class OverflowTagged:
+    __abc_tpflags__ = 1 << 100
+
+
+with assert_raises(OverflowError):
+    _abc._abc_init(OverflowTagged)
+assert "__abc_tpflags__" not in OverflowTagged.__dict__
+
 # `-1` carries both collection bits.
 with assert_raises(TypeError):
     abc_with_tpflags(-1)
@@ -154,5 +166,9 @@ class UnrelatedChild(Unrelated):
 Marked.register(Unrelated)
 assert matches_sequence_pattern(Unrelated())
 assert matches_sequence_pattern(UnrelatedChild())
+str_flags = str.__flags__
 Marked.register(str)
+# The pattern alone would pass on a wrongly marked `str`, because the match
+# excludes str and bytes after reading the marker; read the marker as well.
+assert str.__flags__ == str_flags
 assert not matches_sequence_pattern("ab")

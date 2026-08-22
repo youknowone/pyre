@@ -1322,6 +1322,50 @@ fn test_empty_trace() {
     assert!(guards[0].is_finish);
 }
 
+/// Build, validate, instantiate and run `inputs` under wasmi, then read the
+/// guard-exit index the trace wrote at offset 0 and the first three frame
+/// slots.  Every inline-region repro drives the module exactly this way and
+/// differs only in the exit index it expects.
+fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i64, i64) {
+    let (bytes, _, _) = codegen::build_wasm_module(inputs).expect("non-header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    (
+        read(0),
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
+}
+
 /// The `ModuleBuildInputs` shape every inline-region test shares: a fixed
 /// frame, no nursery, no census, and every base at zero.  Only the owner trace
 /// and the regions merged into it vary between them, so a new field lands here
@@ -3347,43 +3391,9 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             constants: indexmap::IndexMap::new(),
         }],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 1, "the second guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
 /// Collect every `i32.const` / `i64.const` immediate in the emitted body, so a
@@ -3789,43 +3799,9 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             constants: indexmap::IndexMap::new(),
         }],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 1, "the second guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
 /// Two regions attached to the SAME owner, both closing at the NON-header
@@ -3948,43 +3924,9 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
             },
         ],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("two non-header regions merge");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 2, "the third guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 2, "the third guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
 /// A region's guard must sit inside the `loop` whose blocks it branches to.
