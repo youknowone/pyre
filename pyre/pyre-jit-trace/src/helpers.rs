@@ -188,6 +188,41 @@ pub extern "C" fn jit_init_kwdefaults_dict(dict: i64) -> i64 {
     }
 }
 
+/// `objspace.py space.getexecutioncontext()` as a residual callee: the
+/// running thread's ExecutionContext, read out of its thread-local slot.
+///
+/// `call::getexecutioncontext` cannot be the callee directly, for the reason
+/// `jit_force_vref` records above: its pointer return is `i32` on wasm32,
+/// where the residual-call ABI is `(i64×n) -> i64`.
+pub extern "C" fn jit_getexecutioncontext() -> i64 {
+    pyre_interpreter::call::getexecutioncontext() as usize as i64
+}
+
+/// Emit the [`jit_getexecutioncontext`] residual for a trace that holds no
+/// `ec`. `interp_jit.py PyPyJitDriver.reds = ['frame', 'ec']` makes the
+/// context a red the `-live-` markers force-keep at every guard, but a guard
+/// whose resume data named no value at the red's color resumes without one,
+/// and `PyFrame` carries no `execution_context` field to fall back on.
+///
+/// The call must stay non-elidable. A nullary elidable call has all its
+/// arguments constant by construction, so the pure pass would fold it to the
+/// recording thread's ExecutionContext and every other thread entering the
+/// compiled trace would read that thread's exception state.
+///
+/// `site` names the caller in the decline census, which is what separates the
+/// three recoveries: the live red costs no call and these do.
+pub(crate) fn emit_current_execution_context(ctx: &mut TraceCtx, site: &'static str) -> OpRef {
+    crate::jitcode_dispatch::census_record(site);
+    ctx.call_typed_with_effect(
+        OpCode::CallR,
+        jit_getexecutioncontext as *const (),
+        &[],
+        &[],
+        Type::Ref,
+        majit_metainterp::cannot_raise_effect_info(),
+    )
+}
+
 pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
     unsafe {
         jit_dict_exact_lookup_or_null(

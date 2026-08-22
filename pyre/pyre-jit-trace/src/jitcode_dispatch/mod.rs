@@ -8065,31 +8065,35 @@ fn walker_ensure_execution_context<Sym: WalkSym>(
     (!sym.execution_context().is_none()).then(|| sym.execution_context())
 }
 
-/// Validate the portal EC red before the full-body walk records its first guard.
+/// Recover the portal EC red before the full-body walk records its first guard.
 ///
 /// The portal `[frame, ec]` reds (`interp_jit.py reds = ['frame', 'ec']`)
 /// are force-alived in every `-live-` op's R-bank, so every guard's resume
 /// snapshot lists the dedicated EC color. Loop/function-entry syms seed
 /// `InputArgRef(1)` and bridge setup decodes the failing guard's corresponding
-/// inputarg into the same field.
+/// inputarg into the same field — except where the guard's resume data named
+/// no value at that color, which leaves the sym with none.
 ///
 /// The walker's snapshot-capture path
 /// (`walker_capture_snapshot_for_last_guard` → `collect_outer_active_boxes`)
-/// runs AFTER the guard, so recording the recovery there would place the
-/// getfield after the guard that references it (a use-before-def; the resume
-/// position would also stamp onto the getfield rather than the guard, leaving
+/// runs AFTER the guard, so recording the recovery there would place the read
+/// after the guard that references it (a use-before-def; the resume
+/// position would also stamp onto the read rather than the guard, leaving
 /// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
 /// before any opcode is dispatched and thus before any guard. When the EC is
-/// already seeded, or the frame
-/// itself is unset, this is a no-op.
+/// already seeded, or the frame itself is unset, this is a no-op: a frameless
+/// sym's first `ec` consumer goes through `MIFrame::ensure_execution_context`,
+/// which records the same read at an ordinary dispatch position.
 pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
     sym: &mut Sym,
-    _trace_ctx: &mut TraceCtx,
+    trace_ctx: &mut TraceCtx,
 ) {
-    assert!(
-        sym.frame().is_none() || !sym.execution_context().is_none(),
-        "full-body walk is missing the portal execution-context red",
-    );
+    if !sym.execution_context().is_none() || sym.frame().is_none() {
+        return;
+    }
+    let ec =
+        crate::helpers::emit_current_execution_context(trace_ctx, "ExecutionContext::WalkEntry");
+    sym.set_execution_context(ec);
 }
 
 fn walker_int_specialization_operands<Sym: WalkSym>(

@@ -1012,13 +1012,22 @@ impl MIFrame {
     /// Trace and bridge setup seed `sym.execution_context` from the portal's
     /// second red. Adapter paths must preserve that red rather than deriving
     /// it from the virtualizable frame.
-    pub(crate) fn ensure_execution_context(&mut self, _ctx: &mut TraceCtx) -> OpRef {
+    ///
+    /// A bridge resumed at a guard whose resume data named no value at the
+    /// red's color arrives with none, and there is no second live source to
+    /// read it back from — `ec` is a red, not a `PyFrame` field. Recover it
+    /// the way the interpreter does, by asking the thread
+    /// ([`crate::helpers::emit_current_execution_context`]), and keep the
+    /// result so the rest of the frame reuses one read.
+    pub(crate) fn ensure_execution_context(&mut self, ctx: &mut TraceCtx) -> OpRef {
         let ec = self.sym().execution_context;
-        assert!(
-            !ec.is_none(),
-            "MIFrame is missing the portal execution-context red"
-        );
-        ec
+        if !ec.is_none() {
+            return ec;
+        }
+        let recovered =
+            crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::MIFrame");
+        self.sym_mut().execution_context = recovered;
+        recovered
     }
 
     #[inline]

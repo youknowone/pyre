@@ -10783,6 +10783,12 @@ impl JitState for PyreJitState {
         // guard. `consume_boxes` above therefore rebuilt the bridge's own EC
         // inputarg at `portal_ec_reg`; retain that OpRef before converting the
         // color-indexed register bank into the semantic locals/stack mirror.
+        //
+        // Two shapes leave nothing to retain: a skeleton jitcode carries
+        // `u16::MAX` for both portal red colors, and a resumed register can be
+        // empty. Either way the first consumer reaches
+        // `MIFrame::ensure_execution_context`, which reads the thread's own
+        // context instead.
         let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
         let bridge_execution_context = (portal_ec_reg != u16::MAX)
             .then(|| {
@@ -10792,15 +10798,6 @@ impl JitState for PyreJitState {
                     .unwrap_or(OpRef::NONE)
             })
             .unwrap_or(OpRef::NONE);
-        assert!(
-            !bridge_execution_context.is_none(),
-            "setup_bridge_sym: portal ec red missing at color {} for jitcode {} pc {}; \
-             live_refs={:?}",
-            portal_ec_reg,
-            frame0.jitcode_index,
-            frame0.pc,
-            reg_indices.ref_,
-        );
         // Reconstruct the slot-indexed semantic register file
         // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
         // The decode just filled `bridge_registers_r` by abstract-register
@@ -11161,7 +11158,7 @@ impl JitState for PyreJitState {
         sym.execution_context = bridge_execution_context;
         // Both outcomes compile, so only the tally separates the bridge that
         // carries the live red from the one whose first `ec` consumer re-derives
-        // it off the frame.
+        // it from the thread.
         crate::trace::fbw_diag::bump(if sym.execution_context.is_none() {
             crate::trace::fbw_diag::BRIDGE_EC_MISSING
         } else {
@@ -15042,21 +15039,19 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let w_globals_const = ctx.const_ref(w_globals as i64);
     // `PyPyJitDriver.reds = ['frame', 'ec']`: `perform_call` gives an inlined
     // callee the caller's own `ec` Box, so the reconstructed frame is seeded
-    // from the caller's live red. The concrete pointer stays the frame's
-    // constructor argument, but a ConstPtr built from it would bake the
-    // recording thread's ExecutionContext into every bridge compiled from this
-    // loop.
+    // from the caller's live red.
     //
     // A bridge whose resume data held no value at the portal `ec` color
-    // arrives with an empty `ec_box` (`bridge_ec_missing`) and falls back to
-    // the constant. There is no second live source to read it from: `ec` is a
-    // red in `PyPyJitDriver.reds`, not a `PyFrame` field, so a root frame
-    // OpRef names an object that does not carry one.
+    // arrives with an empty `ec_box` (`bridge_ec_missing`). There is no second
+    // live source to read it from: `ec` is a red in `PyPyJitDriver.reds`, not
+    // a `PyFrame` field, so a root frame OpRef names an object that does not
+    // carry one. Read the thread's own context instead — a ConstPtr built from
+    // the concrete pointer would bake the recording thread's ExecutionContext
+    // into every bridge compiled from this loop.
     let ec_seed = if !ec_box.is_none() {
         ec_box
     } else {
-        crate::jitcode_dispatch::census_record("ReconstructedCallee::EcConstFallback");
-        ctx.const_ref(execution_context as i64)
+        crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::ReconstructedCallee")
     };
 
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();

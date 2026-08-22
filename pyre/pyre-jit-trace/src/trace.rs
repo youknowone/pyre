@@ -6848,9 +6848,10 @@ pub mod fbw_diag {
     /// the same Box the parent trace did.  `BRIDGE_EC_MISSING` is the fallback:
     /// a skeleton jitcode has no portal red colors (`u16::MAX`) and a resumed
     /// register can be empty, and either way `sym.execution_context` stays
-    /// `NONE`, so the first consumer re-derives it with a `GetfieldGcR` off the
-    /// frame.  That re-derivation is sound but is not the live red, and nothing
-    /// else distinguishes the two.
+    /// `NONE`, so the first consumer re-derives it by asking the thread
+    /// (`MIFrame::ensure_execution_context`).  That re-derivation is sound but
+    /// costs a residual call the live red does not, and nothing else
+    /// distinguishes the two.
     pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 17;
     pub const BRIDGE_EC_MISSING: usize = 18;
 

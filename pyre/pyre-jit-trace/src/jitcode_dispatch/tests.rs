@@ -447,6 +447,41 @@ fn fresh_trace_ctx() -> TraceCtx {
     TraceCtx::for_test_types(&[Type::Ref])
 }
 
+/// The `ec` recovery every unseeded portal red falls back on
+/// (`seed_execution_context_for_walk`, `MIFrame::ensure_execution_context`,
+/// `setup_reconstructed_callee_frame`) must survive as a call in the trace.
+/// It takes no arguments, so an elidable descr would make the pure pass fold
+/// it to the recording thread's ExecutionContext, and every later thread
+/// entering the compiled trace would read that thread's exception state.
+#[test]
+fn execution_context_recovery_records_a_non_elidable_call() {
+    let mut tc = fresh_trace_ctx();
+    let ops_before = tc.num_ops();
+    let ec = crate::helpers::emit_current_execution_context(&mut tc, "ExecutionContext::Test");
+
+    assert_eq!(
+        tc.num_ops(),
+        ops_before + 1,
+        "the recovery must record exactly the call",
+    );
+    let call_op = tc.ops().last().expect("recorded op");
+    assert_eq!(call_op.opcode, majit_ir::OpCode::CallR);
+    assert_eq!(
+        call_op.getarglist().len(),
+        1,
+        "arglist is the funcptr alone: `getexecutioncontext()` takes no arguments",
+    );
+    assert_eq!(
+        ec.inline_const_to_value(),
+        None,
+        "a folded constant would bake the recording thread's context",
+    );
+    let descr = call_op.getdescr().expect("calldescr");
+    let call_descr = descr.as_call_descr().expect("call descr");
+    assert!(!call_descr.get_extra_info().check_is_elidable());
+    assert!(!call_descr.get_extra_info().check_can_raise(false));
+}
+
 #[test]
 fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
