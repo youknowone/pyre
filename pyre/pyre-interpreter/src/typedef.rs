@@ -23390,21 +23390,20 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if crate::baseobjspace::len_w(sep_obj)? != 1 {
             return Err(sep_length_error());
         }
-        let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
-            let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
-            if !s.is_ascii() {
-                return Err(sep_ascii_error());
-            }
-            s.chars().next().unwrap_or('\0')
+        let sep_bytes: &[u8] = if unsafe { pyre_object::is_str(sep_obj) } {
+            // A lone surrogate is a length-1 separator with no UTF-8
+            // spelling, so the ASCII test reads the WTF-8 payload; demanding
+            // a `str` of it raises nothing, it aborts.
+            unsafe { pyre_object::w_str_get_wtf8(sep_obj) }.as_bytes()
         } else if unsafe { pyre_object::is_bytes(sep_obj) } {
-            let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
-            if !sep_bytes.is_ascii() {
-                return Err(sep_ascii_error());
-            }
-            sep_bytes.first().copied().unwrap_or(0) as char
+            unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) }
         } else {
             return Err(crate::PyError::type_error("sep must be str or bytes."));
         };
+        if !sep_bytes.is_ascii() {
+            return Err(sep_ascii_error());
+        }
+        let sep_char = sep_bytes.first().copied().unwrap_or(0) as char;
         let sep_str = sep_char.to_string();
         // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
         // from the right (default), negative groups from the left; zero
