@@ -3080,8 +3080,9 @@ impl OptHeap {
     /// one, which is why they stay listed.  Upstream lists its two for the same
     /// reason and marks them `# handled specially` in `emitting_operation`.
     ///
-    /// None of the other eleven can arrive on this tree today, and the reasons
-    /// differ enough to be worth recording:
+    /// Of the other eleven, ten cannot arrive on this tree today and one —
+    /// `LeavePortalFrame` — is only *not known* to arrive; the reasons differ
+    /// enough to be worth recording separately:
     ///   - `DebugMergePoint` has no producer at all; every occurrence is a
     ///     declaration or a consumer.
     ///   - `EnterPortalFrame` needs either a `newframe` carrying a greenkey —
