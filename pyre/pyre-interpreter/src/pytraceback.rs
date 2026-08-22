@@ -368,18 +368,6 @@ pub unsafe fn mark_traceback_escaped(w_traceback: PyObjectRef) {
     }
 }
 
-/// `extern "C"` entry for the residual call the `__traceback__` attribute
-/// fold emits.  Compiled code folds that read to a raw slot load, so the
-/// getter's escape mark has to be issued separately; the fold pairs the
-/// load with a call here.
-///
-/// Cannot raise, allocates nothing, and writes only the frame's status
-/// byte, which no field descriptor exposes to the trace — so the call
-/// carries `cannot_raise_effect_info` and invalidates no heap cache entry.
-pub extern "C" fn jit_mark_traceback_escaped(w_traceback: i64) {
-    unsafe { mark_traceback_escaped(w_traceback as usize as PyObjectRef) };
-}
-
 /// `pytraceback.py record_application_traceback` parity:
 ///
 /// ```python

@@ -1731,7 +1731,15 @@ pub fn compute_frozen_bitstrings(all_eis: &mut [&mut EffectInfo]) -> FrozenBitst
     // semantics nor identity, so normalize it before forming cache keys.
     for ei in all_eis.iter_mut() {
         match ei.descr_set_keys.as_mut() {
-            Some(keys) => keys.canonicalize(),
+            // Matched per variant rather than through `DerefMut`: that impl
+            // materializes `Empty` into a boxed empty `DescrSetKeys`, so
+            // canonicalizing every image would spend the compact
+            // representation on every EI that has no keys — before
+            // serialization, which is what the representation exists for.
+            // `Empty` has no member order to normalize; it is already
+            // canonical.
+            Some(DescrSetKeysImage::Populated(keys)) => keys.canonicalize(),
+            Some(DescrSetKeysImage::Empty) => {}
             None => {
                 ei.readonly_descrs_fields = None;
                 ei.write_descrs_fields = None;

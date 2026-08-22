@@ -7683,9 +7683,9 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
 ///
 /// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `tb_frame`,
 /// `__new__`, `__dir__`.
-///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`) when it is
-///     GC-owned, else a `sys.namespace` stub for a non-Gc / freed
-///     frame (see the getter below).
+///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`), which is
+///     always GC-owned once the subsystem is installed at boot (see the
+///     getter below).
 ///   - `__new__` = `TracebackType(tb_next, tb_frame, tb_lasti,
 ///     tb_lineno)` (3.7+ constructor), taking a live `frame` object.
 ///   - `__reduce__` / `__setstate__` are intentionally NOT wired:
@@ -7911,21 +7911,14 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         )
     };
 
-    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
-    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
-    // The traceback keeps the raising frame's chain reachable through
-    // `pytraceback_object_custom_trace`, so a GC-owned frame is still
-    // alive here.  The guard must match the custom_trace's guard
-    // (`try_gc_owns_object`): only frames forwarded as managed edges
-    // survive; a non-Gc frame falls back to the `sys.namespace` stub
-    // built from the retained `w_code` + stamped line number.
-    //
-    // A frame is non-Gc only when the GC stable-alloc hook was never
-    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
-    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
-    // The GC subsystem is installed at boot (`init_gc_subsystem`), so all
-    // frames — including under `PYRE_JIT=0` — are GC-owned oldgen blocks
-    // that stay alive as long as the traceback references them.
+    // `typedef.py PyTraceback.typedef` wires `tb_frame` as a bare
+    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
+    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
+    // traceback keeps that frame reachable through
+    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
+    // at boot (`init_gc_subsystem`), so all frames — including under
+    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
+    // the traceback references them.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
@@ -7938,8 +7931,13 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             // Mark escaped so the JIT keeps the frame materialised for
-            // the exposed reference (pyframe.py `mark_as_escaped`),
-            // mirroring `sys._getframe`.
+            // the exposed reference (pyframe.py `mark_as_escaped`), the
+            // way `sys/vm.py _getframe` does for the frame it hands out.
+            // This store has no counterpart on the upstream `tb_frame`,
+            // whose complete caller set is `executioncontext.py leave`,
+            // `error.py OperationError.get_traceback`,
+            // `interp_exceptions.py descr_gettraceback` and
+            // `sys/vm.py _getframe` — a deviation, not a port.
             unsafe { (*frame).mark_as_escaped() };
             Ok(frame as pyre_object::PyObjectRef)
         },

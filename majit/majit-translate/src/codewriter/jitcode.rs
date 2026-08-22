@@ -1177,8 +1177,27 @@ impl BhFieldSpec {
             && self.is_immutable == other.is_immutable
             && self.is_quasi_immutable == other.is_quasi_immutable
             && self.index_in_parent == other.index_in_parent
-            && majit_ir::descr::class_word_inferred_from_name(&self.name)
-                == majit_ir::descr::class_word_inferred_from_name(&other.name)
+            && self.effective_class_word() == other.effective_class_word()
+    }
+
+    /// The class-word answer this spec rebuilds to: the producer declaration
+    /// when it carried one, otherwise the display-name guess.  This is what
+    /// `make_descr_from_bh` reconstructs — it seeds from the name and lets a
+    /// declaration replace the guess — so it, not either half alone, is what
+    /// layout identity has to compare.
+    ///
+    /// Comparing only the name guess loses the declaration entirely, which is
+    /// the one thing the guess provably cannot recover: `Method`'s payload
+    /// field is spelled `"Method.w_class"` exactly like its inherited header
+    /// row, so both infer `true` and only the declaration separates them.  A
+    /// canonicalizer that called those one layout would share the first
+    /// parent across both and hand `SizeDescr::class_word_field` the wrong
+    /// row.  Comparing the raw `Option` instead would over-fragment: a
+    /// declared `Some(true)` and an undeclared row whose name infers `true`
+    /// rebuild identically and are one layout.
+    pub fn effective_class_word(&self) -> bool {
+        self.is_class_word
+            .unwrap_or_else(|| majit_ir::descr::class_word_inferred_from_name(&self.name))
     }
 
     /// Mirror an `Arc<dyn FieldDescr>` into the serializable
@@ -2290,9 +2309,8 @@ mod tests {
             index_in_parent: 0,
             // Nothing declared this field a class word, which is what
             // `bh_field_spec_from_parts` also records for a spec built with no
-            // layout in reach. `same_descr_layout` reads the name-derived
-            // inference rather than this field, so the test is unaffected
-            // either way.
+            // layout in reach.  Neither name here is a class-word spelling, so
+            // both resolve to `false` and the layout comparison is unaffected.
             is_class_word: None,
         }
     }
@@ -2310,6 +2328,33 @@ mod tests {
         let mut renamed = imported;
         renamed.field_key = "other".to_string();
         assert!(!canonical.same_descr_layout(&renamed));
+    }
+
+    #[test]
+    fn bh_field_layout_separates_rows_that_differ_only_in_the_class_word_declaration() {
+        // `Method` carries an inherited header row and a payload field spelled
+        // the same way, so the name guess answers `true` for both and only the
+        // declaration tells them apart.  A canonicalizer that called these one
+        // layout would share the first parent across both descriptors and let
+        // `SizeDescr::class_word_field` answer the payload.
+        let mut header = test_bh_field("Method.w_class");
+        header.field_key = "w_class".to_string();
+        let mut payload = header.clone();
+
+        header.is_class_word = Some(true);
+        payload.is_class_word = Some(false);
+        assert!(!header.same_descr_layout(&payload));
+
+        // An undeclared row rebuilds through the name guess, so it is the same
+        // layout as the row that declared what the guess would have said — the
+        // comparison must not fragment on the `Option` alone.
+        let undeclared = {
+            let mut spec = header.clone();
+            spec.is_class_word = None;
+            spec
+        };
+        assert!(header.same_descr_layout(&undeclared));
+        assert!(!payload.same_descr_layout(&undeclared));
     }
 
     #[test]

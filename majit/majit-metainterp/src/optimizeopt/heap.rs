@@ -3060,11 +3060,12 @@ impl OptHeap {
         result
     }
 
-    /// heap.py:436-452: operations with no effect on the GC heap caches.
+    /// `heap.py OptHeap.emitting_operation`: operations with no effect on the
+    /// GC heap caches.
     ///
     /// Consulted at TWO sites here against upstream's one.  Upstream reaches the
-    /// list only from `emitting_operation` (heap.py:442, via `emit` at
-    /// heap.py:432 and `dispatch_opt`'s default at heap.py:898).  Here
+    /// list only from `emitting_operation`, via `OptHeap.emit` and
+    /// `dispatch_opt`'s `default=OptHeap.emit` (`heap.py`).  Here
     /// `emitting_operation` is a whole-optimizer callback that fires at final
     /// emission, after this pass has already dispatched — `propagate_forward`
     /// dispatches on its first line — so without the `handle_side_effects`
@@ -3077,17 +3078,19 @@ impl OptHeap {
     /// `SetarrayitemRaw` — have their own dispatch arm and so never reach the
     /// `handle_side_effects` test; they still reach the `emitting_operation`
     /// one, which is why they stay listed.  Upstream lists its two for the same
-    /// reason and marks them `# handled specially` (heap.py:452, :454).
+    /// reason and marks them `# handled specially` in `emitting_operation`.
     ///
-    /// None of the other eleven can arrive on this tree today, and the reasons
-    /// differ enough to be worth recording:
+    /// Of the other eleven, ten cannot arrive on this tree today and one —
+    /// `LeavePortalFrame` — is only *not known* to arrive; the reasons differ
+    /// enough to be worth recording separately:
     ///   - `DebugMergePoint` has no producer at all; every occurrence is a
     ///     declaration or a consumer.
     ///   - `EnterPortalFrame` needs either a `newframe` carrying a greenkey —
     ///     both non-test callers pass `None` — or a runtime answering
     ///     `portal_jitcode`, which the production runtime leaves `None`.
     ///     `LeavePortalFrame` is NOT symmetric: it also rides `popframe`'s
-    ///     `jitdriver_sd` gate, and `call.py:148` does stamp one, so that arm is
+    ///     `jitdriver_sd` gate, and `call.py grab_initial_jitcodes` does stamp
+    ///     one, so that arm is
     ///     not known to be dead.  Do not read it as unreachable without
     ///     measuring.
     ///   - `setinteriorfield_raw` has no producer and no codewriter `OpKind`.

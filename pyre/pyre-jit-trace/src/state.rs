@@ -5034,6 +5034,12 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
+    // A non-null `w_code` does not make the inner pointer non-null; every other
+    // caller of `w_code_get_ptr` in the tree checks the result before
+    // dereferencing it.
+    if raw_code.is_null() {
+        return None;
+    }
     let code = unsafe { &*raw_code };
     let nlocals = code.varnames.len();
     let ncells = pyre_interpreter::pyframe::ncells(code);
@@ -5661,9 +5667,16 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
     // `Value::Void` is the shadow's "no concrete half" sentinel, not a NULL
     // local: writing it back would box to `PY_NULL` and DESTROY the slot the
     // walk is holding in a register.  Decline instead.
+    //
+    // `Ref(NO_CONCRETE)` is the same answer in the other representation — "the
+    // shadow has no concrete pointer for this slot" — and it is worse to write
+    // back, because `boxed_slot_value_for_type` maps `Ref(r)` straight to
+    // `r.as_usize()`: the slot would receive `usize::MAX - 1` as if it were an
+    // object pointer.
     for abs in 0..nlocals {
         match ctx.virtualizable_entry_at(base + abs) {
             Some((_, Value::Void)) | None => return false,
+            Some((_, Value::Ref(gc))) if gc == majit_ir::GcRef::NO_CONCRETE => return false,
             Some(_) => {}
         }
     }

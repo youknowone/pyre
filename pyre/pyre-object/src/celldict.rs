@@ -1213,7 +1213,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::w_module_dict_items_inner(w_dict)
     }
 
-    /// `celldict.py:188-192 getiterkeys`/`getitervalues` — one entry, not the
+    /// `celldict.py getiterkeys`/`getitervalues` — one entry, not the
     /// whole storage.  The trait default rebuilds `items()` per step, and this
     /// strategy's `items` wraps every name into a fresh immortal string, so the
     /// default makes a single view walk quadratic in unreclaimable allocations.
@@ -1226,7 +1226,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     }
 
     /// A `values()` view needs no name at all, so it skips the wrap entirely
-    /// (`dictmultiobject.py:1095-1098`).
+    /// (`dictmultiobject.py AbstractTypedStrategy.getitem`).
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
         crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index)
     }
