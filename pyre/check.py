@@ -158,7 +158,7 @@ WASM_TIMEOUT_SCALE = 4.0
 # a JIT-emitted trace is its own wasm module, so a call leaving it crosses
 # back through the `env.jit_call` trampoline. `math_folds_hot` (13x) reaches
 # the guest's pure-Rust libm where native reaches the platform's;
-# `builtin_folds_hot` (10x) and `str_getitem_len_hot` (4.8x) are loops of
+# `builtin_folds_hot` (13x) and `str_getitem_len_hot` (4.8x) are loops of
 # nothing but calls, so the crossing is the whole measurement. Retiring them
 # means giving the trace module direct imports for the raw helpers rather
 # than one generic trampoline; until that lands, each header states the
