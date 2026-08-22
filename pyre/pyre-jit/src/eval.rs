@@ -4244,22 +4244,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
         pyre_object::bytesobject::set_bytes_data_gc_type_id,
     );
-    // `bytes` `data` block — `rstr.py:1226-1228`'s `STR.chars`, an
-    // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
-    // registers with the shape `get_array_token` reads off that one ARRAY and
-    // no destructor: the payload is inside the block, so the sweep reclaims it
-    // with the block and the collector sizes it from the block's own length
-    // header. `bytes_object_custom_trace` greys it through the `data` field
-    // slot, the same edge the storage box was reached by.
-    let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
-    let bytes_block_tid = gc.register_type(TypeInfo::varsize(
-        bytes_block_token.base_size,
-        bytes_block_token.item_size,
-        bytes_block_token.len_offset,
-        false,
-        Vec::new(),
-    ));
-    pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
     // Mortal (subclass) `str` `value` WTF-8 buffer storage box (off-GC storage
     // epic S5). A leaf `Wtf8Buf` (no inner refs); the W_UnicodeObject `value`
     // gc-pointer edge greys it and the box tid's drop glue reclaims the buffer
@@ -4436,6 +4420,33 @@ fn build_gc() -> Box<MiniMarkGC> {
         .register_unresolved_struct_tids(|size, offsets| {
             gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
         });
+
+    // `bytes` `data` block — `rstr.py:1226-1228`'s `STR.chars`, an
+    // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
+    // registers with the shape `get_array_token` reads off that one ARRAY and
+    // no destructor: the payload is inside the block, so the sweep reclaims it
+    // with the block and the collector sizes it from the block's own length
+    // header. `bytes_object_custom_trace` greys it through the `data` field
+    // slot, the same edge the storage box was reached by.
+    //
+    // Registered after every other type, synthetic structs included. A tid is a
+    // position in this chain, and the interpreter spells many of them as
+    // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
+    // insertion anywhere earlier renumbers every registration below it while the
+    // `debug_assert_eq!`s that pair each literal with its registration are
+    // compiled out of a release build. Allocations made before this line read a
+    // zero tid and take `alloc_bytes_block`'s plain-allocation arm; the trace
+    // skips those blocks on `try_gc_owns_object`, as it did for the storage box
+    // from its own later registration point.
+    let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
+    let bytes_block_tid = gc.register_type(TypeInfo::varsize(
+        bytes_block_token.base_size,
+        bytes_block_token.item_size,
+        bytes_block_token.len_offset,
+        false,
+        Vec::new(),
+    ));
+    pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
 
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
