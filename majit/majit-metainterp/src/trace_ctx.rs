@@ -1362,6 +1362,22 @@ impl TraceCtx {
         self.virtualref_boxes.last().copied()
     }
 
+    /// The current concrete address of one `virtualref_boxes` entry.
+    ///
+    /// The `usize` beside each box is the address the object had when the pair
+    /// was pushed, and the object it names is movable: a minor collection
+    /// relocates it and forwards the stamp, leaving the pushed copy naming the
+    /// old address.  `opimpl_virtual_ref_finish` documents the same hazard on
+    /// the same list.  Read the address back through `concrete_of_opref` —
+    /// pyre's `getref_base()` — so a pair that has moved still matches, and
+    /// keep the pushed copy only for an entry carrying no stamp at all.
+    fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
+        match self.concrete_of_opref(entry.0) {
+            Some(Value::Ref(r)) => r.as_usize(),
+            _ => entry.1,
+        }
+    }
+
     /// Resolve a live tracing-time vref back to its `[virtualbox, vrefbox]`
     /// pair.  This is the paired walk `vrefs_after_residual_call` makes over
     /// `MetaInterp.virtualref_boxes` (`pyjitpl.py`): callers that execute
@@ -1378,7 +1394,7 @@ impl TraceCtx {
         self.virtualref_boxes
             .chunks_exact(2)
             .rev()
-            .find(|pair| pair[1].1 == vref_ptr)
+            .find(|pair| self.virtualref_entry_ptr(pair[1]) == vref_ptr)
             .map(|pair| (pair[0].0, pair[1].0))
     }
 
@@ -1393,7 +1409,7 @@ impl TraceCtx {
         self.virtualref_boxes
             .chunks_exact(2)
             .rev()
-            .find(|pair| pair[0].1 == object_ptr)
+            .find(|pair| self.virtualref_entry_ptr(pair[0]) == object_ptr)
             .map(|pair| pair[0].0)
     }
 
