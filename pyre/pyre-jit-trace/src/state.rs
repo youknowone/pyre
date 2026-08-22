@@ -5559,9 +5559,13 @@ fn flush_walk_end_state_to_frame_inner(
             let recorded_null = matches!(
                 ctx.concrete_of_opref(opref),
                 Some(Value::Ref(r)) if r.0 == 0
-            ) || ctx.virtualizable_slot_stored_live_null(base + abs);
+            ) || ctx.virtualizable_slot_stored_live_null(base + abs)
+                || crate::jitcode_dispatch::null_ref_is_a_value(opref);
             if !allow_known_null_stack || !recorded_null {
-                return decline("NULL operand-stack shadow slot (mid-expression)");
+                return decline(&format!(
+                    "NULL operand-stack shadow slot (mid-expression) at abs={abs} \
+                     nlocals={nlocals} depth={depth} box={opref:?}"
+                ));
             }
         }
     }
