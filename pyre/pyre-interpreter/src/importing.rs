@@ -3772,6 +3772,29 @@ pub fn appleveldef_install(
     appleveldef_install_seeded(ns, source, filename, names, &[]);
 }
 
+/// Whether app level can see the frames of an installed source.
+///
+/// `gateway.py ApplevelClass.hidden_applevel = True`.  The app-level half of a
+/// mixed module is not part of the program being run, so `pyframe.py hide`
+/// answers for its frames: the trace hook returns before reporting the call
+/// (`executioncontext.py _trace`), a failure raised behind one records no
+/// entry (`pytraceback.py record_application_traceback`), and
+/// `getnextframe_nohidden` steps over it, which is the walk `sys._getframe`
+/// counts along.  Every `appleveldefs` entry loads through that class —
+/// `mixedmodule.py getappfileloader` builds a `gateway.applevel` for the
+/// sibling app file — so `Hidden` is what an app file gets upstream.
+///
+/// `Visible` is `gateway.py applevel_temp.hidden_applevel = False`.  pyre also
+/// installs through this path a handful of sources upstream ships as ordinary
+/// `lib_pypy` modules reached by import; those frames are part of the program
+/// upstream, and one of them counts its own with `sys._getframe`, so hiding
+/// them would remove frames pypy shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AppleveldefFrames {
+    Hidden,
+    Visible,
+}
+
 /// [`appleveldef_install`] with `seed` bound into the app namespace before the
 /// source runs.
 ///
@@ -3782,11 +3805,24 @@ pub fn appleveldef_install(
 /// module initializer, before the module object exists, so a name the source
 /// needs from its own module is bound up front instead.
 pub fn appleveldef_install_seeded(
+    ns: impl AppleveldefNamespace,
+    source: &str,
+    filename: &str,
+    names: &[&str],
+    seed: &[(&str, PyObjectRef)],
+) {
+    appleveldef_install_with_frames(ns, source, filename, names, seed, AppleveldefFrames::Hidden);
+}
+
+/// [`appleveldef_install_seeded`] for a source whose frames are not the ones
+/// `gateway.applevel` hands out — see [`AppleveldefFrames`].
+pub fn appleveldef_install_with_frames(
     mut ns: impl AppleveldefNamespace,
     source: &str,
     filename: &str,
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
+    frames: AppleveldefFrames,
 ) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
@@ -3801,7 +3837,14 @@ pub fn appleveldef_install_seeded(
         unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
     }
     let code_ptr = Box::into_raw(Box::new(code));
-    let w_code = crate::w_code_new(code_ptr as *const ());
+    // `build_applevel_dict` passes `hidden_applevel=self.hidden_applevel` to
+    // `space.exec_`, which reaches the compiler as `CompileInfo`; every code
+    // object of the unit is then built with it (`assemble.py make_code`), so
+    // the flag set here reaches the nested functions this source defines.
+    let w_code = crate::pycode::w_code_new_with_hidden_applevel(
+        code_ptr as *const (),
+        frames == AppleveldefFrames::Hidden,
+    );
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
     if let Err(e) = frame.run_with_jit() {

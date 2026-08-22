@@ -16,7 +16,7 @@ crate::py_module! {
         "BLAKE2S_MAX_KEY_SIZE" => 32,
         "BLAKE2S_MAX_DIGEST_SIZE" => 32,
     },
-    appleveldefs: {
+    lib_appleveldefs: {
         "_blake2_app.py" => ["blake2b", "blake2s"],
     },
 }

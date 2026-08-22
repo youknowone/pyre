@@ -7,7 +7,7 @@
 
 crate::py_module! {
     "_typing",
-    appleveldefs: {
+    lib_appleveldefs: {
         "_typing_app.py" => [
             "TypeVar", "ParamSpec", "TypeVarTuple",
             "ParamSpecArgs", "ParamSpecKwargs", "TypeAliasType",

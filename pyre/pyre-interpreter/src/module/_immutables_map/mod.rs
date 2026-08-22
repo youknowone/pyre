@@ -6,7 +6,7 @@
 
 crate::py_module! {
     "_immutables_map",
-    appleveldefs: {
+    lib_appleveldefs: {
         "../../../../../lib_pypy/_immutables_map.py" => ["Map"],
     },
 }
