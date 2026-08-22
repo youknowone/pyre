@@ -662,7 +662,7 @@ impl ExecutionContext {
             // taken on this arm rather than for every frame that leaves.
             let _roots = pyre_object::gc_roots::push_roots();
             let exit_slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut w_exitvalue = pyre_object::gc_roots::pin_root(w_exitvalue);
+            w_exitvalue = pyre_object::gc_roots::pin_root(w_exitvalue);
             let result = self._trace(
                 frame,
                 "leaveframe",

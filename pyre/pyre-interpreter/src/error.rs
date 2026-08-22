@@ -3008,7 +3008,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut tb = pyre_object::gc_roots::pin_root(tb);
+        tb = pyre_object::gc_roots::pin_root(tb);
         let current_tb = pyre_object::gc_roots::shadow_stack_get(tb_slot);
         if !unsafe { crate::pytraceback::is_pytraceback(current_tb) } {
             break;
