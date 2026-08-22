@@ -544,6 +544,12 @@ pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
     unsafe {
         pyobject::decref((*mirror).tp_dict);
         (*mirror).tp_dict = std::ptr::null_mut();
+        // `type_dealloc`'s `decref(obj_pto.c_tp_bases)` and
+        // `decref(obj_pto.c_tp_mro)`, which the fill above owes.
+        pyobject::decref((*mirror).tp_bases);
+        (*mirror).tp_bases = std::ptr::null_mut();
+        pyobject::decref((*mirror).tp_mro);
+        (*mirror).tp_mro = std::ptr::null_mut();
         // `type_dealloc` releases the base only for a heap type, which is the
         // only kind whose base can be one too.
         let base = (*mirror).tp_base;
@@ -721,6 +727,48 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         (*mirror).tp_alloc = PyType_GenericAlloc as *const c_void;
         (*mirror).tp_free = PyObject_Free as *const c_void;
     }
+    // `finish_type_1`'s `c_tp_bases` and `finish_type_2`'s `c_tp_mro` -- the
+    // two fields a reader walks a type's ancestry with from C.  Cython's
+    // `__Pyx_MergeVtables` takes `PyTuple_GET_SIZE(tp_bases)` while laying out
+    // a `cdef class`, so a null here is a size read off nothing rather than a
+    // field merely left unset.
+    //
+    // The MRO is handed over as a fresh tuple, which allocates, so the type is
+    // rooted across it and read back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_type);
+    // `object` names no base, and the empty tuple is what says so: a null is
+    // a length read off nothing.
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(
+        match unsafe {
+            pyre_object::typeobject::w_type_get_bases(pyre_object::gc_roots::shadow_stack_get(
+                type_slot,
+            ))
+        } {
+            bases if bases.is_null() => pyre_object::w_tuple_new(Vec::new()),
+            bases => bases,
+        },
+    );
+    let mro_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(unsafe {
+        let mro = pyre_object::typeobject::w_type_get_mro(pyre_object::gc_roots::shadow_stack_get(
+            type_slot,
+        ));
+        match mro.is_null() {
+            true => pyre_object::w_tuple_new(Vec::new()),
+            false => pyre_object::w_tuple_new((*mro).to_vec()),
+        }
+    });
+    unsafe {
+        (*mirror).tp_bases =
+            pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(bases_slot));
+        (*mirror).tp_mro = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(mro_slot));
+    }
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    drop(roots);
+
     // `typeobject.py:801-802`: the base is resolved here, before the deferred
     // half reads its slots.
     let base = base_mirror(w_type);
@@ -4858,6 +4906,20 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     let _ = roots.pin_root(w_base);
     let metatype_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_metatype);
+    // `finish_type_1`, which fills `c_tp_bases` before the interpreter type is
+    // built.  An extension that declared none gets the single base it was
+    // readied on; `single_base` has already collapsed a `Py_tp_bases` tuple to
+    // that base, so this is where the tuple form comes back.
+    if unsafe { (*tp).tp_bases.is_null() } {
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base_slot),
+        ]));
+        unsafe {
+            (*tp).tp_bases =
+                pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(bases_slot));
+        }
+    }
     let w_type = crate::typedef::make_builtin_type_with_metatype(
         &qualified,
         |ns| install_namespace(ns, tp),
@@ -4891,6 +4953,22 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
             true,
         );
     };
+    // `finish_type_2`'s `pto.c_tp_mro`, once there is a type to read one off.
+    {
+        let mro = unsafe {
+            pyre_object::typeobject::w_type_get_mro(pyre_object::gc_roots::shadow_stack_get(
+                type_slot,
+            ))
+        };
+        if !mro.is_null() {
+            let mro_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(pyre_object::w_tuple_new(unsafe { (*mro).to_vec() }));
+            unsafe {
+                (*tp).tp_mro =
+                    pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(mro_slot));
+            }
+        }
+    }
     stamp_tp_dict(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     stamp_objclass(pyre_object::gc_roots::shadow_stack_get(type_slot), tp);
 
@@ -5306,6 +5384,35 @@ fn apply_slot(tp: *mut CPyTypeObject, id: c_int, value: *mut c_void) -> Result<(
     Ok(())
 }
 
+/// `_PyType_FromMetaclass_impl`'s scan of `tp_members` for the three offsets a
+/// spec cannot name with a slot of its own.
+///
+/// `__vectorcalloffset__` is the one that has nowhere else to go:
+/// [`super::object::PyVectorcall_Call`] reads the callable at that offset, and
+/// a Cython function type declares it exactly this way.  The member is still
+/// published beside the others, as `type_add_members` publishes all of them.
+///
+/// # Safety
+/// `tp` must be a valid type block.
+unsafe fn adopt_offset_members(tp: *mut CPyTypeObject) {
+    let members = unsafe { (*tp).tp_members };
+    if members.is_null() {
+        return;
+    }
+    let mut index = 0isize;
+    while !unsafe { (*members.offset(index)).name }.is_null() {
+        let member = unsafe { members.offset(index) };
+        index += 1;
+        let offset = unsafe { (*member).offset };
+        match unsafe { std::ffi::CStr::from_ptr((*member).name) }.to_bytes() {
+            b"__vectorcalloffset__" => unsafe { (*tp).tp_vectorcall_offset = offset },
+            b"__dictoffset__" => unsafe { (*tp).tp_dictoffset = offset },
+            b"__weaklistoffset__" => unsafe { (*tp).tp_weaklistoffset = offset },
+            _ => {}
+        }
+    }
+}
+
 /// The one base pyre can build a type on.
 ///
 /// `make_builtin_type_with_base` takes a single base, so a spec naming more
@@ -5404,6 +5511,11 @@ fn from_spec(
         }
         index += 1;
     }
+
+    // The three offsets a spec has no slot id for, which a type therefore
+    // declares as members instead.  Read before the size below, which
+    // `tp_dictoffset` and `tp_weaklistoffset` are measured against.
+    unsafe { adopt_offset_members(tp) };
 
     // The base's own size is what a relative or inherited `basicsize` is
     // measured against, so it has to be final before either is resolved.
