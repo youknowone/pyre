@@ -91,6 +91,14 @@ pub mod flags {
     /// queue enforce the contract for callers that cannot establish single
     /// registration statically.
     pub const FINALIZER_REGISTERED: u64 = 1 << 13;
+    /// The object's finalizer has already run (bit 14).
+    ///
+    /// Not an incminimark flag either — the queue delivers an object once and
+    /// incminimark never asks the question afterwards. `gc.is_finalized` does
+    /// ask it: an object its own finalizer resurrected reports
+    /// `_PyGC_FINALIZED`, and with nothing recorded the answer could only be a
+    /// constant `false`.
+    pub const FINALIZER_RUN: u64 = 1 << 14;
 }
 
 /// Low-level trigger stored in an RPython finalizer handler.  It must only
@@ -2804,6 +2812,22 @@ pub fn gc_owns_object(addr: usize) -> bool {
     match ACTIVE_GC_OWNS_OBJECT.get() {
         Some(f) => f(addr),
         None => false,
+    }
+}
+
+/// Whether the finalizer for the object at `addr` has already run.
+///
+/// `false` for an address the active backend's heap does not own, which is the
+/// answer [`GcAllocator::register_finalizer`] already implies for one: it
+/// declines to register a finalizer for such a pointer at all.
+pub fn gc_finalizer_has_run(addr: usize) -> bool {
+    gc_owns_object(addr) && unsafe { (*header::header_of(addr)).has_flag(flags::FINALIZER_RUN) }
+}
+
+/// Record that the finalizer for the object at `addr` has run.
+pub fn gc_mark_finalizer_run(addr: usize) {
+    if gc_owns_object(addr) {
+        unsafe { (*header::header_of(addr)).set_flag(flags::FINALIZER_RUN) };
     }
 }
 

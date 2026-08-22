@@ -2739,6 +2739,12 @@ impl UserDelAction {
         let _ = pyre_object::gc_roots::pin_root(w_del);
         let del_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let del = || pyre_object::gc_roots::shadow_stack_get(del_slot);
+        // The queue this object arrives on is the collector's, so record the
+        // run where `finalize_garbage` sets `_PyGC_SET_FINALIZED` — before the
+        // call, not after it the way the refcount path's
+        // `PyObject_CallFinalizer` does.  `gc.is_finalized` reads it back for
+        // an object that `__del__` resurrected.
+        majit_gc::gc_mark_finalizer_run(current() as usize);
         // pyre's combined helper cannot distinguish get-vs-call errors;
         // report through the call arm (executioncontext.py:680-690).
         if let Err(error) = unsafe {

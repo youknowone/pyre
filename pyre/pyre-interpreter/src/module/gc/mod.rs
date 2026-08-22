@@ -1626,7 +1626,9 @@ crate::py_module! {
             }
             Ok(list_from_roots(first))
         },
-        "is_finalized"  / 1 = |_| Ok(w_bool_from(false)),
+        "is_finalized"  / 1 = |args| Ok(w_bool_from(
+            majit_gc::gc_finalizer_has_run(args[0] as usize),
+        )),
         // CPython 3.14 `gc.freeze()` moves the surviving objects into a
         // permanent generation that later collections skip; it is a pre-fork
         // hint, not a semantic guarantee. The collector has no permanent
