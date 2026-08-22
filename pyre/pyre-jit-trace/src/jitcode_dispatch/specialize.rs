@@ -3948,6 +3948,14 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                 let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
+        // A subclass shares the builtin's `ob_type`, which is all the unbox
+        // guard proves; the operand gate read `w_class`, so pin that too.
+        walker_guard_exact_w_class(
+                    ctx,
+                    op_pc,
+                    value,
+                    walker_numeric_builtin_class(concrete_value),
+                )?;
                 (
                     crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
                     raw,
@@ -3957,6 +3965,14 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 let raw = walker_unbox_float(ctx, op_pc, value, float_type_addr)?;
+        // A subclass shares the builtin's `ob_type`, which is all the unbox
+        // guard proves; the operand gate read `w_class`, so pin that too.
+        walker_guard_exact_w_class(
+                    ctx,
+                    op_pc,
+                    value,
+                    walker_numeric_builtin_class(concrete_value),
+                )?;
                 let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
@@ -4454,6 +4470,11 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
                 } else {
                     walker_unbox_int(ctx, op_pc, it, int_type_addr)?
                 };
+                // The unbox proves `ob_type`, which a subclass shares; without
+                // the `w_class` pin the element is rewrapped as a plain int.
+                if let Some(obj) = walker_concrete_ref_object(ctx, it) {
+                    walker_guard_exact_w_class(ctx, op_pc, it, walker_numeric_builtin_class(obj))?;
+                }
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(v));
                 raws.push(raw);
@@ -4472,6 +4493,9 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             let mut raws: Vec<OpRef> = Vec::with_capacity(len);
             for (&it, &v) in items.iter().zip(vals.iter()) {
                 let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
+                if let Some(obj) = walker_concrete_ref_object(ctx, it) {
+                    walker_guard_exact_w_class(ctx, op_pc, it, walker_numeric_builtin_class(obj))?;
+                }
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(v));
                 // `walker_unbox_float` guards `ob_type` only, which a float
@@ -4855,7 +4879,13 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
+    // `walker_unbox_int_typed` proves only `ob_type`, which an `int` subclass
+    // shares with `int`; the operand gate reads `w_class`, which it does not.
+    // Without these the compiled guard admits the subclass and the comparison
+    // is answered by `IntLt` instead of the overriding `__lt__`.
+    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
     let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
@@ -14362,6 +14392,10 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // storage), so it unboxes through the plain INT_TYPE guard.
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
         let raw = walker_unbox_int(ctx, op_pc, value_op, int_type_addr)?;
+        // The list gets an exact-`w_class` guard above; the VALUE needs its own,
+        // because the unbox proves only `ob_type` and a subclass shares it —
+        // storing its payload would drop the element's Python class.
+        walker_guard_exact_w_class(ctx, op_pc, value_op, walker_numeric_builtin_class(value_obj))?;
         let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Int(elem));
@@ -14374,6 +14408,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         );
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
         let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
+        walker_guard_exact_w_class(ctx, op_pc, value_op, walker_numeric_builtin_class(value_obj))?;
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
@@ -15482,8 +15517,13 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
     // --- emit the specialized IR (walker-native) ---
     let lhs_raw =
         walker_coerce_operand_to_float(ctx, op_pc, lhs, lhs_obj, lhs_is_int, lhs_f64, true)?;
+    // The coercion proves `ob_type`, which an `int`/`float` subclass shares with
+    // its builtin; the operand gate read `w_class`, so pin that too or the
+    // compiled guard admits the subclass and answers with `FloatLt`.
+    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
     let rhs_raw =
         walker_coerce_operand_to_float(ctx, op_pc, rhs, rhs_obj, rhs_is_int, rhs_f64, true)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded =
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
