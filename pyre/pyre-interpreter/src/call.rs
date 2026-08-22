@@ -5498,29 +5498,6 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
         pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
 
-        // typeobject.c type_new: a class body carrying `__abc_tpflags__`
-        // (`collections.abc` Mapping = `1<<6`, Sequence = `1<<5`) folds its
-        // COLLECTION_FLAGS into the structural-match marker, so subclasses of
-        // `abc.Mapping` / `abc.Sequence` match `case {..}` / `case [..]`. The
-        // bit lives only in the defining body's namespace, so subclasses pick
-        // it up through `inherit_flag_map_or_seq` above rather than re-reading.
-        if let Some(w_flags) = crate::type_dict_lookup(w_type, "__abc_tpflags__")
-            && pyre_object::is_int(w_flags)
-        {
-            let flags = pyre_object::w_int_get_value(w_flags);
-            let collection_flags = flags & ((1 << 6) | (1 << 5));
-            if collection_flags == ((1 << 6) | (1 << 5)) {
-                return Err(crate::PyError::type_error(
-                    "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
-                ));
-            }
-            if flags & (1 << 6) != 0 {
-                pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M');
-            } else if flags & (1 << 5) != 0 {
-                pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'S');
-            }
-        }
-
         // typeobject.py: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel
         copy_flags_from_bases(w_type, w_bases);
 

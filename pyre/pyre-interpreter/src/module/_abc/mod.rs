@@ -307,6 +307,40 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         let methods = w_frozenset_from_items(&abstract_names);
         crate::baseobjspace::setattr_str(cls, "__abstractmethods__", methods)?;
+
+        // `app_abc.py _abc_init` — fold a `__abc_tpflags__` in the class body
+        // into the structural-match marker, then drop the attribute.
+        //
+        // This runs here rather than in `type_new` because the marker is only
+        // meant for a class going through `ABCMeta`: consuming it at class
+        // creation gives a plain class the marker too, and `case [...]` would
+        // then accept an object that is not a sequence.
+        //
+        // `_abcmodule.c _abc__abc_init_impl` masks the value and applies
+        // whatever collection bits survive, where `interp_abc.py` compares the
+        // whole value against one flag and raises `ValueError` otherwise. The
+        // mask is the observable behaviour -- `__abc_tpflags__ = (1 << 5) | 1`
+        // sets the sequence marker -- so mask here and hand the primitive the
+        // single bit its own contract is written against.
+        if unsafe { is_type(cls) }
+            && let Some(w_flags) = crate::type_dict_lookup(cls, "__abc_tpflags__")
+        {
+            if unsafe { is_int(w_flags) } {
+                let flags = unsafe { w_int_get_value(w_flags) };
+                if flags & COLLECTION_FLAGS == COLLECTION_FLAGS {
+                    return Err(crate::PyError::type_error(
+                        "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
+                    ));
+                }
+                if flags & COLLECTION_FLAGS != 0 {
+                    set_collection_flag_of(cls, flags & COLLECTION_FLAGS)?;
+                }
+            }
+            // `del cls.__abc_tpflags__`. Outside the int arm: the attribute is
+            // consumed by the class that spells it whatever it holds, and a
+            // leftover would be inherited by every subclass and re-read here.
+            crate::baseobjspace::delattr_str(cls, "__abc_tpflags__")?;
+        }
     }
     Ok(w_none())
 }
@@ -362,6 +396,71 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     }
     Ok(subclass)
+}
+
+/// `typeobject.py PATMA_SEQUENCE` — `Py_TPFLAGS_SEQUENCE`.
+const PATMA_SEQUENCE: i64 = 1 << 5;
+/// `typeobject.py PATMA_MAPPING` — `Py_TPFLAGS_MAPPING`.
+const PATMA_MAPPING: i64 = 1 << 6;
+/// `app_abc.py COLLECTION_FLAGS`.
+const COLLECTION_FLAGS: i64 = PATMA_SEQUENCE | PATMA_MAPPING;
+
+/// `interp_abc.py set_collection_flag` — stamp one structural-match marker on
+/// `w_type`, without touching its subclasses.
+///
+/// `flag` is the exact `Py_TPFLAGS_SEQUENCE` / `Py_TPFLAGS_MAPPING` bit, and
+/// anything else is a `ValueError`; `_abc_init` masks `__abc_tpflags__` down to
+/// a single bit before calling, so the strict test only ever rejects a caller
+/// that spells the flag itself.
+fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), crate::PyError> {
+    if !unsafe { is_type(w_type) } {
+        return Err(crate::PyError::type_error(
+            "_internal_set_collection_flag() argument 1 must be a type",
+        ));
+    }
+    let marker = match flag {
+        PATMA_SEQUENCE => b'S',
+        PATMA_MAPPING => b'M',
+        _ => {
+            return Err(crate::PyError::value_error(format!(
+                "invalid value for __abc_tpflags__: {flag}"
+            )));
+        }
+    };
+    unsafe { typeobject::w_type_set_flag_map_or_seq(w_type, marker) };
+    Ok(())
+}
+
+/// `_abc._internal_set_collection_flag(cls, flag)`.
+fn internal_set_collection_flag(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let [w_type, w_flag] = args else {
+        return Err(crate::PyError::type_error(
+            "_internal_set_collection_flag() requires (cls, flag)",
+        ));
+    };
+    set_collection_flag_of(*w_type, crate::baseobjspace::int_w(*w_flag)?)?;
+    Ok(w_none())
+}
+
+/// `_abc._internal_set_collection_flag_recursive(cls, flag)`.
+fn internal_set_collection_flag_recursive(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let [w_type, w_flag] = args else {
+        return Err(crate::PyError::type_error(
+            "_internal_set_collection_flag_recursive() requires (cls, flag)",
+        ));
+    };
+    let flag = crate::baseobjspace::int_w(*w_flag)?;
+    // The recursive walk takes the marker byte, so validate the flag through
+    // the non-recursive arm first rather than letting an invalid one reach the
+    // subclass walk as a byte nothing rejects.
+    set_collection_flag_of(*w_type, flag)?;
+    let marker = if flag == PATMA_MAPPING { b'M' } else { b'S' };
+    for child in unsafe { typeobject::w_type_get_subclasses(*w_type, false) } {
+        set_collection_flag_recursive(child, marker);
+    }
+    Ok(w_none())
 }
 
 // `interp_abc.py set_collection_flag_recursive` — stamp the marker on
@@ -479,7 +578,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 }
             }
         }
-        // `app_abc.py for rcls in cls._abc_registry:` — subclass of a
+        // `app_abc.py _abc_subclasscheck` `for rcls in cls._abc_registry:` — subclass of a
         // registered class (recursive).  `SimpleWeakSet.__iter__` copies the
         // set before yielding and skips entries whose referent is gone, so the
         // walk survives a collection that fires the discard callback partway
@@ -570,14 +669,14 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls_slot = roots.publish(&[args[0]]);
     let instance_slot = roots.publish(&[args[1]]);
 
-    // `app_abc.py subclass = instance.__class__`.
+    // `app_abc.py _abc_instancecheck` `subclass = instance.__class__`.
     let subclass = crate::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
     let subclass_slot = roots.publish(&[subclass]);
     if weak_cache_contains(roots.get(cls_slot), "_abc_cache", roots.get(subclass_slot))? {
         return Ok(w_bool_from(true));
     }
 
-    // `app_abc.py subtype = type(instance)` — the instance's real class.
+    // `app_abc.py _abc_instancecheck` `subtype = type(instance)` — the instance's real class.
     // User-defined instances carry the generic layout marker in `ob_type` and
     // the real class in `w_class`, so reading `ob_type` directly would resolve
     // to `object`; `r#type` returns the class for both builtin and user
@@ -609,7 +708,7 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             roots.get(subclass_slot),
         )?));
     }
-    // `app_abc.py any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
+    // `app_abc.py _abc_instancecheck` `any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
     for slot in [subclass_slot, subtype_slot] {
         if subclasscheck_of(roots.get(cls_slot), roots.get(slot))? {
             return Ok(w_bool_from(true));
@@ -711,6 +810,8 @@ crate::py_module! {
         "_get_dump"           / 1 = get_dump,
         "_reset_registry"     / 1 = reset_registry,
         "_reset_caches"       / 1 = reset_caches,
+        "_internal_set_collection_flag"           / 2 = internal_set_collection_flag,
+        "_internal_set_collection_flag_recursive" / 2 = internal_set_collection_flag_recursive,
     },
     extra_init: |ns| {
         crate::importing::appleveldef_install_seeded(
