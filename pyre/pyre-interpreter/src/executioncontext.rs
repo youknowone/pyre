@@ -2921,16 +2921,29 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
     WRootFinalizerQueue
 }
 
-/// `interp_jit.py`'s `is_being_profiled` portal green, read from the running
-/// execution context rather than from a frame.
+/// A stand-in for `interp_jit.py`'s `is_being_profiled` portal green at the
+/// green-key sites that hold no frame.
 ///
-/// `setllprofile` sets the per-frame flag on every live frame
-/// (`force_all_frames(is_being_profiled=True)`) and `call_trace` sets it on
-/// each frame it enters, so "this frame is being profiled" and "a profile
-/// function is installed" name the same state for every frame the portal can
-/// reach. The portal has green-key sites with no frame in hand — a function
-/// entry keys on `(pycode, 0)` — and the hash form and the typed form must
-/// agree or they resolve to different cells, so both derive the green here.
+/// The markers do not use this: `jit_merge_point` and `can_enter_jit` both
+/// take `frame.get_is_being_profiled()`, as their declarations do. What has no
+/// frame to read is the `u64` key form — a function entry keys on
+/// `(pycode, 0)` and `fbw_decline` keys on `(pycode, start_pc)` from inside a
+/// walk — so `make_green_key` names the green here instead of taking it.
+///
+/// That makes this an approximation of the green at those sites, and the two
+/// forms can disagree while a profile function is installed. Threading the
+/// caller's own green through `make_green_key` is what removes the
+/// approximation; until then the disagreement is confined to the profiled
+/// regime, where the portal is already effectively out of service.
+///
+/// It reads `profilefunc` rather than a frame's flag because the flag is a
+/// cache of this slot: `setllprofile` calls
+/// `force_all_frames(is_being_profiled=True)` only when installing, so
+/// clearing the profile function leaves every live frame's flag set until
+/// `_c_call_return_trace` or `c_exception_trace` next observes `profilefunc`
+/// gone and repairs it. Every hook fire is gated on `profilefunc` — `leave`,
+/// `call_trace` and `_c_call_return_trace` all test it — so between the clear
+/// and the repair the flag names a regime that is no longer in force.
 pub fn current_is_being_profiled() -> bool {
     let ec = crate::call::getexecutioncontext();
     !ec.is_null() && unsafe { (*ec).profilefunc.is_some() }

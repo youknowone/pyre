@@ -6009,14 +6009,22 @@ pub fn _call_not_in_trace(
 }
 
 #[inline]
-fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) -> Option<u64> {
+fn green_key_from_pycode(
+    next_instr: usize,
+    is_being_profiled: bool,
+    w_pycode: pyre_object::PyObjectRef,
+) -> Option<u64> {
     // Safety: this follows existing wrappers that treat `PyCode`
     // as an owned pointer to a `CodeObject`.
     let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
     if code_ptr.is_null() {
         return None;
     }
-    Some(make_green_key(code_ptr, next_instr))
+    Some(majit_ir::pypyjit_greenkey_uhash(
+        next_instr,
+        is_being_profiled,
+        code_ptr as u64,
+    ))
 }
 
 /// The typed `GreenKey` behind [`green_key_from_pycode`]'s `u64`.
@@ -6028,11 +6036,14 @@ fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) 
 /// warmstate.py:575-582). Callers that read a cell take this; callers that
 /// only tick a counter can keep the hash.
 ///
-/// `is_being_profiled` comes from `current_is_being_profiled` here **because
-/// [`make_green_key`] reads it from the same place** — the two must agree or
-/// the typed and hash paths would resolve to different cells.
+/// `is_being_profiled` is the caller's own green, not a re-derivation of it.
+/// `interp_jit.py` hands each of these entry points' `is_being_profiled`
+/// straight to `jit_hooks`, so a caller naming one half of the key reaches
+/// that half; deriving the green here instead would answer about whichever
+/// cell the running profile state selects and silently ignore the argument.
 fn green_key_typed_from_pycode(
     next_instr: usize,
+    is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> Option<majit_ir::GreenKey> {
     // Safety: as `green_key_from_pycode` — `PyCode` is an owned pointer to a
@@ -6043,7 +6054,7 @@ fn green_key_typed_from_pycode(
     }
     Some(majit_ir::pypyjit_greenkey(
         next_instr,
-        pyre_interpreter::executioncontext::current_is_being_profiled(),
+        is_being_profiled,
         code_ptr as u64,
     ))
 }
@@ -6152,13 +6163,13 @@ pub fn should_unroll_one_iteration(
 pub fn get_jitcell_at_key(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    _is_being_profiled: bool,
+    is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
     // warmstate.py `get_jit_cell_at_key(greenkey)` unwraps the
     // greenkey and hands the green *args* to `get_jitcell`. The green args
     // are this function's own parameters, so the typed key costs no plumbing.
-    let key = green_key_typed_from_pycode(next_instr, w_pycode);
+    let key = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode);
     let (driver, _) = driver_pair();
     w_bool_from(key.is_some_and(|green_key| {
         driver
@@ -6174,13 +6185,14 @@ pub fn get_jitcell_at_key(
 pub fn dont_trace_here(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    _is_being_profiled: bool,
+    is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
     // warmstate.py `dont_trace_here(*greenargs)` reaches its cell
     // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
     // args are this function's parameters.
-    let Some(green_key) = green_key_typed_from_pycode(next_instr, w_pycode) else {
+    let Some(green_key) = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode)
+    else {
         return;
     };
     let (driver, _) = driver_pair();
@@ -6195,13 +6207,14 @@ pub fn dont_trace_here(
 pub fn mark_as_being_traced(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    _is_being_profiled: bool,
+    is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
     // warmstate.py `mark_as_being_traced(*greenargs)` reaches its cell
     // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
     // args are this function's parameters.
-    let Some(green_key) = green_key_typed_from_pycode(next_instr, w_pycode) else {
+    let Some(green_key) = green_key_typed_from_pycode(next_instr, is_being_profiled, w_pycode)
+    else {
         return;
     };
     let (driver, _) = driver_pair();
@@ -6225,10 +6238,10 @@ pub fn mark_as_being_traced(
 pub fn trace_next_iteration(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    _is_being_profiled: bool,
+    is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+    let Some(green_key) = green_key_from_pycode(next_instr, is_being_profiled, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
