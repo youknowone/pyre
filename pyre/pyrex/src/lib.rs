@@ -1387,9 +1387,13 @@ fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef) {
 /// `finalize_modules`: clear detached modules newest-first while their peers
 /// remain available to finalizers that run between module dictionaries.
 fn clear_shutdown_modules(
-    modules: Vec<(rustpython_wtf8::Wtf8Buf, pyre_object::PyObjectRef)>,
+    released: pyre_interpreter::importing::ReleasedSysModules,
     ec_ptr: *const PyExecutionContext,
 ) {
+    let pyre_interpreter::importing::ReleasedSysModules {
+        modules,
+        dropped_unlisted,
+    } = released;
     let _roots = pyre_object::gc_roots::push_roots();
     let roots_start = pyre_object::gc_roots::shadow_stack_len();
     let mut names = Vec::with_capacity(modules.len());
@@ -1406,7 +1410,17 @@ fn clear_shutdown_modules(
         names.push(name);
         pyre_object::gc_roots::pin_root(module);
     }
-    collect_and_run_finalizers(ec_ptr);
+    // `finalize_runtime` sweeps immediately before detaching the import cache,
+    // and every module that detach handed over is pinned just above — so a
+    // sweep here reaches something that one could not only when the detach
+    // dropped an entry this list does not carry: a non-module value, or one
+    // under a key that is not a string. The walk below ends on a sweep either
+    // way, so an import cache holding nothing but named modules — which is
+    // every run that does not assign to `sys.modules` itself — pays one
+    // whole-heap mark-and-sweep less at exit.
+    if dropped_unlisted {
+        collect_and_run_finalizers(ec_ptr);
+    }
     for index in (0..names.len()).rev() {
         let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
         let is_core_module = sys_module_slot.is_some_and(|slot| {
