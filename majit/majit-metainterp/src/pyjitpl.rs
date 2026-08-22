@@ -4937,7 +4937,7 @@ impl<M: Clone> MetaInterp<M> {
                 // TraceCtx, compiled_loops/JitCellToken and the unconditional
                 // finally-clear instead of falling back to the bucket hash.
                 // This is the function-entry twin of on_back_edge_typed's
-                // resolve-once step below (warmstate.py:458-464/:483/:511).
+                // resolve-once step below (`warmstate.py maybe_compile_and_run`).
                 let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
                     self.warm_state.cell_key_for(key)
                 })
@@ -5055,7 +5055,7 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// warmstate.py:446-511 `maybe_compile_and_run` function-threshold half.
+    /// `warmstate.py maybe_compile_and_run`, function-threshold half.
     /// Resolve the portal greens through `comparekey` and run the whole warm
     /// decision on that cell.  The returned boolean only says whether the
     /// already-counted entry should call [`Self::force_start_tracing`]; that

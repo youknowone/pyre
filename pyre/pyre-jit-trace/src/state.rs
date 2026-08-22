@@ -6888,7 +6888,7 @@ impl PyreSym {
     ///      header that `init_vable_indices` assumes (see
     ///      `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` for the
     ///      four concrete scalar fields selected from
-    ///      `interp_jit.py:25-30`); the
+    ///      `interp_jit.py PyFrame._virtualizable_`); the
     ///      frame still owns the shadow
     ///      semantically though.
     ///
@@ -10778,7 +10778,7 @@ impl JitState for PyreJitState {
             sym.registers_f[reg_idx] = resolved;
             value_cursor += 1;
         }
-        // `interp_jit.py:67 reds = ['frame', 'ec']`: codewriter gives both
+        // `interp_jit.py PyPyJitDriver.reds = ['frame', 'ec']`: codewriter gives both
         // portal reds dedicated Ref colors and force-keeps them live at every
         // guard. `consume_boxes` above therefore rebuilt the bridge's own EC
         // inputarg at `portal_ec_reg`; retain that OpRef before converting the

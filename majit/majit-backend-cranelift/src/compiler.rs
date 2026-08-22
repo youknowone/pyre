@@ -16360,7 +16360,7 @@ fn collect_guards(
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
                     let arg_ref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
-                    // `assembler.py:46` `if arg is None: continue`.
+                    // `assembler.py compute_gcmap` `if arg is None: continue`.
                     if arg_ref.is_none() {
                         continue;
                     }

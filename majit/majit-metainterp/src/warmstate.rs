@@ -1293,7 +1293,7 @@ impl WarmEnterState {
             if cell.is_tracing() {
                 return HotResult::AlreadyTracing;
             }
-            // warmstate.py:473-481 handles JC_TEMPORARY before it consults
+            // `warmstate.py maybe_compile_and_run` handles JC_TEMPORARY before it consults
             // JC_DONT_TRACE_HERE: a compile_tmp_callback is only the residual
             // CALL_ASSEMBLER fallback, so it must keep counting toward the
             // callee's real standalone trace even when that callee was marked
@@ -2313,7 +2313,7 @@ impl WarmEnterState {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
                 return FunctionEntryStep::NotHot;
             }
-            // warmstate.py:473-481: JC_TEMPORARY is tested alongside
+            // `warmstate.py maybe_compile_and_run`: JC_TEMPORARY is tested alongside
             // JC_TRACING and, unlike JC_TRACING, counts normally.  This branch
             // must precede JC_DONT_TRACE_HERE below: the temporary token is the
             // interpreter callback used until the non-inlinable callee gets
@@ -2374,7 +2374,7 @@ impl WarmEnterState {
 
     /// Typed-key form of [`Self::should_trace_function_entry`].
     ///
-    /// `maybe_compile_and_run` in warmstate.py:458-464 walks the bucket chain
+    /// `warmstate.py maybe_compile_and_run` walks the bucket chain
     /// with `comparekey` once and keeps that exact `JitCell` through the
     /// JC_TEMPORARY / procedure-token / JC_DONT_TRACE_HERE decision.  A raw
     /// hash names only the bucket in pyre, so using the hash form for this
@@ -5643,7 +5643,7 @@ mod tests {
         );
     }
 
-    /// warmstate.py:473-481 checks JC_TEMPORARY before
+    /// `warmstate.py maybe_compile_and_run` checks JC_TEMPORARY before
     /// JC_DONT_TRACE_HERE.  A callee blamed for a trace-too-long abort can
     /// carry all of TEMPORARY (its residual CALL_ASSEMBLER callback),
     /// DONT_TRACE_HERE (do not inline it again), and FORCE_FINISH (segment its

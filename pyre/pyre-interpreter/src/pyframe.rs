@@ -3045,7 +3045,7 @@ impl PyFrame {
         if self.pycode.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `pyframe.py:132 return jit.promote(self.pycode).w_globals`.  Without
+        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.  Without
         // the promote the code object stays a varying value on the trace and
         // the globals read is a load the optimizer cannot fold; `w_globals` is
         // not a virtualizable field, so nothing else pins it to a constant.
