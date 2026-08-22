@@ -21,7 +21,7 @@
 //! (`REF_ELIDABLE = 21`, `call.py elif cr:`).  The fold machinery
 //! exercised by checks 2-3 (`call_typed_with_effect_pure` →
 //! `record_result_of_call_pure` → `execute_pure_call`) is the
-//! `_record_helper_pure` path, which `pyjitpl.py:1351-1352` reaches ONLY
+//! `MIFrame.execute_varargs(pure=True)` path, which is reached ONLY
 //! for `EF_ELIDABLE_CANNOT_RAISE`.  Both `call_typed_with_effect_pure`
 //! (`history.rs` debug_assert) and `execute_pure_call`
 //! (`executor.rs`'s `elidable_can_raise_panics_debug_assertion`
@@ -88,8 +88,8 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_p))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    // Fold path requires EF_ELIDABLE_CANNOT_RAISE: `_record_helper_pure`
-    // is reached only for that policy (pyjitpl.py:1351-1352).
+    // Fold path requires EF_ELIDABLE_CANNOT_RAISE:
+    // `MIFrame.execute_varargs(pure=True)` is reached only for that policy.
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
     // inputarg slot 0 = first live value, Ref-typed (resoperation.py:739

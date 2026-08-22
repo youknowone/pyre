@@ -9093,9 +9093,9 @@ where
             return (ctx.const_int(fast), fast);
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
-        // pyjitpl.py `_record_helper_pure`: a pure op whose args are all
-        // constants folds to its constant result at trace time and records
-        // nothing.  Every opcode routed here is a pure int/uint arithmetic or
+        // `MetaInterp.execute_and_record`: a pure op whose args are all
+        // constants (`_all_constants`) folds to its constant result at trace
+        // time and records nothing.  Every opcode routed here is a pure int/uint arithmetic or
         // comparison, so an all-constant pair yields a constant destination.
         if lhs.is_constant() && rhs.is_constant() {
             return (ctx.const_int(value), value);
@@ -9164,8 +9164,8 @@ where
             OpCode::IntMulOvf => lhs_value.overflowing_mul(rhs_value),
             _ => unreachable!("trace_int_binop_jump_if_ovf: {opcode:?}"),
         };
-        // All-constant operands fold at trace time (pyjitpl `_record_helper_pure`):
-        // no resop, no guard.  A constant pair that overflows unconditionally
+        // All-constant operands fold at trace time
+        // (`MetaInterp.execute_and_record`): no resop, no guard.  A constant pair that overflows unconditionally
         // takes the overflow branch.
         if lhs.is_constant() && rhs.is_constant() {
             if overflowed {
@@ -9207,7 +9207,8 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
-        // `_record_helper_pure`: a constant source folds to a constant result.
+        // `MetaInterp.execute_and_record`: a constant source folds to a
+        // constant result.
         if src.is_constant() {
             self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
             return;

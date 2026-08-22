@@ -796,8 +796,8 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
 ///
 /// RPython `executor.execute_varargs(cpu, ..., exc=False)`
 /// (`executor.py:75-78`) skips the `metainterp.execute_raised` coordination
-/// when the helper provably cannot raise — `pyjitpl.py:_record_helper_pure`
-/// (`pyjitpl.py:1346-1400`) reaches this path for every `EF_ELIDABLE_CANNOT_RAISE`
+/// when the helper provably cannot raise — `MIFrame.execute_varargs` with
+/// `pure=True` reaches this path for every `EF_ELIDABLE_CANNOT_RAISE`
 /// callee. Pyre's walker (`pyre-jit-trace::jitcode_dispatch::
 /// dispatch_residual_call_*`) cannot thread `&mut MetaInterp` through the
 /// trace recorder seam, so this helper exposes the `exc=False` shape via

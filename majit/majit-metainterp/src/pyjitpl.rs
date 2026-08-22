@@ -15010,12 +15010,15 @@ impl<M: Clone> MetaInterp<M> {
         self.count_ops(opnum, counters::OPS);
         // pyjitpl.py: resvalue = executor.execute_varargs(self.cpu, self, ...)
         let resvalue = crate::executor::execute_varargs(self, opnum, argboxes, descr_view);
-        // pyjitpl.py:2649-2650: assert not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST
+        // `MetaInterp.execute_and_record_varargs` asserts
+        // `not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST`;
+        // the predicate below is the narrower call-only slice of that range.
         debug_assert!(
             !opnum.is_call_pure(),
-            "execute_and_record_varargs: pure calls go through _record_helper_pure_varargs",
+            "execute_and_record_varargs: pure calls go through \
+             MIFrame.execute_varargs(pure=True) → record_result_of_call_pure",
         );
-        // pyjitpl.py: return self._record_helper_varargs(...)
+        // `MetaInterp._record_helper_varargs`
         let opref_args: Vec<OpRef> = argboxes.iter().map(|(_, opref, _)| *opref).collect();
         self._record_helper_varargs(opnum, resvalue, descr, &opref_args)
     }
