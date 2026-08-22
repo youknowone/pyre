@@ -6313,10 +6313,12 @@ impl Repr for StringBuilderRepr {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, STRINGBUILDERPTR.clone()),
             "append" => {
+                // `SomeStringBuilder.method_append` accepts only `SomeString`
+                // or `SomeChar` (rstring.py) — a byte char, never a unicode
+                // code point.
                 let is_char = matches!(
                     hop.args_s.borrow().get(1),
                     Some(crate::annotator::model::SomeValue::Char(_))
-                        | Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
                 );
                 if is_char {
                     let char_repr = crate::translator::rtyper::rstr::char_repr();
@@ -6422,10 +6424,12 @@ impl Repr for UnicodeBuilderRepr {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, UNICODEBUILDERPTR.clone()),
             "append" => {
+                // `SomeUnicodeBuilder.method_append` accepts only
+                // `SomeUnicodeString` or `SomeUnicodeCodePoint` (rstring.py) —
+                // a unicode code point, never a byte char.
                 let is_char = matches!(
                     hop.args_s.borrow().get(1),
-                    Some(crate::annotator::model::SomeValue::Char(_))
-                        | Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
+                    Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
                 );
                 if is_char {
                     let char_repr = crate::translator::rtyper::rstr::unichar_repr();

@@ -145,6 +145,10 @@ pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
     // SAFETY: `buf` holds at least `new_len` valid chars (the builder shrinks to
     // its own `current_pos`), and `new_buf` was allocated for exactly `new_len`.
     unsafe {
+        // Copy the fixed `hash` field (@0) before the variable char array, as
+        // `ll_shrink_array` copies the fixed field first; a fresh allocation
+        // zeroes it, so a non-zero cached hash would otherwise be lost.
+        (new_buf as *mut usize).write(*(buf as *const usize));
         let src = (buf as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         let dst = (new_buf as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         std::ptr::copy_nonoverlapping(src, dst, new_len * ITEM_SIZE);
