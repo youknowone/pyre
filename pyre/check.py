@@ -1985,9 +1985,11 @@ ROOT_BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-too
 def workspace_member_dirs():
     """Directories listed in the root `Cargo.toml` `members` array.
 
-    A source file only reaches a compiler if it belongs to a member crate, so
+    A `.rs` file only reaches a compiler if it belongs to a member crate, so
     this is what separates a build input from a bench fixture or a baseline
-    sitting elsewhere in the tree. `pyre/pyrex/tests/gate_triage_complete.rs`
+    sitting elsewhere in the tree. It does not settle the whole input set: one
+    of those sources can embed a file from anywhere in the tree, which is what
+    [`embedded_inputs_outside_members`] recovers. `pyre/pyrex/tests/gate_triage_complete.rs`
     derives its own search roots the same way, for the same reason — including
     the line anchor, which is what keeps `default-members = [` above from
     being read as this array.
@@ -2028,6 +2030,61 @@ def llbc_input_paths():
     return [str(path) for path in Path("build/llbc").glob("*.ullbc")]
 
 
+# `include_str!("x")`, `include_bytes!("x")` and `include!("x")` with a plain
+# literal. A path built with `concat!`/`env!` is deliberately unmatched: those
+# name `OUT_DIR`, which is under `target/` and so outside the tree this set is
+# derived from.
+EMBED_MACRO = re.compile(r'include(?:_str|_bytes)?!\s*\(\s*"([^"\\]*)"')
+
+
+def embedded_inputs_outside_members(member_sources, members, listed):
+    """Files a member crate embeds from outside every member directory.
+
+    `include_str!` and its siblings read their file at compile time, so it is a
+    build input exactly as the `.rs` around it is, and `rustc` records it in the
+    depinfo that makes `cargo` rebuild when it changes. The path is written
+    relative to the source file, so it can climb out of the crate and out of the
+    workspace entirely: `majit-metainterp/src/ruleopt/mod.rs` embeds
+    `rpython/jit/metainterp/ruleopt/real.rules`, which the member-directory
+    filter alone drops. Left out, editing that file rebuilds the artefact
+    without moving the fingerprint, and a later `--no-build` run approves a
+    binary built from the previous text.
+
+    Scanned rather than listed by hand, so a second one cannot be added to the
+    tree without the gate seeing it.
+
+    Conservative in one direction on purpose: an embed under `#[cfg(test)]`
+    reaches the unit tests and not the measured artefact, and this counts it
+    anyway rather than track cfgs. The cost is a rebuild nobody needed; the
+    alternative fails the other way, which is the one that reports a
+    measurement the binary does not support.
+    """
+    outside = set()
+    for source in member_sources:
+        if not source.endswith(".rs"):
+            continue
+        try:
+            text = Path(source).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Raced with a delete, or unreadable. The file was in the listing a
+            # moment ago, so dropping its embeds is no worse than the enclosing
+            # enumeration already is about a tree changing under it.
+            continue
+        if "include" not in text:
+            continue
+        for embedded in EMBED_MACRO.findall(text):
+            resolved = os.path.normpath(os.path.join(os.path.dirname(source), embedded))
+            if resolved.startswith("..") or os.path.isabs(resolved):
+                # Outside the repository, so no digest over the tree can cover
+                # it; the enumeration says what it saw and nothing more.
+                continue
+            resolved = resolved.replace(os.sep, "/")
+            if resolved.startswith(members) or resolved not in listed:
+                continue
+            outside.add(resolved)
+    return sorted(outside)
+
+
 def build_input_paths():
     """Every file a release artefact is built from, or `None` when the tree
     cannot be enumerated — which makes the freshness gate below fail open
@@ -2055,7 +2112,9 @@ def build_input_paths():
     outside its crate. The only one in the tree is the `lib-python/3` closure
     `pyre-interpreter/build.rs` embeds, and it is guarded by `wasm_vfs`, a
     feature no artefact this script measures is built with. Enabling it for the
-    wasm-host build would mean adding that closure here.
+    wasm-host build would mean adding that closure here. A file embedded by the
+    ordinary sources rather than by a build script is a different matter and is
+    covered — see [`embedded_inputs_outside_members`].
     """
     try:
         listing = subprocess.run(
@@ -2074,6 +2133,9 @@ def build_input_paths():
     # `.c`/`.h` sources and the app-level `.py` bodies reach the binary exactly
     # as the `.rs` files do.
     paths = [p for p in listed if p.startswith(members) or p in ROOT_BUILD_INPUTS]
+    # A member crate can embed a file from outside every member directory, and
+    # the filter above is by path alone, so it cannot see one.
+    paths += embedded_inputs_outside_members(paths, members, frozenset(listed))
     # The LLBC is a build input the fingerprint gate already tracks by content,
     # but it is generated rather than tracked by git.
     paths += llbc_input_paths()
