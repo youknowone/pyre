@@ -13,9 +13,9 @@
 //!   scanning forward" has a checked counterpart there and is *not* re-ported:
 //!   a second, unchecked implementation beside a checked one would be two
 //!   sources of truth for one invariant.  `unichr_as_utf8*` is
-//!   `CodePoint::encode_wtf8` / `Wtf8Buf::push`; `check_utf8`, `_check_utf8`
-//!   and `get_utf8_length` are `Wtf8::from_bytes`; `check_ascii` and
-//!   `first_non_ascii_char` are `Wtf8::is_ascii` and a byte scan;
+//!   `CodePoint::encode_wtf8` / `Wtf8Buf::push`; `get_utf8_length` is
+//!   `codepoints_in_utf8`, which upstream also says to prefer; `check_ascii`
+//!   and `first_non_ascii_char` are `Wtf8::is_ascii` and a byte scan;
 //!   `has_surrogates` and `surrogate_in_utf8` are `Wtf8::as_str().is_err()`;
 //!   `islinebreak`, `isspace` and `utf8_in_chars` are predicates over a
 //!   decoded `CodePoint`; `char_escape_helper`, `make_utf8_escape_function`
@@ -34,6 +34,12 @@
 //! what RPython's `str` payload becomes once the invariant lives in the type,
 //! and holding it lets `codepoint_at_pos` decode through the crate instead of
 //! carrying a second copy of its decoder.
+//!
+//! `check_utf8` is the one validator that *is* re-ported, because
+//! `Wtf8::from_bytes` is not equivalent to it: it accepts sequences upstream
+//! rejects (see that function), and it has no way to spell
+//! `allow_surrogates=False`.  Its three predicates come with it, so the
+//! decoders that already share them read them from here.
 //!
 //! Two members of the family are deliberately absent.  `null_storage` has no
 //! counterpart: an absent table is a null pointer in the `W_UnicodeObject`
@@ -130,6 +136,121 @@ pub fn codepoint_before_pos(code: &Wtf8, pos: usize) -> CodePoint {
     codepoint_at_pos(code, prev_codepoint_pos(code, pos))
 }
 
+/// `CheckError` (`rutf8.py`) — the byte position `check_utf8` stopped at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckError {
+    pub pos: usize,
+}
+
+/// `_invalid_cont_byte` (`rutf8.py`) — a byte outside `0x80..=0xBF`, which
+/// upstream spells as a signed-char comparison against `-0x40`.
+#[inline]
+pub fn invalid_cont_byte(b: u8) -> bool {
+    (b as i8) >= -0x40
+}
+
+/// `_invalid_byte_2_of_3` (`rutf8.py`) — the second byte of a three-byte
+/// sequence, rejecting surrogate encodings unless the caller selected the
+/// `surrogatepass` path.
+#[inline]
+pub fn invalid_byte_2_of_3(ch1: u8, ch2: u8, allow_surrogates: bool) -> bool {
+    invalid_cont_byte(ch2)
+        || (ch1 == 0xE0 && ch2 < 0xA0)
+        || (ch1 == 0xED && ch2 > 0x9F && !allow_surrogates)
+}
+
+/// `_invalid_byte_2_of_4` (`rutf8.py`) — the second byte of a four-byte
+/// sequence, which also carries the range bound the leading byte leaves open.
+#[inline]
+pub fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
+    invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
+}
+
+/// `check_utf8` (`rutf8.py`) — the code point count of `s`, or the byte
+/// position where it stops being well formed.
+///
+/// `_check_utf8`'s ones'-complement return and the `CheckError` its caller
+/// raises from it are one `Result` here.  Upstream's `start`/`stop` window is
+/// left out: every pyre caller validates a whole buffer.
+pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError> {
+    let end = s.len();
+    let mut pos = 0;
+    let mut continuation_bytes = 0;
+    while pos < end {
+        let ordch1 = s[pos];
+        pos += 1;
+        // fast path for ASCII
+        if ordch1 <= 0x7F {
+            continue;
+        }
+        if ordch1 <= 0xC1 {
+            return Err(CheckError { pos: pos - 1 });
+        }
+        if ordch1 <= 0xDF {
+            if pos >= end {
+                return Err(CheckError { pos: pos - 1 });
+            }
+            let ordch2 = s[pos];
+            pos += 1;
+            if invalid_cont_byte(ordch2) {
+                return Err(CheckError { pos: pos - 2 });
+            }
+            continuation_bytes += 1;
+            continue;
+        }
+        if ordch1 <= 0xEF {
+            if pos + 2 > end {
+                return Err(CheckError { pos: pos - 1 });
+            }
+            let ordch2 = s[pos];
+            let ordch3 = s[pos + 1];
+            pos += 2;
+            if invalid_byte_2_of_3(ordch1, ordch2, allow_surrogates) || invalid_cont_byte(ordch3) {
+                return Err(CheckError { pos: pos - 3 });
+            }
+            continuation_bytes += 2;
+            continue;
+        }
+        if ordch1 <= 0xF4 {
+            if pos + 3 > end {
+                return Err(CheckError { pos: pos - 1 });
+            }
+            let ordch2 = s[pos];
+            let ordch3 = s[pos + 1];
+            let ordch4 = s[pos + 2];
+            pos += 3;
+            if invalid_byte_2_of_4(ordch1, ordch2)
+                || invalid_cont_byte(ordch3)
+                || invalid_cont_byte(ordch4)
+            {
+                return Err(CheckError { pos: pos - 4 });
+            }
+            continuation_bytes += 3;
+            continue;
+        }
+        return Err(CheckError { pos: pos - 1 });
+    }
+    Ok(pos - continuation_bytes)
+}
+
+/// The `Wtf8` view of a buffer that arrived from outside the runtime —
+/// `check_utf8` with surrogates admitted, which is the `surrogatepass` decode
+/// every such boundary performs.
+///
+/// `Wtf8::from_bytes` does not stand in for this.  Its surrogate arm matches
+/// `[0xed, 0xa0.., b3, ..]`, leaving the second byte unbounded above and the
+/// third unconstrained, so it accepts `ED C0 80` — three bytes encoding no code
+/// point.  A buffer admitted that way reaches `W_UnicodeObject` with a code
+/// point count that disagrees with what `next_codepoint_pos` steps over, and
+/// the two disagree first inside `create_utf8_index_storage`, which reads past
+/// the buffer.
+pub fn wtf8_from_bytes(s: &[u8]) -> Result<&Wtf8, CheckError> {
+    check_utf8(s, true)?;
+    // SAFETY: every sequence in `s` is well formed, and admitting the
+    // surrogates is what separates WTF-8 from UTF-8.
+    Ok(unsafe { Wtf8::from_bytes_unchecked(s) })
+}
+
 /// `codepoints_in_utf8` (`rutf8.py`) — the number of code points in
 /// `value[start..end]`.
 ///
@@ -141,7 +262,7 @@ pub fn codepoints_in_utf8(value: &Wtf8, start: usize, end: usize) -> usize {
     debug_assert!(start <= end);
     value[start..end]
         .iter()
-        .filter(|&&ch| (ch as i8) >= -0x40)
+        .filter(|&&ch| invalid_cont_byte(ch))
         .count()
 }
 
@@ -291,6 +412,58 @@ pub fn codepoint_index_at_byte_position(
 mod tests {
     use super::*;
     use rustpython_wtf8::Wtf8Buf;
+
+    #[test]
+    fn check_utf8_counts_code_points() {
+        assert_eq!(check_utf8(b"", true), Ok(0));
+        assert_eq!(check_utf8(b"abc", true), Ok(3));
+        assert_eq!(check_utf8("é中\u{10000}".as_bytes(), false), Ok(3));
+    }
+
+    #[test]
+    fn check_utf8_rejects_what_wtf8_from_bytes_admits() {
+        // `Wtf8::from_bytes`'s surrogate arm leaves the second byte unbounded
+        // above and the third unconstrained, so both of these reach a string.
+        for bad in [b"\xed\xc0\x80".as_slice(), b"\xed\xa0\x41".as_slice()] {
+            assert!(Wtf8::from_bytes(bad).is_some());
+            assert_eq!(check_utf8(bad, true), Err(CheckError { pos: 0 }));
+            assert_eq!(wtf8_from_bytes(bad), Err(CheckError { pos: 0 }));
+        }
+    }
+
+    #[test]
+    fn check_utf8_admits_surrogates_only_when_asked() {
+        let lone = b"\xed\xa0\x80";
+        assert_eq!(check_utf8(lone, true), Ok(1));
+        assert_eq!(check_utf8(lone, false), Err(CheckError { pos: 0 }));
+        // A pair stays two code points, which is what `surrogatepass` decodes
+        // `'\\ud800\\udc00'.encode('utf-8', 'surrogatepass')` back to.
+        assert_eq!(check_utf8(b"\xed\xa0\x80\xed\xb0\x80", true), Ok(2));
+    }
+
+    #[test]
+    fn check_utf8_reports_the_offending_sequences_position() {
+        assert_eq!(check_utf8(b"ab\x80", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xc2", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xe0\x80\x80", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xf4\x90\x80\x80", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xf5", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xc1\x81", true), Err(CheckError { pos: 2 }));
+    }
+
+    #[test]
+    fn a_checked_buffer_agrees_with_the_index_table() {
+        // The count `check_utf8` returns is the one `create_utf8_index_storage`
+        // walks to, which is the disagreement the whole check exists to stop.
+        let buf = Wtf8Buf::from_string("a\u{e9}\u{4e2d}\u{10000}".repeat(40));
+        let len = check_utf8(buf.as_bytes(), true).unwrap();
+        assert_eq!(len, buf.code_points().count());
+        let storage = create_utf8_index_storage(&buf, len);
+        assert_eq!(
+            codepoint_at_index(&buf, &storage, len - 1),
+            buf.code_points().last().unwrap()
+        );
+    }
 
     fn sample(kind: &str, repeat: usize) -> Wtf8Buf {
         let mut buf = Wtf8Buf::new();

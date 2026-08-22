@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::pyobject::*;
+use pyre_object::rutf8::{invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte};
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -23712,24 +23713,6 @@ const UTF8_CODE_LENGTH: [u8; 128] = [
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // E0-EF
     4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F0-F4 + F5-FF
 ];
-
-/// rutf8.py:326-328
-fn invalid_cont_byte(b: u8) -> bool {
-    (b as i8) >= -0x40 // equivalent: b < 0x80 || b > 0xBF
-}
-
-/// rutf8.py `_invalid_byte_2_of_3`: reject surrogate encodings unless the
-/// caller selected the `surrogatepass` path.
-fn invalid_byte_2_of_3(ch1: u8, ch2: u8, allow_surrogates: bool) -> bool {
-    invalid_cont_byte(ch2)
-        || (ch1 == 0xE0 && ch2 < 0xA0)
-        || (ch1 == 0xED && ch2 > 0x9F && !allow_surrogates)
-}
-
-/// rutf8.py:345-348
-fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
-    invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
-}
 
 /// interp_locale.py `charp2uni` — decode a C string the way
 /// `str(bytes, 'utf-8', 'surrogateescape')` does: valid UTF-8 passes
