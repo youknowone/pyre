@@ -7,16 +7,20 @@ use crate::callbacks;
 use crate::state::PyreJitState;
 
 /// RPython green_key = pypyjit greens `[next_instr, is_being_profiled,
-/// pycode]` (interp_jit.py:67-70). pyre's portal greens are always exactly
-/// `(PyCode*, next_instr)`, and the JIT path never runs under a profiler,
-/// so `is_being_profiled` folds to 0 — the trace-side call sites have no
-/// frame to read it from. The returned u64 is the full
+/// pycode]` (interp_jit.py). `is_being_profiled` is read from the running
+/// execution context (`current_is_being_profiled`) rather than folded to 0,
+/// so installing a profiler selects a different cell instead of sharing the
+/// unprofiled one. The returned u64 is the full
 /// `JitCell.get_uhash` over the typed green tuple (warmstate.py),
 /// so this legacy hash flow and the typed marker-path lookup
 /// (`lookup_chain_with_key`) agree on the same cell.
 #[inline(always)]
 pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
-    majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
+    majit_ir::pypyjit_greenkey_uhash(
+        pc,
+        pyre_interpreter::executioncontext::current_is_being_profiled(),
+        code_ptr as u64,
+    )
 }
 
 /// The typed form of [`make_green_key`]: the greens themselves, not a fold of
@@ -28,7 +32,11 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// without a comparekey, where no later typed lookup can find it. The u64 form
 /// stays correct for calls that only move a counter.
 pub fn make_green_key_typed(code_ptr: *const (), pc: usize) -> majit_ir::GreenKey {
-    majit_ir::pypyjit_greenkey(pc, false, code_ptr as u64)
+    majit_ir::pypyjit_greenkey(
+        pc,
+        pyre_interpreter::executioncontext::current_is_being_profiled(),
+        code_ptr as u64,
+    )
 }
 
 /// Type alias for the JIT driver pair. Must match pyre-jit/eval.rs JitDriverPair.

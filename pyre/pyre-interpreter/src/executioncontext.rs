@@ -2858,3 +2858,18 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
     let _ = w_root;
     WRootFinalizerQueue
 }
+
+/// `interp_jit.py`'s `is_being_profiled` portal green, read from the running
+/// execution context rather than from a frame.
+///
+/// `setllprofile` sets the per-frame flag on every live frame
+/// (`force_all_frames(is_being_profiled=True)`) and `call_trace` sets it on
+/// each frame it enters, so "this frame is being profiled" and "a profile
+/// function is installed" name the same state for every frame the portal can
+/// reach. The portal has green-key sites with no frame in hand — a function
+/// entry keys on `(pycode, 0)` — and the hash form and the typed form must
+/// agree or they resolve to different cells, so both derive the green here.
+pub fn current_is_being_profiled() -> bool {
+    let ec = crate::call::getexecutioncontext();
+    !ec.is_null() && unsafe { (*ec).profilefunc.is_some() }
+}

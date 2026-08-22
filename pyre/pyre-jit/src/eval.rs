@@ -5939,11 +5939,9 @@ fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) 
 /// warmstate.py:575-582). Callers that read a cell take this; callers that
 /// only tick a counter can keep the hash.
 ///
-/// `is_being_profiled` is folded to `false` here **because
-/// [`make_green_key`] folds it to `false`** — the two must agree or the typed
-/// and hash paths would resolve to different cells. That fold is itself a
-/// parity gap (upstream splits cells on the flag, pyre never does), tracked
-/// separately; it is not this function's to change.
+/// `is_being_profiled` comes from `current_is_being_profiled` here **because
+/// [`make_green_key`] reads it from the same place** — the two must agree or
+/// the typed and hash paths would resolve to different cells.
 fn green_key_typed_from_pycode(
     next_instr: usize,
     w_pycode: pyre_object::PyObjectRef,
@@ -5956,7 +5954,7 @@ fn green_key_typed_from_pycode(
     }
     Some(majit_ir::pypyjit_greenkey(
         next_instr,
-        false,
+        pyre_interpreter::executioncontext::current_is_being_profiled(),
         code_ptr as u64,
     ))
 }
@@ -6420,7 +6418,11 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     // computed allocation-free. `is_being_profiled` folds to 0 (the JIT
     // path is never profiled), so this matches the typed marker-path key
     // and both lookups resolve to the same cell.
-    majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
+    majit_ir::pypyjit_greenkey_uhash(
+        pc,
+        pyre_interpreter::executioncontext::current_is_being_profiled(),
+        code_ptr as u64,
+    )
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::PY_RECURSION_DEPTH is the
@@ -8263,6 +8265,12 @@ fn eval_with_jit_inner(
     // A traced frame runs interpreted: `call_trace` / `return_trace` /
     // `bytecode_trace` are driven from the plain eval path, so a frame the JIT
     // takes over reports no events at all.
+    //
+    // Narrowing this to line tracing alone is not enough on its own: measured,
+    // a profiled frame that reaches the portal still does not compile, and the
+    // calls a compiled trace inlines and the builtins it folds stop reporting
+    // (`call` 1042 against CPython's 3001, `c_call` 2085 against 6001). Both
+    // have to be answered before the profile half can be let through.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
         return frame.execute_frame_plain(resume);
     }
