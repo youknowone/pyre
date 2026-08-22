@@ -24862,11 +24862,13 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn bytearray_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__repr__")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let class_name = crate::typedef::r#type(args[0])
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-        .unwrap_or("bytearray");
+    // `bytearray_repr` names the receiver's type through `_PyType_Name`, so a
+    // subclass whose name is qualified reports only its own component --
+    // unlike `set_repr`, which spells the whole `tp_name`.
+    let class_name = crate::gateway::short_type_name(args[0]);
     Ok(w_str_new_managed(&crate::display::bytearray_repr_string(
-        data, class_name,
+        data,
+        &class_name,
     )))
 }
 
