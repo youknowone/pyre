@@ -14013,6 +14013,61 @@ pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_int_new(try_hash_value(args[0])?))
 }
 
+/// `tupleobject.py W_AbstractTupleObject.descr_hash` — the hash a tuple has by
+/// virtue of its contents, with no `__hash__` lookup on the receiver.
+///
+/// Separate from [`try_hash_value`] because the two answer different
+/// questions.  `hash(x)` must honour whatever `type(x)` says, override
+/// included; `tuple.__hash__(x)` names the base implementation, and running
+/// the override there would return the subclass's answer for a call that
+/// asked for the base's — and loop outright when the override calls back, as
+/// the memoising `def __hash__(self, hash=tuple.__hash__)` idiom does.
+pub(crate) fn tuple_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        // CPython 3.14 `tuple_hash`: a successful aggregate hash is
+        // retained on the tuple.  Check before the recursive stack guard
+        // so repeated dict probes do not touch the elements at all.
+        if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+            return Ok(hash);
+        }
+        // The element walk is the one recursive step here, and the scalar
+        // fast path in `try_hash_value` no longer reaches the call protocol's
+        // own guard, so a nest deep enough to exhaust the C stack has to be
+        // caught on the way down.
+        crate::stack_check::stack_check()?;
+        if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+            return Ok(hash);
+        }
+        // `try_hash_value` runs each element's `__hash__`, which may
+        // collect; `obj` is a raw local re-read in the loop and after it, so
+        // pin it on the shadow stack.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let mut hashes = Vec::with_capacity(n);
+        for i in 0..(n as i64) {
+            if let Some(item) =
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
+            {
+                hashes.push(try_hash_value(item)?);
+            }
+        }
+        let hash = _hash_tuple_xx(&hashes);
+        pyre_object::w_tuple_set_cached_hash(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            hash,
+        );
+        Ok(hash)
+    }
+}
+
+/// `setobject.py W_FrozensetObject.descr_hash` — the frozenset counterpart of
+/// [`tuple_structural_hash`], and separate for the same reason.
+pub(crate) fn frozenset_structural_hash(obj: PyObjectRef) -> i64 {
+    frozenset_hash_from_storage(obj)
+}
+
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
@@ -14103,41 +14158,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
-            // CPython 3.14 `tuple_hash`: a successful aggregate hash is
-            // retained on the tuple.  Check before the recursive stack guard
-            // so repeated dict probes do not touch the elements at all.
-            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
-                return Ok(hash);
-            }
-            // The element walk is the one recursive step here, and the scalar
-            // fast path above no longer reaches the call protocol's own
-            // guard, so a nest deep enough to exhaust the C stack has to be
-            // caught on the way down.
-            crate::stack_check::stack_check()?;
-            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
-                return Ok(hash);
-            }
-            // `try_hash_value` runs each element's `__hash__`, which may
-            // collect; `obj` is a raw local re-read in the loop and after it, so
-            // pin it on the shadow stack.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..(n as i64) {
-                if let Some(item) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
-                {
-                    hashes.push(try_hash_value(item)?);
-                }
-            }
-            let hash = _hash_tuple_xx(&hashes);
-            pyre_object::w_tuple_set_cached_hash(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                hash,
-            );
-            return Ok(hash);
+            return tuple_structural_hash(obj);
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
