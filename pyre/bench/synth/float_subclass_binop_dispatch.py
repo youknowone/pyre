@@ -196,6 +196,56 @@ def warm_then_swap_store_attr(n):
     return type(holder.x).__name__
 
 
+# The same three storage paths on the float side. The value's exact class must
+# survive the store: a `LiarFloat` written through a warmed-up float store must
+# read back as `LiarFloat`, not as `float`.
+def warm_then_swap_store_subscr_float(n):
+    lst = [0.0]
+    for a in [0.0] * n + [LiarFloat(7.0)]:
+        lst[0] = a
+    return type(lst[0]).__name__
+
+
+def warm_then_swap_newlist_float(n):
+    out = None
+    for a in [0.0] * n + [LiarFloat(7.0)]:
+        out = [a]
+    return type(out[0]).__name__
+
+
+def warm_then_swap_store_attr_float(n):
+    holder = Slotted()
+    for a in [0.0] * n + [LiarFloat(7.0)]:
+        holder.x = a
+    return type(holder.x).__name__
+
+
+# Cold start on the storage side: the subclass is the value from the first
+# iteration, so the unboxed-strategy gates must decline on the recorded value
+# rather than rely on the `w_class` pin to reject a later arrival. An unboxed
+# int/float slot stores the raw payload, so a fold here reads back as `int` /
+# `float` instead of the subclass.
+def store_subscr_cold_subclass(n):
+    lst = [0]
+    for _ in range(n):
+        lst[0] = LiarInt(7)
+    return type(lst[0]).__name__
+
+
+def store_attr_cold_subclass(n):
+    holder = Slotted()
+    for _ in range(n):
+        holder.x = LiarInt(7)
+    return type(holder.x).__name__
+
+
+def store_attr_cold_subclass_float(n):
+    holder = Slotted()
+    for _ in range(n):
+        holder.x = LiarFloat(7.0)
+    return type(holder.x).__name__
+
+
 # `truth_int` reaches the same hole from the branch side rather than the value
 # side: `POP_JUMP_IF_*` and the short-circuit operators read the truth of a
 # payload the `GUARD_CLASS INT` admits, so a `__bool__` override on a zero-payload
@@ -216,6 +266,20 @@ def warm_then_swap_truth_and(n):
     return out
 
 
+# Cold start: the trace records on the subclass from the very first iteration
+# rather than meeting it after warming up on exact ints. The fold has to decline
+# on the *recorded* operand — pinning `w_class` only rejects a subclass that
+# arrives later, and the walk is the authoritative executor, so a payload-folded
+# truth here is the answer the program returns. `LiarBool(0)` is falsy by payload
+# and true by `__bool__`, so the two answers differ.
+def truth_cold_subclass(n):
+    hits = 0
+    for a in [LiarBool(0)] * n:
+        if a:
+            hits += 1
+    return hits
+
+
 def truth_bool_call_control(n):
     out = None
     for a in [0] * n + [LiarBool(0)]:
@@ -228,6 +292,13 @@ print(warm_then_swap_compare_float(N))
 print(warm_then_swap_store_subscr(N))
 print(warm_then_swap_newlist(N))
 print(warm_then_swap_store_attr(N))
+print(warm_then_swap_store_subscr_float(N))
+print(warm_then_swap_newlist_float(N))
+print(warm_then_swap_store_attr_float(N))
 print(warm_then_swap_truth_if(N))
 print(warm_then_swap_truth_and(N))
+print(store_subscr_cold_subclass(N))
+print(store_attr_cold_subclass(N))
+print(store_attr_cold_subclass_float(N))
+print(truth_cold_subclass(N))
 print(truth_bool_call_control(N))

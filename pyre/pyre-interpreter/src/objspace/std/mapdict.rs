@@ -3404,7 +3404,7 @@ fn box_value(typ: UnboxType, val: i64) -> PyObjectRef {
 ///
 /// # Safety
 /// `w_value` must point to a live object.
-unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
+pub unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
     if unsafe { pyre_object::is_bool(w_value) } || !unsafe { pyre_object::is_int(w_value) } {
         return false;
     }
