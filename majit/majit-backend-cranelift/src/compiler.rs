@@ -9412,13 +9412,25 @@ impl CraneliftBackend {
         let call_conv = self.module.target_config().default_call_conv;
         // The body uses CallConv::Tail so it can `return_call_indirect` to
         // another body's entry — `assembler.py closing_jump` raw
-        // `JMP imm(target)` parity.  The host (Rust) caller cannot speak
-        // Tail ABI (it clobbers AppleAarch64 callee-saves x19-x28/x29), so a
-        // separate `trace_N_entry` wrapper carrying `default_call_conv` is
-        // declared alongside the body and forwards the jitframe pointer to
-        // the body via `call_indirect`.  Wrapper is what host code calls
+        // `JMP imm(target)` parity.  A separate `trace_N_entry` wrapper
+        // carrying `default_call_conv` is declared alongside it and forwards
+        // the jitframe pointer via `call_indirect`, because the pinned
+        // register `enable_pinned_reg` hands the JIT is NOT callee-saved in
+        // Cranelift and IS callee-saved under AAPCS: something has to park the
+        // host's value across the run.  Wrapper is what host code calls
         // (`CompiledLoop.code_ptr` / `LoopTargetEntry.code_ptr`); body is
         // what in-code dispatch tail-calls (`LoopTargetDescr.ll_loop_code`).
+        //
+        // Not because Tail trashes the callee-saved set: `get_regs_clobbered_by_call`
+        // gives `(Tail, true)` — the EXCEPTION path, which emits no exception
+        // tables here — `ALL_CLOBBERS`, while an ordinary Tail call falls to
+        // `DEFAULT_AAPCS_CLOBBERS` and preserves x19-x28 like any other.  So
+        // the hop is cheap, and measured as emitted it is 13 aarch64
+        // instructions (52 bytes): 4 memory ops over x19 and the fp/lr frame
+        // record, no callee-save block, no fp saves.  An instruction count is
+        // an upper bound on a superscalar core and not a measured cost, but it
+        // bounds this entry at a few nanoseconds — not somewhere to look for
+        // entry overhead.  `MAJIT_DUMP_CLIF` prints it as `[jit][disasm-entry]`.
         let body_call_conv = cranelift_codegen::isa::CallConv::Tail;
 
         let mut sig = Signature::new(body_call_conv);
@@ -15424,6 +15436,13 @@ impl CraneliftBackend {
             self.func_ctx = wrapper_ctx;
         }
         let mut wrapper_compile_ctx = Context::for_function(wrapper_func);
+        if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            // The body's dump above shows what the trace costs; this one shows
+            // what reaching it costs. The wrapper's own conv is the host's, and
+            // the body's is `Tail`, so whatever the two conventions disagree
+            // about is emitted HERE and is paid once per compiled entry.
+            wrapper_compile_ctx.set_disasm(true);
+        }
         if let Err(e) = self
             .module
             .define_function(entry_id, &mut wrapper_compile_ctx)
@@ -15443,6 +15462,18 @@ impl CraneliftBackend {
             .compiled_code()
             .map(|code| code.code_info().total_size as usize)
             .unwrap_or(0);
+        if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            // Bytes and not just the text: on a fixed-width instruction set the
+            // size IS the instruction count, so the entry price of the ABI hop
+            // is readable without parsing the disassembly.
+            eprintln!("[jit][code-size] trace_id={trace_id} wrapper_bytes={wrapper_code_bytes}");
+            if let Some(text) = wrapper_compile_ctx
+                .compiled_code()
+                .and_then(|code| code.vcode.as_deref())
+            {
+                eprintln!("[jit][disasm-entry] trace_id={trace_id}\n{text}");
+            }
+        }
         self.module.clear_context(&mut wrapper_compile_ctx);
 
         self.module.finalize_definitions().unwrap();

@@ -147,8 +147,8 @@ cover the condition they diagnose.
 
 ### `MAJIT_DUMP_CLIF`
 
-- Read sites: 2 — `majit/majit-backend-cranelift/src/compiler.rs`
-- Accessor: read inline in `do_compile()`, at both sites
+- Read sites: 4 — `majit/majit-backend-cranelift/src/compiler.rs`
+- Accessor: read inline in `do_compile()`, at all four sites — two for the trace body, two for the host-callable entry wrapper
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
