@@ -15,7 +15,7 @@
 use indexmap::{IndexMap, IndexSet};
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
@@ -254,6 +254,12 @@ pub struct CompileResult<M> {
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
+    /// `compile.py must_compile` reads the failing GUARD_VALUE operand off the
+    /// deadframe with `cpu.get_value_direct(deadframe, tp, index)`. The
+    /// deadframe's live range ends inside the run, so the read happens where
+    /// `status` is read and the word travels out on this result, keeping it
+    /// per-failure the way upstream's deadframe read is.
+    pub guard_value_operand: Option<i64>,
 }
 
 /// Raw (lightweight) result from running compiled code.
@@ -282,6 +288,8 @@ pub struct RawCompileResult<M> {
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
+    /// Failing GUARD_VALUE operand read while the raw frame is live.
+    pub guard_value_operand: Option<i64>,
 }
 
 /// Terminal exit layout for a FINISH or JUMP op.
@@ -3279,9 +3287,20 @@ fn alloc_fail_index() -> u32 {
 //   - bits 1..3      : `ST_TYPE_MASK` — `TY_NONE` / `TY_INT` / `TY_REF` /
 //                      `TY_FLOAT`, set by `make_a_counter_per_value` to
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
-//   - bits 3..end    : jitcounter hash (when TY_NONE) or guard_value
-//                      failarg index (when TY_INT/REF/FLOAT), accessed via
-//                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
+//   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
+//                      index (when TY_INT/REF/FLOAT), read as
+//                      `status >> STATUS_SHIFT` masked with
+//                      `STATUS_SHIFT_MASK` (`compile.py
+//                      AbstractResumeGuardDescr.ST_SHIFT` /
+//                      `ST_SHIFT_MASK`).
+//
+// What the value-slot index NAMES is backend-specific: dynasm records a
+// deadframe slot, which only a caller still holding the deadframe can read, so
+// it arrives at `must_compile_with_values` as `guard_value_operand`; cranelift
+// and wasm record a fail-argument position and supply no operand, leaving that
+// function to index `fail_values`. See the same note on
+// `guard_value_counter_slot` in majit-backend's `resume_guard_descr.rs`, which
+// this block mirrors.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
 #[allow(dead_code)]
 pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;

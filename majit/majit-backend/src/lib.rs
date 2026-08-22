@@ -89,8 +89,8 @@ pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
     STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
-    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed, push_vector_info,
-    reset_fail_index_counter,
+    build_vector_info_chain, flatten_vector_info, guard_value_counter_slot,
+    make_resume_guard_descr_typed, push_vector_info, reset_fail_index_counter,
 };
 pub use resume_value::{
     FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
@@ -133,6 +133,8 @@ pub struct RawExecResult {
     pub is_exit_frame_with_exception: bool,
     /// compile.py: ResumeGuardDescr.status at guard failure time.
     pub status: u64,
+    /// Failing GUARD_VALUE operand read from its recorded deadframe slot.
+    pub guard_value_operand: Option<i64>,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
     /// `compile.py:701`) — the runtime descr Arc owning this exit.
     /// Always set: routes through `Backend::get_latest_descr_arc`, so
@@ -1253,25 +1255,35 @@ pub struct JitCellToken {
     pub generation: Cell<i64>,
     /// `history.py JitCellToken.retraced_count` parity slot.
     ///
-    /// RPython packs two pieces of state into this u-int:
-    ///   * bit 0 = `FORCE_BRIDGE_SEGMENTING` flag.
-    ///     `compile.py _trace_and_compile_from_bridge` checks
+    /// `history.py JitCellToken.FORCE_BRIDGE_SEGMENTING = 1 # stored in
+    /// retraced_count` says the field is packed, and `history.py`
+    /// offers a shifting `get_retraced_count` / `set_retraced_count` pair
+    /// to hold that packing.  Neither accessor has a caller in the
+    /// vendored tree: every live read and write is on the raw field.
+    ///   * `unroll.py optimize_bridge` compares `cell_token.retraced_count`
+    ///     itself against `retrace_limit` and `+= 1`s it.
+    ///   * `unroll.py disable_retracing_if_max_retrace_guards`
+    ///     assigns it `sys.maxint` whole.
+    ///   * `compile.py _trace_and_compile_from_bridge` reads
     ///     `loop_token.retraced_count & FORCE_BRIDGE_SEGMENTING` to
     ///     decide whether the next bridge from this loop should
-    ///     segment trace at the guard.  Set at `pyjitpl.py:2833`.
-    ///   * bits 1+ = retrace count (`history.py:464-468
-    ///     get_retraced_count() = retraced_count >> 1` /
-    ///     `set_retraced_count(value) = (value << 1) | (current & 1)`),
-    ///     compared by `unroll.py` against `retrace_limit`
-    ///     to disable repeated retracing of the same loop.
+    ///     segment trace at the guard; `pyjitpl.py prepare_trace_segmenting` ORs it in.
     ///
-    /// Pyre's flow is RPython-orthodox: the retrace count rides on
-    /// `JitCellToken.retraced_count` (read via `get_retraced_count`,
-    /// updated via `set_retraced_count` at unroll-pass boundaries —
-    /// `pyjitpl.rs:7978` etc.); `FORCE_BRIDGE_SEGMENTING` is set
-    /// in `MetaInterp::blackhole_trace_too_long_slow` and read by
-    /// `MetaInterp::start_retrace_from_guard` (`pyjitpl.rs:8772-
-    /// 8784`), mirroring `pyjitpl.py:2833` / `compile.py:729`.
+    /// So bit 0 is at once the flag and the count's low bit, and two
+    /// consequences of that are load-bearing.  `sys.maxint` is odd, so
+    /// disabling retracing on a guard-heavy loop also turns
+    /// `FORCE_BRIDGE_SEGMENTING` on and every later bridge off that loop
+    /// traces with `force_finish_trace`.  The `+= 1` consumes the flag
+    /// bit rather than stepping over it, clearing it again.
+    ///
+    /// Pyre keeps the count on `JitCellToken.retraced_count` (read via
+    /// `get_retraced_count`, updated via `set_retraced_count` at
+    /// unroll-pass boundaries), and both accessors are the raw field so
+    /// those two consequences carry over.  `FORCE_BRIDGE_SEGMENTING` is
+    /// set in `MetaInterp::blackhole_trace_too_long_slow` and read by
+    /// `MetaInterp::start_retrace_from_guard`, mirroring
+    /// `pyjitpl.py prepare_trace_segmenting` /
+    /// `compile.py _trace_and_compile_from_bridge`.
     ///
     /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
     /// `warmstate.rs` is NOT a duplicate of this bit — it mirrors
@@ -1290,9 +1302,7 @@ pub struct JitCellToken {
     ///
     /// Interior mutability via `Cell<u32>` mirrors RPython's
     /// attribute writes through `&JitCellToken`; the same
-    /// `unsafe impl Sync` covers it as `generation`.  Callers must
-    /// use the accessors (not `.get()` / `.set()` directly) to keep
-    /// the bit-packing invariant.
+    /// `unsafe impl Sync` covers it as `generation`.
     pub retraced_count: Cell<u32>,
     /// `history.py` `JitCellToken.target_tokens = None`, the class
     /// default, assigned a `list[TargetToken]` at exactly two sites:
@@ -1322,29 +1332,38 @@ pub struct JitCellToken {
 }
 
 impl JitCellToken {
-    /// `history.py` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
-    /// into `retraced_count`.  Set at `pyjitpl.py` (pyre:
-    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge
-    /// trace aborts without an inlinable function; read at
-    /// `compile.py:729` (pyre: `MetaInterp::start_retrace_from_guard`)
-    /// to decide whether the next bridge from this loop should
-    /// `force_finish_trace`.
+    /// `history.py` `FORCE_BRIDGE_SEGMENTING = 1` — bit 0 of
+    /// `retraced_count`.  Two writers set it: `pyjitpl.py` (pyre:
+    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge trace
+    /// aborts without an inlinable function, and
+    /// `unroll.py disable_retracing_if_max_retrace_guards`, whose
+    /// odd `sys.maxint` sentinel sets it as a side effect of disabling
+    /// retracing.  Read at `compile.py _trace_and_compile_from_bridge` (pyre:
+    /// `MetaInterp::start_retrace_from_guard`) to decide whether the
+    /// next bridge from this loop should `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
-    /// `history.py` `def get_retraced_count(self): return
-    /// self.retraced_count >> 1`.
+    /// The raw field, which is what `unroll.py optimize_bridge` reads: it
+    /// compares `cell_token.retraced_count` against `retrace_limit` and
+    /// increments it, never going through `history.py`'s
+    /// `get_retraced_count() = retraced_count >> 1`, which no caller in
+    /// the vendored tree uses.  The count is therefore unshifted and
+    /// shares bit 0 with `FORCE_BRIDGE_SEGMENTING`.
     #[inline]
     pub fn get_retraced_count(&self) -> u32 {
-        self.retraced_count.get() >> 1
+        self.retraced_count.get()
     }
 
-    /// `history.py` `def set_retraced_count(self, value):
-    /// self.retraced_count = (value << 1) | (self.retraced_count & 1)`.
-    /// Preserves the FORCE_BRIDGE_SEGMENTING bit.
+    /// The raw field, matching the two upstream writes:
+    /// `optimize_bridge`'s `cell_token.retraced_count += 1` and
+    /// `disable_retracing_if_max_retrace_guards`'s
+    /// `targeting_jitcell_token.retraced_count = sys.maxint` (`unroll.py`).  Both assign the whole word rather than going
+    /// through `history.py`'s flag-preserving `set_retraced_count`,
+    /// so writing the disable sentinel — odd, like `sys.maxint` — sets
+    /// `FORCE_BRIDGE_SEGMENTING`, and incrementing clears it.
     #[inline]
     pub fn set_retraced_count(&self, value: u32) {
-        let flag = self.retraced_count.get() & Self::FORCE_BRIDGE_SEGMENTING;
-        self.retraced_count.set((value << 1) | flag);
+        self.retraced_count.set(value);
     }
     pub fn new(number: u64) -> Self {
         JitCellToken {
@@ -2610,6 +2629,8 @@ pub trait Backend: Send {
         let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
+        let guard_value_operand =
+            guard_value_counter_slot(descr).map(|slot| self.get_value_direct(&frame, slot));
         let exit_arity = descr.fail_arg_types().len();
         let mut outputs = Vec::with_capacity(exit_arity);
         let mut typed_outputs = Vec::with_capacity(exit_arity);
@@ -2647,6 +2668,7 @@ pub trait Backend: Send {
             is_finish: descr.is_finish(),
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
+            guard_value_operand,
             descr_arc,
         }
     }
@@ -2828,7 +2850,7 @@ pub trait Backend: Send {
     /// without any addr→object lookup.  Pyre's bridge crosses native code
     /// through function pointers (`majit-backend-dynasm/src/lib.rs`
     /// `BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) ->
-    /// Option<i64>` and `BridgeFn = fn(*const i64, usize, usize) -> bool`)
+    /// Option<i64>` and the primitive-only `BridgeFn` callback)
     /// which can only carry primitive types, so the descr identity has to
     /// be transported as a raw `usize` (`descr_addr`) and recovered here
     /// via this method.
@@ -2861,6 +2883,14 @@ pub trait Backend: Send {
 
     /// Read an integer value from a dead frame at the given index.
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64;
+
+    /// `llmodel.py get_value_direct` — read the raw frame word at a
+    /// DEADFRAME SLOT, not at a fail-argument position. `get_int_value` maps
+    /// its index through `rd_locs` (`llmodel.py _decode_pos`); the
+    /// GUARD_VALUE counter slot `make_a_counter_per_value` records
+    /// (`regalloc.py consider_guard_value`) is a register/frame position of the
+    /// failed and generally has no fail-argument position at all.
+    fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64;
 
     /// Read a float value from a dead frame.
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64;
@@ -3813,6 +3843,54 @@ impl Drop for JittedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `unroll.py disable_retracing_if_max_retrace_guards` writes the raw
+    /// field — `targeting_jitcell_token.retraced_count = sys.maxint` — and
+    /// `sys.maxint` is odd, so a loop that carries more guards than
+    /// `max_retrace_guards` also comes out with `FORCE_BRIDGE_SEGMENTING` set.
+    /// That is the bit `compile.py _trace_and_compile_from_bridge` reads to
+    /// force-finish the loop's
+    /// bridges.
+    #[test]
+    fn disabling_retracing_also_arms_bridge_segmenting() {
+        let token = JitCellToken::new(1);
+        assert_eq!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "a fresh token starts with the segmenting bit clear",
+        );
+
+        token.set_retraced_count(u32::MAX);
+
+        assert_ne!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the disable sentinel arms bridge segmenting, as sys.maxint does",
+        );
+        assert_eq!(
+            token.get_retraced_count(),
+            u32::MAX,
+            "and the sentinel reads back whole, so retracing stays disabled",
+        );
+    }
+
+    /// `unroll.py optimize_bridge` reads and increments the same raw word, so the
+    /// increment walks over bit 0 instead of stepping past it.
+    #[test]
+    fn incrementing_the_retrace_count_consumes_the_segmenting_bit() {
+        let token = JitCellToken::new(2);
+        token
+            .retraced_count
+            .set(JitCellToken::FORCE_BRIDGE_SEGMENTING);
+
+        token.set_retraced_count(token.get_retraced_count() + 1);
+
+        assert_eq!(token.get_retraced_count(), 2);
+        assert_eq!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+        );
+    }
 
     #[test]
     fn loop_version_info_add_and_track() {

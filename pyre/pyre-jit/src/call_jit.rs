@@ -4105,8 +4105,19 @@ fn jit_ca_handle_guard_failure(
     raw_values_ptr: *const i64,
     num_values: usize,
     descr_addr: usize,
+    guard_value_operand: i64,
+    guard_value_operand_present: bool,
 ) -> bool {
-    if raw_values_ptr.is_null() || num_values == 0 {
+    // `compile.py AbstractResumeGuardDescr.handle_fail` has no live-value
+    // precondition: it runs `must_compile` for every reported failure. A
+    // GUARD_VALUE whose fail-argument vector is empty still has everything the
+    // hotness decision needs, because the operand it hashes travels separately
+    // in `guard_value_operand` (`compile.py make_a_counter_per_value` keys the
+    // counter on the failing value, not on a fail argument). Bailing on
+    // `num_values == 0` would leave such a guard without a counter tick, and so
+    // without a bridge, forever. Only a null pointer with a non-zero length is
+    // unusable — that pairing cannot be turned into a slice at all.
+    if raw_values_ptr.is_null() && num_values != 0 {
         return false;
     }
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
@@ -4127,7 +4138,13 @@ fn jit_ca_handle_guard_failure(
             return false;
         }
     }
-    let raw_values_input = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
+    // `from_raw_parts` requires a non-null, aligned pointer even for a zero
+    // length, and a backend with nothing to report may pass null.
+    let raw_values_input: &[i64] = if num_values == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) }
+    };
     let mut raw_values_vec = raw_values_input.to_vec();
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code
@@ -4160,6 +4177,7 @@ fn jit_ca_handle_guard_failure(
     let _raw_values_roots =
         ResumeDeadframeRoots::register(&mut raw_values_vec, deadframe_types.as_deref());
     let raw_values = raw_values_vec.as_slice();
+    let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);
 
     // This callback has no channel for the exception value carried by a
     // failing CALL_ASSEMBLER exception guard.  Compiling from its post-call
@@ -4173,9 +4191,12 @@ fn jit_ca_handle_guard_failure(
     // compile.py must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .must_compile_with_values(&descr_arc, raw_values, source_green_key)
+        driver.meta_interp_mut().must_compile_with_values(
+            &descr_arc,
+            raw_values,
+            guard_value_operand,
+            source_green_key,
+        )
     };
     // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
@@ -4278,6 +4299,7 @@ struct CaBridgeAttempt {
 fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     raw_values: &[i64],
+    guard_value_operand: Option<i64>,
 ) -> CaBridgeAttempt {
     if raw_values.is_empty() {
         return CaBridgeAttempt {
@@ -4293,9 +4315,12 @@ fn try_compile_ca_bridge(
     };
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .must_compile_with_values(descr_arc, raw_values, source_green_key)
+        driver.meta_interp_mut().must_compile_with_values(
+            descr_arc,
+            raw_values,
+            guard_value_operand,
+            source_green_key,
+        )
     };
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
         let terminal_declined = {
@@ -4452,7 +4477,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // Inert today (wasm host allocations never collect) but keeps the
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
-            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values);
+            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, None);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
                 // invocation would blackhole.  Invalidate callers so the next

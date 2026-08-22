@@ -1853,7 +1853,6 @@ impl Optimization for OptRewrite {
                 //         if info.is_null(): return
                 //         elif info.is_nonnull(): raise InvalidLoop(...)
                 //     return self.emit(op)
-                let obj = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
                 let obj_box = ctx.resolve_operand_operand_opt(&op.arg(0));
                 if let Some(info) = obj_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
                     if info.is_null() {
@@ -1863,14 +1862,14 @@ impl Optimization for OptRewrite {
                         return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
                     }
                 }
-                // rewrite.py postprocess_GUARD_ISNULL:
-                //     self.make_constant(op.getarg(0), CONST_NULL)
-                // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
-                if self.is_ref_typed(obj, ctx) {
-                    ctx.make_constant_arg(&op.arg(0), Value::Ref(majit_ir::GcRef(0)));
-                } else {
-                    ctx.make_constant_arg(&op.arg(0), Value::Int(0));
-                }
+                // rewrite.py `postprocess_GUARD_ISNULL` runs its
+                // `make_constant(op.getarg(0), CONST_NULL)` in
+                // `propagate_postprocess` below, for the same reason
+                // postprocess_GUARD_VALUE does: pre-emit it installs the Const
+                // forwarding before `emit_operation` resolves the guard's own
+                // arg0, and the guard reaches the backend as
+                // `guard_isnull(ConstPtr(NULL))` — a tautology that never fails,
+                // so the null the trace was specialized on was never re-checked.
                 OptimizationResult::PassOn
             }
             OpCode::GuardClass => self.optimize_guard_class(op, ctx),
@@ -2380,6 +2379,18 @@ impl Optimization for OptRewrite {
                 {
                     ctx.make_constant_arg(&op.arg(0), val);
                 }
+            }
+            // rewrite.py postprocess_GUARD_ISNULL
+            //     self.make_constant(op.getarg(0), CONST_NULL)
+            // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
+            OpCode::GuardIsnull => {
+                let obj = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+                let null = if self.is_ref_typed(obj, ctx) {
+                    majit_ir::Value::Ref(majit_ir::GcRef(0))
+                } else {
+                    majit_ir::Value::Int(0)
+                };
+                ctx.make_constant_arg(&op.arg(0), null);
             }
             _ => {}
         }
@@ -3075,6 +3086,53 @@ mod tests {
         assert!(
             matches!(result, OptimizationResult::InvalidLoop(_)),
             "guard_false(1) should abort as InvalidLoop, got {result:?}"
+        );
+    }
+
+    /// `rewrite.py` splits GUARD_ISNULL in two: `optimize_GUARD_ISNULL` emits the
+    /// guard, `postprocess_` runs `make_constant(op.getarg(0), CONST_NULL)`.
+    /// Running that `make_constant` in the forward half installs the Const
+    /// forwarding before `emit_operation` resolves the guard's own arg 0, and
+    /// the guard reaches the backend as `guard_isnull(ConstPtr(NULL))` — a
+    /// tautology that never fails, so the null the trace was specialized on is
+    /// never re-checked. Same shape as the GUARD_VALUE half of #210.
+    #[test]
+    fn guard_isnull_leaves_its_own_operand_unfolded() {
+        // p0 = inputarg(Ref); guard_isnull(p0); finish(p0)
+        let p0 = crate::history::test_support::TraceBuilder::new().input(majit_ir::Type::Ref, 0);
+        let ops = {
+            let mut guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
+            guard.pos.set(OpRef::void_op(0));
+            let mut finish = Op::new(OpCode::Finish, &[p0]);
+            finish.pos.set(OpRef::void_op(1));
+            vec![guard, finish]
+        };
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(OptRewrite::new()));
+        opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Ref]);
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+
+        let guard = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardIsnull)
+            .expect("GUARD_ISNULL must survive: nothing here proves the pointer null");
+        assert_eq!(
+            guard.arg(0).const_value(),
+            None,
+            "the guard the backend receives still has to carry the pointer it checks"
+        );
+
+        let finish = result
+            .iter()
+            .find(|o| o.opcode == OpCode::Finish)
+            .expect("the FINISH must survive");
+        assert_eq!(
+            finish.arg(0).const_value(),
+            Some(Value::Ref(majit_ir::GcRef(0))),
+            "postprocess_GUARD_ISNULL still has to hand every later op CONST_NULL"
         );
     }
 
