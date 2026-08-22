@@ -220,7 +220,7 @@ fn classify_inline_install_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// Off until the miscompile below is root-caused. See `inline_nonheader_enable`.
+/// Off while the wall-time case is unsettled. See `inline_nonheader_enable`.
 static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
@@ -345,14 +345,28 @@ fn inline_bridge_enabled() -> bool {
 /// Admit a region whose closing JUMP names a resumable LABEL that is not the
 /// loop header. `codegen` emits these by wrapping the entry dispatch in a
 /// `loop` the region branches back into, re-entering past that label's resume
-/// loader with the values already in locals — on fannkuch that is 16.3M of the
-/// 20.6M surviving cross-module crossings.
+/// loader with the values already in locals.
 ///
-/// ⛔ Off by default: the emitted shape is structurally valid and correct on the
-/// unit-test traces (`region_closing_at_a_non_header_label_*`), but on real IR
-/// it miscompiles — 47 `check.py` fixtures die identically with a corrupted Ref
-/// (`TypeError: '' object is not an iterator`). Not yet root-caused, so the
-/// accept condition below keeps declining unless a host opts in to debug it.
+/// The miscompile that first kept this off — 47 `check.py` fixtures dying with
+/// a corrupted Ref — was root-caused to a region attached to a guard in the
+/// peeled preamble, whose branch lands in a LABEL resume loader with the region
+/// body unreachable. `source_in_preamble` declines exactly that case, and with
+/// it in place the synthetic corpus is 437 pass / 1 jit-stats improvement under
+/// this flag, against 438 pass without it. Correctness is no longer the reason.
+///
+/// ⛔ Still off by default, now on wall time rather than on correctness.
+/// `not_header` declines on 81 corpus fixtures and admitting them removes 49.4M
+/// of their 257.3M cross-module crossings — 19.2%, 41 fixtures moved, none the
+/// wrong way. Timed instead of counted (min of 15 interleaved runs, startup
+/// floor subtracted) the same change buys 0.74x on
+/// `short_circuit_value_local_kept` and 0.67x on
+/// `short_circuit_boxed_int_cross_fn`, is flat on most, and costs 1.23x on
+/// `spectral_norm` — which sheds 99.7% of its crossings and still gets slower,
+/// because admitting a region also costs the owner a re-emission and taxes its
+/// fall-through path. Neither fixture that sets the wasm ratio ceiling gains at
+/// all: fannkuch declines every region earlier on `foreign_label` /
+/// `not_direct`, and `str_getitem_len_hot` sheds 24.5k of 120.0M. Defaulting
+/// this on wants an admission rule that tells those two populations apart.
 pub fn inline_nonheader_enable() {
     INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
 }
@@ -3455,8 +3469,8 @@ impl majit_backend::Backend for WasmBackend {
             } else if !resumes_at_loop_header && !inline_nonheader_enabled() {
                 // Resuming at the header lets the region `br` straight to the
                 // `loop`. Resuming at an earlier LABEL goes through the
-                // `loop`-wrapped dispatch, still opt-in
-                // (`inline_nonheader_enable`) while its cost is measured.
+                // `loop`-wrapped dispatch, which is correct but opt-in
+                // (`inline_nonheader_enable`) until it is worth its re-emission.
                 diag_bump(38);
                 decline("not_header");
             } else if let Some(mut candidate) = original_token
