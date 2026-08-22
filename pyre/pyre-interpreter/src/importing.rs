@@ -3138,6 +3138,12 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_ISOLATED.store(flags.isolated, Ordering::Relaxed);
     SYS_DEV_MODE.store(flags.dev_mode, Ordering::Relaxed);
     SYS_WARN_DEFAULT_ENCODING.store(flags.warn_default_encoding, Ordering::Relaxed);
+    // The filesystem codec is picked in `preconfig_read`, ahead of every
+    // import, so `os`'s own `_fscodec` closes over the legacy pair rather than
+    // the one `sys._enablelegacywindowsfsencoding` leaves it holding.
+    #[cfg(windows)]
+    crate::typedef::LEGACY_WINDOWS_FS_ENCODING
+        .store(flags.legacy_windows_fs_encoding, Ordering::Relaxed);
     SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
     SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);

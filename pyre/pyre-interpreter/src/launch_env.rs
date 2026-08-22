@@ -25,6 +25,10 @@ pub struct LaunchFlags {
     pub isolated: bool,
     pub dev_mode: bool,
     pub warn_default_encoding: bool,
+    /// PYTHONLEGACYWINDOWSFSENCODING, which no command-line option spells.
+    /// Read only on Windows, the only platform whose `PyPreConfig` carries it,
+    /// and left false everywhere else.
+    pub legacy_windows_fs_encoding: bool,
     /// `None` until [`finalize`] resolves it; a command line that named
     /// `-X utf8` carries that value through instead.
     pub utf8_mode: Option<i64>,
@@ -83,6 +87,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONUTF8",
     "PYTHONWARNDEFAULTENCODING",
+    "PYTHONLEGACYWINDOWSFSENCODING",
     "PYTHONWARNINGS",
     "PYTHONIOENCODING",
     "LC_ALL",
@@ -256,6 +261,17 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         flags.warn_default_encoding,
         "PYTHONWARNDEFAULTENCODING",
     );
+    // Read in `preconfig_read`, so it takes the same integer fold as the
+    // other variables there rather than the presence one: `=0` leaves the
+    // filesystem codec on the PEP 529 pair.
+    #[cfg(windows)]
+    {
+        flags.legacy_windows_fs_encoding = fold_int_flag(
+            &flags,
+            flags.legacy_windows_fs_encoding,
+            "PYTHONLEGACYWINDOWSFSENCODING",
+        );
+    }
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {

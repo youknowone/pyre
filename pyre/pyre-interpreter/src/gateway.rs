@@ -1612,6 +1612,51 @@ pub fn fsencode_os_str(name: &std::ffi::OsStr) -> Vec<u8> {
     }
 }
 
+/// A path argument the caller spelled as `bytes`, in the units the
+/// interpreter carries a name in.
+///
+/// `path_converter` decodes such an argument with `PyUnicode_DecodeFSDefault`
+/// and keeps only the wide string it produced, so the code page pair
+/// `sys._enablelegacywindowsfsencoding` installs is read here, at the
+/// boundary, and never again downstream: everything past this point — the
+/// stored `co_filename`, the `wide_path` each syscall takes — holds the one
+/// spelling a `str` argument already arrives in.  The two spellings coincide
+/// outside that mode, where the bytes are their own answer.
+pub fn fs_arg_bytes(data: Vec<u8>) -> Result<Vec<u8>, crate::PyError> {
+    #[cfg(windows)]
+    if crate::typedef::legacy_windows_fs_encoding() {
+        return crate::unicodehelper_win32::decode_code_page(
+            windows_sys::Win32::Globalization::CP_ACP,
+            &data,
+            "replace",
+            true,
+        )
+        .map(|(text, _)| text.as_bytes().to_vec());
+    }
+    Ok(data)
+}
+
+/// [`fs_arg_bytes`]'s other direction: a host name handed back to a caller
+/// that asked for its path in `bytes`, which each of those sites spells with
+/// `PyUnicode_EncodeFSDefault` over the name it read as wide.
+///
+/// Total, like [`fsencode_os_str`]: the name came from the host, and the
+/// substitution `replace` makes is the answer rather than a failure.  Only a
+/// Win32 error ends the encode, and there is no caller here to report one to,
+/// so the interpreter's own spelling stands in for it.
+pub fn fs_result_bytes(data: &[u8]) -> Vec<u8> {
+    #[cfg(windows)]
+    if crate::typedef::legacy_windows_fs_encoding()
+        && let Ok(bytes) = crate::unicodehelper_win32::encode_code_page_replace(
+            windows_sys::Win32::Globalization::CP_ACP,
+            &crate::typedef::fsdecode_wtf8_total(data),
+        )
+    {
+        return bytes;
+    }
+    data.to_vec()
+}
+
 /// [`fsencode_os_str`]'s other direction: the host name filesystem bytes
 /// spell, for a caller that has to hand them to an API taking an `OsStr`.
 pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
@@ -1763,7 +1808,7 @@ fn path_or_fd_w(
             // `bytearray` is now turned away by the same message every other
             // rejected type gets.
             (
-                pyre_object::bytesobject::w_bytes_data(obj).to_vec(),
+                fs_arg_bytes(pyre_object::bytesobject::w_bytes_data(obj).to_vec())?,
                 obj_slot,
                 -1,
             )
@@ -1845,7 +1890,7 @@ fn path_or_fd_w(
             // `__fspath__`; a `bytearray` is a readable buffer but not a path.
             if pyre_object::bytesobject::is_bytes(result) {
                 (
-                    pyre_object::bytesobject::w_bytes_data(result).to_vec(),
+                    fs_arg_bytes(pyre_object::bytesobject::w_bytes_data(result).to_vec())?,
                     result_slot,
                     -1,
                 )

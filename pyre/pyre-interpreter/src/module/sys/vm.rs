@@ -10,10 +10,6 @@ use crate::{
 use pyre_object::*;
 use std::sync::OnceLock;
 
-#[cfg(windows)]
-static LEGACY_WINDOWS_FS_ENCODING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 const GETSIZEOF_DOC: &str = "getsizeof(object [, default]) -> int\n\n\
 Return the size of object in bytes.";
 
@@ -3018,13 +3014,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "getfilesystemencoding",
         make_builtin_function_with_arity(
             "getfilesystemencoding",
-            |_| {
-                #[cfg(windows)]
-                if LEGACY_WINDOWS_FS_ENCODING.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(w_str_new("mbcs"));
-                }
-                Ok(w_str_new("utf-8"))
-            },
+            |_| Ok(w_str_new(crate::typedef::fs_encoding())),
             0,
         ),
     );
@@ -3037,13 +3027,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "getfilesystemencodeerrors",
         make_builtin_function_with_arity(
             "getfilesystemencodeerrors",
-            |_| {
-                #[cfg(windows)]
-                if LEGACY_WINDOWS_FS_ENCODING.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(w_str_new("replace"));
-                }
-                Ok(w_str_new(crate::typedef::FS_ERRORS))
-            },
+            |_| Ok(w_str_new(crate::typedef::fs_errors())),
             0,
         ),
     );
@@ -3059,16 +3043,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "DeprecationWarning",
                     1,
                 )?;
-                // `_PyUnicode_EnableLegacyWindowsFSEncoding` also re-runs
-                // `init_fs_codec`, so every path converter switches to
-                // mbcs/replace with it.  Here the flag reaches only the two
-                // getters.  Switching `gateway::fsencode` and
-                // `typedef::FS_ERRORS` as well is not enough on its own: pyre
-                // carries host names as WTF-8 through `fsencode_os_str` and
-                // `os_string_from_fs_bytes`, so the app-level converters and
-                // the host bridge have to change together or a name stops
-                // round-tripping between them.
-                LEGACY_WINDOWS_FS_ENCODING
+                // `_PyUnicode_EnableLegacyWindowsFSEncoding` re-runs
+                // `init_fs_codec`, so the flag moves the two conversions the
+                // codec names as well as the getters that report it:
+                // `gateway::fs_arg_bytes` for a path spelled as `bytes` and
+                // `gateway::fs_result_bytes` for a name reported back as one.
+                // A `str` path is untouched, as `path_converter` keeps the
+                // wide string it was given and asks no codec for it — measured
+                // at 3.14: `os.stat` still finds a name the code page cannot
+                // spell, while `os.listdir(b'.')` reports it as `b'?'`.
+                crate::typedef::LEGACY_WINDOWS_FS_ENCODING
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(w_none())
             },

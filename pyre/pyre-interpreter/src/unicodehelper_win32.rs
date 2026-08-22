@@ -7,7 +7,7 @@
 //! `win32_code_page_search_function` builds land here.
 
 use pyre_object::{PY_NULL, PyObjectRef};
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FLAGS, ERROR_NO_UNICODE_TRANSLATION,
 };
@@ -301,6 +301,59 @@ fn encode_fail() -> CodePageFail {
     }
 }
 
+/// One code point through `WideCharToMultiByte`, appended to `out`.
+///
+/// `Ok(false)` is the code page having no spelling for it, which is the error
+/// handler's business; `Err` is the system reporting anything else.  The walk
+/// is over code points rather than the code units behind them, so an astral
+/// character fails once instead of once per surrogate.
+fn encode_one(
+    code_page: u32,
+    flags: u32,
+    takes_default: bool,
+    ch: u32,
+    out: &mut Vec<u8>,
+) -> Result<bool, crate::PyError> {
+    let mut chars = [0u16; 2];
+    let charsize = if ch < 0x10000 {
+        chars[0] = ch as u16;
+        1
+    } else {
+        chars[0] = (0xD800 - (0x10000 >> 10) + (ch >> 10)) as u16;
+        chars[1] = (0xDC00 + (ch & 0x3FF)) as u16;
+        2
+    };
+    let mut used_default = 0i32;
+    let used_default_ptr = if takes_default {
+        &raw mut used_default
+    } else {
+        std::ptr::null_mut()
+    };
+    // 4 is the longest sequence any code page spells one character in.
+    let mut buffer = [0u8; 4];
+    let outsize = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            flags,
+            chars.as_ptr(),
+            charsize,
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+            std::ptr::null(),
+            used_default_ptr,
+        )
+    };
+    if outsize > 0 {
+        if used_default == 0 {
+            out.extend_from_slice(&buffer[..outsize as usize]);
+            return Ok(true);
+        }
+    } else if last_win32_error() != ERROR_NO_UNICODE_TRANSLATION {
+        return Err(win32_error());
+    }
+    Ok(false)
+}
+
 /// `encode_code_page_errors` — one character at a time, so the error handler
 /// sees the character that failed.
 fn encode_errors(
@@ -326,44 +379,9 @@ fn encode_errors(
     let mut out: Vec<u8> = Vec::with_capacity(code_points.len());
     let mut pos = 0usize;
     while pos < code_points.len() {
-        let ch = code_points[pos];
-        let mut chars = [0u16; 2];
-        let charsize = if ch < 0x10000 {
-            chars[0] = ch as u16;
-            1
-        } else {
-            chars[0] = (0xD800 - (0x10000 >> 10) + (ch >> 10)) as u16;
-            chars[1] = (0xDC00 + (ch & 0x3FF)) as u16;
-            2
-        };
-        let mut used_default = 0i32;
-        let used_default_ptr = if takes_default {
-            &raw mut used_default
-        } else {
-            std::ptr::null_mut()
-        };
-        // 4 is the longest sequence any code page spells one character in.
-        let mut buffer = [0u8; 4];
-        let outsize = unsafe {
-            WideCharToMultiByte(
-                code_page,
-                flags,
-                chars.as_ptr(),
-                charsize,
-                buffer.as_mut_ptr(),
-                buffer.len() as i32,
-                std::ptr::null(),
-                used_default_ptr,
-            )
-        };
-        if outsize > 0 {
-            if used_default == 0 {
-                out.extend_from_slice(&buffer[..outsize as usize]);
-                pos += 1;
-                continue;
-            }
-        } else if last_win32_error() != ERROR_NO_UNICODE_TRANSLATION {
-            return Err(win32_error());
+        if encode_one(code_page, flags, takes_default, code_points[pos], &mut out)? {
+            pos += 1;
+            continue;
         }
         let (replacement, newpos) = crate::type_methods::call_registered_encode_error_handler(
             errors,
@@ -399,6 +417,32 @@ fn encode_errors(
         pos = newpos;
     }
     Ok(out)
+}
+
+/// [`encode_code_page`] for a caller holding a name rather than a `str`
+/// object, under the one handler that never has to be shown the character it
+/// failed on: `replace` answers a `?` per code point, which is written here
+/// instead of being fetched from the error registry.
+pub fn encode_code_page_replace(code_page: u32, text: &Wtf8) -> Result<Vec<u8>, crate::PyError> {
+    let wide: Vec<u16> = text.encode_wide().collect();
+    if wide.is_empty() {
+        return Ok(Vec::new());
+    }
+    match encode_strict(code_page, &wide) {
+        Ok(bytes) => Ok(bytes),
+        Err(CodePageFail::NoTranslation) => {
+            let flags = encode_code_page_flags(code_page, Some("replace"));
+            let takes_default = uses_default_char(code_page);
+            let mut out: Vec<u8> = Vec::with_capacity(wide.len());
+            for point in text.code_points() {
+                if !encode_one(code_page, flags, takes_default, point.to_u32(), &mut out)? {
+                    out.push(b'?');
+                }
+            }
+            Ok(out)
+        }
+        Err(CodePageFail::Os(error)) => Err(error),
+    }
 }
 
 /// `PyUnicode_EncodeCodePage`.

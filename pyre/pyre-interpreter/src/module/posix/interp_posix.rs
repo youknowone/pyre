@@ -2318,7 +2318,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
     fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
         if bytes_mode {
-            pyre_object::bytesobject::w_bytes_from_bytes(name)
+            pyre_object::bytesobject::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(name))
         } else {
             crate::gateway::fsdecode_filename_bytes(name)
         }
@@ -5685,7 +5685,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     {
                         if let Ok(cwd) = host_os::current_dir() {
                             return Ok(pyre_object::w_bytes_from_bytes(
-                                cwd.as_os_str().as_encoded_bytes(),
+                                &crate::gateway::fs_result_bytes(
+                                    cwd.as_os_str().as_encoded_bytes(),
+                                ),
                             ));
                         }
                     }

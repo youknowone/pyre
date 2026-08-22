@@ -23618,6 +23618,48 @@ pub(crate) const FS_ERRORS: &str = if cfg!(windows) {
     "surrogateescape"
 };
 
+/// Whether `sys._enablelegacywindowsfsencoding` has been called.
+///
+/// `_PyUnicode_EnableLegacyWindowsFSEncoding` re-runs `init_fs_codec`, so the
+/// flag has to reach the conversions that codec names and not only the two
+/// `sys` getters reporting it: `gateway::fs_arg_bytes` and
+/// `gateway::fs_result_bytes`, the two points a path crosses between the
+/// caller's `bytes` and the units the interpreter carries a name in.
+#[cfg(windows)]
+pub(crate) static LEGACY_WINDOWS_FS_ENCODING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the filesystem codec is the ANSI code page pair rather than the
+/// PEP 529 one.  Always false off Windows, which has no legacy pair to name.
+pub(crate) fn legacy_windows_fs_encoding() -> bool {
+    #[cfg(windows)]
+    {
+        LEGACY_WINDOWS_FS_ENCODING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// The filesystem codec's name, which `sys.getfilesystemencoding` reports.
+pub(crate) fn fs_encoding() -> &'static str {
+    if legacy_windows_fs_encoding() {
+        "mbcs"
+    } else {
+        "utf-8"
+    }
+}
+
+/// [`FS_ERRORS`], or the `replace` the legacy code page codec is built with.
+pub(crate) fn fs_errors() -> &'static str {
+    if legacy_windows_fs_encoding() {
+        "replace"
+    } else {
+        FS_ERRORS
+    }
+}
+
 /// `unicodehelper.py fsdecode` — filesystem bytes to text.
 ///
 /// `surrogateescape` rescues every byte, so this only ever fails under
