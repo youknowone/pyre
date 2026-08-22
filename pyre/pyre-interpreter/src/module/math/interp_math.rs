@@ -30,24 +30,10 @@ pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
         // subclass falls to the ladder below; an inherited `int.__float__`
         // reproduces the payload.  The `float` arm stays ungated because the
         // conversion short-circuits on the layout and ignores an override.
-        if pyre_object::is_exact_builtin_instance(obj) {
-            if is_int(obj) {
-                return Ok(w_int_get_value(obj) as f64);
-            }
-            if is_long(obj) {
-                // A Python int is always finite, so a non-finite conversion means
-                // the magnitude exceeds f64 range — PyFloat_AsDouble raises here.
-                let v = jit_bigint_to_f64_or_nan(w_long_get_value(obj));
-                if !v.is_finite() {
-                    return Err(crate::PyError::overflow_error(
-                        "int too large to convert to float",
-                    ));
-                }
-                return Ok(v);
-            }
-            if is_bool(obj) {
-                return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
-            }
+        if pyre_object::is_exact_builtin_instance(obj)
+            && let Some(value) = crate::builtins::int_payload_as_f64(obj)
+        {
+            return value;
         }
     }
     // `__float__` is a type-only special-method lookup (`space.lookup`); an
