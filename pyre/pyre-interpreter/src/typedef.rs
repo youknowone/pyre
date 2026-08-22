@@ -8066,31 +8066,7 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // Both arms end at `fast2locals` (the proxy routes its reads
-            // back through the frame), which reads `locals_cells_stack_w`
-            // directly — so the virtualizable has to be materialized first or
-            // the mapping reports the values the frame last wrote out under
-            // correct keys.  `sys._getframe` materializes it with its own
-            // explicit `force_frame` (`module/sys/vm.rs getframe`), not as a
-            // side effect of the walk: `gettopframe_nohidden` forces only the
-            // VREF of the frame it starts from, which is not enough.  A frame
-            // reached through a traceback's `tb_frame` gets neither.
-            // The force materializes the fastlocals through a backend hook
-            // whose callee this crate cannot follow, so the frame is read back.
-            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-            crate::executioncontext::force_frame_before_locals_read(f);
-            let frame = unsafe { &mut *anchor.live() };
-            if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
-                || frame.has_active_hidden_locals()
-            {
-                return Ok(crate::pyframe::frame_locals_proxy::new(args[1]));
-            }
-            let w = frame.getdictscope()?;
-            Ok(if w.is_null() {
-                pyre_object::w_dict_new()
-            } else {
-                w
-            })
+            unsafe { &mut *f }.fget_getdictscope()
         },
         2,
     );
@@ -8224,23 +8200,7 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let frame = unsafe { &*f };
-            let lineno = frame.get_last_lineno();
-            if frame.get_w_f_trace().is_null() {
-                if lineno == -1 {
-                    return Ok(pyre_object::w_none());
-                }
-                return Ok(pyre_object::w_int_new(lineno as i64));
-            }
-            let lineno = if lineno == -1 {
-                frame
-                    .code()
-                    .first_line_number
-                    .map_or(-1, |n| n.get() as isize)
-            } else {
-                lineno
-            };
-            Ok(pyre_object::w_int_new(lineno as i64))
+            Ok(unsafe { &*f }.fget_f_lineno())
         },
         2,
     );

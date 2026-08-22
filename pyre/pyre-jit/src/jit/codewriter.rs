@@ -7943,18 +7943,23 @@ impl CodeWriter {
                 // slot's value live across the marker: co-live frame slots
                 // interfere structurally and the ordinary
                 // dependency/coalesce/color pass keeps them on distinct
-                // colors without a side-table interference oracle.  The
-                // portal reds (`PyPyJitDriver.reds = ['frame', 'ec']`) are
-                // excluded here: `filter_liveness_in_place` force-alives their
-                // dedicated post-color registers at each reachable marker.
-                // Injecting them into this earlier SSA liveness computation
-                // changes inline/cut decisions instead of merely preserving
-                // the jitdriver reds.
+                // colors without a side-table interference oracle.
+                //
+                // The portal reds (`PyPyJitDriver.reds = ['frame', 'ec']`) are
+                // args for that same reason: `liveness.py` forces a variable
+                // alive by naming it as a `-live-` arg in the first place,
+                // where `make_dependencies` sees it and the coloring accounts
+                // for it.  Re-adding their colors afterwards
+                // (`filter_liveness_in_place`) reproduces the marker contents
+                // but not the constraint.
+                //
                 // A closed block accepts no further operations; the next
                 // boundary (mergeblock / catch landing) opens the block the
                 // resume point belongs to.
                 let block_open = current_block.block().borrow().exits.is_empty();
                 let mut live_args: Vec<super::flow::SpaceOperationArg> = Vec::new();
+                live_args.push(frame_var.into());
+                live_args.push(ec_var.into());
                 for (i, lv) in current_state.locals_w.iter().enumerate() {
                     if let Some(super::flow::FlowValue::Variable(v)) = lv {
                         if v.kind == Some(Kind::Ref) && frame_liveness.is_local_live(py_pc, i) {

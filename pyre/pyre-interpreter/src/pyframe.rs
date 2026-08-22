@@ -1313,10 +1313,7 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         let _ =
             pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_filename_obj(w_code) });
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ =
-            pyre_object::gc_roots::pin_root(w_int_new(
-                unsafe { (*anchor.live()).fget_f_lineno() } as i64
-            ));
+        let _ = pyre_object::gc_roots::pin_root(unsafe { (*anchor.live()).fget_f_lineno() });
         let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_name_obj(w_code) });
         let summary = w_tuple_new(vec![
@@ -2884,6 +2881,38 @@ impl PyFrame {
         Ok(self.get_w_locals())
     }
 
+    /// pyframe.py fget_getdictscope — the `f_locals` getset.
+    ///
+    /// Both arms end at `fast2locals` (the proxy routes its reads back
+    /// through the frame), which reads `locals_cells_stack_w` directly — so
+    /// the virtualizable has to be materialized first or the mapping reports
+    /// the values the frame last wrote out under correct keys.
+    /// `sys._getframe` materializes it with its own explicit `force_frame`
+    /// (`module/sys/vm.rs getframe`), not as a side effect of the walk:
+    /// `gettopframe_nohidden` forces only the VREF of the frame it starts
+    /// from, which is not enough.  A frame reached through a traceback's
+    /// `tb_frame` gets neither.
+    /// The force materializes the fastlocals through a backend hook whose
+    /// callee this crate cannot follow, so the frame is read back.
+    pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let anchor = crate::eval::FrameAnchor::new(self);
+        crate::executioncontext::force_frame_before_locals_read(anchor.live());
+        let frame = unsafe { &mut *anchor.live() };
+        if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+            || frame.has_active_hidden_locals()
+        {
+            // The proxy keeps the frame past this call, so it stores the one
+            // read back after the force, not the pointer that went into it.
+            return Ok(frame_locals_proxy::new(anchor.live() as PyObjectRef));
+        }
+        let w = frame.getdictscope()?;
+        Ok(if w.is_null() {
+            pyre_object::w_dict_new()
+        } else {
+            w
+        })
+    }
+
     /// The mapping `locals()` hands back, and the implicit locals `exec` /
     /// `eval` run against (`_PyEval_GetFrameLocals`).
     ///
@@ -4119,21 +4148,27 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py fget_f_lineno
+    /// pyframe.py fget_f_lineno — the line currently executing.
+    ///
+    /// `None` when an untraced frame's line table yields no entry; the
+    /// `f_trace` test only selects the -1 fallback.
     #[inline]
-    pub fn fget_f_lineno(&self) -> isize {
+    pub fn fget_f_lineno(&self) -> PyObjectRef {
+        let lineno = self.get_last_lineno();
         if self.get_w_f_trace().is_null() {
-            self.get_last_lineno()
-        } else {
-            let f_lineno = self.getdebug_data().map_or(-1, |dd| dd.f_lineno);
-            if f_lineno == -1 {
-                self.code()
-                    .first_line_number
-                    .map_or(-1, |n| n.get() as isize)
-            } else {
-                f_lineno
+            if lineno == -1 {
+                return pyre_object::w_none();
             }
+            return pyre_object::w_int_new(lineno as i64);
         }
+        let lineno = if lineno == -1 {
+            self.code()
+                .first_line_number
+                .map_or(-1, |n| n.get() as isize)
+        } else {
+            lineno
+        };
+        pyre_object::w_int_new(lineno as i64)
     }
 
     /// `frameobject.c frame_lineno_set` — set the line the frame will
