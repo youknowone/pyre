@@ -149,6 +149,14 @@ pub fn invalid_cont_byte(b: u8) -> bool {
     (b as i8) >= -0x40
 }
 
+/// `_surrogate_bytes` (`rutf8.py`) — a three-byte lead pair that encodes a
+/// surrogate, which is the one pair `invalid_byte_2_of_3` admits only when
+/// the caller allows surrogates.
+#[inline]
+pub fn surrogate_bytes(ch1: u8, ch2: u8) -> bool {
+    ch1 == 0xED && ch2 > 0x9F
+}
+
 /// `_invalid_byte_2_of_3` (`rutf8.py`) — the second byte of a three-byte
 /// sequence, rejecting surrogate encodings unless the caller selected the
 /// `surrogatepass` path.

@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::pyobject::*;
-use pyre_object::rutf8::{invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte};
+use pyre_object::rutf8::{
+    invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte, surrogate_bytes,
+};
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -23874,8 +23876,18 @@ fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate
 /// Deriving it from `err_mode` here instead made both entry points take the
 /// `_codecs` answer, and the two do not agree — with it off, `ED A0` stops as
 /// an invalid continuation byte at 0..1 and `surrogatepass_errors` decodes a
-/// complete surrogate itself; with it on, the same bytes are an incomplete
-/// sequence at 0..2.
+/// complete surrogate itself.
+///
+/// `[3.14-spec]` The allowance covers a **complete** `ED A0..BF 80..BF` and
+/// nothing less.  `_str_decode_utf8_slowpath` reports the whole admitted lead
+/// pair when the sequence then fails, so `_codecs.utf_8_decode(b'\xed\xa0A',
+/// 'surrogatepass', True)` spans 0..2 there; `unicode_decode_utf8` has no
+/// `allow_surrogates` at all and spans 0..1, which is what a caller reads off
+/// `UnicodeDecodeError.start`/`.end`.  Measured on 3.14.0 and pypy3 over the
+/// 42 rows of `utf8_surrogatepass_error_span.py`: they differ on the six
+/// where the lead pair is a surrogate and the sequence does not complete,
+/// and agree everywhere else.  A truncated pair at the end of a non-final
+/// chunk is still retained, as both do.
 pub(crate) fn decode_utf8_with_errors_incremental(
     data: &[u8],
     err_mode: &str,
@@ -23943,7 +23955,15 @@ pub(crate) fn decode_utf8_with_errors_incremental(
                 if !final_ {
                     break;
                 }
-                run_err!(pos, pos + 2, "unexpected end of data");
+                // [3.14-spec] A pair only the surrogate allowance admits has
+                // to complete as a whole surrogate; with the third byte
+                // missing the answer is the one the allowance suspended.
+                let (end, reason) = if surrogate_bytes(ordch1, ordch2) {
+                    (pos + 1, "invalid continuation byte")
+                } else {
+                    (pos + 2, "unexpected end of data")
+                };
+                run_err!(pos, end, reason);
                 continue;
             } else if n == 4 {
                 // unicodehelper.py:435-459
@@ -23992,7 +24012,15 @@ pub(crate) fn decode_utf8_with_errors_incremental(
                 continue;
             }
             if invalid_cont_byte(ordch3) {
-                run_err!(pos, pos + 2, "invalid continuation byte");
+                // [3.14-spec] as above: the allowance covers a whole encoded
+                // surrogate, so a bad third byte falls back to the strict
+                // span rather than reporting two bytes as one bad sequence.
+                let end = if surrogate_bytes(ordch1, ordch2) {
+                    pos + 1
+                } else {
+                    pos + 2
+                };
+                run_err!(pos, end, "invalid continuation byte");
                 continue;
             }
             // 1110xxxx 10yyyyyy 10zzzzzz
