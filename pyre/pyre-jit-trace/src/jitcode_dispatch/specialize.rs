@@ -10826,20 +10826,19 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `math.isclose(a, b)` with both tolerances defaulted, in the shape
-/// [`walker_newbool_guarded`] recognizes: the result decides one branch and
-/// nothing else.
+/// `math.isclose(a, b)` with both tolerances defaulted.
 ///
 /// The residual costs a builtin dispatch, a keyword split and two
 /// `try_get_double` conversions to produce one of two prebuilt singletons.
 /// Emit instead the two unboxed operands and a pure elidable `CALL_I` into
-/// `jit_math_isclose_default`, whose truth the branch's own guard already
-/// pins.  That helper is total, so unlike the float folds this one needs no
-/// result guard of its own.
+/// `jit_math_isclose_default`, then let [`walker_newbool_guarded`] pin its
+/// truth and hand back the singleton.  That helper is total, so unlike the
+/// float folds this one needs no result guard of its own.
 ///
 /// A keyword argument (which would reach `bh_call_fn_kw`, not this shape), a
-/// third positional, a numeric subclass, a rebound callable, or a result that
-/// escapes the branch all retain the generic residual path (SAFE).
+/// third positional, a numeric subclass or a rebound callable all retain the
+/// generic residual path (SAFE).  Where the result goes afterwards is not a
+/// condition: `space.newbool` guards its `if b:` for every consumer.
 pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -10857,15 +10856,10 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
         return Ok(None);
     }
     // Settle the result's shape before emitting anything: everything below
-    // this point commits ops to the trace, and `walker_newbool_guarded` is
-    // what decides whether the branch's guard can stand in for the box.
-    if ctx.fbw_mode.snapshot_sym.is_null()
-        || dst_bank != 'r'
-        || !matches!(
-            classify_compare_box_use(ctx, op.pc, dst as u8, VablePublish::Tolerated),
-            CompareBoxUse::FeedsBranchOnly { .. }
-        )
-    {
+    // this point commits ops to the trace, so ask up front for the one
+    // condition `walker_newbool_guarded` needs — a resume image to land the
+    // truth guard's bail in, and a Ref destination for the singleton.
+    if ctx.fbw_mode.snapshot_sym.is_null() || dst_bank != 'r' {
         return Ok(None);
     }
     let (Some((a_is_int, a_value)), Some((b_is_int, b_value))) = (
@@ -10922,8 +10916,7 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
         .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(observed)));
     // The shape check above already established what this re-tests, so the
     // `None` arm is unreachable; keep it as the decline rather than assert.
-    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst as u8, dst_bank)?
-    else {
+    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst_bank)? else {
         return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
