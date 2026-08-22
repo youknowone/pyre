@@ -82,8 +82,8 @@ Kept as-is; listed for completeness.
   so it has no epic — delete it with the demand counter itself once the pool's
   working set is settled.
 - **Default-OFF experiments (0)** — every gate this bucket once held has had
-  its reader and its ON path deleted. `PYRE_FORITER_CALL_BODY` graduated: the
-  admission it gated is now unconditional. The live default-OFF arms left in
+  its reader and its ON path deleted, the last of them when the `LIST_APPEND`
+  admission it gated became unconditional. The live default-OFF arms left in
   §6a2 are wasm A/Bs, kept as the switched-off side of a one-binary
   comparison rather than as experiments.
 - **Config / value / master switches (~16)** — tuning, paths, modes; keep:
