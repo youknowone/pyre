@@ -1170,7 +1170,10 @@ fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
-        .map(|g| g.fail_arg_refs.len())
+        // A GUARD_VALUE whose compared operand is not one of its fail
+        // arguments spills that operand one slot past them, so the exit needs
+        // room for it (`collect_guards_and_vars`).
+        .map(|g| g.fail_arg_refs.len() + usize::from(g.counter_value_spill.is_some()))
         .max()
         .unwrap_or(0);
     1 + max_fail_args.max(inputargs.len())
@@ -1670,6 +1673,11 @@ pub struct GuardExit {
     pub fail_arg_refs: Vec<OpRef>,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// The GUARD_VALUE operand this exit spills past its fail arguments, for
+    /// `make_a_counter_per_value`. `None` when the guard is not a GUARD_VALUE,
+    /// or when its operand is already one of the fail arguments and so already
+    /// has a slot. See `counter_value_spill`.
+    pub counter_value_spill: Option<OpRef>,
     /// `op.descr` snapshot — passed through to `WasmFailDescr.meta_descr`
     /// so `get_latest_descr_arc` can return the canonical metainterp Arc
     /// (parity with dynasm/cranelift's `meta_descr` forwarding).
@@ -2021,17 +2029,49 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             // the (guard, failing value) pair. Without it a guard whose failing
             // value never repeats accumulates in one bucket and compiles
             // another bridge every `trace_eagerness` failures, without bound.
+            // The compared operand of a GUARD_VALUE is a promoted value the
+            // resume re-derives, so it is almost never one of the guard's own
+            // fail arguments: 0 of 16 on a synthetic polymorphic call site, 0
+            // of 21 on pyre/bench/fannkuch.py. Reading its slot out of the fail
+            // arguments alone therefore left the stamp unwritten on nearly
+            // every GUARD_VALUE, and an unstamped guard keeps the per-guard
+            // hash: every `trace_eagerness` failures compile another bridge for
+            // a value that never repeats, without bound
+            // (`foriter_make_function_body`: 47 bridges, 0 of them entered).
+            //
+            // `regalloc.py consider_guard_value` hands
+            // `all_reg_indexes[x.value]` — a deadframe slot, not a fail-argument
+            // position — so an operand the guard does not carry is still
+            // readable. This backend's slot space is the exit's own frame
+            // slots, so give such an operand one past the last fail argument
+            // and spill it there (`emit_guard_fail_args_spill`);
+            // `normal_frame_value_slots` reserves it and
+            // `resolve_guard_value_operand` reads it back through
+            // `get_value_direct`.
+            // Decided off the op alone, never off the descr: the emission
+            // (`emit_guard_fail_args_spill`) and the frame sizing
+            // (`normal_frame_value_slots`) both read the same predicate, and a
+            // guard whose descr is absent must still agree with them or the
+            // spill writes a slot the frame never reserved.
+            let counter_value_spill = counter_value_spill(op, &fail_args);
             if op.opcode == OpCode::GuardValue
                 && let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr())
             {
                 let arg0 = op.arg(0).to_opref();
-                if let Some(idx) = fail_args.iter().position(|r| *r == arg0) {
-                    let type_tag = match fail_arg_types.get(idx) {
+                let slot_type = match counter_value_spill {
+                    Some(operand) => Some((fail_args.len(), operand.ty())),
+                    None => fail_args
+                        .iter()
+                        .position(|r| *r == arg0)
+                        .map(|idx| (idx, fail_arg_types.get(idx).copied())),
+                };
+                if let Some((slot, ty)) = slot_type {
+                    let type_tag = match ty {
                         Some(Type::Ref) => majit_backend::STATUS_TY_REF,
                         Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
                         _ => majit_backend::STATUS_TY_INT,
                     };
-                    fd.make_a_counter_per_value(idx as u32, type_tag);
+                    fd.make_a_counter_per_value(slot as u32, type_tag);
                 }
             }
             guards.push(GuardExit {
@@ -2039,6 +2079,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 fail_arg_refs: fail_args,
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
+                counter_value_spill,
                 meta_descr,
             });
             fail_index += 1;
@@ -7450,6 +7491,31 @@ fn emit_guard_fail_args_spill(
         emit_resolve(sink, constants, value_types, arg_ref);
         sink.i64_store(mem64(offset));
     }
+    if let Some(operand) = counter_value_spill(op, &fail_args) {
+        let offset = FRAME_SLOT_BASE + fail_args.len() as u64 * SLOT_SIZE;
+        sink.local_get(0);
+        emit_resolve(sink, constants, value_types, operand);
+        sink.i64_store(mem64(offset));
+    }
+}
+
+/// The GUARD_VALUE operand `op` must spill past its fail arguments so
+/// `make_a_counter_per_value`'s slot is readable, or `None` when the operand
+/// already occupies a fail-argument slot (or is a constant, which the optimizer
+/// has already decided the guard on).
+///
+/// `collect_guards_and_vars` decides the same thing when it stamps the descr
+/// and `normal_frame_value_slots` reserves the slot; all three read it off the
+/// op so the three cannot drift apart.
+fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
+    if op.opcode != OpCode::GuardValue {
+        return None;
+    }
+    let arg0 = op.arg(0).to_opref();
+    if arg0 == OpRef::NONE || arg0.is_constant() || fail_args.contains(&arg0) {
+        return None;
+    }
+    Some(arg0)
 }
 
 fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {

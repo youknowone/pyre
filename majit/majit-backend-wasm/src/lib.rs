@@ -2849,6 +2849,24 @@ pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
     }
 }
 
+/// Exit slots to decode out of a returned frame for `fail_descr`.
+///
+/// Its fail arguments, plus the GUARD_VALUE operand the exit spills one slot
+/// past them when the guard does not carry it as a fail argument
+/// (`codegen::counter_value_spill`). That trailing word is what
+/// `resolve_guard_value_operand` reads back through `get_value_direct` for
+/// `make_a_counter_per_value`; it is never a fail argument, so it stays out of
+/// `fail_arg_types` and out of every typed exit decode.
+fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
+    let fail_args = fail_descr.fail_arg_types.len();
+    fail_descr
+        .meta_descr
+        .as_ref()
+        .and_then(|d| d.as_fail_descr())
+        .and_then(majit_backend::guard_value_counter_slot)
+        .map_or(fail_args, |slot| fail_args.max(slot + 1))
+}
+
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
@@ -2871,7 +2889,7 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let fail_index = unsafe { *frame } as u32;
     let fail_descr =
         global_fail_descr(fail_index).expect("invalid fail_index from in-guest CA callee frame");
-    let num_outputs = fail_descr.fail_arg_types.len();
+    let num_outputs = exit_slot_count(&fail_descr);
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
@@ -4449,7 +4467,7 @@ impl majit_backend::Backend for WasmBackend {
                 // this loop's own `fail_descrs`.
                 let fail_descr =
                     global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
-                let num_outputs = fail_descr.fail_arg_types.len();
+                let num_outputs = exit_slot_count(&fail_descr);
                 let raw_values: Vec<i64> = (0..num_outputs)
                     .map(|i| unsafe { *((items_base + fsb + i * 8) as *const i64) })
                     .collect();
@@ -4505,7 +4523,7 @@ impl majit_backend::Backend for WasmBackend {
             // Global fail-index space (see the CA-path resolution above).
             let fail_descr =
                 global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
-            let num_outputs = fail_descr.fail_arg_types.len();
+            let num_outputs = exit_slot_count(&fail_descr);
             let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
             DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
         }

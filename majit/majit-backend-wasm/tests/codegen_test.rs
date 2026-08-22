@@ -4914,3 +4914,88 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         "the region's back edge must rebind the header LABEL's Ref arg"
     );
 }
+
+/// `compile.py make_a_counter_per_value` keys a GUARD_VALUE's jitcounter on the
+/// pair (guard, failing value), and `regalloc.py consider_guard_value` hands it
+/// `all_reg_indexes[x.value]` — a deadframe slot, not a position inside the
+/// guard's fail arguments. The compared operand is a promoted value the resume
+/// re-derives, so it is almost never one of those fail arguments; an exit that
+/// can only name them leaves the stamp unwritten and the guard keeps the
+/// per-guard hash, compiling a fresh bridge every `trace_eagerness` failures
+/// for a value that never repeats.
+///
+/// So the exit publishes the operand itself, one slot past the last fail
+/// argument, which is what `resolve_guard_value_operand` reads back through
+/// `get_value_direct`.
+#[test]
+fn guard_value_spills_its_operand_past_the_fail_args() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(7)],
+            OpRef::int_op(1),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+            OpRef::int_op(2),
+        ),
+        // v1 is the compared operand and is deliberately NOT a fail argument,
+        // which is the ordinary shape for a promoted value.
+        make_guard(
+            OpCode::GuardValue,
+            &[OpRef::int_op(1), OpRef::const_int(999)],
+            &[OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    assert_eq!(
+        guards[0].counter_value_spill,
+        Some(OpRef::int_op(1)),
+        "the guard's own operand is not among its fail args, so the exit owns it"
+    );
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(read(0), 0, "the GUARD_VALUE is the exit taken");
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE),
+        100,
+        "slot 0 stays the guard's single fail argument"
+    );
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE + 8),
+        7,
+        "the compared operand lands one slot past the fail arguments"
+    );
+}
