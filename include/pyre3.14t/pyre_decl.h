@@ -610,6 +610,7 @@ PyAPI_FUNC(PyObject *) PySys_GetObject(const char *);
 /* cpyext/tupleobject.rs */
 PyAPI_FUNC(int) PyTuple_Check(PyObject *);
 PyAPI_FUNC(int) PyTuple_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyTuple_FromArray(PyObject *const *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyTuple_GetItem(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyTuple_GetSlice(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t);
@@ -632,6 +633,7 @@ PyAPI_FUNC(unsigned int) PyType_ClearCache(void);
 PyAPI_FUNC(int) PyType_Freeze(PyTypeObject *);
 PyAPI_FUNC(PyObject *) PyType_FromMetaclass(PyTypeObject *, PyObject *, PyType_Spec *, PyObject *);
 PyAPI_FUNC(PyObject *) PyType_FromModuleAndSpec(PyObject *, PyType_Spec *, PyObject *);
+PyAPI_FUNC(PyObject *) PyType_FromSlots(PySlot *);
 PyAPI_FUNC(PyObject *) PyType_FromSpec(PyType_Spec *);
 PyAPI_FUNC(PyObject *) PyType_FromSpecWithBases(PyType_Spec *, PyObject *);
 PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *, Py_ssize_t);

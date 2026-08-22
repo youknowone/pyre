@@ -162,6 +162,7 @@ STRUCTS = {
     "CPyCriticalSection": "PyCriticalSection",
     "CPyUnicodeWriter": "PyUnicodeWriter",
     "CPyDateTimeCAPI": "PyDateTime_CAPI",
+    "CPySlot": "PySlot",
 }
 
 
