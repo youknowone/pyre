@@ -760,26 +760,51 @@ pub unsafe fn getsockopt(
     unsafe { ws::getsockopt(s, level, option, value.cast(), len) }
 }
 
-/// `SIO_TCP_SET_ACK_FREQUENCY`, which is what `TCP_QUICKACK` names here.
-/// It is an ioctl rather than a socket option, so `setsockopt` answers
-/// `WSAENOPROTOOPT` for it and the flag has to travel through `WSAIoctl`.
-/// Nothing reads it back: WinSock exposes no query for the current setting.
+/// `WSAIoctl` with an input value and no output buffer, which is the shape
+/// every command `sock_ioctl` takes is issued in.  Answers the `DWORD` the
+/// call reports as returned, or `None` with `WSAGetLastError` set.
+///
+/// # Safety
+/// `value` must address `len` initialised bytes for the duration of the call.
 #[cfg(windows)]
-pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
+pub unsafe fn wsa_ioctl(
+    s: Socket,
+    code: u32,
+    value: *const core::ffi::c_void,
+    len: u32,
+) -> Option<u32> {
     let mut returned: u32 = 0;
-    unsafe {
+    let result = unsafe {
         ws::WSAIoctl(
             s,
-            ws::SIO_TCP_SET_ACK_FREQUENCY,
-            (&raw const flag).cast(),
-            core::mem::size_of::<libc::c_int>() as u32,
+            code,
+            value,
+            len,
             core::ptr::null_mut(),
             0,
             &mut returned,
             core::ptr::null_mut(),
             None,
         )
-    }
+    };
+    (result != ws::SOCKET_ERROR).then_some(returned)
+}
+
+/// `SIO_TCP_SET_ACK_FREQUENCY`, which is what `TCP_QUICKACK` names here.
+/// It is an ioctl rather than a socket option, so `setsockopt` answers
+/// `WSAENOPROTOOPT` for it and the flag has to travel through `WSAIoctl`.
+/// Nothing reads it back: WinSock exposes no query for the current setting.
+#[cfg(windows)]
+pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
+    let sent = unsafe {
+        wsa_ioctl(
+            s,
+            ws::SIO_TCP_SET_ACK_FREQUENCY,
+            (&raw const flag).cast(),
+            core::mem::size_of::<libc::c_int>() as u32,
+        )
+    };
+    if sent.is_some() { 0 } else { ws::SOCKET_ERROR }
 }
 
 #[cfg(unix)]
