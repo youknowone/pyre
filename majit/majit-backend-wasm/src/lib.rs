@@ -89,8 +89,11 @@ use std::sync::{Arc, Mutex};
 /// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
 /// published by another module, which no in-module `br` can reach; 52 = the
 /// region's source guard is in the peeled preamble, outside the `loop` its
-/// block is opened in.
-pub static BRIDGE_DIAG: [AtomicU64; 53] = [const { AtomicU64::new(0) }; 53];
+/// block is opened in; 53 = eligible but no trip callback is published to
+/// defer to; 54 = eligible, merge deferred until the bridge standing in for it
+/// has been entered `INLINE_TRIP_THRESHOLD` times; 55 = that trip fired and the
+/// merge was attempted.
+pub static BRIDGE_DIAG: [AtomicU64; 56] = [const { AtomicU64::new(0) }; 56];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -1751,6 +1754,127 @@ static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
 /// `JitCellToken` number.
 static FORCE_CA_TERMINAL_DECLINE: AtomicU64 = AtomicU64::new(0);
 
+/// `__indirect_function_table` index of the deferred-merge trip callback,
+/// published from pyre-jit the way [`CA_DEOPT_HELPER_SLOT`] is. Zero keeps
+/// every merge deferred forever, which is what a host without the callback
+/// wants: the bridge stays out of line and correct.
+static INLINE_TRIP_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// Entries into an out-of-line bridge before its merge into the owner is
+/// installed.
+///
+/// Merging costs the owner a re-emission — a whole module rebuild, tens of ms
+/// of compile time — and buys 7.78ns per cross-module crossing it removes.
+/// Nothing at admission time predicts how many that will be: every bridge is
+/// compiled at the same guard-failure threshold, and the crossings that decide
+/// the answer all happen afterwards and stay in-guest. So the bridge counts its
+/// own entries and asks for the merge here.
+///
+/// The count is calibrated against the two populations the corpus actually
+/// holds, because a bridge's entry count is a floor on the crossings its merge
+/// removes rather than an estimate of them — merging also brings the region's
+/// own external jumps in-module, which on `short_circuit_value_kept_stack` made
+/// three merges worth ten times their bridges' entries. Below this, a fixture's
+/// ENTIRE crossing budget is under a millisecond and no rebuild can pay back:
+/// `polymorphic_slot_retype` crosses 88.4k times in its whole run and
+/// `short_circuit_side_effects` 37.7k, and eagerly merging cost them 1.09x
+/// each. Above it, the hot bridges of `short_circuit_value_kept_stack` (106k to
+/// 532k entries) are worth 0.82x, and `str_getitem_len_hot`'s single region is
+/// worth 0.75x on 72.0M crossings removed.
+const INLINE_TRIP_THRESHOLD: u64 = 100_000;
+
+/// A merge that passed every inline check and is waiting on
+/// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
+struct PendingInline {
+    /// The loop this region merges into.
+    owner: Arc<JitCellToken>,
+    region: codegen::InlinedBridge,
+    /// The constants pool as it stood for the bridge's own compile.
+    /// `set_constants_pool` clears and refills the backend's pool per trace, so
+    /// by the time the callback fires it describes some unrelated trace.
+    constants: indexmap::IndexMap<u32, i64>,
+    /// The bridge module reads and writes this counter by address, so it must
+    /// not move while the module can still run.
+    _counter: Box<u64>,
+}
+
+thread_local! {
+    /// Deferred merges by id, the id being what the bridge module passes back.
+    static PENDING_INLINES: RefCell<HashMap<i64, PendingInline>> =
+        RefCell::new(HashMap::new());
+    /// Source of the ids above.
+    static NEXT_PENDING_INLINE_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+}
+
+thread_local! {
+    /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`], waiting to be
+    /// merged. The probe runs inside the bridge, so the host is between
+    /// `run_compiled` and its return and already holds the driver mutably; the
+    /// trip only appends here, and [`take_tripped_inlines`]'s caller installs
+    /// the merge once the trace has returned.
+    static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Note that a bridge has counted its way to the threshold. Called from
+/// compiled code, so it touches nothing but the list above.
+pub fn record_inline_trip(pending_id: i64) {
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
+}
+
+/// Take the merges whose bridges have tripped since the last call, for a caller
+/// with no compiled trace left on the stack.
+pub fn take_tripped_inlines() -> Vec<i64> {
+    TRIPPED_INLINES.with(|tripped| std::mem::take(&mut *tripped.borrow_mut()))
+}
+
+/// Record a deferred merge and describe the probe the bridge standing in for
+/// it carries. The counter is boxed rather than pulled from the module's own
+/// storage so it outlives the module: a merge that never trips leaves the
+/// entry alive for the process, which is the same lifetime the bridge itself
+/// has.
+fn register_pending_inline(
+    owner: Arc<JitCellToken>,
+    region: codegen::InlinedBridge,
+    constants: indexmap::IndexMap<u32, i64>,
+) -> codegen::InlineTripProbe {
+    let counter = Box::new(0u64);
+    let counter_addr = counter.as_ref() as *const u64 as usize as u32;
+    let pending_id = NEXT_PENDING_INLINE_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    PENDING_INLINES.with(|pending| {
+        pending.borrow_mut().insert(
+            pending_id,
+            PendingInline {
+                owner,
+                region,
+                constants,
+                _counter: counter,
+            },
+        )
+    });
+    codegen::InlineTripProbe {
+        counter_addr,
+        threshold: INLINE_TRIP_THRESHOLD,
+        trip_fn_ptr: inline_trip_helper_slot() as i64,
+        pending_id,
+    }
+}
+
+/// Host entry point publishing [`INLINE_TRIP_HELPER_SLOT`] (called from
+/// pyre-jit's `init_jit_hooks` with `wasm_jit_inline_trip as *const () as
+/// usize`, which on wasm32 is the function's table index).
+pub fn set_inline_trip_helper_slot(slot: u32) {
+    INLINE_TRIP_HELPER_SLOT.store(slot as u64, Ordering::Relaxed);
+}
+
+/// Current trip-callback table slot (0 = unset).
+fn inline_trip_helper_slot() -> u32 {
+    INLINE_TRIP_HELPER_SLOT.load(Ordering::Relaxed) as u32
+}
+
 /// Host entry point publishing [`CA_DEOPT_HELPER_SLOT`] (called from pyre-jit's
 /// `init_jit_hooks` with `wasm_ca_resume_deopt as *const () as usize`, which on
 /// wasm32 is the function's table index).
@@ -1992,6 +2116,135 @@ impl WasmBackend {
                 }
             }
         }
+    }
+
+    /// Merge a deferred region into its owner, for a bridge that has been
+    /// entered [`INLINE_TRIP_THRESHOLD`] times.
+    ///
+    /// The trip itself only queued the id ([`record_inline_trip`]); this runs
+    /// from the host once the trace has returned.
+    ///
+    /// A candidate that no longer qualifies — an invalidated owner, a loop that
+    /// has since taken a region for the same guard — is dropped rather than
+    /// retried: the bridge is already installed and correct, so the only thing
+    /// lost is the merge.
+    pub fn install_pending_inline(&mut self, pending_id: i64) {
+        let Some(pending) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&pending_id)) else {
+            return;
+        };
+        diag_bump(55);
+        let PendingInline {
+            owner,
+            region,
+            constants,
+            ..
+        } = pending;
+        self.install_inline_region(&owner, region, constants);
+    }
+
+    /// Rebuild `owner` with `region` merged into it. `false` leaves the owner
+    /// exactly as it was, for a caller that still has an out-of-line bridge to
+    /// fall back on.
+    fn install_inline_region(
+        &mut self,
+        owner: &JitCellToken,
+        mut region: codegen::InlinedBridge,
+        constants: indexmap::IndexMap<u32, i64>,
+    ) -> bool {
+        if owner.is_invalidated() {
+            diag_bump(50);
+            return false;
+        }
+        let Some(source_loop) = owner
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        else {
+            return false;
+        };
+        let Some(mut candidate) = source_loop.reemit.borrow().as_ref().cloned() else {
+            diag_bump(35);
+            return false;
+        };
+        let source_fail_index = region.source_fail_index;
+        if candidate
+            .inlined_bridges
+            .iter()
+            .any(|r| r.source_fail_index == source_fail_index)
+        {
+            diag_bump(36);
+            return false;
+        }
+        // Re-decided here rather than carried: the candidate may have taken
+        // more regions since, and the placement depends on them.
+        region.outside_loop =
+            codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
+                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+        if region.outside_loop {
+            diag_bump(52);
+        }
+        candidate.inlined_bridges.push(region);
+        let mut merged_ops = candidate.ops.clone();
+        for region in &candidate.inlined_bridges {
+            merged_ops.extend(region.ops.iter().cloned());
+        }
+        candidate.constants = constants;
+        candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
+        candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
+        candidate.nursery = nursery_alloc_params(&merged_ops);
+        // The merged region supersedes the bridge's own dispatch cell. Remove
+        // it before reemit so the fresh array cannot replay a contradictory
+        // slot — the bridge on the stack right now finishes its pass either
+        // way, and nothing enters it again.
+        let source_cells_base = source_loop.bridge_cells_base.get();
+        let old_bridge_slot = source_loop
+            .bridge_slots
+            .borrow_mut()
+            .remove(&source_fail_index);
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if source_cells_base != 0 {
+            let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
+            unsafe { core::ptr::write(cell, 0) };
+        }
+        // Eligibility IS the emission: `reemit_loop` runs the same
+        // `build_wasm_module` over the same candidate, and nothing it does
+        // before that call mutates state a failure would have to unwind — it
+        // reads the fail-index base and allocates a cell array that is dropped
+        // on the error path. So install directly and let the build answer,
+        // instead of asking it once as a trial and once for real.
+        let old_inputs = source_loop.reemit.replace(Some(candidate));
+        match self.reemit_loop(owner) {
+            Ok(()) => {
+                diag_bump(31);
+                diag_bump(32);
+                // The region runs from the owner's module, so its
+                // `GUARD_NOT_INVALIDATED` reads the owner's root flag. Name that
+                // as this compile's generation, or the quasi-immutable
+                // dependencies registered afterwards attach to a flag the merged
+                // code never loads and a mutated field leaves the fold in place.
+                owner.record_bridge_invalidation_flag(owner.invalidation_flag());
+                return true;
+            }
+            Err(error) => {
+                source_loop.reemit.replace(old_inputs);
+                if let Some(slot) = old_bridge_slot {
+                    source_loop
+                        .bridge_slots
+                        .borrow_mut()
+                        .insert(source_fail_index, slot);
+                    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                    if source_cells_base != 0 {
+                        let cell = (source_cells_base as usize + source_fail_index as usize * 4)
+                            as *mut u32;
+                        unsafe { core::ptr::write(cell, slot) };
+                    }
+                }
+                record_inline_trial_error(&error);
+                classify_inline_install_error(&error);
+            }
+        }
+        let _ = source_cells_base;
+        false
     }
 
     /// Rebuild a loop module and install it into its original shared-table
@@ -2857,6 +3110,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_entry_arity: None,
             bridge_param_dispatch: bridge_params_enabled(),
             trace_entry_census,
+            inline_trip: None,
             // A real loop's JUMP is a local back-edge `br`; an entry bridge
             // tail-calls its target loop and is deliberately not re-emittable.
             external_jump_slot: entry_bridge_target.map_or(0, |t| t.func_handle),
@@ -3433,6 +3687,9 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
 
+        // Set by the inline block below to the owner of a merge candidate whose
+        // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
+        let mut defer_inline: Option<Arc<JitCellToken>> = None;
         if inline_bridge_enabled() {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
@@ -3442,11 +3699,13 @@ impl majit_backend::Backend for WasmBackend {
             // the out-of-line path mint the fresh flag that keeps the contract.
             // `(slot, key)` names the crossing this decline leaves in place,
             // which is what the trace-entry census counts.
+            // By value: the id this compile will take, which the eager arm
+            // below consumes before the last `decline` call is out of scope.
+            let bridge_trace_id = self.trace_counter;
             let decline = |reason: &str| {
                 record_inline_decline(format!(
-                    "bridge={} src={source_trace_id} fi={source_fail_index} \
-                     slot={external_jump_slot} key={external_jump_key} reason={reason}",
-                    self.trace_counter,
+                    "bridge={bridge_trace_id} src={source_trace_id} fi={source_fail_index} \
+                     slot={external_jump_slot} key={external_jump_key} reason={reason}"
                 ));
             };
             if original_token.is_invalidated() {
@@ -3467,7 +3726,7 @@ impl majit_backend::Backend for WasmBackend {
                 // owner's loop instead of the loop the bridge meant.
                 diag_bump(51);
                 decline("foreign_label");
-            } else if let Some(mut candidate) = original_token
+            } else if let Some(candidate) = original_token
                 .compiled
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
@@ -3502,7 +3761,16 @@ impl majit_backend::Backend for WasmBackend {
                     // worth its re-emission.
                     diag_bump(38);
                     decline("not_header");
-                } else {
+                } else if inline_trip_helper_slot() == 0 {
+                    // Nothing to defer to: without the callback published the
+                    // count could never be acted on, so the bridge stays out of
+                    // line.
+                    diag_bump(53);
+                    decline("no_trip_helper");
+                } else if let Some(owner) = original_token
+                    .compiled_loop_token()
+                    .and_then(|clt| clt.upgrade_loop_token())
+                {
                     // Merging is append-only, so once one region takes the
                     // outside-the-loop placement every later one must too: its
                     // ops are the tail of the merged stream, and splicing an
@@ -3513,71 +3781,33 @@ impl majit_backend::Backend for WasmBackend {
                     // merge.
                     let outside_loop = source_in_preamble
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
-                    if outside_loop {
-                        diag_bump(52);
-                    }
                     self.collect_constants_from_ops(ops);
-                    candidate.inlined_bridges.push(codegen::InlinedBridge {
-                        source_fail_index,
-                        outside_loop,
-                        trace_id: self.trace_counter,
-                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                        ops: ops_owned.clone(),
-                        gc_table_base,
-                        constants: self.constants.clone(),
-                    });
-                    let mut merged_ops = candidate.ops.clone();
-                    for region in &candidate.inlined_bridges {
-                        merged_ops.extend(region.ops.iter().cloned());
-                    }
-                    candidate.constants = self.constants.clone();
-                    candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
-                    candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
-                    candidate.nursery = nursery_alloc_params(&merged_ops);
-                    let source_loop = original_token
-                        .compiled
-                        .get()
-                        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                        .expect("source loop disappeared before inline install");
-                    // The local branch supersedes any previous direct-cell
-                    // dispatch for this guard. Remove it before reemit so
-                    // the fresh array cannot replay a contradictory slot.
-                    let old_bridge_slot = source_loop
-                        .bridge_slots
-                        .borrow_mut()
-                        .remove(&source_fail_index);
-                    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-                    if source_cells_base != 0 {
-                        let cell = (source_cells_base as usize + source_fail_index as usize * 4)
-                            as *mut u32;
-                        unsafe { core::ptr::write(cell, 0) };
-                    }
-                    // Eligibility IS the emission: `reemit_loop` runs the same
-                    // `build_wasm_module` over the same candidate, and nothing
-                    // it does before that call mutates state a failure would
-                    // have to unwind — it reads the fail-index base and
-                    // allocates a cell array that is dropped on the error path.
-                    // So install directly and let the build answer, instead of
-                    // asking it once as a trial and once for real.
-                    let old_inputs = source_loop.reemit.replace(Some(candidate));
-                    match self.reemit_loop(original_token) {
-                        Ok(()) => {
+                    if outside_loop {
+                        // Eligible, but not yet worth its owner re-emission:
+                        // arm the bridge's entry counter and merge when it
+                        // trips. Everything else about this compile is the
+                        // ordinary out-of-line path below.
+                        defer_inline = Some(owner);
+                        diag_bump(54);
+                        decline("deferred");
+                    } else {
+                        // A region resuming at the loop header sits on the
+                        // body's fall-through and was measured and shipped
+                        // merged on the spot, so it stays that way.
+                        let region = codegen::InlinedBridge {
+                            source_fail_index,
+                            outside_loop,
+                            trace_id: self.trace_counter,
+                            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                            ops: ops_owned.clone(),
+                            gc_table_base,
+                            constants: self.constants.clone(),
+                        };
+                        if self.install_inline_region(&owner, region, self.constants.clone()) {
                             self.trace_counter += 1;
                             if let Some(table) = gc_table {
                                 Self::register_gc_table(original_token, table);
                             }
-                            diag_bump(31);
-                            diag_bump(32);
-                            // The region runs from the owner's module, so its
-                            // `GUARD_NOT_INVALIDATED` reads the owner's root
-                            // flag. Name that as this compile's generation, or
-                            // the quasi-immutable dependencies registered
-                            // afterwards attach to a flag the merged code never
-                            // loads and a mutated field leaves the fold in
-                            // place.
-                            original_token.record_bridge_invalidation_flag(
-                                original_token.invalidation_flag(),
-                            );
                             // The region has no code of its own: it was
                             // installed by rebuilding the owner, so there is no
                             // address to report. `model.py compile_bridge`
@@ -3591,25 +3821,13 @@ impl majit_backend::Backend for WasmBackend {
                                 code_size: 0,
                             });
                         }
-                        Err(error) => {
-                            source_loop.reemit.replace(old_inputs);
-                            if let Some(slot) = old_bridge_slot {
-                                source_loop
-                                    .bridge_slots
-                                    .borrow_mut()
-                                    .insert(source_fail_index, slot);
-                                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-                                if source_cells_base != 0 {
-                                    let cell = (source_cells_base as usize
-                                        + source_fail_index as usize * 4)
-                                        as *mut u32;
-                                    unsafe { core::ptr::write(cell, slot) };
-                                }
-                            }
-                            record_inline_trial_error(&error);
-                            classify_inline_install_error(&error);
-                        }
                     }
+                } else {
+                    // The merge outlives this call and has to keep the owner
+                    // alive; a token with no compiled-loop token has no strong
+                    // handle to take.
+                    diag_bump(53);
+                    decline("no_owner_handle");
                 }
             } else {
                 diag_bump(35);
@@ -3657,6 +3875,25 @@ impl majit_backend::Backend for WasmBackend {
             }
         };
 
+        // The region carries the trace id of the bridge standing in for it, so
+        // the sub-bridges chained onto this bridge's guards
+        // (`chained_bridge_slots`, keyed by that id) are replayed into the
+        // merged region's cells when the owner is finally rebuilt.
+        let inline_trip = defer_inline.map(|owner| {
+            let region = codegen::InlinedBridge {
+                source_fail_index,
+                // Decided against the candidate as it stands when the merge
+                // actually runs, which may have taken more regions by then.
+                outside_loop: false,
+                trace_id,
+                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                ops: ops_owned.clone(),
+                gc_table_base,
+                constants: self.constants.clone(),
+            };
+            register_pending_inline(owner, region, self.constants.clone())
+        });
+
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
         let base = fail_descr_base();
@@ -3684,6 +3921,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_entry_arity,
             bridge_param_dispatch: bridge_params_enabled(),
             trace_entry_census,
+            inline_trip,
             external_jump_slot,
             external_jump_key,
             frame: source_frame,

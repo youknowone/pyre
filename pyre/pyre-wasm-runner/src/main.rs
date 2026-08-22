@@ -763,6 +763,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_owner_invalidated",
                 "inline_decl_foreign_label",
                 "inline_ok_outside_loop",
+                "inline_decl_no_trip_helper",
+                "inline_deferred",
+                "inline_trip_fired",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

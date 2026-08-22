@@ -11,7 +11,7 @@ use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
 use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
 use smallvec::smallvec;
-use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
+use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
 fn validate_wasm(bytes: &[u8]) {
     wasmparser::validate(bytes).expect("generated wasm should be valid");
@@ -483,6 +483,7 @@ fn build_module_with_frame(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame,
@@ -731,6 +732,7 @@ fn build_module_with_write_barrier_target(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         // The allocated trace keeps both Ref inputs live across New; reserve
@@ -1247,6 +1249,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -1366,6 +1369,90 @@ fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i6
     )
 }
 
+/// A bridge whose merge is deferred carries an entry counter and calls back
+/// once, on the entry that reaches the threshold — not before it, and not
+/// again after. The counter is what separates a region worth its owner's
+/// re-emission from one that is crossed a few thousand times and never pays it
+/// back, so both halves of "exactly once, at the threshold" are the point.
+#[test]
+fn a_deferred_merge_trips_once_at_its_threshold() {
+    const COUNTER_ADDR: u32 = 0x10000;
+    const THRESHOLD: u64 = 3;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[OpRef::int_op(1)]),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
+    let mut inputs = inline_region_inputs(&inputargs, ops, Vec::new());
+    inputs.inline_trip = Some(codegen::InlineTripProbe {
+        counter_addr: COUNTER_ADDR,
+        threshold: THRESHOLD,
+        // Table slot 1 below; slot 0 stays null so a mis-selected slot traps
+        // rather than calling the wrong function.
+        trip_fn_ptr: 1,
+        pending_id: 77,
+    });
+
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("the armed module compiles");
+    let mut store = Store::new(&engine, Vec::<i64>::new());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    let trip = wasmi::Func::wrap(
+        &mut store,
+        |mut caller: wasmi::Caller<'_, Vec<i64>>, id: i64| {
+            caller.data_mut().push(id);
+            0i64
+        },
+    );
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 2, None),
+        Val::default(ValType::FuncRef),
+    )
+    .expect("test table should allocate");
+    table
+        .set(&mut store, 1, Val::from(trip))
+        .expect("the trip callback occupies slot 1");
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("the armed module instantiates");
+    let trace = instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap();
+
+    let counter = |store: &Store<Vec<i64>>| {
+        let mut buf = [0u8; 8];
+        memory.read(store, COUNTER_ADDR as usize, &mut buf).unwrap();
+        u64::from_le_bytes(buf)
+    };
+    for entry in 1..=THRESHOLD + 2 {
+        trace.call(&mut store, 0).expect("the trace runs");
+        assert_eq!(counter(&store), entry, "every entry is counted");
+        let fired = if entry < THRESHOLD { 0 } else { 1 };
+        assert_eq!(
+            store.data().len(),
+            fired,
+            "the callback fires on entry {THRESHOLD} and on no other"
+        );
+    }
+    assert_eq!(store.data(), &[77], "the callback names its own merge");
+}
+
 /// The `ModuleBuildInputs` shape every inline-region test shares: a fixed
 /// frame, no nursery, no census, and every base at zero.  Only the owner trace
 /// and the regions merged into it vary between them, so a new field lands here
@@ -1393,6 +1480,7 @@ fn inline_region_inputs(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -1561,6 +1649,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -1772,6 +1861,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -2080,6 +2170,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         bridge_entry_arity: Some(0),
         bridge_param_dispatch: true,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -2399,6 +2490,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -2779,6 +2871,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -3479,6 +3572,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -3601,20 +3695,26 @@ fn host_loop_inputargs() -> Vec<InputArg> {
 }
 
 /// The complement of the decline below. With the same owner, guard and bridge
-/// but no invalidation, nothing short-circuits the inline arm: the trial runs
-/// every accept precondition and reaches the merged install. On the host that
-/// install cannot complete — there is no wasm host, so the owner's module was
-/// never materialized and the rebuild refuses — which is what `bridge_diag(37)`
-/// records. So this does not assert an accepted inline (only a wasm host can
-/// produce one); it pins that the invalidation decline is the ONLY thing
-/// separating the two tests.
+/// but no invalidation, nothing short-circuits the inline arm: the bridge
+/// resumes at the loop header, so it takes the arm that merges on the spot and
+/// reaches the install. On the host that install cannot complete — there is no
+/// wasm host, so the owner's module was never materialized and the rebuild
+/// refuses — which is what `bridge_diag(37)` records. So this does not assert
+/// an accepted inline (only a wasm host can produce one); it pins that the
+/// invalidation decline is the ONLY thing separating the two tests.
 #[test]
 fn a_valid_owner_reaches_the_inline_trial() {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut backend = majit_backend_wasm::WasmBackend::new();
-    let token = majit_backend::JitCellToken::new(1);
+    // Through an `Arc`, with the compiled-loop token wired back to it the way
+    // `make_jitcell_token` does: a deferred merge outlives the compile that
+    // registered it, so it takes a strong handle on the owner from there.
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(1));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(1));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(70, false);
 
     backend
@@ -3627,7 +3727,11 @@ fn a_valid_owner_reaches_the_inline_trial() {
         arg_types: vec![Type::Int, Type::Int],
     };
     let declines_before = majit_backend_wasm::bridge_diag(50);
+    let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
+    // A merge is only considered once there is a callback to defer the
+    // outside-loop half to; the guest publishes the real one.
+    majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
             &fail_descr,
@@ -3638,11 +3742,17 @@ fn a_valid_owner_reaches_the_inline_trial() {
             None,
         )
         .expect("the loop-closing bridge compiles");
+    majit_backend_wasm::set_inline_trip_helper_slot(0);
 
     assert_eq!(
         majit_backend_wasm::bridge_diag(50),
         declines_before,
         "a valid owner is not declined by the invalidation arm"
+    );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(54),
+        deferred_before,
+        "a header-resuming region is not the half that waits on a trip"
     );
     assert!(
         majit_backend_wasm::bridge_diag(37) > trials_before,
@@ -4468,6 +4578,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![
                 InputArg::from_type(Type::Int, 10),
@@ -4492,6 +4603,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -4662,6 +4774,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![
                 InputArg::from_type(Type::Int, 10),
@@ -4685,6 +4798,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),

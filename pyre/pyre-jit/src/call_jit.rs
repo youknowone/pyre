@@ -4366,6 +4366,24 @@ fn try_compile_ca_bridge(
     CaBridgeAttempt { terminal_declined }
 }
 
+/// Queue a deferred inline merge, called from the out-of-line bridge that
+/// stands in for it once that bridge has been entered often enough to pay for
+/// rebuilding its owner (`majit_backend_wasm::INLINE_TRIP_THRESHOLD`). Its
+/// table slot is published through `set_inline_trip_helper_slot` during
+/// `JIT_DRIVER` init, the way the CA deopt helper's is.
+///
+/// ⛔ This runs with the bridge on the wasm stack, inside the
+/// `run_compiled` call that `execute_assembler` holds the driver mutably
+/// across, so it must not reach the driver: it only records the id, and
+/// `execute_assembler` installs the merge once the trace has returned.
+///
+/// Returns 0 because the trace drops the result.
+#[cfg(target_arch = "wasm32")]
+pub extern "C" fn wasm_jit_inline_trip(pending_id: i64) -> i64 {
+    majit_backend_wasm::record_inline_trip(pending_id);
+    0
+}
+
 /// Host completion for an in-guest self-recursive CALL_ASSEMBLER callee that
 /// deopted (`PYRE_WASM_CA`). The wasm CA arm `call_indirect`s this through the
 /// shared `__indirect_function_table` (its slot published via

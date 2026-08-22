@@ -5114,6 +5114,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_backend_wasm::set_ca_deopt_helper_slot(
         crate::call_jit::wasm_ca_resume_deopt as *const () as usize as u32,
     );
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::set_inline_trip_helper_slot(
+        crate::call_jit::wasm_jit_inline_trip as *const () as usize as u32,
+    );
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
     (d, info)
@@ -9991,6 +9995,18 @@ fn execute_assembler(
             || {},
         )
     };
+
+    // Bridges that reached their inline-trip threshold during this run asked
+    // for their merge from inside compiled code, where the driver is already
+    // borrowed. Install them now the trace has returned — the same level a
+    // guard failure reaches `compile_bridge` from.
+    #[cfg(target_arch = "wasm32")]
+    for pending_id in majit_backend_wasm::take_tripped_inlines() {
+        driver
+            .meta_interp_mut()
+            .backend_mut()
+            .install_pending_inline(pending_id);
+    }
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // JIT-overflow flag the backend probe records when it trips. The

@@ -2219,6 +2219,24 @@ pub struct AllocHelpers {
 
 type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
 
+/// Counts entries into an out-of-line bridge module and calls out once there
+/// have been enough of them to pay for merging that bridge into its owner.
+///
+/// The callee only records the request — the merge itself runs after the trace
+/// returns, because the host holds the driver mutably across the whole
+/// compiled run.
+#[derive(Clone, Copy)]
+pub struct InlineTripProbe {
+    /// Address of this bridge's own `u64` entry counter.
+    pub counter_addr: u32,
+    /// Entry count at which the callback fires — once, on equality.
+    pub threshold: u64,
+    /// `__indirect_function_table` index of the `(i64) -> i64` callback.
+    pub trip_fn_ptr: i64,
+    /// The callback's only argument: which deferred merge to install.
+    pub pending_id: i64,
+}
+
 /// Owned inputs for one wasm module build.  A loop retains this after its
 /// first build so it can emit the same trace again without revisiting mutable
 /// backend state such as the constants pool or GC-reference interning pass.
@@ -2252,6 +2270,10 @@ pub struct ModuleBuildInputs {
     /// Guest-memory counters baked into an armed trace-entry census module.
     /// `None` keeps the generated module byte-identical to the normal path.
     pub trace_entry_census: Option<crate::TraceEntryCensusStorage>,
+    /// Entry counter and callback for a bridge whose merge into its owner is
+    /// deferred until it has been crossed often enough to pay for the owner's
+    /// re-emission. `None` keeps the generated module byte-identical.
+    pub inline_trip: Option<InlineTripProbe>,
     pub external_jump_slot: u32,
     pub external_jump_key: u32,
     pub frame: FrameGeometry,
@@ -2366,6 +2388,7 @@ impl Clone for ModuleBuildInputs {
             bridge_entry_arity: self.bridge_entry_arity,
             bridge_param_dispatch: self.bridge_param_dispatch,
             trace_entry_census: self.trace_entry_census,
+            inline_trip: self.inline_trip,
             external_jump_slot: self.external_jump_slot,
             external_jump_key: self.external_jump_key,
             frame: self.frame,
@@ -2517,6 +2540,7 @@ pub fn build_wasm_module(
         bridge_entry_arity,
         bridge_param_dispatch,
         trace_entry_census,
+        inline_trip,
         external_jump_slot,
         external_jump_key,
         frame,
@@ -2862,7 +2886,8 @@ pub fn build_wasm_module(
         || residual_max_arity.is_some()
         || !float_residual_sigs.is_empty()
         || true_void_residual_max_arity.is_some()
-        || ca.emit_ca;
+        || ca.emit_ca
+        || inline_trip.is_some();
     // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
     // so all CA frame-helper trampoline `else` arms below are baseline-only.
     debug_assert!(!ca.emit_ca || residual_max_arity.is_some());
@@ -2958,6 +2983,14 @@ pub fn build_wasm_module(
             types.ty().function(vec![ValType::I64; n], vec![]);
         }
         next_type_idx += max as u32 + 1;
+    }
+    // Deferred-merge trip callback `(i64 pending_id) -> i64`, declared before
+    // the bridge-parameter arities so an armed probe cannot shift their
+    // indices.
+    let inline_trip_type_idx = next_type_idx;
+    if inline_trip.is_some() {
+        types.ty().function(vec![ValType::I64], vec![ValType::I64]);
+        next_type_idx += 1;
     }
     for arity in bridge_param_arities {
         if bridge_param_type_indices.contains_key(&arity) {
@@ -3093,6 +3126,7 @@ pub fn build_wasm_module(
         ca_helper_type_idx,
         *trace_entry_census,
         label_param_entry,
+        inline_trip.map(|probe| (probe, inline_trip_type_idx)),
     )?;
     if label_param_entry {
         codes.function(&build_label_param_shim(trace_func_idx + 1));
@@ -3177,6 +3211,7 @@ fn build_function(
     ca_helper_type_idx: u32,
     trace_entry_census: Option<crate::TraceEntryCensusStorage>,
     label_param_entry: bool,
+    inline_trip: Option<(InlineTripProbe, u32)>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
@@ -3574,6 +3609,11 @@ fn build_function(
             sink.local_get(local_idx);
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
+    }
+    // Past the entry loader, so the count is one per entry on the same path
+    // the inputs are loaded on.
+    if let Some((probe, type_idx)) = inline_trip {
+        emit_inline_trip_probe(&mut sink, probe, type_idx);
     }
 
     // Seed with the fail-index base so each guard/finish exit writes
@@ -6555,6 +6595,32 @@ pub fn entry_dispatch_key_count(ops: &[Op]) -> usize {
     } else {
         1
     }
+}
+
+/// `counter += 1; if counter == threshold { trip(pending_id) }`, at the entry
+/// of an out-of-line bridge whose merge into its owner is waiting on this
+/// count. Equality rather than `>=` so the callback fires exactly once; the
+/// merge takes the bridge out of the dispatch, so nothing reaches this code
+/// again anyway.
+///
+/// Operand-stack-neutral, and it reads no frame slot.
+fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, type_idx: u32) {
+    sink.i32_const(probe.counter_addr as i32);
+    sink.i32_const(probe.counter_addr as i32);
+    sink.i64_load(mem64(0));
+    sink.i64_const(1);
+    sink.i64_add();
+    sink.i64_store(mem64(0));
+    sink.i32_const(probe.counter_addr as i32);
+    sink.i64_load(mem64(0));
+    sink.i64_const(probe.threshold as i64);
+    sink.i64_eq();
+    sink.if_(BlockType::Empty);
+    sink.i64_const(probe.pending_id);
+    sink.i32_const(probe.trip_fn_ptr as i32);
+    sink.call_indirect(0, type_idx);
+    sink.drop(); // returns 0; ignored
+    sink.end();
 }
 
 /// Increment one module's guest-memory entry counter. `key_local` holds the
