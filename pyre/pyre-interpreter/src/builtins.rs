@@ -10432,39 +10432,54 @@ pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     )))
 }
 
-/// `int.__float__(self)`, which `bool` inherits — intobject.py `descr_float`.
-/// Structural only, for the reason `builtin_float_dunder` gives: `float()`
-/// looks `__float__` up on a subtype, and this is what that lookup resolves to
-/// when the subtype does not override it.
+/// The `int` payload as a double, or `None` when `obj` is not an int by layout.
+///
+/// Reads the payload of a strict subclass too.  `PyLong_AsDouble` is a layout
+/// read, and an inherited `int.__float__` has to reproduce it: the exactness
+/// gates on the coercion entry points send a subclass to a `__float__` lookup,
+/// and this is what that lookup resolves to.
+pub(crate) fn int_payload_as_f64(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
+    unsafe {
+        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+        if is_bool(obj) {
+            return Some(Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 }));
+        }
+        if is_int(obj) {
+            return Some(Ok(w_int_get_value(obj) as f64));
+        }
+        if pyre_object::is_long(obj) {
+            // `rbigint.tofloat()` raises when the value does not fit a double.
+            let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
+            if !v.is_finite() {
+                return Some(Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                )));
+            }
+            return Some(Ok(v));
+        }
+    }
+    None
+}
+
+/// `int.__float__(self)` — longobject.py `descr___float__`, which converts the
+/// receiver's payload and never re-dispatches.  `bool` inherits it.
+///
+/// Kept separate from the `float()` constructor for the reason
+/// [`builtin_float_dunder`] gives: the constructor looks `__float__` up on a
+/// strict subclass so an override is honored, so binding this name to the
+/// constructor makes a subclass that does *not* override it re-enter the very
+/// lookup that reached here.
 pub(crate) fn builtin_int_float_dunder(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[0];
-    unsafe {
-        if is_bool(obj) {
-            return Ok(floatobject::w_float_new(if w_bool_get_value(obj) {
-                1.0
-            } else {
-                0.0
-            }));
-        }
-        if is_int(obj) {
-            return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
-        }
-        if pyre_object::is_long(obj) {
-            let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
-            if !v.is_finite() {
-                return Err(crate::PyError::overflow_error(
-                    "int too large to convert to float",
-                ));
-            }
-            return Ok(floatobject::w_float_new(v));
-        }
+    match int_payload_as_f64(obj) {
+        Some(value) => Ok(floatobject::w_float_new(value?)),
+        None => Err(crate::PyError::type_error(format!(
+            "descriptor '__float__' requires a 'int' object but received a '{}'",
+            crate::type_methods::arg_type_name(obj)
+        ))),
     }
-    Err(crate::PyError::type_error(format!(
-        "descriptor '__float__' requires an 'int' object but received a '{}'",
-        crate::type_methods::arg_type_name(obj)
-    )))
 }
 
 /// `float(obj)` → convert to float
@@ -18880,10 +18895,12 @@ pub(crate) fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyEr
         if is_bool(obj) {
             return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
         }
-        if is_int(obj) {
+        if is_int(obj) && is_exact_builtin_instance(obj) {
             return Ok((w_int_get_value(obj) as f64, 0.0));
         }
         if is_long(obj) {
+            // `float_w` applies the same exactness rule to the payload arms,
+            // so a strict subclass overriding `__float__` is honored there.
             return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
         }
         if is_float(obj) {

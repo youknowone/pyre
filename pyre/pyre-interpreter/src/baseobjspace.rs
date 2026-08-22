@@ -14045,29 +14045,39 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         if pyre_object::is_float(obj) {
             return Ok(pyre_object::w_float_get_value(obj));
         }
-        // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
-        if pyre_object::pyobject::is_bool(obj) {
-            return Ok(if pyre_object::boolobject::w_bool_get_value(obj) {
-                1.0
-            } else {
-                0.0
-            });
-        }
-        if pyre_object::pyobject::is_int(obj) {
-            return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
-        }
-        if pyre_object::pyobject::is_long(obj) {
-            use num_traits::ToPrimitive;
-            // longobject.py `tofloat` — `rbigint.tofloat()` raises
-            // OverflowError "int too large to convert to float" when the
-            // value does not fit a C double.
-            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
-                pyre_object::longobject::w_long_get_value(obj),
-            );
-            if !f.is_finite() {
-                return Err(PyError::overflow_error("int too large to convert to float"));
+        // The integer fast paths read the payload, which is the answer only
+        // when the operand's Python class is the builtin itself: a strict
+        // subclass may override `__float__`, and the layout predicates read
+        // `ob_type`, which the subclass shares.  A subclass falls through to
+        // the lookup below, where an inherited `int.__float__` reproduces the
+        // same payload.  The `float` arm above is deliberately not gated: the
+        // conversion short-circuits on the float layout and never consults an
+        // override.
+        if pyre_object::is_exact_builtin_instance(obj) {
+            // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+            if pyre_object::pyobject::is_bool(obj) {
+                return Ok(if pyre_object::boolobject::w_bool_get_value(obj) {
+                    1.0
+                } else {
+                    0.0
+                });
             }
-            return Ok(f);
+            if pyre_object::pyobject::is_int(obj) {
+                return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
+            }
+            if pyre_object::pyobject::is_long(obj) {
+                use num_traits::ToPrimitive;
+                // longobject.py `tofloat` — `rbigint.tofloat()` raises
+                // OverflowError "int too large to convert to float" when the
+                // value does not fit a C double.
+                let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
+                    pyre_object::longobject::w_long_get_value(obj),
+                );
+                if !f.is_finite() {
+                    return Err(PyError::overflow_error("int too large to convert to float"));
+                }
+                return Ok(f);
+            }
         }
     }
     let Some(method) = (unsafe { lookup(obj, "__float__") }) else {

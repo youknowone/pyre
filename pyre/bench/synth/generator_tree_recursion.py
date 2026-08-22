@@ -3,11 +3,12 @@
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
-# 2951..2958 across nursery sizes; PYRE_JIT=decay=0 pinned 2999 everywhere,
-# while loops_compiled=3 and bridges_compiled=26 stayed invariant and remain
-# gated exactly. Width 8 adds one count of margin (0.27%); real regressions this
-# gate caught moved by hundreds to thousands (828 -> 4923, 404 -> 812,
-# 937 -> 7408).
+# 3648..3661 across nursery sizes; PYRE_JIT=decay=0 pinned 3600 everywhere,
+# while loops_compiled=3 and bridges_compiled=29 stayed invariant and remain
+# gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
+# run, not that 13-wide unpinned spread; width 8 is margin (0.22%). Real
+# regressions this gate caught moved by hundreds to thousands (828 -> 4923,
+# 404 -> 812, 937 -> 7408).
 # Generator-driven accumulation over recursive tree/linear results. The
 # tree_sum recursion once silently miscompiled on cranelift (first checksum
 # already wrong) and recovered a regalloc panic on dynasm. Deterministic;
@@ -17,12 +18,13 @@
 # `decay` (rlib/jit.py:588, default 40) scales every JitCounter entry down, and
 # counter.py:104-121 applies that scaling once per 32 minor collections. How far
 # a guard's counter has advanced by the time the workload reaches it therefore
-# depends on how much the process has allocated so far, and for this recursion
-# that is a per-ISA quantity: x86 spills every CALL_ASSEMBLER result into a fresh
-# JITFRAME slot (`x86/assembler.rs:7319`, `:7396` -> `allocate_slot`) where
-# aarch64 keeps it in the regalloc result register (`aarch64/assembler.rs:6037`),
-# so the two dynasm backends run a different minor-collection schedule over the
-# same trace. Left at the default, `guard_failures` reads 2957/2955/2951 across a
+# depends on how much the process has allocated so far, which is why the pin
+# exists: anything that shifts allocation volume shifts every counter. Both
+# dynasm backends now deliver a CALL_ASSEMBLER or nursery result into the
+# regalloc result register rather than a JitFrame slot
+# (`move_call_assembler_result`, and `consider_call_malloc_nursery`'s
+# `force_allocate_reg`), so neither grows the frame per call the way x86 did.
+# Left at the default, `guard_failures` reads 3661/3648/3648 across a
 # 1MB/4MB/16MB nursery sweep on one binary with `loops_compiled` and
 # `bridges_compiled` unchanged; at 0 the same sweep reads one number.
 #

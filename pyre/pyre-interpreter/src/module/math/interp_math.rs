@@ -21,25 +21,33 @@ pub fn get_double(obj: PyObjectRef) -> f64 {
 /// to reject `math.exp("spam")` etc.
 pub fn try_get_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
     unsafe {
-        if is_int(obj) {
-            return Ok(w_int_get_value(obj) as f64);
-        }
         if is_float(obj) {
             return Ok(floatobject::w_float_get_value(obj));
         }
-        if is_long(obj) {
-            // A Python int is always finite, so a non-finite conversion means
-            // the magnitude exceeds f64 range — PyFloat_AsDouble raises here.
-            let v = jit_bigint_to_f64_or_nan(w_long_get_value(obj));
-            if !v.is_finite() {
-                return Err(crate::PyError::overflow_error(
-                    "int too large to convert to float",
-                ));
+        // Reading the payload answers only for an operand whose Python class
+        // is the builtin: `is_int` / `is_long` / `is_bool` read `ob_type`,
+        // which a strict subclass shares while overriding `__float__`.  The
+        // subclass falls to the ladder below; an inherited `int.__float__`
+        // reproduces the payload.  The `float` arm stays ungated because the
+        // conversion short-circuits on the layout and ignores an override.
+        if pyre_object::is_exact_builtin_instance(obj) {
+            if is_int(obj) {
+                return Ok(w_int_get_value(obj) as f64);
             }
-            return Ok(v);
-        }
-        if is_bool(obj) {
-            return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
+            if is_long(obj) {
+                // A Python int is always finite, so a non-finite conversion means
+                // the magnitude exceeds f64 range — PyFloat_AsDouble raises here.
+                let v = jit_bigint_to_f64_or_nan(w_long_get_value(obj));
+                if !v.is_finite() {
+                    return Err(crate::PyError::overflow_error(
+                        "int too large to convert to float",
+                    ));
+                }
+                return Ok(v);
+            }
+            if is_bool(obj) {
+                return Ok(if w_bool_get_value(obj) { 1.0 } else { 0.0 });
+            }
         }
     }
     // `__float__` is a type-only special-method lookup (`space.lookup`); an
@@ -808,6 +816,19 @@ fn bigint_log(n: &BigInt, base: f64) -> Result<f64, crate::PyError> {
     n.log(base).map_err(map_rbigint_err)
 }
 
+/// `loghelper` converts *any* integer operand from its payload — a subclass
+/// included, since the check is `PyLong_Check` — and only a non-integer one
+/// reaches the general float coercion.  `log(x, base)` runs both operands
+/// through it, so the base needs the same rule as the argument that
+/// [`log_any`] handles inline; `try_get_double` would consult an overridden
+/// `__float__` here and answer a different logarithm.
+fn log_operand_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    match crate::builtins::int_payload_as_f64(obj) {
+        Some(value) => value,
+        None => try_get_double(obj),
+    }
+}
+
 /// Special-case integer arguments to avoid overflow, and give the domain
 /// error the value-carrying message except for an int argument, whose error
 /// carries no value.
@@ -885,7 +906,7 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
     let base = if args.len() >= 2 {
         // The base is validated before the argument, so log(x, base) with a
         // non-positive base reports the base rather than the argument.
-        let b = try_get_double(args[1])?;
+        let b = log_operand_double(args[1])?;
         if b <= 0.0 {
             return Err(crate::PyError::value_error(format!(
                 "expected a positive input, got {}",

@@ -205,10 +205,11 @@ pub struct JitCode {
 /// so an answer already computed for the original holds for it too.
 #[derive(Debug, Default, Clone)]
 pub struct DerivedBodyFacts {
-    /// Whether descending into this body can reach a residual call whose
-    /// funcbox is an un-lowered helper's symbolic hash. Read through
-    /// [`JitCode::descent_reaches_unlowered_helper_call`].
-    descent_reaches_unlowered_helper_call: OnceLock<bool>,
+    /// The un-lowered helper a descent into this body can reach, named by
+    /// the symbolic hash standing in for its funcbox, or `None` when the
+    /// descent reaches no such call. Read through
+    /// [`JitCode::descent_unlowered_helper_blocker`].
+    descent_unlowered_helper_blocker: OnceLock<Option<i64>>,
 }
 
 mod oncelock_usize_serde {
@@ -312,16 +313,20 @@ impl JitCode {
             .expect("JitCode body not yet set — call set_body() before body_mut()")
     }
 
-    /// Whether descending into this body can reach a residual call whose
-    /// funcbox is an un-lowered helper's symbolic hash, computing the answer
-    /// with `compute` the first time it is asked. The property is fixed by the
-    /// assembled body, so the first answer is the only one this instance gives:
-    /// `body_mut` needs `&mut self`, which `runtime_fnaddr_patch` can only take
-    /// before the jitcode is published behind an `Arc`.
-    pub fn descent_reaches_unlowered_helper_call(&self, compute: impl FnOnce() -> bool) -> bool {
+    /// The un-lowered helper a descent into this body can reach, named by
+    /// the symbolic hash standing in for its funcbox, computing the answer
+    /// with `compute` the first time it is asked. `None` means the descent
+    /// reaches no such call. The property is fixed by the assembled body, so
+    /// the first answer is the only one this instance gives: `body_mut` needs
+    /// `&mut self`, which `runtime_fnaddr_patch` can only take before the
+    /// jitcode is published behind an `Arc`.
+    pub fn descent_unlowered_helper_blocker(
+        &self,
+        compute: impl FnOnce() -> Option<i64>,
+    ) -> Option<i64> {
         *self
             .derived
-            .descent_reaches_unlowered_helper_call
+            .descent_unlowered_helper_blocker
             .get_or_init(compute)
     }
 

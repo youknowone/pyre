@@ -30,6 +30,25 @@ fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
     .then_some(arg)
 }
 
+/// The bytes of a string literal, in either spelling it can have.
+///
+/// [`str_const_fold::fold_str_consts`](crate::translator::rtyper::str_const_fold::fold_str_consts)
+/// rewrites the front's synthetic `__str_const` call to [`OpKind::ConstStr`],
+/// but it runs in the codewriter — a front pass still sees the call.
+pub(crate) fn str_literal_bytes(kind: &OpKind) -> Option<Vec<u8>> {
+    match kind {
+        OpKind::ConstStr(bytes) => Some(bytes.clone()),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
+            Some(segments[1].as_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
 /// Resolve `value` to a string literal that dominates its use.
 ///
 /// The walk accepts only straight-line control flow. At a block input it also
@@ -59,10 +78,7 @@ fn dominating_literal(
             .rev()
             .find(|op| op.result.as_ref() == Some(&value))
         {
-            return match &producer.kind {
-                OpKind::ConstStr(bytes) => Some(bytes.clone()),
-                _ => None,
-            };
+            return str_literal_bytes(&producer.kind);
         }
 
         if let Some(slot) = block.inputargs.iter().position(|arg| arg == &value) {
@@ -163,6 +179,33 @@ mod tests {
             OpKind::ConstStr(b"__instancecheck__".to_vec())
         );
         let folded = &graph.block(call_block).operations[0];
+        assert_eq!(folded.result.as_ref(), Some(&boxed));
+        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+    }
+
+    /// The other arm of [`str_literal_bytes`]. A front pass sees the literal
+    /// as an unlowered `__str_const` call, because `fold_str_consts` runs later
+    /// in the codewriter — so this fold must not depend on having run it, which
+    /// the test above cannot show because it runs it first.
+    #[test]
+    fn folds_an_unlowered_str_const_call() {
+        let mut graph = FunctionGraph::new("box_literal_front");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__instancecheck__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal.clone()), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        // Only the box call folds; its producer is left for the codewriter.
+        assert_eq!(
+            graph.block(entry).operations[0].kind,
+            str_const_call("__instancecheck__")
+        );
+        let folded = &graph.block(entry).operations[1];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
         assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
     }

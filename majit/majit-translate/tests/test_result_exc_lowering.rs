@@ -84,10 +84,16 @@ fn pop_value_lowers_to_raise_links() {
                 } if owner_path.last().map(String::as_str) == Some("Result") => {
                     result_ctors += 1;
                 }
+                // The raise site reaches the materialisation through the
+                // published free function, not the method: its body must stay
+                // opaque to the codewriter so the GC-root, exception-object
+                // and WTF-8 machinery under it does not land in this graph.
                 OpKind::Call {
-                    target: CallTarget::Method { name, .. },
+                    target: CallTarget::FunctionPath { segments },
                     ..
-                } if name == "to_exc_object" => to_exc_object_calls += 1,
+                } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object") => {
+                    to_exc_object_calls += 1
+                }
                 _ => {}
             }
         }
@@ -320,5 +326,74 @@ fn eval_loop_custom_match_gets_catch_and_rewrap() {
     assert!(
         from_exc_calls >= 1,
         "rewrap exception arm binds PyError::from_exc_object(last_exc_value)"
+    );
+}
+
+/// Count the raise-path calls in `name`'s lowered graph: fused, unfused
+/// materialisations, and surviving `PyError` constructors.
+fn raise_path_calls(name: &str) -> (usize, usize, usize) {
+    let graph = lower_function(interp(), name).unwrap_or_else(|e| panic!("lower {name}: {e:?}"));
+    let (mut fused, mut materialise, mut ctors) = (0, 0, 0);
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            match segments.last().map(String::as_str) {
+                Some("pyerror_type_error_to_exc_object") => fused += 1,
+                Some("pyerror_to_exc_object") => materialise += 1,
+                Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
+                    ctors += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    (fused, materialise, ctors)
+}
+
+#[test]
+fn constant_message_raise_sites_fuse_their_constructor() {
+    // A gateway wrapper's receiver and arity checks each raise a TypeError
+    // with a literal message. Every one of them must reach the published
+    // `pyerror_type_error_to_exc_object`, leaving no `PyError` constructor
+    // behind: the constructor is transparent, has no host symbol, and one of
+    // them anywhere in the body refuses the whole descent.
+    let (fused, materialise, ctors) = raise_path_calls("__pyre_wrap_random");
+    assert!(fused > 0, "the fusion must fire on a gateway wrapper");
+    assert_eq!(ctors, 0, "no PyError constructor may survive");
+    assert_eq!(materialise, 0, "no unfused materialisation may survive");
+}
+
+#[test]
+fn formatted_message_raise_sites_keep_the_two_call_form() {
+    // `__class_getitem__`'s checks build their message with `format!`, whose
+    // result is not the `box_str_constant` object the helper reads. Those
+    // sites must keep the constructor plus `pyerror_to_exc_object`: the
+    // fusion is additive and never replaces its own fallback.
+    let (fused, materialise, ctors) = raise_path_calls("__pyre_wrap___class_getitem__");
+    assert_eq!(fused, 0, "a formatted message must not fuse");
+    assert!(
+        ctors > 0,
+        "the fixture must still raise through a constructor"
+    );
+    assert_eq!(
+        materialise, ctors,
+        "every declined site keeps both halves of the pair"
+    );
+}
+
+#[test]
+fn pop_value_keeps_its_unfused_materialisation() {
+    // `pop_value` raises through `shared_opcode::stack_underflow_error`, not
+    // a `PyError` constructor, so there is nothing to fuse and the single
+    // materialisation call stands.
+    assert_eq!(
+        raise_path_calls("pyre_interpreter::eval::<Impl>::pop_value"),
+        (0, 1, 0)
     );
 }

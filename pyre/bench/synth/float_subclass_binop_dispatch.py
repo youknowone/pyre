@@ -12,8 +12,18 @@
 # Without it every line below silently loses the override and prints the raw
 # IEEE result.
 #
-# The int subclass at the bottom is the control: the int specialization has
-# carried that exactness test all along, so it must stay correct either way.
+# The int subclass at the bottom is the control for the record-time gate: when
+# the subclass is present from the first iteration, the gate sees it on the
+# recorded operand and declines, and every fold below stayed correct on that
+# shape alone.
+#
+# That shape is not sufficient. The `warm_then_swap_*` cases below compile the
+# trace from EXACT builtins first and introduce the subclass afterwards, so the
+# gate never sees it and only the emitted guard can reject it. `compare_op_int`,
+# `compare_op_float`, `store_subscr`, `newlist` and the `store_attr` in-place
+# arm each emitted the `ob_type` unbox guard without the matching `w_class` pin
+# and answered these with the raw payload -- `a < 1` returning True where the
+# override returns a string, and a stored subclass reading back as a plain int.
 N = 20000
 
 
@@ -126,3 +136,98 @@ print(lt_hot(N))
 print(eq_hot(N))
 print(mixed_int_operand_hot(N))
 print(int_control_hot(N))
+
+
+# --- warm on the exact builtin, then swap in the subclass -------------------
+# The list has no branch on the element, so the compiled trace can only reject
+# the tail element through a type guard. Each function prints what the override
+# says; a fold missing its `w_class` pin prints the raw builtin answer instead.
+class LiarInt(int):
+    def __lt__(self, other):
+        return "LT"
+
+
+class LiarFloat(float):
+    def __lt__(self, other):
+        return "FLT"
+
+
+class Slotted:
+    __slots__ = ("x",)
+
+
+class LiarBool(int):
+    def __bool__(self):
+        return True
+
+
+def warm_then_swap_compare_int(n):
+    out = None
+    for a in [0] * n + [LiarInt(0)]:
+        out = a < 1
+    return out
+
+
+def warm_then_swap_compare_float(n):
+    out = None
+    for a in [0.0] * n + [LiarFloat(0.0)]:
+        out = a < 1.0
+    return out
+
+
+def warm_then_swap_store_subscr(n):
+    lst = [0]
+    for a in [0] * n + [LiarInt(7)]:
+        lst[0] = a
+    return type(lst[0]).__name__
+
+
+def warm_then_swap_newlist(n):
+    out = None
+    for a in [0] * n + [LiarInt(7)]:
+        out = [a]
+    return type(out[0]).__name__
+
+
+def warm_then_swap_store_attr(n):
+    holder = Slotted()
+    for a in [0] * n + [LiarInt(7)]:
+        holder.x = a
+    return type(holder.x).__name__
+
+
+# `truth_int` reaches the same hole from the branch side rather than the value
+# side: `POP_JUMP_IF_*` and the short-circuit operators read the truth of a
+# payload the `GUARD_CLASS INT` admits, so a `__bool__` override on a zero-payload
+# subclass is skipped and the branch is taken the wrong way. `bool(a)` does not
+# reach the fold and stays correct either way, so it is the control.
+def warm_then_swap_truth_if(n):
+    hits = 0
+    for a in [0] * n + [LiarBool(0)]:
+        if a:
+            hits += 1
+    return hits
+
+
+def warm_then_swap_truth_and(n):
+    out = None
+    for a in [0] * n + [LiarBool(0)]:
+        out = a and "yes"
+    return out
+
+
+def truth_bool_call_control(n):
+    out = None
+    for a in [0] * n + [LiarBool(0)]:
+        out = bool(a)
+    return out
+
+
+print(warm_then_swap_compare_int(N))
+print(warm_then_swap_compare_float(N))
+print(warm_then_swap_store_subscr(N))
+print(warm_then_swap_newlist(N))
+print(warm_then_swap_store_attr(N))
+print(warm_then_swap_truth_if(N))
+print(warm_then_swap_truth_and(N))
+print(truth_bool_call_control(N))
