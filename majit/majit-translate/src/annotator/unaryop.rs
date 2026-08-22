@@ -2654,6 +2654,20 @@ fn stringbuilder_method_append(
     None
 }
 
+/// `StringBuilder.append_slice(self, s_str, s_start, s_end)` (rstring.py) —
+/// void; the model asserts a str arg with integer bounds and the call binds
+/// Impossible.
+fn stringbuilder_method_append_slice(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeStringBuilder,
+    s_str: &SomeValue,
+    s_start: &SomeValue,
+    s_end: &SomeValue,
+) -> Option<SomeValue> {
+    let _ = s_self.method_append_slice(s_str, s_start, s_end);
+    None
+}
+
 /// `StringBuilder.build(self)` (rstring.py) → `SomeString`.
 fn stringbuilder_method_build(
     _ann: &RPythonAnnotator,
@@ -2791,9 +2805,10 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
         },
         // rstring.py — the `StringBuilder` call surface.  Only the
         // methods the rtyper lowers (`StringBuilderRepr::rtype_method`) are
-        // exposed here: append/build/getlength.
+        // exposed here: append/append_slice/build/getlength.
         SomeValue::StringBuilder(_) => match name {
             "append" => "stringbuilder_method_append",
+            "append_slice" => "stringbuilder_method_append_slice",
             "build" => "stringbuilder_method_build",
             "getlength" => "stringbuilder_method_getlength",
             _ => return None,
@@ -3624,6 +3639,25 @@ pub(crate) fn call_builtin_method(
             // Void analyser (None = no result): early-return the threaded
             // Option so the simple_call binds Impossible without blocking.
             return Ok(stringbuilder_method_append(ann, s_self, s_str));
+        }
+        "stringbuilder_method_append_slice" => {
+            let SomeValue::StringBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_str", "s_start", "s_end"],
+                None,
+                &method.analyser_name,
+            )?;
+            let [s_str, s_start, s_end] = scope.as_slice() else {
+                unreachable!();
+            };
+            // Void analyser: early-return the threaded Option (see append).
+            return Ok(stringbuilder_method_append_slice(
+                ann, s_self, s_str, s_start, s_end,
+            ));
         }
         "stringbuilder_method_build" => {
             let SomeValue::StringBuilder(s_self) = &*method.s_self else {
