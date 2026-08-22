@@ -35,7 +35,9 @@ extern "C" {
 #  endif
 #endif
 
-typedef intptr_t Py_ssize_t;
+typedef uintptr_t Py_uintptr_t;
+typedef intptr_t Py_intptr_t;
+typedef Py_intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
 typedef Py_ssize_t Py_hash_t;
