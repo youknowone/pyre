@@ -1529,11 +1529,11 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Genuinely non-UTF-8 LC_TIME output (from %Z/%a in a non-UTF-8 locale)
         // is not valid WTF-8; fall back to surrogateescape rather than raising,
         // mirroring str_decode_locale_surrogateescape.
-        let result = match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
+        let result = match pyre_object::rutf8::wtf8_from_bytes(&rendered) {
             // interp_time.py returns `space.newutf8(decoded, size)`:
             // strftime's formatted value is an ordinary runtime string.
-            Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8),
-            Err(bytes) => crate::typedef::charp2uni(&bytes),
+            Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8.to_owned()),
+            Err(_) => crate::typedef::charp2uni(&rendered),
         };
         Ok(result)
     }

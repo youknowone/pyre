@@ -594,7 +594,44 @@ impl FileReader {
     }
 }
 
+/// `read_wtf8`'s validation, done with `rutf8::check_utf8`.
+///
+/// The trait's own body uses `Wtf8::from_bytes`, which accepts three-byte
+/// sequences that encode no code point, so a `u`/`a`/`z` payload naming one
+/// reaches `w_str_from_wtf8` with a code point count its buffer disagrees with.
+/// `r_object` decodes `TYPE_UNICODE` with `surrogatepass`, so surrogates are
+/// admitted and a rejection is that call's `UnicodeDecodeError`, which the
+/// sink carries past the wire reader's own error type.
+fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalError> {
+    pyre_object::rutf8::wtf8_from_bytes(bytes).map_err(|_| {
+        errors.remember(crate::typedef::utf8_decode_error(bytes));
+        wire::MarshalError::InvalidUtf8
+    })
+}
+
+/// A marshal byte stream, wrapped so `read_wtf8` is the strict one.
+struct BytesReader<'a> {
+    data: &'a [u8],
+    errors: ErrorSink,
+}
+
+impl wire::Read for BytesReader<'_> {
+    fn read_slice(&mut self, n: u32) -> Result<&[u8], wire::MarshalError> {
+        self.data.read_slice(n)
+    }
+
+    fn read_wtf8(&mut self, len: u32) -> Result<&Wtf8, wire::MarshalError> {
+        let errors = self.errors;
+        strict_wtf8(self.read_slice(len)?, errors)
+    }
+}
+
 impl wire::Read for FileReader {
+    fn read_wtf8(&mut self, len: u32) -> Result<&Wtf8, wire::MarshalError> {
+        let errors = self.errors;
+        strict_wtf8(self.read_slice(len)?, errors)
+    }
+
     fn read_slice(&mut self, n: u32) -> Result<&[u8], wire::MarshalError> {
         // A hostile length prefix must not allocate `n` bytes before the file
         // proves they exist. Fill the reusable result incrementally with a
@@ -1030,10 +1067,13 @@ fn marshal_to_bytes(
 /// false, a decoded code object is rejected (marshal.check_no_code).
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    let mut reader: &[u8] = data;
     let mut pending_error = None;
-    let result = match wire::deserialize_value(&mut reader, PyreMarshalBag::new(&mut pending_error))
-    {
+    let bag = PyreMarshalBag::new(&mut pending_error);
+    let mut reader = BytesReader {
+        data,
+        errors: bag.errors,
+    };
+    let result = match wire::deserialize_value(&mut reader, bag) {
         Ok(result) => result,
         Err(error) => return Err(pending_error.unwrap_or_else(|| marshal_error(error))),
     };

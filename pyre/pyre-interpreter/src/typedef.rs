@@ -23464,6 +23464,31 @@ fn unicode_decode_error_msg(
 /// `W_UnicodeDecodeError.descr_init` (interp_exceptions.py) so
 /// the caught exception carries the full attribute set, not just a message.
 /// `.object` holds the whole bytes buffer; `start`/`end` index into it.
+/// Construct Python's UTF-8 decode error details from Rust's `Utf8Error`.
+/// `error_len == None` is a truncated multibyte sequence; otherwise a valid
+/// leading byte at `valid_up_to` means the following byte was an invalid
+/// continuation, and every other offending byte is an invalid start.
+pub(crate) fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
+    let error = std::str::from_utf8(bytes).unwrap_err();
+    let start = error.valid_up_to();
+    let reason = match error.error_len() {
+        None => "unexpected end of data",
+        Some(_)
+            if bytes
+                .get(start)
+                .is_some_and(|byte| matches!(byte, 0xC2..=0xF4)) =>
+        {
+            "invalid continuation byte"
+        }
+        Some(_) => "invalid start byte",
+    };
+    let end = start
+        + error
+            .error_len()
+            .unwrap_or(bytes.len().saturating_sub(start));
+    unicode_decode_error("utf-8", bytes, start, end.min(bytes.len()), reason)
+}
+
 pub(crate) fn unicode_decode_error(
     encoding: &str,
     data: &[u8],
