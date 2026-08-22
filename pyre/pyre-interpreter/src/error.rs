@@ -3493,6 +3493,12 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
                     strings.push(std::mem::take(&mut current));
                     formats.push(spec.to_string());
                 }
+                // Upstream raises `ValueError` here, but `oefmt` is
+                // `@specialize.arg(1)`: `valuefmt` is a constant per call site
+                // and the class this feeds is built during translation, so the
+                // raise aborts the build rather than a running program.  A
+                // panic is that same "this call site is malformed" report at
+                // the earliest point this port can make it.
                 Some(_) | None => {
                     panic!("invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)")
                 }
@@ -3549,7 +3555,7 @@ fn operation_error_from_instance(
 ///
 /// A null class falls back to the message alone — a value cannot be reported
 /// through a class that is not there.
-fn operation_error_from_class(w_type: PyObjectRef, message: &str) -> OperationError {
+fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> OperationError {
     if w_type.is_null() {
         return PyError::runtime_error(message);
     }
@@ -3560,7 +3566,9 @@ fn operation_error_from_class(w_type: PyObjectRef, message: &str) -> OperationEr
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
     _roots.pin_root(w_type);
-    let w_message = pyre_object::w_str_new(message);
+    // `w_str_new`'s buffer-taking sibling: same allocation policy, and it is
+    // the one that accepts a lone surrogate.
+    let w_message = pyre_object::w_str_from_wtf8(message.clone());
     _roots.pin_root(w_message);
     let (w_type, w_message) = (_roots.get(base), _roots.get(base + 1));
     operation_error_from_instance(
@@ -3612,7 +3620,7 @@ impl FmtArg<'_> {
 
 fn expected_fmt_arg(format: char) -> &'static str {
     match format {
-        's' => "Text",
+        's' => "Text or Bytes",
         'd' => "Int",
         '8' => "Bytes",
         'R' | 'S' | 'T' | 'N' => "Obj",
@@ -3622,7 +3630,7 @@ fn expected_fmt_arg(format: char) -> &'static str {
 
 /// The shared `%R` / `%S` conversion and rescue from
 /// `get_operrcls2.OpErrFmt._compute_value`.
-fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
+fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> Wtf8Buf {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = _roots.base();
     _roots.pin_root(obj);
@@ -3645,16 +3653,16 @@ fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
         // takes the rescue below.  Reading it back through a `&str` view
         // instead would divert a lone surrogate — legal in that buffer — into
         // the rescue as well, reporting `<repr raised>` for a repr that
-        // succeeded.  The surrogate itself does not survive the last step: the
-        // message this builds is a Rust `String`.
-        Ok(rendered) => rendered.to_string_lossy().into_owned(),
+        // succeeded.  The buffer is carried on rather than converted, so the
+        // surrogate reaches the message intact.
+        Ok(rendered) => rendered,
         Err(mut error) => {
             error.write_unraisable(
                 pyre_object::w_none(),
                 rustpython_wtf8::Wtf8::new("exception formatting: "),
                 obj(),
             );
-            fallback.to_owned()
+            Wtf8Buf::from_string(fallback.to_string())
         }
     }
 }
@@ -3665,12 +3673,12 @@ fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
 /// The name is read off the string's own buffer for the reason
 /// [`format_obj_as_utf8`] gives: a `&str` view would turn a lone surrogate in
 /// `__name__` into a raise, and this function reports a raise as `?`.
-fn format_obj_name(obj: PyObjectRef) -> String {
+fn format_obj_name(obj: PyObjectRef) -> Wtf8Buf {
     match crate::baseobjspace::getattr_str(obj, "__name__")
         .and_then(crate::baseobjspace::text_wtf8_w)
     {
-        Ok(name) => name.to_string_lossy().into_owned(),
-        Err(_) => "?".to_owned(),
+        Ok(name) => name.to_owned(),
+        Err(_) => Wtf8Buf::from_string("?".to_string()),
     }
 }
 
@@ -3696,7 +3704,7 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> Operat
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.
     let message = if args.is_empty() {
-        valuefmt.to_string()
+        Wtf8Buf::from_string(valuefmt.to_string())
     } else {
         // `OpErrFmt, strings = get_operr_class(valuefmt)`, then the walk
         // `_compute_value` makes over them: a literal part, the argument
@@ -3724,43 +3732,52 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> Operat
         }
         let first_obj_slot = _roots.base();
         let mut next_obj_slot = first_obj_slot;
-        let mut message = String::new();
+        // The message is a `Wtf8Buf` for the same reason `_compute_value`
+        // joins `space.utf8_w` results: `%R`, `%S` and `%N` can each produce a
+        // lone surrogate, which no `&str` can hold.
+        let mut message = Wtf8Buf::new();
         for (i, part) in strings[..formats.len()].iter().enumerate() {
             message.push_str(part);
             let format = formats[i].chars().next().unwrap();
             let arg = &args[i];
-            let rendered = match (format, arg) {
-                ('d', FmtArg::Int(value)) => value.to_string(),
-                ('s', FmtArg::Text(value)) => (*value).to_owned(),
-                ('8', FmtArg::Bytes(value)) => String::from_utf8_lossy(value).into_owned(),
+            match (format, arg) {
+                ('d', FmtArg::Int(value)) => message.push_str(&value.to_string()),
+                ('s', FmtArg::Text(value)) => message.push_str(value),
+                // `_compute_value`'s final `else` — `%s` over a byte string,
+                // which upstream checks is already UTF-8 rather than decoding.
+                // The check has no failure branch there beyond a length
+                // correction, and an invalid byte cannot be carried into this
+                // buffer, so it is replaced the way `%8` replaces one.
+                ('s', FmtArg::Bytes(value)) | ('8', FmtArg::Bytes(value)) => {
+                    message.push_str(&String::from_utf8_lossy(value))
+                }
                 ('T', FmtArg::Obj(_)) => {
                     let obj = _roots.get(next_obj_slot);
                     next_obj_slot += 1;
-                    type_name_of(obj)
+                    message.push_str(&type_name_of(obj));
                 }
                 ('N', FmtArg::Obj(_)) => {
                     let obj = _roots.get(next_obj_slot);
                     next_obj_slot += 1;
-                    format_obj_name(obj)
+                    message.push_wtf8(&format_obj_name(obj));
                 }
                 ('R' | 'S', FmtArg::Obj(_)) => {
                     let obj = _roots.get(next_obj_slot);
                     next_obj_slot += 1;
-                    format_obj_as_utf8(obj, format)
+                    message.push_wtf8(&format_obj_as_utf8(obj, format));
                 }
                 _ => panic!(
                     "oefmt format %{format} requires {} argument, got {}",
                     expected_fmt_arg(format),
                     arg.kind_name()
                 ),
-            };
-            message.push_str(&rendered);
+            }
         }
         debug_assert_eq!(next_obj_slot - first_obj_slot, rooted_obj_count);
         message.push_str(&strings[formats.len()]);
         message
     };
-    operation_error_from_class(w_type, &message)
+    operation_error_from_class(w_type, message)
 }
 
 pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
@@ -3893,15 +3910,22 @@ pub fn new_exception_class(
             return std::ptr::null_mut();
         }
     };
-    if let Some(module) = module {
+    // `if module:` — a name like `".Name"` splits to an empty prefix, which is
+    // falsy upstream, so the attribute is left alone rather than set to `""`.
+    if let Some(module) = module.filter(|module| !module.is_empty()) {
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         _roots.pin_root(w_exc);
-        let w_module = pyre_object::w_str_new(module);
+        // Pinned like every other operand here: `setattr_str` allocates, and a
+        // collection rewrites the root SLOT rather than this frame's copy.
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        _roots.pin_root(pyre_object::w_str_new(module));
         // `space.setattr` propagates its failure through the same bare-return
         // channel as the class call above.
-        if let Err(err) =
-            crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module)
-        {
+        if let Err(err) = crate::baseobjspace::setattr_str(
+            _roots.get(exc_slot),
+            "__module__",
+            _roots.get(module_slot),
+        ) {
             crate::call::set_call_error(err);
             return std::ptr::null_mut();
         }
@@ -4129,6 +4153,26 @@ mod tests {
             &[super::FmtArg::Int(-42), super::FmtArg::Text("items")],
         );
         assert_eq!(err.render_exception(), "RuntimeError: -42 items");
+    }
+
+    #[test]
+    fn oefmt_takes_a_byte_string_for_percent_s() {
+        // `error.py _compute_value`'s final `else`, which
+        // `interpreter/test/test_error.py test_oefmt_utf8` exercises: a UTF-8
+        // byte string reaches `%s` and reads back as the same text a `str`
+        // operand would have produced.
+        let text = "abc \u{e0}\u{e8}\u{ec}\u{f2}\u{f9}";
+        let from_bytes = super::oefmt(
+            std::ptr::null_mut(),
+            "%s",
+            &[super::FmtArg::Bytes(text.as_bytes())],
+        );
+        let from_text = super::oefmt(std::ptr::null_mut(), "%s", &[super::FmtArg::Text(text)]);
+        assert_eq!(from_bytes.message_wtf8(), from_text.message_wtf8());
+        assert_eq!(
+            from_bytes.render_exception(),
+            format!("RuntimeError: {text}")
+        );
     }
 
     #[test]
