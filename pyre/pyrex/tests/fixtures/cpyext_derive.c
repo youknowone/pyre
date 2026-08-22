@@ -154,9 +154,11 @@ static PyObject *slots_of(PyObject *self, PyObject *type)
     }
     t = (PyTypeObject *)type;
     return Py_BuildValue(
-        "{s:n,s:n,s:O,s:O,s:O,s:O,s:O}",
+        "{s:n,s:n,s:n,s:n,s:O,s:O,s:O,s:O,s:O}",
         "basicsize", (Py_ssize_t)t->tp_basicsize,
         "itemsize", (Py_ssize_t)t->tp_itemsize,
+        "dictoffset", (Py_ssize_t)t->tp_dictoffset,
+        "weaklistoffset", (Py_ssize_t)t->tp_weaklistoffset,
         "alloc", t->tp_alloc == NULL ? Py_False : Py_True,
         "free", t->tp_free == NULL ? Py_False : Py_True,
         "new", t->tp_new == NULL ? Py_False : Py_True,
@@ -431,6 +433,41 @@ static PyObject *suites_are_embedded(PyObject *self, PyObject *o)
         t->tp_as_buffer == &ht->as_buffer ? 1 : 0);
 }
 
+/* ── types that declare the four numbers `type_members` publishes ─────── */
+
+/* Var-sized: `tp_itemsize` is the element width, and the block a subclass of
+   this is given has to keep it. */
+typedef struct {
+    PyObject_VAR_HEAD
+    long items[1];
+} VecObject;
+
+static PyTypeObject VecType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "cpyext_derive.Vec",
+    /* Deliberately the bare header: `derive_exec` widens it once the type is
+       ready, which is the order a compiled `cdef class` writes these in. */
+    .tp_basicsize = sizeof(PyObject),
+    .tp_itemsize = sizeof(long),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+};
+
+/* An instance dict and a weakref list at offsets the type declares itself. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *dict;
+    PyObject *weaklist;
+} DwObject;
+
+static PyTypeObject DwType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "cpyext_derive.Dw",
+    .tp_basicsize = sizeof(DwObject),
+    .tp_dictoffset = offsetof(DwObject, dict),
+    .tp_weaklistoffset = offsetof(DwObject, weaklist),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+};
+
 static PyMethodDef methods[] = {
     {"slots_of", slots_of, METH_O, NULL},
     {"walk_slots", walk_slots, METH_O, NULL},
@@ -452,6 +489,19 @@ static int derive_exec(PyObject *module)
         return -1;
     }
     Py_DECREF(made);
+
+    if (PyType_Ready(&VecType) < 0 || PyType_Ready(&DwType) < 0) {
+        return -1;
+    }
+    /* The widening a compiled module performs after the type is ready: a
+       reader is owed the field as it stands now, not as it was declared. */
+    VecType.tp_basicsize = sizeof(VecObject);
+    if (PyModule_AddObjectRef(module, "Vec", (PyObject *)&VecType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddObjectRef(module, "Dw", (PyObject *)&DwType) < 0) {
+        return -1;
+    }
     return 0;
 }
 

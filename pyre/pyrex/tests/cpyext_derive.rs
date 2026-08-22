@@ -110,6 +110,58 @@ eq('the second level builds', m.Cell(7).value, 7)
 eq('the second level instance', Deeper(9, 'c').tag, 'c')
 
 
+# ── the four numbers `type_members` publishes ──────────────────────────
+
+# A type declared in C is sized by the struct it wrote down, so the number
+# Python reports is the one C reads off the same field.
+eq('the declared size', m.Cell.__basicsize__, cell['basicsize'])
+eq('the declared element width', m.Cell.__itemsize__, cell['itemsize'])
+eq('a class derived from it reports the base\'s size',
+   Sub.__basicsize__, sub['basicsize'])
+eq('at the second level too', Deeper.__basicsize__, deeper['basicsize'])
+
+vec = m.slots_of(m.Vec)
+# `derive_exec` widens `tp_basicsize` once `PyType_Ready` has returned, which
+# is where a compiled module puts the size of its own struct.  What is
+# reported is the field as it stands, not as it was declared.
+eq('a size widened after the type was ready', m.Vec.__basicsize__, vec['basicsize'])
+assert m.Vec.__basicsize__ > 8, m.Vec.__basicsize__
+eq('the element width of a var-sized type', m.Vec.__itemsize__, vec['itemsize'])
+eq('and it is the width the type declared', m.Vec.__itemsize__, 8)
+
+dw = m.slots_of(m.Dw)
+eq('the size a static type declared', m.Dw.__basicsize__, dw['basicsize'])
+eq('an offset the type declared itself', m.Dw.__dictoffset__, dw['dictoffset'])
+eq('and the weakref one beside it', m.Dw.__weakrefoffset__, dw['weaklistoffset'])
+assert m.Dw.__dictoffset__ > 0, m.Dw.__dictoffset__
+assert m.Dw.__weakrefoffset__ > 0, m.Dw.__weakrefoffset__
+
+
+class SubVec(m.Vec):
+    pass
+
+
+# `inherit_special`'s `COPYVAL(tp_itemsize)`: a class derived from a var-sized
+# type stays var-sized, and both sides of the boundary have to say so.
+eq('the derived element width', SubVec.__itemsize__, m.Vec.__itemsize__)
+eq('and the mirror carries it too',
+   m.slots_of(SubVec)['itemsize'], m.Vec.__itemsize__)
+
+
+class SubDw(m.Dw):
+    pass
+
+
+# `COPYVAL(tp_dictoffset)` / `COPYVAL(tp_weaklistoffset)`: the block a
+# derived instance is given is sized for the base's struct, so the fields the
+# base declared are still where it put them.
+subdw = m.slots_of(SubDw)
+eq('the derived dict offset', SubDw.__dictoffset__, m.Dw.__dictoffset__)
+eq('and the mirror carries it', subdw['dictoffset'], m.Dw.__dictoffset__)
+eq('the derived weakref offset', SubDw.__weakrefoffset__, m.Dw.__weakrefoffset__)
+eq('and the mirror carries it', subdw['weaklistoffset'], m.Dw.__weakrefoffset__)
+
+
 # ── weakrefs ───────────────────────────────────────────────────────────
 
 # `create_all_slots` gives a weakref slot to every namespace with no

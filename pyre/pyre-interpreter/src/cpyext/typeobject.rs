@@ -733,6 +733,24 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         if !base.is_null() && (*base).tp_basicsize > (*mirror).tp_basicsize {
             (*mirror).tp_basicsize = (*base).tp_basicsize;
         }
+        // `inherit_special`'s `COPYVAL(tp_itemsize)`.  A class derived in
+        // Python from a var-sized type declared in C stays var-sized, and
+        // whoever reads the element width off this mirror has only the base
+        // to have learnt it from.
+        if !base.is_null() && (*mirror).tp_itemsize == 0 {
+            (*mirror).tp_itemsize = (*base).tp_itemsize;
+        }
+        // `COPYVAL(tp_dictoffset)` and `COPYVAL(tp_weaklistoffset)` beside
+        // them.  The block an instance of this class is given is sized for
+        // the base's struct, so a field the base declared is at the offset
+        // the base declared it at, and a reader that walks up for it would
+        // find the same number.
+        if !base.is_null() && (*mirror).tp_dictoffset == 0 {
+            (*mirror).tp_dictoffset = (*base).tp_dictoffset;
+        }
+        if !base.is_null() && (*mirror).tp_weaklistoffset == 0 {
+            (*mirror).tp_weaklistoffset = (*base).tp_weaklistoffset;
+        }
     }
     TYPE_NAMES.lock().insert(mirror as usize, name);
 }
@@ -1709,6 +1727,51 @@ pub(super) fn interpreter_type(tp: *mut CPyTypeObject) -> PyObjectRef {
 }
 
 // ── slot lookup ─────────────────────────────────────────────────────────
+
+/// The four numbers `type_members` publishes off a `PyTypeObject`, for a type
+/// an extension declared in C, or `None` for one this runtime defines.
+///
+/// Read live rather than recorded when the type was readied: an extension
+/// widens the fields after `PyType_Ready` returns, which is where Cython puts
+/// the offset of a `cdef object __weakref__`, and the widened numbers are the
+/// ones a reader is owed.
+///
+/// The nearest ancestor that declares them answers for a class derived in
+/// Python, which is the walk `inherit_special` performs once per field as
+/// `if (type->tp_basicsize == 0) type->tp_basicsize = base->tp_basicsize` and
+/// `COPYVAL(tp_itemsize)` / `COPYVAL(tp_dictoffset)` /
+/// `COPYVAL(tp_weaklistoffset)`.
+pub(crate) fn declared_type_layout(
+    w_type: PyObjectRef,
+) -> Option<crate::typedef::DeclaredTypeLayout> {
+    let mut w_current = w_type;
+    while !w_current.is_null() {
+        // The mirror as it stands, never a synthesized one: a type that has
+        // not crossed into C declares nothing, and minting a block for it
+        // here would answer with the very numbers being asked for.
+        let tp = pyobject::as_pyobj(w_current) as *mut CPyTypeObject;
+        // A mirror this layer filled describes a type pyre defines, so its
+        // fields are what [`describe_interpreter_type`] synthesized rather
+        // than a declaration.  `TYPE_NAMES` holds exactly those, and a block
+        // still carrying the null `tp_name` it was declared with is one that
+        // has been linked but not yet filled -- neither is a declaration.
+        let declared = !tp.is_null()
+            && unsafe { !(*tp).tp_name.is_null() }
+            && !TYPE_NAMES.lock().contains_key(&(tp as usize));
+        if declared {
+            return Some(unsafe {
+                crate::typedef::DeclaredTypeLayout {
+                    basicsize: (*tp).tp_basicsize as i64,
+                    itemsize: (*tp).tp_itemsize as i64,
+                    dictoffset: (*tp).tp_dictoffset as i64,
+                    weaklistoffset: (*tp).tp_weaklistoffset as i64,
+                }
+            });
+        }
+        w_current = unsafe { pyre_object::typeobject::w_type_get_best_base(w_current) };
+    }
+    None
+}
 
 /// The `PyTypeObject` of `w_type` and of each of its bases, nearest first.
 ///
@@ -3746,6 +3809,14 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         }
         if (*tp).tp_itemsize == 0 {
             (*tp).tp_itemsize = (*base).tp_itemsize;
+        }
+        // The `COPYVAL(tp_dictoffset)` and `COPYVAL(tp_weaklistoffset)`
+        // `inherit_special` performs beside the two above.
+        if (*tp).tp_dictoffset == 0 {
+            (*tp).tp_dictoffset = (*base).tp_dictoffset;
+        }
+        if (*tp).tp_weaklistoffset == 0 {
+            (*tp).tp_weaklistoffset = (*base).tp_weaklistoffset;
         }
     }
 }

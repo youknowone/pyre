@@ -11173,6 +11173,35 @@ fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
     unsafe { pyre_object::w_type_get_have_gc(w_type) }
 }
 
+/// The four numbers `typeobject.c type_members` publishes off a
+/// `PyTypeObject`, for a type an extension declared in C.
+pub(crate) struct DeclaredTypeLayout {
+    pub basicsize: i64,
+    pub itemsize: i64,
+    pub dictoffset: i64,
+    pub weaklistoffset: i64,
+}
+
+/// What a type declared in C reports for those four; `None` for a type this
+/// runtime defines, and in every build without the extension layer.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn declared_type_layout(w_type: PyObjectRef) -> Option<DeclaredTypeLayout> {
+    crate::cpyext::typeobject::declared_type_layout(w_type)
+}
+
+#[cfg(not(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+fn declared_type_layout(_w_type: PyObjectRef) -> Option<DeclaredTypeLayout> {
+    None
+}
+
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.
@@ -11190,7 +11219,13 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     let word = std::mem::size_of::<usize>() as i64;
     let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
     let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
-    let (base, item) = if is(&pyre_object::INSTANCE_TYPE) {
+    let (base, item) = if let Some(declared) = declared_type_layout(w_type) {
+        // A type declared in C sizes its instances by the struct it wrote
+        // down, and `type_members` publishes that struct's own numbers.  The
+        // prefix a type of this runtime's would contribute is not what those
+        // fields were laid out against, so the declaration precedes the table.
+        (declared.basicsize, declared.itemsize)
+    } else if is(&pyre_object::INSTANCE_TYPE) {
         (4 * word, 0)
     } else if is(&pyre_object::TYPE_TYPE) {
         // `PyHeapTypeObject`, which keeps a unique-id word here that a build
@@ -11286,6 +11321,8 @@ fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (0, 26 * word)
     } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
         (0, 19 * word)
+    } else if let Some(declared) = declared_type_layout(w_type) {
+        (declared.dictoffset, declared.weaklistoffset)
     } else {
         (0, 0)
     };
