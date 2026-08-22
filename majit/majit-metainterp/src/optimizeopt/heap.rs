@@ -6239,8 +6239,12 @@ mod tests {
         let pos100 = ctx.materialize_operand_at(OpRef::ref_op(100));
         ctx.set_ptr_info(&pos100, PtrInfo::instance(None, None));
         let val101 = ctx.materialize_operand_at(OpRef::ref_op(101));
+        // Seed the slot the reader will consult: `field_slot_index`, not the
+        // descriptor's own key.  A descriptor with no parent carries no slot
+        // number, so the two differ.
+        let slot = OptHeap::field_slot_index(&descr);
         ctx.with_ptr_info_mut(&pos100, |info| {
-            info.setfield(descr.index(), val101.clone());
+            info.setfield(slot, val101.clone());
         })
         .unwrap();
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
