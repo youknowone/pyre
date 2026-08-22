@@ -415,11 +415,14 @@ impl W_TextIOWrapper {
         Ok(())
     }
 
-    /// `encoding="locale"` selects the current locale's encoding; the sandbox
-    /// and default environment resolve that to UTF-8.
+    /// `encoding="locale"` selects the current locale's encoding, which is
+    /// what `_Py_GetLocaleEncodingObject` answers for it and for the
+    /// unspecified argument that resolves to it.  A sandbox build has no host
+    /// locale to ask and reads utf-8, the answer a `_Py_FORCE_UTF8_LOCALE`
+    /// build gives without asking one.
     fn resolve_locale_encoding(encoding: String) -> String {
         if encoding == "locale" {
-            "utf-8".to_string()
+            crate::module::_locale::interp_locale::locale_encoding()
         } else {
             encoding
         }
@@ -1056,8 +1059,23 @@ impl W_TextIOWrapper {
         self.w_buffer = PY_NULL;
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
 
+        // An unspecified `encoding` reads the locale's, unless UTF-8 mode has
+        // already answered the question.  `_io.text_encoding` is not on this
+        // path - a direct `TextIOWrapper(...)` call reaches the constructor
+        // itself - so the warning that argument's absence carries is raised
+        // here, at this frame.
+        if unsafe { pyre_object::is_none(encoding) }
+            && crate::importing::warn_default_encoding_flag()
+        {
+            crate::warn::warn_category("'encoding' argument not specified", "EncodingWarning", 1)?;
+        }
+        let unspecified = if crate::importing::utf8_mode_flag() != 0 {
+            "utf-8"
+        } else {
+            "locale"
+        };
         let encoding =
-            Self::resolve_locale_encoding(Self::checked_text0(encoding, "utf-8", "encoding")?);
+            Self::resolve_locale_encoding(Self::checked_text0(encoding, unspecified, "encoding")?);
         let errors = Self::checked_text0(errors, "strict", "errors")?;
         Self::io_check_errors(&errors)?;
         let newline_value = Self::unwrap_newline(newline)?;

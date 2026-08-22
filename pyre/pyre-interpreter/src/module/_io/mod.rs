@@ -1350,7 +1350,7 @@ pub(crate) fn text_encoding(
     }
     if crate::importing::warn_default_encoding_flag() {
         crate::warn::warn_category(
-            "'encoding' argument not specified.",
+            "'encoding' argument not specified",
             "EncodingWarning",
             stacklevel + 1,
         )?;

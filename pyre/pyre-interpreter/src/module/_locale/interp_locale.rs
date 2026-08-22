@@ -26,8 +26,11 @@ type CollationArg = std::ffi::CString;
 /// falls back to `sys.getfilesystemencoding()` when it does not, and the two
 /// are different answers wherever the filesystem encoding is not the locale
 /// one — every Windows host, where PEP 529 makes the filesystem utf-8.
+///
+/// `_io.TextIOWrapper` reads it as well, for the `encoding="locale"` its
+/// unspecified argument resolves to.
 #[cfg(all(windows, not(feature = "sandbox")))]
-fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> String {
     // The active ANSI code page, spelled `cp<n>` whatever it is: code page
     // 65001 answers `cp65001`, not `utf-8`.
     format!("cp{}", unsafe {
@@ -41,7 +44,7 @@ fn locale_encoding() -> String {
     not(feature = "sandbox"),
     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
 ))]
-fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> String {
     match rustpython_host_env::locale::nl_langinfo_codeset() {
         // An empty codeset answers utf-8: `nl_langinfo` returns one on macOS
         // when the `LC_CTYPE` locale is not supported.
@@ -56,7 +59,7 @@ fn locale_encoding() -> String {
     not(feature = "sandbox"),
     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
 ))))]
-fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> String {
     // No host locale to ask, which is the answer `_Py_FORCE_UTF8_LOCALE`
     // builds give without asking one.
     "utf-8".to_string()
