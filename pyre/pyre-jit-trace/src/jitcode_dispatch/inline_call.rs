@@ -3165,8 +3165,7 @@ fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, Disp
 }
 
 /// The byte ranges of `code`'s exception handlers. A handler begins at a table
-/// entry's `target` and covers the contiguous run of table ranges that starts
-/// there, up to where the next handler begins.
+/// entry's `target` and runs to where the next handler begins.
 ///
 /// One `except` body routinely spans several table ranges: binding the caught
 /// exception to a name, or a handler body that can itself raise, emits the
@@ -3174,6 +3173,13 @@ fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, Disp
 /// the range that a `target` opens therefore sees the first few opcodes of the
 /// handler and nothing after them -- for `except E as m: ... raise` it stops
 /// before the `raise`.
+///
+/// Those further ranges are not always contiguous. A nested block whose body
+/// cannot raise covers no table range at all, so the handler's own ranges sit
+/// on either side of a hole -- `except E: (try: pass finally: pass); raise`
+/// leaves the `raise` past the gap. Ending the handler at the first
+/// discontinuity puts that `raise` outside every span. So the run ends only at
+/// the next range a `target` opens, and a gap inside it is carried over.
 fn callee_handler_spans(code: &pyre_interpreter::CodeObject) -> Vec<(u32, u32)> {
     let mut entries: Vec<_> =
         pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
@@ -3187,7 +3193,7 @@ fn callee_handler_spans(code: &pyre_interpreter::CodeObject) -> Vec<(u32, u32)> 
         }
         let mut end = entry.end;
         for next in &entries[index + 1..] {
-            if next.start != end || targets.contains(&next.start) {
+            if targets.contains(&next.start) {
                 break;
             }
             end = next.end;
@@ -3238,7 +3244,83 @@ fn callee_only_bare_reraises_in_handlers(code: &pyre_interpreter::CodeObject) ->
             return false;
         }
     }
-    saw_raise
+    saw_raise && !callee_handler_can_return(code, &spans)
+}
+
+/// True when a `return` is reachable from one of `spans`, so some handler path
+/// leaves the callee without raising.
+///
+/// Every raise qualifying is not enough on its own, because the raises are only
+/// the paths that DO raise. A callee whose sole `RAISE_VARARGS` is a handler's
+/// bare re-raise still qualifies when a sibling clause returns instead --
+/// `except ValueError: raise` beside `except TypeError: g += 1; return 0` has
+/// one raise, bare, inside a span. The exemption's resume argument covers the
+/// re-raise coordinate; on the returning path it suppresses the screen for a
+/// body whose write a callee rebuild would replay. The same hole opens inside a
+/// single clause that re-raises conditionally (`if c: raise` then `return 0`).
+///
+/// Answered by forward reachability from each span start over the same
+/// successor model `codewriter.rs` builds: a raise or re-raise ends its path
+/// (that is the coordinate the exemption is about), a `return` answers true,
+/// and the exception edges are followed too, which can only make the answer
+/// stricter. Anything not decodable stops that path rather than continuing into
+/// whatever instruction happens to sit next.
+fn callee_handler_can_return(code: &pyre_interpreter::CodeObject, spans: &[(u32, u32)]) -> bool {
+    use pyre_interpreter::bytecode::Instruction as I;
+
+    let num_instrs = code.instructions.len();
+    // `spans` are byte offsets; the instruction stream is indexed in units.
+    let mut work: Vec<usize> = spans
+        .iter()
+        .map(|(start, _)| *start as usize / 2)
+        .filter(|pc| *pc < num_instrs)
+        .collect();
+    let mut seen = vec![false; num_instrs];
+    while let Some(pc) = work.pop() {
+        if pc >= num_instrs || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
+            if (entry.start as usize / 2..entry.end as usize / 2).contains(&pc) {
+                work.push(entry.target as usize / 2);
+            }
+        }
+        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            continue;
+        };
+        match instruction {
+            I::ReturnValue | I::ReturnGenerator => return true,
+            // The coordinate the exemption is about; the path ends here.
+            I::RaiseVarargs { .. } | I::Reraise { .. } => continue,
+            I::JumpForward { delta } => {
+                work.push(pyre_interpreter::jump_target_forward(
+                    &code.instructions,
+                    pc + 1,
+                    delta.get(op_arg).as_usize(),
+                ));
+                continue;
+            }
+            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => {
+                work.push((pc + 1).saturating_sub(delta.get(op_arg).as_usize()));
+                continue;
+            }
+            I::PopJumpIfFalse { delta }
+            | I::PopJumpIfTrue { delta }
+            | I::PopJumpIfNone { delta }
+            | I::PopJumpIfNotNone { delta }
+            | I::ForIter { delta } => {
+                work.push(pyre_interpreter::jump_target_forward(
+                    &code.instructions,
+                    pc + 1,
+                    delta.get(op_arg).as_usize(),
+                ));
+            }
+            _ => {}
+        }
+        work.push(pc + 1);
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8548,7 +8630,10 @@ mod tests {
             "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        raise\n",
             "def f(x, g):\n    try:\n        return g(x)\n    except ValueError as m:\n        raise\n",
         ] {
-            assert!(callee_only_bare_reraises_in_handlers(&callee(source)));
+            assert!(
+                callee_only_bare_reraises_in_handlers(&callee(source)),
+                "should qualify: {source:?}"
+            );
         }
         for source in [
             // Duplicated `finally` body: the normal copy's bare raise sits
@@ -8562,7 +8647,41 @@ mod tests {
             // No exception table at all.
             "def f(x):\n    raise ValueError(x)\n",
         ] {
-            assert!(!callee_only_bare_reraises_in_handlers(&callee(source)));
+            assert!(
+                !callee_only_bare_reraises_in_handlers(&callee(source)),
+                "should not qualify: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handler_path_that_returns_disqualifies() {
+        // Every raise qualifying does not settle the paths that do NOT raise.
+        // Both bodies below hold exactly one `RAISE_VARARGS`, bare, inside a
+        // handler span, and both leave the callee through a handler without
+        // raising -- the sibling clause in the first, the untaken branch of the
+        // one clause in the second. A callee rebuild on that path replays the
+        // write, which is what the screen this exempts exists to stop.
+        for source in [
+            "def f(x, g):\n    global e\n    try:\n        return g(x)\n    except ValueError:\n        raise\n    except TypeError:\n        e += 1\n        return 0\n",
+            "def f(x, g, c):\n    global e\n    try:\n        return g(x)\n    except ValueError:\n        if c:\n            raise\n        e += 1\n        return 0\n",
+        ] {
+            assert!(
+                !callee_only_bare_reraises_in_handlers(&callee(source)),
+                "should not qualify: {source:?}"
+            );
+        }
+        // A handler that does its own work and still leaves only by re-raising
+        // keeps qualifying, including through a nested block of its own.
+        for source in [
+            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError as m:\n        g(m)\n        raise\n",
+            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        try:\n            pass\n        finally:\n            pass\n        raise\n",
+            "def f(x, g):\n    try:\n        return g(x)\n    except:\n        raise\n",
+        ] {
+            assert!(
+                callee_only_bare_reraises_in_handlers(&callee(source)),
+                "should qualify: {source:?}"
+            );
         }
     }
 }
