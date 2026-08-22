@@ -5090,12 +5090,16 @@ pub(crate) fn bind_builtin_kwargs(
     let keyword_entries = kwargs.map(|dict| unsafe { pyre_object::w_dict_str_entries_wtf8(dict) });
     let mut unknown: Option<usize> = None;
     // PyPy `_match_signature` copies positional values with
-    // `for i in range(take)` so the constant signature bounds let the JIT
-    // unroll ordinary indexed reads. Keep that storage shape instead of Rust
-    // iterator adapters, whose `Filter`/`Enumerate` state has no RPython
-    // counterpart.
+    // `take = min(num_args, co_argcount - upfront)` and `for i in range(take)`,
+    // so the constant signature bounds let the JIT unroll ordinary indexed
+    // reads. Keep that storage shape instead of Rust iterator adapters, whose
+    // `Filter`/`Enumerate` state has no RPython counterpart — and keep the
+    // `min`: `scope` and `filled` are `names.len()` long, while `clinic_arity`
+    // bounds the count of non-null entries rather than the slice itself, so a
+    // null-padded `positional` longer than the signature reaches here.
+    let take = positional.len().min(names.len());
     let mut positional_index = 0;
-    while positional_index < positional.len() {
+    while positional_index < take {
         let value = positional[positional_index];
         scope[positional_index] = value;
         filled[positional_index] = !value.is_null();

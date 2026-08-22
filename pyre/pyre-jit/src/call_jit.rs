@@ -6491,26 +6491,13 @@ pub extern "C" fn bh_load_import_fn(frame_ptr: i64) -> i64 {
         publish_residual_call_exception(err.to_exc_object() as i64);
         return 0;
     }
-    let w_builtin = unsafe { (*frame).get_builtin() };
-    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-        if !w_dict.is_null() {
-            match pyre_interpreter::baseobjspace::finditem_str(w_dict, "__import__") {
-                Ok(Some(value)) => return value as i64,
-                Ok(None) => {}
-                Err(mut err) => {
-                    publish_residual_call_exception(err.to_exc_object() as i64);
-                    return 0;
-                }
-            }
+    match pyre_interpreter::importing::lookup_dunder_import(unsafe { &*frame }) {
+        Ok(w_import) => w_import as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
         }
     }
-    let mut err = pyre_interpreter::PyError::new(
-        pyre_interpreter::PyErrorKind::ImportError,
-        "__import__ not found",
-    );
-    publish_residual_call_exception(err.to_exc_object() as i64);
-    0
 }
 
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.

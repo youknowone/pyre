@@ -4566,12 +4566,12 @@ fn absolute_import(
 // ── IMPORT_NAME ──────────────────────────────────────────────────────
 
 /// PyPy equivalent: pyopcode.py `IMPORT_NAME`.
-pub fn import_name(
-    frame: &mut PyFrame,
-    w_modulename: PyObjectRef,
-    w_fromlist: PyObjectRef,
-    w_flag: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+/// `pyopcode.py` `IMPORT_NAME`'s `self.get_builtin().getdictvalue(space,
+/// '__import__')`, on its own so the interpreter and the JIT's `LoadImport`
+/// residual read the importer the same way.  The `is_module` test has no
+/// upstream counterpart: `get_builtin` can hand back a plain mapping, which
+/// carries no module dict to look the name up in.
+pub fn lookup_dunder_import(frame: &PyFrame) -> Result<PyObjectRef, crate::PyError> {
     let w_builtin = frame.get_builtin();
     let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
@@ -4582,8 +4582,18 @@ pub fn import_name(
         }
     } else {
         None
-    }
-    .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))?;
+    };
+    w_import
+        .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))
+}
+
+pub fn import_name(
+    frame: &mut PyFrame,
+    w_modulename: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    w_flag: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let w_import = lookup_dunder_import(frame)?;
 
     let w_locals = match frame.getdebug() {
         Some(d) if !d.w_locals.is_null() => d.w_locals,
