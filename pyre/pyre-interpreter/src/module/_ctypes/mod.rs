@@ -29,7 +29,7 @@ fn finish_cpython_type(
     immutable: bool,
 ) -> pyre_object::PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
-    roots.pin_root(tp);
+    let _ = roots.pin_root(tp);
     let slot = roots.base();
     let w_module = pyre_object::w_str_new(module);
     let tp = roots.get(slot);

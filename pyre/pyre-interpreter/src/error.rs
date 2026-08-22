@@ -679,11 +679,11 @@ impl PyError {
             None
         } else {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(self.exc_object);
+            let _ = pyre_object::gc_roots::pin_root(self.exc_object);
             Some(slot)
         };
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let w_name = pyre_object::w_str_new(name);
         if let Some(slot) = exc_slot {
             self.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -3624,7 +3624,7 @@ fn expected_fmt_arg(format: char) -> &'static str {
 fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> Wtf8Buf {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = _roots.base();
-    _roots.pin_root(obj);
+    let _ = _roots.pin_root(obj);
     let obj = || _roots.get(obj_slot);
 
     let (rendered, fallback) = if format == 'R' {

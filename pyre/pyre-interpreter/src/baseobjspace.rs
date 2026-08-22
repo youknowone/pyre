@@ -13044,9 +13044,9 @@ pub fn call(
     // publish and reload the corresponding raw pointers explicitly.
     let roots = pyre_object::gc_roots::push_roots();
     let root_base = roots.base();
-    roots.pin_root(callable);
-    roots.pin_root(w_args);
-    roots.pin_root(w_kwds.unwrap_or(PY_NULL));
+    let _ = roots.pin_root(callable);
+    let _ = roots.pin_root(w_args);
+    let _ = roots.pin_root(w_kwds.unwrap_or(PY_NULL));
     let callable = || roots.get(root_base);
     let w_args = || roots.get(root_base + 1);
     let w_kwds = || roots.get(root_base + 2);
@@ -19020,13 +19020,13 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
     // them back at every use past this point.
     let _roots = pyre_object::gc_roots::push_roots();
     let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(async_gen);
+    let _ = pyre_object::gc_roots::pin_root(async_gen);
 
     let qualname = unsafe {
         w_generator_get_qualname(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
     };
     let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(qualname);
+    let _ = pyre_object::gc_roots::pin_root(qualname);
     let method_repr = unsafe { crate::display::py_repr_wtf8(w_str_new(method)) }
         .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
     let qualname_repr = unsafe {
@@ -19051,7 +19051,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
             None
         } else {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(err.exc_object);
+            let _ = pyre_object::gc_roots::pin_root(err.exc_object);
             Some(slot)
         };
         let repr = unsafe {

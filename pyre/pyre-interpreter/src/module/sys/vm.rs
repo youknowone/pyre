@@ -356,7 +356,7 @@ fn simple_namespace_new(args: &[PyObjectRef]) -> crate::PyResult {
     // `__getattribute__` or shadows `__dict__` neither runs during
     // construction nor can make `S()` raise.
     let dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(object_slot))?;
-    pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(dict);
     let dict = pyre_object::gc_roots::shadow_stack_get(object_slot + 1);
     unsafe {
         use pyre_object::dictmultiobject::DictStrategy;

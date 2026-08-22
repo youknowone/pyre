@@ -674,7 +674,7 @@ fn pin_object(object: majit_ir::GcRef) {
 fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
     let w_obj = object.0 as PyObjectRef;
     if crate::typedef::cpython_object_is_gc(w_obj) {
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
     }
 }
 
@@ -705,7 +705,7 @@ fn pin_unboxed_container_referents(source_slot: usize) {
             for index in 0..len {
                 let list = pyre_object::gc_roots::shadow_stack_get(source_slot);
                 if let Some(item) = listobject::w_list_getitem(list, index as i64) {
-                    pyre_object::gc_roots::pin_root(item);
+                    let _ = pyre_object::gc_roots::pin_root(item);
                 }
             }
         } else if std::ptr::eq((*w_obj).ob_type, &DICT_TYPE) {
@@ -722,7 +722,7 @@ fn pin_unboxed_container_referents(source_slot: usize) {
                 if let Some((key, _)) = dictmultiobject::w_dict_nth_item(dict, index) {
                     // The typed strategy's GC walker already reported the
                     // boxed value; only its native i64/Vec<u8> key was absent.
-                    pyre_object::gc_roots::pin_root(key);
+                    let _ = pyre_object::gc_roots::pin_root(key);
                 }
             }
         } else if is_specialised_tuple_ii(w_obj) || is_specialised_tuple_ff(w_obj) {
@@ -735,7 +735,7 @@ fn pin_unboxed_container_referents(source_slot: usize) {
             for index in 0..2 {
                 let tuple = pyre_object::gc_roots::shadow_stack_get(source_slot);
                 if let Some(item) = tupleobject::w_tuple_getitem(tuple, index) {
-                    pyre_object::gc_roots::pin_root(item);
+                    let _ = pyre_object::gc_roots::pin_root(item);
                 }
             }
         }
@@ -775,7 +775,7 @@ fn remove_root_slot_preserving_tail(slot: usize) {
 /// safely widen to.
 fn pin_referents(w_obj: PyObjectRef) {
     let source_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     majit_gc::get_referents(majit_ir::GcRef(source as usize), pin_object);
     pin_unboxed_container_referents(source_slot);

@@ -927,7 +927,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // publish one object in every co_consts_w slot before returning PyCode.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::pin_root(obj);
     // The shadow-stack root forwards the wrapper itself; only the raw walker
     // driven from this registry reaches its `co_consts_w` slots. Enrol an
     // off-GC wrapper before the fill loop, or a collection triggered by a
@@ -1363,7 +1363,7 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         // borrow across the re-entrant boundary.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         crate::warn::warn_deprecation("co_lnotab is deprecated, use co_lines instead.")?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let code = unsafe { require_code(obj, name)? };

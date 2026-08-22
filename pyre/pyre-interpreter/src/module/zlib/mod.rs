@@ -201,7 +201,7 @@ static ZDECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLoc
 /// those PyPy type names and add only the observable namespace entry.
 fn publish_cpython_module(ns: PyObjectRef) {
     let roots = pyre_object::gc_roots::push_roots();
-    roots.pin_root(ns);
+    let _ = roots.pin_root(ns);
     let slot = roots.base();
     let module = pyre_object::w_str_new("zlib");
     unsafe {
