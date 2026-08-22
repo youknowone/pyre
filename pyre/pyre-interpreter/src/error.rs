@@ -3639,11 +3639,15 @@ fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
             "<str raised>",
         )
     };
-    match rendered.and_then(|rendered| {
-        let w_rendered = pyre_object::w_str_from_wtf8_managed(rendered);
-        crate::baseobjspace::utf8_w(w_rendered).map(str::to_owned)
-    }) {
-        Ok(rendered) => rendered,
+    match rendered {
+        // `space.utf8_w(w_s)` hands back the string's own buffer, which is what
+        // `py_repr_wtf8` already returned, so only a repr or str that *raised*
+        // takes the rescue below.  Reading it back through a `&str` view
+        // instead would divert a lone surrogate — legal in that buffer — into
+        // the rescue as well, reporting `<repr raised>` for a repr that
+        // succeeded.  The surrogate itself does not survive the last step: the
+        // message this builds is a Rust `String`.
+        Ok(rendered) => rendered.to_string_lossy().into_owned(),
         Err(mut error) => {
             error.write_unraisable(
                 pyre_object::w_none(),
@@ -3655,12 +3659,37 @@ fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> String {
     }
 }
 
-/// `W_Root.getname`: read `__name__` as UTF-8 and suppress a failing lookup
-/// or conversion with `?`.
+/// `W_Root.getname`: read `__name__` and answer `?` when the lookup raises —
+/// for any `OperationError`, not just the two an attribute miss produces.
+///
+/// The name is read off the string's own buffer for the reason
+/// [`format_obj_as_utf8`] gives: a `&str` view would turn a lone surrogate in
+/// `__name__` into a raise, and this function reports a raise as `?`.
 fn format_obj_name(obj: PyObjectRef) -> String {
-    let name =
-        crate::baseobjspace::getattr_str(obj, "__name__").and_then(crate::baseobjspace::utf8_w);
-    name.unwrap_or("?").to_owned()
+    match crate::baseobjspace::getattr_str(obj, "__name__")
+        .and_then(crate::baseobjspace::text_wtf8_w)
+    {
+        Ok(name) => name.to_string_lossy().into_owned(),
+        Err(_) => "?".to_owned(),
+    }
+}
+
+/// `space.type(w_obj).getname(space)` — the `%T` spelling.
+///
+/// The Python-visible type, which is `w_class`; `ob_type` names the storage a
+/// value is laid out as, and a class deriving from a builtin shares its
+/// storage while presenting its own name.
+pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
+    // A tagged int immediate is an exact builtin int; skip the ob_type deref.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
+        return "int".to_string();
+    }
+    unsafe {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+            None => (*(*w_obj).ob_type).name.to_string(),
+        }
+    }
 }
 
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> OperationError {
@@ -3707,7 +3736,7 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> Operat
                 ('T', FmtArg::Obj(_)) => {
                     let obj = _roots.get(next_obj_slot);
                     next_obj_slot += 1;
-                    unsafe { pyre_object::pyobject::type_name_of(obj) }.to_owned()
+                    type_name_of(obj)
                 }
                 ('N', FmtArg::Obj(_)) => {
                     let obj = _roots.get(next_obj_slot);
