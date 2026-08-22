@@ -79,6 +79,38 @@ pub unsafe extern "C" fn PyList_SetItem(
     0
 }
 
+/// `PyList_GET_SIZE(list)` — the unchecked spelling of [`PyList_Size`].
+///
+/// Exported as well as spelled as a macro, for the reason [`Py_TYPE`] is: a
+/// caller that declares the prototype itself rather than including the header
+/// still has to find a symbol.  It reads the list rather than a field of the
+/// mirror, which is the only place the length is.
+///
+/// [`Py_TYPE`]: super::object::Py_TYPE
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_GET_SIZE(object: *mut CPyObject) -> isize {
+    unsafe { PyList_Size(object) }
+}
+
+/// `PyList_GET_ITEM(list, index)` — the unchecked spelling of
+/// [`PyList_GetItem`], exported for the reason [`PyList_GET_SIZE`] is.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_GET_ITEM(object: *mut CPyObject, index: isize) -> *mut CPyObject {
+    unsafe { PyList_GetItem(object, index) }
+}
+
+/// `PyList_SET_ITEM(list, index, item)` — the unchecked spelling of
+/// [`PyList_SetItem`], exported for the reason [`PyList_GET_SIZE`] is.  It
+/// steals the reference its checked twin steals.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_SET_ITEM(
+    object: *mut CPyObject,
+    index: isize,
+    item: *mut CPyObject,
+) {
+    unsafe { PyList_SetItem(object, index, item) };
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Append(object: *mut CPyObject, item: *mut CPyObject) -> c_int {
     super::object::realize_all([object, item]);
@@ -262,6 +294,9 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyList_Size as *const ());
     std::hint::black_box(PyList_GetItem as *const ());
     std::hint::black_box(PyList_SetItem as *const ());
+    std::hint::black_box(PyList_GET_SIZE as *const ());
+    std::hint::black_box(PyList_GET_ITEM as *const ());
+    std::hint::black_box(PyList_SET_ITEM as *const ());
     std::hint::black_box(PyList_Append as *const ());
     std::hint::black_box(PyList_GetItemRef as *const ());
     std::hint::black_box(PyList_Insert as *const ());
