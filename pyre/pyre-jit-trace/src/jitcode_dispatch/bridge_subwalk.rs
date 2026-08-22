@@ -1458,8 +1458,27 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // would replay them.  Capture the frames while this `WalkContext` still
         // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
         // the image, and a decline there leaves the pre-existing rollback.
+        let audit = bridge_latch_audit_enabled();
         if let Err(ref error) = outcome {
-            let _ = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            // Sampled before the latch: afterwards `abort_blackhole_latched` is
+            // always true.  `already_latched` is the one that matters — it means
+            // this call replaced an inner frame's image with one rooted here.
+            let already_latched = audit.then(abort_blackhole_latched);
+            let accepted = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            if let Some(already_latched) = already_latched {
+                eprintln!(
+                    "[bridge-latch] outcome=err already_latched={already_latched} complete_image={} accepted={accepted} stop_pc={} error={error:?}",
+                    error.leaves_complete_image(),
+                    error.stop_pc(),
+                );
+            }
+        } else if audit {
+            // Reported on the Ok leg too, so the absence of an `outcome=err`
+            // line means "this sub-walk never aborted" rather than "the site was
+            // never reached".  A silent counter cannot tell those apart, and
+            // reading one as the other is how a diagnostic ends up proving
+            // nothing.
+            eprintln!("[bridge-latch] outcome=ok");
         }
         outcome
     };
