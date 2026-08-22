@@ -418,36 +418,6 @@ pub extern "C" fn pyre_stack_get_length_adr() -> usize {
     &raw const PYRE_STACKTOOBIG.stack_length as usize
 }
 
-/// rpython/translator/c/src/stack.c:23-36 `_ll_stack_os_limit`. Size in
-/// bytes of this thread's C stack as the OS sees it, or 0 when
-/// unknown/unlimited. Computed once and cached: this is not on a hot
-/// path, but `test.support.infinite_recursion()` toggles the recursion
-/// limit in a loop, so caching keeps repeated calls free.
-#[cfg(not(any(windows, target_arch = "wasm32")))]
-#[allow(dead_code)]
-fn stack_os_limit() -> usize {
-    static CACHED: AtomicUsize = AtomicUsize::new(usize::MAX);
-    let cached = CACHED.load(Ordering::Relaxed);
-    if cached != usize::MAX {
-        return cached;
-    }
-    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
-    let limit = match unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } {
-        0 if rl.rlim_cur != libc::RLIM_INFINITY && rl.rlim_cur != 0 => rl.rlim_cur as usize,
-        _ => 0,
-    };
-    CACHED.store(limit, Ordering::Relaxed);
-    limit
-}
-
-/// Windows before `GetCurrentThreadStackLimits` (Windows 8) and wasm32
-/// have no runtime query, so no clamp applies — matching the
-/// `#ifdef` fallthrough at stack.c:36-45.
-#[cfg(any(windows, target_arch = "wasm32"))]
-fn stack_os_limit() -> usize {
-    0
-}
-
 /// rpython/translator/c/src/stack.c:58-77 `LL_stack_set_length_fraction`.
 ///
 /// ```c
