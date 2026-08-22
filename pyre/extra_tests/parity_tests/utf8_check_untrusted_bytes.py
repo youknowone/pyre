@@ -43,4 +43,12 @@ assert _json.scanstring('"ab"', 1) == ("ab", 4)
 assert raises(ValueError, lambda: b"ab".hex(chr(0xDC80))) == "sep must be ASCII."
 assert b"ab".hex("-") == "61-62"
 
+# `fromhex` rejects one as an ordinary non-hex character.  Everything before
+# the first rejected character is ASCII, so its byte offset is its index.
+for subject, position in ((chr(0xDC80), 0), ("41" + chr(0xDC80) + "42", 2), ("41\u4e2d", 2)):
+    reason = f"non-hexadecimal number found in fromhex() arg at position {position}"
+    assert raises(ValueError, lambda: bytes.fromhex(subject)) == reason
+    assert raises(ValueError, lambda: bytearray.fromhex(subject)) == reason
+assert bytes.fromhex("41 42") == b"AB"
+
 print("OK")

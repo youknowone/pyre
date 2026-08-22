@@ -23087,7 +23087,12 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let a = args[0];
     if unsafe { pyre_object::is_str(a) } {
-        return parse_hex_bytes(unsafe { pyre_object::w_str_get_value(a) }.as_bytes());
+        // Every character before the first rejected one is a hex digit or
+        // ASCII whitespace, so the byte offset the scan reports is also the
+        // code point offset `_PyBytes_FromHex` names.  Reading the WTF-8
+        // payload rather than demanding a `str` keeps a lone surrogate a
+        // rejected character instead of an abort.
+        return parse_hex_bytes(unsafe { pyre_object::w_str_get_wtf8(a) }.as_bytes());
     }
     let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(a)? else {
         return Err(crate::PyError::type_error(format!(
