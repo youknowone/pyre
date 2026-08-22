@@ -395,8 +395,24 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     // barrier below: either operation can park behind another thread's
     // collection, which may move the otherwise-unrooted fresh array.
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    // Ask the ownership question first: it is the operation that can park
+    // behind a collection, and the barrier has to be the last thing before the
+    // items land, the way `writebarrier_before_copy` precedes `ll_arraycopy`'s
+    // memcpy.  Asking it after the fill leaves the young elements in an
+    // unregistered old-gen block across that wait, where a minor collection
+    // does not trace them.  A move during the query keeps the answer, since
+    // both generations are managed; re-read the block for the address.
+    let owns_block = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
+        block_slot,
+    ) as *mut u8);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
+    // Old→young barrier if the block landed in old-gen (see
+    // alloc_tuple_items_block_gc): registers an old-gen block holding young
+    // elements onto the remembered set, no-op for a nursery block.
+    if owns_block {
+        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+    }
     if len > 0 {
         // RPython's pop_roots reloads the livevars as one generated block.
         // Enter TLS once for the whole contiguous item range instead of once
@@ -407,12 +423,6 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     }
     for i in len..cap {
         unsafe { *base.add(i) = PY_NULL };
-    }
-    // Old→young barrier if the block landed in old-gen (see
-    // alloc_tuple_items_block_gc): registers an old-gen block holding young
-    // elements onto the remembered set, no-op for a nursery block.
-    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
-        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
     }
     block
 }
@@ -471,22 +481,28 @@ pub unsafe fn grow_list_items_block_gc(
     let new_block_slot = crate::gc_roots::shadow_stack_len();
     let new_block = unsafe { alloc_items_block_gc(new_cap) };
     let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
+    // The ownership query is the safepoint, so it runs before the barrier and
+    // the copy — see `alloc_list_items_block_gc` for why the barrier cannot
+    // follow the items.
+    let owns_new = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
+        new_block_slot,
+    ) as *mut u8);
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
     let old = old_slot
         .map(|slot| crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock)
         .unwrap_or(old);
+    // Old→young barrier if the grown block landed in old-gen (see
+    // alloc_tuple_items_block_gc).
+    if owns_new {
+        crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
+    }
     if live_len > 0 {
         let old_base = unsafe { items_block_items_base(old) };
         unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
     }
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };
-    }
-    // Old→young barrier if the grown block landed in old-gen (see
-    // alloc_tuple_items_block_gc).
-    if crate::gc_hook::try_gc_owns_object(new_block as *mut u8) {
-        crate::gc_hook::try_gc_write_barrier(new_block as *mut u8);
     }
     new_block
 }
@@ -513,13 +529,13 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    // The ownership query is the safepoint, so it runs before the barrier and
+    // the fill — see `alloc_list_items_block_gc`.
+    let owns_block = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
+        block_slot,
+    ) as *mut u8);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    if cap > 0 {
-        // Same block-shaped pop_roots reload as the list constructor above.
-        let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
-        crate::gc_roots::shadow_stack_copy_range(save, dst);
-    }
     // The block may have landed in old-gen (nursery-full fallback) while its
     // elements are still young. That old→young edge is invisible to a minor
     // collection unless the block is on the remembered set, so write-barrier
@@ -527,8 +543,13 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     // a no-op; an old-gen block is registered so the next minor collection
     // walks its items (write_barrier_from_array, incminimark.py). Guard
     // on GC ownership exactly like `list_write_barrier`.
-    if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+    if owns_block {
         crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+    }
+    if cap > 0 {
+        // Same block-shaped pop_roots reload as the list constructor above.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
+        crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
     block
 }
@@ -1065,17 +1086,22 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
         }
         mem as *mut FixedObjectArray
     };
+    // The ownership query can park behind another thread's collection, so it
+    // runs before the elements are written rather than between them and the
+    // barrier — see `alloc_list_items_block_gc`.  The block is stable, so no
+    // re-read is owed for the address.
+    let owns_block = crate::gc_hook::try_gc_owns_object(block as *mut u8);
     unsafe {
         (*block).len = len;
-        let items = (*block).items_mut_ptr();
-        for (i, &v) in values.iter().enumerate() {
-            items.add(i).write(v);
-        }
         // Old→young barrier if the block landed in old-gen and any element is a
         // young object: registers the block on the remembered set so a later
         // minor collection forwards the young MRO entries.
-        if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
+        if owns_block {
             crate::gc_hook::try_gc_write_barrier(block as *mut u8);
+        }
+        let items = (*block).items_mut_ptr();
+        for (i, &v) in values.iter().enumerate() {
+            items.add(i).write(v);
         }
     }
     block

@@ -3202,6 +3202,15 @@ impl PyFrame {
         frame.valuestackdepth = idx + 1;
     }
 
+    /// Reads and writes through the caller's `&mut self`, without the
+    /// [`Self::live_mut`] reload [`Self::push`] takes.
+    ///
+    /// That is sound because the opcode bodies keep `pyopcode.py`'s
+    /// `pop; op; push` order: every pop runs before the operation that can
+    /// collect, and the push that follows the operation reloads for itself.
+    /// A body that allocates between two pops breaks the premise — the second
+    /// pop would read the abandoned copy — and owes the reload at its own call
+    /// site.
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
         if self.valuestackdepth <= self.stack_base() {
