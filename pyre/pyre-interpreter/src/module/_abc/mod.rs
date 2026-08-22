@@ -18,6 +18,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // `_abc_negative_cache_version` is compared against this on every check.
 static INVALIDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Boxes holding the root slots [`root_forever`] registers, kept for the life
+/// of the process.  A `Vec` reallocation would move a word the collector still
+/// writes through, so the indirection is what makes the registration outlive
+/// the next push.
+static ROOTED_SLOTS: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(Vec::new());
+
+/// Keep an object this module will go on naming by address.
+///
+/// Everything stashed below is an ordinary mortal GC object reached through a
+/// module attribute, and old-gen is mark-sweep: not moving is not staying
+/// alive.  Rebinding the attribute, or dropping the module, lets the sweep
+/// reclaim the object while the stash still hands its address out — and the
+/// collector traces neither the stash nor anything that would keep the object
+/// on its account.  [`simple_weak_set_type`] would then name freed memory, and
+/// the identity comparison could match an address the allocator has since
+/// handed to something else.  Registering the address in a stable slot is what
+/// buys survival, the `_structseq.rs` `root_structseq_type` idiom.
+///
+/// The stashes stay plain addresses rather than reads of these slots.  Types,
+/// functions and code objects are all born outside the nursery, so no walker
+/// rewrites a slot naming one and a read back through the root would return
+/// the same bits; only list and dict headers move.
+fn root_forever(obj: PyObjectRef) {
+    let mut slot = Box::new(obj as usize);
+    let root_slot = (&raw mut *slot) as *mut *mut u8;
+    unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+    ROOTED_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(slot);
+}
+
 /// The app-level `SimpleWeakSet` (`app_abc.py`), stashed at module init
 /// the way `weakref_type` stashes its own.  The registry and both caches are
 /// instances of it, so the collection this module installs is the one
@@ -853,9 +885,20 @@ crate::py_module! {
         );
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
+        root_forever(simple_weak_set);
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
         let installed = simple_weak_set_contains_identity();
         if installed != (0, 0, 0, 0) {
+            // Each word is an address the comparison keeps naming, so each has
+            // to outlive the stash for a match to mean the body is unchanged
+            // rather than that the allocator reused the address.  The
+            // `TypeError` word is `0` unless a module entry shadows the
+            // builtin, and zero names nothing.
+            for word in [installed.0, installed.1, installed.2, installed.3] {
+                if word != 0 {
+                    root_forever(word as PyObjectRef);
+                }
+            }
             let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
         }
     },
