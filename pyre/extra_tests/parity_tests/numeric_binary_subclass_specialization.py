@@ -167,4 +167,51 @@ assert math.log(100, ToFloat(10)) == 2.0
 assert coerce_hot(tail(16, ToFloat(16)), math.isqrt) == 4
 assert coerce_hot(tail(0, ToFloat(0)), lambda a: math.ldexp(1.0, a)) == 1.0
 
+
+# ── the subclass that does NOT override ─────────────────────────────────────
+# Every gate above sends a strict subclass to a `__float__` lookup. When it
+# overrides nothing, that lookup resolves to the INHERITED `int.__float__` /
+# `float.__float__`, which convert the receiver's payload. Binding either name
+# to its constructor instead makes this case re-enter the lookup that reached
+# it, so these asserts are what separates a payload-only dunder from one.
+class Plain(int):
+    pass
+
+
+class PlainFloat(float):
+    pass
+
+
+assert float(Plain(7)) == 7.0
+assert type(float(Plain(7))) is float
+assert Plain(7).__float__() == 7.0
+assert int.__float__(Plain(7)) == 7.0
+assert float(PlainFloat(4.5)) == 4.5
+assert type(float(PlainFloat(4.5))) is float
+
+assert coerce_hot(tail(4, Plain(4)), float) == 4.0
+assert coerce_hot(tail(4, Plain(4)), math.sqrt) == 2.0
+assert coerce_hot(tail(4, Plain(4)), math.frexp) == math.frexp(4.0)
+assert coerce_hot(tail(4, Plain(4)), complex) == complex(4.0, 0.0)
+assert coerce_hot(tail(4, Plain(4)), lambda a: format(a, ".2f")) == "4.00"
+assert coerce_hot(tail(4.0, PlainFloat(4.0)), math.sqrt) == 2.0
+assert math.log(100, Plain(10)) == 2.0
+
+# `int.__float__` converts a payload rather than constructing, so a receiver of
+# the wrong layout is a descriptor error, not a conversion.
+try:
+    int.__float__("x")
+except TypeError as exc:
+    assert "requires a 'int' object" in str(exc), exc
+else:
+    raise AssertionError("int.__float__ accepted a str")
+
+# `rbigint.tofloat()` raises rather than answering inf.
+try:
+    (1 << 2000).__float__()
+except OverflowError as exc:
+    assert "too large" in str(exc), exc
+else:
+    raise AssertionError("no OverflowError for an out-of-range int")
+
 print("OK")

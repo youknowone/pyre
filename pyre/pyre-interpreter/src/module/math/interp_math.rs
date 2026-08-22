@@ -823,28 +823,10 @@ fn bigint_log(n: &BigInt, base: f64) -> Result<f64, crate::PyError> {
 /// [`log_any`] handles inline; `try_get_double` would consult an overridden
 /// `__float__` here and answer a different logarithm.
 fn log_operand_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    unsafe {
-        if pyre_object::is_bool(obj) {
-            return Ok(if pyre_object::w_bool_get_value(obj) {
-                1.0
-            } else {
-                0.0
-            });
-        }
-        if pyre_object::is_int(obj) {
-            return Ok(pyre_object::w_int_get_value(obj) as f64);
-        }
-        if pyre_object::is_long(obj) {
-            let v = jit_bigint_to_f64_or_nan(w_long_get_value(obj));
-            if !v.is_finite() {
-                return Err(crate::PyError::overflow_error(
-                    "int too large to convert to float",
-                ));
-            }
-            return Ok(v);
-        }
+    match crate::builtins::int_payload_as_f64(obj) {
+        Some(value) => value,
+        None => try_get_double(obj),
     }
-    try_get_double(obj)
 }
 
 /// Special-case integer arguments to avoid overflow, and give the domain
