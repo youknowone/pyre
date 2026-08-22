@@ -1576,6 +1576,7 @@ bound_pool!(
 );
 
 /// Every pool, for the questions asked of all of them at once.
+#[cfg(test)]
 static BOUND_FAMILIES: &[&BoundFamily] = &[
     &UNARY_BOUND,
     &LENGTH_BOUND,
