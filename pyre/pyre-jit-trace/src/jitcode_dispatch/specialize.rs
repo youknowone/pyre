@@ -7673,8 +7673,12 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
 /// constant True and the attribute's value is never loaded, which is strictly
 /// less work than the `getattr` fold does for the same receiver.
 ///
-/// Absence is a different proof — the shape resolver declines a name it cannot
-/// place rather than reporting "not here" — so a miss stays on the residual.
+/// Absence is a different proof, and `getattr_absent_fast_path` is the one that
+/// carries it: the two pins keep `name` off both the type and the receiver's
+/// own storage, and with no `__getattr__` left to run the access ends in the
+/// `AttributeError` this builtin reports as False.  Neither hit resolver can
+/// stand in for it — they decline a name they cannot *place*, which is not the
+/// same claim as "not here".
 pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -7731,9 +7735,15 @@ pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
     // the same refusals first (custom `__getattribute__`, an `INVALID`
     // classify, an uncacheable `version_tag`), so a `Some` from either means
     // the lookup this fold replaces cannot raise.
-    let Some((w_type, version_tag, map)) = (unsafe {
+    //
+    // Absence is its own proof, not the failure of these two:
+    // `getattr_absent_fast_path` reports it only when the same two pins keep
+    // `name` off both the type and the receiver's storage AND there is no
+    // `__getattr__` left to run, which is exactly when the access ends in the
+    // AttributeError this builtin reports as False.
+    let Some((w_type, version_tag, map, answer)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name)
-            .map(|(w_type, version_tag, map, _storageindex)| (w_type, version_tag, map))
+            .map(|(w_type, version_tag, map, _storageindex)| (w_type, version_tag, map, true))
             .or_else(|| {
                 pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
                     concrete_obj,
@@ -7741,9 +7751,16 @@ pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
                 )
                 .map(
                     |(w_type, version_tag, map, _storageindex, _listindex, _unbox)| {
-                        (w_type, version_tag, map)
+                        (w_type, version_tag, map, true)
                     },
                 )
+            })
+            .or_else(|| {
+                pyre_interpreter::objspace::std::mapdict::getattr_absent_fast_path(
+                    concrete_obj,
+                    name,
+                )
+                .map(|(w_type, version_tag, map)| (w_type, version_tag, map, false))
             })
     }) else {
         return Ok(None);
@@ -7782,7 +7799,7 @@ pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
         version_tag,
         map,
     )?;
-    walker_write_const_bool_result(ctx, op.pc, true, dst, 'r')?;
+    walker_write_const_bool_result(ctx, op.pc, answer, dst, 'r')?;
     Ok(Some(()))
 }
 

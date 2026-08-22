@@ -1793,6 +1793,47 @@ pub unsafe fn getattr_hook_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
+    Some((w_type, version_tag, map, w_getattr))
+}
+
+/// The `__getattr__`-less twin of [`getattr_hook_fast_path`]: `name` resolves
+/// nowhere *and* the type has no hook to run afterwards, so the access ends in
+/// the `AttributeError` `object_getattr_miss` raises.
+///
+/// That makes the whole miss a compile-time answer for the callers that only
+/// need to know the access fails — `hasattr(obj, name)` is then a constant
+/// False and `getattr(obj, name, default)` is `default`. The two pins the
+/// caller owes are the same ones [`getattr_hook_fast_path`] documents.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn getattr_absent_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef)> {
+    let pins = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    // A hook would run application code whose answer neither pin describes,
+    // and which can return a value or raise something other than
+    // AttributeError.
+    if unsafe { crate::baseobjspace::lookup_in_type_where(pins.0, "__getattr__") }.is_some() {
+        return None;
+    }
+    Some(pins)
+}
+
+/// The shared miss proof behind [`getattr_hook_fast_path`] and
+/// [`getattr_absent_fast_path`]: `name` is on neither the type nor the
+/// receiver's own storage, and the returned `version_tag` / `map` pins are what
+/// keep that true.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+unsafe fn getattr_resolves_nowhere(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef)> {
     // mapdict.py:1495 `if map is not None:` — also filters non-instances.
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
@@ -1841,8 +1882,7 @@ pub unsafe fn getattr_hook_fast_path(
     if unsafe { find_map_attr(map, Wtf8::new(name), DICT) }.is_some() {
         return None;
     }
-    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
-    Some((w_type, version_tag, map, w_getattr))
+    Some((w_type, version_tag, map))
 }
 
 /// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
