@@ -242,6 +242,26 @@ assert sorted([(1, 2, 3), (0, 3, 6)], key=lambda x: x[0]) == [(0, 3, 6), (1, 2, 
 assert sorted([(1, 2, 3), (0, 3, 6)], key=lambda x: x[1]) == [(1, 2, 3), (0, 3, 6)]
 assert sorted([(1, 2), (), (5,)], key=len) == [(), (5,), (1, 2)]
 
+# The all-int sorter stands in for the integer list strategy, so it must
+# accept exactly what that strategy does.  A bigint is an exact `int` by class
+# while storing a pointer where a machine int stores its value, so admitting
+# one orders the list by that pointer -- always a large positive number, which
+# is why only a negative bigint, or a bigint that should lose to a large
+# machine int, tells the two orders apart.
+_big = 2**70
+assert sorted([-_big, 5]) == [-_big, 5]
+assert sorted([5, -_big]) == [-_big, 5]
+assert sorted([_big, 2**62]) == [2**62, _big]
+assert sorted([-_big, 0, _big]) == [-_big, 0, _big]
+assert sorted([_big, -_big, 3, -4]) == [-_big, -4, 3, _big]
+_l = [3, -_big, 7, -1]
+_l.sort()
+assert _l == [-_big, -1, 3, 7]
+_l.sort(reverse=True)
+assert _l == [7, 3, -1, -_big]
+# A bool alongside a bigint keeps the same requirement.
+assert sorted([True, -_big, False]) == [-_big, False, True]
+
 lst = [3, 1, 5, 2, 4]
 
 

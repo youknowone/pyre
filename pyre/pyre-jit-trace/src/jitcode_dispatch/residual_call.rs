@@ -1242,6 +1242,12 @@ impl Drop for LiveLastInstrGuard {
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
         // commit withdrawal still restores the resume pc rather than the
         // executing one.
+        // The test is "did an escape happen on THIS frame", not "did a flush
+        // write a resume pc".  Both legs arm the capture and both leave the
+        // frame heap-authoritative at the published executing coordinate, so
+        // narrowing this to the committing leg restores the PRE-call coordinate
+        // on the locals-only escapes — the withdrawn-too-early defect
+        // `getframe_caller_resume_coord_two_call_sites` measures and prints.
         let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
@@ -3921,16 +3927,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 .find(|(_, a)| *a == func_ptr as i64)
                 .map(|(n, _)| *n);
             eprintln!(
-                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} writes_live={writes_live_heap} \
-                 entered_frame={} fn={:?}/{:#x}",
+                "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} extraeffect={:?} \
+                 writes_live={writes_live_heap} entered_frame={} fn={:?}/{:#x}",
                 call_descr.result_type(),
+                ei.extraeffect,
                 heap_write_odometer_before
                     .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
                 name,
                 func_ptr as usize,
             );
         }
-        fbw_bump_executed_effect();
+        fbw_bump_executed_effect("residual");
     }
     match exec_result {
         Ok(result_i64) => {
@@ -6105,6 +6112,117 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_fabs", || {
+            try_walker_specialize_math_fabs(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_float1", || {
+            try_walker_specialize_math_float1(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_float2", || {
+            try_walker_specialize_math_float2(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_isclose", || {
+            try_walker_specialize_math_isclose(ctx, code, op, &r_args, dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_fold1", || {
+            try_walker_specialize_builtin_fold1(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("builtin_fold2", || {
+            try_walker_specialize_builtin_fold2(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_floor", || {
+            try_walker_specialize_math_round_to_int(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                MathRoundMode::Floor,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_ceil", || {
+            try_walker_specialize_math_round_to_int(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                MathRoundMode::Ceil,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && spec_gate("math_trunc", || {
+            try_walker_specialize_math_round_to_int(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                MathRoundMode::Trunc,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && spec_gate("int_call", || {
             try_walker_specialize_int_call(ctx, code, op, &r_args, dst)
         })?
@@ -6641,7 +6759,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         }
                         WalkerStoreAttrSpecialization::Direct => {
                             fbw_mark_foriter_body_effect_since_consume();
-                            fbw_bump_executed_effect();
+                            fbw_bump_executed_effect("store_attr_direct");
                             return Ok((DispatchOutcome::Continue, op.next_pc));
                         }
                     }

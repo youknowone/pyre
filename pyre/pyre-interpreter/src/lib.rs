@@ -145,6 +145,7 @@ pub mod host_seam {
     }
 }
 pub mod async_operation;
+pub mod jit_builtin_folds;
 pub mod jit_fnaddr;
 pub mod launch_env;
 pub mod listobject;

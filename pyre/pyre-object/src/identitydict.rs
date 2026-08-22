@@ -336,12 +336,13 @@ impl DictStrategy for IdentityDictStrategy {
             .collect()
     }
 
-    /// `dictmultiobject.py:1095-1098 AbstractTypedStrategy.getitem` reads one
+    /// `dictmultiobject.py AbstractTypedStrategy.getitem` reads one
     /// entry off the typed storage.  The trait default instead rebuilds the
     /// whole `items()` per step, which makes one view walk quadratic in the
     /// entry count — and unlike the empty strategies it is written for, this
     /// one backs every dict keyed on ordinary instances.  `wrap` is identity
-    /// here (`identitydict.py:26-27`), so the entry needs no allocation.
+    /// here (`identitydict.py IdentityDictStrategy.wrap`), so the entry needs
+    /// no allocation.
     unsafe fn nth_item(
         &self,
         w_dict: PyObjectRef,

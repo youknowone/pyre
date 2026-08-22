@@ -11082,7 +11082,7 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
 ///
 /// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
-/// spelling (`jitcode.py fnaddr=None`) and must not be called either. The
+/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called either. The
 /// `func == 0` arm of the backends' `bh_call_*` returns `0`/null instead, which
 /// is a fine no-op convention for a `residual_call` whose funcptr the host
 /// deliberately left unbound, but for an `inline_call` it would fabricate a

@@ -897,7 +897,7 @@ pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
 /// `QuasiImmutDescr.__init__` (`pyjitpl.py`) calls it: a write reached
 /// later in that same trace then sees a non-null `mutate_*` field and aborts
 /// the attempt. The instance is handed back so the recording can carry it to
-/// `heap.py is_still_valid_for` and `compile.py
+/// `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` and `compile.py
 /// register_loop_token`, after which [`w_type_notify_quasi_immut_watchers`]
 /// revokes the loop when the tag is bumped.
 ///

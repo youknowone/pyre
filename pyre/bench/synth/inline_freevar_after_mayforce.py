@@ -1,11 +1,20 @@
 # pyre-check: max-pypy-ratio=86
-# pyre-check: jitstats-band=guard_failures=1
-# One tree, three runners, one CI run (`1d212895c6b`): macOS and ubuntu read
-# 1003 dynasm / 1008 cranelift, windows 1004 / 1009. The loop and bridge counts
-# agreed at six and five everywhere, so the split is carried entirely by this
-# counter and is not a function of the tree. The baseline holds the pair the two
-# agreeing runners read; the band is exactly the measured width, so anything
-# wider than the split still gates.
+# pyre-check: jitstats-band=guard_failures=8
+# `guard_failures` here is carried by two things this fixture is not about.
+# One is the host: one tree read 1003 dynasm / 1008 cranelift on macOS and
+# ubuntu and 1004 / 1009 on windows in a single CI run (`1d212895c6b`), with the
+# loop and bridge counts agreeing everywhere. The other is the collection
+# schedule -- one binary swept across nursery sizes read 1034 / 1014 / 1007 /
+# 1007 at 2 / 4 / 6 / 8 MB, 27 counts, while `loops_compiled` and
+# `bridges_compiled` did not move. Suppressing the whole trace-time fold table
+# moved it by one count and suppressing the folds this branch adds by none, so
+# it is not reading those either.
+#
+# Width 8 covers both: the one-count host split, and the several counts a tree
+# that allocates differently picks up on top of it -- this branch read 1011 on
+# all three runners against a baseline of 1008. Anything wider than a tree's own
+# allocation behaviour still gates, and `loops_compiled` and `bridges_compiled`
+# stay gated exactly. Only the loop count answers whether the arm compiles.
 # The ceiling is a function of N, so raising N refits it. pypy's execution here
 # is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
 # backend pays roughly 27us per iteration, so the ratio tracks N nearly one for

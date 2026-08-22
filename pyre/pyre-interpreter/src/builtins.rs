@@ -4612,8 +4612,64 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     };
     builtin_abs_obj(obj)
 }
+/// Whether the receiver's `__abs__` is still the one its builtin numeric type
+/// installs, which is what makes the structural arms below correct for it.
+/// `int` covers the bigint representation and `bool`, neither of which
+/// registers its own.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is readable.
+unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
+    let w_class = unsafe { (*obj).w_class };
+    if w_class.is_null() {
+        return true;
+    }
+    // An exact receiver cannot carry a replacement, so the common call spends
+    // a pointer compare rather than a lookup.
+    for tp in [
+        &pyre_object::INT_TYPE,
+        &pyre_object::FLOAT_TYPE,
+        &pyre_object::COMPLEX_TYPE,
+    ] {
+        if std::ptr::eq(w_class, pyre_object::get_instantiate(tp)) {
+            return true;
+        }
+    }
+    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__abs__") })
+    else {
+        return true;
+    };
+    [
+        &pyre_object::INT_TYPE,
+        &pyre_object::FLOAT_TYPE,
+        &pyre_object::COMPLEX_TYPE,
+    ]
+    .into_iter()
+    .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp)))
+}
 
 fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    // `operation.py`'s `abs` hands the operand to `space.abs`, which reaches
+    // `__abs__` through the type, so a subtype that replaced the builtin one —
+    // `__abs__ = None` included — is dispatched by the lookup below rather than
+    // answered structurally.
+    if unsafe { abs_uses_builtin(obj) } {
+        return abs_structural(obj);
+    }
+    unsafe {
+        if let Some(tp) = crate::typedef::r#type(obj)
+            && let Some(method) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__abs__")
+        {
+            return crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[]);
+        }
+    }
+    Err(abs_bad_operand(obj))
+}
+
+/// `int.__abs__` / `float.__abs__`: the layout arms on their own.  These are
+/// what the lookup in `builtin_abs_obj` dispatches to, so they must not repeat
+/// it — a subtype whose `__abs__` calls back into one would not terminate.
+fn abs_structural(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -4628,10 +4684,11 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         }
         if is_long(obj) {
             let val = w_long_get_value(obj);
-            // rbigint.py:1303-1308 returns `self` for nonnegative values;
-            // longobject.py then allocates a fresh W_LongObject around
-            // that same rbigint. Preserve both wrapper identity and payload
-            // sharing instead of translating `Clone` into another GC payload.
+            // `rbigint.abs` returns `self` for nonnegative values, and
+            // longobject.py's `_make_descr_unaryop('abs')` then allocates a
+            // fresh W_LongObject around that same rbigint. Preserve both
+            // wrapper identity and payload sharing instead of translating
+            // `Clone` into another GC payload.
             if val.get_sign() != -1 {
                 return Ok(pyre_object::longobject::w_long_from_raw(
                     pyre_object::longobject::w_long_get_raw_value(obj),
@@ -4646,19 +4703,23 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             return crate::objspace::descroperation::complex_abs(obj);
         }
     }
-    // Instance __abs__ — PyPy: baseobjspace.py abs
-    unsafe {
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__abs__") {
-                return crate::call::call_function_impl_result(method, &[obj]);
-            }
-        }
-    }
-    Err(crate::PyError::type_error(format!(
+    Err(abs_bad_operand(obj))
+}
+
+/// `int.__abs__` / `float.__abs__` as gateway functions.
+pub fn builtin_abs_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__abs__")?,
+    };
+    abs_structural(obj)
+}
+
+fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
         "bad operand type for abs(): '{}'",
         crate::baseobjspace::object_functionstr_type_name(obj)
-    )))
+    ))
 }
 
 pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5167,12 +5228,12 @@ pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
 ///   - reject any kwargs other than `key` / `default`
 ///   - reject `default=` paired with multiple positional args
 ///   - require ≥1 positional arg
-fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     min_max_dispatch(args, /* want_max= */ false, "min")
 }
 
 /// `max(a, b)` / `max(iterable)` — return the largest of two values or an iterable.
-fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     min_max_dispatch(args, /* want_max= */ true, "max")
 }
 
@@ -10367,6 +10428,41 @@ pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     )))
 }
 
+/// `int.__float__(self)`, which `bool` inherits — intobject.py `descr_float`.
+/// Structural only, for the reason `builtin_float_dunder` gives: `float()`
+/// looks `__float__` up on a subtype, and this is what that lookup resolves to
+/// when the subtype does not override it.
+pub(crate) fn builtin_int_float_dunder(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if is_bool(obj) {
+            return Ok(floatobject::w_float_new(if w_bool_get_value(obj) {
+                1.0
+            } else {
+                0.0
+            }));
+        }
+        if is_int(obj) {
+            return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
+        }
+        if pyre_object::is_long(obj) {
+            let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
+            if !v.is_finite() {
+                return Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(floatobject::w_float_new(v));
+        }
+    }
+    Err(crate::PyError::type_error(format!(
+        "descriptor '__float__' requires an 'int' object but received a '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
+}
+
 /// `float(obj)` → convert to float
 pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -10391,7 +10487,13 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             if is_exact_type(obj, &FLOAT_TYPE) {
                 return Ok(obj);
             }
-        } else if is_int(obj) {
+        } else if is_int(obj) && is_exact_type(obj, &INT_TYPE) {
+            // Exact only, for the reason the `float` arm above gives: an `int`
+            // subtype falls through to the `__float__` lookup so an override
+            // is honored, and resolves to `int.__float__` when there is none.
+            // `is_exact_type` answers on `w_class`, which a bigint shares with
+            // `int`, so `is_int` (which reads `ob_type`) is what separates the
+            // two layouts here.
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
         if is_bool(obj) {
@@ -10401,7 +10503,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 0.0
             }));
         }
-        if pyre_object::is_long(obj) {
+        if pyre_object::is_long(obj) && is_exact_type(obj, &INT_TYPE) {
             // A Python int is finite, so a non-finite conversion means the
             // magnitude exceeds f64 range.
             let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
@@ -14397,7 +14499,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
 
 /// `ord(c)` — PyPy: operation.py ord (dispatches to space.ord);
 /// `unicodeobject.py:155-160` raises TypeError on multi-char strings.
-fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(
             "ord() takes exactly one argument",
@@ -15124,9 +15226,12 @@ impl crate::listsort::SortLt<usize> for SortCompare {
 /// upstream — so the test has to be `is_exact_type` (pyobject.rs), which
 /// compares the instance's `w_class` against the builtin's type object and so
 /// rejects a subclass, which retags `w_class` to its own.  `is_int` / `is_str`
-/// / `is_float` are NOT usable here: they are `py_type_check`, an `ob_type`
-/// layout test a subclass instance also passes because it shares the builtin
-/// vtable.  A `key=` sort is `CustomKeySort`, generic upstream as well.
+/// / `is_float` are NOT usable here ON THEIR OWN: they are `py_type_check`, an
+/// `ob_type` layout test a subclass instance also passes because it shares the
+/// builtin vtable.  The int arm needs both tests, which is what
+/// `is_plain_int1` is -- the exact-class test alone would let a bigint into a
+/// comparator that reads a machine word.  A `key=` sort is `CustomKeySort`,
+/// generic upstream as well.
 fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
     if keyed {
         return SortCompare::Generic(base);
@@ -15138,7 +15243,15 @@ fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
             // `bool` is admitted alongside `int` because it cannot be
             // subclassed, so it can never carry an overriding `__lt__`, and
             // `int_value` reads it the same way.
-            all_int &= pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
+            // `is_exact_type` answers on `w_class`, and a bigint's is wired
+            // to `int`'s so that `type(x) is int` holds for one -- so it alone
+            // admits a `W_LongObject`, whose `*mut BigInt` sits where
+            // `W_IntObject` keeps `intval`, and the `Int` arm's `int_value`
+            // would order the list by payload address.  `is_plain_int1` is the
+            // strategy's own `is_correct_type`, which carries both halves;
+            // using it here is what makes this scan the strategy decision it
+            // stands in for.
+            all_int &= pyre_object::listobject::is_plain_int1(item)
                 || pyre_object::is_exact_type(item, &pyre_object::BOOL_TYPE);
             all_float &= pyre_object::is_exact_type(item, &pyre_object::FLOAT_TYPE);
             all_str &= pyre_object::is_exact_type(item, &pyre_object::STR_TYPE);
@@ -18389,6 +18502,18 @@ unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
 }
 
 pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    round_receiver(args, false)
+}
+
+/// `int.__round__` / `float.__round__`.  These are what the lookup at the end
+/// of `round_receiver` dispatches to, so they must not repeat it: a subtype
+/// whose `__round__` delegates back to the slot would re-enter the lookup that
+/// reached it and never terminate.
+pub(crate) fn builtin_round_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    round_receiver(args, true)
+}
+
+fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate::PyError> {
     // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
     let (pos, kwargs) = split_builtin_kwargs(args);
     let total = pos.len() + real_kwarg_count(kwargs);
@@ -18404,11 +18529,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
     let ndigits = ndigits_arg.as_ref();
     unsafe {
-        // `operation.py:97` reaches `__round__` through the type, so a subtype
-        // that replaced the builtin one — `__round__ = None` included — is
-        // dispatched by the lookup at the end of this function rather than
-        // rounded structurally here.
-        let structural = round_uses_builtin(obj);
+        // `operation.py`'s `round` reaches `__round__` through the type, so a
+        // subtype that replaced the builtin one — `__round__ = None` included
+        // — is dispatched by the lookup at the end of this function rather
+        // than rounded structurally here.  Arriving through the slot has
+        // already answered that question the other way.
+        let structural = slot || round_uses_builtin(obj);
         if structural && is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
@@ -18495,9 +18621,11 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
     }
-    // operation.py:97 — lookup __round__ on user objects.  An omitted or
-    // explicit-None `ndigits` calls `__round__()` with no second argument.
+    // `operation.py`'s `round` looks `__round__` up on user objects.  An
+    // omitted or explicit-None `ndigits` calls `__round__()` with no second
+    // argument.  The slot skips this: it is the lookup's own target.
     if let Some(tp) = crate::typedef::r#type(obj)
+        && !slot
         && let Some(method) =
             unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__round__") }
     {

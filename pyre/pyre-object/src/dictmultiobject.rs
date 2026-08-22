@@ -1256,7 +1256,7 @@ pub unsafe fn module_dict_strategy_current_version_qmut(
     Some((*strategy).current_version_qmut())
 }
 
-/// `pyjitpl.py mutatebox.nonnull()` for this strategy's `version?`.
+/// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()` for this strategy's `version?`.
 ///
 /// # Safety
 /// `strategy` must be null or point at a valid `ModuleDictStrategy`.
@@ -4525,7 +4525,8 @@ pub unsafe fn w_dict_nth_item(
 
 /// Read only the value at iteration position `index`.
 ///
-/// `dictmultiobject.py:1095-1098` reads the typed storage value without
+/// `dictmultiobject.py AbstractTypedStrategy.getitem` reads the typed storage
+/// value without
 /// wrapping its key.
 ///
 /// # Safety
@@ -5227,7 +5228,7 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// halves are `IndexMap`s, so this reads that entry rather than building the
 /// whole list. Only the one name is wrapped.
 ///
-/// `celldict.py:188-192 getiterkeys`/`getitervalues` are lazy iterators
+/// `celldict.py getiterkeys`/`getitervalues` are lazy iterators
 /// upstream; the cursor stands in for them here because the GC-object layout
 /// cannot hold a live iterator ([`DictStrategy::nth_item`]).  Serving that
 /// cursor from the default `nth_item` — `self.items(w_dict).into_iter()
@@ -5261,7 +5262,8 @@ pub unsafe fn w_module_dict_nth_item_inner(
 }
 
 /// [`w_module_dict_nth_item_inner`]'s value half, which wraps no name —
-/// `dictmultiobject.py:1095-1098` reads the typed storage value without
+/// `dictmultiobject.py AbstractTypedStrategy.getitem` reads the typed storage
+/// value without
 /// wrapping its key, and here that skips the whole allocation.
 ///
 /// # Safety
@@ -5964,7 +5966,8 @@ pub trait DictStrategy {
     }
 
     /// Read the value at iteration position `index` without requiring a
-    /// separately materialised key (`dictmultiobject.py:1095-1098`).
+    /// separately materialised key
+    /// (`dictmultiobject.py AbstractTypedStrategy.getitem`).
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.

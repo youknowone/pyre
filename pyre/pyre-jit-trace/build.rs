@@ -1607,7 +1607,7 @@ fn real_main() {
         )
         .unwrap();
 
-        // RPython `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
+        // RPython `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`.
         // Persist the build-time assembler's shared `all_liveness` byte stream so a
         // runtime consumer re-tracing a build-time jitcode (whose `BC_LIVE` ops
         // carry offsets baked against this table) can install it into

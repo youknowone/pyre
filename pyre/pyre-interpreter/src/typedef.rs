@@ -7683,9 +7683,9 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
 ///
 /// Pyre wires `tb_lasti`, `tb_lineno`, `tb_next`, `tb_frame`,
 /// `__new__`, `__dir__`.
-///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`) when it is
-///     GC-owned, else a `sys.namespace` stub for a non-Gc / freed
-///     frame (see the getter below).
+///   - `tb_frame` returns the live `PyFrame` (`FRAME_TYPE`), which is
+///     always GC-owned once the subsystem is installed at boot (see the
+///     getter below).
 ///   - `__new__` = `TracebackType(tb_next, tb_frame, tb_lasti,
 ///     tb_lineno)` (3.7+ constructor), taking a live `frame` object.
 ///   - `__reduce__` / `__setstate__` are intentionally NOT wired:
@@ -7911,21 +7911,14 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         )
     };
 
-    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
-    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
-    // The traceback keeps the raising frame's chain reachable through
-    // `pytraceback_object_custom_trace`, so a GC-owned frame is still
-    // alive here.  The guard must match the custom_trace's guard
-    // (`try_gc_owns_object`): only frames forwarded as managed edges
-    // survive; a non-Gc frame falls back to the `sys.namespace` stub
-    // built from the retained `w_code` + stamped line number.
-    //
-    // A frame is non-Gc only when the GC stable-alloc hook was never
-    // pytraceback.py:34 descr_get_tb_frame — return the live `PyFrame`
-    // itself (`FRAME_TYPE` typedef) as the user-visible `frame` object.
-    // The GC subsystem is installed at boot (`init_gc_subsystem`), so all
-    // frames — including under `PYRE_JIT=0` — are GC-owned oldgen blocks
-    // that stay alive as long as the traceback references them.
+    // `typedef.py PyTraceback.typedef` wires `tb_frame` as a bare
+    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
+    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
+    // traceback keeps that frame reachable through
+    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
+    // at boot (`init_gc_subsystem`), so all frames — including under
+    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
+    // the traceback references them.
     let frame_getter = make_builtin_function_with_arity(
         "tb_frame",
         |args| {
@@ -7938,8 +7931,13 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                 return Ok(pyre_object::w_none());
             }
             // Mark escaped so the JIT keeps the frame materialised for
-            // the exposed reference (pyframe.py `mark_as_escaped`),
-            // mirroring `sys._getframe`.
+            // the exposed reference (pyframe.py `mark_as_escaped`), the
+            // way `sys/vm.py _getframe` does for the frame it hands out.
+            // This store has no counterpart on the upstream `tb_frame`,
+            // whose complete caller set is `executioncontext.py leave`,
+            // `error.py OperationError.get_traceback`,
+            // `interp_exceptions.py descr_gettraceback` and
+            // `sys/vm.py _getframe` — a deviation, not a port.
             unsafe { (*frame).mark_as_escaped() };
             Ok(frame as pyre_object::PyObjectRef)
         },
@@ -18614,14 +18612,18 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__float__",
-            make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+            make_builtin_function_with_arity(
+                "__float__",
+                crate::builtins::builtin_int_float_dunder,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__abs__",
-            make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs, 1),
+            make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs_dunder, 1),
         )
     };
     unsafe {
@@ -19480,7 +19482,7 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__abs__",
-            make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs, 1),
+            make_builtin_function_with_arity("__abs__", crate::builtins::builtin_abs_dunder, 1),
         )
     };
     unsafe {
@@ -19761,6 +19763,16 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         FloatToIntMode::Floor => v.floor(),
         FloatToIntMode::Ceil => v.ceil(),
     };
+    // `floatobject.py`'s `newint_from_float` reaches for
+    // `ovfcheck_float_to_int` first and only materialises a long when that
+    // overflows.  `2**63` is exactly representable while `i64::MAX` is not, so
+    // the upper bound is strict — the same pair the `int(x)` walker
+    // specialization uses.
+    const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+    const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+    if reduced >= SIGNED_MIN_AS_FLOAT && reduced < SIGNED_LIMIT_AS_FLOAT {
+        return Ok(pyre_object::w_int_new(reduced as i64));
+    }
     use num_traits::FromPrimitive;
     let big = BigInt::from_f64(reduced).expect("finite already checked");
     if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {

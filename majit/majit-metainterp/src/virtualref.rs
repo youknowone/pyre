@@ -515,7 +515,7 @@ impl VirtualRefInfo {
             // supply a non-null materialised object.
             debug_assert!(!real_object.is_null());
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-            // `virtualref.py assert vref.virtual_token != TOKEN_TRACING_RESCALL`
+            // `virtualref.py VirtualRefInfo.continue_tracing assert vref.virtual_token != TOKEN_TRACING_RESCALL`
             debug_assert_ne!(vref.virtual_token, token_tracing_rescall());
             vref.virtual_token = TOKEN_NONE;
             // The vref is an old-gen allocation and `real_object` can be young,

@@ -549,3 +549,37 @@ _check_msg(
     lambda: INF.__int__(), OverflowError, "cannot convert float infinity to integer"
 )
 _check_msg(lambda: NAN.__floor__(), ValueError, "cannot convert float NaN to integer")
+
+
+# `float()` reaches `__float__` through the type, so an `int` subtype that
+# overrides it is dispatched to rather than converted from its layout.
+class FloatsToStr(int):
+    def __float__(self):
+        return "not a float"
+
+
+try:
+    float(FloatsToStr(-5))
+except TypeError:
+    pass
+else:
+    raise AssertionError("float() ignored an int subtype's __float__")
+
+
+# A subtype that does not override it resolves to `int.__float__`, which is
+# structural -- so an override that delegates back to the slot terminates.
+class PlainInt(int):
+    pass
+
+
+class DelegatesToInt(int):
+    def __float__(self):
+        return int.__float__(self)
+
+
+assert float(PlainInt(-5)) == -5.0
+assert type(float(PlainInt(-5))) is float
+assert float(DelegatesToInt(-5)) == -5.0
+assert int.__float__(FloatsToStr(-5)) == -5.0
+assert float(True) == 1.0 and float(False) == 0.0
+assert float(2**70) == 2.0**70

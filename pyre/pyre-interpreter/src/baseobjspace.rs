@@ -4580,33 +4580,24 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal
-        // (`float2longlong`), so `0.0 is -0.0` is false and a NaN is its
-        // own identity. `float` subclasses (`user_overridden_class`) keep
-        // pointer identity — the exact-type gate excludes them.
+        // (`float2longlong`), so `0.0 is -0.0` is false. `float` subclasses
+        // (`user_overridden_class`) keep pointer identity — the exact-type
+        // gate excludes them.
         //
-        // This has to stay in step with `function::immutable_unique_id`, which
-        // derives `id()` from the same bits, and with `FloatListStrategy`,
-        // which unboxes and reboxes list elements: pointer identity here would
-        // make `a is b` false while `id(a) == id(b)` stayed true, and would
-        // make `[a][0] is a` false.
+        // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
+        // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
+        // Values, `is` and `id`").
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::FLOAT_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::FLOAT_TYPE)
         {
-            return pyre_object::floatobject::w_float_get_value(w_one).to_bits()
-                == pyre_object::floatobject::w_float_get_value(w_two).to_bits();
+            let one = pyre_object::floatobject::w_float_get_value(w_one);
+            let two = pyre_object::floatobject::w_float_get_value(w_two);
+            if one.is_nan() || two.is_nan() {
+                return false;
+            }
+            return one.to_bits() == two.to_bits();
         }
-        // `W_ComplexObject.is_w` (complexobject.py): two plain
-        // `complex`es are identical when both component bit patterns are
-        // equal (`float2longlong`). `complex` subclasses
-        // (`user_overridden_class`) keep pointer identity.
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::COMPLEX_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::COMPLEX_TYPE)
-        {
-            return pyre_object::complexobject::w_complex_get_real(w_one).to_bits()
-                == pyre_object::complexobject::w_complex_get_real(w_two).to_bits()
-                && pyre_object::complexobject::w_complex_get_imag(w_one).to_bits()
-                    == pyre_object::complexobject::w_complex_get_imag(w_two).to_bits();
-        }
+        // CPython 3.14 gives complex objects pointer identity, handled above.
         // `W_AbstractTupleObject.is_w` (tupleobject.py): a `tuple` is
         // identical to another only when both are the empty tuple — "empty
         // tuples are unique-ified". Non-empty tuples keep pointer identity
@@ -12437,9 +12428,10 @@ pub unsafe fn exception_attr_slot_fold(
             ExceptionAttrSlot::Filename2
         }
         // `__traceback__` is a `W_BaseException` slot on every exception kind.
-        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`; the
-        // fold folds only the slot read, so the specializer pairs it with a
-        // residual call that issues the mark.
+        // `descr_gettraceback` also calls `tb.frame.mark_as_escaped()`, which
+        // the fold cannot drop: it emits the flag OR inline, as a load of the
+        // frame's flags word followed by a `SetfieldGc` of it, so a compiled
+        // replay marks the frame without a residual call.
         "__traceback__" => ExceptionAttrSlot::Traceback,
         // `name` shares the `w_exc_name` slot across the kinds whose getattr
         // arm reads it; other kinds keep the regular attribute fall-through.

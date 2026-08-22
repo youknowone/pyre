@@ -3847,9 +3847,11 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 }
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-                // A non-float changes the slot to boxed storage and freezes further
-                // unboxing (mapdict.py), so retain setattr.
-                if !unsafe { pyre_object::pyobject::is_float(concrete_value) } {
+                // Match mapdict.py `_direct_write` exactly: subclasses and
+                // NaNs convert the slot to boxed storage.
+                if !unsafe {
+                    pyre_interpreter::objspace::std::mapdict::is_unboxable_float(concrete_value)
+                } {
                     return Ok(None);
                 }
             }
@@ -3883,6 +3885,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
+                walker_guard_float_not_nan(ctx, op_pc, raw)?;
                 (
                     crate::helpers::jit_mapdict_unboxed_write_f as *const (),
                     raw,
@@ -4332,11 +4335,16 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             Emit::Int(vals)
         }
         ListStrategy::Float => {
-            // `all_floats` is strict `type(w) is W_FloatObject`, so every
-            // element is an exact `W_FloatObject` (`walker_unbox_float`'s
-            // `&FLOAT_TYPE` guard holds).
+            // `list_strategy_for` admits only exact, non-NaN floats here.  Its
+            // subclass term is enforced on replay by pinning each element's
+            // `w_class`; `is_plain_float_strict` also admits the null spelling
+            // of "exact float", which no pin can express, so decline such an
+            // element rather than emit a guard it would fail itself.
             let mut vals = Vec::with_capacity(len);
             for &p in &concretes {
+                if unsafe { walker_exact_builtin_class(p) }.is_none() {
+                    return Ok(None);
+                }
                 vals.push(unsafe { pyre_object::w_float_get_value(p) });
             }
             Emit::Float(vals)
@@ -4391,6 +4399,17 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
                 let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(v));
+                // `walker_unbox_float` guards `ob_type` only, which a float
+                // SUBCLASS instance shares; pin `w_class` so it side-exits
+                // instead of being unboxed into Float storage the interpreter
+                // would have declined (`all_floats` is strict).
+                walker_guard_exact_w_class(
+                    ctx,
+                    op_pc,
+                    it,
+                    pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+                )?;
+                walker_guard_float_not_nan(ctx, op_pc, raw)?;
                 raws.push(raw);
             }
             crate::helpers::emit_typed_list_inline(
@@ -10036,6 +10055,837 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `math.fabs(x)` on an exact int/float argument.  `interp_math.py`'s `fabs` is
+/// `math1(space, math.fabs, w_x)`, and RPython lowers `ll_math_fabs` to a sign
+/// mask, so the whole builtin is one `FloatAbs` once the operand is unboxed.
+/// `fabs` is total — it raises for no input and needs no domain guard — so the
+/// only guards are the operand's own class and exact-`w_class` checks.
+/// Rebound callables, numeric subclasses, and non-numeric inputs retain the
+/// ordinary residual call.
+pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::module::math::interp_math::is_math_fabs_function(concrete_callable) {
+        return Ok(None);
+    }
+    let (is_int, val) = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) {
+            return Ok(None);
+        }
+        if pyre_object::is_int(arg_obj) {
+            (true, pyre_object::w_int_get_value(arg_obj) as f64)
+        } else if pyre_object::is_float(arg_obj) {
+            (false, pyre_object::w_float_get_value(arg_obj))
+        } else {
+            return Ok(None);
+        }
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    // `w_float_get_value` reads the payload without checking the box, and a
+    // non-float here would be read as one rather than rejected, so the value
+    // the trace records would be a number with no relation to the answer.
+    if !unsafe { pyre_object::is_float(boxed_result) } {
+        return Ok(None);
+    }
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    // The trace computes `FloatAbs` over the coerced operand, so an int too
+    // large to be an exact `f64` would have the trace answering for a value
+    // the builtin never saw.  Compare the two on this operand, by bits so the
+    // two zeroes stay distinct.
+    if val.abs().to_bits() != result_val.to_bits() {
+        return Ok(None);
+    }
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    let raw = ctx.trace_ctx.record_op(OpCode::FloatAbs, &[x]);
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// Which reduction `try_walker_specialize_math_round_to_int` is folding.
+#[derive(Clone, Copy)]
+pub(crate) enum MathRoundMode {
+    Floor,
+    Ceil,
+    Trunc,
+}
+
+/// `math.floor(x)` / `math.ceil(x)` / `math.trunc(x)` on an exact float.
+///
+/// `floor`/`ceil`/`trunc` look the dunder up on the type and call
+/// it; for an exact float that resolves to `W_FloatObject`'s own reduction
+/// followed by `newint_from_float`, whose `ovfcheck_float_to_int` arm is a
+/// machine cast.  Recreate that shape: unbox, guard the operand into the
+/// signed range, round, and cast.
+///
+/// Only an exact float is folded.  An `int` argument reaches
+/// `int.__floor__`, which returns the argument object itself rather than a
+/// fresh box, and a float subclass may override the dunder — both keep the
+/// residual.
+///
+/// The range guard is on the operand rather than the rounded value, which is
+/// sufficient for all three modes: `-2**63` is an integer so `floor` cannot
+/// leave the range from below, `|trunc(x)| <= |x|`, and every float below
+/// `2**63` large enough for `ceil` to move it is already integral (the ulp
+/// there is 2048).
+pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+    mode: MathRoundMode,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    let is_this_builtin: fn(pyre_object::PyObjectRef) -> bool = match mode {
+        MathRoundMode::Floor => pyre_interpreter::module::math::interp_math::is_math_floor_function,
+        MathRoundMode::Ceil => pyre_interpreter::module::math::interp_math::is_math_ceil_function,
+        MathRoundMode::Trunc => pyre_interpreter::module::math::interp_math::is_math_trunc_function,
+    };
+    if !is_this_builtin(concrete_callable) {
+        return Ok(None);
+    }
+    let value = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) || !pyre_object::is_float(arg_obj) {
+            return Ok(None);
+        }
+        pyre_object::w_float_get_value(arg_obj)
+    };
+    // `2**63` is exactly representable while `i64::MAX` is not; use a strict
+    // upper bound, matching ovfcheck_float_to_int on a signed 64-bit target.
+    // NaN and both infinities fail these comparisons and keep the residual,
+    // which raises for them.
+    const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+    const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+    if !(value >= SIGNED_MIN_AS_FLOAT && value < SIGNED_LIMIT_AS_FLOAT) {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_int(boxed_result) } {
+        return Ok(None);
+    }
+    let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let arg_op = r_args[2];
+    let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+    let raw_float = walker_unbox_float(ctx, op.pc, arg_op, float_type_addr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op.pc,
+        arg_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+    )?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_float, majit_ir::Value::Float(value));
+    let low = ctx
+        .trace_ctx
+        .const_float(SIGNED_MIN_AS_FLOAT.to_bits() as i64);
+    let high = ctx
+        .trace_ctx
+        .const_float(SIGNED_LIMIT_AS_FLOAT.to_bits() as i64);
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatGe, &[raw_float, low], true)?;
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[raw_float, high], true)?;
+
+    // `CastFloatToInt` already truncates toward zero, so only floor and ceil
+    // need a rounding step.  Both are elidable and cannot raise.
+    let rounded = match mode {
+        MathRoundMode::Trunc => raw_float,
+        MathRoundMode::Floor | MathRoundMode::Ceil => {
+            let (helper, rounded_value) = match mode {
+                MathRoundMode::Floor => (
+                    pyre_interpreter::module::math::interp_math::jit_math_floor_raw as *const (),
+                    value.floor(),
+                ),
+                _ => (
+                    pyre_interpreter::module::math::interp_math::jit_math_ceil_raw as *const (),
+                    value.ceil(),
+                ),
+            };
+            let rounded = ctx.trace_ctx.call_float_typed_with_effect(
+                helper,
+                &[raw_float],
+                &[majit_ir::Type::Float],
+                majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(rounded, majit_ir::Value::Float(rounded_value));
+            rounded
+        }
+    };
+    let raw_int = ctx.trace_ctx.record_op(OpCode::CastFloatToInt, &[rounded]);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_int, majit_ir::Value::Int(result_value));
+    let boxed = walker_box_int(ctx, op.pc, raw_int, result_value)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result as i64));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// Read a plain `bh_call_fn(callable, PY_NULL, args…)` shape's concrete
+/// operands.  `None` means the call is not that shape — a bound receiver in
+/// `null_or_self`, a NULL operand, or a non-`Ref` concrete.
+fn plain_builtin_call_concretes<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    arity: usize,
+) -> Option<(pyre_object::PyObjectRef, [pyre_object::PyObjectRef; 2])> {
+    if r_args.len() != arity + 2 {
+        return None;
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return None;
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() {
+        return None;
+    }
+    let mut operands = [pyre_object::PY_NULL; 2];
+    for (slot, concrete) in operands.iter_mut().zip(&arg_concretes[2..arity + 2]) {
+        let ConcreteValue::Ref(obj) = *concrete else {
+            return None;
+        };
+        if obj.is_null() {
+            return None;
+        }
+        *slot = obj;
+    }
+    Some((concrete_callable, operands))
+}
+
+/// Classify a fold operand as an exact `int`/`bool`/`float` and read its
+/// value as an `f64`.  A numeric subclass keeps the builtin `ob_type` layout
+/// but carries a Python-visible `w_class`, and the `guard_class` the coercion
+/// emits reads `ob_type`, so it would not catch the subclass — decline here.
+fn fold_float_operand(obj: pyre_object::PyObjectRef) -> Option<(bool, f64)> {
+    unsafe {
+        if !pyre_object::is_exact_builtin_instance(obj) {
+            return None;
+        }
+        if pyre_object::is_int(obj) {
+            Some((true, pyre_object::w_int_get_value(obj) as f64))
+        } else if pyre_object::is_float(obj) {
+            Some((false, pyre_object::w_float_get_value(obj)))
+        } else {
+            None
+        }
+    }
+}
+
+/// Pin a fold's callable identity.  The module-attr fold usually makes it a
+/// constant already; guard only when it is not.
+fn walker_guard_fold_callable<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    callable_op: OpRef,
+    concrete_callable: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if callable_op.is_constant() {
+        return Ok(());
+    }
+    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(callable_op, expected);
+    Ok(())
+}
+
+/// `raw - raw == 0` holds exactly for every finite value, including signed
+/// zero; an infinity or a NaN bails to the builtin.  This is the guard that
+/// makes the generic float folds sound: the raw helper answers what the
+/// builtin body computes and reports every raising direction as NaN, so a
+/// finite result means the builtin returned this exact value.
+fn walker_guard_float_result_finite<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    raw: OpRef,
+) -> Result<(), DispatchError> {
+    let diff = ctx.trace_ctx.record_op(OpCode::FloatSub, &[raw, raw]);
+    ctx.trace_ctx
+        .set_opref_concrete(diff, majit_ir::Value::Float(0.0));
+    let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+    walker_float_cmp_guard(ctx, pc, OpCode::FloatEq, &[diff, zero], true)
+}
+
+/// The one-argument half of the generic `math` float fold.
+///
+/// `interp_math`'s `pm1!` family is a single `pymath` call wrapped in the
+/// boxing and error mapping the module needs; the walker otherwise sees only
+/// the opaque `bh_call_fn(builtin, NULL, x)` residual, so a numeric loop pays
+/// an argument tuple, a `W_FloatObject` allocation and a full builtin dispatch
+/// per iteration.  Emit instead the unboxed operand, one pure elidable
+/// `CALL_F` into that function's raw helper, and an inline `wrapfloat`.
+///
+/// The helper reports every raising direction as NaN, so the trailing
+/// finite-result guard is what keeps this correct for arbitrary operands: it
+/// deoptimizes into the builtin, which re-executes and raises or returns the
+/// non-finite value itself.  The fold therefore needs no per-function domain
+/// knowledge, and adding a function to `MATH_FLOAT1_FOLDS` is all it takes to
+/// cover it.  Rebound callables, numeric subclasses and non-numeric operands
+/// retain the generic residual path (SAFE).
+pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
+    else {
+        return Ok(None);
+    };
+    let Some(raw_fn) =
+        pyre_interpreter::module::math::interp_math::math_float1_fold_helper(concrete_callable)
+    else {
+        return Ok(None);
+    };
+    let Some((is_int, value)) = fold_float_operand(operands[0]) else {
+        return Ok(None);
+    };
+    // Authentic boxed result, produced on the plain eval loop exactly as the
+    // skipped residual would.  A raise, a non-float result, or a non-finite
+    // one all record a guard that would fail on the operand it was recorded
+    // from, so keep the residual for them.
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[operands[0]])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let Some(result_value) = fold_finite_float_result(boxed_result) else {
+        return Ok(None);
+    };
+    // The compiled loop calls the raw helper, not the function it stands for.
+    // Compare the two on this operand and keep the residual when they differ,
+    // so a helper that disagrees is not compiled into the loop.  Bit equality
+    // rather than `==`, which cannot tell the two zeroes apart.
+    if raw_fn(value).to_bits() != result_value.to_bits() {
+        return Ok(None);
+    }
+
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    let x =
+        walker_coerce_operand_to_float(ctx, op.pc, r_args[2], operands[0], is_int, value, false)?;
+    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+        raw_fn as *const (),
+        &[x],
+        &[majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
+    walker_guard_float_result_finite(ctx, op.pc, raw)?;
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// The two-argument half of the generic `math` float fold — `pow`, `fmod`,
+/// `copysign`, `remainder` and `atan2`.  Same shape and same soundness
+/// argument as [`try_walker_specialize_math_float1`]; the finite-result guard
+/// carries `pow`'s `ValueError` (`pow(0.0, -2.0)`) and `OverflowError`
+/// (`pow(1e100, 1e100)`) directions back to the builtin.
+pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
+    else {
+        return Ok(None);
+    };
+    let Some(raw_fn) =
+        pyre_interpreter::module::math::interp_math::math_float2_fold_helper(concrete_callable)
+    else {
+        return Ok(None);
+    };
+    let (Some((x_is_int, x_value)), Some((y_is_int, y_value))) = (
+        fold_float_operand(operands[0]),
+        fold_float_operand(operands[1]),
+    ) else {
+        return Ok(None);
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let Some(result_value) = fold_finite_float_result(boxed_result) else {
+        return Ok(None);
+    };
+    // Same cross-check as the one-argument half: the compiled loop calls the
+    // raw helper, so a helper that disagrees with the function it stands for
+    // must not be compiled into it.
+    if raw_fn(x_value, y_value).to_bits() != result_value.to_bits() {
+        return Ok(None);
+    }
+
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    let x = walker_coerce_operand_to_float(
+        ctx,
+        op.pc,
+        r_args[2],
+        operands[0],
+        x_is_int,
+        x_value,
+        false,
+    )?;
+    let y = walker_coerce_operand_to_float(
+        ctx,
+        op.pc,
+        r_args[3],
+        operands[1],
+        y_is_int,
+        y_value,
+        false,
+    )?;
+    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+        raw_fn as *const (),
+        &[x, y],
+        &[majit_ir::Type::Float, majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
+    walker_guard_float_result_finite(ctx, op.pc, raw)?;
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// `math.isclose(a, b)` with both tolerances defaulted, in the shape
+/// [`walker_newbool_guarded`] recognizes: the result decides one branch and
+/// nothing else.
+///
+/// The residual costs a builtin dispatch, a keyword split and two
+/// `try_get_double` conversions to produce one of two prebuilt singletons.
+/// Emit instead the two unboxed operands and a pure elidable `CALL_I` into
+/// `jit_math_isclose_default`, whose truth the branch's own guard already
+/// pins.  That helper is total, so unlike the float folds this one needs no
+/// result guard of its own.
+///
+/// A keyword argument (which would reach `bh_call_fn_kw`, not this shape), a
+/// third positional, a numeric subclass, a rebound callable, or a result that
+/// escapes the branch all retain the generic residual path (SAFE).
+pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
+    else {
+        return Ok(None);
+    };
+    if !pyre_interpreter::module::math::interp_math::is_math_isclose_function(concrete_callable) {
+        return Ok(None);
+    }
+    // Settle the result's shape before emitting anything: everything below
+    // this point commits ops to the trace, and `walker_newbool_guarded` is
+    // what decides whether the branch's guard can stand in for the box.
+    if ctx.fbw_mode.snapshot_sym.is_null()
+        || dst_bank != 'r'
+        || !matches!(
+            classify_compare_box_use(ctx, op.pc, dst as u8, VablePublish::Tolerated),
+            CompareBoxUse::FeedsBranchOnly { .. }
+        )
+    {
+        return Ok(None);
+    }
+    let (Some((a_is_int, a_value)), Some((b_is_int, b_value))) = (
+        fold_float_operand(operands[0]),
+        fold_float_operand(operands[1]),
+    ) else {
+        return Ok(None);
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    // The helper reimplements the comparison rather than calling the module's
+    // own; compare the two answers on this operand pair before committing to
+    // it, so a divergence declines here instead of recording wrong code.
+    let observed = std::ptr::eq(boxed_result, pyre_object::w_bool_from(true));
+    if !observed && !std::ptr::eq(boxed_result, pyre_object::w_bool_from(false)) {
+        return Ok(None);
+    }
+    let helper = pyre_interpreter::module::math::interp_math::jit_math_isclose_default;
+    if (helper(a_value, b_value) != 0) != observed {
+        return Ok(None);
+    }
+
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    let a = walker_coerce_operand_to_float(
+        ctx,
+        op.pc,
+        r_args[2],
+        operands[0],
+        a_is_int,
+        a_value,
+        false,
+    )?;
+    let b = walker_coerce_operand_to_float(
+        ctx,
+        op.pc,
+        r_args[3],
+        operands[1],
+        b_is_int,
+        b_value,
+        false,
+    )?;
+    let truth = ctx.trace_ctx.call_int_typed_with_effect(
+        helper as *const (),
+        &[a, b],
+        &[majit_ir::Type::Float, majit_ir::Type::Float],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(observed)));
+    // The shape check above already established what this re-tests, so the
+    // `None` arm is unreachable; keep it as the decline rather than assert.
+    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst as u8, dst_bank)?
+    else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// The `f64` behind an exact-`float` fold result, or `None` when the builtin
+/// answered something else or something the finite-result guard would reject.
+fn fold_finite_float_result(boxed_result: pyre_object::PyObjectRef) -> Option<f64> {
+    unsafe {
+        if boxed_result.is_null()
+            || !pyre_object::is_exact_builtin_instance(boxed_result)
+            || !pyre_object::is_float(boxed_result)
+        {
+            return None;
+        }
+        let value = pyre_object::w_float_get_value(boxed_result);
+        value.is_finite().then_some(value)
+    }
+}
+
+/// The machine int a folded builtin's authentic boxed result carries, or
+/// `None` when that result is not an exact `int` at all.  `True`/`False` are
+/// excluded: a raw helper reporting `1` must not be accepted for a builtin
+/// that returned the bool, because the trace boxes it with `wrapint`.
+fn fold_boxed_int_value(boxed_result: pyre_object::PyObjectRef) -> Option<i64> {
+    unsafe {
+        if boxed_result.is_null()
+            || !pyre_object::is_exact_builtin_instance(boxed_result)
+            || !pyre_object::is_int(boxed_result)
+            || pyre_object::is_bool(boxed_result)
+        {
+            return None;
+        }
+        Some(pyre_object::w_int_get_value(boxed_result))
+    }
+}
+
+/// Guard an int-channel helper's result against its decline sentinel, so every
+/// operand the helper does not answer for resumes in the builtin.
+fn walker_guard_int_result_not_declined<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    raw: OpRef,
+) -> Result<(), DispatchError> {
+    let sentinel = ctx
+        .trace_ctx
+        .const_int(pyre_interpreter::jit_builtin_folds::INT_FOLD_DECLINE);
+    let answered = ctx.trace_ctx.record_op(OpCode::IntNe, &[raw, sentinel]);
+    ctx.trace_ctx
+        .set_opref_concrete(answered, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardTrue, &[answered])
+}
+
+/// The generic builtin fold, one argument.
+///
+/// Every builtin that is not hand-specialized reaches the interpreter as
+/// `bh_call_fn(builtin, NULL, x)`, and that residual costs the same regardless
+/// of what the builtin does: the frame force, the argument rooting, the
+/// execution-context resolution and the gateway signature binding all run
+/// before the body does.  Measured against pypy 7.3.20 the floor is an order
+/// of magnitude on its own — `hash`, `ord` and `abs` all sit within a few
+/// percent of each other because none of them is paying for its own work.
+///
+/// `jit_builtin_folds` names, per builtin, a raw helper that is the body of
+/// that builtin restricted to the operands it can answer without running
+/// app-level code and without allocating.  Emit a direct call into it, guard
+/// the channel's decline sentinel, and box the result inline so the optimizer
+/// can keep it virtual.  A declined operand — a subclass instance, a shape the
+/// helper does not implement, the argument that would have raised — resumes in
+/// the builtin, which re-executes the call from scratch, so the fold needs no
+/// per-builtin domain knowledge and adding a table row is all it takes to
+/// cover another one.  Rebound callables keep the residual (SAFE).
+pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::jit_builtin_folds::{BuiltinFoldRaw, INT_FOLD_DECLINE};
+
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
+    else {
+        return Ok(None);
+    };
+    let rows: Vec<_> =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 1).collect();
+    // Ask the raw helpers before the builtin runs.  A call no row answers for
+    // is not this fold's shape, and the walker has to learn that without
+    // executing the builtin: the residual it falls back to executes the call
+    // again, so a decline taken afterwards would run a side-effecting
+    // `__hash__` or `__abs__` twice in one walk.
+    let answered = rows.iter().any(|fold| match fold.raw {
+        BuiltinFoldRaw::Int1(raw_fn) => raw_fn(operands[0] as i64) != INT_FOLD_DECLINE,
+        BuiltinFoldRaw::Float1(raw_fn) => !raw_fn(operands[0] as i64).is_nan(),
+        BuiltinFoldRaw::Ref2(_) => false,
+    });
+    if !answered {
+        return Ok(None);
+    }
+    // Authentic boxed result, produced on the plain eval loop exactly as the
+    // skipped residual would.  Every row cross-checks its helper against this,
+    // so a helper that disagrees with the builtin it stands for declines here
+    // rather than compiling the disagreement into the loop.
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands[..1])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    for fold in &rows {
+        match fold.raw {
+            BuiltinFoldRaw::Int1(raw_fn) => {
+                let value = raw_fn(operands[0] as i64);
+                if value == INT_FOLD_DECLINE || fold_boxed_int_value(boxed_result) != Some(value) {
+                    continue;
+                }
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+                let raw = ctx.trace_ctx.call_int_typed_with_effect(
+                    raw_fn as *const (),
+                    &[r_args[2]],
+                    &[majit_ir::Type::Ref],
+                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                );
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
+                walker_guard_int_result_not_declined(ctx, op.pc, raw)?;
+                let boxed = walker_box_int(ctx, op.pc, raw, value)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(boxed, box_int_concrete(value, boxed_result as i64));
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+            BuiltinFoldRaw::Float1(raw_fn) => {
+                let Some(result_value) = fold_finite_float_result(boxed_result) else {
+                    continue;
+                };
+                let value = raw_fn(operands[0] as i64);
+                // By bits: `==` cannot tell `-0.0` from `0.0`, and which one
+                // the fold answers with is observable through `copysign`.
+                if value.to_bits() != result_value.to_bits() {
+                    continue;
+                }
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+                let raw = ctx.trace_ctx.call_float_typed_with_effect(
+                    raw_fn as *const (),
+                    &[r_args[2]],
+                    &[majit_ir::Type::Ref],
+                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                );
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
+                walker_guard_float_result_finite(ctx, op.pc, raw)?;
+                let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+                ctx.trace_ctx.set_opref_concrete(
+                    boxed,
+                    majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+                );
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+            BuiltinFoldRaw::Ref2(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// The two-argument half of the generic builtin fold — `min(a, b)` and
+/// `max(a, b)`, whose helpers return one of their own arguments rather than
+/// building anything.  Same shape and same soundness argument as
+/// [`try_walker_specialize_builtin_fold1`]; a `PY_NULL` is the decline the
+/// trailing non-null guard carries back to the builtin.
+pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::jit_builtin_folds::BuiltinFoldRaw;
+
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
+    else {
+        return Ok(None);
+    };
+    let rows: Vec<_> =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 2).collect();
+    // Same ordering as the one-argument half: no row may answer only after the
+    // builtin has already run, or the residual re-executes it.
+    let answered = rows.iter().any(|fold| match fold.raw {
+        BuiltinFoldRaw::Ref2(raw_fn) => {
+            !(raw_fn(operands[0] as i64, operands[1] as i64) as pyre_object::PyObjectRef).is_null()
+        }
+        BuiltinFoldRaw::Int1(_) | BuiltinFoldRaw::Float1(_) => false,
+    });
+    if !answered {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    for fold in &rows {
+        let BuiltinFoldRaw::Ref2(raw_fn) = fold.raw else {
+            continue;
+        };
+        let value = raw_fn(operands[0] as i64, operands[1] as i64) as pyre_object::PyObjectRef;
+        if value.is_null() || value != boxed_result {
+            continue;
+        }
+        walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+        let raw = ctx.trace_ctx.call_ref_typed_with_effect(
+            raw_fn as *const (),
+            &[r_args[2], r_args[3]],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            // `min` / `max` compare two exact scalars and hand back one of
+            // their own arguments, so unlike the allocating ref helpers this
+            // one really cannot collect -- which drops the gcmap bracket the
+            // plain `CannotRaise` constructor would ask every backend for.
+            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        );
+        // Concrete before the guard: the guard captures a resume snapshot, and
+        // a `raw` with no value yet is recorded into it without one.
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(value as usize)));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw])?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+        return Ok(Some(()));
+    }
+    Ok(None)
+}
+
 /// `float(x)` on an exact int/float argument: inline the conversion
 /// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
 /// `float(f) is f` for an exact float) instead of the opaque
@@ -10672,7 +11522,8 @@ unsafe fn orthodox_list_append_recognize(
         let int_ok = pyre_object::is_plain_int1(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
-        let float_ok = !value.is_null() && pyre_object::is_plain_float_strict(value);
+        // NaNs select Object storage to preserve identity.
+        let float_ok = pyre_object::is_float_strategy_item(value);
         // switch_to_correct_strategy routes `is_plain_int1` (exact int or
         // fits-in-word long) -> Integer with no tagged exclusion. Exclude any
         // plain-int / float from the object fallback so a tagged-int DECLINES
@@ -10680,7 +11531,7 @@ unsafe fn orthodox_list_append_recognize(
         // traced strategy from the concrete one the commit installs.
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
-            && !pyre_object::is_plain_float_strict(value);
+            && !pyre_object::is_float_strategy_item(value);
         if !int_ok && !float_ok && !obj_ok {
             return None;
         }
@@ -10702,14 +11553,10 @@ unsafe fn orthodox_list_append_recognize(
     // object items block — no unboxing, so the value carries no type
     // precondition.
     let obj_ok = pyre_object::w_list_uses_object_storage(inner_self) && !value.is_null();
-    // Float-storage specialization: a strict `W_FloatObject` stored
-    // unboxed. `FloatListStrategy.is_correct_type` (listobject.py) is
-    // `type(w_obj) is W_FloatObject`, the strict predicate the body's Float
-    // arm also uses. No fits-* long analogue (a float is never re-boxed
-    // across arithmetic, unlike a fits-int W_LongObject).
+    // Match `FloatListStrategy.is_correct_type`; NaNs take the residual path
+    // that converts the receiver to Object storage.
     let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
-        && !value.is_null()
-        && pyre_object::is_plain_float_strict(value);
+        && pyre_object::is_float_strategy_item(value);
     if !int_ok && !obj_ok && !float_ok {
         return None;
     }
@@ -10797,7 +11644,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
                     && pyre_object::tagged_int::is_tagged_int(value));
             if int_ok {
                 ListStrategy::Integer
-            } else if !value.is_null() && pyre_object::is_plain_float_strict(value) {
+            } else if pyre_object::is_float_strategy_item(value) {
                 ListStrategy::Float
             } else {
                 ListStrategy::Object
@@ -13097,6 +13944,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // route through the generic path — PyPy's IntegerListStrategy rejects a
         // W_BoolObject (`is_correct_type` is exact-type), switching the list to
         // object storage, so the int-storage fast path would drop the bool type.
+        // Float subclasses and NaNs switch the list to Object storage.
         // EXACT list only: a list SUBCLASS instance shares `ob_type ==
         // &LIST_TYPE` but retags `w_class` and may override `__setitem__`;
         // `is_exact_list` excludes it so it falls to the generic residual
@@ -13120,8 +13968,16 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         {
             1i64
         } else if pyre_object::w_list_uses_float_storage(list_obj)
-            && pyre_object::is_float(value_obj)
+            && pyre_object::is_float_strategy_item(value_obj)
         {
+            // The subclass term of that predicate is enforced on replay by
+            // pinning `w_class` below.  `is_plain_float_strict` also admits the
+            // null spelling of "exact float", which no pin can express, so
+            // decline such an operand here rather than emit a guard it would
+            // fail itself (see `walker_guard_exact_w_class`).
+            if walker_exact_builtin_class(value_obj).is_none() {
+                return Ok(None);
+            }
             2i64
         } else {
             return Ok(None);
@@ -13226,6 +14082,19 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
+        // A float SUBCLASS instance shares `ob_type == &FLOAT_TYPE` (so it
+        // passes the unbox guard) but retags `w_class`;
+        // `FloatListStrategy.is_correct_type` rejects it, so the interpreter
+        // switches the list to Object storage instead of writing raw f64.
+        // Pin the canonical class the same way the list operand is pinned
+        // above, so such an instance side-exits to the generic residual.
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            value_op,
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+        )?;
+        walker_guard_float_not_nan(ctx, op_pc, raw)?;
         crate::state::trace_float_block_setitem_value(ctx.trace_ctx, block, raw_index, raw);
     }
 

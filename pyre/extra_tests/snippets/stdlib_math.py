@@ -311,3 +311,243 @@ assert math.fmod(0.0, 3.0) == 0.0
 assert math.fmod(0.0, NINF) == 0.0
 
 assert math.gamma(1) == 1.0
+
+
+# The `__float__` fallback of math.floor/ceil goes through newlong_from_float,
+# so a value outside the machine-int range stays exact and a non-finite one
+# raises rather than saturating to a machine bound.  math.trunc has no such
+# fallback and requires `__trunc__`.
+class FloatLike:
+    def __init__(self, value):
+        self.value = value
+
+    def __float__(self):
+        return self.value
+
+
+for _unary in (math.floor, math.ceil):
+    assert _unary(FloatLike(1e300)) == int(1e300)
+    assert _unary(FloatLike(-1e300)) == int(-1e300)
+    assert_raises(ValueError, lambda f=_unary: f(FloatLike(NAN)))
+    assert_raises(OverflowError, lambda f=_unary: f(FloatLike(INF)))
+    assert_raises(OverflowError, lambda f=_unary: f(FloatLike(NINF)))
+
+assert math.floor(FloatLike(41.9)) == 41
+assert math.ceil(FloatLike(42.5)) == 43
+assert type(math.floor(FloatLike(41.9))) is int
+assert_raises(TypeError, lambda: math.trunc(FloatLike(23.5)))
+
+
+# gcd reduces a pair of machine words without going through rbigint.  The
+# machine-word arm must decline where |x| leaves the signed range, must read a
+# bool and an int subclass as their raw value, and must never return the
+# operand object itself.
+_MIN64 = -(2**63)
+assert math.gcd(_MIN64, 0) == 2**63
+assert math.gcd(_MIN64, 6) == 2
+assert math.gcd(_MIN64, _MIN64) == 2**63
+assert math.gcd(True, False) == 1
+assert type(math.gcd(True, False)) is int
+assert math.gcd(-120, 84) == 12
+
+
+class _IndexingInt(int):
+    def __index__(self):
+        return 99
+
+
+class _AbsingInt(int):
+    def __abs__(self):
+        return 7
+
+
+assert math.gcd(_IndexingInt(10), 4) == 2
+assert math.gcd(_AbsingInt(-10), 4) == 2
+
+
+# The tolerance sanity check names the tolerances rather than reporting the
+# generic domain error the underlying comparison raises.
+assert_raises(
+    ValueError,
+    lambda: math.isclose(1, 2, rel_tol=-1),
+    _msg="tolerances must be non-negative",
+)
+assert_raises(
+    ValueError,
+    lambda: math.isclose(1, 2, abs_tol=-1),
+    _msg="tolerances must be non-negative",
+)
+# All four operands are converted before any of them is checked, so an
+# operand that is not a number is reported even when a tolerance is also
+# rejectable, and the conversions run left to right.
+assert_raises(
+    TypeError,
+    lambda: math.isclose("x", 1.0, rel_tol=-1),
+    _msg="the operand is converted before the tolerance is checked",
+)
+
+
+class _Reports:
+    def __init__(self, name, seen):
+        self.name = name
+        self.seen = seen
+
+    def __float__(self):
+        self.seen.append(self.name)
+        return 1.0
+
+
+_seen = []
+assert math.isclose(
+    _Reports("a", _seen),
+    _Reports("b", _seen),
+    rel_tol=_Reports("rel", _seen),
+    abs_tol=_Reports("abs", _seen),
+)
+assert _seen == ["a", "b", "rel", "abs"], _seen
+
+assert math.isclose(1.0, 1.0 + 1e-12)
+assert not math.isclose(1.0, 2.0)
+
+
+# The generic float folds answer through a raw helper that reports every
+# raising direction as NaN and is guarded finite.  Run each covered function
+# hot on one operand at a time, so the loop compiles and either the fold or
+# the decline it chose runs for every iteration, and check the answer against
+# the one the interpreter gave before anything was compiled.
+_FLOAT1 = (
+    math.tan, math.asin, math.acos, math.atan,
+    math.sinh, math.cosh, math.tanh, math.asinh, math.acosh, math.atanh,
+    math.cbrt, math.exp, math.exp2, math.expm1, math.log1p,
+    math.erf, math.erfc, math.gamma, math.lgamma,
+    math.ulp, math.degrees, math.radians,
+)
+_FLOAT2 = (math.pow, math.fmod, math.copysign, math.remainder, math.atan2)
+
+_PROBE1 = (0.5, 1.0, -1.0, 0.0, -0.0, 2.0, 1e300, -1e300, 710.0, INF, NINF, NAN)
+_PROBE2 = (
+    (2.0, 3.0), (2.0, -3.0), (0.0, -2.0), (-1.0, 2.3), (1e300, 1e300),
+    (7.0, 3.0), (7.0, 0.0), (-1.0, 0.0), (INF, 2.0), (NAN, 1.0), (3, 2),
+)
+
+
+def _outcome(fn, args):
+    """The answer or the rejection, as a comparable value."""
+    try:
+        return ("v", fn(*args))
+    except (ValueError, OverflowError) as exc:
+        return (type(exc).__name__, str(exc))
+
+
+def _agrees(got, want):
+    if got == want:
+        return True
+    # A NaN result is never equal to itself.
+    return (
+        got[0] == "v" and want[0] == "v" and got[1] != got[1] and want[1] != want[1]
+    )
+
+
+for _fn, _args in [(f, (x,)) for f in _FLOAT1 for x in _PROBE1] + [
+    (f, p) for f in _FLOAT2 for p in _PROBE2
+]:
+    _want = _outcome(_fn, _args)
+    for _round in range(300):
+        assert _agrees(_outcome(_fn, _args), _want), (_fn, _args, _want)
+
+
+# A float subclass and a rebound name both decline the fold; the answers must
+# stay the interpreter's.
+class _MyFloat(float):
+    pass
+
+
+for _round in range(400):
+    assert math.exp(_MyFloat(0.0)) == 1.0
+    assert math.pow(_MyFloat(2.0), _MyFloat(3.0)) == 8.0
+
+_real_exp = math.exp
+math.exp = lambda x: "rebound"
+try:
+    for _round in range(400):
+        assert math.exp(1.0) == "rebound"
+finally:
+    math.exp = _real_exp
+assert math.exp(0.0) == 1.0
+
+
+# `isclose` folds only where the result decides a branch, and the folded
+# helper re-implements the comparison rather than calling the module's own.
+# Check both shapes against each other on both truths, on the infinities, and
+# on NaN.
+_CLOSE = (
+    (1.0, 1.0, True), (1.0, 1.0 + 1e-12, True), (1.0, 2.0, False),
+    (INF, INF, True), (INF, NINF, False), (INF, 1.0, False),
+    (NAN, NAN, False), (NAN, 1.0, False), (0.0, -0.0, True),
+    (0.0, 1e-300, False), (1, 1, True), (True, 1.0, True),
+    (-1.0, -1.0 - 1e-12, True), (1e300, 1e300 + 1e280, True),
+)
+for _a, _b, _want in _CLOSE:
+    for _round in range(300):
+        # The branch shape, which folds.
+        if math.isclose(_a, _b):
+            assert _want, (_a, _b)
+        else:
+            assert not _want, (_a, _b)
+        # The escaping shape, which keeps the residual.
+        assert math.isclose(_a, _b) is _want, (_a, _b)
+
+
+# comb reduces a machine-word pair without rbigint.  The arm must decline
+# where an intermediate leaves the range, must keep the rejection order, and
+# must agree with the rbigint path everywhere the two overlap.
+assert math.comb(0, 0) == 1
+assert math.comb(5, 2) == 10
+assert math.comb(5, 3) == 10
+assert math.comb(40, 20) == 137846528820
+assert math.comb(62, 31) == 465428353255261088
+assert math.comb(68, 34) == 28453041475240576740
+assert math.comb(100, 50) == 100891344545564193334812497256
+assert math.comb(10, 11) == 0
+assert math.comb(2**70, 2) == (2**70 * (2**70 - 1)) // 2
+assert math.comb(True, True) == 1
+assert type(math.comb(True, True)) is int
+assert math.comb(_IndexingInt(10), 4) == 210
+assert_raises(ValueError, lambda: math.comb(-1, -1), _msg="n must be a non-negative integer")
+assert_raises(ValueError, lambda: math.comb(1, -1), _msg="k must be a non-negative integer")
+# A METH_VARARGS entry point takes no keywords at all, so one is rejected
+# before the operands are read rather than reaching the body as an extra
+# argument.  Every arity is covered because the marker arrives appended.
+assert_raises(TypeError, lambda: math.comb(5, k=2), _msg="comb takes no keywords")
+assert_raises(TypeError, lambda: math.comb(n=5, k=2), _msg="comb takes no keywords")
+assert_raises(TypeError, lambda: math.perm(5, k=2), _msg="perm takes no keywords")
+assert_raises(TypeError, lambda: math.gcd(5, b=2), _msg="gcd takes no keywords")
+assert_raises(TypeError, lambda: math.lcm(5, b=2), _msg="lcm takes no keywords")
+# Every small pair against the same value built by repeated addition, which
+# shares no code with either comb arm.
+_pascal = [[1]]
+for _n in range(1, 60):
+    _prev = _pascal[-1]
+    _pascal.append([1] + [_prev[_i] + _prev[_i + 1] for _i in range(_n - 1)] + [1])
+for _n in range(60):
+    for _k in range(_n + 1):
+        assert math.comb(_n, _k) == _pascal[_n][_k], (_n, _k)
+
+# perm shares comb's machine-word arm.  `perm(n)` and `perm(n, None)` both
+# mean k = n.
+assert math.perm(0) == 1
+assert math.perm(5) == 120
+assert math.perm(5, None) == 120
+assert math.perm(5, 2) == 20
+assert math.perm(20) == 2432902008176640000
+assert math.perm(21) == 51090942171709440000
+assert math.perm(2**70, 2) == 2**70 * (2**70 - 1)
+assert math.perm(10, 11) == 0
+assert math.perm(True, True) == 1
+assert type(math.perm(True, True)) is int
+assert math.perm(_IndexingInt(10), 4) == 5040
+assert_raises(ValueError, lambda: math.perm(-1, -1), _msg="n must be a non-negative integer")
+assert_raises(ValueError, lambda: math.perm(1, -1), _msg="k must be a non-negative integer")
+for _n in range(30):
+    for _k in range(_n + 1):
+        assert math.perm(_n, _k) == math.comb(_n, _k) * math.factorial(_k), (_n, _k)

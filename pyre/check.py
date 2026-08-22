@@ -154,7 +154,7 @@ WASM_TIMEOUT_SCALE = 4.0
 # that still exceeded it -- fib_recursive and loop_callee_shared_mutation, both
 # bound by CALL_ASSEMBLER returns -- were fixed rather than exempted. No fixture
 # carries an allowance today.
-WASM_MAX_DYNASM_RATIO = 4.0
+WASM_MAX_DYNASM_RATIO = 3.8
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x

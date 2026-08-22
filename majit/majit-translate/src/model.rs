@@ -229,7 +229,7 @@ impl ImmutableRank {
     }
 
     /// True for `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY` —
-    /// `jtransform.py immut in (IR_QUASIIMMUTABLE, IR_QUASIIMMUTABLE_ARRAY)`.
+    /// `jtransform.py Transformer.rewrite_op_getfield immut in (IR_QUASIIMMUTABLE, IR_QUASIIMMUTABLE_ARRAY)`.
     pub fn is_quasi_immutable(self) -> bool {
         matches!(self, Self::QuasiImmutable | Self::QuasiImmutableArray)
     }
@@ -707,7 +707,7 @@ pub enum OpKind {
     /// <ty>)` for the rtyper / `constfold::replace_we_are_jitted`
     /// (→ `false`) genc path, and `jtransform` folds it to
     /// `ConstBool(true)` keyed on the `SpecTag` identity (parity with
-    /// `jtransform.py value is _we_are_jitted`).  No
+    /// `jtransform.py Transformer.rewrite_op_int_is_true value is _we_are_jitted`).  No
     /// `ConstSymbolic` survives `jtransform`, so the backend never
     /// materialises one.
     ConstSymbolic {

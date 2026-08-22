@@ -266,7 +266,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 60] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 69] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -298,6 +298,15 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 60] = [
     ("math_frexp",                "residual_call", "-"),
     ("math_ldexp",                "residual_call", "-"),
     ("math_isqrt",                "residual_call", "-"),
+    ("math_fabs",                 "residual_call", "-"),
+    ("math_float1",               "residual_call", "-"),
+    ("math_float2",               "residual_call", "-"),
+    ("math_isclose",              "residual_call", "-"),
+    ("builtin_fold1",             "residual_call", "-"),
+    ("builtin_fold2",             "residual_call", "-"),
+    ("math_floor",                "residual_call", "-"),
+    ("math_ceil",                 "residual_call", "-"),
+    ("math_trunc",                "residual_call", "-"),
     ("int_call",                  "residual_call", "-"),
     ("float_call",                "residual_call", "-"),
     ("builtin_divmod",            "residual_call", "-"),
@@ -458,10 +467,10 @@ pub fn fbw_depth_census_summary() -> String {
 /// selector tokens.  The reserved `all` token turns off every
 /// `SPEC_FOLD_ROWS` row and nothing else: the `try_walker_fold_*` trio
 /// and the `try_walker_inline_*` descent entry points all stay live.
-fn spec_suppression() -> &'static (u64, Vec<String>) {
-    static SUPPRESSION: std::sync::OnceLock<(u64, Vec<String>)> = std::sync::OnceLock::new();
+fn spec_suppression() -> &'static (SpecMask, Vec<String>) {
+    static SUPPRESSION: std::sync::OnceLock<(SpecMask, Vec<String>)> = std::sync::OnceLock::new();
     SUPPRESSION.get_or_init(|| {
-        let mut mask = 0u64;
+        let mut mask = SpecMask::none();
         let mut unknown = Vec::new();
         if let Some(selectors) = std::env::var_os("PYRE_FBW_NO_SPECIALIZE") {
             for selector in selectors.to_string_lossy().split(',') {
@@ -470,9 +479,9 @@ fn spec_suppression() -> &'static (u64, Vec<String>) {
                     continue;
                 }
                 if selector == "all" {
-                    mask = (1u64 << SPEC_FOLD_COUNT) - 1;
+                    mask = SpecMask::all();
                 } else if let Some(idx) = spec_row_index(selector) {
-                    mask |= 1u64 << idx;
+                    mask.set(idx);
                 } else {
                     unknown.push(selector.to_owned());
                 }
@@ -482,7 +491,39 @@ fn spec_suppression() -> &'static (u64, Vec<String>) {
     })
 }
 
-fn spec_suppressed_mask() -> u64 {
+/// One bit per [`SPEC_FOLD_ROWS`] entry.  A single `u64` held the whole table
+/// until the row count reached its width; the shape is the same, spread over
+/// as many words as the table needs.
+#[derive(Clone, Copy)]
+struct SpecMask([u64; SPEC_FOLD_COUNT.div_ceil(u64::BITS as usize)]);
+
+impl SpecMask {
+    fn none() -> Self {
+        Self([0; SPEC_FOLD_COUNT.div_ceil(u64::BITS as usize)])
+    }
+
+    fn all() -> Self {
+        let mut mask = Self::none();
+        for idx in 0..SPEC_FOLD_COUNT {
+            mask.set(idx);
+        }
+        mask
+    }
+
+    fn set(&mut self, idx: usize) {
+        self.0[idx / u64::BITS as usize] |= 1u64 << (idx % u64::BITS as usize);
+    }
+
+    fn get(&self, idx: usize) -> bool {
+        self.0[idx / u64::BITS as usize] & (1u64 << (idx % u64::BITS as usize)) != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|word| *word == 0)
+    }
+}
+
+fn spec_suppressed_mask() -> SpecMask {
     spec_suppression().0
 }
 
@@ -494,7 +535,7 @@ fn spec_suppress_unknown() -> &'static [String] {
 /// pays one cached load and one predictable branch per consult.
 fn spec_instrumented() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| fbw_spec_census_enabled() || spec_suppressed_mask() != 0)
+    *ON.get_or_init(|| fbw_spec_census_enabled() || !spec_suppressed_mask().is_empty())
 }
 
 fn spec_row_index(name: &str) -> Option<usize> {
@@ -531,7 +572,7 @@ pub(crate) fn spec_gate<T, E>(
         SPEC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return call();
     };
-    if spec_suppressed_mask() & (1u64 << idx) != 0 {
+    if spec_suppressed_mask().get(idx) {
         SPEC_SUPPRESSED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
     }
@@ -570,7 +611,7 @@ pub(super) fn spec_gate_store_attr<E>(
         return call();
     };
     let mask = spec_suppressed_mask();
-    if mask & ((1u64 << direct_idx) | (1u64 << residual_idx)) != 0 {
+    if mask.get(direct_idx) || mask.get(residual_idx) {
         SPEC_SUPPRESSED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SPEC_SUPPRESSED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
@@ -621,13 +662,13 @@ pub fn spec_census_summary() -> String {
     let consulted_total: u64 = rows.iter().map(|row| row.3).sum();
     let fired_total: u64 = rows.iter().map(|row| row.4).sum();
     let suppressed_total: u64 = rows.iter().map(|row| row.5).sum();
-    let suppressed_names = if mask == 0 {
+    let suppressed_names = if mask.is_empty() {
         "-".to_owned()
     } else {
         SPEC_FOLD_ROWS
             .iter()
             .enumerate()
-            .filter_map(|(idx, (label, _, _))| (mask & (1u64 << idx) != 0).then_some(*label))
+            .filter_map(|(idx, (label, _, _))| mask.get(idx).then_some(*label))
             .collect::<Vec<_>>()
             .join(",")
     };
