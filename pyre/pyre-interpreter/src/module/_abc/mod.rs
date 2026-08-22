@@ -316,17 +316,32 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // creation gives a plain class the marker too, and `case [...]` would
         // then accept an object that is not a sequence.
         //
-        // `_abcmodule.c _abc__abc_init_impl` masks the value and applies
-        // whatever collection bits survive, where `interp_abc.py` compares the
-        // whole value against one flag and raises `ValueError` otherwise. The
-        // mask is the observable behaviour -- `__abc_tpflags__ = (1 << 5) | 1`
-        // sets the sequence marker -- so mask here and hand the primitive the
-        // single bit its own contract is written against.
+        // `_abc.c _abc__abc_init_impl` masks the value and applies whatever
+        // collection bits survive, where `interp_abc.py set_collection_flag`
+        // compares the whole value against one flag and raises `ValueError`
+        // otherwise. The mask is the observable behaviour -- `__abc_tpflags__ =
+        // (1 << 5) | 1` sets the sequence marker -- so mask here and hand the
+        // primitive the single bit its own contract is written against.
         if unsafe { is_type(cls) }
             && let Some(w_flags) = crate::type_dict_lookup(cls, "__abc_tpflags__")
         {
-            if unsafe { is_int(w_flags) } {
-                let flags = unsafe { w_int_get_value(w_flags) };
+            // `PyDict_Pop(dict, &_Py_ID(__abc_tpflags__), &flags)` -- take the
+            // entry out of the type dict itself, and take it before validating.
+            // A metaclass `__delattr__` never sees this, and a value the checks
+            // below reject is consumed all the same, so a subclass re-running
+            // `_abc_init` does not inherit the same rejection.
+            let roots = pyre_object::gc_roots::push_roots();
+            let flags_slot = roots.publish(&[w_flags]);
+            crate::type_dict_delete(cls, "__abc_tpflags__");
+            unsafe { crate::baseobjspace::mutated(cls, Some("__abc_tpflags__")) };
+            let w_flags = roots.get(flags_slot);
+            // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is
+            // consumed and ignored, as is anything that is not an int at all.
+            // Both int representations spell `int`, so both are exact.
+            if unsafe { is_exact_type(w_flags, &INT_TYPE) || is_exact_type(w_flags, &LONG_TYPE) } {
+                // `PyLong_AsLong` -- a value past the machine word raises
+                // `OverflowError` rather than being skipped like a non-int.
+                let flags = crate::baseobjspace::int_w(w_flags)?;
                 if flags & COLLECTION_FLAGS == COLLECTION_FLAGS {
                     return Err(crate::PyError::type_error(
                         "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
@@ -336,10 +351,6 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     set_collection_flag_of(cls, flags & COLLECTION_FLAGS)?;
                 }
             }
-            // `del cls.__abc_tpflags__`. Outside the int arm: the attribute is
-            // consumed by the class that spells it whatever it holds, and a
-            // leftover would be inherited by every subclass and re-read here.
-            crate::baseobjspace::delattr_str(cls, "__abc_tpflags__")?;
         }
     }
     Ok(w_none())
@@ -408,27 +419,31 @@ const COLLECTION_FLAGS: i64 = PATMA_SEQUENCE | PATMA_MAPPING;
 /// `interp_abc.py set_collection_flag` — stamp one structural-match marker on
 /// `w_type`, without touching its subclasses.
 ///
-/// `flag` is the exact `Py_TPFLAGS_SEQUENCE` / `Py_TPFLAGS_MAPPING` bit, and
-/// anything else is a `ValueError`; `_abc_init` masks `__abc_tpflags__` down to
-/// a single bit before calling, so the strict test only ever rejects a caller
-/// that spells the flag itself.
+/// `_abc_init` masks `__abc_tpflags__` down to a single bit first, so the
+/// strict test below only ever rejects a caller that spells the flag itself.
 fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), crate::PyError> {
-    if !unsafe { is_type(w_type) } {
-        return Err(crate::PyError::type_error(
-            "_internal_set_collection_flag() argument 1 must be a type",
-        ));
-    }
-    let marker = match flag {
-        PATMA_SEQUENCE => b'S',
-        PATMA_MAPPING => b'M',
-        _ => {
-            return Err(crate::PyError::value_error(format!(
-                "invalid value for __abc_tpflags__: {flag}"
-            )));
-        }
-    };
+    let marker = collection_marker(w_type, flag, "_internal_set_collection_flag")?;
     unsafe { typeobject::w_type_set_flag_map_or_seq(w_type, marker) };
     Ok(())
+}
+
+/// The `flag_patma_collection` byte one collection flag stands for, with the
+/// two rejections `set_collection_flag` makes before it stamps anything:
+/// `space.interp_w(W_TypeObject, w_self)` on the receiver, and the strict
+/// one-bit test on the flag.
+fn collection_marker(w_type: PyObjectRef, flag: i64, who: &str) -> Result<u8, crate::PyError> {
+    if !unsafe { is_type(w_type) } {
+        return Err(crate::PyError::type_error(format!(
+            "{who}() argument 1 must be a type"
+        )));
+    }
+    match flag {
+        PATMA_SEQUENCE => Ok(b'S'),
+        PATMA_MAPPING => Ok(b'M'),
+        _ => Err(crate::PyError::value_error(format!(
+            "invalid value for __abc_tpflags__: {flag}"
+        ))),
+    }
 }
 
 /// `_abc._internal_set_collection_flag(cls, flag)`.
@@ -451,32 +466,34 @@ fn internal_set_collection_flag_recursive(
             "_internal_set_collection_flag_recursive() requires (cls, flag)",
         ));
     };
-    let flag = crate::baseobjspace::int_w(*w_flag)?;
-    // The recursive walk takes the marker byte, so validate the flag through
-    // the non-recursive arm first rather than letting an invalid one reach the
-    // subclass walk as a byte nothing rejects.
-    set_collection_flag_of(*w_type, flag)?;
-    let marker = if flag == PATMA_MAPPING { b'M' } else { b'S' };
-    for child in unsafe { typeobject::w_type_get_subclasses(*w_type, false) } {
-        set_collection_flag_recursive(child, marker);
-    }
+    let marker = collection_marker(
+        *w_type,
+        crate::baseobjspace::int_w(*w_flag)?,
+        "_internal_set_collection_flag_recursive",
+    )?;
+    // `_PyType_SetFlagsRecursive` starts the guarded walk at the argument
+    // itself, not at its children: `set_collection_flag` stamps whatever it is
+    // handed, so entering through that one would let this primitive mark an
+    // immutable type -- `str` among them.
+    set_collection_flag_recursive(*w_type, marker);
     Ok(w_none())
 }
 
-// `interp_abc.py set_collection_flag_recursive` — stamp the marker on
-// `w_type` and every class already deriving from it.
+// `typeobject.c set_flags_recursive` — stamp the marker on `w_type` and every
+// class already deriving from it.  `interp_abc.py set_collection_flag_recursive`
+// carries neither of the two stops below and would mark `str`.
 fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
     unsafe {
-        // A non-heap type's marker is fixed at registration
-        // (`objspace.py:104-108` marks exactly dict / dictproxy / list /
-        // tuple), and `Py_TPFLAGS_IMMUTABLETYPE` stops the recursion there.
-        // `_collections_abc` runs `Sequence.register(str)` and
-        // `ByteString.register(bytes)`, so without this stop `str` / `bytes` /
-        // `bytearray` would start matching `case [...]` — the one thing a
-        // sequence pattern must never accept.
+        // `Py_TPFLAGS_IMMUTABLETYPE`: a non-heap type's marker is fixed at
+        // registration (`objspace.py StdObjSpace.initialize` marks exactly
+        // dict / dictproxy / list / tuple). `_collections_abc` runs
+        // `Sequence.register(str)` and `ByteString.register(bytes)`, so without
+        // this stop `str` / `bytes` / `bytearray` would start matching
+        // `case [...]` — the one thing a sequence pattern must never accept.
         //
-        // A class already carrying the marker passed it to its descendants at
-        // creation (`inherit_flag_map_or_seq`), so that subtree is done.
+        // `(tp_flags & mask) == flags`: a class already carrying the marker
+        // passed it to its descendants at creation
+        // (`inherit_flag_map_or_seq`), so that subtree is done.
         if !typeobject::w_type_is_heaptype(w_type)
             || typeobject::w_type_get_flag_map_or_seq(w_type) == flag
         {
