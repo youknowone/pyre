@@ -3473,26 +3473,29 @@ pub fn get_converted_unexpected_exception(
 
 /// pypy/interpreter/error.py `decompose_valuefmt`.
 ///
-/// Upstream splits on `'%'` and asserts `len(parts) == len(formats) + 1`:
-/// every format code has a literal part on each side, so a format string that
-/// ends in one still contributes a trailing empty part.  `_compute_value`
-/// relies on that — it walks the parts and the formats in lockstep.
+/// Every format code has a literal part on each side, so a format string that
+/// ends in one still contributes a trailing empty part. `_compute_value`
+/// relies on that — it walks the parts and the formats in lockstep — and
+/// `get_operrcls2` asserts the resulting relationship.
 pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
+    const FMTS: &str = "8NRSTds";
+
     let mut strings = Vec::new();
     let mut formats = Vec::new();
     let mut current = String::new();
 
-    let mut iter = valuefmt.chars().peekable();
+    let mut iter = valuefmt.chars();
     while let Some(ch) = iter.next() {
         if ch == '%' {
-            if let Some('%') = iter.peek() {
-                let _ = iter.next();
-                current.push('%');
-                continue;
-            }
-            strings.push(std::mem::take(&mut current));
-            if let Some(spec) = iter.next() {
-                formats.push(spec.to_string());
+            match iter.next() {
+                Some('%') => current.push('%'),
+                Some(spec) if FMTS.contains(spec) => {
+                    strings.push(std::mem::take(&mut current));
+                    formats.push(spec.to_string());
+                }
+                Some(_) | None => {
+                    panic!("invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)")
+                }
             }
         } else {
             current.push(ch);
@@ -3503,11 +3506,13 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
     // that makes `strings` one longer than `formats`.
     strings.push(current);
 
+    assert!(!formats.is_empty(), "unsupported: no % command found");
     (strings, formats)
 }
 
 pub fn get_operrcls2(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
-    let (strings, _formats) = decompose_valuefmt(valuefmt);
+    let (strings, formats) = decompose_valuefmt(valuefmt);
+    assert_eq!(strings.len(), formats.len() + 1);
     (std::ptr::null_mut(), strings)
 }
 
@@ -3748,7 +3753,14 @@ pub fn new_exception_class(
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         _roots.pin_root(w_exc);
         let w_module = pyre_object::w_str_new(module);
-        let _ = crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module);
+        // `space.setattr` propagates its failure through the same bare-return
+        // channel as the class call above.
+        if let Err(err) =
+            crate::baseobjspace::setattr_str(_roots.get(exc_slot), "__module__", w_module)
+        {
+            crate::call::set_call_error(err);
+            return std::ptr::null_mut();
+        }
         return _roots.get(exc_slot);
     }
     w_exc
@@ -3899,8 +3911,6 @@ mod tests {
             "cannot do %s to %s",
             "%s leads",
             "trails %s",
-            "no format codes",
-            "",
             "%N takes %R and %T",
         ] {
             let (strings, formats) = super::decompose_valuefmt(valuefmt);
@@ -3910,6 +3920,22 @@ mod tests {
                 "{valuefmt:?} -> {strings:?} / {formats:?}"
             );
         }
+    }
+
+    #[test]
+    fn decompose_valuefmt_rejects_no_format_command() {
+        for valuefmt in ["no format codes", ""] {
+            let panic = std::panic::catch_unwind(|| super::decompose_valuefmt(valuefmt));
+            assert!(panic.is_err(), "accepted {valuefmt:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)"
+    )]
+    fn decompose_valuefmt_rejects_an_invalid_code() {
+        let _ = super::decompose_valuefmt("cannot use %q");
     }
 
     #[test]
