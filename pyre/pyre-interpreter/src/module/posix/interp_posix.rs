@@ -813,6 +813,285 @@ fn split_root(path: &rustpython_wtf8::Wtf8) -> (&rustpython_wtf8::Wtf8, &rustpyt
     }
 }
 
+/// The separator a path is spelled with, and the second one Windows also
+/// accepts. Which pair applies is the host's, and it travels as a value rather
+/// than a `cfg` so both spellings stay under test wherever the tests run.
+#[derive(Clone, Copy)]
+struct PathSeps {
+    /// `SEP`.
+    sep: u16,
+    /// `ALTSEP`, absent where the host defines none.
+    altsep: Option<u16>,
+    /// Whether the drive, UNC share and device prefixes exist at all, which is
+    /// the `#ifdef MS_WINDOWS` in `_Py_skiproot` and `_Py_normpath_and_size`.
+    drives: bool,
+}
+
+const NT_SEPS: PathSeps = PathSeps {
+    sep: b'\\' as u16,
+    altsep: Some(b'/' as u16),
+    drives: true,
+};
+
+const POSIX_SEPS: PathSeps = PathSeps {
+    sep: b'/' as u16,
+    altsep: None,
+    drives: false,
+};
+
+/// The host's own pair — `ntpath` on Windows, `posixpath` everywhere else.
+const HOST_SEPS: PathSeps = if cfg!(windows) { NT_SEPS } else { POSIX_SEPS };
+
+impl PathSeps {
+    fn is_sep(self, path: &[u16], index: usize) -> bool {
+        match path.get(index) {
+            Some(&c) => c == self.sep || self.altsep == Some(c),
+            None => false,
+        }
+    }
+}
+
+/// `_Py_skiproot` — how much of `path` is the drive prefix, and how much of
+/// what follows is the root separator. Everything past the two is the tail.
+///
+/// The counts are UTF-16 units, the width the wide spelling of a path is
+/// measured in, so the drive test reads the second unit of a surrogate pair
+/// rather than the second character: `"\u{1f600}:\\x"` names no drive.
+fn skiproot(path: &[u16], seps: PathSeps) -> (usize, usize) {
+    let is_sep = |index: usize| seps.is_sep(path, index);
+    let is_end = |index: usize| index >= path.len();
+    let sep_or_end = |index: usize| is_sep(index) || is_end(index);
+    let is_letter = |index: usize, upper: u8| {
+        matches!(path.get(index), Some(&c)
+            if c == u16::from(upper) || c == u16::from(upper.to_ascii_lowercase()))
+    };
+
+    if !seps.drives {
+        if !is_sep(0) {
+            // Relative path, e.g.: 'foo'
+            return (0, 0);
+        }
+        if !is_sep(1) || is_sep(2) {
+            // Absolute path, e.g.: '/foo', '///foo', '////foo', etc.
+            return (0, 1);
+        }
+        // Precisely two leading slashes, e.g.: '//foo'. Implementation defined
+        // per POSIX.
+        return (0, 2);
+    }
+    if is_sep(0) {
+        if !is_sep(1) {
+            // Relative path with root, e.g. \Windows
+            return (0, 1);
+        }
+        // Device drives, e.g. \\.\device or \\?\device
+        // UNC drives, e.g. \\server\share or \\?\UNC\server\share
+        let unc = path.get(2) == Some(&u16::from(b'?'))
+            && is_sep(3)
+            && is_letter(4, b'U')
+            && is_letter(5, b'N')
+            && is_letter(6, b'C')
+            && is_sep(7);
+        let mut idx = if unc { 8 } else { 2 };
+        while !sep_or_end(idx) {
+            idx += 1;
+        }
+        if is_end(idx) {
+            return (idx, 0);
+        }
+        idx += 1;
+        while !sep_or_end(idx) {
+            idx += 1;
+        }
+        return (idx, usize::from(!is_end(idx)));
+    }
+    if !is_end(0) && path.get(1) == Some(&u16::from(b':')) {
+        // Absolute drive-letter path, e.g. X:\Windows, or one relative to the
+        // drive's own cursor, e.g. X:Windows.
+        return (2, usize::from(is_sep(2)));
+    }
+    // Relative path, e.g. Windows
+    (0, 0)
+}
+
+/// `_Py_normpath_and_size` — fold `.`, `..` and repeated separators out of
+/// `buf` in place, and answer how many units the result occupies.
+///
+/// `buf` carries the trailing null the wide spelling of a path does, and is
+/// one unit longer than the path itself: the scan reads one unit past the
+/// segment it is measuring, and the last write is the terminator behind the
+/// folded name. The fold never lengthens a path, so it needs no other room.
+fn normpath_and_size(buf: &mut [u16], seps: PathSeps) -> usize {
+    const DOT: u16 = b'.' as u16;
+    let sep = seps.sep;
+    let size = buf.len() - 1;
+    if size == 0 {
+        return 0;
+    }
+    let is_sep = |buf: &[u16], index: usize| seps.is_sep(buf, index);
+    let is_end = |index: usize| index >= size;
+    let sep_or_end = |buf: &[u16], index: usize| is_sep(buf, index) || is_end(index);
+
+    let mut p1 = 0; // sequentially scanned index in the path
+    let mut p2 = 0; // destination of a scanned unit to be ljusted
+    let mut min_p2 = 0; // the beginning of the destination range
+    let mut last_c = 0; // the last ljusted unit, buf[p2 - 1] in most cases
+
+    let (drvsize, rootsize) = skiproot(&buf[..size], seps);
+    if drvsize != 0 || rootsize != 0 {
+        // Skip past root and update min_p2
+        p1 = drvsize + rootsize;
+        match seps.altsep {
+            Some(altsep) => {
+                while p2 < p1 {
+                    if buf[p2] == altsep {
+                        buf[p2] = sep;
+                    }
+                    p2 += 1;
+                }
+            }
+            None => p2 = p1,
+        }
+        min_p2 = p2 - 1;
+        last_c = buf[min_p2];
+        if seps.drives && last_c != sep {
+            min_p2 += 1;
+        }
+    }
+    if buf[p1] == DOT && sep_or_end(buf, p1 + 1) {
+        // Skip leading '.\'
+        p1 += 1;
+        last_c = buf[p1];
+        if seps.altsep == Some(last_c) {
+            last_c = sep;
+        }
+        while is_sep(buf, p1) {
+            p1 += 1;
+        }
+    }
+
+    while !is_end(p1) {
+        let mut c = buf[p1];
+        if seps.altsep == Some(c) {
+            c = sep;
+        }
+        if last_c == sep {
+            if c == DOT {
+                let sep_at_1 = sep_or_end(buf, p1 + 1);
+                let sep_at_2 = !sep_at_1 && sep_or_end(buf, p1 + 2);
+                if sep_at_2 && buf[p1 + 1] == DOT {
+                    let mut p3 = p2;
+                    while p3 != min_p2 {
+                        p3 -= 1;
+                        if buf[p3] != sep {
+                            break;
+                        }
+                    }
+                    while p3 != min_p2 && buf[p3 - 1] != sep {
+                        p3 -= 1;
+                    }
+                    if p2 == min_p2
+                        || (buf[p3] == DOT && buf[p3 + 1] == DOT && is_sep(buf, p3 + 2))
+                    {
+                        // Previous segment is also ../, so append instead.
+                        // Relative path does not absorb ../ at min_p2 as well.
+                        buf[p2] = DOT;
+                        buf[p2 + 1] = DOT;
+                        p2 += 2;
+                        last_c = DOT;
+                    } else if buf[p3] == sep {
+                        // Absolute path, so absorb segment
+                        p2 = p3 + 1;
+                    } else {
+                        p2 = p3;
+                    }
+                    p1 += 1;
+                } else if !sep_at_1 {
+                    buf[p2] = c;
+                    p2 += 1;
+                    last_c = c;
+                }
+            } else if c != sep {
+                buf[p2] = c;
+                p2 += 1;
+                last_c = c;
+            }
+        } else {
+            buf[p2] = c;
+            p2 += 1;
+            last_c = c;
+        }
+        p1 += 1;
+    }
+
+    buf[p2] = 0;
+    if p2 == min_p2 {
+        // The destination never advanced, so the fold left nothing behind the
+        // root: one unit before the range is where it ends.
+        return p2;
+    }
+    loop {
+        p2 -= 1;
+        if p2 == min_p2 || buf[p2] != sep {
+            return p2 + 1;
+        }
+        buf[p2] = 0;
+    }
+}
+
+/// The wide spelling `_Py_skiproot` and `_Py_normpath_and_size` read, with the
+/// trailing null they scan up to.
+fn wide_with_nul(text: &rustpython_wtf8::Wtf8) -> Vec<u16> {
+    let mut wide: Vec<u16> = text.encode_wide().collect();
+    wide.push(0);
+    wide
+}
+
+/// A `path_t(make_wide=True, nonstrict=True)` argument, read as the wide units
+/// a path is measured in. The flag reports whether it arrived as `bytes`, so
+/// the answer can be spelled back the way the caller spelled the question.
+///
+/// `nonstrict` is what lifts the embedded-null rejection: the two callers fold
+/// and split the name as text and hand it to nobody, so a null is a character
+/// like any other there.
+fn nonstrict_wide_path(
+    obj: PyObjectRef,
+    func: &str,
+) -> Result<(Vec<u16>, bool), crate::PyError> {
+    let resolved = crate::gateway::fsencode_path_nonstrict_w(obj, func, "path")?;
+    let as_bytes = unsafe { resolved.is_bytes() };
+    let text = crate::gateway::fsdecode_filename_wtf8(&resolved.as_bytes);
+    Ok((wide_with_nul(&text), as_bytes))
+}
+
+/// One of the `_path_*` helpers as a function object, carrying both the
+/// docstring `__doc__` reports and the clinic signature line ahead of it that
+/// `__text_signature__` does.
+fn path_helper_fn(
+    name: &'static str,
+    func: crate::gateway::BuiltinCodeFn,
+    text_signature: &'static str,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let function = crate::make_builtin_function_with_doc(name, func, docstring);
+    unsafe {
+        crate::function::fset_func_text_signature(function, pyre_object::w_str_new(text_signature));
+    }
+    function
+}
+
+/// A name answered back in the units the question was asked in:
+/// `PyUnicode_FromWideChar`, and `PyUnicode_EncodeFSDefault` over that where
+/// the argument was `bytes`.
+fn wide_result(units: &[u16], as_bytes: bool) -> PyObjectRef {
+    let text = rustpython_wtf8::Wtf8Buf::from_wide(units);
+    if as_bytes {
+        pyre_object::w_bytes_from_bytes(&crate::gateway::fsencode_wtf8_total(&text))
+    } else {
+        pyre_object::w_str_from_wtf8(text)
+    }
+}
+
 /// Windows-only `nt` calls — PyPy: pypy/module/posix/interp_nt.py and the
 /// `if _WIN32` blocks of interp_posix.py. Registered under the `nt` module
 /// name on Windows (moduledef.py `applevel_name = os.name`); `ntpath` reaches
@@ -849,10 +1128,9 @@ mod win_nt {
     /// Read argument 0 as a filesystem path; the flag reports whether the
     /// input was bytes so the result can be encoded back to match.
     ///
-    /// The conversion is the caller-less one. Every entry point reached through
-    /// here is Windows-only, so what it should name itself and its argument is
-    /// not something this host can measure, and a guessed wording would be
-    /// worse than the one uniform gap. See the follow-up task.
+    /// `path_converter` fills `function_name` and `argument_name` from the
+    /// argument clinic, so a rejected argument and an embedded null both name
+    /// the call that read them.
     fn arg_path(
         args: &[PyObjectRef],
         func: &str,
@@ -862,7 +1140,7 @@ mod win_nt {
                 "{func}() missing required argument 'path'"
             )));
         };
-        let resolved = crate::gateway::fsencode_path_w(arg)?;
+        let resolved = crate::gateway::fsencode_path_named_w(arg, func, "path")?;
         let as_bytes = unsafe { resolved.is_bytes() };
         // Windows names files in UTF-16, so the path reaches the host API as
         // code units rather than bytes. Going through a Rust `String` on the
@@ -936,6 +1214,115 @@ mod win_nt {
             Ok(name) => Ok(pyre_object::w_str_from_wtf8(
                 crate::gateway::fsdecode_os_str_wtf8(&name),
             )),
+            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
+        }
+    }
+
+    /// `path_t(suppress_value_error=True)` — the name or the descriptor a file
+    /// test reads, or nothing where the conversion reported a `ValueError` and
+    /// the test's own answer is `False`. Every other failure is still one:
+    /// `path_converter` clears the error only for that one class.
+    fn path_or_fd_suppressing(
+        obj: PyObjectRef,
+        func: &str,
+    ) -> Result<Option<crate::gateway::FsEncodedPath>, crate::PyError> {
+        match crate::gateway::fsencode_path_or_fd_w(obj, func, true) {
+            Ok(path) => Ok(Some(path)),
+            Err(mut error) => match crate::builtins::lookup_exc_class("ValueError") {
+                Some(value_error)
+                    if crate::eval::check_exc_match_against(
+                        error.to_exc_object(),
+                        value_error,
+                    ) =>
+                {
+                    Ok(None)
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
+    /// The wide name a converted path spells. A null would have ended the
+    /// conversion already, so the only argument that gets here without one is
+    /// a name the host can take.
+    fn tested_wide(path: &crate::gateway::FsEncodedPath) -> Option<widestring::WideCString> {
+        let wide: Vec<u16> = crate::gateway::fsdecode_filename_wtf8(&path.as_bytes)
+            .encode_wide()
+            .collect();
+        widestring::WideCString::from_vec(wide).ok()
+    }
+
+    /// `_testFileType` — the descriptor's handle where the argument named one,
+    /// and `_testFileTypeByName` over the name otherwise. A descriptor is
+    /// tested `diskOnly`, so a pipe or a console is no kind of file.
+    pub fn test_file_type(
+        obj: PyObjectRef,
+        func: &str,
+        tested: host_nt::TestType,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let Some(path) = path_or_fd_suppressing(obj, func)? else {
+            return Ok(pyre_object::w_bool_from(false));
+        };
+        // Both arms open handles and query the volume, which blocks while a
+        // network name answers.
+        let _blocked = crate::module::thread::before_external_block();
+        let result = if path.as_fd != -1 {
+            host_nt::test_file_type_by_handle(host_nt::handle_from_fd(path.as_fd), tested, true)
+        } else {
+            tested_wide(&path).is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
+        };
+        Ok(pyre_object::w_bool_from(result))
+    }
+
+    /// `_testFileExists` — a descriptor exists where its handle has a type,
+    /// and a name where `_testFileExistsByName` reaches it. `follow_links`
+    /// separates `_path_exists`, which a broken link is not, from
+    /// `_path_lexists`, which it is.
+    pub fn test_file_exists(
+        obj: PyObjectRef,
+        func: &str,
+        follow_links: bool,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let Some(path) = path_or_fd_suppressing(obj, func)? else {
+            return Ok(pyre_object::w_bool_from(false));
+        };
+        let _blocked = crate::module::thread::before_external_block();
+        let result = if path.as_fd != -1 {
+            unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(path.as_fd) }
+                .is_ok_and(host_nt::fd_exists)
+        } else {
+            tested_wide(&path)
+                .is_some_and(|wide| host_nt::test_file_exists_by_name(&wide, follow_links))
+        };
+        Ok(pyre_object::w_bool_from(result))
+    }
+
+    /// ntpath.isdevdrive helper — whether the volume the name sits on carries
+    /// `PERSISTENT_VOLUME_STATE_DEV_VOLUME`. A volume that cannot be reached
+    /// is an error rather than a `False`, which is why `ntpath.isdevdrive`
+    /// wraps the call in its own `except OSError`.
+    pub fn _path_isdevdrive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, _as_bytes, _resolved) = arg_path(args, "_path_isdevdrive")?;
+        let state = {
+            let _blocked = crate::module::thread::before_external_block();
+            host_nt::path_isdevdrive(&path)
+        };
+        // `PyErr_SetFromWindowsErr` — the volume, not the name, is what
+        // failed, so no filename is attached.
+        state
+            .map(pyre_object::w_bool_from)
+            .map_err(|error| io_err(&error, ""))
+    }
+
+    /// ntpath.ismount helper — the mount point the name sits under.
+    pub fn _getvolumepathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, as_bytes, resolved) = arg_path(args, "_getvolumepathname")?;
+        let volume = {
+            let _blocked = crate::module::thread::before_external_block();
+            host_nt::getvolumepathname(&path)
+        };
+        match volume {
+            Ok(name) => Ok(wrap_path(&name, as_bytes)),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
@@ -2515,9 +2902,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pos.len()
             )));
         }
-        let mut allowed: Vec<&str> = params.to_vec();
-        allowed.extend_from_slice(kwonly);
-        crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
+        // The names are checked after the count is satisfied:
+        // `_PyArg_UnpackKeywords` fills the slots first and reports a required
+        // one still empty, so `os.stat(other=1)` names `path` as missing
+        // rather than `other` as unexpected.
         let mut bound = Vec::with_capacity(params.len());
         for (index, key) in params.iter().enumerate() {
             let value = crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)?;
@@ -2529,6 +2917,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             bound.push(value);
         }
+        let mut allowed: Vec<&str> = params.to_vec();
+        allowed.extend_from_slice(kwonly);
+        crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
         Ok((bound, kwargs))
     }
 
@@ -3574,18 +3965,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "_path_splitroot",
-        crate::make_builtin_function_with_arity(
+        path_helper_fn(
             "_path_splitroot",
             |args| {
-                let Some(&arg) = args.first() else {
-                    return Err(crate::PyError::type_error(
-                        "_path_splitroot() missing required argument 'path'",
-                    ));
-                };
-                // Windows-only, so what it should name itself with is not
-                // measurable from a POSIX host; it keeps the caller-less
-                // conversion meanwhile. See the follow-up task.
-                let path = extract_path(arg)?;
+                let (bound, _) = bind_path_args(args, "_path_splitroot", &["path"], 1, &[])?;
+                let path = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("path is required"),
+                    "_path_splitroot",
+                    "path",
+                )?
+                .as_bytes;
                 // Splitting a drive or UNC prefix is a text operation on a
                 // Windows path, and both halves are handed back as `str`, so
                 // this one stays in the text domain rather than the byte one.
@@ -3596,9 +3985,203 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_str_from_wtf8(tail.to_wtf8_buf()),
                 ]))
             },
-            1,
+            "($module, /, path)",
+            "Removes everything after the root on Win32.",
         ),
     );
+
+    // ── posix._path_splitroot_ex(p) → (drive, root, tail) ──
+    // `_Py_skiproot` measures the two prefixes and the three pieces are slices
+    // of the one name. This is `ntpath.splitroot` and `posixpath.splitroot`
+    // themselves: both import it and fall back to their own Python split only
+    // where a build does not carry it.
+    crate::module_ns_store(
+        ns,
+        "_path_splitroot_ex",
+        path_helper_fn(
+            "_path_splitroot_ex",
+            |args| {
+                let (bound, _) = bind_path_args(args, "_path_splitroot_ex", &["p"], 1, &[])?;
+                let (wide, as_bytes) =
+                    nonstrict_wide_path(bound[0].expect("p is required"), "_path_splitroot_ex")?;
+                let units = &wide[..wide.len() - 1];
+                let (drvsize, rootsize) = skiproot(units, HOST_SEPS);
+                Ok(pyre_object::w_tuple_new(vec![
+                    wide_result(&units[..drvsize], as_bytes),
+                    wide_result(&units[drvsize..drvsize + rootsize], as_bytes),
+                    wide_result(&units[drvsize + rootsize..], as_bytes),
+                ]))
+            },
+            "($module, /, p)",
+            "Split a pathname into drive, root and tail.\n\nThe tail contains \
+             anything after the root.",
+        ),
+    );
+
+    // ── posix._path_normpath(path) → path ──
+    // `ntpath.normpath` and `posixpath.normpath` themselves, on the same
+    // import-or-fall-back terms as `_path_splitroot_ex` above.
+    crate::module_ns_store(
+        ns,
+        "_path_normpath",
+        path_helper_fn(
+            "_path_normpath",
+            |args| {
+                let (bound, _) = bind_path_args(args, "_path_normpath", &["path"], 1, &[])?;
+                let (mut wide, as_bytes) =
+                    nonstrict_wide_path(bound[0].expect("path is required"), "_path_normpath")?;
+                let norm_len = normpath_and_size(&mut wide, HOST_SEPS);
+                // A name that folds away to nothing names the current
+                // directory, which `PyUnicode_FromOrdinal('.')` spells.
+                if norm_len == 0 {
+                    return Ok(wide_result(&[u16::from(b'.')], as_bytes));
+                }
+                Ok(wide_result(&wide[..norm_len], as_bytes))
+            },
+            "($module, /, path)",
+            "Normalize path, eliminating double slashes, etc.",
+        ),
+    );
+
+    // ── nt._path_isdir / _path_isfile / _path_islink / _path_isjunction /
+    //    _path_exists / _path_lexists ──
+    // `path_t(allow_fd=True, suppress_value_error=True)`: a descriptor is
+    // tested through its handle, and a name the conversion cannot spell is not
+    // an error but a `False` — `_testFileType` and `_testFileExists` both open
+    // with `if (path->value_error) return FALSE`. `ntpath` imports the six in
+    // one `try`, in place of the `genericpath` predicates that would stat.
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        crate::module_ns_store(
+            ns,
+            "_path_isdir",
+            path_helper_fn(
+                "_path_isdir",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_isdir", &["s"], 1, &[])?;
+                    win_nt::test_file_type(
+                        bound[0].expect("s is required"),
+                        "_path_isdir",
+                        rustpython_host_env::nt::TestType::Directory,
+                    )
+                },
+                "($module, /, s)",
+                "Return true if the pathname refers to an existing directory.",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_isfile",
+            path_helper_fn(
+                "_path_isfile",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_isfile", &["path"], 1, &[])?;
+                    win_nt::test_file_type(
+                        bound[0].expect("path is required"),
+                        "_path_isfile",
+                        rustpython_host_env::nt::TestType::RegularFile,
+                    )
+                },
+                "($module, /, path)",
+                "Test whether a path is a regular file",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_islink",
+            path_helper_fn(
+                "_path_islink",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_islink", &["path"], 1, &[])?;
+                    win_nt::test_file_type(
+                        bound[0].expect("path is required"),
+                        "_path_islink",
+                        rustpython_host_env::nt::TestType::Symlink,
+                    )
+                },
+                "($module, /, path)",
+                "Test whether a path is a symbolic link",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_isjunction",
+            path_helper_fn(
+                "_path_isjunction",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_isjunction", &["path"], 1, &[])?;
+                    win_nt::test_file_type(
+                        bound[0].expect("path is required"),
+                        "_path_isjunction",
+                        rustpython_host_env::nt::TestType::Junction,
+                    )
+                },
+                "($module, /, path)",
+                "Test whether a path is a junction",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_exists",
+            path_helper_fn(
+                "_path_exists",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_exists", &["path"], 1, &[])?;
+                    win_nt::test_file_exists(
+                        bound[0].expect("path is required"),
+                        "_path_exists",
+                        true,
+                    )
+                },
+                "($module, /, path)",
+                "Test whether a path exists.  Returns False for broken symbolic links.",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_getvolumepathname",
+            path_helper_fn(
+                "_getvolumepathname",
+                |args| {
+                    let (bound, _) =
+                        bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
+                    win_nt::_getvolumepathname(&[bound[0].expect("path is required")])
+                },
+                "($module, /, path)",
+                "A helper function for ismount on Win32.",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_isdevdrive",
+            path_helper_fn(
+                "_path_isdevdrive",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_isdevdrive", &["path"], 1, &[])?;
+                    win_nt::_path_isdevdrive(&[bound[0].expect("path is required")])
+                },
+                "($module, /, path)",
+                "Determines whether the specified path is on a Windows Dev Drive.",
+            ),
+        );
+        crate::module_ns_store(
+            ns,
+            "_path_lexists",
+            path_helper_fn(
+                "_path_lexists",
+                |args| {
+                    let (bound, _) = bind_path_args(args, "_path_lexists", &["path"], 1, &[])?;
+                    win_nt::test_file_exists(
+                        bound[0].expect("path is required"),
+                        "_path_lexists",
+                        false,
+                    )
+                },
+                "($module, /, path)",
+                "Test whether a path exists.  Returns True for broken symbolic links.",
+            ),
+        );
+    }
 
     // ── Windows-only nt calls — moduledef.py `if os.name == 'nt'` block ──
     // ntpath imports these from `nt` behind try/except ImportError, so a build
@@ -11594,5 +12177,518 @@ mod split_root_tests {
         assert_eq!(root.as_str(), Ok("C:\\"));
         assert_eq!(tail.code_points().next().map(|c| c.to_u32()), Some(0xdcff));
         assert_eq!(tail.len(), path.len() - root.len());
+    }
+}
+
+#[cfg(test)]
+mod normpath_tests {
+    use super::{NT_SEPS, POSIX_SEPS, PathSeps, normpath_and_size, skiproot, wide_with_nul};
+    use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
+
+    /// The tables spell the lone surrogate `fsdecode` produces for an
+    /// undecodable name as U+0001, which a Rust string literal can hold and no
+    /// path carries.
+    fn w(text: &str) -> Wtf8Buf {
+        let mut out = Wtf8Buf::new();
+        for ch in text.chars() {
+            match ch {
+                '\u{1}' => out.push(CodePoint::from_u32(0xdfff).unwrap()),
+                _ => out.push_char(ch),
+            }
+        }
+        out
+    }
+
+    fn split_ex(path: &Wtf8, seps: PathSeps) -> (Wtf8Buf, Wtf8Buf, Wtf8Buf) {
+        let wide: Vec<u16> = path.encode_wide().collect();
+        let (drvsize, rootsize) = skiproot(&wide, seps);
+        (
+            Wtf8Buf::from_wide(&wide[..drvsize]),
+            Wtf8Buf::from_wide(&wide[drvsize..drvsize + rootsize]),
+            Wtf8Buf::from_wide(&wide[drvsize + rootsize..]),
+        )
+    }
+
+    fn normpath(path: &Wtf8, seps: PathSeps) -> Wtf8Buf {
+        let mut buf = wide_with_nul(path);
+        let norm_len = normpath_and_size(&mut buf, seps);
+        if norm_len == 0 {
+            return Wtf8Buf::from_string(".".to_string());
+        }
+        Wtf8Buf::from_wide(&buf[..norm_len])
+    }
+
+    fn check_split(cases: &[(&str, &str, &str, &str)], seps: PathSeps) {
+        for &(path, drive, root, tail) in cases {
+            assert_eq!(
+                split_ex(&w(path), seps),
+                (w(drive), w(root), w(tail)),
+                "splitroot({path:?})"
+            );
+        }
+    }
+
+    fn check_normpath(cases: &[(&str, &str)], seps: PathSeps) {
+        for &(path, expected) in cases {
+            assert_eq!(normpath(&w(path), seps), w(expected), "normpath({path:?})");
+        }
+    }
+
+    /// Expectations taken from `ntpath.splitroot`, which is `_path_splitroot_ex`
+    /// itself on a Windows host.
+    #[test]
+    fn skiproot_matches_ntpath_splitroot() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("", "", "", ""),
+            (".", "", "", "."),
+            ("..", "", "", ".."),
+            ("...", "", "", "..."),
+            ("/", "", "/", ""),
+            ("//", "//", "", ""),
+            ("///", "///", "", ""),
+            ("////", "///", "/", ""),
+            ("\\", "", "\\", ""),
+            ("\\\\", "\\\\", "", ""),
+            ("\\\\\\", "\\\\\\", "", ""),
+            ("foo", "", "", "foo"),
+            ("foo/bar", "", "", "foo/bar"),
+            ("foo\\bar", "", "", "foo\\bar"),
+            ("foo//bar", "", "", "foo//bar"),
+            ("foo\\\\bar", "", "", "foo\\\\bar"),
+            ("./foo", "", "", "./foo"),
+            (".\\foo", "", "", ".\\foo"),
+            ("././foo", "", "", "././foo"),
+            ("./", "", "", "./"),
+            (".\\", "", "", ".\\"),
+            ("./.", "", "", "./."),
+            ("foo/.", "", "", "foo/."),
+            ("foo\\.", "", "", "foo\\."),
+            ("foo/..", "", "", "foo/.."),
+            ("foo\\..", "", "", "foo\\.."),
+            ("foo/../bar", "", "", "foo/../bar"),
+            ("foo\\..\\bar", "", "", "foo\\..\\bar"),
+            ("../foo", "", "", "../foo"),
+            ("..\\foo", "", "", "..\\foo"),
+            ("../../foo", "", "", "../../foo"),
+            ("..\\..\\foo", "", "", "..\\..\\foo"),
+            ("/..", "", "/", ".."),
+            ("/../foo", "", "/", "../foo"),
+            ("//../foo", "//../foo", "", ""),
+            ("///../foo", "///..", "/", "foo"),
+            ("\\..\\foo", "", "\\", "..\\foo"),
+            ("/foo/../..", "", "/", "foo/../.."),
+            ("/foo/../../bar", "", "/", "foo/../../bar"),
+            ("foo/../..", "", "", "foo/../.."),
+            ("foo/../../bar", "", "", "foo/../../bar"),
+            ("foo/bar/../..", "", "", "foo/bar/../.."),
+            ("foo/bar/../../..", "", "", "foo/bar/../../.."),
+            ("C:", "C:", "", ""),
+            ("C:.", "C:", "", "."),
+            ("C:..", "C:", "", ".."),
+            ("C:foo", "C:", "", "foo"),
+            ("C:\\", "C:", "\\", ""),
+            ("C:\\.", "C:", "\\", "."),
+            ("C:\\..", "C:", "\\", ".."),
+            ("C:\\foo", "C:", "\\", "foo"),
+            ("C:/foo/../bar", "C:", "/", "foo/../bar"),
+            ("C:\\foo\\..\\..\\bar", "C:", "\\", "foo\\..\\..\\bar"),
+            ("C:foo\\..\\..\\bar", "C:", "", "foo\\..\\..\\bar"),
+            ("c:\\a\\b\\..\\..\\..\\c", "c:", "\\", "a\\b\\..\\..\\..\\c"),
+            ("\\\\server\\share", "\\\\server\\share", "", ""),
+            ("\\\\server\\share\\", "\\\\server\\share", "\\", ""),
+            ("\\\\server\\share\\dir", "\\\\server\\share", "\\", "dir"),
+            ("\\\\server\\share\\..\\dir", "\\\\server\\share", "\\", "..\\dir"),
+            ("\\\\server\\share\\dir\\..\\..", "\\\\server\\share", "\\", "dir\\..\\.."),
+            ("//server/share/dir/../..", "//server/share", "/", "dir/../.."),
+            ("//server/share/../..", "//server/share", "/", "../.."),
+            ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:", "\\", "foo\\..\\bar"),
+            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share", "\\", "dir\\.."),
+            ("//?/unc/server/share/dir/..", "//?/unc/server/share", "/", "dir/.."),
+            ("\\\\.\\device\\x\\..", "\\\\.\\device", "\\", "x\\.."),
+            ("\\\\.\\device", "\\\\.\\device", "", ""),
+            ("\\\\", "\\\\", "", ""),
+            ("\\\\a", "\\\\a", "", ""),
+            ("\\\\a\\", "\\\\a\\", "", ""),
+            ("\\\\a\\b", "\\\\a\\b", "", ""),
+            ("\\\\a\\b\\", "\\\\a\\b", "\\", ""),
+            ("\\\\a\\b\\c", "\\\\a\\b", "\\", "c"),
+            (":a", "", "", ":a"),
+            ("a:b:c", "a:", "", "b:c"),
+            ("\u{e4}:\\x", "\u{e4}:", "\\", "x"),
+            ("\u{e4}:\\x\\..", "\u{e4}:", "\\", "x\\.."),
+            ("fo\u{0}o", "", "", "fo\u{0}o"),
+            ("fo\u{0}o\\..\\bar", "", "", "fo\u{0}o\\..\\bar"),
+            ("fo\u{0}o/../bar", "", "", "fo\u{0}o/../bar"),
+            ("\u{1}", "", "", "\u{1}"),
+            ("\u{1}\\..\\foo", "", "", "\u{1}\\..\\foo"),
+            ("\u{1}/../foo", "", "", "\u{1}/../foo"),
+            ("\u{1f600}:\\x", "", "", "\u{1f600}:\\x"),
+            ("\u{1f600}/../foo", "", "", "\u{1f600}/../foo"),
+            ("foo/./bar", "", "", "foo/./bar"),
+            ("foo/././bar", "", "", "foo/././bar"),
+            ("foo/.bar", "", "", "foo/.bar"),
+            ("foo/..bar", "", "", "foo/..bar"),
+            ("foo/...", "", "", "foo/..."),
+            ("foo/.../bar", "", "", "foo/.../bar"),
+            ("/./", "", "/", "./"),
+            ("/.", "", "/", "."),
+            ("//.", "//.", "", ""),
+            ("/././.", "", "/", "././."),
+            ("a/b/c/../../../../d", "", "", "a/b/c/../../../../d"),
+            ("\\a\\b\\..\\..\\..\\c", "", "\\", "a\\b\\..\\..\\..\\c"),
+            ("C:\\\\\\foo", "C:", "\\", "\\\\foo"),
+            ("C:////foo", "C:", "/", "///foo"),
+            ("//foo", "//foo", "", ""),
+            ("///foo", "///foo", "", ""),
+            ("//foo/bar", "//foo/bar", "", ""),
+            ("foo/bar/", "", "", "foo/bar/"),
+            ("foo/bar//", "", "", "foo/bar//"),
+            ("foo\\bar\\\\", "", "", "foo\\bar\\\\"),
+            ("C:\\foo\\", "C:", "\\", "foo\\"),
+        ];
+        check_split(cases, NT_SEPS);
+    }
+
+    /// Expectations taken from `posixpath.splitroot`.
+    #[test]
+    fn skiproot_matches_posixpath_splitroot() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("", "", "", ""),
+            (".", "", "", "."),
+            ("..", "", "", ".."),
+            ("...", "", "", "..."),
+            ("/", "", "/", ""),
+            ("//", "", "//", ""),
+            ("///", "", "/", "//"),
+            ("////", "", "/", "///"),
+            ("\\", "", "", "\\"),
+            ("\\\\", "", "", "\\\\"),
+            ("\\\\\\", "", "", "\\\\\\"),
+            ("foo", "", "", "foo"),
+            ("foo/bar", "", "", "foo/bar"),
+            ("foo\\bar", "", "", "foo\\bar"),
+            ("foo//bar", "", "", "foo//bar"),
+            ("foo\\\\bar", "", "", "foo\\\\bar"),
+            ("./foo", "", "", "./foo"),
+            (".\\foo", "", "", ".\\foo"),
+            ("././foo", "", "", "././foo"),
+            ("./", "", "", "./"),
+            (".\\", "", "", ".\\"),
+            ("./.", "", "", "./."),
+            ("foo/.", "", "", "foo/."),
+            ("foo\\.", "", "", "foo\\."),
+            ("foo/..", "", "", "foo/.."),
+            ("foo\\..", "", "", "foo\\.."),
+            ("foo/../bar", "", "", "foo/../bar"),
+            ("foo\\..\\bar", "", "", "foo\\..\\bar"),
+            ("../foo", "", "", "../foo"),
+            ("..\\foo", "", "", "..\\foo"),
+            ("../../foo", "", "", "../../foo"),
+            ("..\\..\\foo", "", "", "..\\..\\foo"),
+            ("/..", "", "/", ".."),
+            ("/../foo", "", "/", "../foo"),
+            ("//../foo", "", "//", "../foo"),
+            ("///../foo", "", "/", "//../foo"),
+            ("\\..\\foo", "", "", "\\..\\foo"),
+            ("/foo/../..", "", "/", "foo/../.."),
+            ("/foo/../../bar", "", "/", "foo/../../bar"),
+            ("foo/../..", "", "", "foo/../.."),
+            ("foo/../../bar", "", "", "foo/../../bar"),
+            ("foo/bar/../..", "", "", "foo/bar/../.."),
+            ("foo/bar/../../..", "", "", "foo/bar/../../.."),
+            ("C:", "", "", "C:"),
+            ("C:.", "", "", "C:."),
+            ("C:..", "", "", "C:.."),
+            ("C:foo", "", "", "C:foo"),
+            ("C:\\", "", "", "C:\\"),
+            ("C:\\.", "", "", "C:\\."),
+            ("C:\\..", "", "", "C:\\.."),
+            ("C:\\foo", "", "", "C:\\foo"),
+            ("C:/foo/../bar", "", "", "C:/foo/../bar"),
+            ("C:\\foo\\..\\..\\bar", "", "", "C:\\foo\\..\\..\\bar"),
+            ("C:foo\\..\\..\\bar", "", "", "C:foo\\..\\..\\bar"),
+            ("c:\\a\\b\\..\\..\\..\\c", "", "", "c:\\a\\b\\..\\..\\..\\c"),
+            ("\\\\server\\share", "", "", "\\\\server\\share"),
+            ("\\\\server\\share\\", "", "", "\\\\server\\share\\"),
+            ("\\\\server\\share\\dir", "", "", "\\\\server\\share\\dir"),
+            ("\\\\server\\share\\..\\dir", "", "", "\\\\server\\share\\..\\dir"),
+            ("\\\\server\\share\\dir\\..\\..", "", "", "\\\\server\\share\\dir\\..\\.."),
+            ("//server/share/dir/../..", "", "//", "server/share/dir/../.."),
+            ("//server/share/../..", "", "//", "server/share/../.."),
+            ("\\\\?\\C:\\foo\\..\\bar", "", "", "\\\\?\\C:\\foo\\..\\bar"),
+            ("\\\\?\\UNC\\server\\share\\dir\\..", "", "", "\\\\?\\UNC\\server\\share\\dir\\.."),
+            ("//?/unc/server/share/dir/..", "", "//", "?/unc/server/share/dir/.."),
+            ("\\\\.\\device\\x\\..", "", "", "\\\\.\\device\\x\\.."),
+            ("\\\\.\\device", "", "", "\\\\.\\device"),
+            ("\\\\", "", "", "\\\\"),
+            ("\\\\a", "", "", "\\\\a"),
+            ("\\\\a\\", "", "", "\\\\a\\"),
+            ("\\\\a\\b", "", "", "\\\\a\\b"),
+            ("\\\\a\\b\\", "", "", "\\\\a\\b\\"),
+            ("\\\\a\\b\\c", "", "", "\\\\a\\b\\c"),
+            (":a", "", "", ":a"),
+            ("a:b:c", "", "", "a:b:c"),
+            ("\u{e4}:\\x", "", "", "\u{e4}:\\x"),
+            ("\u{e4}:\\x\\..", "", "", "\u{e4}:\\x\\.."),
+            ("fo\u{0}o", "", "", "fo\u{0}o"),
+            ("fo\u{0}o\\..\\bar", "", "", "fo\u{0}o\\..\\bar"),
+            ("fo\u{0}o/../bar", "", "", "fo\u{0}o/../bar"),
+            ("\u{1}", "", "", "\u{1}"),
+            ("\u{1}\\..\\foo", "", "", "\u{1}\\..\\foo"),
+            ("\u{1}/../foo", "", "", "\u{1}/../foo"),
+            ("\u{1f600}:\\x", "", "", "\u{1f600}:\\x"),
+            ("\u{1f600}/../foo", "", "", "\u{1f600}/../foo"),
+            ("foo/./bar", "", "", "foo/./bar"),
+            ("foo/././bar", "", "", "foo/././bar"),
+            ("foo/.bar", "", "", "foo/.bar"),
+            ("foo/..bar", "", "", "foo/..bar"),
+            ("foo/...", "", "", "foo/..."),
+            ("foo/.../bar", "", "", "foo/.../bar"),
+            ("/./", "", "/", "./"),
+            ("/.", "", "/", "."),
+            ("//.", "", "//", "."),
+            ("/././.", "", "/", "././."),
+            ("a/b/c/../../../../d", "", "", "a/b/c/../../../../d"),
+            ("\\a\\b\\..\\..\\..\\c", "", "", "\\a\\b\\..\\..\\..\\c"),
+            ("C:\\\\\\foo", "", "", "C:\\\\\\foo"),
+            ("C:////foo", "", "", "C:////foo"),
+            ("//foo", "", "//", "foo"),
+            ("///foo", "", "/", "//foo"),
+            ("//foo/bar", "", "//", "foo/bar"),
+            ("foo/bar/", "", "", "foo/bar/"),
+            ("foo/bar//", "", "", "foo/bar//"),
+            ("foo\\bar\\\\", "", "", "foo\\bar\\\\"),
+            ("C:\\foo\\", "", "", "C:\\foo\\"),
+        ];
+        check_split(cases, POSIX_SEPS);
+    }
+
+    /// Expectations taken from `ntpath.normpath`, which is `_path_normpath`
+    /// itself on a Windows host.
+    #[test]
+    fn normpath_matches_ntpath() {
+        let cases: &[(&str, &str)] = &[
+            ("", "."),
+            (".", "."),
+            ("..", ".."),
+            ("...", "..."),
+            ("/", "\\"),
+            ("//", "\\\\"),
+            ("///", "\\\\\\"),
+            ("////", "\\\\\\\\"),
+            ("\\", "\\"),
+            ("\\\\", "\\\\"),
+            ("\\\\\\", "\\\\\\"),
+            ("foo", "foo"),
+            ("foo/bar", "foo\\bar"),
+            ("foo\\bar", "foo\\bar"),
+            ("foo//bar", "foo\\bar"),
+            ("foo\\\\bar", "foo\\bar"),
+            ("./foo", "foo"),
+            (".\\foo", "foo"),
+            ("././foo", "foo"),
+            ("./", "."),
+            (".\\", "."),
+            ("./.", "."),
+            ("foo/.", "foo"),
+            ("foo\\.", "foo"),
+            ("foo/..", "."),
+            ("foo\\..", "."),
+            ("foo/../bar", "bar"),
+            ("foo\\..\\bar", "bar"),
+            ("../foo", "..\\foo"),
+            ("..\\foo", "..\\foo"),
+            ("../../foo", "..\\..\\foo"),
+            ("..\\..\\foo", "..\\..\\foo"),
+            ("/..", "\\"),
+            ("/../foo", "\\foo"),
+            ("//../foo", "\\\\..\\foo"),
+            ("///../foo", "\\\\\\..\\foo"),
+            ("\\..\\foo", "\\foo"),
+            ("/foo/../..", "\\"),
+            ("/foo/../../bar", "\\bar"),
+            ("foo/../..", ".."),
+            ("foo/../../bar", "..\\bar"),
+            ("foo/bar/../..", "."),
+            ("foo/bar/../../..", ".."),
+            ("C:", "C:"),
+            ("C:.", "C:"),
+            ("C:..", "C:.."),
+            ("C:foo", "C:foo"),
+            ("C:\\", "C:\\"),
+            ("C:\\.", "C:\\"),
+            ("C:\\..", "C:\\"),
+            ("C:\\foo", "C:\\foo"),
+            ("C:/foo/../bar", "C:\\bar"),
+            ("C:\\foo\\..\\..\\bar", "C:\\bar"),
+            ("C:foo\\..\\..\\bar", "C:..\\bar"),
+            ("c:\\a\\b\\..\\..\\..\\c", "c:\\c"),
+            ("\\\\server\\share", "\\\\server\\share"),
+            ("\\\\server\\share\\", "\\\\server\\share\\"),
+            ("\\\\server\\share\\dir", "\\\\server\\share\\dir"),
+            ("\\\\server\\share\\..\\dir", "\\\\server\\share\\dir"),
+            ("\\\\server\\share\\dir\\..\\..", "\\\\server\\share\\"),
+            ("//server/share/dir/../..", "\\\\server\\share\\"),
+            ("//server/share/../..", "\\\\server\\share\\"),
+            ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:\\bar"),
+            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share\\"),
+            ("//?/unc/server/share/dir/..", "\\\\?\\unc\\server\\share\\"),
+            ("\\\\.\\device\\x\\..", "\\\\.\\device\\"),
+            ("\\\\.\\device", "\\\\.\\device"),
+            ("\\\\", "\\\\"),
+            ("\\\\a", "\\\\a"),
+            ("\\\\a\\", "\\\\a\\"),
+            ("\\\\a\\b", "\\\\a\\b"),
+            ("\\\\a\\b\\", "\\\\a\\b\\"),
+            ("\\\\a\\b\\c", "\\\\a\\b\\c"),
+            (":a", ":a"),
+            ("a:b:c", "a:b:c"),
+            ("\u{e4}:\\x", "\u{e4}:\\x"),
+            ("\u{e4}:\\x\\..", "\u{e4}:\\"),
+            ("fo\u{0}o", "fo\u{0}o"),
+            ("fo\u{0}o\\..\\bar", "bar"),
+            ("fo\u{0}o/../bar", "bar"),
+            ("\u{1}", "\u{1}"),
+            ("\u{1}\\..\\foo", "foo"),
+            ("\u{1}/../foo", "foo"),
+            ("\u{1f600}:\\x", "\u{1f600}:\\x"),
+            ("\u{1f600}/../foo", "foo"),
+            ("foo/./bar", "foo\\bar"),
+            ("foo/././bar", "foo\\bar"),
+            ("foo/.bar", "foo\\.bar"),
+            ("foo/..bar", "foo\\..bar"),
+            ("foo/...", "foo\\..."),
+            ("foo/.../bar", "foo\\...\\bar"),
+            ("/./", "\\"),
+            ("/.", "\\"),
+            ("//.", "\\\\."),
+            ("/././.", "\\"),
+            ("a/b/c/../../../../d", "..\\d"),
+            ("\\a\\b\\..\\..\\..\\c", "\\c"),
+            ("C:\\\\\\foo", "C:\\foo"),
+            ("C:////foo", "C:\\foo"),
+            ("//foo", "\\\\foo"),
+            ("///foo", "\\\\\\foo"),
+            ("//foo/bar", "\\\\foo\\bar"),
+            ("foo/bar/", "foo\\bar"),
+            ("foo/bar//", "foo\\bar"),
+            ("foo\\bar\\\\", "foo\\bar"),
+            ("C:\\foo\\", "C:\\foo"),
+        ];
+        check_normpath(cases, NT_SEPS);
+    }
+
+    /// Expectations taken from `posixpath.normpath`.
+    #[test]
+    fn normpath_matches_posixpath() {
+        let cases: &[(&str, &str)] = &[
+            ("", "."),
+            (".", "."),
+            ("..", ".."),
+            ("...", "..."),
+            ("/", "/"),
+            ("//", "//"),
+            ("///", "/"),
+            ("////", "/"),
+            ("\\", "\\"),
+            ("\\\\", "\\\\"),
+            ("\\\\\\", "\\\\\\"),
+            ("foo", "foo"),
+            ("foo/bar", "foo/bar"),
+            ("foo\\bar", "foo\\bar"),
+            ("foo//bar", "foo/bar"),
+            ("foo\\\\bar", "foo\\\\bar"),
+            ("./foo", "foo"),
+            (".\\foo", ".\\foo"),
+            ("././foo", "foo"),
+            ("./", "."),
+            (".\\", ".\\"),
+            ("./.", "."),
+            ("foo/.", "foo"),
+            ("foo\\.", "foo\\."),
+            ("foo/..", "."),
+            ("foo\\..", "foo\\.."),
+            ("foo/../bar", "bar"),
+            ("foo\\..\\bar", "foo\\..\\bar"),
+            ("../foo", "../foo"),
+            ("..\\foo", "..\\foo"),
+            ("../../foo", "../../foo"),
+            ("..\\..\\foo", "..\\..\\foo"),
+            ("/..", "/"),
+            ("/../foo", "/foo"),
+            ("//../foo", "//foo"),
+            ("///../foo", "/foo"),
+            ("\\..\\foo", "\\..\\foo"),
+            ("/foo/../..", "/"),
+            ("/foo/../../bar", "/bar"),
+            ("foo/../..", ".."),
+            ("foo/../../bar", "../bar"),
+            ("foo/bar/../..", "."),
+            ("foo/bar/../../..", ".."),
+            ("C:", "C:"),
+            ("C:.", "C:."),
+            ("C:..", "C:.."),
+            ("C:foo", "C:foo"),
+            ("C:\\", "C:\\"),
+            ("C:\\.", "C:\\."),
+            ("C:\\..", "C:\\.."),
+            ("C:\\foo", "C:\\foo"),
+            ("C:/foo/../bar", "C:/bar"),
+            ("C:\\foo\\..\\..\\bar", "C:\\foo\\..\\..\\bar"),
+            ("C:foo\\..\\..\\bar", "C:foo\\..\\..\\bar"),
+            ("c:\\a\\b\\..\\..\\..\\c", "c:\\a\\b\\..\\..\\..\\c"),
+            ("\\\\server\\share", "\\\\server\\share"),
+            ("\\\\server\\share\\", "\\\\server\\share\\"),
+            ("\\\\server\\share\\dir", "\\\\server\\share\\dir"),
+            ("\\\\server\\share\\..\\dir", "\\\\server\\share\\..\\dir"),
+            ("\\\\server\\share\\dir\\..\\..", "\\\\server\\share\\dir\\..\\.."),
+            ("//server/share/dir/../..", "//server"),
+            ("//server/share/../..", "//"),
+            ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:\\foo\\..\\bar"),
+            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share\\dir\\.."),
+            ("//?/unc/server/share/dir/..", "//?/unc/server/share"),
+            ("\\\\.\\device\\x\\..", "\\\\.\\device\\x\\.."),
+            ("\\\\.\\device", "\\\\.\\device"),
+            ("\\\\", "\\\\"),
+            ("\\\\a", "\\\\a"),
+            ("\\\\a\\", "\\\\a\\"),
+            ("\\\\a\\b", "\\\\a\\b"),
+            ("\\\\a\\b\\", "\\\\a\\b\\"),
+            ("\\\\a\\b\\c", "\\\\a\\b\\c"),
+            (":a", ":a"),
+            ("a:b:c", "a:b:c"),
+            ("\u{e4}:\\x", "\u{e4}:\\x"),
+            ("\u{e4}:\\x\\..", "\u{e4}:\\x\\.."),
+            ("fo\u{0}o", "fo\u{0}o"),
+            ("fo\u{0}o\\..\\bar", "fo\u{0}o\\..\\bar"),
+            ("fo\u{0}o/../bar", "bar"),
+            ("\u{1}", "\u{1}"),
+            ("\u{1}\\..\\foo", "\u{1}\\..\\foo"),
+            ("\u{1}/../foo", "foo"),
+            ("\u{1f600}:\\x", "\u{1f600}:\\x"),
+            ("\u{1f600}/../foo", "foo"),
+            ("foo/./bar", "foo/bar"),
+            ("foo/././bar", "foo/bar"),
+            ("foo/.bar", "foo/.bar"),
+            ("foo/..bar", "foo/..bar"),
+            ("foo/...", "foo/..."),
+            ("foo/.../bar", "foo/.../bar"),
+            ("/./", "/"),
+            ("/.", "/"),
+            ("//.", "//"),
+            ("/././.", "/"),
+            ("a/b/c/../../../../d", "../d"),
+            ("\\a\\b\\..\\..\\..\\c", "\\a\\b\\..\\..\\..\\c"),
+            ("C:\\\\\\foo", "C:\\\\\\foo"),
+            ("C:////foo", "C:/foo"),
+            ("//foo", "//foo"),
+            ("///foo", "/foo"),
+            ("//foo/bar", "//foo/bar"),
+            ("foo/bar/", "foo/bar"),
+            ("foo/bar//", "foo/bar"),
+            ("foo\\bar\\\\", "foo\\bar\\\\"),
+            ("C:\\foo\\", "C:\\foo\\"),
+        ];
+        check_normpath(cases, POSIX_SEPS);
     }
 }
