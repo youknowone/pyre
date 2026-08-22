@@ -233,9 +233,9 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
     Ok(pos - continuation_bytes)
 }
 
-/// The `Wtf8` view of a buffer that arrived from outside the runtime —
-/// `check_utf8` with surrogates admitted, which is the `surrogatepass` decode
-/// every such boundary performs.
+/// The `Wtf8` view of a buffer that arrived from outside the runtime — the
+/// `surrogatepass` decode every such boundary performs, so it admits exactly
+/// what `check_utf8(s, true)` does.
 ///
 /// `Wtf8::from_bytes` does not stand in for this.  Its surrogate arm matches
 /// `[0xed, 0xa0.., b3, ..]`, leaving the second byte unbounded above and the
@@ -244,8 +244,24 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
 /// point count that disagrees with what `next_codepoint_pos` steps over, and
 /// the two disagree first inside `create_utf8_index_storage`, which reads past
 /// the buffer.
+///
+/// Its *loop* is kept, because `str::from_utf8` scans a word at a time and
+/// `check_utf8` a byte at a time — 0.08 against 0.35 ns per byte, over every
+/// name in every code object a marshal load carries.  Only the two bounds
+/// `_invalid_byte_2_of_3` and `_invalid_byte_3_of_3` impose are restored;
+/// `check_utf8_and_wtf8_from_bytes_agree` holds the two to one answer.
 pub fn wtf8_from_bytes(s: &[u8]) -> Result<&Wtf8, CheckError> {
-    check_utf8(s, true)?;
+    let mut pos = 0;
+    while let Err(error) = std::str::from_utf8(&s[pos..]) {
+        pos += error.valid_up_to();
+        // A strict decode stops at a surrogate's leading byte and nowhere
+        // else that WTF-8 goes on from, so exactly one three-byte sequence
+        // may follow before the scan resumes.
+        match s[pos..] {
+            [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..] => pos += 3,
+            _ => return Err(CheckError { pos }),
+        }
+    }
     // SAFETY: every sequence in `s` is well formed, and admitting the
     // surrogates is what separates WTF-8 from UTF-8.
     Ok(unsafe { Wtf8::from_bytes_unchecked(s) })
@@ -429,6 +445,53 @@ mod tests {
             assert_eq!(check_utf8(bad, true), Err(CheckError { pos: 0 }));
             assert_eq!(wtf8_from_bytes(bad), Err(CheckError { pos: 0 }));
         }
+    }
+
+    #[test]
+    fn check_utf8_and_wtf8_from_bytes_agree() {
+        // Every two-byte buffer, every three-byte buffer whose lead byte can
+        // begin a three-byte sequence, and the four-byte leads around the two
+        // range bounds.  `wtf8_from_bytes` reports where the strict scan
+        // stopped, which is the sequence start `check_utf8` names.
+        let mut buf = Vec::new();
+        let mut probe = |buf: &[u8]| {
+            let want = check_utf8(buf, true);
+            let got = wtf8_from_bytes(buf).map(|_| ());
+            assert_eq!(want.is_ok(), got.is_ok(), "{buf:02x?}");
+            if let (Err(a), Err(b)) = (want, got) {
+                assert_eq!(a, b, "{buf:02x?}");
+            }
+        };
+        for b1 in 0u16..=0xFF {
+            for b2 in 0u16..=0xFF {
+                buf.clear();
+                buf.extend_from_slice(&[b1 as u8, b2 as u8]);
+                probe(&buf);
+            }
+        }
+        for b1 in 0xE0u16..=0xEF {
+            for b2 in 0u16..=0xFF {
+                for b3 in 0u16..=0xFF {
+                    buf.clear();
+                    buf.extend_from_slice(&[b1 as u8, b2 as u8, b3 as u8]);
+                    probe(&buf);
+                }
+            }
+        }
+        for b1 in [0xF0u8, 0xF3, 0xF4, 0xF5] {
+            for b2 in 0u16..=0xFF {
+                buf.clear();
+                buf.extend_from_slice(&[b1, b2 as u8, 0x80, 0x80]);
+                probe(&buf);
+                buf.clear();
+                buf.extend_from_slice(&[b1, 0x90, b2 as u8, 0x80]);
+                probe(&buf);
+            }
+        }
+        // A surrogate before the offending sequence: the scan must resume
+        // past it rather than report its own position.
+        probe(b"\xed\xa0\x80\xed\xc0\x80");
+        probe(b"a\xed\xa0\x80\xed\xb0\x80z");
     }
 
     #[test]
