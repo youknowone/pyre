@@ -6637,6 +6637,7 @@ struct FbwStoreJournalRootArea {
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
+    locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
 }
@@ -6655,6 +6656,7 @@ thread_local! {
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         active_session: ACTIVE_WALK_SESSION.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
+        locals_mirror_undo: locals_mirror_undo_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
         multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
     };
@@ -7031,6 +7033,16 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
     if let Some(undo) = escape_undo.as_mut() {
         for slot in undo.slots.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
+    }
+    // The `f_locals` fold's pre-mirror images are armed the same way and live
+    // just as long — until the walk's commit or rollback leg consumes them —
+    // and the live-frame slots they shadow now hold the mirrored values, so
+    // each displaced entry needs forwarding too.
+    let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
+    for entry in locals_mirror.iter_mut() {
+        for slot in entry.slots.iter_mut() {
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
     }

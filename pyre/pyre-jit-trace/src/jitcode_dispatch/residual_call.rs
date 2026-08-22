@@ -1585,8 +1585,15 @@ pub(crate) fn restore_escape_flush_undo() {
         let Some(undo) = slot.borrow_mut().take() else {
             return;
         };
+        // A JIT-created frame can be nursery-resident, and a minor collection
+        // between the flush and this restore drags it out, leaving a forwarding
+        // stub at the captured address.  Restoring through the stale address
+        // would write the abandoned copy and leave the live frame flushed.
+        let frame =
+            pyre_object::gc_hook::try_gc_current_object_address(undo.frame as *mut u8) as usize;
         unsafe {
-            let pf = &mut *(undo.frame as *mut pyre_interpreter::PyFrame);
+            let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
+            let arr_ptr = pf.locals_cells_stack_w;
             let dst = locals_w_mut!(pf);
             let n = undo.slots.len().min(dst.as_slice().len());
             for (i, &v) in undo.slots.iter().take(n).enumerate() {
@@ -1594,6 +1601,12 @@ pub(crate) fn restore_escape_flush_undo() {
             }
             pf.last_instr = undo.last_instr;
             pf.valuestackdepth = undo.valuestackdepth;
+            // The forward flush arms this per store; the restore writes values
+            // that are already boxed, so nothing allocates between them and one
+            // arming covers the whole image.  Without it a pre-flush value that
+            // is nursery-young goes back into an old-gen array with no
+            // remembered-set entry to re-trace it.
+            crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
         }
     });
 }

@@ -166,11 +166,39 @@ thread_local! {
     /// recorded `setfield_vable_i` half needs no undo — it only reaches a frame
     /// on a compiled run.
     ///
-    /// Only the first publish of a walk is recorded, so the restore targets the
-    /// value the frame carried when the walk began rather than an intermediate
-    /// one.  Cleared with the store journal at the start of every walk.
-    static FBW_EXIT_LAST_INSTR_UNDO: std::cell::Cell<Option<(usize, isize)>> =
-        const { std::cell::Cell::new(None) };
+    /// Only the first publish of a walk is recorded PER FRAME, so the restore
+    /// targets the value each frame carried when the walk began rather than an
+    /// intermediate one.  More than one frame can be displaced in a walk — the
+    /// recording frame's per-opcode publication, and the portal frame's
+    /// coordinate when a positive-depth `_getframe` fold lands on it — so this
+    /// holds one entry each rather than one entry overall.  Cleared with the
+    /// store journal at the start of every walk.
+    static FBW_EXIT_LAST_INSTR_UNDO: std::cell::RefCell<Vec<(usize, isize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The `locals_cells_stack_w` image a walk-time `f_locals` fold displaced,
+    /// per frame it mirrored into.
+    ///
+    /// The fold answers `frame.f_locals` by writing the virtualizable shadow
+    /// into the live array so the `FrameLocalsProxy` it hands out reads current
+    /// values (`virtualizable.py write_boxes`, which `pyframe.py fast2locals`
+    /// reaches through `force`).  That write lands whether or not the walk
+    /// commits, and a walk that does not commit replays the frame from its
+    /// pre-walk instruction — the replay would then re-derive these locals on
+    /// top of walk-time values instead of the ones the frame entered with.
+    ///
+    /// Kept separate from the residual force's `ESCAPE_FLUSH_UNDO` even though
+    /// both snapshot the same array: that capture is consumed by the tail
+    /// restore in `try_execute_residual_call_via_executor`, which runs after
+    /// EVERY non-forcing residual, so a mirror recorded there would be reverted
+    /// by the next call in the same walk.  This one is consumed only by the
+    /// walk-end legs, beside [`fbw_exit_last_instr_rollback`].
+    ///
+    /// First write per frame wins, for the same reason as the coordinate undo
+    /// above.  Rolled back AFTER `restore_escape_flush_undo`, so where both are
+    /// armed for one frame the older (pre-fold) image is the one that stands.
+    static FBW_LOCALS_MIRROR_UNDO: std::cell::RefCell<Vec<FbwLocalsMirrorUndo>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
     /// before a single-frame, direct-return-capable guard-failure walk.  When
@@ -402,7 +430,48 @@ pub(crate) fn fbw_store_journal_reset() {
     // unrelated POP_EXCEPT in this walk.
     FBW_EXC_PREV.with(|s| s.borrow_mut().clear());
     FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(false));
-    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.set(None));
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
+    FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+}
+
+/// The address a journalled frame lives at NOW.
+///
+/// A journal entry names its frame by raw address, and a JIT-created frame can
+/// be nursery-resident: a minor collection between the eager write and the
+/// walk-end restore drags it out and leaves a forwarding stub at the recorded
+/// address, so restoring through that address would write the abandoned copy
+/// and leave the live frame at its walk-time state.  `PyFrame::live_mut`
+/// carries the same reload for the interpreter's own field writes.
+///
+/// Applied at both ends: at record time so entries key on one identity, and at
+/// restore time so an entry recorded before the move still lands.  One
+/// application suffices — the drag-out promotes the frame out of the nursery,
+/// and nothing outside it moves (`gc_current_object_address`).
+fn live_frame_addr(frame: usize) -> usize {
+    pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize
+}
+
+/// Record the `last_instr` an eager walk-time write is about to displace, so
+/// [`fbw_exit_last_instr_rollback`] can put it back when the walk does not
+/// commit.  First write per frame wins: that is the coordinate the frame
+/// carried when the walk began.
+pub(crate) fn fbw_note_last_instr_undo(frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    let frame = live_frame_addr(frame);
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if undo.iter().any(|(f, _)| *f == frame) {
+            return;
+        }
+        // SAFETY: the caller holds a live `PyFrame` at this address, and
+        // `frame_layout` pins `last_instr` to this offset with a compile-time
+        // assertion against the interpreter's own constant.
+        let before =
+            unsafe { *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *const isize) };
+        undo.push((frame, before));
+    });
 }
 
 /// Put `last_instr` back for a walk that did not commit its end state, so the
@@ -410,21 +479,98 @@ pub(crate) fn fbw_store_journal_reset() {
 /// [`fbw_store_journal_rollback`] on every non-committed exit; the commit side
 /// just drops the undo ([`fbw_exit_last_instr_commit`]).
 pub(crate) fn fbw_exit_last_instr_rollback() {
-    let Some((frame, before)) = FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.take()) else {
-        return;
-    };
-    // SAFETY: the frame the publish wrote is the walk's live recording frame,
-    // which outlives the walk, and `frame_layout` pins `last_instr` to this
-    // offset with a compile-time assertion against the interpreter's constant.
-    unsafe {
-        *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) = before;
+    let undo = FBW_EXIT_LAST_INSTR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // Newest first, so a frame displaced twice — which the per-frame guard
+    // above already prevents — could never end on the later value.
+    for (frame, before) in undo.into_iter().rev() {
+        let frame = live_frame_addr(frame);
+        // SAFETY: every frame a publish wrote is live for the whole walk, and
+        // `frame_layout` pins `last_instr` to this offset with a compile-time
+        // assertion against the interpreter's constant.
+        unsafe {
+            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) = before;
+        }
     }
 }
 
 /// Drop the undo: the walk's end state is kept, so the published exit
 /// coordinate is the one the frame should carry.
 pub(crate) fn fbw_exit_last_instr_commit() {
-    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.set(None));
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
+}
+
+/// One frame's pre-fold `locals_cells_stack_w` image.  See
+/// [`FBW_LOCALS_MIRROR_UNDO`].
+pub(crate) struct FbwLocalsMirrorUndo {
+    frame: usize,
+    pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+}
+
+/// Record the locals image a walk-time `f_locals` mirror is about to
+/// overwrite.  `nlocals` is the region the mirror writes — the operand stack
+/// above it is deliberately left out, so the rollback cannot revert a stack
+/// slot some other walk-time write owns.  First write per frame wins: that is
+/// the image the frame carried when the walk began.
+pub(crate) fn fbw_note_locals_mirror_undo(frame: usize, nlocals: usize) {
+    if frame == 0 {
+        return;
+    }
+    let frame = live_frame_addr(frame);
+    FBW_LOCALS_MIRROR_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if undo.iter().any(|entry| entry.frame == frame) {
+            return;
+        }
+        // SAFETY: the caller holds a live `PyFrame` at this address for the
+        // rest of the walk — it is the frame whose `f_locals` it just folded.
+        let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        let live = pyre_interpreter::locals_w!(pf).as_slice();
+        let slots = live[..nlocals.min(live.len())].to_vec();
+        undo.push(FbwLocalsMirrorUndo { frame, slots });
+    });
+}
+
+/// Non-commit epilogue: put each mirrored frame's pre-fold locals back, so the
+/// replay re-derives them from the frame's entry state instead of compounding
+/// onto the walk's.  Newest first, matching the store journal.
+pub(crate) fn fbw_locals_mirror_rollback() {
+    let undo = FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for entry in undo.into_iter().rev() {
+        let frame = live_frame_addr(entry.frame);
+        // SAFETY: as in the capture — the frame is live for the whole walk.
+        unsafe {
+            let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
+            let arr_ptr = pf.locals_cells_stack_w;
+            let dst = pyre_interpreter::locals_w_mut!(pf);
+            // The array cannot be reallocated mid-walk, but clamp anyway: a
+            // short write is recoverable, a write past the end is not.
+            let n = entry.slots.len().min(dst.as_slice().len());
+            for (i, &value) in entry.slots.iter().take(n).enumerate() {
+                dst[i] = value;
+            }
+            // A restored value can be nursery-young while the frame and its
+            // array are old-gen, and nothing re-traces it unless an owner is in
+            // the remembered set.  The forward write arms this per store
+            // because boxing allocates between them; the restore writes values
+            // that are already boxed, so nothing can collect mid-loop and one
+            // arming after it covers every slot.
+            crate::state::frame_array_write_barrier(frame as *mut u8, arr_ptr);
+        }
+    }
+}
+
+/// Drop the undo: the walk's end state is kept, so the mirrored locals are the
+/// ones the frame should carry (the resumed interpreter reads its fastlocals
+/// straight out of that array).
+pub(crate) fn fbw_locals_mirror_commit() {
+    FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+}
+
+/// GC: a pre-fold image can be the ONLY reference to a value the mirror
+/// displaced, so the root area forwards them (see
+/// [`capture_fbw_store_journal_root_area`]).
+pub(crate) fn locals_mirror_undo_cell_ptr() -> *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>> {
+    FBW_LOCALS_MIRROR_UNDO.with(|c| c as *const _)
 }
 
 /// Record the element a walked eager list store displaces, for rollback
@@ -2188,11 +2334,7 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         // compile-time assertion against the interpreter's own constant.
         let slot =
             (recording_frame_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
-        FBW_EXIT_LAST_INSTR_UNDO.with(|c| {
-            if c.get().is_none() {
-                c.set(Some((recording_frame_ptr, unsafe { *slot })));
-            }
-        });
+        fbw_note_last_instr_undo(recording_frame_ptr);
         unsafe {
             *slot = py_pc as isize;
         }
