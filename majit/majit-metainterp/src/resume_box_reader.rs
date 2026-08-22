@@ -1101,16 +1101,11 @@ pub fn seed_bridge_virtualizable_boxes(
     // compile.py:27), which is strictly more conservative than upstream: the
     // guard keeps deopting through the blackhole exactly as it did before.
     //
-    // The two writes upstream pairs with the assignment are both inert for this
-    // seed's only consumer, so neither is ported:
-    //   * `reset_token_gcref` — the state-field vinfo is built by
-    //     `VirtualizableInfo::without_vable_token()`, whose token protocol
-    //     no-ops (`codegen_state.rs` `__build_virtualizable_info`).
-    //   * `synchronize_virtualizable()` — `TraceCtx::synchronize_virtualizable`
-    //     deliberately skips the write-back for `RustVec` array storage, which
-    //     is what every `[.. ; virt]` state field is: the macro-generated
-    //     mainloop owns that struct and writes it on every opcode, so the heap
-    //     is authoritative and flushing the shadow back would clobber it.
+    // Of the two writes upstream pairs with the assignment, `reset_token_gcref`
+    // is inert for this seed's only consumer — the state-field vinfo is built by
+    // `VirtualizableInfo::without_vable_token()`, whose token protocol no-ops
+    // (`codegen_state.rs` `__build_virtualizable_info`) — so it is not ported.
+    // `synchronize_virtualizable()` is ported, below the seed.
     match ctx.virtualizable_heap_ptr() {
         Some(live) if live == vable_ptr => {}
         Some(_) | None => return false,
@@ -1148,6 +1143,21 @@ pub fn seed_bridge_virtualizable_boxes(
     ));
     values.push(identity_value);
     ctx.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
+    // `rebuild_state_after_failure`'s trailing `self.synchronize_virtualizable()`
+    // (pyjitpl.py) — the object and the shadow have to agree before the bridge
+    // replays a single vable op.
+    //
+    // A token-less vinfo is a `#[jit_interp]` `state` struct, and it is the
+    // family with no other writer for this: the compiled loop carries its banks
+    // in machine registers, so the guard leaves the struct holding whatever the
+    // run was entered with, and the macro-generated mainloop that otherwise
+    // keeps it current ran no opcode of that entry. A token-bearing one is a
+    // host object whose slots have a boxing protocol the generic
+    // `value_to_raw_bits` cannot serve, and whose own field-aware guard-failure
+    // writer has already synchronized it.
+    if !info.has_vable_token() {
+        ctx.synchronize_virtualizable();
+    }
     true
 }
 

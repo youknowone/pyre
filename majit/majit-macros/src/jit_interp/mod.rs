@@ -2931,13 +2931,13 @@ fn rewrite_body(
                                         &mut #state,
                                     );
                                     // Push the walk-final loop-carried virt-array
-                                    // element values into native `state` too. The
-                                    // walk mutates the array on the trace-ctx
-                                    // shadow only; native `state`'s array is
-                                    // frozen at trace-start (synchronize_
-                                    // virtualizable skips the RustVec write-back
-                                    // during tracing). Without this the compiled-
-                                    // loop seed (extract_live reads native state)
+                                    // element values into native `state` too. A
+                                    // field embedding a Rust `Vec` by value is
+                                    // carved out of `synchronize_virtualizable`,
+                                    // so its array stays frozen at trace-start
+                                    // and this is its only writer; without it the
+                                    // compiled-loop seed (extract_live reads
+                                    // native state)
                                     // reflects the trace-start array and the loop
                                     // re-executes the peeled iteration, double-
                                     // firing any side-effecting residual. No-op
