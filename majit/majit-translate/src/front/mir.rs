@@ -2256,25 +2256,22 @@ fn lower_fun_decl_builder_variant_from_body(
     .map(Some)
 }
 
-/// Whether `u` (the body of `fd`) contains at least one builder-mode string
-/// accumulator ([`is_builder_mode_accumulator`]) — the cheap pre-check that
-/// decides whether a builder variant is worth lowering at all.
-#[allow(dead_code)] // reached once the whole-program loop calls lower_fun_decl_builder_variant
-fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
-    let n_locals = u.locals.locals.len();
-    let arg_count = u.locals.arg_count as usize;
-    // A fresh builder accumulator's sole def is a `Wtf8Buf` / `String`
-    // `new` / `with_capacity` CALL terminator ([`is_fresh_str_builder`] sets
-    // its `ctor_def` flag only in the call-terminator arm), so only such a
-    // call's destination local can ever qualify.  Scan the body once for
-    // those dests and run the full check on each, instead of paying an
-    // O(body) [`is_fresh_str_builder`] scan for every one of `n_locals`
-    // locals — the vast majority of which have no ctor def and can never be
-    // accumulators.  Resolved on demand from the body, no per-local side
-    // table; a local that is not such a ctor dest would decline
-    // [`is_fresh_str_builder`] anyway, so restricting to ctor dests is
-    // behaviour-preserving.
-    for bb in &u.body {
+/// The MIR locals that can be a fresh string-builder accumulator: the
+/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` CALL
+/// terminator in the accumulator range `(arg_count+1..n_locals)`.
+///
+/// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
+/// call-terminator arm, so no other local can pass it — iterating these
+/// candidates instead of every one of `n_locals` locals drops the
+/// `n_locals` factor that made the builder recognizers O(n_locals × body)
+/// per function.  Resolved on demand from the body, no per-local side table.
+fn builder_ctor_dest_locals<'a>(
+    body: &'a Unstructured,
+    llbc: &'a Llbc,
+) -> impl Iterator<Item = usize> + 'a {
+    let n_locals = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    body.body.iter().filter_map(move |bb| {
         if let Ok(TermKind::Call { call, .. }) = bb.term()
             && let PlaceKind::Local(i) = call.dest.kind
             && (arg_count + 1..n_locals).contains(&(i as usize))
@@ -2282,12 +2279,20 @@ fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
                 wtf8buf_method_leaf(llbc, &call),
                 Some("new") | Some("with_capacity")
             )
-            && is_builder_mode_accumulator(u, llbc, i as usize)
         {
-            return true;
+            Some(i as usize)
+        } else {
+            None
         }
-    }
-    false
+    })
+}
+
+/// Whether `u` (the body of `fd`) contains at least one builder-mode string
+/// accumulator ([`is_builder_mode_accumulator`]) — the cheap pre-check that
+/// decides whether a builder variant is worth lowering at all.
+#[allow(dead_code)] // reached once the whole-program loop calls lower_fun_decl_builder_variant
+fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
+    builder_ctor_dest_locals(u, llbc).any(|c| is_builder_mode_accumulator(u, llbc, c))
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -3492,10 +3497,9 @@ impl<'a> Lowering<'a> {
     #[allow(dead_code)] // wired by the make_jitcodes driver (#56)
     fn enable_builder_mode(&mut self) -> bool {
         self.builder_mode = true;
-        let n_locals = self.body.locals.locals.len();
-        // Locals 0 (return) and 1..=arg_count (parameters) are never fresh
-        // owned accumulators (see [`append_accumulator_of_arg_temp`]).
-        (self.arg_count + 1..n_locals).any(|c| is_builder_mode_accumulator(self.body, self.llbc, c))
+        // Same "any builder-mode accumulator?" question as the pre-check, over
+        // the ctor-dest candidates only (see [`builder_ctor_dest_locals`]).
+        graph_has_builder_accumulator(self.llbc, self.body)
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -14845,11 +14849,13 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
 /// the MIR body, so the recognizer keeps no per-local side table; the append
 /// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
 fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    let n_locals = body.locals.locals.len();
-    let arg_count = body.locals.arg_count as usize;
-    // Locals 0 (return) and 1..=arg_count (parameters) are never fresh owned
-    // accumulators — skipping them keeps a `&mut`-parameter receiver residual.
-    (arg_count + 1..n_locals).find(|&c| {
+    // Only a `Wtf8Buf` / `String` ctor dest can pass [`is_fresh_str_builder`]
+    // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
+    // parameters), and a ref-temp borrows exactly one local so at most one
+    // accumulator's receiver set contains `rt`; check those candidates instead
+    // of every local — dropping the `n_locals` factor — and first-match order
+    // is therefore irrelevant.
+    builder_ctor_dest_locals(body, llbc).find(|&c| {
         is_fresh_str_builder(body, llbc, c)
             && clean_accumulator_ref_temps(body, llbc, c)
                 .is_some_and(|receivers| receivers.contains(&rt))
