@@ -3754,12 +3754,21 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> Operat
             ('d', FmtArg::Int(value)) => message.push_str(&value.to_string()),
             ('s', FmtArg::Text(value)) => message.push_str(value),
             // `_compute_value`'s final `else` — `%s` over a byte string,
-            // which upstream checks is already UTF-8 rather than decoding.
-            // The check has no failure branch there beyond a length
-            // correction, and an invalid byte cannot be carried into this
-            // buffer, so it is replaced the way `%8` replaces one.
+            // which it keeps verbatim after only checking the length — and
+            // `%8`, which it decodes with `'replace'`.  Both run with
+            // `allow_surrogates`, so a byte string that is already WTF-8
+            // reaches the message unchanged, encoded surrogates included;
+            // decoding it as UTF-8 would turn each into `U+FFFD`.
+            //
+            // Bytes that are not WTF-8 at all are where the two part company
+            // upstream: `%8` replaces them, which this matches, while `%s`
+            // keeps them and subtracts the bad run from the reported length
+            // instead.  No `Wtf8Buf` can hold them, so `%s` replaces them too.
             ('s', FmtArg::Bytes(value)) | ('8', FmtArg::Bytes(value)) => {
-                message.push_str(&String::from_utf8_lossy(value))
+                match rustpython_wtf8::Wtf8::from_bytes(value) {
+                    Some(value) => message.push_wtf8(value),
+                    None => message.push_str(&String::from_utf8_lossy(value)),
+                }
             }
             ('T', FmtArg::Obj(_)) => {
                 let obj = _roots.get(next_obj_slot);
@@ -4181,6 +4190,25 @@ mod tests {
             from_bytes.render_exception(),
             format!("RuntimeError: {text}")
         );
+    }
+
+    #[test]
+    fn oefmt_keeps_a_surrogate_encoded_in_a_byte_string() {
+        // WTF-8 for a lone `U+D800`.  `_compute_value` decodes `%8` with
+        // `allow_surrogates` and hands `%s` its bytes untouched, so neither
+        // conversion replaces this.
+        let bytes = [0xEDu8, 0xA0, 0x80];
+        let expected = rustpython_wtf8::Wtf8::from_bytes(&bytes)
+            .expect("the encoding of a lone surrogate is WTF-8")
+            .to_owned();
+        for valuefmt in ["%s", "%8"] {
+            let err = super::oefmt(
+                std::ptr::null_mut(),
+                valuefmt,
+                &[super::FmtArg::Bytes(&bytes)],
+            );
+            assert_eq!(err.message_wtf8(), expected, "for {valuefmt}");
+        }
     }
 
     #[test]
