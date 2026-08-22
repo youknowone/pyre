@@ -12286,8 +12286,8 @@ impl CodeWriter {
                         // `(name, globals, None, fromlist, level)`.  Keeping
                         // the lookup and CallFn separate is load-bearing: the
                         // latter can descend through BuiltinCode.func and
-                        // trace `_gcd_import`; the old monolithic
-                        // one monolithic residual hid the entire importer.
+                        // trace `_gcd_import`; one monolithic residual hid
+                        // the entire importer.
                         Instruction::ImportName { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
