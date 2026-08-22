@@ -2409,6 +2409,16 @@ pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0
 }
 
+/// `true` when a mirror is itself a `PyTypeObject`, whose block therefore
+/// begins with a `PyVarObject` rather than a bare header.
+pub(super) fn is_type_mirror(raw: *mut CPyObject) -> bool {
+    if raw.is_null() {
+        return false;
+    }
+    let ob_type = unsafe { (*raw).ob_type };
+    !ob_type.is_null() && unsafe { (*ob_type).tp_flags } & PY_TPFLAGS_TYPE_SUBCLASS != 0
+}
+
 /// `true` when a mirror is a `PyModuleDef` rather than a linked object.
 pub(super) fn is_module_def(raw: *mut CPyObject) -> bool {
     !raw.is_null() && unsafe { std::ptr::eq((*raw).ob_type, &raw mut CPY_MODULE_DEF_TYPE) }
@@ -5843,6 +5853,97 @@ fn from_spec(
 pub unsafe extern "C" fn PyType_FromSpec(spec: *mut CPyTypeSpec) -> *mut CPyObject {
     super::object::result(from_spec(
         spec,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ))
+}
+
+/// `PySlot` — one entry of the identifier-keyed array `PyType_FromSlots`
+/// reads, which supersedes `PyType_Spec`'s fixed fields.  The value is a
+/// union of a pointer, a function, and the integer widths; every arm is
+/// eight bytes wide, so one of them stands for all.
+#[repr(C)]
+pub struct CPySlot {
+    pub sl_id: u16,
+    pub sl_flags: u16,
+    pub sl_reserved: u32,
+    pub sl_value: u64,
+}
+
+/// `PySlot.sl_flags`: an entry the reader may skip rather than refuse.
+pub(super) const SLOT_OPTIONAL: u16 = 0x01;
+
+/// The identifiers `PyType_FromSlots` reads for itself; every other one is
+/// left to the `Py_tp_slots` array, which is the `PyType_Spec` vocabulary.
+mod from_slots_id {
+    pub const TP_SLOTS: u16 = 93;
+    pub const TP_NAME: u16 = 95;
+    pub const TP_BASICSIZE: u16 = 96;
+    pub const TP_EXTRA_BASICSIZE: u16 = 97;
+    pub const TP_ITEMSIZE: u16 = 98;
+    pub const TP_FLAGS: u16 = 99;
+}
+
+/// `PyType_FromSlots(slots)` — a heap type described by one array rather than
+/// by a `PyType_Spec` beside one.
+///
+/// The array is read into the spec the rest of this layer already builds a
+/// type from: the identifiers below carry what the spec's own fields carry,
+/// and `Py_tp_slots` carries the array the spec would have pointed at.  A
+/// zero identifier ends the array.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromSlots(slots: *mut CPySlot) -> *mut CPyObject {
+    if slots.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let mut spec = CPyTypeSpec {
+        name: std::ptr::null(),
+        basicsize: 0,
+        itemsize: 0,
+        flags: 0,
+        slots: std::ptr::null_mut(),
+    };
+    let mut entry = slots;
+    loop {
+        let slot = unsafe { &*entry };
+        if slot.sl_id == 0 {
+            break;
+        }
+        let value = slot.sl_value;
+        match slot.sl_id {
+            from_slots_id::TP_NAME => spec.name = value as *const c_char,
+            from_slots_id::TP_FLAGS => spec.flags = value as c_uint,
+            from_slots_id::TP_BASICSIZE => spec.basicsize = value as isize as c_int,
+            // A size relative to the base's, which the spec spells as the
+            // negative of the same number.
+            from_slots_id::TP_EXTRA_BASICSIZE => {
+                spec.basicsize = -(value as isize as c_int);
+            }
+            from_slots_id::TP_ITEMSIZE => spec.itemsize = value as isize as c_int,
+            from_slots_id::TP_SLOTS => spec.slots = value as *mut CPyTypeSlot,
+            unknown => {
+                if slot.sl_flags & SLOT_OPTIONAL == 0 {
+                    super::pyerrors::set_pending_error(crate::PyError::new(
+                        crate::PyErrorKind::SystemError,
+                        format!("PyType_FromSlots(): unrecognised slot {unknown}"),
+                    ));
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        entry = unsafe { entry.add(1) };
+    }
+    if spec.name.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyType_FromSlots(): the slot array has no Py_tp_name",
+        ));
+        return std::ptr::null_mut();
+    }
+    super::object::result(from_spec(
+        &raw mut spec,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),

@@ -418,8 +418,9 @@ else:
 # ── a spec declaring storage relative to its base's ────────────────────
 assert issubclass(m.Extra, m.Spec)
 assert m.type_data_size(m.Extra) >= 16, m.type_data_size(m.Extra)
-# Spec declares a whole block, so it extends its base by nothing.
-assert m.type_data_size(m.Spec) == 0, m.type_data_size(m.Spec)
+# Spec declares a whole block: one header plus its own `long`, so the data
+# it adds beyond `object`'s is that field alone.
+assert m.type_data_size(m.Spec) == 8, m.type_data_size(m.Spec)
 
 e = m.Extra(9)
 assert e.code == 9

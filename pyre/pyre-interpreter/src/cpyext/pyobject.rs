@@ -28,7 +28,7 @@
 //! cycle is told apart from one from outside it.
 
 use super::ForkMutex;
-use super::typeobject::CPyTypeObject;
+use super::typeobject::{CPyTypeObject, CPyVarObject};
 use majit_gc::rawrefcount;
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::alloc::Layout;

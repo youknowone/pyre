@@ -29,6 +29,9 @@ struct _object {
    way `lock.h` declares `PyMutex_Lock` ahead of its own inline fast path. */
 PyAPI_FUNC(PyTypeObject *) Py_TYPE(PyObject *);
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
+
+/* Exported as well as spelled here, for the reason `Py_TYPE` is. */
+PyAPI_FUNC(int) Py_IS_TYPE(PyObject *, PyTypeObject *);
 #define Py_IS_TYPE(ob, type) (Py_TYPE(ob) == (type))
 /* bpo-39573: writing `ob_type` and `ob_size` goes through these. */
 #define Py_SET_TYPE(ob, type) ((void)(Py_TYPE(ob) = (type)))
@@ -318,6 +321,27 @@ struct PyType_Spec {
     unsigned int flags;
     PyType_Slot *slots;
 };
+
+/* `PySlot` — one entry of the identifier-keyed array `PyType_FromSlots` reads,
+   which carries what a `PyType_Spec`'s fixed fields carry and points at a
+   `PyType_Slot` array for the rest.  A zero `sl_id` ends the array. */
+struct PySlot {
+    uint16_t sl_id;
+    uint16_t sl_flags;
+    uint32_t sl_reserved;
+    union {
+        void *sl_ptr;
+        void (*sl_func)(void);
+        Py_ssize_t sl_size;
+        int64_t sl_int64;
+        uint64_t sl_uint64;
+    };
+};
+
+/* `PySlot.sl_flags`. */
+#define PySlot_OPTIONAL 0x01
+#define PySlot_STATIC 0x02
+#define PySlot_INTPTR 0x04
 
 /* `PyType_GetModuleByDef` needs `PyModuleDef`, so it is declared with it. */
 
