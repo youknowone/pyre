@@ -169,6 +169,14 @@ impl Default for PyreCpu {
     }
 }
 
+/// The offset a blackhole item read takes, refused unless it is one: `as
+/// usize` wraps a negative operand and truncates one wider than the target's
+/// `usize`, and either turns the bounds test that follows into a read of the
+/// wrong element.
+fn item_index(index: i64) -> Option<usize> {
+    usize::try_from(index).ok()
+}
+
 impl Cpu for PyreCpu {
     fn cls_of_box(&self, box_: &Operand) -> i64 {
         self.0.cls_of_box(box_)
@@ -231,7 +239,7 @@ impl Cpu for PyreCpu {
         }
         let s = unsafe { &*value_ptr };
         let bytes = s.as_bytes();
-        let i = index as usize;
+        let i = item_index(index)?;
         if i >= bytes.len() {
             return None;
         }
@@ -258,7 +266,7 @@ impl Cpu for PyreCpu {
             return None;
         }
         let s = unsafe { &*value_ptr };
-        let i = index as usize;
+        let i = item_index(index)?;
         let len = unsafe { *((unicode.0 + UNICODE_LEN_OFFSET) as *const usize) };
         if i >= len {
             return None;
