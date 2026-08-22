@@ -3702,82 +3702,90 @@ pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
 
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
-    // the message verbatim, `%` sequences and all.
-    let message = if args.is_empty() {
-        Wtf8Buf::from_string(valuefmt.to_string())
-    } else {
-        // `OpErrFmt, strings = get_operr_class(valuefmt)`, then the walk
-        // `_compute_value` makes over them: a literal part, the argument
-        // belonging to the format code that followed it, and so on to the
-        // trailing part `decompose_valuefmt` guarantees.
-        let (strings, formats) = decompose_valuefmt(valuefmt);
-        assert_eq!(
-            args.len(),
-            formats.len(),
-            "oefmt argument count mismatch: {} format codes but {} arguments",
-            formats.len(),
-            args.len()
-        );
+    // the message verbatim, `%` sequences and all.  Nothing on the way to the
+    // error runs application-level code, so the class needs no root here.
+    if args.is_empty() {
+        return operation_error_from_class(w_type, Wtf8Buf::from_string(valuefmt.to_string()));
+    }
+    // `OpErrFmt, strings = get_operr_class(valuefmt)`, then the walk
+    // `_compute_value` makes over them: a literal part, the argument
+    // belonging to the format code that followed it, and so on to the
+    // trailing part `decompose_valuefmt` guarantees.
+    let (strings, formats) = decompose_valuefmt(valuefmt);
+    assert_eq!(
+        args.len(),
+        formats.len(),
+        "oefmt argument count mismatch: {} format codes but {} arguments",
+        formats.len(),
+        args.len()
+    );
 
-        // Pin every object before the first object-space conversion can move
-        // any later operand. The argument slice itself contains raw pointers
-        // and is not a GC root.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut rooted_obj_count = 0;
-        for arg in args {
-            if let FmtArg::Obj(obj) = arg {
-                _roots.pin_root(*obj);
-                rooted_obj_count += 1;
-            }
+    // The class and every object operand form one livevar set, published in
+    // one pass and normalized once.  `pin_root` per operand would instead
+    // query the GC between publications, and that query is a safepoint: it
+    // can wait through a foreign collection which moves the operands still
+    // held only in `args`, which is not a root.  `publish_roots` states the
+    // rule, and `DictOperationGuard::new` follows it for the same reason:
+    // its `refs` is a caller-owned native slice no collection rewrites.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = _roots.publish(std::slice::from_ref(&w_type));
+    let mut rooted_obj_count = 0;
+    for arg in args {
+        if let FmtArg::Obj(obj) = arg {
+            _roots.publish(std::slice::from_ref(obj));
+            rooted_obj_count += 1;
         }
-        let first_obj_slot = _roots.base();
-        let mut next_obj_slot = first_obj_slot;
-        // The message is a `Wtf8Buf` for the same reason `_compute_value`
-        // joins `space.utf8_w` results: `%R`, `%S` and `%N` can each produce a
-        // lone surrogate, which no `&str` can hold.
-        let mut message = Wtf8Buf::new();
-        for (i, part) in strings[..formats.len()].iter().enumerate() {
-            message.push_str(part);
-            let format = formats[i].chars().next().unwrap();
-            let arg = &args[i];
-            match (format, arg) {
-                ('d', FmtArg::Int(value)) => message.push_str(&value.to_string()),
-                ('s', FmtArg::Text(value)) => message.push_str(value),
-                // `_compute_value`'s final `else` — `%s` over a byte string,
-                // which upstream checks is already UTF-8 rather than decoding.
-                // The check has no failure branch there beyond a length
-                // correction, and an invalid byte cannot be carried into this
-                // buffer, so it is replaced the way `%8` replaces one.
-                ('s', FmtArg::Bytes(value)) | ('8', FmtArg::Bytes(value)) => {
-                    message.push_str(&String::from_utf8_lossy(value))
-                }
-                ('T', FmtArg::Obj(_)) => {
-                    let obj = _roots.get(next_obj_slot);
-                    next_obj_slot += 1;
-                    message.push_str(&type_name_of(obj));
-                }
-                ('N', FmtArg::Obj(_)) => {
-                    let obj = _roots.get(next_obj_slot);
-                    next_obj_slot += 1;
-                    message.push_wtf8(&format_obj_name(obj));
-                }
-                ('R' | 'S', FmtArg::Obj(_)) => {
-                    let obj = _roots.get(next_obj_slot);
-                    next_obj_slot += 1;
-                    message.push_wtf8(&format_obj_as_utf8(obj, format));
-                }
-                _ => panic!(
-                    "oefmt format %{format} requires {} argument, got {}",
-                    expected_fmt_arg(format),
-                    arg.kind_name()
-                ),
+    }
+    _roots.normalize(type_slot, 1 + rooted_obj_count);
+    // The class is read back out of its slot after the conversions, which is
+    // why it is in the set at all: `%R`, `%S` and `%N` each run
+    // application-level code between this point and the error below.
+    let first_obj_slot = type_slot + 1;
+    let mut next_obj_slot = first_obj_slot;
+    // The message is a `Wtf8Buf` for the same reason `_compute_value`
+    // joins `space.utf8_w` results: `%R`, `%S` and `%N` can each produce a
+    // lone surrogate, which no `&str` can hold.
+    let mut message = Wtf8Buf::new();
+    for (i, part) in strings[..formats.len()].iter().enumerate() {
+        message.push_str(part);
+        let format = formats[i].chars().next().unwrap();
+        let arg = &args[i];
+        match (format, arg) {
+            ('d', FmtArg::Int(value)) => message.push_str(&value.to_string()),
+            ('s', FmtArg::Text(value)) => message.push_str(value),
+            // `_compute_value`'s final `else` — `%s` over a byte string,
+            // which upstream checks is already UTF-8 rather than decoding.
+            // The check has no failure branch there beyond a length
+            // correction, and an invalid byte cannot be carried into this
+            // buffer, so it is replaced the way `%8` replaces one.
+            ('s', FmtArg::Bytes(value)) | ('8', FmtArg::Bytes(value)) => {
+                message.push_str(&String::from_utf8_lossy(value))
             }
+            ('T', FmtArg::Obj(_)) => {
+                let obj = _roots.get(next_obj_slot);
+                next_obj_slot += 1;
+                message.push_str(&type_name_of(obj));
+            }
+            ('N', FmtArg::Obj(_)) => {
+                let obj = _roots.get(next_obj_slot);
+                next_obj_slot += 1;
+                message.push_wtf8(&format_obj_name(obj));
+            }
+            ('R' | 'S', FmtArg::Obj(_)) => {
+                let obj = _roots.get(next_obj_slot);
+                next_obj_slot += 1;
+                message.push_wtf8(&format_obj_as_utf8(obj, format));
+            }
+            _ => panic!(
+                "oefmt format %{format} requires {} argument, got {}",
+                expected_fmt_arg(format),
+                arg.kind_name()
+            ),
         }
-        debug_assert_eq!(next_obj_slot - first_obj_slot, rooted_obj_count);
-        message.push_str(&strings[formats.len()]);
-        message
-    };
-    operation_error_from_class(w_type, message)
+    }
+    debug_assert_eq!(next_obj_slot - first_obj_slot, rooted_obj_count);
+    message.push_str(&strings[formats.len()]);
+    operation_error_from_class(_roots.get(type_slot), message)
 }
 
 pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
