@@ -661,6 +661,15 @@ fn w_memoryview_new_with_flags_impl(
                     "cannot create a new view from a restricted memoryview",
                 ));
             }
+            // `memory_getbuf`: read-only storage cannot answer a writable
+            // request, and the wording names the view rather than what it is
+            // over because a view is what refused.
+            if flags & 0x0001 != 0 && w_memoryview_view(w_obj).readonly() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not writable",
+                ));
+            }
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
