@@ -2109,6 +2109,13 @@ impl TraceCtx {
     /// Constant-fold a pure field read on a constant object pointer.
     /// If `obj` is a constant and `descr` is immutable, reads the field
     /// at runtime and returns the value as a constant OpRef.
+    ///
+    /// The constant is minted through `OpRef::const_inline_from_value`
+    /// (`executor.wrap_constant`), so the result carries the field's own
+    /// type rather than always being an int. A ref field folded as a
+    /// `ConstInt` would be a live heap pointer that the trace walkers
+    /// cannot see — `OpRef::walk_const_ptr_refs` forwards `ConstPtr`
+    /// alone — and a moving collection would leave it stale.
     pub fn try_const_fold_pure_field(
         &mut self,
         obj: OpRef,
@@ -2122,18 +2129,18 @@ impl TraceCtx {
             return None;
         }
         let fd = descr.as_field_descr()?;
-        let offset = fd.offset();
-        let field_size = fd.field_size();
         let value = unsafe {
-            let base = obj_ptr as *const u8;
-            match field_size {
-                8 => *(base.add(offset) as *const i64),
-                4 if fd.is_field_signed() => *(base.add(offset) as *const i32) as i64,
-                4 => *(base.add(offset) as *const u32) as i64,
+            let base = (obj_ptr as *const u8).add(fd.offset());
+            match (fd.field_type(), fd.field_size()) {
+                (Type::Ref, 8) => Value::Ref(majit_ir::value::GcRef(*(base as *const usize))),
+                (Type::Float, 8) => Value::Float(*(base as *const f64)),
+                (Type::Int, 8) => Value::Int(*(base as *const i64)),
+                (Type::Int, 4) if fd.is_field_signed() => Value::Int(*(base as *const i32) as i64),
+                (Type::Int, 4) => Value::Int(*(base as *const u32) as i64),
                 _ => return None,
             }
         };
-        Some(self.const_int(value))
+        Some(OpRef::const_inline_from_value(&value))
     }
 
     /// M1 bridge: translate a pyre `OpRef` into the `opencoder::Box` that
