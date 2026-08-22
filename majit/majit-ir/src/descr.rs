@@ -1190,17 +1190,9 @@ impl GcCache {
     /// defect. `setup_descrs` cannot serve — it stamps `descr_index` on every
     /// entry, so calling it merely to count would perturb the thing measured.
     pub fn all_descrs_len(&self) -> usize {
-        self._cache_size.len()
-            + self._cache_field.values().map(IndexMap::len).sum::<usize>()
-            + self._cache_array.len()
-            + self._cache_arraylen.len()
-            + self._cache_call.len()
-            + self._cache_interiorfield.len()
-            + self._external_size_order.len()
-            + self._external_field_order.len()
-            + self._external_array_order.len()
-            + self._external_arraylen_order.len()
-            + self._external_interiorfield_order.len()
+        let mut count = 0;
+        self.walk_descrs(|_| count += 1);
+        count
     }
 
     /// descr.py setup_descrs().
@@ -1210,36 +1202,54 @@ impl GcCache {
     /// order (insertion order). Assigns sequential descr_index.
     pub fn setup_descrs(&self) -> Vec<DescrRef> {
         let mut all_descrs: Vec<DescrRef> = Vec::new();
-        // One object, one dense slot.  Upstream gets that for free: a
-        // `_cache_*` dict holds each descr once and there is no second
-        // sequence to chain.  Pyre's keyed caches are chained WITH the
-        // `_external_*_order` migration Vecs, and a key can be aliased, so the
-        // same Arc can be reached twice — which would take two slots and leave
-        // the object carrying only the last `descr_index`, breaking the
-        // one-object/one-index assumption descriptor encoding and the bridge
-        // tables rely on.  Identity is `Arc::ptr_eq`, matching the
-        // `register_external_*` de-dup rule; structurally equal but distinct
-        // Arcs stay separate, as upstream's post-mint dict identity does.
-        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-        let mut push = |all_descrs: &mut Vec<DescrRef>, v: &DescrRef| {
-            if !seen.insert(Arc::as_ptr(v) as *const ()) {
-                return;
-            }
+        self.walk_descrs(|v| {
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
+        });
+        assert!(
+            all_descrs.len() < (1 << 15),
+            "descr.py:46: assert len(all_descrs) < 2**15"
+        );
+        all_descrs
+    }
+
+    /// The enumeration itself: the six caches in RPython's fixed group order,
+    /// each chained with its `_external_*_order` migration Vec, visiting each
+    /// descr object exactly once.
+    ///
+    /// One object, one dense slot.  Upstream gets that for free: a `_cache_*`
+    /// dict holds each descr once and there is no second sequence to chain.
+    /// Pyre's keyed caches are chained WITH the migration Vecs, and a key can
+    /// be aliased, so the same Arc can be reached twice — which would take two
+    /// slots and leave the object carrying only the last `descr_index`,
+    /// breaking the one-object/one-index assumption descriptor encoding and the
+    /// bridge tables rely on.  Identity is `Arc::ptr_eq`, matching the
+    /// `register_external_*` de-dup rule; structurally equal but distinct Arcs
+    /// stay separate, as upstream's post-mint dict identity does.
+    ///
+    /// [`Self::setup_descrs`] and [`Self::all_descrs_len`] must agree on which
+    /// entries exist — the selection-vs-pool fork compares one against the
+    /// other, so a count that included the duplicates this walk drops would
+    /// report a pool move that never happened.  Hence one walk, two callers.
+    fn walk_descrs(&self, mut visit: impl FnMut(&DescrRef)) {
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        let mut visit_once = |v: &DescrRef| {
+            if seen.insert(Arc::as_ptr(v) as *const ()) {
+                visit(v);
+            }
         };
         // descr.py:27-29: _cache_size
         for v in self._cache_size.values().chain(&self._external_size_order) {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
         // descr.py:30-33: _cache_field (nested)
         for fields in self._cache_field.values() {
             for v in fields.values() {
-                push(&mut all_descrs, &(v.clone() as DescrRef));
+                visit_once(&(v.clone() as DescrRef));
             }
         }
         for v in &self._external_field_order {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
         // descr.py:34-36: _cache_array
         for v in self
@@ -1247,7 +1257,7 @@ impl GcCache {
             .values()
             .chain(&self._external_array_order)
         {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
         // descr.py:37-39: _cache_arraylen
         for v in self
@@ -1255,11 +1265,11 @@ impl GcCache {
             .values()
             .chain(&self._external_arraylen_order)
         {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
         // descr.py:40-42: _cache_call
         for v in self._cache_call.values() {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
         // descr.py:43-45: _cache_interiorfield
         for v in self
@@ -1267,13 +1277,8 @@ impl GcCache {
             .values()
             .chain(&self._external_interiorfield_order)
         {
-            push(&mut all_descrs, v);
+            visit_once(v);
         }
-        assert!(
-            all_descrs.len() < (1 << 15),
-            "descr.py:46: assert len(all_descrs) < 2**15"
-        );
-        all_descrs
     }
 
     /// Register the GC layouts of synthetic structs whose serialized
