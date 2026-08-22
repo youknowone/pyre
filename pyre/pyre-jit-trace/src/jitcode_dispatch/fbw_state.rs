@@ -480,6 +480,8 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_NAMESPACE_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.set(false));
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_TRACEBACK_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(false));
@@ -745,6 +747,82 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
     fbw_bump_executed_effect("cell_store_journal");
 }
 
+/// Record the namespace binding a `*_NAME` / `*_GLOBAL` residual is about to
+/// overwrite, so a walk that hands its region back to the replay can put it
+/// back ([`FBW_NAMESPACE_STORE_JOURNAL`]).  `displaced` is null when the name is
+/// unbound at store time — a fresh binding, which the rollback removes.
+///
+/// The residual itself bumps the executed-effect odometer, so unlike
+/// [`fbw_cell_store_journal_push`] — which stands in for the residual its fold
+/// elided — this push must not bump it a second time.
+pub(crate) fn fbw_namespace_store_journal_push(
+    namespace: pyre_object::PyObjectRef,
+    name: pyre_object::PyObjectRef,
+    displaced: pyre_object::PyObjectRef,
+    loop_var: bool,
+) {
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-namespace-journal] push ns=0x{:x} name=0x{:x} displaced=0x{:x} \
+             loop_var={loop_var}",
+            namespace as usize, name as usize, displaced as usize,
+        );
+    }
+    FBW_NAMESPACE_STORE_JOURNAL.with(|j| {
+        j.borrow_mut().push(FbwNamespaceStore {
+            namespace,
+            name,
+            displaced,
+            loop_var,
+        })
+    });
+}
+
+/// Whether this walk's rollback undid a namespace binding that an in-flight
+/// FOR_ITER delivery would not re-apply for itself.
+pub(crate) fn fbw_namespace_store_rolled_back() -> bool {
+    FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.get())
+}
+
+/// Raise the flag [`fbw_namespace_store_rolled_back`] reads.  Its own name
+/// because the delivery refusal is the whole point of the rollback recording
+/// anything, and a test can drive the refusal without a live namespace dict.
+fn fbw_namespace_store_mark_rolled_back() {
+    FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.set(true));
+}
+
+/// Non-commit epilogue for the namespace bindings the walked region wrote:
+/// restore each displaced value — or unbind the name that had none — in reverse
+/// push order, so the replay re-derives the region's bindings from the pre-walk
+/// namespace instead of reading the walk's own.
+fn fbw_namespace_store_journal_rollback() {
+    FBW_NAMESPACE_STORE_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while let Some(entry) = entries.pop() {
+            if !entry.loop_var {
+                fbw_namespace_store_mark_rolled_back();
+            }
+            // SAFETY: the push gated `name` on the residual's own str name
+            // operand and `namespace` on a live dict the frame still holds.
+            unsafe {
+                let name = pyre_object::unicodeobject::w_str_get_wtf8(entry.name);
+                if entry.displaced.is_null() {
+                    pyre_object::dictmultiobject::w_dict_delitem_wtf8_no_proxy(
+                        entry.namespace,
+                        name,
+                    );
+                } else {
+                    pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
+                        entry.namespace,
+                        name,
+                        entry.displaced,
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Record the `sys_exc_value` a walked eager `set_current_exception`
 /// displaces, for the in-place restore when the walk does not commit its
 /// end state.  Pushed by [`try_walker_lower_exc_info_residual`] before it
@@ -797,6 +875,9 @@ pub(crate) fn fbw_store_journal_commit() {
     FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    // A committed walk's end state IS the region's result, so the namespace
+    // bindings it wrote are the ones the frame goes on with.
+    FBW_NAMESPACE_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     // A committed walk keeps its eager `sys_exc_value` store (the compiled
     // trace or the adopted end state carries the same exception state), so
     // drop the undo log without re-applying it.
@@ -1352,7 +1433,16 @@ pub fn fbw_foriter_inflight_take(
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());
     let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
-    if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 {
+    // A rolled-back namespace binding the delivery cannot re-apply: the
+    // reposition runs the FOR_ITER body, not the region ahead of it, so a
+    // binding written before the consume would stay undone.
+    let namespace_rolled_back = fbw_namespace_store_rolled_back();
+    if body_effect
+        || store_len != 0
+        || append_len != 0
+        || cell_store_len != 0
+        || namespace_rolled_back
+    {
         crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
@@ -1366,6 +1456,7 @@ pub fn fbw_foriter_inflight_take(
                 "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
+                 namespace_rolled_back={namespace_rolled_back} \
                  — keeping legacy drop-on-abort to avoid a double-apply (R1)",
                 body_pc
             );
@@ -1619,6 +1710,29 @@ mod foriter_delivery_tests {
         );
     }
 
+    /// The second refusal reason, beside an executed body effect: a rollback
+    /// that put a namespace binding back.  Delivery repositions the frame to
+    /// the body pc, so every statement between the walk entry and that pc is
+    /// skipped and never rewrites the binding the rollback just restored —
+    /// only a replay from the walk entry does.  The loop variable's own store
+    /// is exempt at push time, so it never raises this flag.
+    #[test]
+    fn a_rolled_back_namespace_binding_refuses_consumed_item_delivery() {
+        fbw_store_journal_reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_namespace_store_mark_rolled_back();
+
+        assert!(fbw_namespace_store_rolled_back());
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
+
+        fbw_store_journal_reset();
+        assert!(
+            !fbw_namespace_store_rolled_back(),
+            "the reset clears the flag, so it cannot refuse the NEXT walk"
+        );
+    }
+
     #[test]
     fn executed_body_effect_still_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
@@ -1644,6 +1758,7 @@ mod foriter_delivery_tests {
 /// (max) length, so every restore lands while the list is still grown;
 /// shrinking first could push a restore index past the length and drop it.
 pub(crate) fn fbw_store_journal_rollback() {
+    fbw_namespace_store_journal_rollback();
     FBW_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
         while let Some([list, key, displaced]) = entries.pop() {

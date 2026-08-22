@@ -5418,6 +5418,78 @@ pub(crate) fn residual_call_is_proven_truth(
     };
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
+
+/// Journal the namespace binding a `STORE_NAME` / `STORE_GLOBAL` /
+/// `DELETE_NAME` / `DELETE_GLOBAL` residual is about to overwrite, so a walk
+/// that does not commit can put it back before the replay re-runs the region
+/// (`FBW_NAMESPACE_STORE_JOURNAL`).  Without it the replay reads the walk's own
+/// bindings for every statement ahead of the store.
+///
+/// The namespace is the one the opcode family writes: `*_NAME` binds the
+/// frame's `w_locals`, `*_GLOBAL` its `w_globals`.  Only a real dict is
+/// journaled — an `exec(src, mapping)` namespace takes its write through the
+/// mapping protocol, which a `setitem`/`delitem` undo would not reverse
+/// faithfully — and only for the authoritative executor, the walk whose
+/// concrete writes are the ones that land.
+fn journal_walker_namespace_write<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    helper: majit_ir::PyreHelperKind,
+    r_args: &[OpRef],
+) -> Option<()> {
+    use majit_ir::PyreHelperKind as K;
+    if !ctx.is_authoritative_executor {
+        return None;
+    }
+    let binds_name = matches!(helper, K::StoreName | K::DeleteName);
+    if !binds_name && !matches!(helper, K::StoreGlobal | K::DeleteGlobal) {
+        return None;
+    }
+    let (&frame_opref, &name_opref) = (r_args.first()?, r_args.get(1)?);
+    let (
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(w_name_ptr))),
+    ) = (
+        ctx.trace_ctx.box_value(frame_opref),
+        ctx.trace_ctx.box_value(name_opref),
+    )
+    else {
+        return None;
+    };
+    if frame_ptr == 0 || w_name_ptr == 0 {
+        return None;
+    }
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+    let namespace = if binds_name {
+        frame.get_w_locals()
+    } else {
+        frame.get_w_globals()
+    };
+    if namespace.is_null() {
+        return None;
+    }
+    // SAFETY: `namespace` is a live namespace object the frame holds.
+    if !unsafe {
+        pyre_object::is_module_dict(namespace)
+            || pyre_object::py_type_check(namespace, &pyre_object::DICT_TYPE)
+    } {
+        return None;
+    }
+    let name = w_name_ptr as pyre_object::PyObjectRef;
+    // SAFETY: a namespace opcode's name operand is the code object's interned
+    // `co_names` string, and the dict was just type-checked.
+    let displaced =
+        unsafe { pyre_object::w_dict_lookup(namespace, name) }.unwrap_or(std::ptr::null_mut());
+    // The loop-variable binding store is the op at the in-flight FOR_ITER's
+    // `body_pc`, recognised the way the R1 in-flight accounting recognises it.
+    // An in-flight delivery re-runs the body from that pc, so this one binding
+    // is re-applied by the delivery itself and its rollback closes no road.
+    let loop_var = matches!(helper, K::StoreName | K::StoreGlobal)
+        && fbw_foriter_inflight_top_body_pc()
+            .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize);
+    fbw_namespace_store_journal_push(namespace, name, displaced, loop_var);
+    Some(())
+}
+
 /// `pyjitpl.py opimpl_jit_force_quasi_immutable` for the module
 /// namespace's `version?` (`celldict.py _immutable_fields_ = ["version?"]`),
 /// asked ahead of an opaque STORE_NAME / STORE_GLOBAL / DELETE_NAME /
@@ -7624,6 +7696,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
+        // A namespace write reaches the executor as an ordinary residual and
+        // mutates the frame's dict in place; record what it displaces while the
+        // write is still entirely ahead of the walk.
+        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9003,6 +9079,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
+        // A namespace write reaches the executor as an ordinary residual and
+        // mutates the frame's dict in place; record what it displaces while the
+        // write is still entirely ahead of the walk.
+        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9255,6 +9335,10 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // `symbolic_fnaddr_for_path` hashes whose bits ≥ 47 are set)
         // so unregistered helpers degrade gracefully to recording-only
         // instead of SIGBUSing.
+        // A namespace write reaches the executor as an ordinary residual and
+        // mutates the frame's dict in place; record what it displaces while the
+        // write is still entirely ahead of the walk.
+        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
