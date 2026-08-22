@@ -391,17 +391,16 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let block = unsafe { alloc_items_block_gc(cap) };
     // `alloc_items_block_gc` returns a fresh GCREF.  RPython's
     // gct_fv_gc_malloc pop_roots makes that result live before the next
-    // collecting operation.  Publish it before the ownership query / write
-    // barrier below: either operation can park behind another thread's
-    // collection, which may move the otherwise-unrooted fresh array.
+    // collecting operation, so the fresh array is published here rather than
+    // carried only in this frame's native copy.
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-    // Ask the ownership question first: it is the operation that can park
-    // behind a collection, and the barrier has to be the last thing before the
-    // items land, the way `writebarrier_before_copy` precedes `ll_arraycopy`'s
-    // memcpy.  Asking it after the fill leaves the young elements in an
-    // unregistered old-gen block across that wait, where a minor collection
-    // does not trace them.  A move during the query keeps the answer, since
-    // both generations are managed; re-read the block for the address.
+    // The barrier is the last thing before the items land, the way
+    // `writebarrier_before_copy` precedes `ll_arraycopy`'s memcpy.  Asking the
+    // ownership question after the fill instead would leave the young elements
+    // in an unregistered old-gen block, where a minor collection does not
+    // trace them.  Both generations are managed, so the answer holds either
+    // way; the address is taken from the published slot, which is the one
+    // authority a promotion rewrites.
     let owns_block = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
         block_slot,
     ) as *mut u8);
@@ -1086,10 +1085,10 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
         }
         mem as *mut FixedObjectArray
     };
-    // The ownership query can park behind another thread's collection, so it
-    // runs before the elements are written rather than between them and the
-    // barrier — see `alloc_list_items_block_gc`.  The block is stable, so no
-    // re-read is owed for the address.
+    // The ownership question runs before the elements are written rather than
+    // between them and the barrier — see `alloc_list_items_block_gc`.  This
+    // block is raw-malloced and never moves, so no re-read is owed for the
+    // address.
     let owns_block = crate::gc_hook::try_gc_owns_object(block as *mut u8);
     unsafe {
         (*block).len = len;
