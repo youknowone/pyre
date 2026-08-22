@@ -998,6 +998,25 @@ pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
 /// [`box_code_object`] for a caller that only has a borrow, which has to copy.
 /// A caller that owns its `CodeObject` should hand it over instead — the copy
 /// is a whole recursive duplicate of the constants graph.
+///
+/// The marshal decode path used to be such a caller twice over
+/// (`make_runtime_code`, `make_code`), copying and then dropping the original;
+/// both now pass ownership to [`box_code_object`]. What is left are two
+/// defensive sites — [`crate::eval`]'s `code_constant` and the blackhole's
+/// constant realization — that see a code object only as an element of a
+/// *container* constant. The compiler does not emit that shape: the pinned
+/// compiler crate's `constant_data_to_ast_constant_value` treats
+/// `ConstantData::Code` as `unreachable!`, since a code object is not an
+/// `ast.Constant` value. A top-level code constant reaches
+/// [`box_code_constant_in_place`] instead, so the copy here is not on any
+/// measured path.
+///
+/// Two ways to remove the copy were considered and both cost more than it:
+/// widening [`box_code_constant_in_place`] would put its "never freed, never
+/// moved" contract on a `pub fn` that other crates and tests call with
+/// stack-owned values, and holding constants as `Rc<CodeObject>` would fork
+/// `CodeObject` out of the shared compiler crate — the crate that keeps the
+/// translation and interpreter halves separate.
 #[majit_macros::dont_look_inside]
 pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     box_code_object(code.clone())
