@@ -198,6 +198,11 @@ pub use jitdriver::{
     drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled, spdiag_enabled,
     trace_continuation_suspended,
 };
+// The warm-entry stage probe, which an embedder drives from its own harness —
+// the split has to be read through the frontend's own door, so the counts are
+// set from outside and the door is left the shipping one.
+#[cfg(feature = "back-edge-stage-probe")]
+pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_stage_repeats};
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted

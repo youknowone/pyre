@@ -11,6 +11,14 @@ description = "Meta-interpreter and optimizer for majit JIT compiler"
 dynasm = ["dep:majit-backend-dynasm"]
 cranelift = ["dep:majit-backend-cranelift"]
 jit-audits = ["majit-ir/jit-audits"]
+# A measurement arm, never a shipping one. It adds run-time selectable
+# amplification loops to three stages of the warm compiled entry in
+# `jitdriver::JitDriver::back_edge_internal`, so what one stage costs
+# against another is a difference taken inside ONE binary. Off by default,
+# and a build without it has neither the loops nor the atomic load that
+# selects them. See `jitdriver::BackEdgeStageRepeats`, which also says which
+# stages CANNOT be amplified and are therefore left in the residual.
+back-edge-stage-probe = []
 
 [dependencies]
 majit-ir = { workspace = true }
