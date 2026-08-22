@@ -994,6 +994,11 @@ impl OptHeap {
     /// array, so a sparse high slot costs one entry and nothing else.
     const HEADER_FIELD_SLOT_BASE: u32 = 0x8000_0000;
 
+    /// Slot base for a field descriptor the parent's slot list does not place
+    /// (see [`Self::field_slot_index`]).  Disjoint from both the dense
+    /// `index_in_parent` space and [`Self::HEADER_FIELD_SLOT_BASE`].
+    const UNSLOTTED_FIELD_SLOT_BASE: u32 = 0x4000_0000;
+
     /// Compute the `PtrInfo._fields` slot for a field descriptor.
     ///
     /// RPython uses `descr.get_index()` only for `info._fields[index]`
@@ -1013,17 +1018,19 @@ impl OptHeap {
     /// which is what `make_equal_to`'s `Box.type` invariant fires on.
     ///
     /// So use the position only where the parent's list actually holds this
-    /// field at it, and otherwise fall back to the descr's own key, which for
-    /// an unnumbered field is minted out of its payload and cannot collide
-    /// with a position.
+    /// field at it.  A field that list does not place carries no position, and
+    /// the descr's own `index()` is not one either: every `VirtualizableInfo`
+    /// field descriptor is minted with index `0`, so answering with it puts
+    /// the vable's array-pointer read on the same slot as the vable token
+    /// store, and the read comes back with the token.  Key those by offset in
+    /// a band of their own instead.
     ///
-    /// That fallback does NOT cover the header words, which is why they are
-    /// answered before it: `PyObject.ob_type` carries `index()` `0`, a real
-    /// position, so routing it through the fallback returns it to the very slot
-    /// the check just refused. They resolve through no field list at all --
-    /// `OptVirtualize` folds `is_typeptr` from `known_class` and `is_w_class`
-    /// from the virtual's class identity -- so give them a band above the
-    /// positional space instead, keyed by offset to keep the two apart.
+    /// The header words are answered before all of that, in a band of their
+    /// own.  They resolve through no field list at all -- `OptVirtualize`
+    /// folds `is_typeptr` from `known_class` and `is_w_class` from the
+    /// virtual's class identity -- and an offset alone would not separate a
+    /// header word from an unplaced field naming the same word, so the two
+    /// bands stay apart.
     pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
         let descr_idx = descr.index();
         let Some(field_descr) = descr.as_field_descr() else {
@@ -1045,7 +1052,16 @@ impl OptHeap {
         if holds_this_field {
             index as u32
         } else {
-            descr_idx
+            // The parent places this field nowhere, so there is no slot number
+            // for it — and `descr.index()` is not one either.  Slot numbers are
+            // `index_in_parent` values, small and dense; a descriptor minted
+            // without a parent slot would land on top of whatever the parent
+            // really holds at that slot, and a read through one descriptor
+            // would then answer with the value stored through the other.
+            // Offset is the identity such a field does carry, so key it by
+            // that: descriptors naming the same word alias, descriptors naming
+            // different words never do.
+            Self::UNSLOTTED_FIELD_SLOT_BASE + field_descr.offset() as u32
         }
     }
 

@@ -5221,35 +5221,57 @@ impl TraceCtx {
         )
     }
 
-    /// One array slot of `virtualizable.py write_boxes`, emitted into the trace.
+    /// The array half of `virtualizable.py write_boxes`, emitted into the trace
+    /// for one array field of the STANDARD virtualizable.
     ///
     /// `pyjitpl.py synchronize_virtualizable` runs that write-back after every
     /// vable store, but only against the recording-time virtualizable: upstream
     /// readers of a virtualizable array are traced through and read the boxes,
     /// so the compiled trace never needs the array itself to be current.  A
-    /// consumer that reads the array at run time instead needs the same write
+    /// consumer that reads the array at run time instead needs the same writes
     /// emitted, which is what this records.
+    ///
+    /// `items` is `(element index, box)` pairs; only the listed slots are
+    /// written, so a caller covering a sub-range of the array leaves the rest
+    /// alone.  The emission shape is `gen_store_back_in_vable`'s array loop —
+    /// one `getfield_gc_r` of `array_pointer_field_descr` followed by a
+    /// `setarrayitem_gc` per item under `array_item_descr`.  Neither the token
+    /// store nor `forced_virtualizable` is touched: this writes the image out,
+    /// it does not force the virtualizable.
     ///
     /// The shadow is left alone — it already holds these values and stays
     /// authoritative for the rest of the trace.
-    ///
-    /// The array base comes from the same `getfield_gc_r` + heapcache step
-    /// `_opimpl_setarrayitem_vable` takes on its non-standard branch; nothing
-    /// about that read is specific to a non-standard virtualizable.
-    pub fn vable_array_item_write_back(
+    pub fn vable_array_region_write_back(
         &mut self,
         vable_opref: OpRef,
-        index: OpRef,
-        value: OpRef,
-        fdescr: &DescrRef,
-        adescr: DescrRef,
-    ) {
-        let array_opref = self.nonstandard_vable_array_base(vable_opref, fdescr);
-        self.profiler()
-            .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
-        self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+        array_index: usize,
+        items: &[(i64, OpRef)],
+    ) -> bool {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return false;
+        };
+        if array_index >= info.array_fields.len() {
+            return false;
+        }
+        let field_descr = info.array_pointer_field_descr(array_index);
+        let array_descr = info.array_item_descr(array_index);
+        let array_opref = self.vable_getfield_ref_descr(vable_opref, field_descr.clone());
+        // `executor.execute` for the read: the array base has to carry its
+        // concrete half, or the consumer below reaches the backend with an
+        // operand no producer answers for.  Same step every other recorded
+        // vable array-base read takes.
+        let vable_concrete = self.concrete_of_opref(vable_opref);
+        self.stamp_vable_array_base(array_opref, vable_concrete, &field_descr);
+        self.heapcache_getfield_now_known(vable_opref, field_descr.index(), array_opref);
+        for &(item_index, value) in items {
+            let index = self.const_int(item_index);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+            self.profiler()
+                .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
+            self.vable_setarrayitem_descr(array_opref, index, value, array_descr.clone());
+        }
+        true
     }
 
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`

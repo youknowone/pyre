@@ -2596,12 +2596,6 @@ fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
     let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
         return false;
     };
-    let (Some(fdescr), Some(adescr)) = (
-        info.array_field_descrs().first().cloned(),
-        info.array_descrs.first().cloned(),
-    ) else {
-        return false;
-    };
     let base = info.num_static_extra_boxes;
     let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
         return false;
@@ -2618,12 +2612,8 @@ fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
     if !crate::state::flush_locals_region_to_frame(ctx.trace_ctx, concrete_frame) {
         return false;
     }
-    for (slot, value) in slots {
-        let index = ctx.trace_ctx.const_int(slot);
-        ctx.trace_ctx
-            .vable_array_item_write_back(frame_op, index, value, &fdescr, adescr.clone());
-    }
-    true
+    ctx.trace_ctx
+        .vable_array_region_write_back(frame_op, 0, &slots)
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
