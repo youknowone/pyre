@@ -5552,9 +5552,17 @@ fn init_list_type(ns: PyObjectRef) {
                     // slots rather than that copy.  Returning the pre-move word
                     // stores it into the assignment target, where the next
                     // minor finds a root pointing at a stale header.
+                    // The publication ends in a forwarding query, which is
+                    // itself a safepoint, and it rewrites the slots rather
+                    // than `args`; the helper is handed the words read back
+                    // out of them.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
-                    crate::type_methods::list_method_extend(args)?;
+                    let live = [
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    ];
+                    crate::type_methods::list_method_extend(&live)?;
                     Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
                 2,
@@ -7214,9 +7222,17 @@ fn init_dict_type(ns: PyObjectRef) {
                     // copy, as `list.__iadd__` does.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
-                    let self_ = crate::type_methods::resolve_dict_backing(args[0]);
+                    // Both operands come off their slots, not out of `args`:
+                    // the publication's own forwarding query is a safepoint,
+                    // and it rewrites the slots alone.
+                    let self_ = crate::type_methods::resolve_dict_backing(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    );
                     if !self_.is_null() {
-                        crate::type_methods::dict_update1(self_, args[1])?;
+                        crate::type_methods::dict_update1(
+                            self_,
+                            pyre_object::gc_roots::shadow_stack_get(base + 1),
+                        )?;
                     }
                     Ok(pyre_object::gc_roots::shadow_stack_get(base))
                 },
@@ -26622,10 +26638,15 @@ pub(crate) fn set_method_symmetric_difference(
     // `set_method_union` and `set_method_difference`, which copy it before any
     // Python runs, this one drains the operand first and only then walks the
     // receiver — and `COMPARE_OP` popped it off the value stack.
+    // Both go on the stack as one slice: a `pin_root` per value ends each
+    // publication in a forwarding query, itself a safepoint, so the operand
+    // would be published at its pre-query address.  The operand is also the
+    // movable one — any iterable, a list included — so the conversion reads it
+    // off its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
-    let w_other_as_set = set_operand_as_set(args[1])?;
+    let receiver_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let w_other_as_set =
+        set_operand_as_set(pyre_object::gc_roots::shadow_stack_get(receiver_slot + 1))?;
     pyre_object::gc_roots::pin_root(w_other_as_set);
     let w_new = set_symmetric_difference_storage(
         pyre_object::gc_roots::shadow_stack_get(receiver_slot),

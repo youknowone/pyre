@@ -663,7 +663,12 @@ impl ExecutionContext {
             let _roots = pyre_object::gc_roots::push_roots();
             let exit_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(w_exitvalue);
-            let result = self._trace(frame, "leaveframe", w_exitvalue, None);
+            let result = self._trace(
+                frame,
+                "leaveframe",
+                pyre_object::gc_roots::shadow_stack_get(exit_slot),
+                None,
+            );
             w_exitvalue = pyre_object::gc_roots::shadow_stack_get(exit_slot);
             result
         } else {
@@ -808,7 +813,15 @@ impl ExecutionContext {
         let _roots = pyre_object::gc_roots::push_roots();
         let retval_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_retval);
-        self._trace(frame, "return", w_retval, None)?;
+        // The callback is handed the value off its slot too: publication ends
+        // in a forwarding query, which is a safepoint, and it rewrites the
+        // slot rather than this frame's copy.
+        self._trace(
+            frame,
+            "return",
+            pyre_object::gc_roots::shadow_stack_get(retval_slot),
+            None,
+        )?;
         Ok(pyre_object::gc_roots::shadow_stack_get(retval_slot))
     }
 

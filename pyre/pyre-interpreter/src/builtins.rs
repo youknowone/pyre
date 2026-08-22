@@ -5277,23 +5277,26 @@ fn min_max_sequence(
     want_max: bool,
     fn_name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let sequence_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(sequence);
     // `iter` below runs the argument's `__iter__`.  The gateway pins the
-    // argument array, but `key` and `default` are copies taken out of it and a
-    // minor rewrites the array rather than the copies, so both take slots of
-    // their own before anything can collect.  Publishing a stale word as a
-    // root is worse than reading one: the next collection walks it as if it
-    // named an object.
-    let key_fn_slot = key_fn.map(|key| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(key);
-        slot
-    });
+    // argument array, but `sequence`, `key` and `default` are copies taken out
+    // of it and a minor rewrites the array rather than the copies, so all
+    // three take slots of their own before anything can collect.  Publishing a
+    // stale word as a root is worse than reading one: the next collection
+    // walks it as if it named an object.
+    //
+    // One `pin_roots` for the three rather than a `pin_root` each: the
+    // forwarding query that ends a publication is itself a safepoint, so a
+    // value still sitting in a native local while an earlier query runs is
+    // published afterwards at the address it had before.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sequence_slot = pyre_object::gc_roots::pin_roots(&[
+        sequence,
+        key_fn.unwrap_or_else(pyre_object::w_none),
+        default.unwrap_or_else(pyre_object::w_none),
+    ]);
+    let key_fn_slot = key_fn.map(|_| sequence_slot + 1);
     let has_default = default.is_some();
-    let default_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(default.unwrap_or_else(pyre_object::w_none));
+    let default_slot = sequence_slot + 2;
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot))?;
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
