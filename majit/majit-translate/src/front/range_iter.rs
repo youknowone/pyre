@@ -50,6 +50,8 @@
 //! declines (leaves the ctor + FieldWrite chain, census Skip), so a decline
 //! never regresses a graph the legacy walker already handled.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
@@ -80,9 +82,16 @@ pub(crate) fn rewire_range_iter_sites(
     range_sites: &[RangeNewSite],
     next_results: &[Variable],
 ) -> usize {
+    // The origin trace and consumer-closure walks read only control flow
+    // (block `inputargs` / `exits`), which the rewrite never mutates — it
+    // touches only `operations` — so the value-flow adjacency is stable for
+    // the whole pass.  Build it ONCE here instead of re-deriving it (with a
+    // full-graph scan per hop) inside the helpers for every `next()` site ×
+    // range candidate.
+    let flow = ValueFlow::build(graph);
     let mut rewritten = 0;
     for next_opt in next_results {
-        match rewire_one_range_iter_site(graph, next_opt, range_sites) {
+        match rewire_one_range_iter_site(graph, &flow, next_opt, range_sites) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 // Leave the ctor + FieldWrite chain; the shared Range
@@ -93,8 +102,50 @@ pub(crate) fn rewire_range_iter_sites(
     rewritten
 }
 
+/// Value-flow adjacency over the graph's `Link` args ↔ target-block
+/// `inputargs`, precomputed once per graph.  A positional `Link.arg[i]`
+/// carrying variable `src` into a block whose `inputargs[i]` is `dst` is one
+/// edge `src → dst`; `fwd` holds it forward (for the consumer-closure walk),
+/// `back` reversed (for the iterator-origin trace).  Both walks read only
+/// this adjacency, so a single build serves every `next()` site and range
+/// candidate — turning each helper from a per-hop full-graph rescan into a
+/// linear BFS.
+struct ValueFlow {
+    fwd: HashMap<Variable, Vec<Variable>>,
+    back: HashMap<Variable, Vec<Variable>>,
+}
+
+impl ValueFlow {
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
+    fn build(graph: &FunctionGraph) -> Self {
+        let mut fwd: HashMap<Variable, Vec<Variable>> = HashMap::new();
+        let mut back: HashMap<Variable, Vec<Variable>> = HashMap::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                // `BlockId` doubles as the index into `graph.blocks`.
+                let Some(target) = graph.blocks.get(link.target.0) else {
+                    continue;
+                };
+                for (i, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(src) = arg else { continue };
+                    let Some(dst) = target.inputargs.get(i) else {
+                        continue;
+                    };
+                    fwd.entry(src.clone()).or_default().push(dst.clone());
+                    back.entry(dst.clone()).or_default().push(src.clone());
+                }
+            }
+        }
+        Self { fwd, back }
+    }
+}
+
 fn rewire_one_range_iter_site(
     graph: &mut FunctionGraph,
+    flow: &ValueFlow,
     next_opt: &Variable,
     range_sites: &[RangeNewSite],
 ) -> Result<(), String> {
@@ -126,7 +177,7 @@ fn rewire_one_range_iter_site(
     //    the loop iterator, so the trace reaches the ctor result var).
     let site = range_sites
         .iter()
-        .find(|s| range_iter_origin_matches(graph, &iter_arg, &s.result_var))
+        .find(|s| range_iter_origin_matches(flow, &iter_arg, &s.result_var))
         .ok_or_else(|| {
             format!(
                 "{name}: next() iterator does not originate from a captured int-Range aggregate"
@@ -139,7 +190,7 @@ fn rewire_one_range_iter_site(
     //    a `.start` read, or a stored range reads it as a different op
     //    operand — diverting it to a `SomeList`/iterator would break that
     //    consumer, so decline.
-    if !range_feeds_only_forloop(graph, &res, next_opt) {
+    if !range_feeds_only_forloop(graph, flow, &res, next_opt) {
         return Err(format!(
             "{name}: range value has a non-iteration consumer — declining"
         ));
@@ -199,34 +250,29 @@ fn rewire_one_range_iter_site(
 /// slot, so the loop-header iterator phi resolves through its entry edge to
 /// the pre-loop range value), but keys on reaching the captured range value
 /// instead of an `iter` op.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn range_iter_origin_matches(
-    graph: &FunctionGraph,
+    flow: &ValueFlow,
     iter_arg: &Variable,
     range_result: &Variable,
 ) -> bool {
-    let mut visited: Vec<Variable> = Vec::new();
+    let mut visited: HashSet<Variable> = HashSet::new();
     let mut stack: Vec<Variable> = vec![iter_arg.clone()];
     while let Some(v) = stack.pop() {
-        if visited.contains(&v) {
+        if !visited.insert(v.clone()) {
             continue;
         }
-        visited.push(v.clone());
         if &v == range_result {
             return true;
         }
-        for b in &graph.blocks {
-            if let Some(pos) = b.inputargs.iter().position(|iv| iv == &v) {
-                let target_id = b.id;
-                for pb in &graph.blocks {
-                    for link in &pb.exits {
-                        if link.target == target_id
-                            && let Some(LinkArg::Value(src)) = link.args.get(pos)
-                        {
-                            stack.push(src.clone());
-                        }
-                    }
-                }
-            }
+        // A var that is a block inputarg traces back to each predecessor's
+        // link arg in the matching slot (`flow.back`); anything else
+        // dead-ends.
+        if let Some(srcs) = flow.back.get(&v) {
+            stack.extend(srcs.iter().cloned());
         }
     }
     false
@@ -246,33 +292,21 @@ fn range_iter_origin_matches(
 )]
 fn range_feeds_only_forloop(
     graph: &FunctionGraph,
+    flow: &ValueFlow,
     range_result: &Variable,
     next_opt: &Variable,
 ) -> bool {
-    use std::collections::HashSet;
+    // Forward alias closure of the range value: every inputarg it flows into
+    // through positional `Link.args` (including the renamed loop-iterator
+    // phi), reached by BFS over the precomputed `fwd` adjacency.
     let mut closure: HashSet<Variable> = HashSet::new();
-    closure.insert(range_result.clone());
-    loop {
-        let mut grew = false;
-        for block in &graph.blocks {
-            for link in &block.exits {
-                let Some(target_idx) = graph.blocks.iter().position(|b| b.id == link.target) else {
-                    continue;
-                };
-                let target_inputargs = &graph.blocks[target_idx].inputargs;
-                for (arg_idx, arg) in link.args.iter().enumerate() {
-                    let LinkArg::Value(var) = arg else { continue };
-                    if closure.contains(var)
-                        && let Some(iarg) = target_inputargs.get(arg_idx)
-                        && closure.insert(iarg.clone())
-                    {
-                        grew = true;
-                    }
-                }
-            }
+    let mut stack: Vec<Variable> = vec![range_result.clone()];
+    while let Some(v) = stack.pop() {
+        if !closure.insert(v.clone()) {
+            continue;
         }
-        if !grew {
-            break;
+        if let Some(succs) = flow.fwd.get(&v) {
+            stack.extend(succs.iter().cloned());
         }
     }
 
@@ -489,6 +523,81 @@ mod tests {
             &[opt],
         );
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
+        assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
+        assert_eq!(
+            count_calls_ending(&g, &["__pyre_range"]),
+            1,
+            "one range() builtin emitted"
+        );
+        assert_eq!(
+            count_calls_ending(&g, &["core", "slice", "iter"]),
+            1,
+            "one iter op emitted"
+        );
+    }
+
+    /// The range value is threaded through TWO block hops (entry → mid →
+    /// header) before `next()`, so the backward origin trace must cross two
+    /// inputarg phis and the forward consumer closure must grow across both.
+    /// Locks the transitive value-flow BFS that replaced the per-hop
+    /// full-graph rescans.
+    #[test]
+    fn rewrite_diverts_range_threaded_through_two_blocks() {
+        let mut g = FunctionGraph::new("test_range_iter_two_hops");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+
+        // Intermediate block M just relays the range value onward.
+        let (m, m_args) = g.create_block_with_arg_vars(1);
+        let mid = m_args[0].clone();
+        // Loop header H: inputarg = the iterator, reached only via M.
+        let (h, h_args) = g.create_block_with_arg_vars(1);
+        let it = h_args[0].clone();
+        let opt = g
+            .push_op_var(
+                h,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("Range".to_string())),
+                    args: vec![it.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(h, Some(opt.clone()));
+        g.set_goto(n, m, vec![range.clone()]);
+        g.set_goto(m, h, vec![mid.clone()]);
+
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range.clone(),
+                start: a,
+                end: b,
+            }],
+            &[opt],
+        );
+        assert_eq!(rewritten, 1, "two-hop range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
             count_calls_ending(&g, &["__pyre_range"]),
