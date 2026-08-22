@@ -402,7 +402,11 @@ pub fn load_extension_module(
     let handle =
         rustpython_host_env::ctypes::open_library_with_mode(path, mode).map_err(|error| {
             extension_import_error(
-                format!("cannot load extension '{}': {error}", path.display()),
+                format!(
+                    "cannot load extension '{}': {}",
+                    path.display(),
+                    crate::with_causes(&error)
+                ),
                 name,
                 path,
             )

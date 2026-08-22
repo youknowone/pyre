@@ -937,6 +937,30 @@ pub use shared_opcode::*;
 /// constants as `malachite_bigint::BigInt`.  Convert at that fixed API seam;
 /// interpreter objects and every arithmetic operation use RPython's rbigint.
 #[majit_macros::dont_look_inside]
+/// An error's own message followed by whatever it names as the cause.
+///
+/// A host library loader reports the reason a load failed -- the `dlerror()`
+/// text, and it is the whole diagnostic -- as the error's *source* rather than
+/// in its own `Display`, which alone reads only "dlopen failed". A message
+/// built from `{error}` therefore says that something went wrong and nothing
+/// about what, so every load failure reads alike and none can be triaged.
+///
+/// A cause already quoted by the message it would be appended to is left out,
+/// since a chain that repeats itself reads as two failures.
+pub(crate) fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        let text = source.to_string();
+        if !text.is_empty() && !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        cause = source.source();
+    }
+    rendered
+}
+
 pub(crate) fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> PyBigInt {
     let (sign, bytes) = value.to_bytes_le();
     let sign = match sign {
