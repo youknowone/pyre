@@ -168,7 +168,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 **OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
 `PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
 
-### §6a — Live default-ON (6): the removal targets
+### §6a — Live default-ON (5): the removal targets
 
 | gate | what is ON by default | retire when |
 |---|---|---|
@@ -177,10 +177,9 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_BRIDGE_PARAMS | a wasm guard passing its fail args to the bridge as call parameters (`lib.rs bridge_params_enabled`); `=0`/`false`/`off` restores the jitframe spill crossing | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_INLINE_BRIDGE | merging a loop-closing bridge's ops into the module of the loop it guards into, so `guard → bridge → loop` becomes a `br` (`lib.rs inline_bridge_enabled`); `=0`/`false`/`off` restores the separate bridge module | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
-| PYRE_WASM_INLINE_NONHEADER | admitting an inlined region whose closing JUMP names a resumable LABEL other than the loop header (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it. Opt-IN, not opt-out: `codegen` emits the shape (entry dispatch wrapped in a `loop` the region branches back into) and it is unit-tested, but on real IR 47 fixtures die with a corrupted Ref | the miscompile is root-caused; it is worth ~16.3M of fannkuch's 20.6M surviving cross-module crossings |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6a2 — Default-OFF experiments (2)
+### §6a2 — Default-OFF experiments (3)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.  Bridge inlining reaches module replacement on its own, so
@@ -191,6 +190,7 @@ exercises the replacement machinery by itself.
 |---|---|---|
 | PYRE_FORITER_CALL_BODY | admits a `LIST_APPEND` FOR_ITER body that also carries a CALL (`eval.rs for_iter_call_body_admitted`), so a call-bearing comprehension can trace.  The body's item now survives the mid-body abort (the forward resume delivers it), but the loop it compiles residualizes the call it could not inline and is measured SLOWER: `[C(i) for i in range(2000)]` x200 runs 0.478s off / 0.569s on, dynasm | the traced body inlines that call (gh#73/gh#34); until then the ON arm loses and this is the one-binary A/B for it |
 | PYRE_WASM_REEMIT | re-emits a compiled loop's wasm module into its own table slot once, on the first bridge installed against it | when the replacement path no longer needs an isolated arm |
+| PYRE_WASM_INLINE_NONHEADER | admits an inlined region whose closing JUMP names a resumable LABEL other than the loop header AND whose source guard is in the LOOP BODY (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it.  The preamble-sourced half of that class takes a different placement — blocks outside the header `loop`, body past its `end` — and is admitted unconditionally, so this flag now covers only the body-sourced half.  Arming it removes 49.4M of the 257.3M cross-module crossings on the 81 fixtures that reach the decline and buys 0.74x/0.67x on two of them, but costs 1.23x on `spectral_norm` | the +18 ops per non-failing iteration it levies on the owner's fall-through is paid back on the fixtures it admits, or an admission rule separates them from `spectral_norm`, which sheds 99.7% of its crossings and still loses 23% |
 
 ### §6b — VALUE knobs (12): config, not gates
 

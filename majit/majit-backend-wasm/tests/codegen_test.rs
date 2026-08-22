@@ -11,7 +11,7 @@ use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
 use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
 use smallvec::smallvec;
-use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
+use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
 fn validate_wasm(bytes: &[u8]) {
     wasmparser::validate(bytes).expect("generated wasm should be valid");
@@ -483,6 +483,7 @@ fn build_module_with_frame(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame,
@@ -731,6 +732,7 @@ fn build_module_with_write_barrier_target(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         // The allocated trace keeps both Ref inputs live across New; reserve
@@ -1247,6 +1249,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -1322,6 +1325,166 @@ fn test_empty_trace() {
     assert!(guards[0].is_finish);
 }
 
+/// Build, validate, instantiate and run `inputs` under wasmi, then read the
+/// guard-exit index the trace wrote at offset 0 and the first three frame
+/// slots.  Every inline-region repro drives the module exactly this way and
+/// differs only in the exit index it expects.
+fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i64, i64) {
+    let (bytes, _, _) = codegen::build_wasm_module(inputs).expect("non-header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    (
+        read(0),
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
+}
+
+/// A bridge whose merge is deferred carries an entry counter and calls back
+/// once, on the entry that reaches the threshold — not before it, and not
+/// again after. The counter is what separates a region worth its owner's
+/// re-emission from one that is crossed a few thousand times and never pays it
+/// back, so both halves of "exactly once, at the threshold" are the point.
+///
+/// The same entry zeroes the source guard's dispatch cell, which is what gets
+/// the host back: without it the owner's loop can run to completion before the
+/// merge is installed.
+#[test]
+fn a_deferred_merge_trips_once_at_its_threshold() {
+    const COUNTER_ADDR: u32 = 0x10000;
+    const CELLS_BASE_PTR: u32 = 0x10100;
+    const CELLS_BASE: u32 = 0x10200;
+    const CELL_INDEX: u32 = 2;
+    const THRESHOLD: u64 = 3;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[OpRef::int_op(1)]),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
+    let mut inputs = inline_region_inputs(&inputargs, ops, Vec::new());
+    inputs.inline_trip = Some(codegen::InlineTripProbe {
+        counter_addr: COUNTER_ADDR,
+        threshold: THRESHOLD,
+        // Table slot 1 below; slot 0 stays null so a mis-selected slot traps
+        // rather than calling the wrong function.
+        trip_fn_ptr: 1,
+        pending_id: 77,
+        cells_base_ptr: CELLS_BASE_PTR,
+        dispatch_cell_index: CELL_INDEX,
+    });
+
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("the armed module builds");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("the armed module compiles");
+    let mut store = Store::new(&engine, Vec::<i64>::new());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    let trip = wasmi::Func::wrap(
+        &mut store,
+        |mut caller: wasmi::Caller<'_, Vec<i64>>, id: i64| {
+            caller.data_mut().push(id);
+            0i64
+        },
+    );
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 2, None),
+        Val::default(ValType::FuncRef),
+    )
+    .expect("test table should allocate");
+    table
+        .set(&mut store, 1, Val::from(trip))
+        .expect("the trip callback occupies slot 1");
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    // The array the owner's guards dispatch through, reached the way the probe
+    // reaches it: through the base the owner keeps, not a baked address.
+    memory
+        .write(
+            &mut store,
+            CELLS_BASE_PTR as usize,
+            &CELLS_BASE.to_le_bytes(),
+        )
+        .unwrap();
+    let cell_addr = (CELLS_BASE + CELL_INDEX * 4) as usize;
+    memory
+        .write(&mut store, cell_addr, &7u32.to_le_bytes())
+        .unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("the armed module instantiates");
+    let trace = instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap();
+    let cell = |store: &Store<Vec<i64>>| {
+        let mut buf = [0u8; 4];
+        memory.read(store, cell_addr, &mut buf).unwrap();
+        u32::from_le_bytes(buf)
+    };
+
+    let counter = |store: &Store<Vec<i64>>| {
+        let mut buf = [0u8; 8];
+        memory.read(store, COUNTER_ADDR as usize, &mut buf).unwrap();
+        u64::from_le_bytes(buf)
+    };
+    for entry in 1..=THRESHOLD + 2 {
+        trace.call(&mut store, 0).expect("the trace runs");
+        assert_eq!(counter(&store), entry, "every entry is counted");
+        let fired = if entry < THRESHOLD { 0 } else { 1 };
+        assert_eq!(
+            store.data().len(),
+            fired,
+            "the callback fires on entry {THRESHOLD} and on no other"
+        );
+        assert_eq!(
+            cell(&store),
+            if fired == 1 { 0 } else { 7 },
+            "the dispatch cell is cleared by the same entry that fires"
+        );
+    }
+    assert_eq!(store.data(), &[77], "the callback names its own merge");
+}
+
 /// The `ModuleBuildInputs` shape every inline-region test shares: a fixed
 /// frame, no nursery, no census, and every base at zero.  Only the owner trace
 /// and the regions merged into it vary between them, so a new field lands here
@@ -1349,6 +1512,7 @@ fn inline_region_inputs(
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -1370,6 +1534,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         vec![guard, finish],
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 1)],
             ops: vec![Op::new(OpCode::Finish, &[])],
@@ -1492,6 +1657,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             ops: owner_ops,
             inlined_bridges: vec![codegen::InlinedBridge {
                 source_fail_index: 0,
+                outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
                     InputArg::from_type(Type::Int, 40),
@@ -1515,6 +1681,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -1702,6 +1869,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             ops: owner_ops(),
             inlined_bridges: vec![codegen::InlinedBridge {
                 source_fail_index: 1,
+                outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
                     InputArg::from_type(Type::Int, base),
@@ -1725,6 +1893,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -2033,6 +2202,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         bridge_entry_arity: Some(0),
         bridge_param_dispatch: true,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -2352,6 +2522,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -2732,6 +2903,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -3159,6 +3331,7 @@ fn build_owner_with_region_closing_at(
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
             ops: region_ops,
@@ -3333,6 +3506,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: if with_ref {
                 vec![
@@ -3347,43 +3521,9 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             constants: indexmap::IndexMap::new(),
         }],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 1, "the second guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
 /// Collect every `i32.const` / `i64.const` immediate in the emitted body, so a
@@ -3464,6 +3604,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
+            inline_trip: None,
             external_jump_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
@@ -3586,20 +3727,26 @@ fn host_loop_inputargs() -> Vec<InputArg> {
 }
 
 /// The complement of the decline below. With the same owner, guard and bridge
-/// but no invalidation, nothing short-circuits the inline arm: the trial runs
-/// every accept precondition and reaches the merged install. On the host that
-/// install cannot complete — there is no wasm host, so the owner's module was
-/// never materialized and the rebuild refuses — which is what `bridge_diag(37)`
-/// records. So this does not assert an accepted inline (only a wasm host can
-/// produce one); it pins that the invalidation decline is the ONLY thing
-/// separating the two tests.
+/// but no invalidation, nothing short-circuits the inline arm: the bridge
+/// resumes at the loop header, so it takes the arm that merges on the spot and
+/// reaches the install. On the host that install cannot complete — there is no
+/// wasm host, so the owner's module was never materialized and the rebuild
+/// refuses — which is what `bridge_diag(37)` records. So this does not assert
+/// an accepted inline (only a wasm host can produce one); it pins that the
+/// invalidation decline is the ONLY thing separating the two tests.
 #[test]
 fn a_valid_owner_reaches_the_inline_trial() {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut backend = majit_backend_wasm::WasmBackend::new();
-    let token = majit_backend::JitCellToken::new(1);
+    // Through an `Arc`, with the compiled-loop token wired back to it the way
+    // `make_jitcell_token` does: a deferred merge outlives the compile that
+    // registered it, so it takes a strong handle on the owner from there.
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(1));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(1));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(70, false);
 
     backend
@@ -3612,7 +3759,11 @@ fn a_valid_owner_reaches_the_inline_trial() {
         arg_types: vec![Type::Int, Type::Int],
     };
     let declines_before = majit_backend_wasm::bridge_diag(50);
+    let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
+    // A merge is only considered once there is a callback to defer the
+    // outside-loop half to; the guest publishes the real one.
+    majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
             &fail_descr,
@@ -3623,11 +3774,17 @@ fn a_valid_owner_reaches_the_inline_trial() {
             None,
         )
         .expect("the loop-closing bridge compiles");
+    majit_backend_wasm::set_inline_trip_helper_slot(0);
 
     assert_eq!(
         majit_backend_wasm::bridge_diag(50),
         declines_before,
         "a valid owner is not declined by the invalidation arm"
+    );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(54),
+        deferred_before,
+        "a header-resuming region is not the half that waits on a trip"
     );
     assert!(
         majit_backend_wasm::bridge_diag(37) > trials_before,
@@ -3782,6 +3939,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
             ops: region_ops,
@@ -3789,43 +3947,9 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             constants: indexmap::IndexMap::new(),
         }],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 1, "the second guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
 /// Two regions attached to the SAME owner, both closing at the NON-header
@@ -3932,6 +4056,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
         vec![
             codegen::InlinedBridge {
                 source_fail_index: 0,
+                outside_loop: false,
                 trace_id: 1,
                 inputargs: vec![InputArg::from_type(Type::Int, 10)],
                 ops: region_a,
@@ -3940,6 +4065,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
             },
             codegen::InlinedBridge {
                 source_fail_index: 1,
+                outside_loop: false,
                 trace_id: 2,
                 inputargs: vec![InputArg::from_type(Type::Int, 20)],
                 ops: region_b,
@@ -3948,51 +4074,114 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
             },
         ],
     );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("two non-header regions merge");
-    validate_wasm(&bytes);
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
-    let mut store = Store::new(&engine, ());
-    let memory =
-        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
-    memory
-        .write(
-            &mut store,
-            codegen::FRAME_SLOT_BASE as usize,
-            &0i64.to_le_bytes(),
-        )
-        .unwrap();
-    let mut linker = Linker::new(&engine);
-    linker.define("env", "memory", memory).unwrap();
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .expect("generated trace should instantiate");
-    instance
-        .get_typed_func::<i32, i32>(&store, "trace")
-        .unwrap()
-        .call(&mut store, 0)
-        .expect("generated trace should execute");
-
-    let read = |off: u64| {
-        let mut buf = [0u8; 8];
-        memory.read(&store, off as usize, &mut buf).unwrap();
-        i64::from_le_bytes(buf)
-    };
-    assert_eq!(read(0), 2, "the third guard is the one that exits");
-    (
-        read(codegen::FRAME_SLOT_BASE),
-        read(codegen::FRAME_SLOT_BASE + 8),
-        read(codegen::FRAME_SLOT_BASE + 16),
-    )
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 2, "the third guard is the one that exits");
+    (slot0, slot1, slot2)
 }
 
-/// A region's guard must sit inside the `loop` whose blocks it branches to.
-/// `InlineGuard::branch_depth` counts those blocks from loop-body statement
-/// level; in the peeled preamble the same depth names a LABEL resume loader,
-/// so a bridge sourced there has to keep the out-of-line path.
+/// A region attached to a guard in the PEELED PREAMBLE, ahead of the loop
+/// header LABEL. The per-region blocks the loop-body regions use are opened
+/// inside the wasm `loop`, which the preamble has not entered, so such a
+/// region needs its block outside that loop.
+///
+/// The trace increments once before LABEL0, once more between LABEL0 and the
+/// header, and guards `v2 > 10` there. The first pass has `v2 == 2`, so the
+/// guard fails into the region, which adds 5000 and re-enters at LABEL0 with
+/// the sum. The second pass reaches the header with `v2 == 5003` and the loop
+/// runs to its own exit guard, so the frame reports the region's arithmetic
+/// rather than the header loader's zeroed slots.
 #[test]
-fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
+fn a_region_attached_to_a_preamble_guard_runs_its_body() {
+    assert_eq!(run_preamble_region_repro(), (5004, 5003, 5002));
+}
+
+fn run_preamble_region_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(50, false);
+    let descr1 = majit_ir::make_loop_target_descr(51, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let guard_to_region = make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(2)]);
+    let guard_exit = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(5)],
+        &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+    );
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        guard_to_region,
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        guard_exit,
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(descr0);
+    let region_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = inline_region_inputs(
+        &inputargs,
+        ops,
+        vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            outside_loop: true,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+    );
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
+}
+
+/// Which of the two region-block families a guard's region belongs to. A guard
+/// inside the `loop` reaches the blocks opened there; one in the peeled
+/// preamble, which has not entered that `loop`, takes the blocks opened outside
+/// it instead. The exit ordinal is what decides.
+#[test]
+fn a_preamble_guard_is_classified_apart_from_a_loop_body_one() {
     let descr0 = majit_ir::make_loop_target_descr(50, false);
     let descr1 = majit_ir::make_loop_target_descr(51, false);
 
@@ -4040,10 +4229,224 @@ fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let inputs = inline_region_inputs(&inputargs, ops, vec![]);
-    assert!(codegen::inline_source_guard_precedes_loop_label(&inputs, 0));
-    assert!(!codegen::inline_source_guard_precedes_loop_label(
-        &inputs, 1
-    ));
+    assert!(codegen::source_guard_precedes_loop_label(&inputs.ops, 0));
+    assert!(!codegen::source_guard_precedes_loop_label(&inputs.ops, 1));
+}
+
+/// One region in each family at once: region A hangs off a PREAMBLE guard, so
+/// its block is opened outside the header `loop`, while region B hangs off a
+/// loop-body guard and keeps its block inside it. Both close at LABEL0, so
+/// both leave through the entry dispatch, and each has to reach its own block
+/// from a different nesting depth.
+///
+/// B is listed first because merging is append-only and A's body is emitted
+/// past the `end` of the loop B's body sits inside, so every outside-loop
+/// region trails every inside-loop one.
+///
+///   entry     v1 = in0 + 1
+///   LABEL0    [v1]
+///             v2 = v1 + 1;  guard v2 > 10   -> region A
+///   LABEL1    [v2]                             (loop header)
+///             v3 = v2 + 1;  guard v3 > 6000 -> region B
+///             guard v3 < 100000             -> exit
+///             JUMP -> LABEL1 [v3]
+///   region A  v11 = v10 + 5000;  JUMP -> LABEL0 [v11]
+///   region B  v21 = v20 + 50000; JUMP -> LABEL0 [v21]
+///
+/// A fires once (v2 == 2), B once (v3 == 5004), and the loop then counts up to
+/// its own exit, so the frame reports both regions' arithmetic.
+#[test]
+fn a_preamble_region_and_a_loop_body_region_each_reach_their_own_block() {
+    assert_eq!(run_mixed_region_families_repro(), (100000, 99999, 55004));
+}
+
+fn run_mixed_region_families_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(60, false);
+    let descr1 = majit_ir::make_loop_target_descr(61, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(6),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(6)], &[OpRef::int_op(2)]),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(6000)],
+            OpRef::int_op(7),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(7)], &[OpRef::int_op(3)]),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(5)],
+            &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+        ),
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+    assert!(codegen::source_guard_precedes_loop_label(&ops, 0));
+    assert!(!codegen::source_guard_precedes_loop_label(&ops, 1));
+
+    let region_a_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_a_jump.setdescr(descr0.clone());
+    let region_a = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_a_jump,
+    ];
+    let region_b_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(21))]);
+    region_b_jump.setdescr(descr0);
+    let region_b = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(20), OpRef::const_int(50000)],
+            OpRef::int_op(21),
+        ),
+        region_b_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = inline_region_inputs(
+        &inputargs,
+        ops,
+        vec![
+            codegen::InlinedBridge {
+                source_fail_index: 1,
+                outside_loop: false,
+                trace_id: 2,
+                inputargs: vec![InputArg::from_type(Type::Int, 20)],
+                ops: region_b,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+            codegen::InlinedBridge {
+                source_fail_index: 0,
+                outside_loop: true,
+                trace_id: 1,
+                inputargs: vec![InputArg::from_type(Type::Int, 10)],
+                ops: region_a,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+        ],
+    );
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 2, "the third guard is the one that exits");
+    (slot0, slot1, slot2)
+}
+
+/// A preamble region resumes PAST its target LABEL's resume loader, which
+/// restores that label's captures from slots the fall-through path writes as it
+/// crosses the label — and a fresh entry clears them. A region whose guard
+/// fails BEFORE the label it names has not written them, so the merge is
+/// declined rather than resumed onto cleared slots.
+#[test]
+fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
+    let descr0 = majit_ir::make_loop_target_descr(70, false);
+    let descr1 = majit_ir::make_loop_target_descr(71, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0);
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1.clone());
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(6),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(6)], &[OpRef::int_op(2)]),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(5)], &[OpRef::int_op(3)]),
+        jump,
+    ];
+
+    // The region names LABEL1, which sits after the guard it hangs off.
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(descr1);
+    let inputs = inline_region_inputs(
+        &vec![InputArg::from_type(Type::Int, 0)],
+        ops,
+        vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            outside_loop: true,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: vec![
+                make_op(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+                    OpRef::int_op(11),
+                ),
+                region_jump,
+            ],
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+    );
+
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("the region's target LABEL is past its own guard"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("had not crossed"), "{error}");
 }
 
 /// A region closing at the loop HEADER must rebind the header LABEL's Ref arg
@@ -4207,6 +4610,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![
                 InputArg::from_type(Type::Int, 10),
@@ -4231,6 +4635,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
@@ -4401,6 +4806,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![
                 InputArg::from_type(Type::Int, 10),
@@ -4424,6 +4830,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         bridge_entry_arity: None,
         bridge_param_dispatch: false,
         trace_entry_census: None,
+        inline_trip: None,
         external_jump_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
