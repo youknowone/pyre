@@ -23,6 +23,16 @@ from llbc_extract import CrateSpec, run_cli  # noqa: E402
 # closure manifests and Cargo.lock. The full cargo closure remains separately
 # hashed as `closure=` so inputs the file table cannot prove irrelevant still
 # produce a diagnostic when they move.
+# Passed to Charon for every pyre crate. `--hide-marker-traits` drops the
+# `Sized` / `Send` / `Sync` clauses from every generic signature: nothing in
+# `majit-translate` reads a trait clause, and Charon's own help names the flag
+# as a translation speed-up. Measured on `pyre-interpreter`: 97 s -> 81 s of
+# CPU for the host pass, with the prepass output unchanged (`jit_trace_gen.rs`,
+# `jitcodes_index.bin`, `descrs_index.bin` and the rest of the build script's
+# cross-process determinism set compared byte-equal across the flag).
+# `--no-typecheck` was tried beside it and made the pass slower.
+CHARON_ARGS = ["--hide-marker-traits"]
+
 SPECS: dict[str, CrateSpec] = {
     # `corpus` lives outside the crate graph the metadata walk sees, so its
     # fingerprint inputs are explicit pathspecs.
@@ -51,28 +61,33 @@ SPECS: dict[str, CrateSpec] = {
         name="majit-rlib",
         crate_dir=ROOT / "majit" / "majit-rlib",
         output_name="majit-rlib.ullbc",
+        charon_args=CHARON_ARGS,
     ),
     "pyre-object": CrateSpec(
         name="pyre-object",
         crate_dir=ROOT / "pyre" / "pyre-object",
         output_name="pyre-object.ullbc",
+        charon_args=CHARON_ARGS,
     ),
     "pyre-module": CrateSpec(
         name="pyre-module",
         crate_dir=ROOT / "pyre" / "pyre-module",
         output_name="pyre-module.ullbc",
+        charon_args=CHARON_ARGS,
         cargo_args=["--features", "pyre-interpreter/{features}"],
     ),
     "pyre-interpreter": CrateSpec(
         name="pyre-interpreter",
         crate_dir=ROOT / "pyre" / "pyre-interpreter",
         output_name="pyre-interpreter.ullbc",
+        charon_args=CHARON_ARGS,
         cargo_args=["--features", "{features}"],
     ),
     "pyre-jit": CrateSpec(
         name="pyre-jit",
         crate_dir=ROOT / "pyre" / "pyre-jit",
         output_name="pyre-jit.ullbc",
+        charon_args=CHARON_ARGS,
         # `--no-default-features` drops `prepass` and nothing else (`dynasm` is
         # the other default and is named): `pyre-jit-trace`'s build script
         # then writes its placeholders without build-depending on a host copy
