@@ -5176,6 +5176,20 @@ fn min_max_sequence(
     let _roots = pyre_object::gc_roots::push_roots();
     let sequence_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(sequence);
+    // `iter` below runs the argument's `__iter__`.  The gateway pins the
+    // argument array, but `key` and `default` are copies taken out of it and a
+    // minor rewrites the array rather than the copies, so both take slots of
+    // their own before anything can collect.  Publishing a stale word as a
+    // root is worse than reading one: the next collection walks it as if it
+    // named an object.
+    let key_fn_slot = key_fn.map(|key| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(key);
+        slot
+    });
+    let has_default = default.is_some();
+    let default_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(default.unwrap_or_else(pyre_object::w_none));
     let it = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sequence_slot))?;
     let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(it);
@@ -5193,14 +5207,8 @@ fn min_max_sequence(
         };
         pyre_object::gc_roots::pin_root(w_dict);
     }
-    let key_fn_slot = key_fn.map(|key| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(key);
-        slot
-    });
-    let has_default = default.is_some();
     let best_item_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(default.unwrap_or_else(pyre_object::w_none));
+    pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(default_slot));
     let best_key_slot = if key_fn_slot.is_some() {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(pyre_object::w_none());
