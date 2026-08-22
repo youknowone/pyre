@@ -7,9 +7,16 @@ repository.workspace = true
 description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 
 [features]
-default = ["dynasm"]
+default = ["dynasm", "prepass"]
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
 dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
+# The build script's translation prepass over the LLBC set, and with it the
+# build-dependencies that prepass alone needs (a host copy of the interpreter
+# stack, compiled at the build-override opt-level). Off, the script writes
+# compile-only placeholders and refuses unless `MAJIT_LLBC_EXTRACTION=1`, so
+# the only build that legitimately drops it is a Charon extraction pass of
+# `pyre-jit` — which is exactly where the host copy was dead weight.
+prepass = ["dep:pyre-interpreter", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
 test-support = []
 
 [dependencies]
@@ -41,15 +48,16 @@ majit-backend-dynasm = { workspace = true, optional = true }
 majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [build-dependencies]
+# `majit-ir` and `bincode` serve the placeholders too; the rest is `prepass`.
 majit-ir = { workspace = true }
-majit-translate = { workspace = true }
-mimalloc = { version = "0.1" }
-pyre-interpreter = { workspace = true, features = ["dynasm"] }
+majit-translate = { workspace = true, optional = true }
+mimalloc = { version = "0.1", optional = true }
+pyre-interpreter = { workspace = true, features = ["dynasm"], optional = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 bincode = { workspace = true }
-syn = { workspace = true }
-walkdir = { workspace = true }
+syn = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }

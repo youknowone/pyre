@@ -47,7 +47,9 @@ pyre-interpreter = { workspace = true }
 # Specified directly (not via workspace inheritance) so default-features
 # can be turned off — drops the native `dynasm` backend, which does not
 # build for wasm32; on wasm32 the JIT backend is selected by target_arch.
-pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false }
+# `prepass` is named because defaults are off: without it `pyre-jit-trace`'s
+# build script emits placeholder JIT tables and refuses the build.
+pyre-jit = { path = "../pyre-jit", version = "0.0.2", default-features = false, features = ["prepass"] }
 wasm-bindgen = { workspace = true, optional = true }
 getrandom = { workspace = true }
 # Only the `wasm-host` (native-host) build installs the residual-call host

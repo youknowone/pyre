@@ -73,7 +73,12 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-jit",
         crate_dir=ROOT / "pyre" / "pyre-jit",
         output_name="pyre-jit.ullbc",
-        cargo_args=["--features", "{features}"],
+        # `--no-default-features` drops `prepass` and nothing else (`dynasm` is
+        # the other default and is named): `pyre-jit-trace`'s build script
+        # then writes its placeholders without build-depending on a host copy
+        # of `pyre-interpreter` + `majit-translate`, the one unit set this pass
+        # compiled that no artefact ever read.
+        cargo_args=["--no-default-features", "--features", "{features}"],
         # No layout sidecar. A cross-target pass has to pass cargo
         # `--target`, and cargo then stops applying `RUSTFLAGS` to host
         # units — including `pyre-jit-trace`'s build script, which

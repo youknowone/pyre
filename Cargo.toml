@@ -60,7 +60,9 @@ pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
 pyre-sandbox = { version = "0.0.2", path = "pyre/pyre-sandbox" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
 pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit" }
-pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
+# Defaults off so `pyre-jit` forwards `dynasm` / `cranelift` / `prepass` one by
+# one and its LLBC extraction pass can leave `prepass` out (see that manifest).
+pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace", default-features = false }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
