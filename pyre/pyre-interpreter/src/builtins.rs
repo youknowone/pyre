@@ -17360,16 +17360,16 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // The console stream is a host-console type, so a sandbox build — which
     // compiles it out — keeps the plain `FileIO` construction.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    let raw_type = {
+    let (raw_type, console) = {
         let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         if crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0' {
-            crate::module::_io::windows_console_io_type()
+            (crate::module::_io::windows_console_io_type(), true)
         } else {
-            crate::module::_io::fileio_type()
+            (crate::module::_io::fileio_type(), false)
         }
     };
     #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
-    let raw_type = crate::module::_io::fileio_type();
+    let (raw_type, console) = (crate::module::_io::fileio_type(), false);
     let raw = crate::call::call_function_impl_result(
         raw_type,
         &[
@@ -17445,12 +17445,20 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
         }
 
-        // This native open call does not add a Python frame between the user
-        // and `_io.text_encoding`; one frame of warning stack depth is enough.
-        let resolved_encoding = crate::module::_io::text_encoding(
-            pyre_object::gc_roots::shadow_stack_get(encoding_slot),
-            1,
-        )?;
+        // `_open` writes `encoding = "utf-8"` in the same step that picks the
+        // console class, ahead of the argument the caller gave: a console
+        // stream reports no other codec, and never counts as relying on the
+        // default one.  Everything else goes through `_io.text_encoding`, and
+        // this native open call adds no Python frame between the user and it,
+        // so one frame of warning stack depth is enough.
+        let resolved_encoding = if console {
+            w_str_new("utf-8")
+        } else {
+            crate::module::_io::text_encoding(
+                pyre_object::gc_roots::shadow_stack_get(encoding_slot),
+                1,
+            )?
+        };
         pyre_object::gc_roots::pin_root(resolved_encoding);
         let resolved_encoding_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let wrapper = crate::call::call_function_impl_result(
