@@ -2573,11 +2573,24 @@ fn new_typeobject_with_metatype_and_layout(
     let ns = pyre_object::w_dict_new();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
-    // `type_ready_set_dict` — a static type whose `tp_name` is qualified
-    // publishes the leading component as a `__module__` entry, so
+    // `type_ready_set_dict` — a type whose `tp_name` is qualified publishes the
+    // leading component as a `__module__` entry, so
     // `array.array.__dict__["__module__"] == "array"`.  An unqualified name
     // stores nothing and the `type.__module__` getset reports "builtins".
-    if let Some((module, _)) = name.rsplit_once('.') {
+    //
+    // A namespace that already names `__module__` keeps what it has: a member
+    // row may be declared under that name precisely to shadow it.
+    // `type_new_set_module` and `_PyType_FromMetaclass_impl`'s `module_from_spec`
+    // are the same refusal.
+    let named = unsafe {
+        pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "__module__",
+        )
+    };
+    if named.is_none()
+        && let Some((module, _)) = name.rsplit_once('.')
+    {
         // Allocate the value first: reading `ns` before `w_str_new` would hand
         // the store an address the allocation is free to move.
         let w_module = w_str_new(module);
