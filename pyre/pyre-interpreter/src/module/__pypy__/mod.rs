@@ -67,6 +67,29 @@ fn add_memory_pressure(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
+/// `interp_magic.py hidden_applevel` — `func.getcode().hidden_applevel = True`,
+/// returning the function so it can be spelled as a decorator.
+///
+/// One function at a time, rather than a whole compilation unit: a module that
+/// is otherwise the program's own reaches for this on the single frame that is
+/// not, the way `lib_pypy/_contextvars.py` marks `Context.run`, which stands
+/// between a callable and whoever asked the context to run it.
+fn hidden_applevel(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let w_func = args[0];
+    // `space.interp_w(Function, w_func)`, whose mismatch raises the same
+    // `'%s' object expected, got '%T' instead` as `descr_call_mismatch`.
+    if w_func.is_null() || !unsafe { crate::is_function(w_func) } {
+        return Err(crate::baseobjspace::descr_call_mismatch(
+            w_func,
+            "hidden_applevel",
+            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+        ));
+    }
+    let w_code = unsafe { crate::function_get_code(w_func) } as pyre_object::PyObjectRef;
+    unsafe { crate::pycode::w_code_set_hidden_applevel(w_code, true) };
+    Ok(w_func)
+}
+
 /// `interp_dict.py:43-45 / 79-81` `isinstance(w_obj, W_DictMultiObject)`:
 /// resolve the backing of an exact dict, module dict, or dict subclass,
 /// rejecting a read-only `mappingproxy` (a `W_Root`, not a `W_DictMultiObject`)
@@ -209,6 +232,7 @@ crate::py_module! {
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,
         "write_unraisable" / 3 = write_unraisable,
+        "hidden_applevel" / 1 = hidden_applevel,
         "newmemoryview" / * = interp_buffer::newmemoryview,
     },
     extra_init: |ns| {
