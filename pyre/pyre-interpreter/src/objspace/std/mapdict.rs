@@ -97,8 +97,11 @@ pub const NUM_DIGITS_POW2: usize = 1 << NUM_DIGITS;
 /// (afterwards just use a dict).
 pub const LIMIT_MAP_ATTRIBUTES: usize = 80;
 
-/// mapdict.py `ALLOW_UNBOXING_INTS = LONG_BIT == 64`. pyre targets
-/// 64-bit, so int unboxing is permitted.
+/// mapdict.py `ALLOW_UNBOXING_INTS = LONG_BIT == 64`.
+///
+/// False on a 32-bit target, which for pyre means the wasm guest: it builds for
+/// `wasm32-unknown-unknown`, so an int attribute stays boxed there while the
+/// native builds unbox it. Float unboxing is unaffected, as upstream.
 pub const ALLOW_UNBOXING_INTS: bool = usize::BITS == 64;
 
 /// mapdict.py `DICT = 0` — attrkind for instance `__dict__` entries.
