@@ -233,9 +233,9 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
     Ok(pos - continuation_bytes)
 }
 
-/// The `Wtf8` view of a buffer that arrived from outside the runtime — the
-/// `surrogatepass` decode every such boundary performs, so it admits exactly
-/// what `check_utf8(s, true)` does.
+/// The `Wtf8` view of a buffer `check_utf8` accepts — `str_decode_utf8`'s
+/// "fast version first" arm, and the check every untrusted-bytes boundary
+/// performs before the buffer becomes a string.
 ///
 /// `Wtf8::from_bytes` does not stand in for this.  Its surrogate arm matches
 /// `[0xed, 0xa0.., b3, ..]`, leaving the second byte unbounded above and the
@@ -250,7 +250,18 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
 /// name in every code object a marshal load carries.  Only the two bounds
 /// `_invalid_byte_2_of_3` and `_invalid_byte_3_of_3` impose are restored;
 /// `check_utf8_and_wtf8_from_bytes_agree` holds the two to one answer.
-pub fn wtf8_from_bytes(s: &[u8]) -> Result<&Wtf8, CheckError> {
+pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckError> {
+    if !allow_surrogates {
+        // `check_utf8` with the flag off admits exactly well-formed UTF-8, and
+        // `Utf8Error::valid_up_to` is the same offset it would report: both
+        // name the start of the sequence the scan stopped on.
+        return match std::str::from_utf8(s) {
+            Ok(valid) => Ok(Wtf8::new(valid)),
+            Err(error) => Err(CheckError {
+                pos: error.valid_up_to(),
+            }),
+        };
+    }
     let mut pos = 0;
     while let Err(error) = std::str::from_utf8(&s[pos..]) {
         pos += error.valid_up_to();
@@ -443,7 +454,7 @@ mod tests {
         for bad in [b"\xed\xc0\x80".as_slice(), b"\xed\xa0\x41".as_slice()] {
             assert!(Wtf8::from_bytes(bad).is_some());
             assert_eq!(check_utf8(bad, true), Err(CheckError { pos: 0 }));
-            assert_eq!(wtf8_from_bytes(bad), Err(CheckError { pos: 0 }));
+            assert_eq!(wtf8_from_bytes(bad, true), Err(CheckError { pos: 0 }));
         }
     }
 
@@ -455,11 +466,13 @@ mod tests {
         // stopped, which is the sequence start `check_utf8` names.
         let mut buf = Vec::new();
         let mut probe = |buf: &[u8]| {
-            let want = check_utf8(buf, true);
-            let got = wtf8_from_bytes(buf).map(|_| ());
-            assert_eq!(want.is_ok(), got.is_ok(), "{buf:02x?}");
-            if let (Err(a), Err(b)) = (want, got) {
-                assert_eq!(a, b, "{buf:02x?}");
+            for allow in [true, false] {
+                let want = check_utf8(buf, allow);
+                let got = wtf8_from_bytes(buf, allow).map(|_| ());
+                assert_eq!(want.is_ok(), got.is_ok(), "{buf:02x?} allow={allow}");
+                if let (Err(a), Err(b)) = (want, got) {
+                    assert_eq!(a, b, "{buf:02x?} allow={allow}");
+                }
             }
         };
         for b1 in 0u16..=0xFF {

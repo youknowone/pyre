@@ -603,7 +603,7 @@ impl FileReader {
 /// admitted and a rejection is that call's `UnicodeDecodeError`, which the
 /// sink carries past the wire reader's own error type.
 fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalError> {
-    pyre_object::rutf8::wtf8_from_bytes(bytes).map_err(|_| {
+    pyre_object::rutf8::wtf8_from_bytes(bytes, true).map_err(|_| {
         errors.remember(crate::typedef::utf8_decode_error(bytes));
         wire::MarshalError::InvalidUtf8
     })

@@ -624,7 +624,7 @@ pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
     // WTF-8, while malformed byte sequences must still be rejected.  The
     // rejection is `rutf8::check_utf8`'s and not `Wtf8Buf::from_bytes`'s,
     // which admits sequences that hold no code point at all.
-    let s = pyre_object::rutf8::wtf8_from_bytes(data)
+    let s = pyre_object::rutf8::wtf8_from_bytes(data, true)
         .map_err(|_| crate::typedef::utf8_decode_error(data))?;
     Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(
         s.to_owned(),
