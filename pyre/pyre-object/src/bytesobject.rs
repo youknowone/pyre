@@ -68,6 +68,16 @@ pub const BYTES_BLOCK_TOKEN: crate::object_array::ArrayToken = crate::object_arr
     len_offset: BYTES_BLOCK_LEN_OFFSET,
 };
 
+// The collector sizes a block as `base_size + item_size * length` read at
+// `len_offset`, and `bytes_block_chars` reads the payload at `base_size`. A
+// field added to `BytesBlock` moves both silently, so pin the shape here: the
+// length header first, the chars one word in, and one byte per item.
+const _: () = {
+    assert!(BYTES_BLOCK_LEN_OFFSET == 0);
+    assert!(BYTES_BLOCK_CHARS_OFFSET == std::mem::size_of::<usize>());
+    assert!(BYTES_BLOCK_TOKEN.item_size == 1);
+};
+
 /// Runtime-assigned GC type id for [`BytesBlock`], published by
 /// `pyre-jit::eval` with the other tail registrations.
 static BYTES_BLOCK_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -215,20 +225,31 @@ impl crate::lltype::GcType for W_BytesObject {
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let len = bytes.len();
+    // `build_list_storage` (listobject.rs) states the rule the block obeys:
+    // old-gen is mark-sweep, so a block with no heap edge yet is sweepable
+    // rather than merely immobile, and it has to be rooted across every later
+    // GC operation. `try_gc_alloc_stable_raw` is one of them
+    // (`IntArray::pin_block`), and `get_instantiate` allocates as well, so both
+    // the block and the class travel on the shadow stack and are read back from
+    // their slots once the last allocation is behind them.
+    let _roots = crate::gc_roots::push_roots();
+    let data_slot = crate::gc_roots::shadow_stack_len();
     let data = alloc_bytes_block(bytes);
-    let header = PyObject {
-        ob_type: &BYTES_TYPE as *const PyType,
-        w_class: get_instantiate(&BYTES_TYPE),
-    };
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
     let body = W_BytesObject {
-        ob_header: header,
-        data,
+        ob_header: PyObject {
+            ob_type: &BYTES_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
+        data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
         len,
         ctypes_keepalive_refs: 0,
         w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
     let w_bytes = if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut W_BytesObject, body);
@@ -248,6 +269,13 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
+    // The block is allocated before the body and rooted across it, not built
+    // inside the struct literal: the literal is evaluated after
+    // `try_gc_alloc_stable_raw` has already produced `raw`, which leaves that
+    // fresh body unrooted across the block's own allocation.
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let data = alloc_bytes_block(bytes);
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         <W_BytesObject as crate::lltype::GcType>::type_id(),
         <W_BytesObject as crate::lltype::GcType>::SIZE,
@@ -257,7 +285,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
             ob_type: &BYTES_TYPE as *const PyType,
             w_class: crate::gc_roots::shadow_stack_get(root_base),
         },
-        data: alloc_bytes_block(bytes),
+        data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
         len: bytes.len(),
         ctypes_keepalive_refs: 0,
         w_dict: PY_NULL,
