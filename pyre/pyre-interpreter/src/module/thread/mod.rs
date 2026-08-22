@@ -498,10 +498,22 @@ pub(crate) fn current_frames() -> PyObjectRef {
         }
     });
     let result = w_dict_new();
+    pyre_object::gc_roots::pin_root(result);
+    let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for (index, ident) in entries.into_iter().enumerate() {
-        let frame = pyre_object::gc_roots::shadow_stack_get(base + index);
-        unsafe { w_dict_setitem(result, ident, frame) };
+        // The key is built first: `w_int_new` allocates, so a dict or a value
+        // read before it would be a pre-collection address by the time the
+        // store runs.
+        let key = pyre_object::w_int_new(ident);
+        unsafe {
+            w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                key,
+                pyre_object::gc_roots::shadow_stack_get(base + index),
+            )
+        };
     }
+    let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
     drop(roots);
     result
 }
@@ -518,8 +530,11 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
     majit_gc::gc_sync::request_stw(|_| {
         let contexts = EXECUTION_CONTEXTS.lock();
         for (&ident, &ec) in contexts.iter() {
-            let exception =
-                unsafe { (*(ec as *const crate::PyExecutionContext)).current_exception() };
+            // `sys_exc_info`, not the flat `sys_exc_value`: a thread inside a
+            // generator entered from an `except` handler has its exception
+            // parked on the generator, and `_get_topmost_exception` is what
+            // reads it back.
+            let exception = unsafe { (*(ec as *const crate::PyExecutionContext)).sys_exc_info() };
             pyre_object::gc_roots::pin_root(if exception.is_null() {
                 w_none()
             } else {
@@ -529,15 +544,22 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
         }
     });
     let result = w_dict_new();
+    pyre_object::gc_roots::pin_root(result);
+    let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for (index, ident) in entries.into_iter().enumerate() {
+        // The key is built first: `w_int_new` allocates, so a dict or a value
+        // read before it would be a pre-collection address by the time the
+        // store runs.
+        let key = pyre_object::w_int_new(ident);
         unsafe {
-            w_dict_setitem(
-                result,
-                ident,
+            w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+                key,
                 pyre_object::gc_roots::shadow_stack_get(base + index),
             )
         };
     }
+    let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
     drop(roots);
     result
 }
