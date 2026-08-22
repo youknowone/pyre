@@ -1209,6 +1209,18 @@ pub fn make_builtin_function_with_doc(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_builtin_function_with_doc` for a caller that only sometimes has a
+/// docstring to attach -- `None` leaves the code object without one, the way
+/// `interp2app` does for a function whose `__doc__` is empty.
+pub fn make_builtin_function_with_opt_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, docstring);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// GatewayCache.build parity for an interp2app carrying the text signature
 /// produced by `interp2app._generate_text_signature`.
 pub fn make_builtin_function_with_text_signature(
