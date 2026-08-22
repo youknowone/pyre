@@ -1264,6 +1264,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 forward_py_pc,
                 &vable_boxes,
                 &vref_boxes,
+                "fbw",
+                op_pc,
             );
             return Ok(());
         }
@@ -1299,9 +1301,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         arm_py_pc,
         &vable_boxes,
         &vref_boxes,
+        "carried",
+        op_pc,
     );
     ctx.outer_active_boxes = active;
     Ok(())
+}
+
+/// `PYRE_GUARD_RESUME_PC=1` prints the coordinate every walker-emitted guard
+/// resumes at.  A guard whose printed `py_pc` is not the opcode it was emitted
+/// under re-executes the wrong bytecode on deopt, which reads as a livelock or
+/// a corrupted local rather than as a crash, so the coordinate is otherwise
+/// invisible.
+fn guard_resume_pc_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_GUARD_RESUME_PC").as_deref() == Ok("1"))
 }
 
 /// Attach a freshly built single-frame snapshot to the guard this capture is
@@ -1321,7 +1335,22 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
     py_pc: u32,
     vable_boxes: &[majit_metainterp::recorder::SnapshotTagged],
     vref_boxes: &[majit_metainterp::recorder::SnapshotTagged],
+    origin: &str,
+    op_pc: usize,
 ) {
+    if guard_resume_pc_probe_enabled() {
+        let opcode = match guard_stamp {
+            GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
+            GuardStampTarget::GuardFromEnd(from_end) => {
+                ctx.trace_ctx.guard_op_opcode_from_end(from_end)
+            }
+        };
+        eprintln!(
+            "[guard-pc] {origin} {opcode:?} op_pc={op_pc} jc={jitcode_index} \
+             jit_pc={pc} py_pc={py_pc} active={}",
+            active.len(),
+        );
+    }
     match guard_stamp {
         GuardStampTarget::LastOp => ctx
             .trace_ctx
