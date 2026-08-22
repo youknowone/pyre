@@ -68,7 +68,7 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 /// precedence over the lazy resolver because it writes the slot
 /// outright.
 pub struct ExceptionData {
-    /// `exceptiondata.py standardexceptions = standardexceptions`.
+    /// `exceptiondata.py ExceptionData standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
     /// Resolved runtime pointer per standard exception, indexed
     /// parallel to `standardexceptions`.  `None` means the resolver

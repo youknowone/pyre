@@ -3365,7 +3365,7 @@ pub fn trace_and_compile_from_bridge(
     // threads `resumedescr` (the descr) as the canonical identity source
     // through the entire bridge tracer.  Pyre's backend FailDescr Arc
     // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
-    // `pyjitpl.py resumedescr.rd_loop_token.loop_token_wref()`),
+    // `pyjitpl.py MetaInterp.handle_guard_failure resumedescr.rd_loop_token.loop_token_wref()`),
     // `arc.fail_index_per_trace()` (mirroring `compile.py:854
     // ResumeGuardDescr._attrs_`), and `arc.trace_id()` (mirroring the
     // `compile.py record_loop_or_bridge` stamp) are the line-by-

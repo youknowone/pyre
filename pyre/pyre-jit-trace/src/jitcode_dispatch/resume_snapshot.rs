@@ -1458,14 +1458,9 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
 /// load could not be replayed, so it never answers a slot.  A stamped NULL is
 /// judged by what carries it:
 ///
-/// * An input argument is bound from the real frame when the loop is entered
-///   and rebound from the fail args at every guard failure, so a NULL stamped
-///   on one is the operand's value, the same way RPython's
-///   `MIFrame.registers_r` entry for a loop input box holds it.
-///   `LOAD_FAST_AND_CLEAR` saves an unbound local as exactly that null and
-///   leaves it on the operand stack below an inlined comprehension for the
-///   whole loop, so answering unresolved left every paused-caller image built
-///   over that stack one slot short and `capture_root_parent_resume_stack`
+/// * A box [`null_ref_is_a_value`] accepts carries the operand's own null.
+///   Answering unresolved for one left every paused-caller image built over
+///   that stack one slot short and `capture_root_parent_resume_stack`
 ///   declined it.
 /// * Any other box may read back `Ref(0)` while the walk still holds the
 ///   operand symbolically — a deferred `LOAD_ATTR name + NULL|self` pair is
@@ -1481,6 +1476,23 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
 /// The one operand whose correct value IS null whatever carries it — a
 /// `CALL`'s own `null_or_self` — is named and supplied separately by
 /// [`collect_call_stack_overrides`].
+/// Whether a NULL carried by `opref` is the operand's VALUE rather than a slot
+/// whose value is simply unknown.
+///
+/// An input argument is bound from the real frame when the loop is entered and
+/// rebound from the fail args at every guard failure, so a NULL stamped on one
+/// is what that operand holds — RPython's `MIFrame.registers_r` entry for a
+/// loop input box holds the same null.  `LOAD_FAST_AND_CLEAR` saves an unbound
+/// local as exactly that null and leaves it on the operand stack below an
+/// inlined comprehension for the whole loop, so a merge point inside the
+/// comprehension closes over one.
+///
+/// Any other box may read back `Ref(0)` while the walk still holds the operand
+/// symbolically, which is a different fact and answers false here.
+pub(crate) fn null_ref_is_a_value(opref: OpRef) -> bool {
+    matches!(opref, OpRef::InputArgRef(_))
+}
+
 pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
@@ -1495,7 +1507,7 @@ pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     if let OpRef::ConstPtr(value) = opref {
         return Some(value.as_usize() as pyre_object::PyObjectRef);
     }
-    let null_is_a_value = matches!(opref, OpRef::InputArgRef(_));
+    let null_is_a_value = null_ref_is_a_value(opref);
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Ref(r))
             if r != majit_ir::GcRef::NO_CONCRETE && (null_is_a_value || !r.is_null()) =>

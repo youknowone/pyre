@@ -30,7 +30,7 @@ use crate::parse::CallPath;
 /// consumers (e.g. `crate::generated::all_jitcodes`) receive one value and
 /// do not need to pass `CallControl` around to perform later lookups.
 pub struct AllJitCodes {
-    /// RPython `call.py self.jitcodes = {}` (graph-keyed dict). Pyre's
+    /// RPython `call.py CallControl.__init__ self.jitcodes = {}` (graph-keyed dict). Pyre's
     /// graph identity at this boundary is `CallPath`.
     pub by_path: indexmap::IndexMap<CallPath, Arc<JitCode>>,
     /// RPython `call.py:88 self.all_jitcodes = []` (alloc-order list). The
@@ -848,7 +848,7 @@ impl CodeWriter {
             let _ = &ssarepr;
             // RPython `codewriter.py log.dot()` is unconditional —
             // the only gate is the `CodeWriter.debug` instance flag
-            // (`codewriter.py debug = True`).  Keep that semantics:
+            // (`codewriter.py CodeWriter debug = True`).  Keep that semantics:
             // a single `self.debug` gate, no additional `MAJIT_LOG`
             // dependency.
             eprintln!("[CodeWriter] {}", jitcode.name);
@@ -1009,7 +1009,7 @@ impl CodeWriter {
                 /* verbose = */ false,
                 index,
             );
-            // RPython `codewriter.py all_jitcodes.append(jitcode)`.
+            // RPython `codewriter.py CodeWriter.make_jitcodes all_jitcodes.append(jitcode)`.
             // `transform_graph_to_jitcode` already set `jitcode.index`.
             callcontrol.finish_jitcode(jitcode.clone());
 

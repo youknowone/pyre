@@ -2727,7 +2727,7 @@ pub(super) fn lower_dispatch_chain(
                 majit_metainterp::record_degraded_dispatch_arm(#interp, #arm_name, #reason);
             }
         };
-        // `jitcode.py self.name = name` — the name every sub-JitCode built
+        // `jitcode.py JitCode.__init__ self.name = name` — the name every sub-JitCode built
         // for this arm carries.  The same spelling the degraded-arm record
         // uses, so a log line and a `degraded_dispatch_arms()` entry for one
         // arm can be matched by eye.

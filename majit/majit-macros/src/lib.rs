@@ -2652,7 +2652,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             __asm: &mut majit_metainterp::Assembler,
         ) -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
-            // `jitcode.py self.name = name` — every jitcode upstream is
+            // `jitcode.py JitCode.__init__ self.name = name` — every jitcode upstream is
             // named at construction. The builder defaults the field to the
             // empty string, and the diagnostics that print it (the bytecode
             // encoder's register/const ceiling audit among them) then identify

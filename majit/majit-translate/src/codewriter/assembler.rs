@@ -4907,7 +4907,7 @@ impl Assembler {
         self.insns.insert(name.to_string(), opnum);
     }
 
-    /// RPython `assembler.py self.all_liveness = []` — the shared
+    /// RPython `assembler.py Assembler.__init__ self.all_liveness = []` — the shared
     /// liveness byte stream populated by `_encode_liveness`.  Returned
     /// as a contiguous `&[u8]` view so consumers (notably
     /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py`) can

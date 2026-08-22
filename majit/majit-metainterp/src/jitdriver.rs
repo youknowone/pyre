@@ -1641,7 +1641,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Copy `shared_asm`'s `all_liveness` byte
     /// stream into `staticdata.liveness_info`, mirroring
-    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
+    /// `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`.
     ///
     /// Must run while `staticdata` Arc is uniquely owned (i.e. before
     /// the first trace clones it), after macro-emitted prebuild has
@@ -1654,7 +1654,7 @@ impl<S: JitState> JitDriver<S> {
     /// Install the state-field JIT canonical liveness payload before
     /// any tracing path runs.  Mirrors RPython `warmspot.py:281-289`'s
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
-    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+    /// `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
     /// slice — full `finish_setup` requires `CodeWriter` /
     /// `CallControl` construction, which is not yet wired.
     ///
@@ -1782,7 +1782,7 @@ impl<S: JitState> JitDriver<S> {
     /// A driver that has not registered a dispatch jitcode has nothing to
     /// publish and is left alone.
     ///
-    /// `warmspot.py metainterp_sd.jitcodes` now owns the table
+    /// `warmspot.py WarmRunnerDesc.__init__ metainterp_sd.jitcodes` now owns the table
     /// (`MetaInterp::install_jitcodes`), but one `MetaInterpStaticData` per
     /// driver is still not upstream's ONE table, and this store is a separate
     /// per-thread copy of it besides. Re-aiming on entry only removes the
@@ -9318,7 +9318,7 @@ mod tests {
         //   3. Forward to `JitDriver::install_canonical_liveness`.
         //
         // RPython parity: `warmspot.py:281-289` →
-        // `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+        // `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
         // — the metainterp-side test
         // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the
