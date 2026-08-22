@@ -231,6 +231,36 @@ static PyObject *c_call_kwargs(PyObject *s, PyObject *args)
     return result;
 }
 
+/* ── a `dict` subclass defined in C ────────────────────────────────────
+   The shape a Cython `cdef class` deriving from `dict` compiles to.  Its
+   base is reached through an instance because no `PyTypeObject` is exported
+   as a data symbol. */
+static PyType_Slot cdict_slots[] = {{0, NULL}};
+
+static PyObject *make_cdict(void)
+{
+    PyObject *probe = PyDict_New();
+    if (probe == NULL) return NULL;
+    PyTypeObject *base = Py_TYPE(probe);
+    Py_INCREF((PyObject *)base);
+    Py_DECREF(probe);
+
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)base);
+    if (bases == NULL) { Py_DECREF((PyObject *)base); return NULL; }
+
+    PyType_Spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.name = "cpyext_dict_subclass.CDict";
+    spec.basicsize = (int)base->tp_basicsize;
+    spec.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+    spec.slots = cdict_slots;
+
+    PyObject *type = PyType_FromSpecWithBases(&spec, bases);
+    Py_DECREF(bases);
+    Py_DECREF((PyObject *)base);
+    return type;
+}
+
 #define M(name, fn) {name, fn, METH_O, NULL}
 static PyMethodDef methods[] = {
     M("check", c_check), M("check_exact", c_check_exact),
@@ -261,5 +291,13 @@ static struct PyModuleDef def = {
 
 PyMODINIT_FUNC PyInit_cpyext_dict_subclass(void)
 {
-    return PyModule_Create(&def);
+    PyObject *module = PyModule_Create(&def);
+    if (module == NULL) return NULL;
+    PyObject *cdict = make_cdict();
+    if (cdict == NULL || PyModule_AddObject(module, "CDict", cdict) < 0) {
+        Py_XDECREF(cdict);
+        Py_DECREF(module);
+        return NULL;
+    }
+    return module;
 }

@@ -2626,7 +2626,28 @@ fn new_typeobject_with_metatype_and_layout(
         let has_dict = pyre_object::w_dict_getitem_str(ns, "__dict__").is_some();
         let has_weakref = pyre_object::w_dict_getitem_str(ns, "__weakref__").is_some();
         let layout = if reuse {
-            parent_layout
+            // A `dict` subclass keeps its entries in a reserved layout slot
+            // rather than in the dict layout.  `create_all_slots` reserves
+            // one for a class written in Python; a type readied from C takes
+            // this route instead and is owed the same slot, or
+            // `set_dict_backing` has nowhere to write and every `dict` method
+            // rejects the instance as a foreign receiver.
+            //
+            // The typedef is still the base's, so what this mints is the
+            // base's layout plus that slot rather than an instance layout of
+            // its own -- everything else is inherited, not re-derived from
+            // the namespace.
+            match crate::type_methods::base_owes_dict_backing(base) {
+                false => parent_layout,
+                true => pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+                    typedef: layout_pytype,
+                    nslots: (*parent_layout).nslots + 1,
+                    newslotnames: vec![crate::type_methods::DICT_DATA_SLOT.to_string()],
+                    base_layout: parent_layout,
+                    acceptable_as_base_class: (*parent_layout).acceptable_as_base_class,
+                    typedef_hasdict: (*parent_layout).typedef_hasdict,
+                }),
+            }
         } else {
             let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
