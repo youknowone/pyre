@@ -12,16 +12,14 @@
 //!   `rutf8` function whose whole content is "encode, decode or validate,
 //!   scanning forward" has a checked counterpart there and is *not* re-ported:
 //!   a second, unchecked implementation beside a checked one would be two
-//!   sources of truth for one invariant.  `unichr_as_utf8*` (:40) is
-//!   `CodePoint::encode_wtf8` / `Wtf8Buf::push`; `check_utf8` (:351),
-//!   `_check_utf8` (:373) and `get_utf8_length` (:364) are `Wtf8::from_bytes`;
-//!   `check_ascii` (:242) and `first_non_ascii_char` (:249) are
-//!   `Wtf8::is_ascii` and a byte scan; `has_surrogates` (:439) and
-//!   `surrogate_in_utf8` (:489) are `Wtf8::as_str().is_err()`; `islinebreak`
-//!   (:255), `isspace` (:272) and `utf8_in_chars` (:307) are predicates over a
-//!   decoded `CodePoint`; `char_escape_helper` (:647),
-//!   `make_utf8_escape_function` (:660) and `decode_latin_1` (:867) belong to
-//!   `repr` and `_codecs`.
+//!   sources of truth for one invariant.  `unichr_as_utf8*` is
+//!   `CodePoint::encode_wtf8` / `Wtf8Buf::push`; `check_utf8`, `_check_utf8`
+//!   and `get_utf8_length` are `Wtf8::from_bytes`; `check_ascii` and
+//!   `first_non_ascii_char` are `Wtf8::is_ascii` and a byte scan;
+//!   `has_surrogates` and `surrogate_in_utf8` are `Wtf8::as_str().is_err()`;
+//!   `islinebreak`, `isspace` and `utf8_in_chars` are predicates over a
+//!   decoded `CodePoint`; `char_escape_helper`, `make_utf8_escape_function`
+//!   and `decode_latin_1` belong to `repr` and `_codecs`.
 //!
 //! * **This module owns random access**, which the crate deliberately has no
 //!   counterpart for — its iterators are sequential, so resolving the n-th code
@@ -37,11 +35,11 @@
 //! and holding it lets `codepoint_at_pos` decode through the crate instead of
 //! carrying a second copy of its decoder.
 //!
-//! Two members of the family are deliberately absent.  `null_storage` (:513)
-//! has no counterpart: an absent table is a null pointer in the
-//! `W_UnicodeObject` slot.  `_pos_at_index` (:568), the "Slow!" linear
-//! fallback, has no pyre caller — upstream reaches it from `unicodehelper` and
-//! `formatting`, neither of which pyre routes this way.
+//! Two members of the family are deliberately absent.  `null_storage` has no
+//! counterpart: an absent table is a null pointer in the `W_UnicodeObject`
+//! slot.  `_pos_at_index`, the "Slow!" linear fallback, has no pyre caller —
+//! upstream reaches it from `unicodehelper` and `formatting`, neither of
+//! which pyre routes this way.
 //!
 //! Names, entry layout, group sizes and the build loop follow
 //! `rpython/rlib/rutf8.py`.  The `_is_64bit` branch of
