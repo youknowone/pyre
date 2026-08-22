@@ -28,11 +28,12 @@ static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 /// has no generational allocation counters to drive, so the values are only
 /// remembered: `set_threshold` stores what it was given and `get_threshold`
 /// hands the same tuple back, which is the part of the pair's behaviour a
-/// caller can observe.  The third threshold is not among them — an incremental
-/// collector has no third generation to size, so it reads back as 0 whatever
-/// it was set to.  The initial values are the ones a fresh interpreter starts
-/// with.
-static GC_THRESHOLD: [AtomicI64; 2] = [AtomicI64::new(2000), AtomicI64::new(10)];
+/// caller can observe.  All three are kept, including the third, whose round
+/// trip 3.14 preserves even though its own incremental collector sizes no
+/// third generation.  The initial values are the ones a fresh interpreter
+/// starts with.
+static GC_THRESHOLD: [AtomicI64; 3] =
+    [AtomicI64::new(2000), AtomicI64::new(10), AtomicI64::new(10)];
 
 const STATE_SCANNING: u8 = 0;
 const STATE_MARKING: u8 = 1;
@@ -1537,8 +1538,7 @@ crate::py_module! {
             }
             // Read every value before storing any, so a non-integer in the
             // tail leaves the previous thresholds untouched.  An omitted
-            // trailing value keeps the threshold it already had, and a third
-            // value is validated but not kept.
+            // trailing value keeps the threshold it already had.
             let mut given = Vec::with_capacity(positional.len());
             for &w_value in positional {
                 // The index protocol, so an object carrying only `__int__` is
@@ -1554,7 +1554,6 @@ crate::py_module! {
             GC_THRESHOLD
                 .iter()
                 .map(|slot| w_int_new(slot.load(Ordering::Relaxed)))
-                .chain(std::iter::once(w_int_new(0)))
                 .collect(),
         )),
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
