@@ -1388,6 +1388,12 @@ pub fn green_key_hash_typed(values: &[i64], types: &[majit_ir::GreenType]) -> u6
 // Re-exported from majit-codegen so both meta and backend can access it.
 pub use majit_backend::{JittedGuard, set_jitted, we_are_jitted};
 
+// ── jitframe allocation arm ──
+// An embedder measuring the compiled entry needs to select the arm from its own
+// harness, and `majit-backend` is not one of its dependencies — every embedder
+// reaches the backends through this crate.
+pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
+
 // ── rstack criticalcode hooks ──
 // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start/stop.
 // Used by blackhole_from_resumedata / handle_async_forcing /

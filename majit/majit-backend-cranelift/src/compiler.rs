@@ -278,6 +278,7 @@ fn match_metainterp_finish_descr(
 // JitFrame layout constants (`jitframe.py:61-83`)
 // The canonical layout lives in `majit_backend::jitframe`; re-export the
 // byte offsets here so uses inside this file stay terse.
+use majit_backend::deadframe::{FrameHeapOwner, jitframe_pool_enabled};
 use majit_backend::jitframe::{
     BASEITEMOFS, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
     JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS,
@@ -3176,7 +3177,7 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
 fn deadframe_from_jitframe(
     jf_gcref: GcRef,
     fail_descr: DescrRef,
-    heap_owner: Option<Vec<i64>>,
+    heap_owner: Option<FrameHeapOwner>,
 ) -> DeadFrame {
     DeadFrame::JitFrame(JitFrameDeadFrame::new(
         jf_gcref, fail_descr, None, heap_owner,
@@ -7974,7 +7975,7 @@ impl FrameInputs<'_> {
 /// the JitFrame GcRef is returned directly. Values stay in place.
 struct JitExecResult {
     jf_gcref: GcRef,
-    heap_owner: Option<Vec<i64>>,
+    heap_owner: Option<FrameHeapOwner>,
     fail_index: u32,
     direct_descr: Option<DescrRef>,
 }
@@ -8092,7 +8093,7 @@ fn run_compiled_code_inner(
     // SSA/ref_root_slots afterward.
     let runtime_jitframe_tid = cranelift_jitframe_type_id();
     let use_gc_alloc = runtime_jitframe_tid.is_some();
-    let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
+    let (jf_gcref, heap_owner): (GcRef, Option<FrameHeapOwner>) = if use_gc_alloc {
         let type_id = runtime_jitframe_tid.unwrap();
         let gcref = with_cranelift_gc_required(|gc| {
             gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
@@ -8114,7 +8115,11 @@ fn run_compiled_code_inner(
         // pointer, so without it that load reads outside the buffer.
         const HEADER_WORDS: usize = majit_gc::header::GcHeader::SIZE / 8;
         const _: () = assert!(HEADER_WORDS * 8 == majit_gc::header::GcHeader::SIZE);
-        let mut buf = vec![0i64; HEADER_WORDS + jf_total];
+        // Off the per-thread free list by default, or one `calloc`/`free` pair
+        // per compiled entry if the owned arm was selected — `FrameHeapOwner`
+        // is where the two differ, and the buffer it hands back is zeroed to
+        // `words` either way.
+        let mut buf = FrameHeapOwner::new(HEADER_WORDS + jf_total, jitframe_pool_enabled());
         let gcref = GcRef(unsafe { buf.as_mut_ptr().add(HEADER_WORDS) } as usize);
         // jitframe.py:84 parity — `jf_frame.length` is the count of `Signed`
         // payload slots after the length word.  The GC-alloc branch above
