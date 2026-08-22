@@ -1414,6 +1414,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         vec![guard, finish],
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 1)],
             ops: vec![Op::new(OpCode::Finish, &[])],
@@ -1536,6 +1537,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             ops: owner_ops,
             inlined_bridges: vec![codegen::InlinedBridge {
                 source_fail_index: 0,
+                outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
                     InputArg::from_type(Type::Int, 40),
@@ -1746,6 +1748,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             ops: owner_ops(),
             inlined_bridges: vec![codegen::InlinedBridge {
                 source_fail_index: 1,
+                outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
                     InputArg::from_type(Type::Int, base),
@@ -3203,6 +3206,7 @@ fn build_owner_with_region_closing_at(
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
             ops: region_ops,
@@ -3377,6 +3381,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: if with_ref {
                 vec![
@@ -3792,6 +3797,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
         ops,
         vec![codegen::InlinedBridge {
             source_fail_index: 0,
+            outside_loop: false,
             trace_id: 1,
             inputargs: vec![InputArg::from_type(Type::Int, 10)],
             ops: region_ops,
@@ -3908,6 +3914,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
         vec![
             codegen::InlinedBridge {
                 source_fail_index: 0,
+                outside_loop: false,
                 trace_id: 1,
                 inputargs: vec![InputArg::from_type(Type::Int, 10)],
                 ops: region_a,
@@ -3916,6 +3923,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
             },
             codegen::InlinedBridge {
                 source_fail_index: 1,
+                outside_loop: false,
                 trace_id: 2,
                 inputargs: vec![InputArg::from_type(Type::Int, 20)],
                 ops: region_b,
@@ -3929,12 +3937,109 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
     (slot0, slot1, slot2)
 }
 
-/// A region's guard must sit inside the `loop` whose blocks it branches to.
-/// `InlineGuard::branch_depth` counts those blocks from loop-body statement
-/// level; in the peeled preamble the same depth names a LABEL resume loader,
-/// so a bridge sourced there has to keep the out-of-line path.
+/// A region attached to a guard in the PEELED PREAMBLE, ahead of the loop
+/// header LABEL. The per-region blocks the loop-body regions use are opened
+/// inside the wasm `loop`, which the preamble has not entered, so such a
+/// region needs its block outside that loop.
+///
+/// The trace increments once before LABEL0, once more between LABEL0 and the
+/// header, and guards `v2 > 10` there. The first pass has `v2 == 2`, so the
+/// guard fails into the region, which adds 5000 and re-enters at LABEL0 with
+/// the sum. The second pass reaches the header with `v2 == 5003` and the loop
+/// runs to its own exit guard, so the frame reports the region's arithmetic
+/// rather than the header loader's zeroed slots.
 #[test]
-fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
+fn a_region_attached_to_a_preamble_guard_runs_its_body() {
+    assert_eq!(run_preamble_region_repro(), (5004, 5003, 5002));
+}
+
+fn run_preamble_region_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(50, false);
+    let descr1 = majit_ir::make_loop_target_descr(51, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let guard_to_region = make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(2)]);
+    let guard_exit = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(5)],
+        &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+    );
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        guard_to_region,
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        guard_exit,
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(descr0);
+    let region_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = inline_region_inputs(
+        &inputargs,
+        ops,
+        vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            outside_loop: true,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+    );
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
+}
+
+/// Which of the two region-block families a guard's region belongs to. A guard
+/// inside the `loop` reaches the blocks opened there; one in the peeled
+/// preamble, which has not entered that `loop`, takes the blocks opened outside
+/// it instead. The exit ordinal is what decides.
+#[test]
+fn a_preamble_guard_is_classified_apart_from_a_loop_body_one() {
     let descr0 = majit_ir::make_loop_target_descr(50, false);
     let descr1 = majit_ir::make_loop_target_descr(51, false);
 
@@ -3982,10 +4087,224 @@ fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let inputs = inline_region_inputs(&inputargs, ops, vec![]);
-    assert!(codegen::inline_source_guard_precedes_loop_label(&inputs, 0));
-    assert!(!codegen::inline_source_guard_precedes_loop_label(
-        &inputs, 1
-    ));
+    assert!(codegen::source_guard_precedes_loop_label(&inputs.ops, 0));
+    assert!(!codegen::source_guard_precedes_loop_label(&inputs.ops, 1));
+}
+
+/// One region in each family at once: region A hangs off a PREAMBLE guard, so
+/// its block is opened outside the header `loop`, while region B hangs off a
+/// loop-body guard and keeps its block inside it. Both close at LABEL0, so
+/// both leave through the entry dispatch, and each has to reach its own block
+/// from a different nesting depth.
+///
+/// B is listed first because merging is append-only and A's body is emitted
+/// past the `end` of the loop B's body sits inside, so every outside-loop
+/// region trails every inside-loop one.
+///
+///   entry     v1 = in0 + 1
+///   LABEL0    [v1]
+///             v2 = v1 + 1;  guard v2 > 10   -> region A
+///   LABEL1    [v2]                             (loop header)
+///             v3 = v2 + 1;  guard v3 > 6000 -> region B
+///             guard v3 < 100000             -> exit
+///             JUMP -> LABEL1 [v3]
+///   region A  v11 = v10 + 5000;  JUMP -> LABEL0 [v11]
+///   region B  v21 = v20 + 50000; JUMP -> LABEL0 [v21]
+///
+/// A fires once (v2 == 2), B once (v3 == 5004), and the loop then counts up to
+/// its own exit, so the frame reports both regions' arithmetic.
+#[test]
+fn a_preamble_region_and_a_loop_body_region_each_reach_their_own_block() {
+    assert_eq!(run_mixed_region_families_repro(), (100000, 99999, 55004));
+}
+
+fn run_mixed_region_families_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(60, false);
+    let descr1 = majit_ir::make_loop_target_descr(61, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(6),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(6)], &[OpRef::int_op(2)]),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(6000)],
+            OpRef::int_op(7),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(7)], &[OpRef::int_op(3)]),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(5)],
+            &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+        ),
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+    assert!(codegen::source_guard_precedes_loop_label(&ops, 0));
+    assert!(!codegen::source_guard_precedes_loop_label(&ops, 1));
+
+    let region_a_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_a_jump.setdescr(descr0.clone());
+    let region_a = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_a_jump,
+    ];
+    let region_b_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(21))]);
+    region_b_jump.setdescr(descr0);
+    let region_b = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(20), OpRef::const_int(50000)],
+            OpRef::int_op(21),
+        ),
+        region_b_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = inline_region_inputs(
+        &inputargs,
+        ops,
+        vec![
+            codegen::InlinedBridge {
+                source_fail_index: 1,
+                outside_loop: false,
+                trace_id: 2,
+                inputargs: vec![InputArg::from_type(Type::Int, 20)],
+                ops: region_b,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+            codegen::InlinedBridge {
+                source_fail_index: 0,
+                outside_loop: true,
+                trace_id: 1,
+                inputargs: vec![InputArg::from_type(Type::Int, 10)],
+                ops: region_a,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+        ],
+    );
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 2, "the third guard is the one that exits");
+    (slot0, slot1, slot2)
+}
+
+/// A preamble region resumes PAST its target LABEL's resume loader, which
+/// restores that label's captures from slots the fall-through path writes as it
+/// crosses the label — and a fresh entry clears them. A region whose guard
+/// fails BEFORE the label it names has not written them, so the merge is
+/// declined rather than resumed onto cleared slots.
+#[test]
+fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
+    let descr0 = majit_ir::make_loop_target_descr(70, false);
+    let descr1 = majit_ir::make_loop_target_descr(71, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0);
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1.clone());
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(2), OpRef::const_int(10)],
+            OpRef::int_op(6),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(6)], &[OpRef::int_op(2)]),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(5)], &[OpRef::int_op(3)]),
+        jump,
+    ];
+
+    // The region names LABEL1, which sits after the guard it hangs off.
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(descr1);
+    let inputs = inline_region_inputs(
+        &vec![InputArg::from_type(Type::Int, 0)],
+        ops,
+        vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            outside_loop: true,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: vec![
+                make_op(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+                    OpRef::int_op(11),
+                ),
+                region_jump,
+            ],
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+    );
+
+    let error = match codegen::build_wasm_module(&inputs) {
+        Ok(_) => panic!("the region's target LABEL is past its own guard"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("had not crossed"), "{error}");
 }
 
 /// A region closing at the loop HEADER must rebind the header LABEL's Ref arg

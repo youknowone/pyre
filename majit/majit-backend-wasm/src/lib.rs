@@ -220,7 +220,7 @@ fn classify_inline_install_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// Off while the wall-time case is unsettled. See `inline_nonheader_enable`.
+/// Off for the loop-body half of the class. See `inline_nonheader_enable`.
 static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
@@ -343,30 +343,31 @@ fn inline_bridge_enabled() -> bool {
 }
 
 /// Admit a region whose closing JUMP names a resumable LABEL that is not the
-/// loop header. `codegen` emits these by wrapping the entry dispatch in a
-/// `loop` the region branches back into, re-entering past that label's resume
-/// loader with the values already in locals.
+/// loop header AND whose guard sits inside the loop body. Both halves of that
+/// class re-enter the same way — `codegen` wraps the entry dispatch in a `loop`
+/// the region branches back into, landing past the named label's resume loader
+/// with the values already in locals — but they are placed differently and they
+/// measure differently, so only this half is behind the flag.
 ///
-/// The miscompile that first kept this off — 47 `check.py` fixtures dying with
-/// a corrupted Ref — was root-caused to a region attached to a guard in the
-/// peeled preamble, whose branch lands in a LABEL resume loader with the region
-/// body unreachable. `source_in_preamble` declines exactly that case, and with
-/// it in place the synthetic corpus is 437 pass / 1 jit-stats improvement under
-/// this flag, against 438 pass without it. Correctness is no longer the reason.
+/// A region attached to a PREAMBLE guard is admitted unconditionally: the
+/// `loop` holding the body regions' blocks has not been entered there, so
+/// `build_function` opens its blocks outside that loop and emits its body past
+/// the loop's `end`. On `str_getitem_len_hot`, whose bytes and bytearray legs
+/// fail a peeled-preamble GuardClass on every iteration, that removes 72.0M of
+/// 120.0M cross-module crossings and takes exec from 0.985s to 0.716s — 0.73x,
+/// min of 15 interleaved runs with each arm's startup floor subtracted.
+/// `spectral_norm` measures 0.95x and `fannkuch` 0.98x on the same change.
 ///
-/// ⛔ Still off by default, now on wall time rather than on correctness.
-/// `not_header` declines on 81 corpus fixtures and admitting them removes 49.4M
-/// of their 257.3M cross-module crossings — 19.2%, 41 fixtures moved, none the
-/// wrong way. Timed instead of counted (min of 15 interleaved runs, startup
-/// floor subtracted) the same change buys 0.74x on
-/// `short_circuit_value_local_kept` and 0.67x on
-/// `short_circuit_boxed_int_cross_fn`, is flat on most, and costs 1.23x on
-/// `spectral_norm` — which sheds 99.7% of its crossings and still gets slower,
-/// because admitting a region also costs the owner a re-emission and taxes its
-/// fall-through path. Neither fixture that sets the wasm ratio ceiling gains at
-/// all: fannkuch declines every region earlier on `foreign_label` /
-/// `not_direct`, and `str_getitem_len_hot` sheds 24.5k of 120.0M. Defaulting
-/// this on wants an admission rule that tells those two populations apart.
+/// ⛔ The loop-body half stays off, on wall time rather than on correctness.
+/// Admitting it declines nothing on 81 corpus fixtures and removes 49.4M of
+/// their 257.3M crossings — 19.2%, 41 fixtures moved, none the wrong way — and
+/// buys 0.74x on `short_circuit_value_local_kept` and 0.67x on
+/// `short_circuit_boxed_int_cross_fn`. It still costs 1.23x on `spectral_norm`,
+/// which sheds 99.7% of its own crossings and gets slower anyway, because
+/// admitting a region costs the owner a re-emission and taxes its fall-through
+/// path 18 ops on every iteration that does NOT fail the guard. A preamble
+/// guard's region is not on that fall-through, which is why the two halves
+/// separate.
 pub fn inline_nonheader_enable() {
     INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
 }
@@ -3466,19 +3467,20 @@ impl majit_backend::Backend for WasmBackend {
                 // owner's loop instead of the loop the bridge meant.
                 diag_bump(51);
                 decline("foreign_label");
-            } else if !resumes_at_loop_header && !inline_nonheader_enabled() {
-                // Resuming at the header lets the region `br` straight to the
-                // `loop`. Resuming at an earlier LABEL goes through the
-                // `loop`-wrapped dispatch, which is correct but opt-in
-                // (`inline_nonheader_enable`) until it is worth its re-emission.
-                diag_bump(38);
-                decline("not_header");
             } else if let Some(mut candidate) = original_token
                 .compiled
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .and_then(|loop_| loop_.reemit.borrow().as_ref().cloned())
             {
+                // A guard in the peeled preamble cannot reach the loop-body
+                // region blocks: the `loop` holding them has not been entered
+                // there. `build_function` gives that class blocks of its own
+                // outside the loop, and a body past the loop's `end` that only
+                // the entry dispatch re-enters — so the header question below
+                // is not asked of it.
+                let source_in_preamble =
+                    codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index);
                 if candidate
                     .inlined_bridges
                     .iter()
@@ -3489,20 +3491,35 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
-                } else if codegen::inline_source_guard_precedes_loop_label(
-                    &candidate,
-                    source_fail_index,
-                ) {
-                    // The guard is in the peeled preamble, which the `loop`
-                    // holding the region blocks has not been entered from, so
-                    // its branch would land in a LABEL resume loader and the
-                    // region body would be unreachable.
-                    diag_bump(52);
-                    decline("source_in_preamble");
+                } else if !resumes_at_loop_header
+                    && !source_in_preamble
+                    && !inline_nonheader_enabled()
+                {
+                    // Resuming at the header lets a region inside the `loop`
+                    // `br` straight to it. Resuming at an earlier LABEL from
+                    // there goes through the `loop`-wrapped dispatch, which is
+                    // correct but opt-in (`inline_nonheader_enable`) until it is
+                    // worth its re-emission.
+                    diag_bump(38);
+                    decline("not_header");
                 } else {
+                    // Merging is append-only, so once one region takes the
+                    // outside-the-loop placement every later one must too: its
+                    // ops are the tail of the merged stream, and splicing an
+                    // inside-loop region ahead of them would renumber the exits
+                    // their sub-bridges' dispatch cells are keyed by. A
+                    // loop-body guard can branch out to that placement, so this
+                    // costs the later region its `br` to the header and not the
+                    // merge.
+                    let outside_loop = source_in_preamble
+                        || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+                    if outside_loop {
+                        diag_bump(52);
+                    }
                     self.collect_constants_from_ops(ops);
                     candidate.inlined_bridges.push(codegen::InlinedBridge {
                         source_fail_index,
+                        outside_loop,
                         trace_id: self.trace_counter,
                         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                         ops: ops_owned.clone(),

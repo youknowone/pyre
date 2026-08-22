@@ -2261,6 +2261,16 @@ pub struct ModuleBuildInputs {
 pub struct InlinedBridge {
     /// Per-trace fail index of the guard that enters this region.
     pub source_fail_index: u32,
+    /// Emit this region's block outside the header `loop` and its body past
+    /// that loop's `end`, rather than inside it.
+    ///
+    /// Forced when the source guard is in the peeled preamble, which has not
+    /// entered the loop the inside blocks are opened in. It is also the only
+    /// placement left to a region attaching AFTER one of those, because merging
+    /// is append-only: an outside region's ops are the tail of the merged
+    /// stream, and splicing anything ahead of them would renumber the exits its
+    /// own sub-bridges' dispatch cells are keyed by.
+    pub outside_loop: bool,
     pub trace_id: u64,
     pub inputargs: Vec<InputArg>,
     pub ops: Vec<Op>,
@@ -2285,42 +2295,40 @@ pub fn merged_stream_has_loop_label(inputs: &ModuleBuildInputs) -> bool {
     find_loop_label_index(&ops).is_some_and(|label_idx| label_idx < inputs.ops.len())
 }
 
-/// Whether the guard a region would attach to sits in the owner's peeled
-/// preamble, ahead of the loop header LABEL.
+/// Whether the guard at exit ordinal `fail_index` sits in the peeled preamble,
+/// ahead of the loop header LABEL.
 ///
-/// `InlineGuard::branch_depth` is a depth at loop-body statement level, where
-/// the per-region blocks are the innermost ones open. The preamble has not
-/// entered the `loop` those blocks are opened in; its innermost blocks are the
-/// LABEL resume pairs, so the same depth names a resume loader and the region
-/// body stays unreachable. Such a bridge must keep the out-of-line path.
+/// A region attaching to such a guard cannot take the loop-body placement: its
+/// block would be opened inside the `loop` the preamble has not entered.
+/// `build_function` gives this class its own blocks outside that loop and
+/// emits their bodies after it closes, which is why the ordinal decides the
+/// emission order of the merged stream.
 ///
 /// `fail_index` is the exit ordinal within the owner's own stream — the
-/// numbering `collect_guards_and_vars` assigns and `InlinedBridge`
-/// records as `source_fail_index`.
-pub fn inline_source_guard_precedes_loop_label(
-    inputs: &ModuleBuildInputs,
-    fail_index: u32,
-) -> bool {
-    let Some(label_idx) = find_loop_label_index(&inputs.ops) else {
-        return false;
-    };
-    let mut exit_ordinal = 0u32;
-    for (pos, op) in inputs.ops.iter().enumerate() {
-        if !op.opcode.is_guard() && op.opcode != OpCode::Finish {
-            continue;
-        }
-        if exit_ordinal == fail_index {
-            return pos < label_idx;
-        }
-        exit_ordinal += 1;
+/// numbering `collect_guards_and_vars` assigns and `InlinedBridge` records as
+/// `source_fail_index`. The merged stream appends every region after the
+/// owner, so the same ordinal reads the same guard there.
+pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
+    match (exit_op_index(ops, fail_index), find_loop_label_index(ops)) {
+        (Some(pos), Some(label_idx)) => pos < label_idx,
+        _ => false,
     }
-    false
+}
+
+/// Position in `ops` of the exit with ordinal `fail_index`.
+fn exit_op_index(ops: &[Op], fail_index: u32) -> Option<usize> {
+    ops.iter()
+        .enumerate()
+        .filter(|(_, op)| op.opcode.is_guard() || op.opcode == OpCode::Finish)
+        .nth(fail_index as usize)
+        .map(|(pos, _)| pos)
 }
 
 impl Clone for InlinedBridge {
     fn clone(&self) -> Self {
         Self {
             source_fail_index: self.source_fail_index,
+            outside_loop: self.outside_loop,
             trace_id: self.trace_id,
             inputargs: self
                 .inputargs
@@ -2476,6 +2484,7 @@ fn rebase_region_value_ids(
     Ok((
         InlinedBridge {
             source_fail_index: bridge.source_fail_index,
+            outside_loop: bridge.outside_loop,
             trace_id: bridge.trace_id,
             inputargs,
             ops,
@@ -3194,16 +3203,81 @@ fn build_function(
             "wasm backend: inlined bridge operations are not contained in the merged stream".into(),
         )
     })?;
+    // `InlinedBridge::outside_loop` names the placement. The outside ones are
+    // emitted past the header `loop`'s `end`, so their ops are the tail of the
+    // merged stream and every inside one has to precede them.
+    let body_region_count = inlined_bridges
+        .iter()
+        .position(|bridge| bridge.outside_loop)
+        .unwrap_or(inlined_bridges.len());
+    let outside_region_count = inlined_bridges.len() - body_region_count;
+    if inlined_bridges[body_region_count..]
+        .iter()
+        .any(|bridge| !bridge.outside_loop)
+    {
+        return Err(BackendError::Unsupported(
+            "wasm backend: an inside-loop inline region follows an outside-loop one".into(),
+        ));
+    }
+    if inlined_bridges.iter().any(|bridge| {
+        !bridge.outside_loop && source_guard_precedes_loop_label(ops, bridge.source_fail_index)
+    }) {
+        return Err(BackendError::Unsupported(
+            "wasm backend: a preamble-sourced inline region is placed inside the loop".into(),
+        ));
+    }
+    let outside_start = bridge_start
+        + inlined_bridges[..body_region_count]
+            .iter()
+            .map(|bridge| bridge.ops.len())
+            .sum::<usize>();
+    if outside_region_count > 0 && !key_dispatch {
+        return Err(BackendError::Unsupported(
+            "wasm backend: an outside-loop inline region needs an entry dispatch".into(),
+        ));
+    }
+    // An outside-loop region re-enters PAST its target LABEL's resume loader,
+    // so it takes that label's captures from the frame slots the fall-through
+    // path writes as it crosses the label — and a fresh entry clears them. A
+    // region reached from the loop body has crossed every resumable label by
+    // then; one reached from the preamble has only crossed the labels ahead of
+    // its own guard.
+    {
+        let mut start = outside_start;
+        for bridge in &inlined_bridges[body_region_count..] {
+            let guard_pos = exit_op_index(ops, bridge.source_fail_index).ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge source guard is outside the owner stream".into(),
+                )
+            })?;
+            for op in &ops[start..start + bridge.ops.len()] {
+                if op.opcode != OpCode::Jump {
+                    continue;
+                }
+                if find_jump_target_label_index(ops, op).is_none_or(|idx| idx >= guard_pos) {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: an outside-loop inline region closes at a LABEL its \
+                         own entry path had not crossed"
+                            .into(),
+                    ));
+                }
+            }
+            start += bridge.ops.len();
+        }
+    }
     // A region whose closing JUMP names a resumable LABEL other than the header
     // cannot `br` to the `loop`. Wrap the dispatch in a `loop` such a region
     // re-enters through instead, and give the entry `br_table` a second bucket
     // per label: key `num_labels + 1 + j` lands PAST label j's resume loader,
     // so the region hands its values over in locals rather than through the
-    // frame slots the loader reads.
+    // frame slots the loader reads. A preamble-sourced region always leaves by
+    // that route: it is emitted past the `end` of the header `loop`, so no `br`
+    // reaches it.
     let resume_dispatch = key_dispatch
-        && ops[bridge_start..].iter().any(|op| {
-            op.opcode == OpCode::Jump && jump_resume_ordinal(ops, op, num_labels).is_some()
-        });
+        && (outside_region_count > 0
+            || ops[bridge_start..].iter().any(|op| {
+                op.opcode == OpCode::Jump && jump_resume_ordinal(ops, op, num_labels).is_some()
+            }));
 
     // Value locals occupy the dense local range beginning at 1; reserve
     // `UMULHI_SCRATCH` i64 locals past them for the `UintMulHigh`
@@ -3252,10 +3326,15 @@ fn build_function(
         .map(|(region, bridge)| InlineGuard {
             guard_idx: fail_index_base + bridge.source_fail_index,
             inputargs: &bridge.inputargs,
-            // Blocks open in reverse attach order, making region 0 innermost.
-            // This is the target depth at statement level; the guard `if`
-            // contributes the final +1 in `emit_guard_if_exit`.
-            branch_depth: region as u32,
+            // Blocks open in reverse attach order, making region 0 of each
+            // family innermost. The guard `if` contributes the final +1 in
+            // `emit_guard_if_exit`.
+            branch_depth: if region < body_region_count {
+                region as u32
+            } else {
+                (region - body_region_count) as u32
+            },
+            outside_loop: region >= body_region_count,
         })
         .collect();
     let guard_dispatch = BridgeDispatch {
@@ -3265,6 +3344,7 @@ fn build_function(
         enabled: bridge_dispatch,
         param_type_indices: bridge_param_type_indices,
         inline_guards: &inline_guards,
+        outside_region_base: 0,
         ref_homes,
         frame,
     };
@@ -3357,6 +3437,13 @@ fn build_function(
             emit_trace_entry_census(&mut sink, census, bridge_slot_local, Some(resume_key_local));
         }
         sink.loop_(BlockType::Empty); // R $resume
+        // One block per preamble-sourced region, outside the (B_j, C_j) label
+        // pairs and outside the header `loop`, so a guard anywhere in the
+        // function can `br` to it. Region 0 is innermost, matching the order
+        // the `end`s below close them in.
+        for _ in 0..outside_region_count {
+            sink.block(BlockType::Empty); // P_k
+        }
     }
     if key_dispatch {
         // Per resumable label j (opened outermost = the loop header):
@@ -3567,7 +3654,7 @@ fn build_function(
         }
         if Some(op_idx) == loop_label_idx {
             sink.loop_(BlockType::Empty);
-            for _ in inlined_bridges.iter().rev() {
+            for _ in 0..body_region_count {
                 sink.block(BlockType::Empty);
             }
             in_loop_body = true;
@@ -3575,71 +3662,94 @@ fn build_function(
         // The loop's normal body ends with its JUMP, which branches around all
         // regions. Closing one block before each attached region makes its
         // body reachable only from the guard that branched to that block.
-        let mut started_bridge_regions = 0usize;
-        if in_loop_body && op_idx >= bridge_start {
+        // Preamble-sourced regions follow the body-sourced ones, and the header
+        // `loop` closes before the first of them: their blocks were opened
+        // outside it, so their bodies cannot be emitted inside it.
+        let in_outside_region = outside_region_count > 0 && op_idx >= outside_start;
+        let mut started_body_regions = 0usize;
+        let mut started_outside_regions = 0usize;
+        if has_loop && op_idx >= bridge_start {
             let mut start = bridge_start;
-            for bridge in inlined_bridges {
+            for (region, bridge) in inlined_bridges.iter().enumerate() {
+                let outside_placed = region >= body_region_count;
                 if op_idx == start {
+                    if outside_placed && in_loop_body {
+                        // A well-formed body ends in a branch, so this return
+                        // is unreachable; emit it anyway so a malformed one
+                        // cannot walk out of the loop into a region body.
+                        sink.local_get(0);
+                        sink.return_();
+                        sink.end(); // end loop
+                        in_loop_body = false;
+                    }
                     sink.end();
                 }
                 if op_idx >= start {
-                    started_bridge_regions += 1;
+                    if outside_placed {
+                        started_outside_regions += 1;
+                    } else {
+                        started_body_regions += 1;
+                    }
                 }
                 start += bridge.ops.len();
             }
         }
-        // The blocks opened at the loop LABEL are closed once at the start of
-        // each appended region.  Compute the remaining nesting directly from
-        // this operation's position, so a label-less stream cannot close a
-        // block that was never opened.
-        let open_bridge_blocks = if in_loop_body {
-            let remaining = inlined_bridges
-                .len()
-                .checked_sub(started_bridge_regions)
-                .ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm backend: inlined bridge region bookkeeping exceeded its open blocks"
-                            .into(),
-                    )
-                })?;
+        // Compute the remaining nesting directly from this operation's
+        // position, so a label-less stream cannot close a block that was never
+        // opened. The body blocks exist only inside the `loop`; the preamble
+        // ones are open from the resume `loop` to the end of the function.
+        let open_region_blocks = |opened: usize, total: usize| -> Result<u32, BackendError> {
+            let remaining = total.checked_sub(opened).ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge region bookkeeping exceeded its open blocks"
+                        .into(),
+                )
+            })?;
             u32::try_from(remaining).map_err(|_| {
                 BackendError::Unsupported(
                     "wasm backend: too many inlined bridge regions for wasm branch depth".into(),
                 )
-            })?
+            })
+        };
+        let open_bridge_blocks = if in_loop_body {
+            open_region_blocks(started_body_regions, body_region_count)?
         } else {
             0
         };
+        let open_outside_blocks =
+            open_region_blocks(started_outside_regions, outside_region_count)?;
         // Depth (from statement level) of the enclosing `block` that guard
-        // exits `br` to. Without `key_dispatch`: preamble = 0, loop body = 1
-        // (the `loop` sits between the body and block A). With `key_dispatch`
-        // a segment that still has `num_labels - labels_passed` labels ahead
-        // sits inside that many (B_j, C_j) pairs, so it br's to depth
-        // `2 * remaining`; the body is unchanged at 1 (every pair closes
-        // before the loop). Straight-line traces use the universal hot exit
-        // block at depth 0.
-        let block_exit_depth = match (has_loop, in_loop_body) {
-            (false, _) => {
-                if open_bridge_blocks != 0 {
-                    return Err(BackendError::Unsupported(
-                        "wasm backend: inlined bridge regions require a local loop LABEL".into(),
-                    ));
-                }
-                0u32
+        // exits `br` to, counted outward from this operation: the
+        // (B_j, C_j) pairs a preamble segment still sits inside, the header
+        // `loop`, the region blocks open here, the resume `loop`, and block A.
+        // Without `key_dispatch` the preamble is at 0, and a straight-line
+        // trace uses the universal hot exit block at 0.
+        let block_exit_depth = if !has_loop {
+            if open_bridge_blocks + open_outside_blocks != 0 {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: inlined bridge regions require a local loop LABEL".into(),
+                ));
             }
-            (true, false) => {
-                if open_bridge_blocks != 0 {
-                    return Err(BackendError::Unsupported(
-                        "wasm backend: inlined bridge region opened before its loop LABEL".into(),
-                    ));
-                }
-                if key_dispatch {
-                    2 * (num_labels - labels_passed) as u32 + u32::from(resume_dispatch)
-                } else {
-                    0u32
-                }
-            }
-            (true, true) => 1u32 + open_bridge_blocks + u32::from(resume_dispatch),
+            0u32
+        } else {
+            let label_blocks = if key_dispatch && !in_loop_body {
+                2 * (num_labels - labels_passed) as u32
+            } else {
+                0
+            };
+            label_blocks
+                + u32::from(in_loop_body)
+                + open_bridge_blocks
+                + open_outside_blocks
+                + u32::from(resume_dispatch)
+        };
+        // A region's block, from this operation's statement level. Region 0 is
+        // the innermost of each family, so the ordinal adds to the base.
+        let outside_region_base =
+            block_exit_depth - open_outside_blocks - u32::from(resume_dispatch);
+        let guard_dispatch = BridgeDispatch {
+            outside_region_base,
+            ..guard_dispatch
         };
         // The guard whose condition the previous op already pushed and tested.
         // `block_exit_depth` is unchanged across the pair: only a LABEL moves
@@ -3797,15 +3907,31 @@ fn build_function(
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                     }
                 }
-                match resume_dispatch
-                    .then(|| jump_resume_ordinal(ops, op, num_labels))
-                    .flatten()
-                {
-                    // A region closing at a non-header LABEL re-enters the
-                    // dispatch at the key that lands past that label's resume
-                    // loader: the parallel move above already left the label
-                    // args in their locals, so none of them goes through a
-                    // frame slot. The captures still take the loader's restore.
+                // A region closing at a LABEL it has no `br` to re-enters the
+                // dispatch at the key that lands past that label's resume
+                // loader: the parallel move above already left the label args
+                // in their locals, so none of them goes through a frame slot.
+                // The captures still take the loader's restore. A preamble
+                // region sits past the `end` of the header `loop`, so it leaves
+                // that way even when it names the header itself.
+                let resume_at = if !resume_dispatch {
+                    None
+                } else if in_outside_region {
+                    Some(
+                        jump_label_ordinal(ops, op)
+                            .filter(|&j| j < num_labels)
+                            .ok_or_else(|| {
+                                BackendError::Unsupported(
+                                    "wasm backend: an outside-loop inline region closes at \
+                                     no resumable LABEL"
+                                        .into(),
+                                )
+                            })?,
+                    )
+                } else {
+                    jump_resume_ordinal(ops, op, num_labels)
+                };
+                match resume_at {
                     Some(j) => {
                         emit_label_capture_restore(
                             &mut sink,
@@ -3817,7 +3943,7 @@ fn build_function(
                         );
                         sink.i32_const((num_labels + 1 + j) as i32);
                         sink.local_set(resume_key_local);
-                        sink.br(open_bridge_blocks + 1);
+                        sink.br(block_exit_depth - 1);
                     }
                     None => {
                         sink.br(open_bridge_blocks);
@@ -6345,7 +6471,7 @@ fn build_function(
         }
     }
 
-    if has_loop {
+    if in_loop_body {
         sink.end(); // end loop
     }
     if resume_dispatch {
@@ -6579,12 +6705,20 @@ pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
 /// `br` target: the `loop` opens at the header, so branching there would skip
 /// the segment between label `j` and the header.
 fn jump_resume_ordinal(ops: &[Op], jump: &Op, num_labels: usize) -> Option<usize> {
-    let label_idx = find_jump_target_label_index(ops, jump)?;
-    let ordinal = ops[..label_idx]
-        .iter()
-        .filter(|op| op.opcode == OpCode::Label)
-        .count();
+    let ordinal = jump_label_ordinal(ops, jump)?;
     (ordinal + 1 < num_labels).then_some(ordinal)
+}
+
+/// Ordinal of the LABEL a JUMP names among this stream's LABELs. `None` when
+/// the JUMP names no local label at all.
+fn jump_label_ordinal(ops: &[Op], jump: &Op) -> Option<usize> {
+    let label_idx = find_jump_target_label_index(ops, jump)?;
+    Some(
+        ops[..label_idx]
+            .iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .count(),
+    )
 }
 
 fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
@@ -6862,7 +6996,12 @@ fn emit_array_addr(
 struct InlineGuard<'a> {
     guard_idx: u32,
     inputargs: &'a [InputArg],
+    /// Ordinal within this region's family of blocks, region 0 innermost. For a
+    /// body region that is already the branch depth at loop-body statement
+    /// level; a preamble region adds `BridgeDispatch::outside_region_base`,
+    /// which depends on where the branching guard sits.
     branch_depth: u32,
+    outside_loop: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -6875,6 +7014,9 @@ struct BridgeDispatch<'a> {
     /// signature carries values as i64, including Float bit patterns.
     param_type_indices: &'a indexmap::IndexMap<usize, u32>,
     inline_guards: &'a [InlineGuard<'a>],
+    /// Depth of the innermost still-open preamble-region block, at the
+    /// statement level of the operation being emitted.
+    outside_region_base: u32,
     ref_homes: &'a RefHomes,
     frame: FrameGeometry,
 }
@@ -7061,7 +7203,12 @@ fn emit_guard_exit(
         );
         // The target depth is measured outside this failing `if`; include the
         // `if` itself before selecting the enclosing bridge block.
-        sink.br(inline.branch_depth + 1);
+        let depth = if inline.outside_loop {
+            dispatch.outside_region_base + inline.branch_depth
+        } else {
+            inline.branch_depth
+        };
+        sink.br(depth + 1);
         return;
     }
     if dispatch.param_type_indices.is_empty() {
