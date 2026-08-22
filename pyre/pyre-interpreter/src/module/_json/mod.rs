@@ -84,7 +84,11 @@ fn encode_basestring_impl(obj: PyObjectRef, ascii_only: bool) -> PyResult {
 
 fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyResult {
     let value = require_string(doc)?;
-    if end < 0 {
+    // `py_scanstring` bounds `end` against the code point count before using
+    // it.  `w_str_index_to_byte` takes an index in range, so the upper bound
+    // is the caller's to check; a count equal to `end` is the empty tail,
+    // which `scan_string` reports as an unterminated string.
+    if end < 0 || end as usize > unsafe { pyre_object::w_str_len(doc) } {
         return Err(PyError::value_error("end is out of bounds"));
     }
     let strict = crate::baseobjspace::is_true(strict_obj)?;
@@ -589,10 +593,12 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
         return Err(PyError::value_error("idx cannot be negative"));
     }
     let char_index = index as usize;
-    let byte_index = unsafe { pyre_object::w_str_index_to_byte(doc, char_index) };
-    if byte_index >= unsafe { pyre_object::w_str_get_wtf8(doc) }.len() {
+    // `scanner_call` compares the index against the code point count, and it
+    // has to be this way round: `w_str_index_to_byte` takes an index in range.
+    if char_index >= unsafe { pyre_object::w_str_len(doc) } {
         return Err(stop_iteration(index));
     }
+    let byte_index = unsafe { pyre_object::w_str_index_to_byte(doc, char_index) };
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
     for value in [self_obj, doc] {
