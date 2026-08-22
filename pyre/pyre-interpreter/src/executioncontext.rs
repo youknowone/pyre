@@ -1,5 +1,6 @@
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PyFrame;
 
@@ -213,7 +214,23 @@ impl WRootFinalizerQueue {
     }
 }
 
+/// How many times the collector has run the death-queue trigger below.
+///
+/// The collector skips a queue whose deque is empty
+/// (`majit-gc` `Collector::execute_finalizer_triggers`), so a collection bumps
+/// this exactly when that collection put something finalizable on the queue.
+/// Reading it either side of a collection is therefore the collector's own
+/// answer to "did that sweep find anything to finalize", which is why the
+/// drain it feeds keeps its upstream shape and reports nothing.
+static FINALIZER_TRIGGER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Read [`FINALIZER_TRIGGER_COUNT`].
+pub fn finalizer_trigger_count() -> usize {
+    FINALIZER_TRIGGER_COUNT.load(Ordering::Relaxed)
+}
+
 fn finalizer_queue_trigger() {
+    FINALIZER_TRIGGER_COUNT.fetch_add(1, Ordering::Relaxed);
     let action = space_user_del_action();
     if !action.is_null() {
         unsafe { (*action).fire() };
@@ -907,10 +924,11 @@ impl ExecutionContext {
         Ok(anchor.live())
     }
 
-    /// Returns whether any queued finalizer was taken; see [`UserDelAction::_run_finalizers`].
-    pub fn _run_finalizers_now(&mut self) -> bool {
+    pub fn _run_finalizers_now(&mut self) {
         let action = space_user_del_action();
-        !action.is_null() && unsafe { (*action)._run_finalizers() }
+        if !action.is_null() {
+            unsafe { (*action)._run_finalizers() };
+        }
     }
 
     /// gh-142766 compatibility for `generator.close()`: once the close path
@@ -2582,11 +2600,7 @@ impl UserDelAction {
     /// `self.space.finalizer_queue` is read via the local
     /// `self.finalizer_queue` field (see struct doc for
     /// TODO).
-    /// Returns whether the queue held anything, i.e. whether running it could
-    /// have changed the heap. A caller that swept the heap to fill this queue
-    /// learns from `false` that the sweep found nothing to finalize.
-    pub fn _run_finalizers(&mut self) -> bool {
-        let mut ran = false;
+    pub fn _run_finalizers(&mut self) {
         loop {
             let w_obj = self.finalizer_queue.next_dead();
             match w_obj {
@@ -2596,11 +2610,9 @@ impl UserDelAction {
                     let _roots = pyre_object::gc_roots::push_roots();
                     pyre_object::gc_roots::pin_root(w);
                     self._call_finalizer(w);
-                    ran = true;
                 }
             }
         }
-        ran
     }
 
     /// Defer the reachability pass until the next opcode boundary.  Calling

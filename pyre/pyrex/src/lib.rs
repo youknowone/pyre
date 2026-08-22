@@ -1288,10 +1288,19 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
 /// whether anything was. `false` says the heap held no unreachable finalizer at
 /// this point, so a caller that has changed nothing since can skip its next
 /// sweep: that one would walk the same heap to the same empty queue.
+///
+/// The answer comes from the collector rather than from the drain: a sweep runs
+/// the death-queue trigger only for a queue it has just put something in, so a
+/// bumped `finalizer_trigger_count` is that sweep reporting what it found.
 fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) -> bool {
+    let triggers_before = pyre_interpreter::executioncontext::finalizer_trigger_count();
     pyre_object::gc_hook::try_gc_collect();
-    !ec_ptr.is_null()
-        && unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() }
+    let made_finalizable =
+        pyre_interpreter::executioncontext::finalizer_trigger_count() != triggers_before;
+    if !ec_ptr.is_null() {
+        unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() };
+    }
+    made_finalizable
 }
 
 /// Whether releasing this binding can remove anything from the reachable set,
