@@ -26,20 +26,23 @@ static ROOTED_SLOTS: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(V
 
 /// Keep an object this module will go on naming by address.
 ///
-/// Everything stashed below is an ordinary mortal GC object reached through a
-/// module attribute, and old-gen is mark-sweep: not moving is not staying
-/// alive.  Rebinding the attribute, or dropping the module, lets the sweep
-/// reclaim the object while the stash still hands its address out — and the
-/// collector traces neither the stash nor anything that would keep the object
-/// on its account.  [`simple_weak_set_type`] would then name freed memory, and
-/// the identity comparison could match an address the allocator has since
-/// handed to something else.  Registering the address in a stable slot is what
-/// buys survival, the `_structseq.rs` `root_structseq_type` idiom.
+/// [`simple_weak_set_type`] hands out an address the caller dereferences, and
+/// old-gen is mark-sweep: not moving is not staying alive.  Rebinding the
+/// module attribute, or dropping the module, lets the sweep reclaim the type
+/// while the stash still names it — the collector traces neither the stash nor
+/// anything that would keep the object on its account.  Registering the address
+/// in a stable slot is what buys survival, the `_structseq.rs`
+/// `root_structseq_type` idiom.
 ///
-/// The stashes stay plain addresses rather than reads of these slots.  Types,
-/// functions and code objects are all born outside the nursery, so no walker
-/// rewrites a slot naming one and a read back through the root would return
-/// the same bits; only list and dict headers move.
+/// Used only where the object must genuinely outlive its last Python
+/// reference: the class itself, and the weak references in
+/// [`SIMPLE_WEAK_SET_CONTAINS`], which retain nothing of what they name.  The
+/// bodies those references identify are deliberately not rooted.
+///
+/// The stashes stay plain addresses rather than reads of these slots.  Types
+/// and weak references are born outside the nursery, so no walker rewrites a
+/// slot naming one and a read back through the root would return the same bits;
+/// only list and dict headers move.
 fn root_forever(obj: PyObjectRef) {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
@@ -82,8 +85,61 @@ fn simple_weak_set_type() -> PyObjectRef {
 /// `__globals__["TypeError"]` moves it off `0` and the comparison declines,
 /// which is the mutation this guards.  Rebinding `builtins.TypeError` itself is
 /// a process-wide change this does not pretend to cover.
-static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize, usize, usize)> =
-    std::sync::OnceLock::new();
+///
+/// What is stored is not those four addresses but a weak reference to each,
+/// [`weak_lifeline`], read back through [`installed_contains_identity`].  A
+/// strong stash would answer the address question by making the object
+/// immortal: rebinding `__contains__` and dropping the last reference to the
+/// old function would still leave it, its code and the module dict its
+/// `__globals__` names alive for the life of the process.  Weakly, a dead
+/// referent reads as "the body is gone", which is the same answer the
+/// comparison wanted, and a live one cannot have had its address reused.
+///
+/// This buys hygiene rather than a behaviour, and the difference is worth
+/// stating: a `__contains__` that is replaced and dropped stays reachable here
+/// and on the reference build alike — measured, still alive after seven full
+/// collections — because a method-cache slot goes on naming it.  What the weak
+/// stash avoids is the one retention no eviction can undo, a root that is
+/// permanent by construction.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
+
+/// A weak reference to `obj`, kept by a root of its own.
+///
+/// Rooting the reference does not root its referent — that is the whole point —
+/// so the address stays readable while the object lives without the stash being
+/// the reason it lives.
+fn weak_lifeline(obj: PyObjectRef) -> Option<usize> {
+    let lifeline = crate::module::_weakref::interp__weakref::descr__new__weakref(
+        crate::module::_weakref::interp__weakref::weakref_type(),
+        &[obj],
+    )
+    .ok()?;
+    root_forever(lifeline);
+    Some(lifeline as usize)
+}
+
+/// The identity [`SIMPLE_WEAK_SET_CONTAINS`] recorded, as addresses again.
+///
+/// `None` once any referent has died, because an object the class no longer
+/// holds cannot be the body a membership test would reach.  A `0` entry is a
+/// word that was absent at install time — the `TypeError` shadow — and stays
+/// absent here rather than becoming a dead reference.
+fn installed_contains_identity() -> Option<(usize, usize, usize, usize)> {
+    let lifelines = SIMPLE_WEAK_SET_CONTAINS.get()?;
+    let mut words = [0usize; 4];
+    for (word, &lifeline) in words.iter_mut().zip(lifelines.iter()) {
+        if lifeline == 0 {
+            continue;
+        }
+        let referent =
+            crate::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
+        if referent.is_null() {
+            return None;
+        }
+        *word = referent as usize;
+    }
+    Some((words[0], words[1], words[2], words[3]))
+}
 
 /// The installed `__contains__`, the code object it currently holds and its two
 /// globals, as the tuple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything that is
@@ -170,7 +226,7 @@ fn simple_weak_set_contains(
     // rebinding either global its body resolves — the `ref` it calls, the
     // `TypeError` it catches — each leaves every instance an exact
     // `SimpleWeakSet` while changing what a membership test answers.
-    let Some(&installed) = SIMPLE_WEAK_SET_CONTAINS.get() else {
+    let Some(installed) = installed_contains_identity() else {
         return Ok(None);
     };
     if simple_weak_set_contains_identity() != installed {
@@ -889,17 +945,34 @@ crate::py_module! {
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
         let installed = simple_weak_set_contains_identity();
         if installed != (0, 0, 0, 0) {
-            // Each word is an address the comparison keeps naming, so each has
-            // to outlive the stash for a match to mean the body is unchanged
-            // rather than that the allocator reused the address.  The
+            // Each word is an address the comparison keeps naming, so a match
+            // has to mean the object is still the one installed rather than
+            // that the allocator reused its address.  A weak reference settles
+            // that without also deciding how long the object lives.  The
             // `TypeError` word is `0` unless a module entry shadows the
-            // builtin, and zero names nothing.
-            for word in [installed.0, installed.1, installed.2, installed.3] {
-                if word != 0 {
-                    root_forever(word as PyObjectRef);
-                }
+            // builtin, and zero names nothing to reference.
+            let mut lifelines = [0usize; 4];
+            let installed_words = [installed.0, installed.1, installed.2, installed.3];
+            let recorded = lifelines
+                .iter_mut()
+                .zip(installed_words)
+                .all(|(lifeline, word)| {
+                    if word == 0 {
+                        return true;
+                    }
+                    match weak_lifeline(word as PyObjectRef) {
+                        Some(recorded) => {
+                            *lifeline = recorded;
+                            true
+                        }
+                        None => false,
+                    }
+                });
+            // A referent that refuses a weak reference leaves nothing to
+            // compare against later, so the fast path simply never installs.
+            if recorded {
+                let _ = SIMPLE_WEAK_SET_CONTAINS.set(lifelines);
             }
-            let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
         }
     },
 }
