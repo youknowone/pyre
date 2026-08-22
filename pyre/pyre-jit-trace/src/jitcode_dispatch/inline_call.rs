@@ -2928,7 +2928,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
-            bool_box_truth_reset();
             return Ok(None);
         }
         Err(error) => {

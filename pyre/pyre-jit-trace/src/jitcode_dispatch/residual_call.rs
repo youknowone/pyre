@@ -945,31 +945,14 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
                     ConcreteValue::Ref(value) => Some(value as i64),
                     _ => None,
                 });
-        // The dead-`box_bool` marker writes a comparison's RAW TRUTH Int
-        // straight into the Ref register rather than boxing it, on
-        // `compare_box_provably_dead`'s proof that no GUARD RESUME snapshot can
-        // observe the slot.  This bank copy is not a guard resume: the
-        // blackhole runs forward from a post-step pc, and the very next opcode
-        // is the `is_true` that reads exactly this color.  Neither arm above
-        // can represent an Int in a Ref bank, so the color would be skipped and
-        // the blackhole would read NULL — `is_true(NULL)` is false, which sends
-        // a `while` straight to its exit arm and drops every remaining
-        // iteration.  The truth value is known, so materialize the immortal
-        // singleton the box would have produced and keep the image exact.
-        //
-        // The marker is recognisable because its sites record the truth against
-        // ITSELF; a genuinely boxed bool records a distinct `boxed` key and its
-        // concrete is a Ref, so it is already served by `forwarded`.
-        let from_bool_marker = opref
-            .filter(|&value| value != OpRef::NONE)
-            .filter(|&value| bool_box_truth_lookup(value) == Some(value))
-            .and_then(|value| match ctx.trace_ctx.lookup_opref_concrete(value) {
-                Some(majit_ir::Value::Int(truth)) => {
-                    Some(pyre_object::w_bool_from(truth != 0) as i64)
-                }
-                _ => None,
-            });
-        if let Some(value) = forwarded.or(from_shadow).or(from_bool_marker) {
+        // Every bool a comparison leaves in a Ref register is now a real Ref —
+        // either the `space.newbool` singleton behind its truth guard or the
+        // residual box — so `forwarded` reads it directly.  A raw-truth Int was
+        // once written into this bank as a dead-box marker, which neither arm
+        // above can represent; the color was skipped and the blackhole read
+        // NULL, and `is_true(NULL)` is false, sending a `while` straight to its
+        // exit arm and dropping every remaining iteration.
+        if let Some(value) = forwarded.or(from_shadow) {
             miframe.ref_values[color] = Some(value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
@@ -4777,8 +4760,7 @@ pub(crate) fn residual_call_is_exception_match(
 /// Such an operand's `__bool__` is `int`'s or `bool`'s, so the call reads a
 /// field and returns an int: it commits nothing a replay could double.  That is
 /// the same argument the `replay_safe_read` set is built on, and it holds
-/// whether or not the walk-time folds
-/// (`bool_box_truth_lookup`, `try_walker_specialize_truth_int`,
+/// whether or not the walk-time folds (`try_walker_specialize_truth_int`,
 /// `try_walker_specialize_truth_bool`) erase the residual.
 ///
 /// `iRd>i`: the funcbox int operand, then the R-list (length byte, then one
@@ -5604,23 +5586,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // recording `CALL_MAY_FORCE_*`.
     do_jit_force_virtual_guard(ei, op.pc)?;
 
-    // #62: `is_true(box_bool(t))` -> `t` fold.  A `POP_JUMP_IF_*` lowers to an
-    // `is_true` residual (`residual_call_r_i`, Int result) whose sole Ref arg
-    // is the boxed bool a preceding COMPARE specialization produced.  Folding
-    // it to the raw truth Int elides the may-force unbox (and lets the dead box
-    // + value-stack store DCE), matching the retired MIFrame path's
-    // branch-on-raw-compare behaviour. bool->int is value-preserving so the fold is sound. The
-    // lookup is read-only (it does not remove the entry); OpRef SSA-uniqueness
-    // (`recorder.rs`) guarantees the box opref never re-binds within one walk,
-    // so a stale mis-fold is impossible and physical removal is unnecessary.
-    // Authoritative walks only: `BOOL_BOX_TRUTH` is reset at FBW walk
-    // entry; a non-authoritative context consulting it could read a stale
-    // OpRef key from an earlier walk's recorder.
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
-        if let Some(truth) = bool_box_truth_lookup(r_args[0]) {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
         // #124: a TO_BOOL / POP_JUMP truth residual on a provably-int box
         // (e.g. the `(i % 7)` in `(i % 7) and (i + 3)`) folds to a pure
         // `int_is_true`, eliding the may-force call whose force/exc guards

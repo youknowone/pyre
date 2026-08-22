@@ -240,7 +240,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// three shapes have no name to give.
 ///
 /// * **Functionless replace** — the emit is inlined into a `match` arm, so
-///   there is no function to name (`bool_box_truth_lookup`'s arm).
+///   there is no function to name.
 /// * **Registry** — one entry more means one fold more, with no new call site
 ///   and no new function (`try_fold_registered_symbolic_residual`).
 /// * **Elision** — the arm recognises a shape and emits *nothing*, so a census
