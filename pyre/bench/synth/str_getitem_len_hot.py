@@ -1,5 +1,15 @@
 # pyre-check: max-pypy-ratio=19
 # pyre-check: spec-folds=builtin_len
+# pyre-check: max-wasm-ratio=4.8
+# Fitted to the highest reading observed plus 15%. This fixture sits over the
+# global 3.5x wasm ceiling on every branch that measures it, not only here: a
+# census of eleven branch runs on 2026-08-22 read 3.6x six times, 3.7x twice,
+# 3.8x once and 4.1x once, with the one remaining run not reaching the leg.
+# The ceiling is an allowance and not a fix -- the leg is a residual
+# STRGETITEM/UNICODEGETITEM loop, so on wasm every iteration crosses out of
+# the trace module through `env.jit_call`, and closing the gap means giving
+# the trace module a direct import for the item read rather than raising a
+# number.
 # Hot-loop str/unicode subscript and length over every string kind: ASCII /
 # latin1 (1-byte code units), BMP (2-byte), and non-BMP astral (4-byte). The
 # subscripts emit residual STRGETITEM/UNICODEGETITEM and the lengths STRLEN/

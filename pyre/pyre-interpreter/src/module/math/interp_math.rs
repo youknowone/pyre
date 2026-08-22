@@ -229,6 +229,10 @@ static MATH_SIN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
 static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_FABS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_FLOOR_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_CEIL_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_TRUNC_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Record the checked-arity wrapper pointers installed by `py_module!`.
 ///
@@ -246,7 +250,29 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ("frexp", &MATH_FREXP_WRAPPER),
         ("ldexp", &MATH_LDEXP_WRAPPER),
         ("isqrt", &MATH_ISQRT_WRAPPER),
+        ("fabs", &MATH_FABS_WRAPPER),
+        ("floor", &MATH_FLOOR_WRAPPER),
+        ("ceil", &MATH_CEIL_WRAPPER),
+        ("trunc", &MATH_TRUNC_WRAPPER),
+        ("isclose", &MATH_ISCLOSE_WRAPPER),
     ] {
+        let callable = crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
+        let wrapper = unsafe {
+            let code = crate::function_get_code(callable) as PyObjectRef;
+            debug_assert!(crate::gateway::is_builtin_code(code));
+            crate::gateway::builtin_code_get(code) as usize
+        };
+        let installed = slot.get_or_init(|| wrapper);
+        debug_assert_eq!(*installed, wrapper);
+    }
+    // The generic float folds are identified the same way; they differ only in
+    // that one table entry stands for one raw helper rather than one probe fn.
+    for (name, slot) in MATH_FLOAT1_FOLDS
+        .iter()
+        .map(|fold| (fold.name, &fold.slot))
+        .chain(MATH_FLOAT2_FOLDS.iter().map(|fold| (fold.name, &fold.slot)))
+    {
         let callable = crate::module_ns_get(ns, name)
             .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
         let wrapper = unsafe {
@@ -312,6 +338,34 @@ pub fn is_math_isqrt_function(callable: PyObjectRef) -> bool {
     unsafe { math_builtin_wrapper_matches(callable, &MATH_ISQRT_WRAPPER) }
 }
 
+pub fn is_math_fabs_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_FABS_WRAPPER) }
+}
+
+pub fn is_math_floor_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_FLOOR_WRAPPER) }
+}
+
+pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_CEIL_WRAPPER) }
+}
+
+pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_TRUNC_WRAPPER) }
+}
+
+/// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
+/// path.  Both are total on finite input and cannot raise, so the walker emits
+/// them as pure elidable calls; the trace guards the rounded value into the
+/// machine range before casting.
+pub extern "C" fn jit_math_floor_raw(x: f64) -> f64 {
+    x.floor()
+}
+
+pub extern "C" fn jit_math_ceil_raw(x: f64) -> f64 {
+    x.ceil()
+}
+
 /// Raw, allocation-free counterparts of RPython's `ll_math_frexp` result
 /// components.  The translated PyPy trace carries the pair as two unboxed
 /// values before `space.newtuple2` virtualizes; pyre's walker emits one pure
@@ -368,6 +422,205 @@ pub extern "C" fn jit_math_isqrt_i64(n: i64) -> i64 {
         root -= 1;
     }
     root as i64
+}
+
+// ── raw helpers and identity table for the generic float folds ───────
+
+/// One entry of the walker's generic `math` fold table: the module
+/// attribute's checked-arity wrapper pointer and the raw helper that computes
+/// the same value without boxing.
+///
+/// Each helper answers exactly what the builtin body would compute for the
+/// same `f64` operands, and reports the builtin's raising directions as NaN.
+/// The walker guards the result finite, so a NaN — whether it came from a
+/// raising direction or from a genuine NaN result — resumes in the builtin
+/// and reproduces the interpreter's answer.  That makes the fold sound for
+/// every operand without the walker knowing any function's domain.
+pub struct MathFloatFold<Raw: 'static> {
+    name: &'static str,
+    slot: std::sync::OnceLock<usize>,
+    raw: Raw,
+}
+
+pub type MathFloat1Fold = MathFloatFold<extern "C" fn(f64) -> f64>;
+pub type MathFloat2Fold = MathFloatFold<extern "C" fn(f64, f64) -> f64>;
+
+/// Raw counterpart of a `pm1!`/`pm1_edom!` body: the same `pymath` call, with
+/// every error direction reported as NaN.
+macro_rules! jit_raw1 {
+    ($helper:ident, $name:ident) => {
+        pub extern "C" fn $helper(x: f64) -> f64 {
+            match pymath::math::$name(x) {
+                Ok(v) => v,
+                Err(_) => f64::NAN,
+            }
+        }
+    };
+}
+
+/// Raw counterpart of a `pm1_plain!` body, which has no error direction.
+macro_rules! jit_raw1_plain {
+    ($helper:ident, $name:ident) => {
+        pub extern "C" fn $helper(x: f64) -> f64 {
+            pymath::math::$name(x)
+        }
+    };
+}
+
+macro_rules! jit_raw2 {
+    ($helper:ident, $name:ident) => {
+        pub extern "C" fn $helper(x: f64, y: f64) -> f64 {
+            match pymath::math::$name(x, y) {
+                Ok(v) => v,
+                Err(_) => f64::NAN,
+            }
+        }
+    };
+}
+
+jit_raw1!(jit_math_tan, tan);
+jit_raw1!(jit_math_asin, asin);
+jit_raw1!(jit_math_acos, acos);
+jit_raw1!(jit_math_atan, atan);
+jit_raw1!(jit_math_sinh, sinh);
+jit_raw1!(jit_math_cosh, cosh);
+jit_raw1!(jit_math_tanh, tanh);
+jit_raw1!(jit_math_asinh, asinh);
+jit_raw1!(jit_math_acosh, acosh);
+jit_raw1!(jit_math_atanh, atanh);
+jit_raw1!(jit_math_cbrt, cbrt);
+jit_raw1!(jit_math_exp, exp);
+jit_raw1!(jit_math_exp2, exp2);
+jit_raw1!(jit_math_expm1, expm1);
+jit_raw1!(jit_math_log1p, log1p);
+jit_raw1!(jit_math_erf, erf);
+jit_raw1!(jit_math_erfc, erfc);
+jit_raw1!(jit_math_gamma, gamma);
+jit_raw1!(jit_math_lgamma, lgamma);
+jit_raw1_plain!(jit_math_ulp, ulp);
+jit_raw1_plain!(jit_math_degrees, degrees);
+jit_raw1_plain!(jit_math_radians, radians);
+
+jit_raw2!(jit_math_pow, pow);
+jit_raw2!(jit_math_fmod, fmod);
+jit_raw2!(jit_math_copysign, copysign);
+jit_raw2!(jit_math_remainder, remainder);
+jit_raw2!(jit_math_atan2, atan2);
+
+/// Raw `math.isclose(a, b)` with both keyword tolerances left at their
+/// defaults, `rel_tol=1e-09` and `abs_tol=0.0`.
+///
+/// Spelled out rather than delegated to `pymath::math::isclose` so that it is
+/// total: the only rejection the builtin has is a negative tolerance, which
+/// no default is, so this form has no error direction to report and the
+/// walker can read the answer as a plain truth value.  Identical operands
+/// (including two infinities of the same sign) compare close; a single
+/// infinity and any NaN do not.
+pub extern "C" fn jit_math_isclose_default(a: f64, b: f64) -> i64 {
+    const REL_TOL: f64 = 1e-09;
+    if a == b {
+        return 1;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return 0;
+    }
+    let diff = (b - a).abs();
+    i64::from(diff <= (REL_TOL * b).abs() || diff <= (REL_TOL * a).abs())
+}
+
+static MATH_ISCLOSE_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// True iff `callable` is the canonical builtin `math.isclose`.
+pub fn is_math_isclose_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_ISCLOSE_WRAPPER) }
+}
+
+macro_rules! math_fold_table {
+    ($table:ident: $entry:ty, $($name:literal => $helper:ident),* $(,)?) => {
+        // The length is spelled out from the entry list rather than left to a
+        // slice reference: a `static` holding `&[..]` extends the temporary's
+        // lifetime, and an entry's `OnceLock` makes that temporary interior
+        // mutable, which a static borrow may not refer to.
+        static $table: [$entry; [$(stringify!($helper)),*].len()] = [
+            $(MathFloatFold {
+                name: $name,
+                slot: std::sync::OnceLock::new(),
+                raw: $helper,
+            }),*
+        ];
+    };
+}
+
+/// `sqrt`, `log`, `cos`, `sin` and `fabs` are absent: each has a dedicated
+/// specialization that lowers to a tighter shape (a domain-guarded call with
+/// no result guard, or a single `FloatAbs`).
+math_fold_table!(
+    MATH_FLOAT1_FOLDS: MathFloat1Fold,
+    "tan" => jit_math_tan,
+    "asin" => jit_math_asin,
+    "acos" => jit_math_acos,
+    "atan" => jit_math_atan,
+    "sinh" => jit_math_sinh,
+    "cosh" => jit_math_cosh,
+    "tanh" => jit_math_tanh,
+    "asinh" => jit_math_asinh,
+    "acosh" => jit_math_acosh,
+    "atanh" => jit_math_atanh,
+    "cbrt" => jit_math_cbrt,
+    "exp" => jit_math_exp,
+    "exp2" => jit_math_exp2,
+    "expm1" => jit_math_expm1,
+    "log1p" => jit_math_log1p,
+    "erf" => jit_math_erf,
+    "erfc" => jit_math_erfc,
+    "gamma" => jit_math_gamma,
+    "lgamma" => jit_math_lgamma,
+    "ulp" => jit_math_ulp,
+    "degrees" => jit_math_degrees,
+    "radians" => jit_math_radians,
+);
+
+math_fold_table!(
+    MATH_FLOAT2_FOLDS: MathFloat2Fold,
+    "pow" => jit_math_pow,
+    "fmod" => jit_math_fmod,
+    "copysign" => jit_math_copysign,
+    "remainder" => jit_math_remainder,
+    "atan2" => jit_math_atan2,
+);
+
+/// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`
+/// for a callable that is not a builtin function.
+unsafe fn builtin_wrapper_addr(callable: PyObjectRef) -> Option<usize> {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return None;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return None;
+        }
+        Some(crate::gateway::builtin_code_get(code) as usize)
+    }
+}
+
+/// The raw 1-arg helper for `callable`, or `None` when it is not one of the
+/// canonical `math` builtins in [`MATH_FLOAT1_FOLDS`].  A value rebound under
+/// the same name carries a different code object and declines here.
+pub fn math_float1_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f64) -> f64> {
+    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
+    MATH_FLOAT1_FOLDS
+        .iter()
+        .find(|fold| fold.slot.get() == Some(&wrapper))
+        .map(|fold| fold.raw)
+}
+
+pub fn math_float2_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f64, f64) -> f64> {
+    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
+    MATH_FLOAT2_FOLDS
+        .iter()
+        .find(|fold| fold.slot.get() == Some(&wrapper))
+        .map(|fold| fold.raw)
 }
 
 pm1!(cbrt);
@@ -479,21 +732,26 @@ fn math_unary_int(
             "{fname}() takes exactly 1 argument",
         )));
     }
-    // If the descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
-    // propagate that error rather than silently falling back to float.
-    match unsafe { crate::baseobjspace::lookup_special(args[0], dunder) } {
-        Ok(Some(method)) => {
-            crate::call::clear_call_error();
-            let result = crate::call_function(method, &[]);
-            if !result.is_null() {
-                return Ok(result);
-            }
-            if let Some(err) = crate::call::take_call_error() {
-                return Err(err);
-            }
-        }
-        Ok(None) => {}
-        Err(err) => return Err(err),
+    // `interp_math.py`'s `floor` / `ceil` / `trunc`:
+    //
+    //     w_descr = space.lookup(w_x, '__floor__')
+    //     if w_descr is not None:
+    //         return space.get_and_call_function(w_descr, w_x)
+    //
+    // The unbound descriptor is called with the object leading the
+    // positionals, so a plain `float` argument does not pay for a bound method
+    // object per call.  A descriptor whose `__get__` itself raises (e.g.
+    // BadDescr.__get__ → ValueError) still propagates that error:
+    // `get_and_call_function` binds through `get` for every descriptor other
+    // than a function or method descriptor, and neither of those runs user
+    // code to bind.  `lookup` reads the type MRO only, so an instance
+    // attribute of the same name stays ignored.
+    if let Some(w_descr) = unsafe { crate::baseobjspace::lookup(args[0], dunder) }
+        && let Some(w_type) = crate::typedef::r#type(args[0])
+    {
+        return unsafe {
+            crate::baseobjspace::get_and_call_function(w_descr, args[0], w_type.as_ptr(), &[])
+        };
     }
     if !fallback_float {
         return Err(crate::PyError::type_error(format!(
@@ -507,11 +765,18 @@ fn math_unary_int(
     // `__float__`, or the `OverflowError` for an int too wide for an f64 —
     // propagates; relabelling here would swallow exactly those.
     let v = try_get_double(args[0])?;
-    Ok(w_int_new(match dunder {
-        "__ceil__" => v.ceil() as i64,
-        "__floor__" => v.floor() as i64,
-        _ => v.trunc() as i64,
-    }))
+    // `float_to_pyint` is `newlong_from_float`: NaN raises, an infinity raises,
+    // and a finite value outside the machine range becomes a long.  A direct
+    // `as i64` saturates instead, so `floor(FloatLike(1e300))` answered
+    // `i64::MAX` and `floor(FloatLike(nan))` answered `0`.
+    crate::typedef::float_to_pyint(
+        v,
+        match dunder {
+            "__ceil__" => crate::typedef::FloatToIntMode::Ceil,
+            "__floor__" => crate::typedef::FloatToIntMode::Floor,
+            _ => crate::typedef::FloatToIntMode::Trunc,
+        },
+    )
 }
 
 pub fn floor(args: &[PyObjectRef]) -> PyResult {
@@ -728,6 +993,14 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
     crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    // `interp_math.py`'s `isclose` — all four operands are converted, in this
+    // order, before anything about them is checked, so a non-numeric `a` is
+    // reported even when a tolerance is negative.  An omitted tolerance
+    // arrives upstream as an already-wrapped float, so converting it can
+    // neither raise nor reach `__float__`; `None` stands in for that here and
+    // `pymath` supplies the same defaults.
+    let a = try_get_double(pos[0])?;
+    let b = try_get_double(pos[1])?;
     let read = |name: &str| -> Result<Option<f64>, crate::PyError> {
         match crate::builtins::kwarg_get(kwargs, name) {
             Some(v) => Ok(Some(try_get_double(v)?)),
@@ -736,12 +1009,16 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     };
     let rel_tol = read("rel_tol")?;
     let abs_tol = read("abs_tol")?;
-    match pymath::math::isclose(
-        try_get_double(pos[0])?,
-        try_get_double(pos[1])?,
-        rel_tol,
-        abs_tol,
-    ) {
+    // `isclose` — the sanity check on the tolerances runs
+    // after those conversions and before the comparison, and names them.
+    // `pymath` reports the same rejection as EDOM, which `map_int_err`
+    // relabels "math domain error".
+    if rel_tol.is_some_and(|t| t < 0.0) || abs_tol.is_some_and(|t| t < 0.0) {
+        return Err(crate::PyError::value_error(
+            "tolerances must be non-negative",
+        ));
+    }
+    match pymath::math::isclose(a, b, rel_tol, abs_tol) {
         Ok(v) => Ok(w_bool_from(v)),
         Err(e) => Err(map_int_err(e)),
     }
@@ -876,8 +1153,28 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
     ))
 }
 
+/// `space.abs(space.index(w))` in the machine-word domain.  `None` is
+/// `gcd_two`'s `except OverflowError` direction, which replays the
+/// pair in the rbigint domain: `is_long` values never fit, and `i64::MIN` is
+/// the one machine int whose absolute value leaves the range.
+fn index_abs_machine_word(obj: PyObjectRef) -> Option<i64> {
+    if !unsafe { pyre_object::is_int(obj) } {
+        return None;
+    }
+    unsafe { pyre_object::w_int_get_value(obj) }.checked_abs()
+}
+
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
     let args = no_keywords(args, "gcd")?;
+    // `interp_math.py`'s `gcd_two` reads both operands as Signed and only
+    // falls back to rbigint when one overflows.  Taking the pair through
+    // `get_bigint` unconditionally allocates five digit blocks and runs a
+    // divmod to reduce two machine words.
+    if let [a, b] = args
+        && let (Some(a), Some(b)) = (index_abs_machine_word(*a), index_abs_machine_word(*b))
+    {
+        return Ok(w_int_new(majit_rlib::rbigint::gcd_binary(a, b)));
+    }
     // RPython's GC transform roots this running rbigint across the next
     // argument's potentially user-defined `__index__` call.
     let mut result = RBigIntGcRoot::new(BigInt::zero());
@@ -928,11 +1225,70 @@ fn bigint_to_pyint(b: &BigInt) -> PyObjectRef {
     }
 }
 
+/// The value of an operand that is already a machine int.  `None` covers
+/// everything `space.index` would have to run to answer — a long, or an
+/// object with `__index__`.
+fn machine_word_int(obj: PyObjectRef) -> Option<i64> {
+    unsafe { pyre_object::is_int(obj).then(|| pyre_object::w_int_get_value(obj)) }
+}
+
+/// `comb(n, k)` in the machine-word domain, for `0 <= k <= n`.
+///
+/// `None` is the direction that replays the pair in the rbigint domain: an
+/// intermediate that leaves the machine range.  Each step is the exact
+/// `C(n, i-1) * (n - i + 1) / i = C(n, i)`, so the running value is a real
+/// binomial coefficient throughout and only the last multiplication before
+/// the answer itself grows out of range can overflow.
+fn comb_machine_word(n: i64, k: i64) -> Option<i64> {
+    let k = k.min(n - k);
+    let mut result: i64 = 1;
+    for i in 1..=k {
+        result = result.checked_mul(n - i + 1)?;
+        result /= i;
+    }
+    Some(result)
+}
+
+/// `perm(n, k)` in the machine-word domain, for `0 <= k <= n`: the falling
+/// factorial `n * (n-1) * ... * (n-k+1)`.  `None` replays the pair in the
+/// rbigint domain.
+fn perm_machine_word(n: i64, k: i64) -> Option<i64> {
+    let mut result: i64 = 1;
+    for i in 0..k {
+        result = result.checked_mul(n - i)?;
+    }
+    Some(result)
+}
+
 pub fn comb(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 2 {
         return Err(crate::PyError::type_error(
             "comb() takes exactly two arguments",
         ));
+    }
+    // `get_bigint` allocates a digit block per operand before the reduction
+    // below allocates another per multiplication and per divmod.  A pair of
+    // machine ints answers the same value with neither.  The two rejections
+    // keep their order, so `comb(-1, -1)` still names `n`.
+    if let [n, k] = args
+        && let (Some(n), Some(k)) = (machine_word_int(*n), machine_word_int(*k))
+    {
+        if n < 0 {
+            return Err(crate::PyError::value_error(
+                "n must be a non-negative integer",
+            ));
+        }
+        if k < 0 {
+            return Err(crate::PyError::value_error(
+                "k must be a non-negative integer",
+            ));
+        }
+        if k > n {
+            return Ok(w_int_new(0));
+        }
+        if let Some(result) = comb_machine_word(n, k) {
+            return Ok(w_int_new(result));
+        }
     }
     // `n` is an unboxed rbigint local across `index(k)`, exactly the kind of
     // local rooted automatically by RPython's GC transform.
@@ -994,6 +1350,34 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
         return Err(crate::PyError::type_error(
             "perm() takes at most 2 arguments",
         ));
+    }
+    // `perm(n, k)` over machine ints whose falling factorial stays in range
+    // answers without a digit block per multiplication, the same way `comb`
+    // does.  `perm(n)` and `perm(n, None)` mean k = n, which only fits for
+    // n <= 20 and otherwise falls through.
+    if let Some(n) = args.first().copied().and_then(machine_word_int)
+        && let Some(k) = match args.get(1).copied() {
+            None => Some(n),
+            Some(k) if unsafe { pyre_object::is_none(k) } => Some(n),
+            Some(k) => machine_word_int(k),
+        }
+    {
+        if n < 0 {
+            return Err(crate::PyError::value_error(
+                "n must be a non-negative integer",
+            ));
+        }
+        if k < 0 {
+            return Err(crate::PyError::value_error(
+                "k must be a non-negative integer",
+            ));
+        }
+        if k > n {
+            return Ok(w_int_new(0));
+        }
+        if let Some(result) = perm_machine_word(n, k) {
+            return Ok(w_int_new(result));
+        }
     }
     // Keep `n` rooted while a non-None `k` invokes its `__index__`.
     let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);

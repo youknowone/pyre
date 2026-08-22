@@ -313,7 +313,7 @@ pub(crate) fn arity_pow(args: &[PyObjectRef], name: &str) -> Result<(), crate::P
 pub fn number_dunder_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "__round__")?;
     arity_at_most(args, "__round__", 1)?;
-    crate::builtins::builtin_round(args)
+    crate::builtins::builtin_round_dunder(args)
 }
 
 /// TypeError for an unbound method descriptor invoked with no receiver
