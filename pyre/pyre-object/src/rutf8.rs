@@ -493,7 +493,7 @@ mod tests {
         // range bounds.  `wtf8_from_bytes` reports where the strict scan
         // stopped, which is the sequence start `check_utf8` names.
         let mut buf = Vec::new();
-        let mut probe = |buf: &[u8]| {
+        let probe = |buf: &[u8]| {
             for allow in [true, false] {
                 let want = check_utf8(buf, allow);
                 let got = wtf8_from_bytes(buf, allow).map(|_| ());
