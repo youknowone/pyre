@@ -1170,13 +1170,28 @@ fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
-        // A GUARD_VALUE whose compared operand is not one of its fail
-        // arguments spills that operand one slot past them, so the exit needs
-        // room for it (`collect_guards_and_vars`).
-        .map(|g| g.fail_arg_refs.len() + usize::from(g.counter_value_spill.is_some()))
+        .map(|g| g.fail_arg_refs.len())
         .max()
         .unwrap_or(0);
-    1 + max_fail_args.max(inputargs.len())
+    let value_area = max_fail_args.max(inputargs.len());
+    1 + value_area + usize::from(guards.iter().any(|g| g.counter_value_spill.is_some()))
+}
+
+/// The trace-wide GUARD_VALUE counter slot, or `None` when no guard needs one.
+///
+/// The first slot past the value area every exit writes into, so it is free in
+/// every exit's layout, and `normal_frame_value_slots` reserves it.
+fn counter_slot(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
+    let (guards, _) = collect_guards_and_vars(inputargs, ops);
+    if guards.iter().all(|g| g.counter_value_spill.is_none()) {
+        return None;
+    }
+    let max_fail_args = guards
+        .iter()
+        .map(|g| g.fail_arg_refs.len())
+        .max()
+        .unwrap_or(0);
+    Some(max_fail_args.max(inputargs.len()))
 }
 
 pub fn frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
@@ -1673,10 +1688,10 @@ pub struct GuardExit {
     pub fail_arg_refs: Vec<OpRef>,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
-    /// The GUARD_VALUE operand this exit spills past its fail arguments, for
-    /// `make_a_counter_per_value`. `None` when the guard is not a GUARD_VALUE,
-    /// or when its operand is already one of the fail arguments and so already
-    /// has a slot. See `counter_value_spill`.
+    /// The GUARD_VALUE operand this exit parks in the trace's counter slot,
+    /// for `make_a_counter_per_value`. `None` when the guard is not a
+    /// GUARD_VALUE, or when its operand is already one of the fail arguments
+    /// and so already has a slot. See `counter_value_spill`.
     pub counter_value_spill: Option<OpRef>,
     /// `op.descr` snapshot — passed through to `WasmFailDescr.meta_descr`
     /// so `get_latest_descr_arc` can return the canonical metainterp Arc
@@ -2052,26 +2067,23 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             // (`emit_guard_fail_args_spill`) and the frame sizing
             // (`normal_frame_value_slots`) both read the same predicate, and a
             // guard whose descr is absent must still agree with them or the
-            // spill writes a slot the frame never reserved.
+            // parked word lands in a slot the frame never reserved.
             let counter_value_spill = counter_value_spill(op, &fail_args);
             if op.opcode == OpCode::GuardValue
                 && let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr())
             {
                 let arg0 = op.arg(0).to_opref();
-                let slot_type = match counter_value_spill {
-                    Some(operand) => Some((fail_args.len(), operand.ty())),
-                    None => fail_args
-                        .iter()
-                        .position(|r| *r == arg0)
-                        .map(|idx| (idx, fail_arg_types.get(idx).copied())),
-                };
-                if let Some((slot, ty)) = slot_type {
-                    let type_tag = match ty {
+                // The parked case is stamped after this loop, where the
+                // trace-wide slot is known.
+                if counter_value_spill.is_none()
+                    && let Some(idx) = fail_args.iter().position(|r| *r == arg0)
+                {
+                    let type_tag = match fail_arg_types.get(idx) {
                         Some(Type::Ref) => majit_backend::STATUS_TY_REF,
                         Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
                         _ => majit_backend::STATUS_TY_INT,
                     };
-                    fd.make_a_counter_per_value(slot as u32, type_tag);
+                    fd.make_a_counter_per_value(idx as u32, type_tag);
                 }
             }
             guards.push(GuardExit {
@@ -2083,6 +2095,32 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 meta_descr,
             });
             fail_index += 1;
+        }
+    }
+
+    // The parked operands share ONE slot, past every exit's fail args and past
+    // the inputargs (`counter_slot`), so it can only be named once every
+    // exit's width is known. `must_compile` reads the stamp back through
+    // `get_value_direct`, so the slot it names has to be the slot
+    // `emit_guard_fail_args_spill` writes.
+    if guards.iter().any(|g| g.counter_value_spill.is_some()) {
+        let value_area = guards
+            .iter()
+            .map(|g| g.fail_arg_refs.len())
+            .max()
+            .unwrap_or(0)
+            .max(inputargs.len());
+        for g in &guards {
+            if let Some(operand) = g.counter_value_spill
+                && let Some(fd) = g.meta_descr.as_ref().and_then(|d| d.as_fail_descr())
+            {
+                let type_tag = match operand.ty() {
+                    Some(Type::Ref) => majit_backend::STATUS_TY_REF,
+                    Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                    _ => majit_backend::STATUS_TY_INT,
+                };
+                fd.make_a_counter_per_value(value_area as u32, type_tag);
+            }
         }
     }
 
@@ -3429,6 +3467,7 @@ fn build_function(
         outside_region_base: 0,
         ref_homes,
         frame,
+        counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -7148,6 +7187,9 @@ struct BridgeDispatch<'a> {
     outside_region_base: u32,
     ref_homes: &'a RefHomes,
     frame: FrameGeometry,
+    /// The trace's one GUARD_VALUE counter slot (`counter_slot`), or `None`
+    /// when no guard needs one.
+    counter_slot: Option<u64>,
 }
 
 fn emit_guard_true(
@@ -7341,7 +7383,14 @@ fn emit_guard_exit(
         return;
     }
     if dispatch.param_type_indices.is_empty() {
-        emit_guard_spill(sink, constants, value_types, guard_idx, op);
+        emit_guard_spill(
+            sink,
+            constants,
+            value_types,
+            guard_idx,
+            op,
+            dispatch.counter_slot,
+        );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
         }
@@ -7349,7 +7398,14 @@ fn emit_guard_exit(
         emit_guard_param_tail_call(sink, constants, value_types, guard_idx, op, dispatch);
         // A missing cell keeps the historical recovery path. It is deliberately
         // after the cell test so a bridge crossing performs no frame spill.
-        emit_guard_spill(sink, constants, value_types, guard_idx, op);
+        emit_guard_spill(
+            sink,
+            constants,
+            value_types,
+            guard_idx,
+            op,
+            dispatch.counter_slot,
+        );
     }
     sink.br(block_exit_depth);
 }
@@ -7454,8 +7510,9 @@ fn emit_guard_spill(
     value_types: &ValueLocals,
     guard_idx: u32,
     op: &Op,
+    counter_slot: Option<u64>,
 ) {
-    emit_guard_fail_args_spill(sink, constants, value_types, op);
+    emit_guard_fail_args_spill(sink, constants, value_types, op, counter_slot);
     emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
 }
 
@@ -7479,11 +7536,9 @@ fn emit_guard_fail_args_spill(
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
+    counter_slot: Option<u64>,
 ) {
-    let fail_args: Vec<OpRef> = op
-        .getfailargs()
-        .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect());
+    let fail_args = exit_fail_args(op);
 
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
@@ -7491,22 +7546,29 @@ fn emit_guard_fail_args_spill(
         emit_resolve(sink, constants, value_types, arg_ref);
         sink.i64_store(mem64(offset));
     }
-    if let Some(operand) = counter_value_spill(op, &fail_args) {
-        let offset = FRAME_SLOT_BASE + fail_args.len() as u64 * SLOT_SIZE;
+    if let Some((operand, slot)) = counter_value_spill(op, &fail_args).zip(counter_slot) {
+        let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
         sink.local_get(0);
         emit_resolve(sink, constants, value_types, operand);
         sink.i64_store(mem64(offset));
     }
 }
 
-/// The GUARD_VALUE operand `op` must spill past its fail arguments so
-/// `make_a_counter_per_value`'s slot is readable, or `None` when the operand
-/// already occupies a fail-argument slot (or is a constant, which the optimizer
-/// has already decided the guard on).
+/// The GUARD_VALUE operand `op` must park in the trace's counter slot so that
+/// `make_a_counter_per_value`'s index is readable, or `None` when the operand
+/// already occupies a fail-argument slot, or is a constant the optimizer has
+/// already decided the guard on.
 ///
-/// `collect_guards_and_vars` decides the same thing when it stamps the descr
-/// and `normal_frame_value_slots` reserves the slot; all three read it off the
-/// op so the three cannot drift apart.
+/// `regalloc.py prepare_op_guard_value` hands `cpu.all_reg_indexes[arg.value]`
+/// — the operand's index in the register save area every guard exit writes, so
+/// upstream always has a slot for a box the guard does not carry among its
+/// fail args. An exit here writes its fail args and nothing else, so the
+/// operand needs a slot of its own.
+///
+/// That slot is ONE per trace (`counter_slot`), past every exit's fail args
+/// and past the inputargs. A per-guard "one past MY fail args" index would
+/// land inside a wider guard's fail-arg range, where the parked word would be
+/// read back as that guard's fail argument.
 fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
     if op.opcode != OpCode::GuardValue {
         return None;
@@ -7516,6 +7578,13 @@ fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
         return None;
     }
     Some(arg0)
+}
+
+/// This op's fail arguments as the exit writes them, in slot order.
+fn exit_fail_args(op: &Op) -> Vec<OpRef> {
+    op.getfailargs()
+        .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
+        .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect())
 }
 
 fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
