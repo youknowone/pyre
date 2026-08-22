@@ -1252,6 +1252,38 @@ pub(crate) fn seed_main_loader(
     }
 }
 
+/// `app_main.py:908-917` — `launch_env` has already assembled the dev-mode,
+/// `PYTHONWARNINGS`, `-W` and BytesWarning entries onto `sys.warnoptions`; what
+/// remains is driving the warnings machinery through them before user code runs.
+/// A module already in `sys.modules` (a `sitecustomize` may have pulled it in)
+/// has run its body once, so it is re-driven through `_processoptions`;
+/// otherwise the plain import runs `_processoptions(sys.warnoptions)` from the
+/// module body (`warnings.py:94`).  This is the step that emits
+/// "Invalid -W option ignored: ..." and that leaves `sys.modules['warnings']`
+/// populated on a `-W` run.  Every failure is swallowed, matching the bare
+/// `except ImportError: pass`.
+fn init_warnoptions(
+    w_main_globals: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    if importing::warnoptions().is_empty() {
+        return;
+    }
+    let Some(w_warnings) = importing::get_sys_module("warnings") else {
+        let _ = importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr);
+        return;
+    };
+    let Some(w_sys) = importing::get_sys_module("sys") else {
+        return;
+    };
+    let _ = pyre_interpreter::baseobjspace::getattr_str(w_warnings, "_processoptions").and_then(
+        |process| {
+            let options = pyre_interpreter::baseobjspace::getattr_str(w_sys, "warnoptions")?;
+            pyre_interpreter::call::call_function_impl_result(process, &[options])
+        },
+    );
+}
+
 pub(crate) fn import_site(
     no_site: bool,
     w_main_globals: pyre_object::PyObjectRef,
@@ -1263,6 +1295,9 @@ pub(crate) fn import_site(
         eprintln!("'import site' failed");
     }
     importing::add_sys_path_0();
+    // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
+    // so `-S -Wxxx` still reports a bad filter.
+    init_warnoptions(w_main_globals, ec_ptr);
 }
 
 /// Run the `init_importlib` / `init_importlib_external` sequence
