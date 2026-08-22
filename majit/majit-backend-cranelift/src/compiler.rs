@@ -7267,6 +7267,22 @@ fn emit_guard_exit(
             publish.store(builder, jf_ptr, offset, val);
         }
     }
+    // `make_a_counter_per_value`'s slot when the compared operand is not one of
+    // the guard's own fail args (`counter_value_spill`).
+    if let Some(operand) = info.counter_value_spill {
+        let offset = JF_FRAME_ITEM0_OFS + (info.fail_arg_refs.len() as i32) * 8;
+        let val = resolve_failarg_opref(
+            builder,
+            constants,
+            jf_ptr,
+            ref_root_slots,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+            operand,
+        );
+        publish.store(builder, jf_ptr, offset, val);
+    }
     publish.flush(builder, jf_ptr);
     // _build_failure_recovery (assembler.py:2102-2105) parity:
     //   POP [ebp + jf_gcmap]   — #2104
@@ -8299,6 +8315,10 @@ struct GuardInfo {
     fail_index: u32,
     can_have_bridge: bool,
     fail_arg_refs: Vec<OpRef>,
+    /// The GUARD_VALUE operand this exit stores one slot past its fail
+    /// arguments so `make_a_counter_per_value` has a slot to name. See
+    /// `counter_value_spill`.
+    counter_value_spill: Option<OpRef>,
     /// assembler.py must_save_exception(): true for
     /// GUARD_EXCEPTION, GUARD_NO_EXCEPTION, GUARD_NOT_FORCED.
     must_save_exception: bool,
@@ -15582,6 +15602,34 @@ impl Drop for CraneliftBackend {
 /// The value MUST equal what `collect_guards` computes — anything
 /// smaller would let a bridge enter a too-small frame without
 /// triggering `cranelift_realloc_frame`.
+/// The GUARD_VALUE operand `op` must spill one slot past `fail_args` so that
+/// `make_a_counter_per_value`'s slot is readable, or `None` when the operand
+/// already occupies a fail-argument slot, or is a constant the optimizer has
+/// already decided the guard on.
+///
+/// `regalloc.py consider_guard_value` hands `all_reg_indexes[x.value]` — a
+/// deadframe slot, not a fail-argument position — so upstream can name a box
+/// the guard does not carry among its own fail args. This backend's slot space
+/// is the dense output-slot vector (`get_value_direct` reads it through
+/// `get_int_value`), which has no home for such a box, so it gets the slot one
+/// past the last fail argument and `emit_guard_exit` stores it there;
+/// `collect_guards` and `precompute_max_output_slots` reserve it.
+///
+/// The slot stays out of the guard's gcmap, which `GuardToken.compute_gcmap`
+/// builds from the fail args alone. A Ref operand parked there is therefore
+/// never traced or updated — `must_compile` only hashes the word, so a value
+/// a later collection moved costs a counter bucket, not a wrong pointer.
+fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
+    if op.opcode != OpCode::GuardValue {
+        return None;
+    }
+    let arg0 = op.arg(0).to_opref();
+    if arg0 == OpRef::NONE || arg0.is_constant() || fail_args.contains(&arg0) {
+        return None;
+    }
+    Some(arg0)
+}
+
 fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // x86/regalloc.py:1273 / aarch64/regalloc.py:276 line-by-line: a JUMP
     // whose descr targets a same-function Label with matching arity is an
@@ -15622,9 +15670,14 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         let n = if is_finish || is_external_jump {
             op.num_args()
         } else if let Some(fa) = op.getfailargs() {
-            fa.len()
+            let refs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
+            refs.len() + usize::from(counter_value_spill(op, &refs).is_some())
         } else {
-            num_inputs
+            // `collect_guards` synthesizes this guard's fail args from the
+            // inputargs. Reserve the GUARD_VALUE counter slot without
+            // re-deriving them: this sizes a bridge's incoming frame, where
+            // over-reserving only widens it.
+            num_inputs + usize::from(op.opcode == OpCode::GuardValue)
         };
         if n > max_slots {
             max_slots = n;
@@ -15757,7 +15810,8 @@ fn collect_guards(
             (refs, types)
         };
 
-        let n = fail_arg_refs.len();
+        let counter_value_spill = counter_value_spill(op, &fail_arg_refs);
+        let n = fail_arg_refs.len() + usize::from(counter_value_spill.is_some());
         if n > *max_output_slots {
             *max_output_slots = n;
         }
@@ -16307,17 +16361,25 @@ fn collect_guards(
         // regalloc.py consider_guard_value / compile.py:813-824
         // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
         // index + type tag in status (overrides store_hash).
-        if op.opcode == majit_ir::OpCode::GuardValue
-            && let Some(fa) = op.getfailargs()
-        {
+        if op.opcode == majit_ir::OpCode::GuardValue {
             let arg0 = op.arg(0).to_opref();
-            if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
-                let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
+            let slot_type = match counter_value_spill {
+                // Not a fail argument of its own guard, which is the usual
+                // case: the compared operand is a promoted value the resume
+                // re-derives. It owns the slot past the last fail argument.
+                Some(operand) => Some((fail_arg_refs.len(), operand.ty())),
+                None => fail_arg_refs
+                    .iter()
+                    .position(|r| *r == arg0)
+                    .map(|idx| (idx, as_fd(&descr).fail_arg_types().get(idx).copied())),
+            };
+            if let Some((slot, ty)) = slot_type {
+                let type_tag = match ty {
                     Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
                     Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
                     _ => majit_backend::STATUS_TY_INT,
                 };
-                as_fd(&descr).make_a_counter_per_value(idx as u32, type_tag);
+                as_fd(&descr).make_a_counter_per_value(slot as u32, type_tag);
             }
         }
         // assembler.py get_gcref_from_faildescr parity: store the
@@ -16410,6 +16472,7 @@ fn collect_guards(
             fail_index,
             can_have_bridge,
             fail_arg_refs,
+            counter_value_spill,
             must_save_exception,
             // llsupport/assembler.py `GuardToken.compute_gcmap` walks
             // `failargs` x `fail_locs` and nothing else — a guard's map is
@@ -19439,6 +19502,65 @@ mod tests {
             compute_loop_phi_keep(&ops, &[2]).get(&2),
             None,
             "ref escaping through a kept back-edge position must not be demoted"
+        );
+    }
+
+    /// `make_a_counter_per_value` (compile.py:813-824) keys a GUARD_VALUE's
+    /// counter on (guard, failing value), and `regalloc.py
+    /// consider_guard_value` names the compared operand's deadframe slot. The
+    /// operand here is not one of the guard's fail arguments, which is the
+    /// usual shape, so the exit must give it the slot past them
+    /// (`counter_value_spill`) or `must_compile` has nothing to read.
+    #[test]
+    fn guard_value_stores_its_operand_past_the_fail_args() {
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let guard = Op::new(
+            OpCode::GuardValue,
+            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+        );
+        guard.pos.set(OpRef::NONE);
+        guard.set_fail_arg_types(vec![Type::Int]);
+        guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            // The promoted value the guard compares; not a fail arg.
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            // The guard's only fail arg.
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
+            std::rc::Rc::new(guard),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 7i64);
+        constants.insert(101, 100i64);
+        constants.insert(102, 999i64);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(0xc0de);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(
+            backend.get_int_value(&frame, 0),
+            100,
+            "slot 0 stays the guard's single fail argument"
+        );
+        let descr = backend.get_latest_descr_arc(&frame);
+        let slot = majit_backend::guard_value_counter_slot(
+            descr
+                .as_fail_descr()
+                .expect("guard exit carries a FailDescr"),
+        )
+        .expect("the GUARD_VALUE stamped a counter slot");
+        assert_eq!(slot, 1, "one past the guard's single fail argument");
+        assert_eq!(
+            backend.get_value_direct(&frame, slot),
+            7,
+            "the compared operand is readable at the slot the stamp names"
         );
     }
 
