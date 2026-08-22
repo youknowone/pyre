@@ -2076,17 +2076,36 @@ def workspace_member_dirs():
     return members
 
 
+# The package whose build script reads `PYRE_MIR_FRONTEND_LLBC`. `cargo` runs a
+# build script with its own package directory as the working directory, so that
+# is what a relative entry in the override is relative to — not this script's.
+LLBC_OVERRIDE_BASE = "pyre/pyre-jit-trace"
+
+
 def llbc_input_paths():
     """The LLBC artefacts the JIT front end will actually read.
 
-    `majit-translate/src/lib.rs:185` resolves them from `PYRE_MIR_FRONTEND_LLBC`
-    (an OS path-list) before falling back to the workspace `build/llbc`, so a
-    run under that override is built against different bytes than the default
-    glob names.
+    `majit_translate::build_semantic_program_via_active_frontend` reads them from
+    `PYRE_MIR_FRONTEND_LLBC` (an OS path-list) before falling back to the
+    workspace `build/llbc`, so a run under that override is built against
+    different bytes than the default glob names.
+
+    A relative entry is resolved against `LLBC_OVERRIDE_BASE` rather than taken
+    as written. The reader is `pyre-jit-trace/build.rs`, and a build script's
+    working directory is its own package, so `../../build/llbc/pyre-jit.ullbc`
+    is the workspace artefact to the build and two levels above the repository
+    to a caller resolving from the root. Taken as written it names a file that
+    is not there, which the digest records as an unreadable input — the same
+    value however often the real artefact is rewritten, so `--no-build` would
+    approve a generated JIT front end built from an LLBC that has since moved.
     """
     override = os.environ.get("PYRE_MIR_FRONTEND_LLBC")
     if override:
-        return [entry for entry in override.split(os.pathsep) if entry]
+        return [
+            entry if os.path.isabs(entry)
+            else os.path.normpath(os.path.join(LLBC_OVERRIDE_BASE, entry)).replace(os.sep, "/")
+            for entry in override.split(os.pathsep) if entry
+        ]
     return [str(path) for path in Path("build/llbc").glob("*.ullbc")]
 
 
