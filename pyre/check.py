@@ -206,14 +206,25 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # their gates at once.  The estimate has to come from the same load conditions
 # as the run it is subtracted from.
 #
-# That last condition is the one this measurement cannot enforce, so the median
-# is printed with the samples it was drawn from ([min..max]).  Startup is
-# measured once, upfront, and then subtracted from benches that run for the
-# rest of the job, so it can come from a load window the benches never saw:
-# one macos job read every interpreter's startup at about twice the
-# neighbouring job's (dynasm 0.151s against 0.066s) while its raw bench times
-# moved by a fifth of that, and a median printed alone shows none of it.
+# That last condition is what STARTUP_REFRESH_S exists to meet.  A single
+# upfront measurement is subtracted from benches that run for the rest of the
+# job, so it can come from a load window those benches never saw: one macos job
+# read every interpreter's startup at about twice the neighbouring job's
+# (dynasm 0.151s against 0.066s) while its raw bench times moved by a fifth of
+# that, which lands whole in `exec` and collapsed a 0.074s exec to 0.009s.
+# Re-measuring on a timer keeps the subtrahend within one interval of the run
+# it is taken from, and every pass prints the samples it was drawn from
+# ([min..max]) so the drift is readable in the log rather than inferred from a
+# neighbouring job.
 STARTUP_SAMPLES = 5
+# Re-measured no more often than this, and only at a fixture boundary: the
+# pairing argument above requires a fixture's numerator and denominator to be
+# reduced by the SAME estimate, which a refresh between one fixture's backends
+# would break.  A pass costs one empty-program spawn per interpreter per
+# sample, seconds against a job of tens of minutes.  Lengthening it trades that
+# back for an estimate allowed to drift further from what it is subtracted
+# from.
+STARTUP_REFRESH_S = 300
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # `exec` is `bench - startup`, and startup is a measured median rather than a
 # constant, so whatever the estimate is off by lands whole in `exec`.  That
@@ -1978,6 +1989,9 @@ class Check:
         # interpreter/backend key -> measured empty-program user-CPU startup (s).
         # Populated by measure_startups(); missing key => 0.0 (no subtraction).
         self.startup = {}
+        # time.monotonic() of the pass that produced self.startup; None until
+        # the first one. Read by maybe_refresh_startups() to age the estimate.
+        self.startup_sampled_at = None
         # (backend, bench name) -> raw user-CPU of that backend's run in THIS
         # invocation. Feeds the wasm-vs-dynasm gate, which needs a baseline
         # measured on the same host under the same load; a recorded one would
@@ -2049,18 +2063,13 @@ class Check:
             return WIN_NATIVE_TIMEOUT_SCALE * self.args.timeout_scale
         return self.args.timeout_scale
 
-    def measure_startups(self):
-        """Measure each timed interpreter/backend's empty-program user-CPU cost.
+    def _sample_startups(self):
+        """One sampling pass: {key: [user-CPU seconds]} per timed interpreter.
 
-        Runs an empty script STARTUP_SAMPLES times per interpreter, records
-        the median user-CPU in self.startup and prints it beside the range its
-        samples spanned. This is the fixed per-process cost (interpreter init;
-        for wasm, wasmtime recompiling the module) added to every bench
-        regardless of workload; subtracting it yields an execution-only
-        comparison. No-op under --no-startup-subtract.
+        A target whose empty program exits non-zero yields an empty list, which
+        `_adopt_startups` reads as "this pass has no estimate for it" rather
+        than as zero.
         """
-        if self.args.no_startup_subtract:
-            return
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False
         ) as handle:
@@ -2075,35 +2084,81 @@ class Check:
                     targets.append(
                         (backend, [self._pyre(backend), empty_path], pyre_env())
                     )
-            parts = []
+            samples = {}
             for key, cmd, env in targets:
-                samples = []
+                got = []
                 for _ in range(STARTUP_SAMPLES):
                     _out, elapsed, code, _err = run_timed(
                         cmd, timeout_s=60, env=env,
                     )
                     if code != 0:
-                        samples = []
+                        got = []
                         break
-                    samples.append(elapsed)
-                startup = statistics.median(samples) if samples else 0.0
-                self.startup[key] = startup
-                spread = (
-                    f"[{min(samples):.3f}..{max(samples):.3f}]"
-                    if samples else ""
-                )
-                parts.append(f"{key}={startup:.3f}s{spread}")
-            print(dim(
-                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}, "
-                f"shown as median[min..max]; ratios/gates are "
-                f"execution-only): "
-                + " ".join(parts)
-            ))
+                    got.append(elapsed)
+                samples[key] = got
+            return samples
         finally:
             try:
                 os.unlink(empty_path)
             except OSError:
                 pass
+
+    def _adopt_startups(self, samples):
+        """Take a pass as the current estimate; return its rendered parts.
+
+        A target this pass failed to sample keeps the estimate it already had:
+        on the first pass that is 0.0, which is the no-subtraction default, and
+        on a refresh it is the previous pass's, which beats dropping to zero
+        mid-job and inflating every later exec time for that interpreter. Such
+        a target is rendered `[unsampled]` so the value is not read as fresh.
+        """
+        parts = []
+        for key, got in samples.items():
+            if got:
+                self.startup[key] = statistics.median(got)
+                spread = f"[{min(got):.3f}..{max(got):.3f}]"
+            else:
+                spread = "[unsampled]"
+            parts.append(f"{key}={self.startup.get(key, 0.0):.3f}s{spread}")
+        self.startup_sampled_at = time.monotonic()
+        return " ".join(parts)
+
+    def measure_startups(self):
+        """Measure each timed interpreter/backend's empty-program user-CPU cost.
+
+        Runs an empty script STARTUP_SAMPLES times per interpreter, records
+        the median user-CPU in self.startup and prints it beside the range its
+        samples spanned. This is the fixed per-process cost (interpreter init;
+        for wasm, wasmtime recompiling the module) added to every bench
+        regardless of workload; subtracting it yields an execution-only
+        comparison. Re-measured during the run by `maybe_refresh_startups`.
+        No-op under --no-startup-subtract.
+        """
+        if self.args.no_startup_subtract:
+            return
+        print(dim(
+            f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}, "
+            f"shown as median[min..max]; ratios/gates are "
+            f"execution-only): "
+            + self._adopt_startups(self._sample_startups())
+        ))
+
+    def maybe_refresh_startups(self):
+        """Re-measure startup once the estimate in hand is STARTUP_REFRESH_S old.
+
+        Call at a fixture boundary only -- see STARTUP_REFRESH_S. Prints the
+        pass in the same shape as the opening line, so the job's log carries
+        the whole series and a suspicious `exec` can be read against the
+        estimate that was actually subtracted from it.
+        """
+        if self.args.no_startup_subtract or self.startup_sampled_at is None:
+            return
+        if time.monotonic() - self.startup_sampled_at < STARTUP_REFRESH_S:
+            return
+        print(dim(
+            "startup re-measured (median[min..max]): "
+            + self._adopt_startups(self._sample_startups())
+        ))
 
     def _exec_time(self, key, t):
         """Startup-subtracted user-CPU for interpreter *key*, floored.
@@ -3203,6 +3258,7 @@ class Check:
         skip_backends=(), *, wasm_float_tol=False,
     ):
         """Run one benchmark on each enabled backend."""
+        self.maybe_refresh_startups()
         need_cpython = False
         if (
             self.enabled("dynasm")
@@ -3454,6 +3510,7 @@ class Check:
         return False
 
     def run_synthetic_bench(self, path, timeout):
+        self.maybe_refresh_startups()
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
