@@ -1053,6 +1053,26 @@ impl W_TextIOWrapper {
         #[default(pyre_object::w_bool_from(false))] line_buffering: PyObjectRef,
         #[default(pyre_object::w_bool_from(false))] write_through: PyObjectRef,
     ) -> Result<(), crate::PyError> {
+        // Every argument is converted before the body runs, in the order the
+        // signature gives them: `encoding` and `newline` are accepted only as
+        // `str` or `None`, and the two flags are truth-tested.  3.14's
+        // constructor uses the `bool` converter for those, unlike
+        // `reconfigure`'s `int` one — an object with `__bool__` but no
+        // `__index__` is accepted here — and a `__bool__` that raises ends
+        // the call before `self->ok = 0`, leaving a stream that was already
+        // open still open.
+        let unspecified = if crate::importing::utf8_mode_flag() != 0 {
+            "utf-8"
+        } else {
+            "locale"
+        };
+        let encoding_text = Self::checked_text0(encoding, unspecified, "encoding")?;
+        if !unsafe { pyre_object::is_none(newline) || pyre_object::is_str(newline) } {
+            return Err(crate::PyError::type_error("illegal newline type"));
+        }
+        let line_buffering = crate::baseobjspace::is_true(line_buffering)?;
+        let write_through = crate::baseobjspace::is_true(write_through)?;
+
         // PyPy starts every initialization attempt in STATE_ZERO.  A failed
         // reinitialization must leave all I/O operations uninitialized.
         self.state = STATE_ZERO;
@@ -1069,24 +1089,11 @@ impl W_TextIOWrapper {
         {
             crate::warn::warn_category("'encoding' argument not specified", "EncodingWarning", 1)?;
         }
-        let unspecified = if crate::importing::utf8_mode_flag() != 0 {
-            "utf-8"
-        } else {
-            "locale"
-        };
-        let encoding =
-            Self::resolve_locale_encoding(Self::checked_text0(encoding, unspecified, "encoding")?);
         let errors = Self::checked_text0(errors, "strict", "errors")?;
         Self::io_check_errors(&errors)?;
         let newline_value = Self::unwrap_newline(newline)?;
+        let encoding = Self::resolve_locale_encoding(encoding_text);
         let codec = Self::lookup_text_codec(&encoding)?;
-        // 3.14's constructor uses the `bool` Argument Clinic converter (truth
-        // testing), unlike `reconfigure`'s `int` converter — an object with
-        // `__bool__` but no `__index__` is accepted here.  Argument parsing
-        // runs before the body, so an object whose `__bool__` raises leaves
-        // the stream unattached rather than half filled in.
-        let line_buffering = crate::baseobjspace::is_true(line_buffering)?;
-        let write_through = crate::baseobjspace::is_true(write_through)?;
 
         self.attach_buffer(
             buffer,
