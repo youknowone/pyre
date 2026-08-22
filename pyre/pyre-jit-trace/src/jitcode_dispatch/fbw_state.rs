@@ -2018,10 +2018,17 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
             // are already represented by their own frame images.  This is the
             // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
             // it copies every `MIFrame` independently (`blackhole.py:1799-1821`).
-            let blackhole_required = session
-                .framestack
-                .last()
-                .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects);
+            // An in-flight FOR_ITER item is in no frame image, so the
+            // per-frame test above cannot see it: a body effect committed in
+            // an enclosing frame leaves the innermost frame's delta at zero
+            // while `fbw_foriter_inflight_take` refuses that very item, and
+            // the legacy path then drops it. Arm the conversion on the same
+            // signal the refusal reads, so the item is carried forward
+            // instead of lost.
+            let blackhole_required =
+                session.framestack.last().is_some_and(|frame| {
+                    fbw_executed_effect_count() != frame.entry_executed_effects
+                }) || (fbw_foriter_inflight_active() && fbw_foriter_any_body_effect_signal());
             (outer_resume, stack_overrides, blackhole_required)
         };
         FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
