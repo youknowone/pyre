@@ -1284,11 +1284,14 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
     }
 }
 
-fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
+/// Sweep the whole heap and run whatever that made finalizable, reporting
+/// whether anything was. `false` says the heap held no unreachable finalizer at
+/// this point, so a caller that has changed nothing since can skip its next
+/// sweep: that one would walk the same heap to the same empty queue.
+fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) -> bool {
     pyre_object::gc_hook::try_gc_collect();
-    if !ec_ptr.is_null() {
-        unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() };
-    }
+    !ec_ptr.is_null()
+        && unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() }
 }
 
 /// Whether releasing this binding can remove anything from the reachable set,
@@ -1488,7 +1491,7 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // itself holds, so without this a stream owned by any other module loses
     // its buffered writes.
     pyre_interpreter::module::_io::flush_all_streams();
-    collect_and_run_finalizers(ec_ptr);
+    let mut swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();
     for (name, _) in entries {
@@ -1504,13 +1507,17 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
             pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
         }
         if !frees_nothing {
-            collect_and_run_finalizers(ec_ptr);
+            swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
         }
     }
-    // The loop ends on a collection whenever it releases anything collectable;
-    // this is the one for the case where the last releases were all skipped, so
-    // teardown still finishes with the heap swept and the queue drained.
-    collect_and_run_finalizers(ec_ptr);
+    // Close the loop on a swept heap and a drained queue. A release the loop
+    // skipped removes nothing from the reachable set, and one it did not is
+    // followed immediately by the sweep above, so the only way this heap can
+    // hold a finalizer the last sweep missed is a `__del__` that sweep ran and
+    // that dropped the last reference to something else.
+    if swept_something_finalizable {
+        collect_and_run_finalizers(ec_ptr);
+    }
     let shutdown_modules = pyre_interpreter::importing::release_sys_modules_for_shutdown();
     clear_shutdown_modules(shutdown_modules, ec_ptr);
 }

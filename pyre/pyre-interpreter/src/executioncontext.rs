@@ -907,11 +907,10 @@ impl ExecutionContext {
         Ok(anchor.live())
     }
 
-    pub fn _run_finalizers_now(&mut self) {
+    /// Returns whether any queued finalizer was taken; see [`UserDelAction::_run_finalizers`].
+    pub fn _run_finalizers_now(&mut self) -> bool {
         let action = space_user_del_action();
-        if !action.is_null() {
-            unsafe { (*action)._run_finalizers() };
-        }
+        !action.is_null() && unsafe { (*action)._run_finalizers() }
     }
 
     /// gh-142766 compatibility for `generator.close()`: once the close path
@@ -2583,7 +2582,11 @@ impl UserDelAction {
     /// `self.space.finalizer_queue` is read via the local
     /// `self.finalizer_queue` field (see struct doc for
     /// TODO).
-    pub fn _run_finalizers(&mut self) {
+    /// Returns whether the queue held anything, i.e. whether running it could
+    /// have changed the heap. A caller that swept the heap to fill this queue
+    /// learns from `false` that the sweep found nothing to finalize.
+    pub fn _run_finalizers(&mut self) -> bool {
+        let mut ran = false;
         loop {
             let w_obj = self.finalizer_queue.next_dead();
             match w_obj {
@@ -2593,9 +2596,11 @@ impl UserDelAction {
                     let _roots = pyre_object::gc_roots::push_roots();
                     pyre_object::gc_roots::pin_root(w);
                     self._call_finalizer(w);
+                    ran = true;
                 }
             }
         }
+        ran
     }
 
     /// Defer the reachability pass until the next opcode boundary.  Calling
