@@ -3225,6 +3225,20 @@ fn rewrite_body(
                                 {
                                     let __back_edge_resume = #call;
                                     #finish_drain
+                                    // The back edge's spelling of the
+                                    // `jit_merge_point!` hook's terminal-return
+                                    // exit. A guard that bridges enters the walk
+                                    // at the guard's own position, so the walk
+                                    // reaches the interpreted function's return
+                                    // here just as it can at a merge point; the
+                                    // position reported alongside names nothing
+                                    // to resume at, and assigning it to
+                                    // `#pc_expr` decodes an out-of-range index in
+                                    // any dispatch loop not bottom-tested on its
+                                    // program length.
+                                    if #driver_expr.take_single_pass_finish() {
+                                        break;
+                                    }
                                     if let Some(__resume_pc) = __back_edge_resume {
                                         #pc_expr = __resume_pc;
                                         continue;

@@ -4932,10 +4932,15 @@ impl<S: JitState> JitDriver<S> {
             self.arm_single_pass_label_entry_on_next_back_edge(state);
             self.discard_single_pass_resume();
             // A terminal dispatch return means the interpreted function has
-            // returned. The hook `break`s out of the native loop for it; the
-            // back edge's own spelling of that is the out-of-range position
-            // its caller assigns to `pc`, which fails the loop's `pc < len`.
-            if self.take_single_pass_finish() {
+            // returned, so the native dispatch loop must EXIT rather than
+            // resume at a position. `single_pass_finish` is how that is said,
+            // and it is deliberately left standing here for the caller to
+            // consume: the `#[jit_interp]` expansion of both markers reads it
+            // straight after the call and `break`s on it, which is the only
+            // exit a dispatch loop is required to have. The `usize::MAX`
+            // beside it is a position no program holds, so a caller that
+            // ignores the flag fails loudly instead of resuming somewhere.
+            if self.meta.single_pass_finish {
                 return Some(usize::MAX);
             }
             return Some(pc);
