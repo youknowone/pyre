@@ -30,28 +30,37 @@ fn simple_weak_set_type() -> PyObjectRef {
         .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
 }
 
-/// The `__contains__` `app_abc.py` defines, stashed beside its type as the
-/// three words a caller can move independently: the method itself, the code
-/// object it holds, and the one global its body reads.  The class is an
+/// The `__contains__` `app_abc.py` defines, stashed beside its type as the four
+/// words a caller can move independently: the method itself, the code object it
+/// holds, and the two globals its body resolves at run time.  The class is an
 /// ordinary heap type, so the method is rebindable and the function it holds is
 /// mutable in place; answering natively is only sound while the body a
 /// membership test would reach is still the one written in `app_abc.py`.
 ///
-/// The body is `try: wr = ref(item) / except TypeError: return False / return
-/// wr in self.data`, so `ref` is its whole free-variable surface and pinning it
-/// is what makes rebinding `__globals__["ref"]` decline.  Defaults are not
-/// pinned because the body takes none.
-static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize, usize)> =
+/// The globals are `ref` and `TypeError` — the constructor the probe calls and
+/// the class its handler catches.  That pair is the body's complete global
+/// surface, read off the compiled code object rather than off the source: its
+/// `LOAD_GLOBAL` operands are exactly those two names, and it declares no free
+/// variables, no cell variables and no defaults.
+///
+/// `ref` is imported by the module, so it is a real entry.  `TypeError` is not:
+/// it resolves through the builtins fallback and the module dict holds no such
+/// key, so what is stashed for it is the module entry that would *shadow*
+/// builtins — `0` while there is none.  A caller who assigns
+/// `__globals__["TypeError"]` moves it off `0` and the comparison declines,
+/// which is the mutation this guards.  Rebinding `builtins.TypeError` itself is
+/// a process-wide change this does not pretend to cover.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize, usize, usize)> =
     std::sync::OnceLock::new();
 
-/// The installed `__contains__`, the code object it currently holds and its
-/// `ref` global, as the triple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything
-/// that is not a function reads as `(0, 0, 0)`, which no stash can equal:
-/// [`crate::function_get_code`] reads the `code` field without checking the
-/// type, so a `__contains__` rebound to a non-function must be rejected before
-/// the read rather than by comparing what the read returned.
-fn simple_weak_set_contains_identity() -> (usize, usize, usize) {
-    const NONE: (usize, usize, usize) = (0, 0, 0);
+/// The installed `__contains__`, the code object it currently holds and its two
+/// globals, as the tuple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything that is
+/// not a function, or a body missing either global, reads as `(0, 0, 0, 0)`,
+/// which no stash can equal: [`crate::function_get_code`] reads the `code` field
+/// without checking the type, so a `__contains__` rebound to a non-function must
+/// be rejected before the read rather than by comparing what the read returned.
+fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
+    const NONE: (usize, usize, usize, usize) = (0, 0, 0, 0);
     let Some(method) =
         (unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") })
     else {
@@ -64,15 +73,18 @@ fn simple_weak_set_contains_identity() -> (usize, usize, usize) {
     if globals.is_null() {
         return NONE;
     }
-    let Some(ref_global) =
-        (unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(globals, "ref") })
-    else {
+    let global = |name| unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(globals, name) };
+    // `ref` must be there; `TypeError` normally is not, and its absence reads
+    // as `0` rather than as a failure to identify the body.
+    let Some(ref_global) = global("ref") else {
         return NONE;
     };
+    let type_error_shadow = global("TypeError").map_or(0, |obj| obj as usize);
     (
         method as usize,
         unsafe { crate::function_get_code(method) as usize },
         ref_global as usize,
+        type_error_shadow,
     )
 }
 
@@ -123,7 +135,8 @@ fn simple_weak_set_contains(
     }
     // The receiver being that class is not enough: rebinding the class's own
     // `__contains__`, assigning that function a different `__code__`, or
-    // rebinding the `ref` its body calls, each leaves every instance an exact
+    // rebinding either global its body resolves — the `ref` it calls, the
+    // `TypeError` it catches — each leaves every instance an exact
     // `SimpleWeakSet` while changing what a membership test answers.
     let Some(&installed) = SIMPLE_WEAK_SET_CONTAINS.get() else {
         return Ok(None);
@@ -842,7 +855,7 @@ crate::py_module! {
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
         let installed = simple_weak_set_contains_identity();
-        if installed != (0, 0, 0) {
+        if installed != (0, 0, 0, 0) {
             let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
         }
     },

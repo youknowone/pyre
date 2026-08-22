@@ -285,6 +285,43 @@ def a_mutated_ref_global_is_consulted():
         namespace['ref'] = original
 
 
+def a_shadowed_typeerror_global_is_consulted():
+    class Caught(metaclass=ABCMeta):
+        pass
+
+    class Impl(Caught):
+        pass
+
+    class Claims:
+        __class__ = 3
+
+    # A populated collection, so the probe is really built and really weakref'd.
+    assert isinstance(Impl(), Caught) is True
+
+    collection = type(Caught._abc_cache)
+    namespace = collection.__contains__.__globals__
+    assert 'TypeError' not in namespace, 'the handler resolves it through builtins'
+
+    class Missing(Exception):
+        pass
+
+    # `except TypeError` reads the name as a global before falling back to
+    # builtins, so a module entry shadows the builtin and stops the handler
+    # catching the weakref failure.  That failure then leaves `__contains__`
+    # instead of becoming a `False`, and the message which escapes says which
+    # body answered.
+    namespace['TypeError'] = Missing
+    try:
+        isinstance(Claims(), Caught)
+    except TypeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('an unweakreferenceable class was accepted')
+    finally:
+        del namespace['TypeError']
+    assert 'weak reference' in message, message
+
+
 empty_collection_answers_then_fills()
 unweakreferenceable_class_reaches_the_subclass_check()
 a_raising_hash_runs_once()
@@ -297,4 +334,5 @@ if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     a_mutated_contains_body_is_consulted()
     a_non_function_contains_declines()
     a_mutated_ref_global_is_consulted()
+    a_shadowed_typeerror_global_is_consulted()
 print('OK')
