@@ -65,6 +65,20 @@ eq('and the subtype inherits it', repr(Sub(2)), '<Cell 2>')
 eq('read off the type, as a compiled module reads it',
    m.call_slot('tp_repr', Sub(3)), '<Cell 3>')
 
+# A wrapper answers with the slot of the class it was published on, so a
+# subclass that overrides the method and then names the base explicitly
+# reaches the base's implementation rather than its own.
+
+
+class Louder(m.Cell):
+    def __repr__(self):
+        return 'Louder(' + m.Cell.__repr__(self) + ')'
+
+
+eq('a wrapper named on the base', repr(Louder(4)), 'Louder(<Cell 4>)')
+eq('and the override is what the type answers with',
+   m.call_slot('tp_repr', Louder(5)), 'Louder(<Cell 5>)')
+
 # The size is the base's, because the base's fields are what the constructor
 # fills: a block sized for the plain header would take those writes past its
 # end.
