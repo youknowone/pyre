@@ -17,14 +17,14 @@ fn method(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(receiver);
+    let _ = roots.pin_root(receiver);
     for &argument in args {
-        roots.pin_root(argument);
+        let _ = roots.pin_root(argument);
     }
     let bound =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(base), name)?;
     let bound_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(bound);
+    let _ = roots.pin_root(bound);
     let args: Vec<PyObjectRef> = (0..args.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(base + 1 + index))
         .collect();
@@ -92,8 +92,8 @@ pub unsafe extern "C" fn PyFrozenSet_New(iterable: *mut CPyObject) -> *mut CPyOb
 fn add_frozen(set: PyObjectRef, key: PyObjectRef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(set);
-    roots.pin_root(key);
+    let _ = roots.pin_root(set);
+    let _ = roots.pin_root(key);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(base + 1))
         .map_err(|error| {
         crate::baseobjspace::wrap_set_element_hash_error(

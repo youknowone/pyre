@@ -178,8 +178,7 @@ fn acquire(
 
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_obj);
-
+    let _ = roots.pin_root(w_obj);
     let view = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<CPyBuffer>() }));
     let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(obj_slot));
     let status = unsafe {
@@ -230,10 +229,10 @@ fn acquire(
     }
 
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(&format));
+    let _ = roots.pin_root(pyre_object::w_str_new(&format));
     if ndim != 1 {
-        roots.pin_root(wrap_dims(&shape));
-        roots.pin_root(wrap_dims(&strides));
+        let _ = roots.pin_root(wrap_dims(&shape));
+        let _ = roots.pin_root(wrap_dims(&strides));
     }
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
@@ -272,7 +271,7 @@ fn wrap_dims(dims: &[i64]) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     for &extent in dims {
-        roots.pin_root(pyre_object::w_int_new(extent));
+        let _ = roots.pin_root(pyre_object::w_int_new(extent));
     }
     let items = (0..dims.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(base + index))
@@ -523,8 +522,8 @@ pub unsafe extern "C" fn PyBuffer_SizeFromFormat(format: *const c_char) -> isize
     let sized = super::import_::import_module("_struct").and_then(|module| {
         let roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(module);
-        roots.pin_root(pyre_object::w_str_new(&format));
+        let _ = roots.pin_root(module);
+        let _ = roots.pin_root(pyre_object::w_str_new(&format));
         let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
         let calcsize = crate::baseobjspace::getattr_str(reload(0), "calcsize")?;
         let size = crate::call::call_function_impl_result(calcsize, &[reload(1)])?;
@@ -888,7 +887,7 @@ fn unowned_view(
     use pyre_object::bufferview::BufferView;
     let roots = pyre_object::gc_roots::push_roots();
     let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(format));
+    let _ = roots.pin_root(pyre_object::w_str_new(format));
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
     let w_obj = pyre_object::w_none();
     let built = BufferView::Raw {

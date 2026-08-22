@@ -431,7 +431,7 @@ impl ExecutionContext {
     #[inline]
     pub fn new() -> Self {
         let builtins_module = crate::builtins::new_builtin_module_dict();
-        pyre_object::gc_roots::pin_root(builtins_module);
+        let builtins_module = pyre_object::gc_roots::pin_root(builtins_module);
         Self {
             space: pyre_object::PY_NULL,
             topframeref: std::ptr::null_mut(),
@@ -662,7 +662,7 @@ impl ExecutionContext {
             // taken on this arm rather than for every frame that leaves.
             let _roots = pyre_object::gc_roots::push_roots();
             let exit_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(w_exitvalue);
+            let mut w_exitvalue = pyre_object::gc_roots::pin_root(w_exitvalue);
             let result = self._trace(
                 frame,
                 "leaveframe",
@@ -812,7 +812,7 @@ impl ExecutionContext {
         }
         let _roots = pyre_object::gc_roots::push_roots();
         let retval_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_retval);
+        let _ = pyre_object::gc_roots::pin_root(w_retval);
         // The callback is handed the value off its slot too: publication ends
         // in a forwarding query, which is a safepoint, and it rewrites the
         // slot rather than this frame's copy.
@@ -1535,7 +1535,7 @@ impl ExecutionContext {
         // module-dict cell may trigger a minor collection before the caller
         // has stored the new namespace anywhere else.
         let _root = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(dict);
+        let dict = pyre_object::gc_roots::pin_root(dict);
         unsafe {
             let w_builtin = self.get_builtin();
             if !w_builtin.is_null() {
@@ -2621,7 +2621,7 @@ impl UserDelAction {
                 Some(w) => {
                     // The deque entry was the object's only root; pin it across the __del__ call.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    pyre_object::gc_roots::pin_root(w);
+                    let w = pyre_object::gc_roots::pin_root(w);
                     self._call_finalizer(w);
                 }
             }
@@ -2649,7 +2649,7 @@ impl UserDelAction {
     pub fn _call_finalizer(&mut self, w_obj: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let current = || pyre_object::gc_roots::shadow_stack_get(root_base);
         crate::module::_weakref::interp__weakref::finalize_weakrefs(current());
         if let Some(pb) = crate::module::__pypy__::W_PickleBuffer::from_obj(current()) {
@@ -2736,7 +2736,7 @@ impl UserDelAction {
         // `__del__` runs arbitrary Python, so it can collect and move the
         // callable that the error report names; publish it and read it back
         // the way `current()` does for the receiver.
-        pyre_object::gc_roots::pin_root(w_del);
+        let _ = pyre_object::gc_roots::pin_root(w_del);
         let del_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let del = || pyre_object::gc_roots::shadow_stack_get(del_slot);
         // pyre's combined helper cannot distinguish get-vs-call errors;

@@ -55,7 +55,7 @@ impl GcMinorHookAction {
         self.reset();
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_minor });
+        let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_minor });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_minor_stats(
             count,
@@ -65,7 +65,7 @@ impl GcMinorHookAction {
             total_memory_used,
             pinned_objects,
         )?;
-        pyre_object::gc_roots::pin_root(stats);
+        let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
@@ -146,7 +146,7 @@ impl GcCollectStepHookAction {
         self.reset();
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect_step });
+        let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect_step });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_collect_step_stats_full(
             count,
@@ -157,7 +157,7 @@ impl GcCollectStepHookAction {
             newstate,
             super::is_done_states(oldstate, newstate),
         )?;
-        pyre_object::gc_roots::pin_root(stats);
+        let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
@@ -237,7 +237,7 @@ impl GcCollectHookAction {
         self.count = 0;
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect });
+        let _ = pyre_object::gc_roots::pin_root(unsafe { (*hooks).w_on_gc_collect });
         let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let stats = new_collect_stats(
             count,
@@ -249,7 +249,7 @@ impl GcCollectHookAction {
             rawmalloc_bytes_after,
             pinned_objects,
         )?;
-        pyre_object::gc_roots::pin_root(stats);
+        let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         crate::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
@@ -348,25 +348,25 @@ impl W_AppLevelHooks {
         // hook.py:100-107 — fetch all three first, so a missing later
         // attribute leaves the existing hook set untouched.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_obj);
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_a = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_minor",
         )?;
-        pyre_object::gc_roots::pin_root(w_a);
+        let _ = pyre_object::gc_roots::pin_root(w_a);
         let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_b = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect_step",
         )?;
-        pyre_object::gc_roots::pin_root(w_b);
+        let _ = pyre_object::gc_roots::pin_root(w_b);
         let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_c = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect",
         )?;
-        pyre_object::gc_roots::pin_root(w_c);
+        let _ = pyre_object::gc_roots::pin_root(w_c);
         let c_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         self.set_on_gc_minor(pyre_object::gc_roots::shadow_stack_get(a_slot));
         self.set_on_gc_collect_step(pyre_object::gc_roots::shadow_stack_get(b_slot));

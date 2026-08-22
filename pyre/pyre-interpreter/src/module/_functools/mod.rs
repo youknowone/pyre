@@ -66,7 +66,7 @@ fn key_wrapper_compare(
             pyre_object::gc_roots::shadow_stack_get(slot + 2),
         ],
     )?;
-    pyre_object::gc_roots::pin_root(result);
+    let _ = pyre_object::gc_roots::pin_root(result);
     // Build the comparison operand first: a custom numeric result makes
     // `w_int_new` allocate, and reading the result slot before that would leave
     // the argument naming a pre-move address.
@@ -163,7 +163,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
             }
             Err(err) => return Err(err),
         };
-    pyre_object::gc_roots::pin_root(w_iter);
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let initial = if effective.len() == 3 {
@@ -179,13 +179,13 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
             Err(err) => return Err(err),
         }
     };
-    pyre_object::gc_roots::pin_root(initial);
+    let _ = pyre_object::gc_roots::pin_root(initial);
     let initial_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let accumulator =
         pyre_object::listobject::w_list_new(vec![pyre_object::gc_roots::shadow_stack_get(
             initial_slot,
         )]);
-    pyre_object::gc_roots::pin_root(accumulator);
+    let _ = pyre_object::gc_roots::pin_root(accumulator);
     let accumulator_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     loop {
@@ -199,7 +199,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
         // transient values in their own root scope: the reducer is arbitrary
         // Python and `w_list_setitem` may switch list strategy and allocate.
         let _iteration_roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
         let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let current = unsafe {
             pyre_object::listobject::w_list_getitem(
@@ -212,7 +212,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
             pyre_object::gc_roots::shadow_stack_get(function_slot),
             &[current, pyre_object::gc_roots::shadow_stack_get(item_slot)],
         )?;
-        pyre_object::gc_roots::pin_root(result);
+        let _ = pyre_object::gc_roots::pin_root(result);
         let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::listobject::w_list_setitem(

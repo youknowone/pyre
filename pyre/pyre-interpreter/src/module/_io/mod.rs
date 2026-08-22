@@ -149,7 +149,7 @@ pub(crate) fn unsupported(message: &str) -> crate::PyError {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_str_new(message));
+    let _ = pyre_object::gc_roots::pin_root(w_str_new(message));
     match crate::call::call_function_impl_result(
         w_type,
         &[pyre_object::gc_roots::shadow_stack_get(sp)],
@@ -169,7 +169,7 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
     // PyPy `close_w`: `flush()` runs while `closed` is still false, and the
     // internal flag is set in `finally`, even when the virtual flush raises.
     let flushed = call_method_result(
@@ -401,7 +401,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let target_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_iobase);
+    let _ = pyre_object::gc_roots::pin_root(w_iobase);
     loop {
         let (index, generation, handle) = {
             let mut flusher = AUTOFLUSHER.lock().unwrap();
@@ -465,7 +465,7 @@ pub fn flush_all_streams() {
         let _handle_roots = pyre_object::gc_roots::push_roots();
         let handles_root = pyre_object::gc_roots::shadow_stack_len();
         for &handle in &handles {
-            pyre_object::gc_roots::pin_root(handle);
+            let _ = pyre_object::gc_roots::pin_root(handle);
         }
         let mut progress = false;
         for index in 0..handles.len() {
@@ -476,7 +476,7 @@ pub fn flush_all_streams() {
             if stream.is_null() {
                 continue;
             }
-            pyre_object::gc_roots::pin_root(stream);
+            let _ = pyre_object::gc_roots::pin_root(stream);
             progress = true;
             // "Silencing all errors is bad, but getting randomly interrupted
             // here is equally as bad, and potentially more frequent (because of
@@ -634,10 +634,10 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
 
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    pyre_object::gc_roots::pin_root(lines);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(lines);
     let iterator = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
-    pyre_object::gc_roots::pin_root(iterator);
+    let iterator = pyre_object::gc_roots::pin_root(iterator);
     loop {
         let iterator = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         let line = match crate::baseobjspace::next(iterator) {
@@ -646,7 +646,7 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
             Err(err) => return Err(err),
         };
         let _line_root = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(line);
+        let _ = pyre_object::gc_roots::pin_root(line);
         let line =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         call_method_result(
@@ -690,8 +690,8 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
 
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    pyre_object::gc_roots::pin_root(peek.unwrap_or(PY_NULL));
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(peek.unwrap_or(PY_NULL));
     let mut output = Vec::new();
     while limit < 0 || output.len() < limit as usize {
         let mut nreadahead = 1usize;
@@ -758,7 +758,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     let iterator = crate::baseobjspace::iter(self_obj)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(iterator);
+    let _ = pyre_object::gc_roots::pin_root(iterator);
     let lines_sp = pyre_object::gc_roots::shadow_stack_len();
     let mut count = 0usize;
     let mut length = 0i64;
@@ -769,7 +769,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
             Err(error) => return Err(error),
         };
         length = length.saturating_add(crate::baseobjspace::len_w(line)?);
-        pyre_object::gc_roots::pin_root(line);
+        let _ = pyre_object::gc_roots::pin_root(line);
         count += 1;
         if hint > 0 && length > hint {
             break;
@@ -989,8 +989,8 @@ fn rawiobase_read(args: &[PyObjectRef]) -> crate::PyResult {
 
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
-    pyre_object::gc_roots::pin_root(pyre_object::bytearrayobject::w_bytearray_new(size));
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::bytearrayobject::w_bytearray_new(size));
     let length = call_method_result(
         pyre_object::gc_roots::shadow_stack_get(sp),
         "readinto",
@@ -1029,7 +1029,7 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
 
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_obj);
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
     let mut output = Vec::new();
     loop {
         let data = call_method_result(

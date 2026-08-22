@@ -154,7 +154,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     // pre-move pointer and every later probe dereferences reclaimed memory.
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -393,7 +393,7 @@ pub unsafe fn dict_entries_insert_object(
     // here and insert the reloaded one.
     let roots = crate::gc_roots::push_roots();
     let value_slot = roots.base();
-    roots.pin_root(value);
+    let _ = roots.pin_root(value);
     let object_key = object_key_for(key);
     entries.insert(object_key, roots.get(value_slot));
 }
@@ -619,7 +619,7 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     // key caches the pointer, so key on the reloaded address.
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
     if crate::dict_eq_hook::take_hash_error() {
@@ -1492,7 +1492,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
     let mut value = value;
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value.dstorage as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(value.dstorage as PyObjectRef);
     let raw = if stable {
         crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
     } else {
@@ -2124,7 +2124,7 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
         // whichever arm writes it.
         let roots = crate::gc_roots::push_roots();
         let value_slot = roots.base();
-        roots.pin_root(w_value);
+        let _ = roots.pin_root(w_value);
         let entries = w_module_dict_object_storage_mut(obj);
         match dict_entries_index_of_str(entries, key, 0) {
             Some(idx) => {
@@ -2598,7 +2598,7 @@ macro_rules! with_dict_rooted {
     ($obj:ident, $body:expr) => {{
         let _scope = crate::gc_roots::push_roots();
         let slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root($obj);
+        let _ = crate::gc_roots::pin_root($obj);
         let result = $body;
         $obj = crate::gc_roots::shadow_stack_get(slot);
         result
@@ -2673,8 +2673,7 @@ unsafe fn scan_dict_key_reentrant(
         // fresh allocation, so a stale index would compare the wrong key.
         let _attempt = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(obj);
-        obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        obj = crate::gc_roots::pin_root(obj);
         let (table_capacity, clear_generation) = (
             dict_entries_capacity(scan_object_entries(obj)),
             scan_clear_generation(obj),
@@ -2693,9 +2692,9 @@ unsafe fn scan_dict_key_reentrant(
             if stored_hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(stored_obj);
+                let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(key.obj);
+                let _ = crate::gc_roots::pin_root(key.obj);
 
                 let equal = dict_keys_equal(stored_obj, key.obj);
                 obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -3111,7 +3110,7 @@ pub unsafe fn w_dict_setdefault_checked(
         // and reload it alongside the container the scan returns.
         let _value_root = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(value);
+        let _ = crate::gc_roots::pin_root(value);
         let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
         let value = crate::gc_roots::shadow_stack_get(value_slot);
         if let Some(i) = found {
@@ -3357,7 +3356,7 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     // and reload it alongside the container the scan returns.
     let _value_root = crate::gc_roots::push_roots();
     let value_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value);
+    let _ = crate::gc_roots::pin_root(value);
     let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
     let value = crate::gc_roots::shadow_stack_get(value_slot);
     match found {
@@ -4000,7 +3999,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         // the identity check), then remove in place on the module storage.
         let _value_root = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(value);
+        let _ = crate::gc_roots::pin_root(value);
         let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
         let value = crate::gc_roots::shadow_stack_get(value_slot);
         let Some(index) = found else {
@@ -4051,7 +4050,7 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     // and reload it alongside the container the scan returns.
     let _value_root = crate::gc_roots::push_roots();
     let value_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(value);
+    let _ = crate::gc_roots::pin_root(value);
     let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
     let value = crate::gc_roots::shadow_stack_get(value_slot);
     let Some(index) = found else {
@@ -4779,7 +4778,7 @@ pub unsafe fn w_dict_nth_item_int_strategy(
     // Wrapping the key collects, and `v` is a bare local by then.
     let roots = crate::gc_roots::push_roots();
     let value_slot = roots.base();
-    roots.pin_root(v);
+    let _ = roots.pin_root(v);
     let w_key = crate::w_int_new(k);
     Some((w_key, roots.get(value_slot)))
 }
@@ -4824,7 +4823,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     // from those slots once every allocation is behind us.
     let roots = crate::gc_roots::push_roots();
     let dict_slot = roots.base();
-    roots.pin_root(w_dict);
+    let w_dict = roots.pin_root(w_dict);
     // Borrow the old typed box (its field stays live, so it is traced
     // while the migration allocates keys); after the store the box is
     // unreachable and the sweep reclaims it.
@@ -4970,7 +4969,7 @@ pub unsafe fn w_dict_nth_item_bytes_strategy(
     // Wrapping the key collects, and `value` is a bare local by then.
     let roots = crate::gc_roots::push_roots();
     let value_slot = roots.base();
-    roots.pin_root(*v);
+    let _ = roots.pin_root(*v);
     let w_key = crate::w_bytes_from_bytes(key_bytes.as_slice());
     Some((w_key, roots.get(value_slot)))
 }
@@ -5000,7 +4999,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     // same three reasons.
     let roots = crate::gc_roots::push_roots();
     let dict_slot = roots.base();
-    roots.pin_root(w_dict);
+    let w_dict = roots.pin_root(w_dict);
     let old = &*((*(w_dict as *const W_DictObject)).dstorage as *const BytesDictStorage);
     let len = old.len();
     let mut hashes = Vec::with_capacity(len);
@@ -5212,7 +5211,7 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         let roots = crate::gc_roots::push_roots();
         let keys_base = roots.base();
         for k in strategy.getiterkeys(storage) {
-            roots.pin_root(crate::w_str_new(k));
+            let _ = roots.pin_root(crate::w_str_new(k));
         }
         strategy
             .getitervalues(storage)
@@ -5256,7 +5255,7 @@ pub unsafe fn w_module_dict_nth_item_inner(
     // back afterwards — the cell storage keeps it traced.
     let roots = crate::gc_roots::push_roots();
     let key_slot = roots.base();
-    roots.pin_root(crate::w_str_new(key));
+    let _ = roots.pin_root(crate::w_str_new(key));
     let value = strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)?;
     Some((roots.get(key_slot), value))
 }
@@ -5515,7 +5514,7 @@ fn w_dict_view_iterator_new_direction(
     let tp = dict_view_iterator_type_for_kind(kind, reverse);
     let _roots = crate::gc_roots::push_roots();
     let dict_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_dict);
+    let _ = crate::gc_roots::pin_root(w_dict);
     let startlen = unsafe { w_dict_len(crate::gc_roots::shadow_stack_get(dict_slot)) };
     let start_keys_version =
         unsafe { w_dict_keys_version(crate::gc_roots::shadow_stack_get(dict_slot)) };
@@ -5686,7 +5685,7 @@ pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let tp = dict_view_type_for_kind(kind);
     let _roots = crate::gc_roots::push_roots();
     let dict_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_dict);
+    let _ = crate::gc_roots::pin_root(w_dict);
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
     let value = W_DictViewObject {
@@ -5998,7 +5997,7 @@ pub trait DictStrategy {
         let value_slot = dict_slot + 3;
         let w_item = self.getitem(w_dict, w_key);
         if let Some(val) = w_item {
-            roots.pin_root(val);
+            let _ = roots.pin_root(val);
             if !self.delitem(roots.get(dict_slot), roots.get(dict_slot + 1)) {
                 return Err(DictPopError);
             }
@@ -6025,7 +6024,7 @@ pub trait DictStrategy {
         // the removal and the returned pair is stale after it.
         let roots = crate::gc_roots::push_roots();
         let dict_slot = roots.base();
-        roots.pin_root(w_dict);
+        let w_dict = roots.pin_root(w_dict);
         let mut items = self.items(w_dict);
         let (w_key, w_value) = items.pop()?;
         let pair_base = roots.publish(&[w_key, w_value]);
@@ -6316,7 +6315,7 @@ pub struct EmptyDictStrategy;
 unsafe fn install_empty_strategy(w_dict: PyObjectRef, strategy: &'static DictStrategyRef) {
     let _roots = crate::gc_roots::push_roots();
     let dict_slot = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_dict);
+    let _ = crate::gc_roots::pin_root(w_dict);
     let storage = strategy.get_empty_storage();
     let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
     let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
@@ -7070,7 +7069,7 @@ impl DictStrategy for BytesDictStrategy {
 
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(value);
+        let _ = crate::gc_roots::pin_root(value);
         let w_key = crate::w_bytes_from_bytes(key.as_slice());
         let value = crate::gc_roots::shadow_stack_get(value_slot);
         Some((w_key, value))
@@ -7521,7 +7520,7 @@ impl DictStrategy for IntDictStrategy {
 
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(value);
+        let _ = crate::gc_roots::pin_root(value);
         let w_key = crate::w_int_new(key);
         let value = crate::gc_roots::shadow_stack_get(value_slot);
         Some((w_key, value))

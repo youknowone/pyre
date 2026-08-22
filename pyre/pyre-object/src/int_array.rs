@@ -104,7 +104,7 @@ impl IntArray {
     #[must_use]
     pub fn pin_block(&self) -> usize {
         let slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(self.block as crate::PyObjectRef);
+        let _ = crate::gc_roots::pin_root(self.block as crate::PyObjectRef);
         slot
     }
 

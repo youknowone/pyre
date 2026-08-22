@@ -34,7 +34,7 @@ pub struct W_SetIterObject {
 )]
 pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_set);
+    let w_set = crate::gc_roots::pin_root(w_set);
     let startlen = unsafe { w_set_len(w_set) };
     W_SetIterObject::allocate_stable(W_SetIterObject {
         ob: PyObject {
@@ -455,9 +455,9 @@ unsafe fn scan_set_key_reentrant(
             if stored_hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(stored_obj);
+                let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(key.obj);
+                let _ = crate::gc_roots::pin_root(key.obj);
 
                 let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
@@ -494,7 +494,7 @@ unsafe fn scan_set_key_reentrant(
 #[inline]
 unsafe fn capture_set_items(obj: PyObjectRef) -> *mut SetItemsStorage {
     let items = (*(obj as *const W_SetObject)).items;
-    crate::gc_roots::pin_root(items as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     items
 }
 
@@ -747,7 +747,7 @@ pub unsafe fn w_set_difference_update_from_set(
         // probe runs is a collection point that would otherwise sweep it.
         let _roots = crate::gc_roots::push_roots();
         let result = w_set_new();
-        crate::gc_roots::pin_root(result);
+        let result = crate::gc_roots::pin_root(result);
         let dst_items = (*(dst as *const W_SetObject)).items;
         let dst_len = (*dst_items).len();
         let mut i = 0;
@@ -952,9 +952,9 @@ unsafe fn w_set_contains_key_for_update(
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(stored.obj);
+                let _ = crate::gc_roots::pin_root(stored.obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(key.obj);
+                let _ = crate::gc_roots::pin_root(key.obj);
                 let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
                 key.obj = crate::gc_roots::shadow_stack_get(key_slot);
@@ -1019,9 +1019,9 @@ unsafe fn w_set_remove_key_for_update(
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(stored.obj);
+                let _ = crate::gc_roots::pin_root(stored.obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                crate::gc_roots::pin_root(key.obj);
+                let _ = crate::gc_roots::pin_root(key.obj);
                 let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
                 key.obj = crate::gc_roots::shadow_stack_get(key_slot);

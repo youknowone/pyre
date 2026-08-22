@@ -132,7 +132,7 @@ const BCJ_KIND: FilterKind = FilterKind {
 fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::PyError> {
     let _roots = push_roots();
     let spec_slot = shadow_stack_len();
-    pin_root(spec);
+    let spec = pin_root(spec);
     let spec = || shadow_stack_get(spec_slot);
 
     if unsafe { crate::baseobjspace::lookup(spec(), "__getitem__") }.is_none() {
@@ -229,7 +229,7 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
 fn parse_filter_chain(filters: PyObjectRef) -> Result<Vec<backend::FilterSpec>, crate::PyError> {
     let _roots = push_roots();
     let filters_slot = shadow_stack_len();
-    pin_root(filters);
+    let filters = pin_root(filters);
     let filters = || shadow_stack_get(filters_slot);
 
     let count = crate::runtime_ops::sequence_len(filters())?;
@@ -308,7 +308,7 @@ mod compressor_methods {
             // here on rather than in this argument.
             let _roots = push_roots();
             let filters_slot = shadow_stack_len();
-            pin_root(filters);
+            let filters = pin_root(filters);
             let filters = || shadow_stack_get(filters_slot);
 
             if format != backend::FORMAT_XZ && check != -1 && check != backend::CHECK_NONE as i32 {
@@ -400,7 +400,7 @@ mod decompressor_methods {
             // caller's own, so the chain moves to a shadow-stack slot first.
             let _roots = push_roots();
             let filters_slot = shadow_stack_len();
-            pin_root(filters);
+            let filters = pin_root(filters);
             let filters = || shadow_stack_get(filters_slot);
 
             let memlimit = if unsafe { is_none(memlimit) } {
@@ -613,7 +613,7 @@ crate::py_module! {
             // is read back out of its slot for every one of them.
             let _roots = push_roots();
             let dict_slot = shadow_stack_len();
-            pin_root(w_dict_new());
+            let _ = pin_root(w_dict_new());
             let dict = || shadow_stack_get(dict_slot);
             let id = w_int_new(decoded.id as i64);
             unsafe { w_dict_setitem_str(dict(), "id", id) };

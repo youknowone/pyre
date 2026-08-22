@@ -92,8 +92,8 @@ pub struct W_Count {
 pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_firstval);
-    crate::gc_roots::pin_root(w_step);
+    let w_firstval = crate::gc_roots::pin_root(w_firstval);
+    let w_step = crate::gc_roots::pin_root(w_step);
     W_Count::allocate_stable(W_Count {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -176,7 +176,7 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
     };
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_obj);
+    let w_obj = crate::gc_roots::pin_root(w_obj);
     W_Repeat::allocate_stable(W_Repeat {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -257,8 +257,8 @@ pub struct W_TakeWhile {
 pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_predicate);
-    crate::gc_roots::pin_root(w_iterable);
+    let w_predicate = crate::gc_roots::pin_root(w_predicate);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     W_TakeWhile::allocate_stable(W_TakeWhile {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -302,8 +302,8 @@ pub struct W_DropWhile {
 pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_predicate);
-    crate::gc_roots::pin_root(w_iterable);
+    let w_predicate = crate::gc_roots::pin_root(w_predicate);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     W_DropWhile::allocate_stable(W_DropWhile {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -355,9 +355,9 @@ pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> P
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     if !w_predicate.is_null() {
-        crate::gc_roots::pin_root(w_predicate);
+        let _ = crate::gc_roots::pin_root(w_predicate);
     }
-    crate::gc_roots::pin_root(w_iterable);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     W_FilterFalse::allocate_stable(W_FilterFalse {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -407,7 +407,7 @@ pub struct W_ISlice {
 /// `space.iter`).  All numeric arguments have already passed `arg_int_w`.
 pub fn w_islice_new(iterable: PyObjectRef, start: i64, stop: i64, step: i64) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(iterable);
+    let iterable = crate::gc_roots::pin_root(iterable);
     W_ISlice::allocate_stable(W_ISlice {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -459,7 +459,7 @@ pub struct W_Batched {
 /// `PyObject_GetIter` before allocating the instance).
 pub fn w_batched_new(it: PyObjectRef, batch_size: isize, strict: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(it);
+    let it = crate::gc_roots::pin_root(it);
     W_Batched::allocate_stable(W_Batched {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -519,8 +519,8 @@ pub struct W_Product {
 
 pub fn w_product_new(gears: PyObjectRef, indices: PyObjectRef, stopped: bool) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(gears);
-    crate::gc_roots::pin_root(indices);
+    let gears = crate::gc_roots::pin_root(gears);
+    let indices = crate::gc_roots::pin_root(indices);
     W_Product::allocate_stable(W_Product {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -563,8 +563,8 @@ pub fn w_combinations_new(
     stopped: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(pool_w);
-    crate::gc_roots::pin_root(indices);
+    let pool_w = crate::gc_roots::pin_root(pool_w);
+    let indices = crate::gc_roots::pin_root(indices);
     W_Combinations::allocate_stable(W_Combinations {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -611,8 +611,8 @@ pub fn w_combinations_with_replacement_new(
     stopped: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(pool_w);
-    crate::gc_roots::pin_root(indices);
+    let pool_w = crate::gc_roots::pin_root(pool_w);
+    let indices = crate::gc_roots::pin_root(indices);
     W_CombinationsWithReplacement::allocate_stable(W_CombinationsWithReplacement {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -659,12 +659,12 @@ pub fn w_permutations_new(
     cycles: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(pool_w);
+    let pool_w = crate::gc_roots::pin_root(pool_w);
     if !indices.is_null() {
-        crate::gc_roots::pin_root(indices);
+        let _ = crate::gc_roots::pin_root(indices);
     }
     if !cycles.is_null() {
-        crate::gc_roots::pin_root(cycles);
+        let _ = crate::gc_roots::pin_root(cycles);
     }
     W_Permutations::allocate_stable(W_Permutations {
         ob: PyObject {
@@ -707,8 +707,8 @@ pub struct W_GroupBy {
 
 pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterator);
-    crate::gc_roots::pin_root(w_keyfunc);
+    let w_iterator = crate::gc_roots::pin_root(w_iterator);
+    let w_keyfunc = crate::gc_roots::pin_root(w_keyfunc);
     W_GroupBy::allocate_stable(W_GroupBy {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -739,8 +739,8 @@ pub struct W_GroupByIterator {
 
 pub fn w_groupby_iterator_new(groupby: PyObjectRef, w_tgtkey: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(groupby);
-    crate::gc_roots::pin_root(w_tgtkey);
+    let groupby = crate::gc_roots::pin_root(groupby);
+    let w_tgtkey = crate::gc_roots::pin_root(w_tgtkey);
     let grouper = W_GroupByIterator::allocate_stable(W_GroupByIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -803,9 +803,9 @@ pub struct W_TeeIterable {
 
 pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterator);
+    let w_iterator = crate::gc_roots::pin_root(w_iterator);
     if !w_chained_list.is_null() {
-        crate::gc_roots::pin_root(w_chained_list);
+        let _ = crate::gc_roots::pin_root(w_chained_list);
     }
     W_TeeIterable::allocate_stable(W_TeeIterable {
         ob: PyObject {
@@ -848,8 +848,8 @@ pub struct W_Compress {
 /// `W_Compress.__init__`.
 pub fn w_compress_new(w_data: PyObjectRef, w_selectors: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_data);
-    crate::gc_roots::pin_root(w_selectors);
+    let w_data = crate::gc_roots::pin_root(w_data);
+    let w_selectors = crate::gc_roots::pin_root(w_selectors);
     W_Compress::allocate_stable(W_Compress {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -891,8 +891,8 @@ pub struct W_StarMap {
 /// `w_iterable` must already have had `space.iter` applied.
 pub fn w_starmap_new(w_fun: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_fun);
-    crate::gc_roots::pin_root(w_iterable);
+    let w_fun = crate::gc_roots::pin_root(w_fun);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     W_StarMap::allocate_stable(W_StarMap {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -933,11 +933,11 @@ pub fn w_accumulate_new(
     w_initial: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterable);
+    let w_iterable = crate::gc_roots::pin_root(w_iterable);
     if !w_func.is_null() {
-        crate::gc_roots::pin_root(w_func);
+        let _ = crate::gc_roots::pin_root(w_func);
     }
-    crate::gc_roots::pin_root(w_initial);
+    let w_initial = crate::gc_roots::pin_root(w_initial);
     W_Accumulate::allocate_stable(W_Accumulate {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -996,8 +996,8 @@ pub fn w_zip_longest_new(
     active: i64,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterators);
-    crate::gc_roots::pin_root(w_fillvalue);
+    let w_iterators = crate::gc_roots::pin_root(w_iterators);
+    let w_fillvalue = crate::gc_roots::pin_root(w_fillvalue);
     W_ZipLongest::allocate_stable(W_ZipLongest {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -1040,7 +1040,7 @@ pub struct W_Pairwise {
 pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterator);
+    let w_iterator = crate::gc_roots::pin_root(w_iterator);
     W_Pairwise::allocate_stable(W_Pairwise {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -1125,9 +1125,9 @@ pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
     // rather than from the parameter copy that collection left pre-move.
     let roots = crate::gc_roots::push_roots();
     let iterable_slot = roots.base();
-    roots.pin_root(w_iterable);
+    let _ = roots.pin_root(w_iterable);
     let saved = crate::listobject::w_list_new(Vec::new());
-    roots.pin_root(saved);
+    let saved = roots.pin_root(saved);
     W_Cycle::allocate_stable(W_Cycle {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -1192,7 +1192,7 @@ pub struct W_Chain {
 pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterables);
+    let w_iterables = crate::gc_roots::pin_root(w_iterables);
     W_Chain::allocate_stable(W_Chain {
         ob: PyObject {
             ob_type: std::ptr::null(),

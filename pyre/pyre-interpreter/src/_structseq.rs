@@ -531,7 +531,7 @@ pub fn new_instance_with_extra(
     } else {
         pyre_object::w_tuple_new_array_backed(rooted_items)
     };
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // The tuple constructor can collect; the pin at `cls_slot` makes this
     // post-allocation address current.
@@ -543,7 +543,7 @@ pub fn new_instance_with_extra(
     }
     if !extras.is_empty() {
         let w_dict = pyre_object::w_dict_new();
-        pyre_object::gc_roots::pin_root(w_dict);
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         for (index, (key, _)) in extras.iter().enumerate() {
             unsafe {
@@ -800,7 +800,7 @@ fn make_heap_structseq_type(
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
-    pyre_object::gc_roots::pin_root(ns);
+    let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
 
     let (module, short_name) = full_name
@@ -818,14 +818,14 @@ fn make_heap_structseq_type(
     }
 
     let bases = pyre_object::w_tuple_new(vec![base]);
-    pyre_object::gc_roots::pin_root(bases);
+    let _ = pyre_object::gc_roots::pin_root(bases);
     let bases_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let cls = pyre_object::w_type_new(
         short_name,
         pyre_object::gc_roots::shadow_stack_get(bases_slot),
         pyre_object::gc_roots::shadow_stack_get(ns_slot) as *mut u8,
     );
-    pyre_object::gc_roots::pin_root(cls);
+    let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     unsafe {

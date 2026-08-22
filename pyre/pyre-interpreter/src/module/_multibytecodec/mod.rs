@@ -269,7 +269,7 @@ fn encode_impl(
     // from there rather than kept as a Rust local across the call.
     let roots = pyre_object::gc_roots::push_roots();
     let input_slot = roots.base();
-    roots.pin_root(w_input);
+    let _ = roots.pin_root(w_input);
     let input = unsafe { pyre_object::w_str_get_wtf8(roots.get(input_slot)) };
     let (mut units, boundaries) = text_to_wchars(input);
     let codec = codec_ptr(name).ok_or_else(|| {

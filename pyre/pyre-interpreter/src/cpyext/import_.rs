@@ -18,9 +18,9 @@ pub(super) fn import_module(name: &str) -> Result<PyObjectRef, crate::PyError> {
     // `__import__` is pinned before the name is built: minting the string
     // allocates, and a collection there would leave this a pre-move address.
     let import_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(import);
+    let import = roots.pin_root(import);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(name));
+    let _ = roots.pin_root(pyre_object::w_str_new(name));
     // `__import__` answers with the top-level package, so the submodule is
     // read back out of `sys.modules` afterwards.
     crate::call::call_function_impl_result(
@@ -204,8 +204,8 @@ fn import_module_level(
     let import = crate::baseobjspace::getattr_str(builtins, "__import__")?;
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(import);
-    roots.pin_root(name);
+    let _ = roots.pin_root(import);
+    let _ = roots.pin_root(name);
     // Each default allocates, so every argument is on the stack before the
     // next one is built and all five are read back afterwards.
     for (raw, default) in [(globals, None), (locals, None), (fromlist, Some(()))] {
@@ -217,9 +217,9 @@ fn import_module_level(
         } else {
             pyre_object::w_none()
         };
-        roots.pin_root(value);
+        let _ = roots.pin_root(value);
     }
-    roots.pin_root(pyre_object::w_int_new(level));
+    let _ = roots.pin_root(pyre_object::w_int_new(level));
     let at = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     crate::call::call_function_impl_result(at(0), &[at(1), at(2), at(3), at(4), at(5)])
 }
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn PyImport_AddModuleRef(name: *const c_char) -> *mut CPyO
     let roots = pyre_object::gc_roots::push_roots();
     let module = pyre_object::module::w_module_new(&name);
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     crate::importing::set_sys_module(&name, pyre_object::gc_roots::shadow_stack_get(module_slot));
     pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }

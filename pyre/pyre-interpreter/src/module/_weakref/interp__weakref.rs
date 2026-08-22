@@ -89,7 +89,7 @@ fn field_slot(obj: PyObjectRef, name: &str) -> Option<u32> {
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     if let Some(slot) = field_slot(pyre_object::gc_roots::shadow_stack_get(root_base), name) {
         let value = unsafe {
             crate::objspace::std::mapdict::getslotvalue(
@@ -108,7 +108,7 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     if w_dict.is_null() {
         return PY_NULL;
     }
-    pyre_object::gc_roots::pin_root(w_dict);
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
     let value = unsafe {
         pyre_object::w_dict_getitem_str(
             pyre_object::gc_roots::shadow_stack_get(root_base + 1),
@@ -127,8 +127,8 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
 fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
-    pyre_object::gc_roots::pin_root(value);
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(value);
     if let Some(slot) = field_slot(pyre_object::gc_roots::shadow_stack_get(root_base), name) {
         unsafe {
             crate::objspace::std::mapdict::setslotvalue(
@@ -142,7 +142,7 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     let w_dict =
         crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
     if !w_dict.is_null() {
-        pyre_object::gc_roots::pin_root(w_dict);
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
         unsafe {
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(root_base + 2),
@@ -489,12 +489,12 @@ pub fn weakref_lifeline_new() -> PyObjectRef {
 fn append_wref_to(self_lifeline: PyObjectRef, w_ref: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(self_lifeline);
-    pyre_object::gc_roots::pin_root(w_ref);
+    let _ = pyre_object::gc_roots::pin_root(self_lifeline);
+    let _ = pyre_object::gc_roots::pin_root(w_ref);
     let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
         pyre_object::gc_roots::shadow_stack_get(root_base + 1),
     );
-    pyre_object::gc_roots::pin_root(weak);
+    let _ = pyre_object::gc_roots::pin_root(weak);
     let lifeline = pyre_object::gc_roots::shadow_stack_get(root_base);
     let mut refs = unsafe { pyre_object::weakref::w_weakref_lifeline_other_refs(lifeline) };
     if refs.is_null() {
@@ -734,12 +734,12 @@ pub fn W_Weakref_new(
     let exact_type = std::ptr::eq(actual_type, weakref_type());
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
-    pyre_object::gc_roots::pin_root(w_callable);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_callable);
     let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
         pyre_object::gc_roots::shadow_stack_get(root_base),
     );
-    pyre_object::gc_roots::pin_root(w_obj_weak);
+    let _ = pyre_object::gc_roots::pin_root(w_obj_weak);
     let callable = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let callable = if !callable.is_null() && !unsafe { pyre_object::is_none(callable) } {
         callable
@@ -897,7 +897,7 @@ pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
 pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
     let current_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let cached = weakref_hash(current_self());
     if !cached.is_null() {
@@ -912,7 +912,7 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // `hash_w_strict` can run a user-defined `__hash__`, which allocates, so
     // the referent is rooted across the call and `current_self` re-reads the
     // reference afterwards.
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let h = pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -1046,11 +1046,11 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
     // primitive exactly as `delitem_if_value_is(d, key, wr)` does upstream.
     let _roots = pyre_object::gc_roots::push_roots();
     let backing_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(backing);
+    let _ = pyre_object::gc_roots::pin_root(backing);
     let key_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(key);
+    let _ = pyre_object::gc_roots::pin_root(key);
     let stored_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(stored);
+    let stored = pyre_object::gc_roots::pin_root(stored);
     let result = crate::call::call_function_impl_result(stored, &[])?;
     if !unsafe { pyre_object::is_none(result) } {
         return Ok(pyre_object::w_none());
@@ -1127,8 +1127,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
-
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     // RPython's local `items` list is GC-transformed together with every
     // element. A Rust Vec only holds copied raw pointers, so retain the same
     // collection in shadow-stack slots while reads below can allocate.
@@ -1136,7 +1135,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
     let others = unsafe { pyre_object::weakref::w_weakref_lifeline_other_refs(w_obj) };
     if !others.is_null() {
         let others_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(others);
+        let _ = pyre_object::gc_roots::pin_root(others);
         let length = unsafe {
             pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(others_slot))
         };
@@ -1152,7 +1151,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
             let w_ref = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
             if !w_ref.is_null() {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(w_ref);
+                let _ = pyre_object::gc_roots::pin_root(w_ref);
                 ref_slots.push(slot);
             }
         }
@@ -1169,7 +1168,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
         }
         let _call_roots = pyre_object::gc_roots::push_roots();
         let call_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_callable);
+        let _ = pyre_object::gc_roots::pin_root(w_callable);
         let current_ref = || pyre_object::gc_roots::shadow_stack_get(slot);
         let current_callable = || pyre_object::gc_roots::shadow_stack_get(call_base);
         if let Err(error) =

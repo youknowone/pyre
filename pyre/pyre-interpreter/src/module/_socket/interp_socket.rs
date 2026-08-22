@@ -162,11 +162,11 @@ struct SocketWritableBuffer {
 impl SocketWritableBuffer {
     unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, crate::PyError> {
         let roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let (data, owner) =
             socket_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
-        pyre_object::gc_roots::pin_root(owner);
+        let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
         let held = crate::builtins::buffer_export_incref(owner);
@@ -2004,9 +2004,9 @@ fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, cr
         // that follows it and is re-read from its slot afterwards.
         let _roots = pyre_object::gc_roots::push_roots();
         let aliases_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_list_new(aliases));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(aliases));
         let addrs_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_list_new(addrs));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(addrs));
         Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new(&name),
             pyre_object::gc_roots::shadow_stack_get(aliases_slot),
@@ -2700,7 +2700,7 @@ fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
     // in a plain vector while the next allocation runs.
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_list_new_empty());
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new_empty());
     let outcome = (|| {
         for index in 0..unsafe { (*table).NumEntries } as usize {
             let row = unsafe { &*(*table).Table.as_ptr().add(index) };
@@ -2794,7 +2794,7 @@ fn ioctl_keepalive_w(obj: pyre_object::PyObjectRef) -> Result<[u32; 3], crate::P
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &items {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let mut values = [0u32; 3];
     for (index, value) in values.iter_mut().enumerate() {

@@ -151,9 +151,9 @@ pub(crate) fn slice_unpack(
 ) -> Result<(i64, i64, i64), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_start);
-    pyre_object::gc_roots::pin_root(w_stop);
-    pyre_object::gc_roots::pin_root(w_step);
+    let _ = pyre_object::gc_roots::pin_root(w_start);
+    let _ = pyre_object::gc_roots::pin_root(w_stop);
+    let _ = pyre_object::gc_roots::pin_root(w_step);
     let (start_slot, stop_slot, step_slot) = (base, base + 1, base + 2);
     let step = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(step_slot)) } {
         1

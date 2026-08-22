@@ -248,9 +248,9 @@ fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
     // frame `call_builtin_code_positional` builds for the interpreter entry.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
-    _roots.pin_root(code);
+    let _ = _roots.pin_root(code);
     for &arg in args {
-        _roots.pin_root(arg as PyObjectRef);
+        let _ = _roots.pin_root(arg as PyObjectRef);
     }
     let mut rooted = [PY_NULL; MAX_KNOWN_BUILTIN_ARGS];
     for (index, slot) in rooted[..args.len()].iter_mut().enumerate() {
@@ -597,10 +597,10 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let _roots = pyre_object::gc_roots::push_roots();
     let items_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in items {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_dict_new());
+    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
     let dict = || pyre_object::gc_roots::shadow_stack_get(dict_slot);
     for index in (0..items.len() - items.len() % 2).step_by(2) {
         let key = pyre_object::gc_roots::shadow_stack_get(items_base + index);
@@ -739,7 +739,7 @@ pub fn store_slice_values(
     roots.publish(&[obj, value]);
     roots.normalize(obj_slot, 2);
     let slice = pyre_object::w_slice_new(start, stop, pyre_object::w_none());
-    roots.pin_root(slice);
+    let slice = roots.pin_root(slice);
     crate::baseobjspace::setitem(roots.get(obj_slot), slice, roots.get(value_slot))?;
     Ok(())
 }
@@ -799,7 +799,7 @@ pub fn binary_slice_values(
             let mut fetched = 0usize;
             for i in s..e {
                 if let Some(v) = pyre_object::w_list_getitem(roots.get(obj_slot), i as i64) {
-                    roots.pin_root(v);
+                    let _ = roots.pin_root(v);
                     fetched += 1;
                 }
             }
@@ -859,7 +859,7 @@ pub fn binary_slice_values(
             let mut fetched = 0usize;
             for i in s..e {
                 if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
-                    roots.pin_root(v);
+                    let _ = roots.pin_root(v);
                     fetched += 1;
                 }
             }
@@ -871,7 +871,7 @@ pub fn binary_slice_values(
         let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
         // The receiver is live across that allocation, and the fresh slice has
         // no heap edge until `getitem` stores it.
-        roots.pin_root(slice_obj);
+        let slice_obj = roots.pin_root(slice_obj);
         crate::baseobjspace::getitem(roots.get(obj_slot), slice_obj)
     }
 }
@@ -1359,11 +1359,11 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         // iterator loop below does.
         let _roots = pyre_object::gc_roots::push_roots();
         let seq_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(seq);
+        let _ = pyre_object::gc_roots::pin_root(seq);
         let seq = || pyre_object::gc_roots::shadow_stack_get(seq_slot);
         let items_base = pyre_object::gc_roots::shadow_stack_len();
         for idx in 0..count {
-            pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
+            let _ = pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
         }
         return Ok((0..count)
             .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
@@ -1392,8 +1392,8 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     // does for the same loop.
     let _roots = pyre_object::gc_roots::push_roots();
     let seq_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(seq);
-    pyre_object::gc_roots::pin_root(iter);
+    let _ = pyre_object::gc_roots::pin_root(seq);
+    let _ = pyre_object::gc_roots::pin_root(iter);
     let seq = || pyre_object::gc_roots::shadow_stack_get(seq_slot);
     let iter = || pyre_object::gc_roots::shadow_stack_get(seq_slot + 1);
     let root_base = seq_slot + 1;
@@ -1420,7 +1420,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
                         "too many values to unpack (expected {count})"
                     )));
                 }
-                pyre_object::gc_roots::pin_root(val);
+                let _ = pyre_object::gc_roots::pin_root(val);
                 pulled += 1;
             }
             Err(e) if e.matches_stop_iteration() => break,
@@ -1458,7 +1458,7 @@ pub fn unpack_ex_slots(
     // slots, as `unpack_sequence_exact` does for the same split.
     let _roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(value);
+    let _ = pyre_object::gc_roots::pin_root(value);
     let value = || pyre_object::gc_roots::shadow_stack_get(value_slot);
     let elements: Vec<PyObjectRef> = unsafe {
         if is_tuple(value()) {
@@ -1492,13 +1492,13 @@ pub fn unpack_ex_slots(
     }
     let elements_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &elements {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let element = |index: usize| pyre_object::gc_roots::shadow_stack_get(elements_base + index);
     let middle_len = elements.len() - min_expected;
     let middle: Vec<PyObjectRef> = (before..before + middle_len).map(element).collect();
     let middle_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_list_new(middle));
+    let _ = pyre_object::gc_roots::pin_root(w_list_new(middle));
     // Head and tail are read back only after the middle list exists, so the
     // returned slots all carry post-move words.
     let mut slots = Vec::with_capacity(before + 1 + after);

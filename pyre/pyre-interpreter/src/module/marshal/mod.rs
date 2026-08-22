@@ -161,7 +161,7 @@ impl WriterRefs {
         let index = self.entries.len() as u32;
         let identity = pyre_object::gc_hook::gc_identity_hash(obj as usize);
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         self.entries.push(WriterRefEntry { slot, incomplete });
         self.by_identity.entry(identity).or_default().push(index);
         Ok(index)
@@ -493,7 +493,7 @@ struct Rooted(usize);
 impl Rooted {
     fn new(obj: PyObjectRef) -> Self {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         Self(slot)
     }
 
@@ -539,13 +539,13 @@ impl FileReader {
         // Build and root the argument before reloading the file. Integer
         // construction may collect, so neither raw pointer crosses it.
         let count_slot = roots.base();
-        roots.pin_root(w_int_new(n as i64));
+        let _ = roots.pin_root(w_int_new(n as i64));
         let result = match call_method(self.file.get(), "read", &[roots.get(count_slot)]) {
             Ok(result) => result,
             Err(error) => return self.python_error(error),
         };
         let result_slot = count_slot + 1;
-        roots.pin_root(result);
+        let _ = roots.pin_root(result);
         let bytes = match bytes_like(roots.get(result_slot), "load") {
             Ok(bytes) => bytes,
             Err(error) => return self.python_error(error),
@@ -566,7 +566,7 @@ impl FileReader {
     fn read_with_readinto(&mut self, n: usize) -> Result<(), wire::MarshalError> {
         let roots = pyre_object::gc_roots::push_roots();
         let buffer_slot = roots.base();
-        roots.pin_root(bytearrayobject::w_bytearray_new(n));
+        let _ = roots.pin_root(bytearrayobject::w_bytearray_new(n));
         let count = match call_method(self.file.get(), "readinto", &[roots.get(buffer_slot)]) {
             Ok(count) => count,
             // AttributeError from inside `readinto` is an application error,
@@ -1019,7 +1019,7 @@ fn marshal_to_bytes(
         reject_code(value)?;
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(value);
+    let value = pyre_object::gc_roots::pin_root(value);
     let mut out = Vec::new();
     let mut refs = (version >= 3).then(WriterRefs::new);
     write_object(&mut out, value, &mut refs, version, MAX_DEPTH)?;

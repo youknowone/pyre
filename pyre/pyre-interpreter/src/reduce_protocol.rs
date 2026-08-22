@@ -54,7 +54,7 @@ fn handle(which: usize) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
-    pyre_object::gc_roots::pin_root(w_app_globals);
+    let _ = pyre_object::gc_roots::pin_root(w_app_globals);
     crate::importing::appleveldef_install(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         include_str!("reduce_protocol_app.py"),
@@ -115,23 +115,23 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     // locals across those points.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_objdict = crate::baseobjspace::findattr(current_obj(), "__dict__");
     let mut state_slot = None;
     if let Some(d) = w_objdict {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(d);
+        let _ = pyre_object::gc_roots::pin_root(d);
         if crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(dict_slot))? > 0 {
             let copy_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
             let items = unsafe {
                 pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(dict_slot))
             };
             let items_slot = pyre_object::gc_roots::shadow_stack_len();
             for (k, v) in &items {
-                pyre_object::gc_roots::pin_root(*k);
-                pyre_object::gc_roots::pin_root(*v);
+                let _ = pyre_object::gc_roots::pin_root(*k);
+                let _ = pyre_object::gc_roots::pin_root(*v);
             }
             let mut count = 0usize;
             for index in 0..items.len() {
@@ -170,7 +170,7 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
     // this frame.  Read it back from the shadow stack for every later use.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = crate::typedef::r#type(current_obj())
         .ok_or_else(|| PyError::type_error("cannot determine type for __getnewargs__"))?;
@@ -252,12 +252,12 @@ pub fn descr_reduce(w_obj: PyObjectRef) -> PyResult {
 /// base type.
 pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_type = crate::typedef::r#type(w_obj)
         .ok_or_else(|| PyError::type_error("cannot determine type for __reduce__"))?;
-    pyre_object::gc_roots::pin_root(w_type.as_ptr());
+    let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     // PySequence_List(self): no GC between reading the items and `w_list_new`
@@ -267,7 +267,7 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
     };
     let w_list = pyre_object::listobject::w_list_new(items);
     let w_args = pyre_object::w_tuple_new(vec![w_list]);
-    pyre_object::gc_roots::pin_root(w_args);
+    let _ = pyre_object::gc_roots::pin_root(w_args);
     let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_state = object_getstate_default(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
@@ -285,10 +285,10 @@ fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
     // argument array before it.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let w_proto = pyre_object::w_int_new(proto);
     let proto_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_proto);
+    let _ = pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_1),
         &[
@@ -309,12 +309,12 @@ fn reduce_2(
     // three already-copied references.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
-    pyre_object::gc_roots::pin_root(w_args);
-    pyre_object::gc_roots::pin_root(w_kwargs);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_args);
+    let _ = pyre_object::gc_roots::pin_root(w_kwargs);
     let w_proto = pyre_object::w_int_new(proto);
     let proto_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_proto);
+    let _ = pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_2),
         &[
@@ -334,21 +334,21 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
     // out of a Rust local.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_obj);
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     // Honour a user `__reduce__` override:
     // `type(obj).__reduce__ is not object.__reduce__`.
     let w_reduce = crate::baseobjspace::findattr(current_obj(), "__reduce__");
     if let Some(w_reduce) = w_reduce {
         let reduce_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_reduce);
+        let _ = pyre_object::gc_roots::pin_root(w_reduce);
         let w_type = crate::typedef::r#type(current_obj())
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         let w_cls_reduce = crate::baseobjspace::getattr_str(w_type.as_ptr(), "__reduce__")?;
         // Both sides of the identity test have to survive the second lookup,
         // or a collection between them reports a spurious override.
         let cls_reduce_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_cls_reduce);
+        let _ = pyre_object::gc_roots::pin_root(w_cls_reduce);
         let w_obj_reduce =
             crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
         let w_cls_reduce = pyre_object::gc_roots::shadow_stack_get(cls_reduce_slot);
@@ -392,8 +392,8 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         }
         let (hasargs, w_args, w_kwargs) = getnewargs(current_obj())?;
         let args_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_args);
-        pyre_object::gc_roots::pin_root(w_kwargs);
+        let _ = pyre_object::gc_roots::pin_root(w_args);
+        let _ = pyre_object::gc_roots::pin_root(w_kwargs);
         // objectobject.py:276 / `_PyObject_GetState(required)`: a type whose
         // instances carry C-level state that `__dict__`/`__slots__` cannot
         // reconstruct, and that supplies no `__getnewargs__`, cannot be

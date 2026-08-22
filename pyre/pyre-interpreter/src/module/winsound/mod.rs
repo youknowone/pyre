@@ -24,8 +24,7 @@ const SND_ASYNC: i32 = 0x0001;
 fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let sound_slot = roots.base();
-    roots.pin_root(sound);
-
+    let sound = roots.pin_root(sound);
     let w_name = if unsafe { pyre_object::is_str(sound) } {
         roots.get(sound_slot)
     } else if unsafe { pyre_object::bytesobject::is_bytes(sound) } {
@@ -44,14 +43,13 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
             )));
         };
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(fspath_fn);
+        let _ = roots.pin_root(fspath_fn);
         let resolved = crate::call::call_function_impl_result(
             roots.get(fspath_slot),
             &[roots.get(sound_slot)],
         )?;
         let resolved_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(resolved);
-        let resolved = roots.get(resolved_slot);
+        let resolved = roots.pin_root(resolved);
         if !unsafe { pyre_object::is_str(resolved) } {
             return Err(crate::PyError::type_error(format!(
                 "'sound' must resolve to str, not {}",
@@ -86,12 +84,12 @@ fn win32_runtime_error(code: u32) -> crate::PyError {
     // a Rust array of raw references is not something the collector updates.
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.base();
-    roots.pin_root(cls);
-    roots.pin_root(pyre_object::w_int_new(0));
-    roots.pin_root(pyre_object::w_str_new(&message));
-    roots.pin_root(pyre_object::w_none());
-    roots.pin_root(pyre_object::w_int_new(i64::from(code as i32)));
-    roots.pin_root(pyre_object::w_none());
+    let _ = roots.pin_root(cls);
+    let _ = roots.pin_root(pyre_object::w_int_new(0));
+    let _ = roots.pin_root(pyre_object::w_str_new(&message));
+    let _ = roots.pin_root(pyre_object::w_none());
+    let _ = roots.pin_root(pyre_object::w_int_new(i64::from(code as i32)));
+    let _ = roots.pin_root(pyre_object::w_none());
     let args = [
         roots.get(cls_slot + 1),
         roots.get(cls_slot + 2),

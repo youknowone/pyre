@@ -231,7 +231,7 @@ fn retain_writable_buffer(
     let r_buffer = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let (slice, owner) = writable_buffer(r_buffer)?;
     let length = slice.len();
-    pyre_object::gc_roots::pin_root(owner);
+    let _ = pyre_object::gc_roots::pin_root(owner);
     let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let held = unsafe {
         crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(owner_slot))
@@ -391,7 +391,7 @@ fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         buffer_export_held: false,
     })));
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(cls);
+    let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let obj = W_Overlapped::allocate_stable(W_Overlapped {
         ob: PyObject::default(),

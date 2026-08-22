@@ -96,7 +96,7 @@ impl W_HashState {
         assert_eq!(16, pyre_native::hash::HASH_STATE_STORAGE_ALIGN);
         let _roots = gc_roots::push_roots();
         let name_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(w_str_new(name));
+        let _ = gc_roots::pin_root(w_str_new(name));
         let state = W_HashState::allocate_stable(W_HashState {
             ob: PyObject::default(),
             name: gc_roots::shadow_stack_get(name_slot),
@@ -138,7 +138,7 @@ impl W_HashState {
     ) -> Result<PyObjectRef, crate::PyError> {
         let _roots = gc_roots::push_roots();
         let name_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(w_str_new(name));
+        let _ = gc_roots::pin_root(w_str_new(name));
         let state = W_HashState::allocate_stable(W_HashState {
             ob: PyObject::default(),
             name: gc_roots::shadow_stack_get(name_slot),
@@ -279,7 +279,7 @@ mod hash_state_class {
         fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
             let _roots = gc_roots::push_roots();
             let name_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(self.name);
+            let _ = gc_roots::pin_root(self.name);
             let clone = W_HashState::allocate_stable(W_HashState {
                 ob: PyObject::default(),
                 name: gc_roots::shadow_stack_get(name_slot),
@@ -437,7 +437,7 @@ impl W_Hmac {
             .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
         let _roots = gc_roots::push_roots();
         let name_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(w_str_new(&format!("hmac-{name}")));
+        let _ = gc_roots::pin_root(w_str_new(&format!("hmac-{name}")));
         let obj = W_Hmac::allocate_stable(W_Hmac {
             ob: PyObject::default(),
             name: gc_roots::shadow_stack_get(name_slot),
@@ -544,7 +544,7 @@ mod hmac_class {
         fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
             let _roots = gc_roots::push_roots();
             let name_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(self.name);
+            let _ = gc_roots::pin_root(self.name);
             let obj = W_Hmac::allocate_stable(W_Hmac {
                 ob: PyObject::default(),
                 name: gc_roots::shadow_stack_get(name_slot),
@@ -845,7 +845,7 @@ fn blake2_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = gc_roots::push_roots();
     let base = gc_roots::shadow_stack_len();
     for &arg in args {
-        gc_roots::pin_root(arg);
+        let _ = gc_roots::pin_root(arg);
     }
     let arg = |index| gc_roots::shadow_stack_get(base + index);
     let name_obj = arg(0);
@@ -1006,10 +1006,10 @@ fn make_hash(
     // from its slot after each re-entry.
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(name);
+    let _ = pyre_object::gc_roots::pin_root(name);
     let pin = |obj: PyObjectRef| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         slot
     };
     let data_slot = data.map(pin);
@@ -1124,7 +1124,7 @@ crate::py_module! {
     extra_init: |ns| {
         let _roots = gc_roots::push_roots();
         let mapping_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(w_dict_new());
+        let _ = gc_roots::pin_root(w_dict_new());
         for (constructor, name) in [
             ("openssl_md5", "md5"),
             ("openssl_sha1", "sha1"),
@@ -1142,9 +1142,9 @@ crate::py_module! {
             let function = crate::module_ns_get(ns, constructor)
                 .expect("_hashlib constructor installed before extra_init");
             let function_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(function);
+            let _ = gc_roots::pin_root(function);
             let name_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(w_str_new(name));
+            let _ = gc_roots::pin_root(w_str_new(name));
             crate::baseobjspace::setitem(
                 gc_roots::shadow_stack_get(mapping_slot),
                 gc_roots::shadow_stack_get(function_slot),

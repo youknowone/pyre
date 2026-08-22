@@ -258,11 +258,10 @@ pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 fn module_from_cached_dict(name: &str, dict: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     let module = pyre_object::w_module_new_managed(name);
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
-    let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+    let module = roots.pin_root(module);
     let module_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     crate::type_methods::dict_update1(
         module_dict,
@@ -278,7 +277,7 @@ fn cached_extension(name: &str, path: &Path) -> Option<PyObjectRef> {
         let cache = EXTENSIONS.lock();
         let dict = cache.get(path)?.dict as PyObjectRef;
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(dict);
+        let _ = roots.pin_root(dict);
         slot
     };
     Some(module_from_cached_dict(
@@ -294,7 +293,7 @@ fn cached_extension_handle(path: &Path) -> Option<usize> {
 fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) {
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     crate::importing::set_sys_module(name, module);
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
     let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
@@ -323,9 +322,9 @@ fn init_symbol(name: &str) -> Result<String, crate::PyError> {
 fn extension_import_error(message: String, name: &str, path: &Path) -> crate::PyError {
     let roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(name));
+    let _ = roots.pin_root(pyre_object::w_str_new(name));
     let path_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    let _ = roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
     crate::PyError::import_error_name_path(
         message,
         pyre_object::gc_roots::shadow_stack_get(name_slot),
@@ -374,7 +373,7 @@ pub fn load_extension_module(
         if let Some(module) = cached_extension(name, path) {
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(module);
+            let _ = roots.pin_root(module);
             crate::importing::set_sys_module(
                 name,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
@@ -430,7 +429,7 @@ pub fn load_extension_module(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(init_result.module());
+    let _ = roots.pin_root(init_result.module());
     match init_result {
         // `create_cpyext_module` returns straight from the multi-phase branch:
         // the definition, not a copied dictionary, is what a later import
@@ -523,19 +522,19 @@ fn finish_init(
 pub fn create_dynamic(spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(spec);
+    let _ = roots.pin_root(spec);
     let w_name = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(spec_slot),
         "name",
     )?;
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_name);
+    let _ = roots.pin_root(w_name);
     let w_origin = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(spec_slot),
         "origin",
     )?;
     let origin_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_origin);
+    let _ = roots.pin_root(w_origin);
     let name =
         crate::baseobjspace::text0_wtf8_w(pyre_object::gc_roots::shadow_stack_get(name_slot))?
             .to_string();
@@ -594,12 +593,12 @@ pub(super) fn call_cfunction_in_class(
     // the argument tuple, the keyword dict and the key strings all collect.
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_self);
+    let _ = roots.pin_root(w_self);
     for &argument in positional {
-        roots.pin_root(argument);
+        let _ = roots.pin_root(argument);
     }
     for (_, value) in keywords {
-        roots.pin_root(*value);
+        let _ = roots.pin_root(*value);
     }
     let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + 1 + index);
 
@@ -622,11 +621,11 @@ pub(super) fn call_cfunction_in_class(
         let items: Vec<PyObjectRef> = (0..positional.len()).map(value_slot).collect();
         let tuple = pyre_object::tupleobject::w_tuple_new(items);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(tuple);
+        let _ = roots.pin_root(tuple);
         if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
             let dict = pyre_object::dictmultiobject::w_dict_new();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(dict);
+            let _ = roots.pin_root(dict);
             for (index, (name, _)) in keywords.iter().enumerate() {
                 unsafe {
                     pyre_object::dictmultiobject::w_dict_setitem_str(
@@ -745,7 +744,7 @@ pub fn exec_dynamic(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
     let _load_guard = extension_load_lock();
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let module = roots.pin_root(module);
     if unsafe { pyre_object::module::is_module(module) }
         && !modsupport::has_module_state(pyre_object::gc_roots::shadow_stack_get(module_slot))
     {

@@ -39,7 +39,7 @@ impl BisectArgs {
 /// this argument, is what holds the forwarded object afterwards.
 fn pin(value: PyObjectRef) -> usize {
     let slot = shadow_stack_len();
-    pin_root(value);
+    let _ = pin_root(value);
     slot
 }
 

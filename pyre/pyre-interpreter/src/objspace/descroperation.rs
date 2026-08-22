@@ -4108,7 +4108,7 @@ pub(crate) fn try_dispatch_binary_special(
         // The reflected implementation has to survive the forward call too.
         let right_slot = w_right_impl.map(|method| {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(method);
+            let _ = pyre_object::gc_roots::pin_root(method);
             slot
         });
         let mut result = None;
@@ -4172,7 +4172,7 @@ fn try_dispatch_ternary_pow_special(
         // in an operand's.
         let pin = |method: PyObjectRef| {
             let slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(method);
+            let _ = pyre_object::gc_roots::pin_root(method);
             slot
         };
         let base_impl_slot = w_base_impl.map(pin);
@@ -4839,12 +4839,13 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // already brackets its own operands for that reason.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(a);
-            pyre_object::gc_roots::pin_root(b);
+            let _ = pyre_object::gc_roots::pin_root(a);
+            let _ = pyre_object::gc_roots::pin_root(b);
             let src = || pyre_object::gc_roots::shadow_stack_get(root_base);
             let other = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             let merged = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
-            pyre_object::gc_roots::pin_root(crate::type_methods::dict_method_copy(&[src()])?);
+            let _ =
+                pyre_object::gc_roots::pin_root(crate::type_methods::dict_method_copy(&[src()])?);
             crate::type_methods::dict_update1(merged(), other())?;
             return Ok(merged());
         }
@@ -5128,8 +5129,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // and read each entry back after the comparisons that precede it.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(a);
-            pyre_object::gc_roots::pin_root(b);
+            let _ = pyre_object::gc_roots::pin_root(a);
+            let _ = pyre_object::gc_roots::pin_root(b);
             let la = pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base));
             let lb =
                 pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
@@ -5139,8 +5140,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                     pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
                 let items_base = pyre_object::gc_roots::shadow_stack_len();
                 for &(k, v) in &items {
-                    pyre_object::gc_roots::pin_root(k);
-                    pyre_object::gc_roots::pin_root(v);
+                    let _ = pyre_object::gc_roots::pin_root(k);
+                    let _ = pyre_object::gc_roots::pin_root(v);
                 }
                 for index in 0..items.len() {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
@@ -5220,9 +5221,9 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 // but an unreachable one is still swept.
                 let _roots = pyre_object::gc_roots::push_roots();
                 let a_set = as_set(a)?;
-                pyre_object::gc_roots::pin_root(a_set);
+                let a_set = pyre_object::gc_roots::pin_root(a_set);
                 let b_set = as_set(b)?;
-                pyre_object::gc_roots::pin_root(b_set);
+                let b_set = pyre_object::gc_roots::pin_root(b_set);
                 let la = pyre_object::w_set_len(a_set);
                 let lb = pyre_object::w_set_len(b_set);
                 let a_subset_b = || crate::typedef::set_is_subset_of(a_set, b_set);
@@ -5270,8 +5271,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // what makes the "read the live lists" contract above hold.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(a);
-            pyre_object::gc_roots::pin_root(b);
+            let _ = pyre_object::gc_roots::pin_root(a);
+            let _ = pyre_object::gc_roots::pin_root(b);
             let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
             let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)

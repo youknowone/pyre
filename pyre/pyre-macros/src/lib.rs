@@ -2162,7 +2162,7 @@ fn expand_pyre_methods(
                 // reload it before stamping the result.
                 let __pyre_new_roots = ::pyre_object::gc_roots::push_roots();
                 let __pyre_cls_input = args.first().copied().unwrap_or(::pyre_object::PY_NULL);
-                ::pyre_object::gc_roots::pin_root(__pyre_cls_input);
+                let _ = ::pyre_object::gc_roots::pin_root(__pyre_cls_input);
                 let __pyre_cls_slot = ::pyre_object::gc_roots::shadow_stack_len() - 1;
                 let __pyre_obj: ::pyre_object::PyObjectRef = match { #body } {
                     ::std::result::Result::Ok(o) => o,

@@ -492,13 +492,13 @@ pub(crate) fn current_frames() -> PyObjectRef {
                 // rather than taken from the pre-force local.
                 let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
                 crate::executioncontext::force_frame(frame);
-                pyre_object::gc_roots::pin_root(anchor.live() as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(anchor.live() as PyObjectRef);
                 entries.push(ident);
             }
         }
     });
     let result = w_dict_new();
-    pyre_object::gc_roots::pin_root(result);
+    let _ = pyre_object::gc_roots::pin_root(result);
     let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for (index, ident) in entries.into_iter().enumerate() {
         // The key is built first: `w_int_new` allocates, so a dict or a value
@@ -535,7 +535,7 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
             // parked on the generator, and `_get_topmost_exception` is what
             // reads it back.
             let exception = unsafe { (*(ec as *const crate::PyExecutionContext)).sys_exc_info() };
-            pyre_object::gc_roots::pin_root(if exception.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(if exception.is_null() {
                 w_none()
             } else {
                 exception
@@ -544,7 +544,7 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
         }
     });
     let result = w_dict_new();
-    pyre_object::gc_roots::pin_root(result);
+    let _ = pyre_object::gc_roots::pin_root(result);
     let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for (index, ident) in entries.into_iter().enumerate() {
         // The key is built first: `w_int_new` allocates, so a dict or a value
@@ -1305,7 +1305,7 @@ mod local_class {
             // create a new dict for this thread
             let w_dict = pyre_object::w_dict_new();
             let roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_dict);
+            let w_dict = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // Published before the initializer runs: the `__init__` about to be
             // entered reaches `getdict` again, and finding this entry is what
@@ -1472,12 +1472,12 @@ mod local_class {
             // initialization.
             let roots = pyre_object::gc_roots::push_roots();
             let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(cls);
+            let _ = pyre_object::gc_roots::pin_root(cls);
             // A plain `_local()` has no keyword mapping, and a null takes no
             // shadow-stack slot.
             let initkwargs_slot = kwargs.map(|w_kwargs| {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(w_kwargs);
+                let _ = pyre_object::gc_roots::pin_root(w_kwargs);
                 slot
             });
             // Pinned BEFORE the tuple is built: `w_tuple_new` allocates, and
@@ -1487,13 +1487,13 @@ mod local_class {
             // addresses, so both are read back from their slots below.
             let initargs = w_tuple_new(positional.get(1..).unwrap_or(&[]).to_vec());
             let initargs_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(initargs);
+            let _ = pyre_object::gc_roots::pin_root(initargs);
             let dicts_slot = pyre_object::gc_roots::shadow_stack_len();
             let dicts = pyre_object::w_dict_new();
-            pyre_object::gc_roots::pin_root(dicts);
+            let _ = pyre_object::gc_roots::pin_root(dicts);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let w_dict = pyre_object::w_dict_new();
-            pyre_object::gc_roots::pin_root(w_dict);
+            let _ = pyre_object::gc_roots::pin_root(w_dict);
             let ident = current_ident();
             unsafe {
                 pyre_object::w_dict_setitem(
@@ -1563,7 +1563,7 @@ fn register_local_in_current_ec(local: PyObjectRef) {
         return;
     }
     let root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(local);
+    let local = pyre_object::gc_roots::pin_root(local);
     let wref = unsafe { pyre_object::weakref::w_weakref_new(local) as PyObjectRef };
     unsafe { (*ec).thread_local_refs.push(wref) };
     drop(root);
@@ -1697,15 +1697,15 @@ fn spawn_thread(
 
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(callable);
+    let callable = pyre_object::gc_roots::pin_root(callable);
     for &arg in &positional {
-        pyre_object::gc_roots::pin_root(arg);
+        let _ = pyre_object::gc_roots::pin_root(arg);
     }
     if let Some(d) = kwargs {
-        pyre_object::gc_roots::pin_root(d);
+        let _ = pyre_object::gc_roots::pin_root(d);
     }
     if let Some(h) = handle {
-        pyre_object::gc_roots::pin_root(h);
+        let _ = pyre_object::gc_roots::pin_root(h);
     }
     let nargs = positional.len();
     let has_kwargs = kwargs.is_some();
@@ -1793,15 +1793,15 @@ fn spawn_thread(
             // interpreter allocation can trigger a moving collection.
             let worker_roots = pyre_object::gc_roots::push_roots();
             let worker_base = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(callable_addr as PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(callable_addr as PyObjectRef);
             for addr in &args_addr {
-                pyre_object::gc_roots::pin_root(*addr as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(*addr as PyObjectRef);
             }
             if has_kwargs {
-                pyre_object::gc_roots::pin_root(kwargs_addr as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(kwargs_addr as PyObjectRef);
             }
             if has_handle {
-                pyre_object::gc_roots::pin_root(handle_addr as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(handle_addr as PyObjectRef);
             }
 
             let mut ec = Box::new(unsafe {
@@ -2145,7 +2145,7 @@ fn except_hook_args_type() -> PyObjectRef {
 
 #[inline]
 fn pin_root_slot(value: PyObjectRef) -> usize {
-    pyre_object::gc_roots::pin_root(value);
+    let _ = pyre_object::gc_roots::pin_root(value);
     pyre_object::gc_roots::shadow_stack_len() - 1
 }
 

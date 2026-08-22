@@ -91,7 +91,7 @@ fn handle(which: usize) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
-    pyre_object::gc_roots::pin_root(w_app_globals);
+    let _ = pyre_object::gc_roots::pin_root(w_app_globals);
     crate::importing::appleveldef_install(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         ASYNC_OP_SRC,

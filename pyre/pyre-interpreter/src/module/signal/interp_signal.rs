@@ -96,7 +96,7 @@ fn handlers_dict() -> PyObjectRef {
     let mut d = HANDLERS.load(Ordering::Acquire) as PyObjectRef;
     if d.is_null() {
         d = pyre_object::w_dict_new();
-        pyre_object::gc_roots::pin_root(d);
+        let mut d = pyre_object::gc_roots::pin_root(d);
         match HANDLERS.compare_exchange(0, d as usize, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
             Err(installed) => d = installed as PyObjectRef,
@@ -333,7 +333,7 @@ pub fn default_int_handler_obj() -> PyObjectRef {
                 Err(unsafe { crate::PyError::from_exc_object(exc) })
             },
         );
-        pyre_object::gc_roots::pin_root(h);
+        let mut h = pyre_object::gc_roots::pin_root(h);
         match DEFAULT_INT_HANDLER.compare_exchange(
             0,
             h as usize,

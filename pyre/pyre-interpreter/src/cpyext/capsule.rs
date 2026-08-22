@@ -69,14 +69,14 @@ fn slot_get(carrier: PyObjectRef, key: &str) -> usize {
 fn slot_set(carrier: PyObjectRef, key: &str, value: usize) {
     let roots = pyre_object::gc_roots::push_roots();
     let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(carrier);
+    let _ = roots.pin_root(carrier);
     let dict =
         crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(carrier_slot));
     if dict.is_null() {
         return;
     }
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(dict);
+    let _ = roots.pin_root(dict);
     let value = pyre_object::w_int_new(value as i64);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn PyCapsule_New(
     let roots = pyre_object::gc_roots::push_roots();
     let carrier = pyre_object::w_instance_new(capsule_type());
     let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(carrier);
+    let _ = roots.pin_root(carrier);
     let reload = || pyre_object::gc_roots::shadow_stack_get(carrier_slot);
     slot_set(reload(), POINTER_KEY, pointer as usize);
     slot_set(reload(), NAME_KEY, name as usize);
@@ -292,7 +292,7 @@ pub unsafe extern "C" fn PyCapsule_Import(name: *const c_char, _no_block: c_int)
         return std::ptr::null_mut();
     };
     let mut slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(reached);
+    let _ = roots.pin_root(reached);
     for component in components {
         let step = super::pyerrors::trap(crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(slot),
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn PyCapsule_Import(name: *const c_char, _no_block: c_int)
             return std::ptr::null_mut();
         };
         slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(step);
+        let _ = roots.pin_root(step);
     }
     let capsule = pyre_object::gc_roots::shadow_stack_get(slot);
     if !is_capsule(capsule) {

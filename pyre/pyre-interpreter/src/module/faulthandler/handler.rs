@@ -302,7 +302,7 @@ fn faulthandler_get_fileno_and_file(
     // them so the caller receives the relocated pointer, not a stale one.
     // `pin_root` normalizes a forwarding stub into the slot, not into the
     // caller's copy, so read the pinned value back before using it.
-    pyre_object::gc_roots::pin_root(resolved);
+    let _ = pyre_object::gc_roots::pin_root(resolved);
     let file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let resolved = pyre_object::gc_roots::shadow_stack_get(file_slot);
     let method = crate::baseobjspace::getattr_str(resolved, "fileno")?;
@@ -360,7 +360,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // owner store below, so keep it rooted across the install.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let file_slot = (!w_file.is_null()).then(|| {
-                        pyre_object::gc_roots::pin_root(w_file);
+                        let _ = pyre_object::gc_roots::pin_root(w_file);
                         pyre_object::gc_roots::shadow_stack_len() - 1
                     });
                     // `pypy_faulthandler_enable(fileno, all_threads)` takes the
@@ -545,7 +545,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // owner store below, so keep it rooted across the install.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let file_slot = (!w_file.is_null()).then(|| {
-                        pyre_object::gc_roots::pin_root(w_file);
+                        let _ = pyre_object::gc_roots::pin_root(w_file);
                         pyre_object::gc_roots::shadow_stack_len() - 1
                     });
                     let _state = lock_faulthandler_state();

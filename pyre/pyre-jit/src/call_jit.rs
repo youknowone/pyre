@@ -536,11 +536,11 @@ fn park_residual_call_exception() -> ParkedResidualException {
     let save = pyre_object::gc_roots::shadow_stack_len();
     let bh_pinned = bh != 0;
     if bh_pinned {
-        pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
     }
     let backend_pinned = backend != 0;
     if backend_pinned {
-        pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
     }
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     drain_backend_jit_exc();
@@ -877,7 +877,7 @@ pub(crate) extern "C" fn resolve_exception_context(exc_value: i64) -> i64 {
         return existing as i64;
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_exc);
+    let w_exc = pyre_object::gc_roots::pin_root(w_exc);
     let active = pyre_interpreter::eval::get_sys_exception();
     pyre_interpreter::error::chain_context(w_exc, active);
     unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_exc) as i64 }
@@ -919,9 +919,9 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_code = w_code_value as PyObjectRef;
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_exc);
-    pyre_object::gc_roots::pin_root(w_code);
-    pyre_object::gc_roots::pin_root(w_globals);
+    let w_exc = pyre_object::gc_roots::pin_root(w_exc);
+    let w_code = pyre_object::gc_roots::pin_root(w_code);
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     // `record_application_traceback` requires the traceback's own frame
     // identity. The recording walker cannot force the optimizer's virtual
     // locals, so materialize a traceback-only frame from the promoted callee
@@ -941,7 +941,7 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     // traceback.clear_frames() must not mistake it for a live activation.
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
-    pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
@@ -1000,9 +1000,9 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_exc);
-    pyre_object::gc_roots::pin_root(w_code);
-    pyre_object::gc_roots::pin_root(w_globals);
+    let w_exc = pyre_object::gc_roots::pin_root(w_exc);
+    let w_code = pyre_object::gc_roots::pin_root(w_code);
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
         w_code as *const (),
         w_globals,
@@ -1016,7 +1016,7 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     // unwind, exactly the `pyopcode.py:184` finished-frame transition.
     frame.set_frame_finished_execution(true);
     let frame_ptr = frame.into_raw();
-    pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
     unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
             w_exc,
@@ -2939,7 +2939,7 @@ pub fn blackhole_resume_via_rd_numb(
             // its whole life; root the value across the equivalent window.
             let _exc_roots = pyre_object::gc_roots::push_roots();
             let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
             let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
@@ -5221,10 +5221,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // dispatch only values reloaded from the forwarded slots.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
-    _roots.pin_root(callable);
-    _roots.pin_root(null_or_self);
+    let _ = _roots.pin_root(callable);
+    let _ = _roots.pin_root(null_or_self);
     for &arg in args {
-        _roots.pin_root(arg);
+        let _ = _roots.pin_root(arg);
     }
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
@@ -5331,8 +5331,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
                 == positional_count;
         if exact_fixed_arity {
-            _roots.pin_root(code);
-            _roots.pin_root(receiver);
+            let _ = _roots.pin_root(code);
+            let _ = _roots.pin_root(receiver);
             let code_slot = root_base + 2 + args.len();
             let receiver_slot = code_slot + 1;
             let mut call_args = [pyre_object::PY_NULL; 4];

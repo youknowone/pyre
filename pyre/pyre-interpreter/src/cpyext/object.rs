@@ -107,17 +107,17 @@ pub(super) fn call_method(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(object);
+    let _ = roots.pin_root(object);
     let first_argument = pyre_object::gc_roots::shadow_stack_len();
     for &argument in arguments {
-        roots.pin_root(argument);
+        let _ = roots.pin_root(argument);
     }
     let method = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(object_slot),
         name,
     )?;
     let method_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(method);
+    let _ = roots.pin_root(method);
     let reloaded: Vec<PyObjectRef> = (0..arguments.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(first_argument + index))
         .collect();
@@ -616,10 +616,10 @@ pub unsafe extern "C" fn PyObject_DelItemString(
     // shadow stack rather than from the pointer taken before it.
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(object);
+    let _ = roots.pin_root(object);
     let w_key = pyre_object::w_str_new(&key);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_key);
+    let _ = roots.pin_root(w_key);
     let outcome = crate::baseobjspace::delitem(
         pyre_object::gc_roots::shadow_stack_get(object_slot),
         pyre_object::gc_roots::shadow_stack_get(key_slot),
@@ -852,11 +852,11 @@ fn call_with_keywords(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(callable);
+    let _ = roots.pin_root(callable);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(args);
+    let _ = roots.pin_root(args);
     let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(kwargs);
+    let _ = roots.pin_root(kwargs);
     let arguments = unsafe {
         pyre_object::tupleobject::w_tuple_items_copy_as_vec(
             pyre_object::gc_roots::shadow_stack_get(args_slot),
@@ -958,7 +958,7 @@ fn file_descriptor_of(object: PyObjectRef) -> Result<c_int, crate::PyError> {
                 ));
             };
             let fileno_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(fileno);
+            let _ = roots.pin_root(fileno);
             let answer = crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(fileno_slot),
                 &[],
@@ -1397,7 +1397,7 @@ unsafe fn call_vector(
     // first: converting a mirror below can realize it, which allocates.
     let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(callable);
+    let _ = roots.pin_root(callable);
     let kwnames = unsafe { pyobject::from_ref(kwnames) };
     if !kwnames.is_null() && !unsafe { pyre_object::is_tuple(kwnames) } {
         return Err(crate::PyError::type_error(
@@ -1405,7 +1405,7 @@ unsafe fn call_vector(
         ));
     }
     let kwnames_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(kwnames);
+    let kwnames = roots.pin_root(kwnames);
     let named = if kwnames.is_null() {
         0
     } else {
@@ -1420,7 +1420,7 @@ unsafe fn call_vector(
                 "vectorcall argument vector holds a NULL",
             ));
         }
-        roots.pin_root(value);
+        let _ = roots.pin_root(value);
     }
     let value_at = |index: usize| pyre_object::gc_roots::shadow_stack_get(value_base + index);
 

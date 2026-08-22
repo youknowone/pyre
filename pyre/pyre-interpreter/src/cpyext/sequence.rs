@@ -146,9 +146,9 @@ fn index_of(object: PyObjectRef, value: PyObjectRef) -> Result<isize, crate::PyE
     // looks: the elements go on the shadow stack and are read back per turn.
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(value);
+    let _ = roots.pin_root(value);
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(object);
+    let _ = roots.pin_root(object);
     let items = crate::baseobjspace::unpackiterable(
         pyre_object::gc_roots::shadow_stack_get(object_slot),
         -1,
@@ -252,9 +252,9 @@ fn count_of(object: PyObjectRef, value: PyObjectRef) -> Result<isize, crate::PyE
     // The same shadow-stack discipline as [`index_of`], for the same reason.
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(value);
+    let _ = roots.pin_root(value);
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(object);
+    let _ = roots.pin_root(object);
     let items = crate::baseobjspace::unpackiterable(
         pyre_object::gc_roots::shadow_stack_get(object_slot),
         -1,

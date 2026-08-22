@@ -1791,8 +1791,7 @@ fn path_or_fd_w(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
-
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let (data, w_path_slot, as_fd) = unsafe {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if nullable && pyre_object::is_none(obj) {
@@ -1858,7 +1857,7 @@ fn path_or_fd_w(
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(fspath_descr);
+            let _ = pyre_object::gc_roots::pin_root(fspath_descr);
             let path_type =
                 crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                     .expect("a path argument has a type");
@@ -1884,8 +1883,7 @@ fn path_or_fd_w(
                 &[],
             )?;
             let result_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(result);
-            let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+            let result = pyre_object::gc_roots::pin_root(result);
             // interp_posix.py:3049-3051 accepts only `str` or `bytes` back from
             // `__fspath__`; a `bytearray` is a readable buffer but not a path.
             if pyre_object::bytesobject::is_bytes(result) {

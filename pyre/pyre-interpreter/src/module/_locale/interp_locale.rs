@@ -172,7 +172,7 @@ fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
     // for every insertion and for the return.
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
-    roots.pin_root(pyre_object::w_dict_new());
+    let _ = roots.pin_root(pyre_object::w_dict_new());
     // The value arrives already built.  Call arguments evaluate left to right,
     // so reading the dict slot inline with an allocating value expression
     // would read the slot first and hand over a pre-move word.
@@ -181,7 +181,7 @@ fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
         // allocated after this value is handed over.
         let value_root = pyre_object::gc_roots::push_roots();
         let value_slot = value_root.base();
-        value_root.pin_root(value);
+        let _ = value_root.pin_root(value);
         // SAFETY: the slot holds the `W_DictObject` pinned above.
         unsafe {
             pyre_object::w_dict_setitem_str(roots.get(dict_slot), k, value_root.get(value_slot));

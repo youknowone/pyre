@@ -65,14 +65,14 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     // these values are baked into the trace as `ConstPtr`s, which outlive the
     // walk.  Same shape as the zip/tuple concrete-shadow build below.
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let exc = pyre_object::gc_roots::pin_root(exc);
     let args_storage = unsafe {
         pyre_object::interp_exceptions::w_exception_get_args_storage(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
         )
     };
     let args_storage_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args_storage);
+    let _ = pyre_object::gc_roots::pin_root(args_storage);
     let args_len = unsafe {
         pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(args_storage_slot))
     };
@@ -86,7 +86,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
         }
         .expect("recorded exception args were validated before trace emission");
         let arg_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(arg);
+        let _ = pyre_object::gc_roots::pin_root(arg);
         concrete_args.push(unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slot) });
     }
     let args = concrete_args
@@ -8388,23 +8388,23 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
     // Recognition is complete; build the authentic shadow before emitting.
     let roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(*tuple0);
-    pyre_object::gc_roots::pin_root(*tuple1);
+    let _ = pyre_object::gc_roots::pin_root(*tuple0);
+    let _ = pyre_object::gc_roots::pin_root(*tuple1);
     let concrete_iter0 = pyre_object::w_tuple_iter_new(unsafe {
         pyre_object::gc_roots::shadow_stack_get(root_base)
     });
-    pyre_object::gc_roots::pin_root(concrete_iter0);
+    let _ = pyre_object::gc_roots::pin_root(concrete_iter0);
     let iter0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let concrete_iter1 = pyre_object::w_tuple_iter_new(unsafe {
         pyre_object::gc_roots::shadow_stack_get(root_base + 1)
     });
-    pyre_object::gc_roots::pin_root(concrete_iter1);
+    let _ = pyre_object::gc_roots::pin_root(concrete_iter1);
     let iter1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let concrete_list = pyre_object::w_list_new(vec![
         unsafe { pyre_object::gc_roots::shadow_stack_get(iter0_slot) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(iter1_slot) },
     ]);
-    pyre_object::gc_roots::pin_root(concrete_list);
+    let _ = pyre_object::gc_roots::pin_root(concrete_list);
     let list_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let concrete_zip = pyre_object::functional::w_zip_new(
         unsafe { pyre_object::gc_roots::shadow_stack_get(list_slot) },
@@ -8414,7 +8414,7 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
         drop(roots);
         return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
     }
-    pyre_object::gc_roots::pin_root(concrete_zip);
+    let _ = pyre_object::gc_roots::pin_root(concrete_zip);
     let zip_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], *callable)?;
@@ -8804,7 +8804,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // Re-read rather than reuse the gate's `w_locals`: the slot resolution
         // above sits between the two, so the pin takes the address the frame
         // holds NOW.
-        pyre_object::gc_roots::pin_root(if frame_owned {
+        let _ = pyre_object::gc_roots::pin_root(if frame_owned {
             frame_ref.get_w_locals()
         } else {
             unsafe { pyre_object::w_dict_new() }
@@ -8813,7 +8813,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             .iter()
             .map(|&value| {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(value);
+                let _ = pyre_object::gc_roots::pin_root(value);
                 slot
             })
             .collect();
@@ -13656,7 +13656,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // and rooted by the compiled loop's gcref table thereafter.
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let _ = pyre_object::gc_roots::pin_root(exc);
     let msg = pyre_object::w_str_from_wtf8(err.message.clone());
     // The root keeps the exception alive across that allocation but does not
     // fix its address: a minor collection moves the object and rewrites the
@@ -13914,7 +13914,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(exc);
+    let _ = pyre_object::gc_roots::pin_root(exc);
     let msg = pyre_object::w_str_from_wtf8(err.message.clone());
     // The allocation may move the exception and leave the local pointer naming
     // its forwarded corpse; the shadow slot contains the live address.
@@ -15389,7 +15389,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
                 unreachable!("setslice specialization: source index {j} has no element");
             };
             let src_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(src_item);
+            let _ = pyre_object::gc_roots::pin_root(src_item);
             let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
                 unreachable!("setslice specialization: operand concrete vanished from the shadow");
             };
@@ -15401,9 +15401,9 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
                 );
             };
             let disp_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(displaced);
+            let _ = pyre_object::gc_roots::pin_root(displaced);
             let key_box = pyre_object::w_int_new(tgt_index);
-            pyre_object::gc_roots::pin_root(key_box);
+            let key_box = pyre_object::gc_roots::pin_root(key_box);
             let Some(list_obj) = walker_concrete_ref_object(ctx, list_op) else {
                 unreachable!("setslice specialization: list concrete vanished mid-apply");
             };

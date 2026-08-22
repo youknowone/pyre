@@ -2968,7 +2968,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             } else {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
-                pyre_object::gc_roots::pin_root(grown as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
                 let block_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 pyre_object::gc_roots::shadow_stack_get(block_slot)
                     as *mut pyre_object::object_array::ItemsBlock
@@ -3008,7 +3008,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
             let fresh = pyre_object::object_array::alloc_instance_items_block(&storage, cap);
-            pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
             let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
@@ -3177,7 +3177,7 @@ impl MapdictObject for MapdictCarrier {
             } else {
                 let grown =
                     pyre_object::object_array::grow_instance_items_block(old, needed, old_cap);
-                pyre_object::gc_roots::pin_root(grown as PyObjectRef);
+                let _ = pyre_object::gc_roots::pin_root(grown as PyObjectRef);
                 pyre_object::gc_roots::shadow_stack_get(
                     pyre_object::gc_roots::shadow_stack_len() - 1,
                 ) as *mut pyre_object::object_array::ItemsBlock
@@ -3207,7 +3207,7 @@ impl MapdictObject for MapdictCarrier {
                 .len()
                 .max(pyre_object::object_array::items_block_capacity(old));
             let fresh = pyre_object::object_array::alloc_instance_items_block(&storage, cap);
-            pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(fresh as PyObjectRef);
             let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             carrier = mapdict_carrier(owner);
@@ -4464,7 +4464,7 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
                 // never read back.  The sibling arm needs none: its
                 // `erase_unboxed` is the argument expression of the store.
                 let _unboxed_root = pyre_object::gc_roots::push_roots();
-                pyre_object::gc_roots::pin_root(unboxed);
+                let unboxed = pyre_object::gc_roots::pin_root(unboxed);
                 if unsafe { (*attr).storage_needed() } > obj._mapdict_storage_length() {
                     obj._set_mapdict_increase_storage1(attr, unboxed);
                     return;
@@ -4527,7 +4527,7 @@ unsafe fn reorder_and_add<O: MapdictObject>(
             for _ in 0..number_to_readd {
                 // current is a PlainAttribute
                 let w_self_value = unsafe { plain_direct_read(current, obj) };
-                pyre_object::gc_roots::pin_root(w_self_value);
+                let _ = pyre_object::gc_roots::pin_root(w_self_value);
                 stack.push((current, pyre_object::gc_roots::shadow_stack_len() - 1));
                 current = unsafe { (*current).as_plain() }.back;
                 obj._mapdict_pop_attribute(current);
@@ -4859,7 +4859,7 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     while i < nodes.len() {
         let node = nodes[i];
         let w_value = plain_direct_read(node, &inst);
-        roots.pin_root(w_value);
+        let w_value = roots.pin_root(w_value);
         vals.push(w_value);
         i += 1;
     }
@@ -4897,7 +4897,7 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
         let name = &(*node).as_plain().name;
         let w_key = pyre_object::unicodeobject::box_str_constant(name);
         let w_value = plain_direct_read(node, &inst);
-        roots.pin_root(w_value);
+        let w_value = roots.pin_root(w_value);
         out.push((w_key, w_value));
         i += 1;
     }
@@ -4946,7 +4946,7 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     // w_obj = self.unerase(w_dict.dstorage) — the backing instance.
     let w_obj =
         unsafe { mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     // dict_w = strategy.unerase(strategy.get_empty_storage()); set_strategy(Object);
     // w_dict.dstorage = strategy.erase(dict_w).
     let dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
@@ -4973,7 +4973,7 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
     let w_obj =
         unsafe { mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
-    pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     let dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
     let dict = unsafe {
         &mut *(pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut pyre_object::W_DictObject)
@@ -5322,7 +5322,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         while let Some(node) = curr {
             let w_key = pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name);
             let w_value = plain_direct_read(node, &inst);
-            roots.pin_root(w_value);
+            let w_value = roots.pin_root(w_value);
             items.push((w_key, w_value));
             curr = node_search((*node).as_plain().back, DICT);
         }
@@ -5422,7 +5422,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let self_slot = pyre_object::gc_roots::pin_roots(&[self_ref]);
         let dict_slot = self_slot + 1;
-        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
             &MAP_DICT_STRATEGY_REF,
             pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut u8,
         ));

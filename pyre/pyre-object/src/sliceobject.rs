@@ -31,10 +31,9 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
     // survive a later minor collection.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(start);
-    crate::gc_roots::pin_root(stop);
-    crate::gc_roots::pin_root(step);
-
+    let _ = crate::gc_roots::pin_root(start);
+    let _ = crate::gc_roots::pin_root(stop);
+    let _ = crate::gc_roots::pin_root(step);
     let header = PyObject {
         ob_type: &SLICE_TYPE as *const PyType,
         w_class: get_instantiate(&SLICE_TYPE),

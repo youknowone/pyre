@@ -64,7 +64,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
 
     let w_globals = execution_context.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_globals);
+    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
     unsafe {
         pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
     };
@@ -262,7 +262,7 @@ fn register_interactive_code(
     source: &str,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_code);
+    let _ = pyre_object::gc_roots::pin_root(w_code);
     let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let linecache = importing::importhook(
         "linecache",
@@ -271,19 +271,19 @@ fn register_interactive_code(
         0,
         runtime.ctx_ptr,
     )?;
-    pyre_object::gc_roots::pin_root(linecache);
+    let _ = pyre_object::gc_roots::pin_root(linecache);
     let linecache_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let register = pyre_interpreter::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(linecache_slot),
         "_register_code",
     )?;
-    pyre_object::gc_roots::pin_root(register);
+    let _ = pyre_object::gc_roots::pin_root(register);
     let register_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Each `w_str_new` can collect, so the earlier string is rooted before
     // the next one is built rather than left in a temporary.
-    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
     let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(pyre_object::w_str_new("<stdin>"));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("<stdin>"));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(register_slot),
@@ -307,7 +307,7 @@ fn shell_exec(
             let code_ptr = Box::into_raw(Box::new(code));
             let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_code);
+            let w_code = pyre_object::gc_roots::pin_root(w_code);
             let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // Source registration is cosmetic — it only feeds later traceback
             // and `inspect` lookups — so a failure must not discard the

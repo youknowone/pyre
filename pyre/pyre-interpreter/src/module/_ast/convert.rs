@@ -1740,7 +1740,7 @@ fn module_to_object(
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
-    pyre_object::gc_roots::pin_root(module_object);
+    let _ = pyre_object::gc_roots::pin_root(module_object);
     let converter = Converter { source, ast_module };
     let root = match module {
         ast::Mod::Expression(module) => converter.node(
@@ -1801,7 +1801,7 @@ impl Converter<'_> {
     /// where it was forwarded to.
     fn pin(&self, value: PyObjectRef) -> Rooted {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
         Rooted(slot)
     }
 

@@ -80,7 +80,7 @@ impl W_WindowsConsoleIO {
     }
 
     fn pin_self(&self) -> usize {
-        pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
         pyre_object::gc_roots::shadow_stack_len() - 1
     }
 
@@ -165,11 +165,11 @@ impl W_WindowsConsoleIO {
         self.smallbuf = [0; SMALLBUF];
 
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_name);
+        let w_name = pyre_object::gc_roots::pin_root(w_name);
         let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_mode);
+        let _ = pyre_object::gc_roots::pin_root(w_mode);
         let mode_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        pyre_object::gc_roots::pin_root(w_closefd);
+        let _ = pyre_object::gc_roots::pin_root(w_closefd);
         let closefd_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let self_slot = self.pin_self();
 
@@ -381,7 +381,7 @@ impl W_WindowsConsoleIO {
             (Some(mut flush), Some(mut close)) => {
                 let flush_slot = pyre_object::gc_roots::shadow_stack_len();
                 let flush_obj = flush.to_exc_object();
-                pyre_object::gc_roots::pin_root(flush_obj);
+                let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 // The second `to_exc_object` allocates, so a moving collection
                 // can run between the pin and the read: it forwards the slot,
                 // never the local copy above.

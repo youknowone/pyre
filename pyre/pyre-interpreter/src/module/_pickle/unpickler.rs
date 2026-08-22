@@ -147,10 +147,10 @@ impl W_Unpickler {
         // `_pickle.c:724-734` BEGIN/END_USING_UNPICKLER.  Attribute lookup
         // on the input stream may execute arbitrary Python.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self as *mut W_Unpickler as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(self as *mut W_Unpickler as PyObjectRef);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         for value in [file, fix_imports, encoding, errors, buffers] {
-            pyre_object::gc_roots::pin_root(value);
+            let _ = pyre_object::gc_roots::pin_root(value);
         }
         let file_slot = self_slot + 1;
         let fix_imports_slot = self_slot + 2;
@@ -202,14 +202,14 @@ impl W_Unpickler {
             "read",
         )?
         .unwrap_or(pyre_object::PY_NULL);
-        pyre_object::gc_roots::pin_root(w_file_read);
+        let _ = pyre_object::gc_roots::pin_root(w_file_read);
         let read_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_file_readline = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             "readline",
         )?
         .unwrap_or(pyre_object::PY_NULL);
-        pyre_object::gc_roots::pin_root(w_file_readline);
+        let _ = pyre_object::gc_roots::pin_root(w_file_readline);
         let readline_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if pyre_object::gc_roots::shadow_stack_get(read_slot).is_null()
             || pyre_object::gc_roots::shadow_stack_get(readline_slot).is_null()
@@ -221,7 +221,7 @@ impl W_Unpickler {
         // The memo persists across `load` calls (a multi-object stream may
         // back-reference an object memoized by an earlier load).
         let memo = pyre_object::listobject::w_list_new(Vec::new());
-        pyre_object::gc_roots::pin_root(memo);
+        let _ = pyre_object::gc_roots::pin_root(memo);
         let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // A non-None `buffers` is consumed as an iterator by NEXT_BUFFER.
         let buffers = pyre_object::gc_roots::shadow_stack_get(buffers_slot);
@@ -256,7 +256,7 @@ impl W_Unpickler {
         // must not recursively consume or reset the active opcode stack.
         let self_ptr = self as *mut W_Unpickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_ptr);
+        let _ = pyre_object::gc_roots::pin_root(self_ptr);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if cur(slot).running {
             return Err(PyError::runtime_error("Unpickler object is already used"));
@@ -274,7 +274,7 @@ impl W_Unpickler {
             else {
                 return Err(unpickling_error("Unpickler.__init__() was not called"));
             };
-            pyre_object::gc_roots::pin_root(w_read);
+            let _ = pyre_object::gc_roots::pin_root(w_read);
             let read_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let Some(w_readline) = crate::baseobjspace::findattr_result(
                 pyre_object::gc_roots::shadow_stack_get(slot),
@@ -283,7 +283,7 @@ impl W_Unpickler {
             else {
                 return Err(unpickling_error("Unpickler.__init__() was not called"));
             };
-            pyre_object::gc_roots::pin_root(w_readline);
+            let _ = pyre_object::gc_roots::pin_root(w_readline);
             let readline_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let current = cur(slot);
             current.w_file_read = pyre_object::gc_roots::shadow_stack_get(read_slot);
@@ -429,17 +429,17 @@ impl W_Unpickler {
             return Ok(self.w_persistent_load);
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self as *const W_Unpickler as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(self as *const W_Unpickler as PyObjectRef);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let cls = type_object();
-        pyre_object::gc_roots::pin_root(cls);
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let descr = crate::runtime_ops::type_dict_lookup(
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
             "__persistent_load_default",
         )
         .ok_or_else(|| PyError::runtime_error("lost Unpickler.persistent_load descriptor"))?;
-        pyre_object::gc_roots::pin_root(descr);
+        let _ = pyre_object::gc_roots::pin_root(descr);
         let descr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         Ok(pyre_object::w_method_new(
             pyre_object::gc_roots::shadow_stack_get(descr_slot),
@@ -465,7 +465,7 @@ impl W_Unpickler {
     fn memo(&self) -> PyObjectRef {
         let self_obj = self as *const W_Unpickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
         let proxy = UnpicklerMemoProxy::allocate_stable(UnpicklerMemoProxy {
@@ -497,11 +497,11 @@ impl W_Unpickler {
     fn set_memo(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
         let self_obj = self as *mut W_Unpickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(self_obj);
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if UnpicklerMemoProxy::from_obj(w_value).is_some() {
             let w_dict = call_meth(w_value, "copy", &[])?;
-            pyre_object::gc_roots::pin_root(w_dict);
+            let _ = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let (w_list, next) =
                 memo_list_from_dict(pyre_object::gc_roots::shadow_stack_get(dict_slot))?;
@@ -567,7 +567,7 @@ fn resolve_dotted_find_class(
 fn attribute_error_with_context(message: String, mut context: PyError) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_context = context.to_exc_object();
-    pyre_object::gc_roots::pin_root(w_context);
+    let _ = pyre_object::gc_roots::pin_root(w_context);
     let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut error = PyError::attribute_error(message);
     let w_error = error.to_exc_object();
@@ -608,9 +608,9 @@ mod memo_proxy {
                 return Ok(w_dict);
             }
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_memo);
+            let _ = pyre_object::gc_roots::pin_root(w_memo);
             let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            pyre_object::gc_roots::pin_root(w_dict);
+            let w_dict = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let len = unsafe {
                 pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
@@ -630,7 +630,7 @@ mod memo_proxy {
                     // `w_dict_setitem` boxes the int key (`w_int_new`), which
                     // may collect and move `v`; pin it across the store.
                     let _r = pyre_object::gc_roots::push_roots();
-                    pyre_object::gc_roots::pin_root(v);
+                    let _ = pyre_object::gc_roots::pin_root(v);
                     let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
                     unsafe {
@@ -649,7 +649,7 @@ mod memo_proxy {
         fn clear(&self) {
             let w_unpickler = self.w_unpickler;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_unpickler);
+            let _ = pyre_object::gc_roots::pin_root(w_unpickler);
             let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let empty = pyre_object::listobject::w_list_new(Vec::new());
             let u = unsafe {
@@ -789,7 +789,7 @@ fn memo_put(slot: usize, i: i64, w_val: PyObjectRef) {
     } else {
         // Grow. `w_list_append` may collect; pin the value and re-read self/list.
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_val);
+        let _ = pyre_object::gc_roots::pin_root(w_val);
         let val_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // NULL-fill through index `i` (inclusive). Appending `PY_NULL` forces the
         // Object strategy, so memoized values keep pointer identity on GET.
@@ -1138,7 +1138,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             // Pin `items` so the `extend`/`append` lookups (which may allocate
             // and collect) do not strand it; re-read the list top per call.
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(items);
+            let _ = pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_list = top(slot, "APPENDS")?;
             match crate::baseobjspace::findattr_result(w_list, "extend")? {
@@ -1198,7 +1198,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         x if x == op::ADDITEMS => {
             let items = pop_mark(slot)?;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(items);
+            let _ = pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_set = top(slot, "ADDITEMS")?;
             let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
@@ -1298,9 +1298,9 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let w_args = pop(slot)?;
             let w_func = top(slot, "REDUCE")?;
             let _roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(w_args);
+            let _ = pyre_object::gc_roots::pin_root(w_args);
             let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            pyre_object::gc_roots::pin_root(w_func);
+            let _ = pyre_object::gc_roots::pin_root(w_func);
             let func_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // `_pickle.c:load_reduce` rejects a non-tuple argument list before
             // the callable ever runs, so an iterable operand is a stream error
@@ -1329,7 +1329,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                     pyre_object::gc_roots::shadow_stack_get(args_slot),
                     kind,
                 )?;
-                pyre_object::gc_roots::pin_root(w_obj);
+                let _ = pyre_object::gc_roots::pin_root(w_obj);
                 let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let me = cur(slot);
                 unsafe {
@@ -1352,7 +1352,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             )?;
             let arg_base = pyre_object::gc_roots::shadow_stack_len();
             for arg in args {
-                pyre_object::gc_roots::pin_root(arg);
+                let _ = pyre_object::gc_roots::pin_root(arg);
             }
             let rooted_args: Vec<PyObjectRef> = (arg_base
                 ..pyre_object::gc_roots::shadow_stack_len())
@@ -1362,7 +1362,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                 pyre_object::gc_roots::shadow_stack_get(func_slot),
                 &rooted_args,
             )?;
-            pyre_object::gc_roots::pin_root(w_obj);
+            let _ = pyre_object::gc_roots::pin_root(w_obj);
             let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // The callable remains in place at stack[-1], matching PyPy's
             // `_stack_top`; replace it with the reduction result.
@@ -1518,14 +1518,14 @@ fn packed_list_from_args(
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_args);
+    let _ = pyre_object::gc_roots::pin_root(w_args);
     let w_zero = pyre_object::w_int_new(0);
-    pyre_object::gc_roots::pin_root(w_zero);
+    let _ = pyre_object::gc_roots::pin_root(w_zero);
     let w_packed = crate::baseobjspace::getitem(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 1),
     )?;
-    pyre_object::gc_roots::pin_root(w_packed);
+    let _ = pyre_object::gc_roots::pin_root(w_packed);
     if unsafe {
         !crate::baseobjspace::isinstance_bytes_w(pyre_object::gc_roots::shadow_stack_get(base + 2))
     } {
@@ -1567,7 +1567,7 @@ fn packed_list_from_args(
                 pyre_object::bytesobject::w_bytes_from_bytes(&data[offset..end])
             }
         };
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
         offset = end;
     }
     let items = (item_base..pyre_object::gc_roots::shadow_stack_len())
@@ -1583,8 +1583,8 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
     // alive while key hashing/equality can call back into Python and collect.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_dict);
-    pyre_object::gc_roots::pin_root(items);
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
+    let items = pyre_object::gc_roots::pin_root(items);
     let n = unsafe {
         pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(base + 1))
     };
@@ -1640,7 +1640,7 @@ fn read_line_int(slot: usize) -> Result<i64, PyError> {
 fn call_find_class_names(slot: usize, module: &str, name: &str) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let w_module = pyre_object::w_str_new(module);
-    pyre_object::gc_roots::pin_root(w_module);
+    let _ = pyre_object::gc_roots::pin_root(w_module);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_name = pyre_object::w_str_new(name);
     call_find_class(
@@ -1658,9 +1658,9 @@ fn call_find_class(
     // Resolving the bound `find_class` allocates, which can move the nursery;
     // pin the arguments (and re-read `self`) across the lookup.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_module);
+    let _ = pyre_object::gc_roots::pin_root(w_module);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_name);
+    let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let method = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(slot),
@@ -1695,9 +1695,9 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
 
 fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_module);
+    let _ = pyre_object::gc_roots::pin_root(w_module);
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_name);
+    let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     if let Ok(sys) = import_module("sys")
         && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
@@ -1742,7 +1742,7 @@ fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
     let obj = call_find_class(slot, w_module, w_name)?;
     // `_extension_cache[code] = obj`; pin `obj` across the dict lookups.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let copyreg = import_module("copyreg")?;
     let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
@@ -1772,10 +1772,10 @@ fn decode_string(slot: usize, data: &[u8]) -> Result<PyObjectRef, PyError> {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let w_bytes = pyre_object::w_bytes_from_bytes(data);
-    pyre_object::gc_roots::pin_root(w_bytes);
+    let _ = pyre_object::gc_roots::pin_root(w_bytes);
     let b = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_encoding = pyre_object::w_str_new(&encoding);
-    pyre_object::gc_roots::pin_root(w_encoding);
+    let _ = pyre_object::gc_roots::pin_root(w_encoding);
     let e = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_errors = pyre_object::w_str_new(&errors);
     call_meth(
@@ -1865,7 +1865,7 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
     // is not in a GC-walked container; resolving the bound `persistent_load`
     // allocates and can move the nursery, so pin it across the lookup.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_pid);
+    let _ = pyre_object::gc_roots::pin_root(w_pid);
     let pid_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let self_obj = pyre_object::gc_roots::shadow_stack_get(slot);
     // `findattr_result` propagates a descriptor's own error instead of panicking;
@@ -1948,19 +1948,19 @@ fn new_instance_star(
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_cls);
+    let _ = pyre_object::gc_roots::pin_root(w_cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_args);
+    let _ = pyre_object::gc_roots::pin_root(w_args);
     let star_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let kwargs_slot = w_kwargs.map(|kwargs| {
-        pyre_object::gc_roots::pin_root(kwargs);
+        let _ = pyre_object::gc_roots::pin_root(kwargs);
         pyre_object::gc_roots::shadow_stack_len() - 1
     });
     let w_new = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
         "__new__",
     )?;
-    pyre_object::gc_roots::pin_root(w_new);
+    let _ = pyre_object::gc_roots::pin_root(w_new);
     let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     // interp_pickle.py `load_newobj`: an empty star-argument
@@ -1983,7 +1983,7 @@ fn new_instance_star(
     )?;
     let positional_base = pyre_object::gc_roots::shadow_stack_len();
     for value in unpacked {
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
 
     let mut keyword_names = Vec::new();
@@ -1998,11 +1998,11 @@ fn new_instance_star(
     }
     let keyword_name_base = pyre_object::gc_roots::shadow_stack_len();
     for name in keyword_names {
-        pyre_object::gc_roots::pin_root(name);
+        let _ = pyre_object::gc_roots::pin_root(name);
     }
     let keyword_value_base = pyre_object::gc_roots::shadow_stack_len();
     for value in keyword_values {
-        pyre_object::gc_roots::pin_root(value);
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
 
     let mut call_args = Vec::with_capacity(1 + keyword_name_base.saturating_sub(positional_base));
@@ -2045,9 +2045,9 @@ fn new_instance_star(
 /// `load_build` — apply pickled state to a freshly created instance.
 fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_inst);
+    let _ = pyre_object::gc_roots::pin_root(w_inst);
     let inst_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_state);
+    let _ = pyre_object::gc_roots::pin_root(w_state);
     let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     // __setstate__ takes precedence.
@@ -2059,7 +2059,7 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
         // attribute explicitly set to `None` is still called — and reports the
         // ordinary "'NoneType' object is not callable".  Only a missing hook
         // falls through to state restoration.
-        pyre_object::gc_roots::pin_root(setstate);
+        let _ = pyre_object::gc_roots::pin_root(setstate);
         let setstate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         call_fn(
             pyre_object::gc_roots::shadow_stack_get(setstate_slot),
@@ -2081,9 +2081,9 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
     } else {
         (current_state, pyre_object::w_none())
     };
-    pyre_object::gc_roots::pin_root(w_dict_state);
+    let _ = pyre_object::gc_roots::pin_root(w_dict_state);
     let dict_state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(w_slot_state);
+    let _ = pyre_object::gc_roots::pin_root(w_slot_state);
     let slot_state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     if !unsafe { pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(dict_state_slot)) } {
@@ -2098,7 +2098,7 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
             pyre_object::gc_roots::shadow_stack_get(inst_slot),
             "__dict__",
         )?;
-        pyre_object::gc_roots::pin_root(w_inst_dict);
+        let _ = pyre_object::gc_roots::pin_root(w_inst_dict);
         let inst_dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let items = unsafe {
             pyre_object::dictmultiobject::w_dict_items(pyre_object::gc_roots::shadow_stack_get(
@@ -2107,9 +2107,9 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
         };
         for (key, value) in items {
             let _item_roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(key);
+            let _ = pyre_object::gc_roots::pin_root(key);
             let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            pyre_object::gc_roots::pin_root(value);
+            let _ = pyre_object::gc_roots::pin_root(value);
             let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // CPython 3.14 Modules/_pickle.c:6837-6843: exact `str`
             // instance-attribute keys pass through the interpreter intern
@@ -2140,9 +2140,9 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
         };
         for (key, value) in items {
             let _item_roots = pyre_object::gc_roots::push_roots();
-            pyre_object::gc_roots::pin_root(key);
+            let _ = pyre_object::gc_roots::pin_root(key);
             let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            pyre_object::gc_roots::pin_root(value);
+            let _ = pyre_object::gc_roots::pin_root(value);
             let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             if !unsafe { pyre_object::is_str(pyre_object::gc_roots::shadow_stack_get(key_slot)) } {
                 return Err(PyError::type_error(format!(

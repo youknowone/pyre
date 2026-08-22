@@ -47,7 +47,7 @@ mod imp {
     pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let argtypes = funcptr::resolve_argtypes(current_obj()).unwrap_or_default();
         // The whole livevar set is published before the first forwarding query:
@@ -220,14 +220,14 @@ mod imp {
         let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(unsafe { *userdata.slot } as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(unsafe { *userdata.slot } as PyObjectRef);
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let use_errno = funcptr::funcptr_flags(current_obj()) & funcptr::FUNCFLAG_USE_ERRNO != 0;
         let call_result = match decode_args(current_obj(), args) {
             Ok(decoded) => host_ctypes::with_callback_errno_preserved(use_errno, || {
                 let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
                     .ok_or_else(|| crate::PyError::type_error("callback has no callable"))?;
-                pyre_object::gc_roots::pin_root(callable);
+                let _ = pyre_object::gc_roots::pin_root(callable);
                 let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(callable_slot),
@@ -242,7 +242,7 @@ mod imp {
         // `restype` cannot represent.
         let written = match funcptr::callback_result(current_obj(), call_result) {
             Ok(value) => {
-                pyre_object::gc_roots::pin_root(value);
+                let _ = pyre_object::gc_roots::pin_root(value);
                 let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 write_result(
                     current_obj(),
@@ -284,7 +284,7 @@ mod imp {
             match decode_arg(at, p) {
                 Ok(value) => {
                     decoded_slots.push(pyre_object::gc_roots::shadow_stack_len());
-                    pyre_object::gc_roots::pin_root(value);
+                    let _ = pyre_object::gc_roots::pin_root(value);
                 }
                 Err(error) => return Err(error),
             }
@@ -305,7 +305,7 @@ mod imp {
             let address = unsafe { *(p as *const usize) };
             let inst = crate::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(inst);
+            let _ = pyre_object::gc_roots::pin_root(inst);
             funcptr::store_funcptr_addr(
                 pyre_object::gc_roots::shadow_stack_get(inst_slot),
                 address,
@@ -330,7 +330,7 @@ mod imp {
         if let Some(size) = cdata::ctype_size_of(at) {
             let inst = crate::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(inst);
+            let _ = pyre_object::gc_roots::pin_root(inst);
             let bytes = unsafe { host_ctypes::borrow_memory(p.cast::<u8>(), size) };
             cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(inst_slot), 0, bytes);
             return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));

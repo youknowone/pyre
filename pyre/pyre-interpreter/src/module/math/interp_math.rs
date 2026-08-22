@@ -695,7 +695,7 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let items_base = pyre_object::gc_roots::shadow_stack_len();
         for &item in &items {
-            pyre_object::gc_roots::pin_root(item);
+            let _ = pyre_object::gc_roots::pin_root(item);
         }
         (0..items.len())
             .map(|index| {
@@ -1456,10 +1456,10 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
     // consumed.
     let _roots = pyre_object::gc_roots::push_roots();
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
     let w_iter = crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
     let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_iter);
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
 
     let mut inf_sum = 0.0;
     let mut special_sum = 0.0;
@@ -1477,7 +1477,7 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
         let original = {
             let _value_root = pyre_object::gc_roots::push_roots();
             let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(w_value);
+            let _ = pyre_object::gc_roots::pin_root(w_value);
             try_get_double(pyre_object::gc_roots::shadow_stack_get(value_slot))?
         };
         let mut value = original;
@@ -1602,11 +1602,11 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let acc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(start);
+    let _ = pyre_object::gc_roots::pin_root(start);
     let items = crate::builtins::collect_iterable(positional[0])?;
     let items_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &items {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     // Multiplication can call `__mul__`; reload both operands after every
     // collection and keep the running product in its rooted slot.
@@ -1636,7 +1636,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let p_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &p {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let q = crate::builtins::collect_iterable(args[1])?;
     // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
@@ -1645,7 +1645,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     // walker updates, so publish them and read each operand back per turn.
     let q_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &q {
-        pyre_object::gc_roots::pin_root(item);
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     if p.len() != q.len() {
         return Err(crate::PyError::value_error(
@@ -1656,7 +1656,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     // Python `total = 0; total += p_i * q_i` recipe: int stays int, and a
     // Decimal/Fraction/float product widens the running total on first add.
     let acc_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_int_new(0));
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     for index in 0..p.len() {
         let prod = crate::baseobjspace::mul(
             pyre_object::gc_roots::shadow_stack_get(p_base + index),
@@ -1666,7 +1666,7 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
         // that call, released again each turn so the bracket stays fixed-size.
         let iteration_roots = pyre_object::gc_roots::push_roots();
         let prod_slot = pyre_object::gc_roots::shadow_stack_len();
-        iteration_roots.pin_root(prod);
+        let _ = iteration_roots.pin_root(prod);
         let total = crate::baseobjspace::add(
             pyre_object::gc_roots::shadow_stack_get(acc_slot),
             pyre_object::gc_roots::shadow_stack_get(prod_slot),

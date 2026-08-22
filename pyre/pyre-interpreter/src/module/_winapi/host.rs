@@ -779,7 +779,7 @@ pub fn VirtualQuerySize(address: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let callback_slot = roots.base();
-    roots.pin_root(on_type_read);
+    let _ = roots.pin_root(on_type_read);
     host_winapi::read_windows_mimetype_registry_in_batches(
         |entries: &mut Vec<(String, String)>| -> Result<(), crate::PyError> {
             // The host refills the batch it hands over, so it has to be

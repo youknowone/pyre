@@ -74,9 +74,9 @@ pub fn w_sre_pattern_new(
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_pattern);
-    crate::gc_roots::pin_root(w_groupindex);
-    crate::gc_roots::pin_root(w_indexgroup);
+    let w_pattern = crate::gc_roots::pin_root(w_pattern);
+    let w_groupindex = crate::gc_roots::pin_root(w_groupindex);
+    let w_indexgroup = crate::gc_roots::pin_root(w_indexgroup);
     let obj = W_SRE_Pattern::allocate(W_SRE_Pattern {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -153,9 +153,9 @@ pub fn w_sre_match_new(
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_srepat);
-    crate::gc_roots::pin_root(w_string);
-    crate::gc_roots::pin_root(w_buffer);
+    let w_srepat = crate::gc_roots::pin_root(w_srepat);
+    let w_string = crate::gc_roots::pin_root(w_string);
+    let w_buffer = crate::gc_roots::pin_root(w_buffer);
     W_SRE_Match::allocate_stable(W_SRE_Match {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -242,9 +242,9 @@ pub fn w_sre_scanner_new(
     export_active: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_srepat);
-    crate::gc_roots::pin_root(w_string);
-    crate::gc_roots::pin_root(w_buffer);
+    let w_srepat = crate::gc_roots::pin_root(w_srepat);
+    let w_string = crate::gc_roots::pin_root(w_string);
+    let w_buffer = crate::gc_roots::pin_root(w_buffer);
     W_SRE_Scanner::allocate_stable(W_SRE_Scanner {
         ob: PyObject {
             ob_type: std::ptr::null(),

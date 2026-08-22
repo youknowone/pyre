@@ -443,11 +443,11 @@ pub fn new_pycfunction_in_class(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_self);
+    let _ = roots.pin_root(w_self);
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_module);
+    let _ = roots.pin_root(w_module);
     let class_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_class.unwrap_or_else(pyre_object::w_none));
+    let _ = roots.pin_root(w_class.unwrap_or_else(pyre_object::w_none));
     let carrier_type = if w_class.is_some() {
         pycmethod_type()
     } else {
@@ -455,7 +455,7 @@ pub fn new_pycfunction_in_class(
     };
     let carrier = pyre_object::w_instance_new(carrier_type);
     let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(carrier);
+    let _ = roots.pin_root(carrier);
 
     let name = text_or_none(unsafe { (*method).ml_name });
     carrier_set(

@@ -578,9 +578,9 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // `ABCMeta.__subclasscheck__`.
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.base();
-    roots.pin_root(cls);
+    let _ = roots.pin_root(cls);
     let subclass_slot = cls_slot + 1;
-    roots.pin_root(subclass);
+    let _ = roots.pin_root(subclass);
 
     // `app_abc.py:130-131` — a positive hit is final: nothing invalidates it,
     // since `register` can only ever add subclasses.
@@ -620,7 +620,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         if !hook.is_null() {
             let hook_roots = pyre_object::gc_roots::push_roots();
             let hook_slot = hook_roots.base();
-            hook_roots.pin_root(hook);
+            let _ = hook_roots.pin_root(hook);
             let ok = crate::call::call_function_impl_result(
                 hook_roots.get(hook_slot),
                 &[roots.get(subclass_slot)],
@@ -649,10 +649,10 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         {
             let registry_roots = pyre_object::gc_roots::push_roots();
             let registry_slot = registry_roots.base();
-            registry_roots.pin_root(registry);
+            let _ = registry_roots.pin_root(registry);
             let iterator = crate::baseobjspace::iter(registry_roots.get(registry_slot))?;
             let iterator_slot = registry_slot + 1;
-            registry_roots.pin_root(iterator);
+            let _ = registry_roots.pin_root(iterator);
             loop {
                 let rcls = match crate::baseobjspace::next(registry_roots.get(iterator_slot)) {
                     Ok(rcls) => rcls,
@@ -661,7 +661,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 };
                 let item_roots = pyre_object::gc_roots::push_roots();
                 let rcls_slot = item_roots.base();
-                item_roots.pin_root(rcls);
+                let _ = item_roots.pin_root(rcls);
                 if crate::baseobjspace::issubclass(
                     roots.get(subclass_slot),
                     item_roots.get(rcls_slot),
@@ -678,13 +678,13 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasses__")?;
         let walk_roots = pyre_object::gc_roots::push_roots();
         let method_slot = walk_roots.base();
-        walk_roots.pin_root(subclasses_method);
+        let _ = walk_roots.pin_root(subclasses_method);
         let subclasses = crate::call::call_function_impl_result(walk_roots.get(method_slot), &[])?;
         let subclasses_slot = method_slot + 1;
-        walk_roots.pin_root(subclasses);
+        let _ = walk_roots.pin_root(subclasses);
         let iterator = crate::baseobjspace::iter(walk_roots.get(subclasses_slot))?;
         let iterator_slot = subclasses_slot + 1;
-        walk_roots.pin_root(iterator);
+        let _ = walk_roots.pin_root(iterator);
         loop {
             let scls = match crate::baseobjspace::next(walk_roots.get(iterator_slot)) {
                 Ok(scls) => scls,
@@ -693,7 +693,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             };
             let item_roots = pyre_object::gc_roots::push_roots();
             let scls_slot = item_roots.base();
-            item_roots.pin_root(scls);
+            let _ = item_roots.pin_root(scls);
             if crate::baseobjspace::issubclass(roots.get(subclass_slot), item_roots.get(scls_slot))?
             {
                 break 'decide true;

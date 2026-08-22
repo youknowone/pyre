@@ -32,9 +32,9 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     // is rooted by the frame any more.  A str is immobile and read directly
     // once pinned; `args` may be a dict and is read back from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(fmt);
+    let fmt = pyre_object::gc_roots::pin_root(fmt);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args);
+    let args = pyre_object::gc_roots::pin_root(args);
     let fmt_str = w_str_get_wtf8(fmt);
     let format = CFormatWtf8::parse_from_wtf8(fmt_str)
         .map_err(|err| PyError::value_error(err.to_string()))?;
@@ -146,9 +146,9 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     // the borrow below — a bytes-like object never moves, but an unreachable
     // one is still swept, and the slice points into its payload.
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(fmt);
+    let fmt = pyre_object::gc_roots::pin_root(fmt);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args);
+    let args = pyre_object::gc_roots::pin_root(args);
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
     let format = CFormatBytes::parse_from_bytes(fmt_bytes)
         .map_err(|err| PyError::value_error(err.to_string()))?;

@@ -545,17 +545,17 @@ fn sched_param_seq_type() -> PyObjectRef {
     *T.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
         let ty = crate::_structseq::make_struct_seq("posix.sched_param", &["sched_priority"]);
-        pyre_object::gc_roots::pin_root(ty);
+        let _ = pyre_object::gc_roots::pin_root(ty);
         let ty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         let new_descr = crate::typedef::make_new_descr_with_signature(
             crate::_structseq::structseq_descr_new,
             crate::gateway::Signature::new(vec!["cls", "sched_priority"], None, None, 0, 1),
         );
-        pyre_object::gc_roots::pin_root(new_descr);
+        let _ = pyre_object::gc_roots::pin_root(new_descr);
         let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let reduce = crate::make_builtin_function_with_arity("__reduce__", sched_param_reduce, 1);
-        pyre_object::gc_roots::pin_root(reduce);
+        let _ = pyre_object::gc_roots::pin_root(reduce);
         let reduce_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         unsafe {
@@ -607,10 +607,10 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     // it is stored.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(cls);
-    pyre_object::gc_roots::pin_root(priority);
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let _ = pyre_object::gc_roots::pin_root(priority);
     let inner = pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(base + 1)]);
-    pyre_object::gc_roots::pin_root(inner);
+    let _ = pyre_object::gc_roots::pin_root(inner);
     Ok(pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 2),
@@ -1067,7 +1067,7 @@ mod win_nt {
 fn create_environ() -> pyre_object::PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
     // Both halves of an entry stay rooted across the store: either allocation
     // may move what the other one already produced.
     #[cfg_attr(
@@ -1081,9 +1081,9 @@ fn create_environ() -> pyre_object::PyObjectRef {
     ) {
         let _entry = pyre_object::gc_roots::push_roots();
         let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(key());
+        let _ = pyre_object::gc_roots::pin_root(key());
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(value());
+        let _ = pyre_object::gc_roots::pin_root(value());
         unsafe {
             pyre_object::w_dict_store(
                 pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -1155,15 +1155,14 @@ pub(crate) fn fspath(
     }
     let roots = pyre_object::gc_roots::push_roots();
     let arg_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(arg);
-    let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+    let arg = pyre_object::gc_roots::pin_root(arg);
     let path_type = crate::typedef::r#type(arg);
     if let Some(pt) = path_type
         && let Some(fspath_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
     {
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(fspath_descr);
+        let _ = pyre_object::gc_roots::pin_root(fspath_descr);
         // PyPy's `interp_posix._fspath` binds `__fspath__` before calling it;
         // a non-descriptor is its own value.
         let fspath_fn = unsafe {
@@ -1191,8 +1190,7 @@ pub(crate) fn fspath(
             &[],
         )?;
         let result_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(result);
-        let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+        let result = pyre_object::gc_roots::pin_root(result);
         // The protocol is only satisfied by what a path can be, so an answer
         // that is neither names the object that gave it and the type it gave.
         if unsafe { pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result) } {
@@ -5330,9 +5328,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     ) {
         let _entry_scope = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, name));
-        pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, full));
-        pyre_object::gc_roots::pin_root(W_DirEntry::allocate_stable(W_DirEntry::default()));
+        let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, name));
+        let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, full));
+        let _ = pyre_object::gc_roots::pin_root(W_DirEntry::allocate_stable(W_DirEntry::default()));
         let obj = pyre_object::gc_roots::shadow_stack_get(base + 2);
         let de = W_DirEntry::from_obj(obj).expect("freshly allocated posix.DirEntry");
         de.w_name = pyre_object::gc_roots::shadow_stack_get(base);
@@ -5363,7 +5361,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // allocation can still drive a moving collection over a large listing,
         // so `list` and each per-entry temporary live on the shadow stack.
         let _list_scope = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(list);
+        let _ = pyre_object::gc_roots::pin_root(list);
         let list_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // A `scandir(fd)` lists through the descriptor and every entry records
         // it (`-1` for the entries a name produced), so its own stat resolves
@@ -5443,7 +5441,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // Initialise the iterator type before allocating its native owner, then
         // pin that stable owner while connecting it to the entries list.
         let _ = scandir_iter_type();
-        pyre_object::gc_roots::pin_root(W_ScandirIterator::allocate_stable(
+        let _ = pyre_object::gc_roots::pin_root(W_ScandirIterator::allocate_stable(
             W_ScandirIterator::default(),
         ));
         let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -8871,12 +8869,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let _roots = pyre_object::gc_roots::push_roots();
                         let header_slot = bound[4].map(|value| {
                             let slot = pyre_object::gc_roots::shadow_stack_len();
-                            pyre_object::gc_roots::pin_root(value);
+                            let _ = pyre_object::gc_roots::pin_root(value);
                             slot
                         });
                         let trailer_slot = bound[5].map(|value| {
                             let slot = pyre_object::gc_roots::shadow_stack_len();
-                            pyre_object::gc_roots::pin_root(value);
+                            let _ = pyre_object::gc_roots::pin_root(value);
                             slot
                         });
                         let collect_buffers = |slot: Option<usize>, name: &str| {
@@ -9067,7 +9065,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 ]);
                 let kwargs_slot = kwargs.map(|kwargs| {
                     let slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(kwargs);
+                    let _ = pyre_object::gc_roots::pin_root(kwargs);
                     slot
                 });
                 let positional =
@@ -9377,7 +9375,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // take the policy out of it afterwards.
                     let _roots = pyre_object::gc_roots::push_roots();
                     let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-                    pyre_object::gc_roots::pin_root(value);
+                    let value = pyre_object::gc_roots::pin_root(value);
                     let param_obj = unsafe { pyre_object::w_tuple_getitem(value, 1).unwrap() };
                     let priority = sched_priority_w(param_obj)?;
                     let value = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
@@ -9820,7 +9818,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         fn store_names_dict(ns: PyObjectRef, key: &str, table: &[(&str, i32)]) {
             let _names_roots = pyre_object::gc_roots::push_roots();
             let names_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
             for (name, value) in table {
                 // The value is allocated before the store, and the dict is
                 // reloaded from its root slot every iteration because the
@@ -9961,7 +9959,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         let w_sysconf_names = pyre_object::w_dict_new();
         let _sysconf_names_root = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_sysconf_names);
+        let _ = pyre_object::gc_roots::pin_root(w_sysconf_names);
         let names_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         for (name, value) in sysconf_names() {
             // Build the value first: call arguments evaluate left to right, so

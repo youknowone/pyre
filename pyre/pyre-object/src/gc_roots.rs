@@ -345,7 +345,8 @@ impl RootScope {
 
     /// Scope-local [`pin_root`] using the already-resolved root-stack cell.
     #[majit_macros::dont_look_inside]
-    pub fn pin_root(&self, root: PyObjectRef) {
+    #[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
+    pub fn pin_root(&self, root: PyObjectRef) -> PyObjectRef {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
         // SAFETY: `stack_slot` is this thread's root-stack cell, alive for the
@@ -361,14 +362,16 @@ impl RootScope {
         // this root write.  Pyre's free-threaded seam needs the normalization
         // only after a second mutator has existed; the sticky predicate also
         // covers one which collected and unregistered before this point.
-        if majit_gc::gc_sync::foreign_mutator_seen() {
-            let normalized =
-                crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-            if normalized != root {
-                // SAFETY: same cell, and `index` is still live.
-                unsafe { *(*self.stack_slot).slot(index) = normalized };
-            }
+        if !majit_gc::gc_sync::foreign_mutator_seen() {
+            return root;
         }
+        let normalized =
+            crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+        if normalized != root {
+            // SAFETY: same cell, and `index` is still live.
+            unsafe { *(*self.stack_slot).slot(index) = normalized };
+        }
+        normalized
     }
 
     /// Scope-local [`shadow_stack_get`] using the cached cell.
@@ -480,11 +483,16 @@ pub fn push_roots() -> RootScope {
 /// so the matching [`Drop`] truncates the entry. Pinning without a
 /// guard is a leak from the GC's perspective once the backend GC consumes the stack.
 ///
+/// Returns the word now held by the shadow-stack slot. A foreign collection
+/// may have forwarded `root` while this call waited at its normalization
+/// safepoint, so callers that use the word after pinning must use this value.
+///
 /// Pushes onto the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the call instead of tracing into
 /// it (`@dont_look_inside`, `rlib/jit.py`), the `shadow_stack_len` twin.
+#[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
 #[majit_macros::dont_look_inside]
-pub fn pin_root(root: PyObjectRef) {
+pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
     // Publish the raw value first.  `try_gc_current_object_address` is itself
@@ -505,7 +513,7 @@ pub fn pin_root(root: PyObjectRef) {
     // an already-forwarded nursery object; normalize the host-side copy at
     // the same boundary so the shadow stack never gains a forwarding stub.
     if !majit_gc::gc_sync::foreign_mutator_seen() {
-        return;
+        return root;
     }
     let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
     // The slot already holds `root`, so a query that found no forwarding stub
@@ -520,6 +528,7 @@ pub fn pin_root(root: PyObjectRef) {
             unsafe { *stack.slot(index) = normalized }
         });
     }
+    normalized
 }
 
 /// Publish a complete translated livevar set before performing any
@@ -912,8 +921,8 @@ mod tests {
         {
             let roots = push_roots();
             assert_eq!(roots.base(), before);
-            roots.pin_root(dummy(0x1234));
-            roots.pin_root(dummy(0x5678));
+            let _ = roots.pin_root(dummy(0x1234));
+            let _ = roots.pin_root(dummy(0x5678));
             assert_eq!(roots.get(before) as usize, 0x1234);
             assert_eq!(roots.get(before + 1) as usize, 0x5678);
         }
@@ -929,8 +938,8 @@ mod tests {
         let before = shadow_stack_len();
         {
             let _roots = push_roots();
-            pin_root(dummy(0xDEAD_BEEF));
-            pin_root(dummy(0xCAFE_F00D));
+            let _ = pin_root(dummy(0xDEAD_BEEF));
+            let _ = pin_root(dummy(0xCAFE_F00D));
             assert_eq!(shadow_stack_len(), before + 2);
             assert_eq!(shadow_stack_get(before) as usize, 0xDEAD_BEEF);
             assert_eq!(shadow_stack_get(before + 1) as usize, 0xCAFE_F00D);
@@ -946,13 +955,13 @@ mod tests {
     fn nested_root_scopes_pop_in_lifo_order() {
         let before = shadow_stack_len();
         let outer = push_roots();
-        pin_root(dummy(1));
+        let _ = pin_root(dummy(1));
         let mid_outer_len = shadow_stack_len();
         assert_eq!(mid_outer_len, before + 1);
         {
             let _inner = push_roots();
-            pin_root(dummy(2));
-            pin_root(dummy(3));
+            let _ = pin_root(dummy(2));
+            let _ = pin_root(dummy(3));
             assert_eq!(shadow_stack_len(), mid_outer_len + 2);
         }
         // _inner dropped — back to the outer's view.
@@ -981,7 +990,7 @@ mod tests {
     #[test]
     fn copy_range_accepts_an_empty_range_at_the_top_of_the_stack() {
         let _roots = push_roots();
-        pin_root(dummy(0x1));
+        let _ = pin_root(dummy(0x1));
         shadow_stack_copy_range(shadow_stack_len(), &mut []);
     }
 
@@ -991,7 +1000,7 @@ mod tests {
     #[should_panic(expected = "shadow-stack range out of bounds")]
     fn copy_range_rejects_an_empty_range_past_the_top_of_the_stack() {
         let _roots = push_roots();
-        pin_root(dummy(0x1));
+        let _ = pin_root(dummy(0x1));
         shadow_stack_copy_range(shadow_stack_len() + 1, &mut []);
     }
 
@@ -1002,9 +1011,9 @@ mod tests {
     #[test]
     fn walk_shadow_stack_visits_each_slot_mutably() {
         let _roots = push_roots();
-        pin_root(dummy(0x1));
-        pin_root(dummy(0x2));
-        pin_root(dummy(0x3));
+        let _ = pin_root(dummy(0x1));
+        let _ = pin_root(dummy(0x2));
+        let _ = pin_root(dummy(0x3));
 
         // Read pass: collect the addresses we see.
         let mut seen = Vec::new();
@@ -1030,19 +1039,23 @@ mod tests {
     #[should_panic(expected = "the shadow stack was mutated while a root walk was in progress")]
     fn walk_shadow_stack_area_rejects_reentrant_push_in_debug_builds() {
         let _roots = push_roots();
-        pin_root(dummy(0x1));
+        let _ = pin_root(dummy(0x1));
         let area = capture_shadow_stack_area();
         // SAFETY: `area` is this thread's shadow stack, and this synchronous
         // self-walk keeps it live for the duration of the call.
-        unsafe { walk_shadow_stack_area(area, |_| pin_root(dummy(0x2))) };
+        unsafe {
+            walk_shadow_stack_area(area, |_| {
+                let _ = pin_root(dummy(0x2));
+            })
+        };
     }
 
     #[cfg(not(debug_assertions))]
     #[test]
     fn walk_shadow_stack_survives_push_that_grows_the_buffer() {
         let _roots = push_roots();
-        pin_root(dummy(0x11));
-        pin_root(dummy(0x22));
+        let _ = pin_root(dummy(0x11));
+        let _ = pin_root(dummy(0x22));
 
         let (capacity_before, additional) =
             with_shadow_stack(|stack| (stack.capacity(), stack.capacity() - stack.len() + 1));
@@ -1053,7 +1066,7 @@ mod tests {
             if !pushed {
                 pushed = true;
                 for offset in 0..additional {
-                    pin_root(dummy(0x1000 + offset));
+                    let _ = pin_root(dummy(0x1000 + offset));
                 }
             }
         });
@@ -1081,8 +1094,8 @@ mod tests {
     #[test]
     fn walk_shadow_stack_write_back_follows_a_grow_inside_the_visitor() {
         let _roots = push_roots();
-        pin_root(dummy(0x11));
-        pin_root(dummy(0x22));
+        let _ = pin_root(dummy(0x11));
+        let _ = pin_root(dummy(0x22));
 
         let additional = with_shadow_stack(|stack| stack.capacity() - stack.len() + 1);
         let mut pushed = false;
@@ -1090,7 +1103,7 @@ mod tests {
             if !pushed {
                 pushed = true;
                 for offset in 0..additional {
-                    pin_root(dummy(0x1000 + offset));
+                    let _ = pin_root(dummy(0x1000 + offset));
                 }
             }
             // Forward the root the way a moving collector would, *after* the

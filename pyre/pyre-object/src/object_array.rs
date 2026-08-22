@@ -276,7 +276,7 @@ pub unsafe fn alloc_instance_items_block(values: &[PyObjectRef], cap: usize) -> 
     let values_base = crate::gc_roots::pin_roots(values);
     unsafe {
         let block = alloc_mapdict_storage_block(cap);
-        crate::gc_roots::pin_root(block as PyObjectRef);
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let block =
             crate::gc_roots::shadow_stack_get(values_base + values.len()) as *mut ItemsBlock;
         let base = items_block_items_base(block);
@@ -385,7 +385,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let _roots = crate::gc_roots::push_roots();
     let save = crate::gc_roots::shadow_stack_len();
     for &v in values {
-        crate::gc_roots::pin_root(v);
+        let _ = crate::gc_roots::pin_root(v);
     }
     let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
@@ -394,7 +394,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     // collecting operation.  Publish it before the ownership query / write
     // barrier below: either operation can park behind another thread's
     // collection, which may move the otherwise-unrooted fresh array.
-    crate::gc_roots::pin_root(block as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     if len > 0 {
@@ -465,12 +465,12 @@ pub unsafe fn grow_list_items_block_gc(
         // std::alloc fallback unconditionally is both safe and removes the
         // ownership-query safepoint entirely.
         let slot = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
+        let _ = crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
         Some(slot)
     };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
     let new_block = unsafe { alloc_items_block_gc(new_cap) };
-    crate::gc_roots::pin_root(new_block as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
     let old = old_slot
@@ -508,11 +508,11 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     let _roots = crate::gc_roots::push_roots();
     let save = crate::gc_roots::shadow_stack_len();
     for &v in values {
-        crate::gc_roots::pin_root(v);
+        let _ = crate::gc_roots::pin_root(v);
     }
     let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
-    crate::gc_roots::pin_root(block as PyObjectRef);
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     if cap > 0 {
@@ -781,7 +781,7 @@ pub unsafe fn grow_typed_items_block(
         // brackets a malloc with (`framework.py:853-856`).
         let _roots = crate::gc_roots::push_roots();
         let fresh_root = crate::gc_roots::shadow_stack_len();
-        crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
+        let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);
         if !old.is_null() && live_len > 0 {
             std::ptr::copy_nonoverlapping(
                 typed_items_block_items_base(old),
@@ -951,8 +951,8 @@ impl FixedObjectArray {
         }
         let _roots = crate::gc_roots::push_roots();
         let root_base = _roots.base();
-        _roots.pin_root(self as *mut Self as PyObjectRef);
-        _roots.pin_root(value);
+        let _ = _roots.pin_root(self as *mut Self as PyObjectRef);
+        let _ = _roots.pin_root(value);
         let array = _roots.get(root_base) as *mut Self;
         // Every mutable FixedObjectArray has a real header word: managed frame
         // locals carry the collector's header, while the StdAlloc snapshot

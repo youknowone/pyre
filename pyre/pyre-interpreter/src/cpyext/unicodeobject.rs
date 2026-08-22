@@ -345,7 +345,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     // deallocator takes this lock.
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_from_wtf8_managed(text));
+    let _ = roots.pin_root(pyre_object::w_str_from_wtf8_managed(text));
     let refcnt = unsafe { (*raw).ob_refcnt };
     pyobject::link_allocated(
         pyre_object::gc_roots::shadow_stack_get(slot),

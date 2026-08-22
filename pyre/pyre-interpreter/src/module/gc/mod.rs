@@ -573,10 +573,10 @@ fn initialize_stats(
 ) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let stats_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_instance_new(stats_type));
+    let _ = pyre_object::gc_roots::pin_root(w_instance_new(stats_type));
     for (name, value) in fields {
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(value.materialize());
+        let _ = pyre_object::gc_roots::pin_root(value.materialize());
         let stored = unsafe {
             crate::objspace::std::mapdict::instance_node_setdictvalue(
                 pyre_object::gc_roots::shadow_stack_get(stats_slot),
@@ -661,7 +661,7 @@ fn new_collect_stats(
 }
 
 fn pin_object(object: majit_ir::GcRef) {
-    pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
 
 /// `[3.14-spec]` PyPy's `referents.py:115-122` exposes every app-level
@@ -799,7 +799,7 @@ fn wrap_raw_nodes(first: usize, last: usize) -> usize {
         } else {
             gcref::wrap_rooted(slot)
         };
-        pyre_object::gc_roots::pin_root(wrapped);
+        let _ = pyre_object::gc_roots::pin_root(wrapped);
     }
     result_first
 }
@@ -815,7 +815,7 @@ fn wrap_raw_nodes(first: usize, last: usize) -> usize {
 /// address valid.
 fn list_from_root_slots(slots: impl IntoIterator<Item = usize>) -> PyObjectRef {
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_list_new_empty());
+    let _ = pyre_object::gc_roots::pin_root(w_list_new_empty());
     for slot in slots {
         unsafe {
             w_list_append(
@@ -854,7 +854,7 @@ fn enable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
         // GC-visible list as it progresses, interp_gc.py:80-84).
         let _roots = pyre_object::gc_roots::push_roots();
         for &obj in pending.iter() {
-            pyre_object::gc_roots::pin_root(obj);
+            let _ = pyre_object::gc_roots::pin_root(obj);
         }
         let root_end = pyre_object::gc_roots::shadow_stack_len();
         let root_base = root_end - pending.len();
@@ -930,10 +930,10 @@ fn gc_stats_attr_string(self_slot: usize, name: &'static str) -> Result<String, 
 fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
     let raw =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), "_s")?;
-    pyre_object::gc_roots::pin_root(raw);
+    let _ = pyre_object::gc_roots::pin_root(raw);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
         .ok_or_else(|| crate::PyError::type_error("GcStats._s is not a native GcStats"))?;
@@ -962,7 +962,7 @@ fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "total_gc_time",
     )?;
-    pyre_object::gc_roots::pin_root(total_gc_time_obj);
+    let _ = pyre_object::gc_roots::pin_root(total_gc_time_obj);
     let total_gc_time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let total_gc_time =
         crate::baseobjspace::float_w(pyre_object::gc_roots::shadow_stack_get(total_gc_time_slot))?
@@ -1014,9 +1014,9 @@ fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(raw);
+    let _ = pyre_object::gc_roots::pin_root(raw);
     let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
         .ok_or_else(|| crate::PyError::type_error("GcStats() requires a native GcStats"))?;
     let memory_pressure_value = if raw.total_memory_pressure == -1 {
@@ -1054,7 +1054,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
     )?;
     for (name, value) in formatted {
         let text = w_str_new(&format_gc_stat(value));
-        pyre_object::gc_roots::pin_root(text);
+        let _ = pyre_object::gc_roots::pin_root(text);
         let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         crate::baseobjspace::setattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -1066,7 +1066,7 @@ fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), cr
     // receiver first, so an inline `w_int_new` here would allocate — and
     // possibly collect — after the argument already held a raw address.
     let time_value = w_int_new(total_gc_time);
-    pyre_object::gc_roots::pin_root(time_value);
+    let _ = pyre_object::gc_roots::pin_root(time_value);
     let time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     crate::baseobjspace::setattr_str(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -1080,11 +1080,11 @@ fn new_public_gc_stats(memory_pressure: bool) -> Result<PyObjectRef, crate::PyEr
     let _roots = pyre_object::gc_roots::push_roots();
     let raw = stats::new(memory_pressure);
     let raw_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(raw);
+    let _ = pyre_object::gc_roots::pin_root(raw);
     let public_type = gc_stats_public_type();
     let obj = w_instance_new(public_type);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(obj);
     populate_public_gc_stats(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
         pyre_object::gc_roots::shadow_stack_get(raw_slot),
@@ -1184,9 +1184,9 @@ fn write_typeids_sidecar(
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    let _ = pyre_object::gc_roots::pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
     let mode_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_str_new(match payload {
+    let _ = pyre_object::gc_roots::pin_root(w_str_new(match payload {
         TypeidsPayload::Binary(_) => "wb",
         TypeidsPayload::Text(_) => "w",
     }));
@@ -1195,11 +1195,11 @@ fn write_typeids_sidecar(
         pyre_object::gc_roots::shadow_stack_get(mode_slot),
     ])?;
     let opened_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(opened);
+    let _ = pyre_object::gc_roots::pin_root(opened);
     // Materialize the payload only now: `builtin_open` allocates, so a value
     // boxed before it would have to be rooted across the open for nothing.
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(match payload {
+    let _ = pyre_object::gc_roots::pin_root(match payload {
         TypeidsPayload::Binary(bytes) => w_bytes_from_bytes(bytes),
         TypeidsPayload::Text(text) => w_str_new(text),
     });
@@ -1221,7 +1221,7 @@ fn write_typeids_sidecar(
 fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let file_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(file);
+    let _ = pyre_object::gc_roots::pin_root(file);
     // Read the slot at every use instead of caching it in a local: the
     // collector forwards the shadow-stack entry, not the Rust binding, and
     // `w_str_new`, `builtin_open`, `getattr_str`, and `gc_call_method` below
@@ -1233,12 +1233,12 @@ fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError
         // dump, closes it, then materializes typeids.txt/.lst if absent.
         let path = crate::gateway::fspath_buf(file())?;
         let mode_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_str_new("wb"));
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("wb"));
         let opened = crate::builtins::builtin_open(&[
             file(),
             pyre_object::gc_roots::shadow_stack_get(mode_slot),
         ])?;
-        pyre_object::gc_roots::pin_root(opened);
+        let _ = pyre_object::gc_roots::pin_root(opened);
         let opened_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let fileno = gc_call_method(
             pyre_object::gc_roots::shadow_stack_get(opened_slot),
@@ -1358,7 +1358,7 @@ crate::py_module! {
             // no generations to select between.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(generation);
+            let _ = pyre_object::gc_roots::pin_root(generation);
             crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
             let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
             if !unsafe { is_none(generation) } {
@@ -1506,7 +1506,7 @@ crate::py_module! {
         "get_rpy_referents" / 1 = |args| {
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(args[0]);
+            let _ = pyre_object::gc_roots::pin_root(args[0]);
             let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let first = pyre_object::gc_roots::shadow_stack_len();
             if !majit_gc::get_rpy_referents(raw, pin_object) {
@@ -1587,7 +1587,7 @@ crate::py_module! {
             // internal storage.
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(args[0]);
+            let _ = pyre_object::gc_roots::pin_root(args[0]);
             let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let size = majit_gc::get_rpy_memory_usage(raw).ok_or_else(|| {
                     crate::PyError::not_implemented("operation not implemented by this GC")
@@ -1599,7 +1599,7 @@ crate::py_module! {
             // type-info group (index zero is the upstream dummy member).
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(args[0]);
+            let _ = pyre_object::gc_roots::pin_root(args[0]);
             let raw = gcref::unwrap(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let index = majit_gc::get_rpy_type_index(raw).ok_or_else(|| {
                     crate::PyError::not_implemented("operation not implemented by this GC")
@@ -1623,7 +1623,7 @@ crate::py_module! {
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
             for value in list {
-                pyre_object::gc_roots::pin_root(w_int_new(value as i64));
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(value as i64));
             }
             Ok(list_from_roots(first))
         },

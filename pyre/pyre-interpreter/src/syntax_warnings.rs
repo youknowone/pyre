@@ -250,11 +250,11 @@ fn warn_invalid_escape_sequence(
     // call rather than held in a Rust local across the next allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let category_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(category);
+    let _ = pyre_object::gc_roots::pin_root(category);
     let message_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&warning_message(escape)));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&warning_message(escape)));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
 
     crate::module::_warnings::do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),

@@ -233,7 +233,7 @@ impl W_BytesIO {
     /// Pin the receiver so [`Self::from_slot`] can recover it, and answer the
     /// slot it landed in.
     fn pin_self(&self) -> usize {
-        pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
         pyre_object::gc_roots::shadow_stack_len() - 1
     }
 
@@ -255,7 +255,7 @@ impl W_BytesIO {
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
         let _roots = pyre_object::gc_roots::push_roots();
         let buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
-        pyre_object::gc_roots::pin_root(buffer);
+        let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let obj = W_BytesIO::allocate_stable(W_BytesIO {
             buffer: pyre_object::gc_roots::shadow_stack_get(slot),
@@ -483,11 +483,11 @@ impl W_BytesIO {
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.self_obj());
-        pyre_object::gc_roots::pin_root(self.getvalue()?);
-        pyre_object::gc_roots::pin_root(w_int_new(self.tell_pos()));
+        let _ = pyre_object::gc_roots::pin_root(self.self_obj());
+        let _ = pyre_object::gc_roots::pin_root(self.getvalue()?);
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(self.tell_pos()));
         let dict = crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(sp));
-        pyre_object::gc_roots::pin_root(if dict.is_null() { w_none() } else { dict });
+        let _ = pyre_object::gc_roots::pin_root(if dict.is_null() { w_none() } else { dict });
         Ok(w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
             pyre_object::gc_roots::shadow_stack_get(sp + 2),

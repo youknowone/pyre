@@ -63,7 +63,7 @@ pub fn warn_category_w(
         .filter(|_| crate::module::_warnings::state_is_readable())
     else {
         let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(w_msg);
+        let w_msg = pyre_object::gc_roots::pin_root(w_msg);
         let text = crate::baseobjspace::text_w(w_msg)
             .map(|text| text.to_string())
             .unwrap_or_default();

@@ -26,7 +26,7 @@ fn pin_pyerror_payload(err: &PyError) -> PyErrorRootSlots {
     {
         if !value.is_null() {
             *slot = Some(gc_roots::shadow_stack_len());
-            gc_roots::pin_root(value);
+            let _ = gc_roots::pin_root(value);
         }
     }
     slots
@@ -97,9 +97,9 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
         Ok((decoded, next, _)) => {
             let _roots = gc_roots::push_roots();
             let decoded_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(decoded));
+            let _ = gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(decoded));
             let next_slot = gc_roots::shadow_stack_len();
-            gc_roots::pin_root(pyre_object::w_int_new(next as i64));
+            let _ = gc_roots::pin_root(pyre_object::w_int_new(next as i64));
             Ok(pyre_object::w_tuple_new(vec![
                 gc_roots::shadow_stack_get(decoded_slot),
                 gc_roots::shadow_stack_get(next_slot),
@@ -149,7 +149,7 @@ fn scanner_scan_once(
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
     for value in [self_obj, memo, doc] {
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     let doc = gc_roots::shadow_stack_get(slot + 2);
     let bytes = unsafe { pyre_object::w_str_get_wtf8(doc) }.as_bytes();
@@ -298,7 +298,7 @@ fn scanner_parse_object(
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
     for value in [self_obj, memo, doc] {
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     let pairs_hook = W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
         .expect("Scanner payload")
@@ -309,7 +309,7 @@ fn scanner_parse_object(
     } else {
         pyre_object::w_dict_new()
     };
-    gc_roots::pin_root(result);
+    let _ = gc_roots::pin_root(result);
 
     (char_index, byte_index) =
         skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
@@ -348,7 +348,7 @@ fn scanner_parse_object(
             let iteration_roots = gc_roots::push_roots();
             let item_slot = gc_roots::shadow_stack_len();
             let candidate = pyre_object::w_str_from_wtf8(decoded);
-            gc_roots::pin_root(candidate);
+            let _ = gc_roots::pin_root(candidate);
             let memo = gc_roots::shadow_stack_get(slot + 1);
             let key =
                 match crate::baseobjspace::finditem(memo, gc_roots::shadow_stack_get(item_slot))? {
@@ -362,7 +362,7 @@ fn scanner_parse_object(
                         gc_roots::shadow_stack_get(item_slot)
                     }
                 };
-            gc_roots::pin_root(key);
+            let _ = gc_roots::pin_root(key);
 
             (char_index, byte_index) =
                 skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
@@ -400,7 +400,7 @@ fn scanner_parse_object(
                     err
                 }
             })?;
-            gc_roots::pin_root(value);
+            let _ = gc_roots::pin_root(value);
             char_index = next_char;
             byte_index = next_byte;
 
@@ -409,7 +409,7 @@ fn scanner_parse_object(
                     gc_roots::shadow_stack_get(item_slot + 1),
                     gc_roots::shadow_stack_get(item_slot + 2),
                 ]);
-                gc_roots::pin_root(pair);
+                let _ = gc_roots::pin_root(pair);
                 unsafe {
                     pyre_object::w_list_append(
                         gc_roots::shadow_stack_get(slot + 3),
@@ -493,10 +493,10 @@ fn scanner_parse_array(
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
     for value in [self_obj, memo, doc] {
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     let result = pyre_object::w_list_new_empty();
-    gc_roots::pin_root(result);
+    let _ = gc_roots::pin_root(result);
     (char_index, byte_index) =
         skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
     let doc = gc_roots::shadow_stack_get(slot + 2);
@@ -532,7 +532,7 @@ fn scanner_parse_array(
                 err
             }
         })?;
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
         unsafe {
             pyre_object::w_list_append(
                 gc_roots::shadow_stack_get(slot + 3),
@@ -596,12 +596,12 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
     for value in [self_obj, doc] {
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     // CPython `scanner_call`: one exact dict per public invocation, shared by
     // the whole recursive descent and discarded with the call.
     let memo = pyre_object::w_dict_new();
-    gc_roots::pin_root(memo);
+    let _ = gc_roots::pin_root(memo);
     let (value, next, _) = scanner_scan_once(
         gc_roots::shadow_stack_get(slot),
         gc_roots::shadow_stack_get(slot + 2),
@@ -609,7 +609,7 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
         char_index,
         byte_index,
     )?;
-    gc_roots::pin_root(value);
+    let _ = gc_roots::pin_root(value);
     Ok(pyre_object::w_tuple_new(vec![
         gc_roots::shadow_stack_get(slot + 3),
         pyre_object::w_int_new(next as i64),
@@ -817,7 +817,7 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     // surrogate, so it is carried as the WTF-8 it is.
     let note = pyre_object::w_str_from_wtf8_managed(note.into());
     let note_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(note);
+    let _ = gc_roots::pin_root(note);
     if let Ok(add_note) =
         crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(exc_slot), "add_note")
     {
@@ -879,14 +879,14 @@ where
     // for deletion; no parallel Rust identity table is introduced.
     let _roots = gc_roots::push_roots();
     let markers_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(markers);
+    let _ = gc_roots::pin_root(markers);
     let self_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(self_obj);
+    let _ = gc_roots::pin_root(self_obj);
     let obj_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(obj);
+    let _ = gc_roots::pin_root(obj);
     let key = marker_key(gc_roots::shadow_stack_get(obj_slot));
     let key_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(key);
+    let _ = gc_roots::pin_root(key);
     if crate::baseobjspace::contains(
         gc_roots::shadow_stack_get(markers_slot),
         gc_roots::shadow_stack_get(key_slot),
@@ -989,10 +989,10 @@ fn encode_sequence(
     // back out of the slot; capturing the parameter would name the pre-move
     // address and report the type of whatever now occupies that cell.
     let obj_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(obj);
+    let _ = gc_roots::pin_root(obj);
     let iter = crate::baseobjspace::iter(obj)?;
     let iter_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(iter);
+    let _ = gc_roots::pin_root(iter);
     let separator_obj = encoder_attr(self_obj, "item_separator")?;
     let separator = require_string(separator_obj)?.to_wtf8_buf();
     let indent = indent_value(self_obj)?.map(Wtf8::to_wtf8_buf);
@@ -1088,13 +1088,13 @@ fn encode_dict(
     // back where it is used.
     let _roots = gc_roots::push_roots();
     let obj_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(obj);
+    let _ = gc_roots::pin_root(obj);
     let items = crate::call::call_function_impl_result(
         crate::baseobjspace::getattr_str(obj, "items")?,
         &[],
     )?;
     let mut items_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(items);
+    let _ = gc_roots::pin_root(items);
     if crate::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
         let builtins = crate::importing::get_sys_module("builtins")
             .ok_or_else(|| PyError::runtime_error("builtins module is unavailable"))?;
@@ -1104,11 +1104,11 @@ fn encode_dict(
             &[gc_roots::shadow_stack_get(items_slot)],
         )?;
         items_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(sorted_items);
+        let _ = gc_roots::pin_root(sorted_items);
     }
     let iter = crate::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
     let iter_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(iter);
+    let _ = gc_roots::pin_root(iter);
     let item_separator = require_string(encoder_attr(self_obj, "item_separator")?)?.to_wtf8_buf();
     let key_separator = require_string(encoder_attr(self_obj, "key_separator")?)?.to_wtf8_buf();
     let indent = indent_value(self_obj)?.map(Wtf8::to_wtf8_buf);
@@ -1134,12 +1134,12 @@ fn encode_dict(
         // this pair.  Root both halves before the first of those calls.
         let _pair_roots = gc_roots::push_roots();
         let pair_slot = gc_roots::shadow_stack_len();
-        gc_roots::pin_root(pair_items[0]);
-        gc_roots::pin_root(pair_items[1]);
+        let _ = gc_roots::pin_root(pair_items[0]);
+        let _ = gc_roots::pin_root(pair_items[1]);
         let Some(key) = coerce_key(self_obj, gc_roots::shadow_stack_get(pair_slot))? else {
             continue;
         };
-        gc_roots::pin_root(key);
+        let _ = gc_roots::pin_root(key);
         if first {
             first = false;
             if let Some(indent) = &indent {
@@ -1190,7 +1190,7 @@ fn encoder_call_impl(self_obj: PyObjectRef, obj: PyObjectRef, level: i64) -> PyR
     let encoded = encode_value(self_obj, obj, level.max(0))?;
     let _roots = gc_roots::push_roots();
     let encoded_slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(encoded));
+    let _ = gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(encoded));
     Ok(pyre_object::w_list_new(vec![gc_roots::shadow_stack_get(
         encoded_slot,
     )]))
@@ -1248,7 +1248,7 @@ fn make_encoder_impl(
         skipkeys,
         allow_nan,
     ] {
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     let _ = encoder_class::type_object();
     Ok(W_Encoder::allocate_stable(W_Encoder {
@@ -1270,7 +1270,7 @@ fn make_encoder_impl(
 fn make_scanner_impl(context: PyObjectRef) -> PyResult {
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
-    gc_roots::pin_root(context);
+    let _ = gc_roots::pin_root(context);
     for name in [
         "strict",
         "parse_float",
@@ -1280,7 +1280,7 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
         "object_pairs_hook",
     ] {
         let value = crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
-        gc_roots::pin_root(value);
+        let _ = gc_roots::pin_root(value);
     }
     // Match the C accelerator: strict is converted during construction, so
     // an overriding `__bool__` raises before the first token is scanned.

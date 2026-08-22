@@ -64,7 +64,7 @@ fn append_public_children(table: &SymbolTable, children_slot: usize) {
         }
         let data = table_data(child);
         let data_roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(data);
+        let _ = pyre_object::gc_roots::pin_root(data);
         let data_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::listobject::w_list_append(
@@ -82,7 +82,7 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
 
     let symbols = pyre_object::dictmultiobject::w_dict_new();
-    pyre_object::gc_roots::pin_root(symbols);
+    let _ = pyre_object::gc_roots::pin_root(symbols);
     let symbols_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for (name, symbol) in &table.symbols {
         // CPython stores the resolved scope in the high bits of the public
@@ -94,7 +94,7 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
         // `symbols_slot`, so evaluating it inline as the third call argument
         // would leave the first argument holding the pre-collection address.
         let value_roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(pyre_object::w_int_new(flags as i64));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(flags as i64));
         let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -107,11 +107,11 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     }
 
     let varnames = pyre_object::listobject::w_list_new(Vec::new());
-    pyre_object::gc_roots::pin_root(varnames);
+    let _ = pyre_object::gc_roots::pin_root(varnames);
     let varnames_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     for name in &table.varnames {
         let value_roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
         let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
             pyre_object::listobject::w_list_append(
@@ -123,15 +123,15 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     }
 
     let children = pyre_object::listobject::w_list_new(Vec::new());
-    pyre_object::gc_roots::pin_root(children);
+    let _ = pyre_object::gc_roots::pin_root(children);
     let children_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     append_public_children(table, children_slot);
 
-    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&table.name));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&table.name));
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table_type(table) as i64));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table_type(table) as i64));
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table.line_number as i64));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table.line_number as i64));
     let line_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     pyre_object::tupleobject::w_tuple_new(vec![
@@ -155,7 +155,7 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     for &arg in args {
-        pyre_object::gc_roots::pin_root(arg);
+        let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let w_filename = unsafe {
         let arg = pyre_object::gc_roots::shadow_stack_get(base + 1);
@@ -173,7 +173,7 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
             )));
         }
     };
-    pyre_object::gc_roots::pin_root(w_filename);
+    let _ = pyre_object::gc_roots::pin_root(w_filename);
     let filename_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // The compiler dependency still requires a Rust `str`; retain this only
     // as its internal source path and restore the surrogate-preserving Python

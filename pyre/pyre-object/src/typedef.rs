@@ -387,7 +387,7 @@ pub fn w_member_new_with_doc(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(w_cls);
+    let _ = crate::gc_roots::pin_root(w_cls);
     let name = crate::lltype::malloc_raw(name);
     let doc = doc.map_or(std::ptr::null(), |doc| {
         crate::lltype::malloc_raw(doc) as *const String

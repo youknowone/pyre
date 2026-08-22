@@ -823,7 +823,7 @@ fn run_python_impl(source: &str) -> String {
     // registration below allocates and can collect in between. Publish it for
     // that span (pyrex `run_source` does the same).
     let _main_frame_root = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(
+    let _ = pyre_object::gc_roots::pin_root(
         &*frame as *const pyre_interpreter::pyframe::PyFrame as pyre_object::PyObjectRef,
     );
 
