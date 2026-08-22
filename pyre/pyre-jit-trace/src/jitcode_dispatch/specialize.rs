@@ -2496,16 +2496,22 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     }
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let value = if stored.is_null() {
-        // End of the chain.  There is no is-null guard opcode, so pin the
-        // slot against the null constant the way the exception `w_dict`
-        // shadow guard does, then produce the None the getter returns.
+        // End of the chain.  A nullity test is `pyjitpl.py
+        // _establish_nullity`'s GUARD_ISNULL plus a `replace_box` onto the null
+        // constant `constant_from_op` gives it — not a promote.  The
+        // distinction is load-bearing: `compile.py
+        // make_a_counter_per_value` keys a GUARD_VALUE's jitcounter on the
+        // *failing value*, and this slot holds a different PyTraceback on every
+        // walk, so no one value here ever reaches `trace_eagerness` and the
+        // continuation for a non-null link never gets a bridge.
+        // Stamped ahead of the guard because `stamp_guard_value_concrete` only
+        // does it for a GUARD_VALUE, and the snapshot the guard captures reads
+        // the slot's concrete.
+        ctx.trace_ctx
+            .set_opref_concrete(raw_value, majit_ir::Value::Ref(majit_ir::GcRef(0)));
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[raw_value])?;
         let null_const = ctx.trace_ctx.const_ref(0);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[raw_value, null_const],
-        )?;
+        ctx.trace_ctx.replace_box(raw_value, null_const);
         ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
     } else {
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
@@ -3294,13 +3300,21 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // like the method must side-exit before the constant descriptor is reused.
     // mapdict.py LOAD_ATTR caching does this by pinning the map; an exception
     // has no map, and pins the still-unallocated `w_dict` slot instead.
-    let (slot_op, slot_const) = match shadow {
+    let (slot_op, slot_const, shadow_guard) = match shadow {
         ShadowGuard::InstanceMap(map) => (
             walker_record_getfield_gc_i_uncached(ctx, obj, unsafe {
                 crate::descr::mapdict_map_descr(concrete_obj)
             }),
             ctx.trace_ctx.const_int(map as i64),
+            OpCode::GuardValue,
         ),
+        // Pinning `w_dict` at null is a nullity test, and `pyjitpl.py
+        // _establish_nullity` proves one with GUARD_ISNULL.  As a GUARD_VALUE
+        // the guard's jitcounter keys on the *failing* value
+        // (`compile.py make_a_counter_per_value`), which here is
+        // whatever dictionary the assignment just allocated — a fresh address
+        // every time, so no one value reaches `trace_eagerness` and the
+        // has-a-dictionary continuation never gets a bridge.
         ShadowGuard::ExceptionDictIsNull(kind) => (
             walker_record_getfield_gc_r_uncached(
                 ctx,
@@ -3308,9 +3322,20 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
                 crate::descr::w_exception_dict_descr(kind),
             ),
             ctx.trace_ctx.const_ref(0),
+            OpCode::GuardIsnull,
         ),
     };
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[slot_op, slot_const])?;
+    // GUARD_ISNULL carries only the pointer; the null constant is still what
+    // the box is replaced with, the way `_establish_nullity` does it.  The
+    // concrete is stamped here because `stamp_guard_value_concrete` reads it
+    // off a GUARD_VALUE's expected operand, which GUARD_ISNULL does not carry.
+    if shadow_guard == OpCode::GuardIsnull {
+        ctx.trace_ctx
+            .set_opref_concrete(slot_op, majit_ir::Value::Ref(majit_ir::GcRef(0)));
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, shadow_guard, &[slot_op])?;
+    } else {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, shadow_guard, &[slot_op, slot_const])?;
+    }
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(slot_op, slot_const);
@@ -8524,9 +8549,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    // The modelled reads answer from `virtualizable_boxes`, which describe the
-    // PORTAL frame only.  An inline sub-walk publishes a different concrete
-    // frame whose locals live in the callee shadow, not in those boxes.
+    // A pre-filter for the frame-identity test below, which is what actually
+    // decides this shape: `locals()` reports on `gettopframe_nohidden()`, and
+    // inside an inline sub-walk or an inlined callee body that frame is not
+    // the standard virtualizable the modelled reads answer from, so the test
+    // below declines the same shapes one step later.  Refusing here as well
+    // keeps a sub-walk from emitting this fold's guards at all, the property
+    // `walker_inline_guard_resumes_in_callee` qualifies for the folds that do
+    // run under one.
     if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
         return Ok(None);
     }

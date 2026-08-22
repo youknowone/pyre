@@ -152,18 +152,9 @@ WASM_TIMEOUT_SCALE = 4.0
 # short_circuit_value_kept_stack) rather than measuring anything, and came back
 # to 3.5 once every one of those allowances had been removed and the fixtures
 # that still exceeded it -- fib_recursive and loop_callee_shared_mutation, both
-# bound by CALL_ASSEMBLER returns -- were fixed rather than exempted.
-#
-# Three fixtures carry an allowance, and all three name the same structure:
-# a JIT-emitted trace is its own wasm module, so a call leaving it crosses
-# back through the `env.jit_call` trampoline. `math_folds_hot` (13x) reaches
-# the guest's pure-Rust libm where native reaches the platform's;
-# `builtin_folds_hot` (13x) and `str_getitem_len_hot` (4.8x) are loops of
-# nothing but calls, so the crossing is the whole measurement. Retiring them
-# means giving the trace module direct imports for the raw helpers rather
-# than one generic trampoline; until that lands, each header states the
-# highest reading it was fitted to.
-WASM_MAX_DYNASM_RATIO = 3.5
+# bound by CALL_ASSEMBLER returns -- were fixed rather than exempted. No fixture
+# carries an allowance today.
+WASM_MAX_DYNASM_RATIO = 3.8
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x

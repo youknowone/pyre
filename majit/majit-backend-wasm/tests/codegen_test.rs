@@ -2443,7 +2443,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
 /// derives from a real `GcLLDescr_framework`-equivalent allocator.
 /// Mirrors `gc.py get_translated_info_for_typeinfo` /
 /// `gc.py get_translated_info_for_guard_is_object` /
-/// `x86/assembler.py cpu.subclassrange_min_offset`.
+/// `x86/assembler.py Assembler386.genop_guard_guard_subclass cpu.subclassrange_min_offset`.
 fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // Pretend the TYPE_INFO table sits at a small in-memory address;
     // wasm validation only checks the bytecode shape, not the actual
@@ -4044,4 +4044,466 @@ fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
     assert!(!codegen::inline_source_guard_precedes_loop_label(
         &inputs, 1
     ));
+}
+
+/// A region closing at the loop HEADER must rebind the header LABEL's Ref arg
+/// and refresh its home, exactly as the non-header back edge does.
+///
+/// `region_closing_at_a_non_header_label_carries_a_ref_label_arg` threads a Ref
+/// that is already zero on entry, so it cannot tell a preserved Ref from a
+/// zeroed one. This one carries a non-zero value into the loop and reads it back
+/// out of the exit spill, which is what a dropped rebind actually looks like:
+/// wasm offset 0 is valid linear memory, so the miscompile is silent.
+#[test]
+fn region_closing_at_the_header_preserves_a_ref_label_arg() {
+    run_header_region_repro(true, RegionGuard::None);
+}
+
+/// A merged region that carries a GUARD of its own. `_jump_to_existing_trace`
+/// prepends extra guards to a bridge that closes onto an existing loop, so a
+/// region reaching the merge with guards is the ordinary case, not an exotic
+/// one. Its guard must spill to its own exit, leaving the owner's loop-carried
+/// locals — the Ref among them — untouched on the passing path.
+#[test]
+fn region_closing_at_the_header_carrying_its_own_guard() {
+    run_header_region_repro(true, RegionGuard::Passes);
+}
+
+/// The same region whose own guard FAILS. A region reached through
+/// `_jump_to_existing_trace` carries extra guards stamped with a
+/// `ResumeAtPositionDescr` of the SOURCE trace, so the merged stream has to give
+/// the region's guard its own exit index and spill the region's live values —
+/// not the owner's.
+#[test]
+fn region_closing_at_the_header_exits_through_its_own_guard() {
+    run_header_region_repro(true, RegionGuard::Fails);
+}
+
+/// The shape a real loop-closing bridge actually reaches the merge with: the
+/// region's closing JUMP PERMUTES the header LABEL's args, two Refs whose homes
+/// both have to be refreshed cross the back edge, and the region opens with a
+/// guard of an inputarg against an inline `ConstPtr` — the extra guard
+/// `_jump_to_existing_trace` prepends when a bridge closes onto an existing
+/// loop.
+#[test]
+fn region_closing_at_the_header_permutes_two_ref_label_args() {
+    const REF_A: i64 = 0x5EF0;
+    const REF_B: i64 = 0x6EF0;
+    let descr0 = majit_ir::make_loop_target_descr(40, false);
+    let descr1 = majit_ir::make_loop_target_descr(41, false);
+
+    let label0 = Op::new(
+        OpCode::Label,
+        &[
+            rb(OpRef::int_op(1)),
+            rb(OpRef::ref_op(6)),
+            rb(OpRef::ref_op(7)),
+        ],
+    );
+    label0.setdescr(descr0);
+    let label1 = Op::new(
+        OpCode::Label,
+        &[
+            rb(OpRef::int_op(2)),
+            rb(OpRef::ref_op(6)),
+            rb(OpRef::ref_op(7)),
+        ],
+    );
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(
+        OpCode::Jump,
+        &[
+            rb(OpRef::int_op(3)),
+            rb(OpRef::ref_op(6)),
+            rb(OpRef::ref_op(7)),
+        ],
+    );
+    jump.setdescr(descr1.clone());
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::ref_op(6), OpRef::ref_op(7)],
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(5)],
+            &[OpRef::int_op(3), OpRef::ref_op(6), OpRef::ref_op(7)],
+        ),
+        jump,
+    ];
+
+    // The region swaps the two Ref label args on the way back.
+    let region_jump = Op::new(
+        OpCode::Jump,
+        &[
+            rb(OpRef::int_op(11)),
+            rb(OpRef::ref_op(16)),
+            rb(OpRef::ref_op(13)),
+        ],
+    );
+    region_jump.setdescr(descr1);
+    let region_ops = vec![
+        make_op(
+            OpCode::PtrEq,
+            &[
+                OpRef::ref_op(13),
+                OpRef::const_ptr(majit_ir::GcRef(REF_A as usize)),
+            ],
+            OpRef::int_op(15),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(15)],
+            &[
+                OpRef::input_arg_int(10),
+                OpRef::ref_op(13),
+                OpRef::ref_op(16),
+            ],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 6),
+        InputArg::from_type(Type::Ref, 7),
+    ];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![
+                InputArg::from_type(Type::Int, 10),
+                InputArg::from_type(Type::Ref, 13),
+                InputArg::from_type(Type::Ref, 16),
+            ],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("permuting region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    for (slot, value) in [(0u64, 0i64), (1, REF_A), (2, REF_B)] {
+        memory
+            .write(
+                &mut store,
+                (codegen::FRAME_SLOT_BASE + slot * 8) as usize,
+                &value.to_le_bytes(),
+            )
+            .unwrap();
+    }
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE),
+        5004,
+        "v3 after the re-entry"
+    );
+    assert_eq!(
+        (
+            read(codegen::FRAME_SLOT_BASE + 8),
+            read(codegen::FRAME_SLOT_BASE + 16)
+        ),
+        (REF_B, REF_A),
+        "the region's back edge must rebind both Ref label args, swapped"
+    );
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RegionGuard {
+    None,
+    Passes,
+    Fails,
+}
+
+/// A region whose closing JUMP carries FEWER args than the header LABEL cannot
+/// rebind every loop-carried local. The back edge's parallel move is bounded by
+/// `jump_args.len().min(label_args.len())`, so the unmatched label locals keep
+/// whatever the failing iteration left in them. Refuse the merge instead.
+#[test]
+fn region_closing_at_the_header_with_a_short_jump_is_declined() {
+    run_header_region_repro(false, RegionGuard::None);
+}
+
+fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
+    const REF_IN: i64 = 0x5EF0;
+    let descr0 = majit_ir::make_loop_target_descr(30, false);
+    let descr1 = majit_ir::make_loop_target_descr(31, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1)), rb(OpRef::ref_op(6))]);
+    label0.setdescr(descr0);
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2)), rb(OpRef::ref_op(6))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::ref_op(6))]);
+    jump.setdescr(descr1.clone());
+
+    let guard_to_region = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(4)],
+        &[OpRef::int_op(3), OpRef::ref_op(6)],
+    );
+    let guard_exit = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(5)],
+        &[OpRef::int_op(3), OpRef::int_op(2), OpRef::ref_op(6)],
+    );
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        guard_to_region,
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        guard_exit,
+        jump,
+    ];
+
+    let region_jump_args = if full_arity {
+        vec![rb(OpRef::int_op(11)), rb(OpRef::ref_op(12))]
+    } else {
+        vec![rb(OpRef::int_op(11))]
+    };
+    let region_jump = Op::new(OpCode::Jump, &region_jump_args);
+    region_jump.setdescr(descr1);
+    let mut region_ops = vec![make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+        OpRef::int_op(11),
+    )];
+    if region_guard != RegionGuard::None {
+        // Passes on 5003 > 0; fails on 5003 > 100000.
+        let threshold = if region_guard == RegionGuard::Passes {
+            0
+        } else {
+            100_000
+        };
+        region_ops.push(make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(11), OpRef::const_int(threshold)],
+            OpRef::int_op(14),
+        ));
+        region_ops.push(make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(14)],
+            &[OpRef::int_op(11), OpRef::ref_op(13)],
+        ));
+    }
+    region_ops.push(make_op(
+        OpCode::SameAsR,
+        &[OpRef::ref_op(13)],
+        OpRef::ref_op(12),
+    ));
+    region_ops.push(region_jump);
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 6),
+    ];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![
+                InputArg::from_type(Type::Int, 10),
+                InputArg::from_type(Type::Ref, 13),
+            ],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let built = codegen::build_wasm_module(&inputs);
+    if !full_arity {
+        assert!(
+            built.is_err(),
+            "a region JUMP that cannot rebind every header LABEL arg must be refused, \
+             not merged with a truncated parallel move"
+        );
+        return;
+    }
+    let (bytes, _, _) = built.expect("header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            (codegen::FRAME_SLOT_BASE + 8) as usize,
+            &REF_IN.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    if region_guard == RegionGuard::Fails {
+        assert_eq!(read(0), 2, "the region's own guard is the one that exits");
+        assert_eq!(
+            read(codegen::FRAME_SLOT_BASE),
+            5003,
+            "the region guard spills its own live int"
+        );
+        assert_eq!(
+            read(codegen::FRAME_SLOT_BASE + 8),
+            REF_IN,
+            "the region guard spills the Ref it was entered with"
+        );
+        return;
+    }
+    assert_eq!(read(0), 1, "the second guard is the one that exits");
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE),
+        5004,
+        "v3 after the re-entry"
+    );
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE + 8),
+        5003,
+        "v2 is the region's JUMP arg"
+    );
+    assert_eq!(
+        read(codegen::FRAME_SLOT_BASE + 16),
+        REF_IN,
+        "the region's back edge must rebind the header LABEL's Ref arg"
+    );
 }

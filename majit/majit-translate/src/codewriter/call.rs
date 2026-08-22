@@ -383,7 +383,7 @@ pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
 /// Hosts implement this trait on `VirtualRefInfo` so
 /// `CodeWriter.setup_vrefinfo` (`codewriter.py`) can store the
 /// instance on `CallControl.virtualref_info`
-/// (`call.py virtualref_info = None`) for later forwarding to
+/// (`call.py CallControl virtualref_info = None`) for later forwarding to
 /// `metainterp_sd.virtualref_info = codewriter.callcontrol.virtualref_info`
 /// (`pyjitpl.py:2267`).  The three accessors expose the three `u32`
 /// descriptor indices the rebuilt `VirtualRefInfo` consumes on the
@@ -405,7 +405,7 @@ pub trait VirtualRefInfoHandle: std::fmt::Debug + Send + Sync {
     fn descr_size(&self) -> u32;
 }
 
-/// `warmspot.py VirtualRefInfo(self)` ↔ majit codewriter-time
+/// `warmspot.py WarmRunnerDesc.__init__ VirtualRefInfo(self)` ↔ majit codewriter-time
 /// stand-in.  The trait values are the
 /// `majit_metainterp::virtualref::descr` constants; this handle
 /// duplicates them so [`CodeWriter::setup_vrefinfo`] can run before
@@ -1279,7 +1279,7 @@ pub struct CallControl {
     /// graph gets.
     opname_helper_paths: HashSet<CallPath>,
 
-    /// `call.py virtualref_info = None` — class-level default,
+    /// `call.py CallControl virtualref_info = None` — class-level default,
     /// populated by `CodeWriter.setup_vrefinfo`
     /// (`codewriter.py:91-94`) before
     /// `MetaInterpStaticData.finish_setup` reads it at
@@ -4111,7 +4111,7 @@ impl CallControl {
         self.jitcodes.get(path).cloned()
     }
 
-    /// RPython `codewriter.py all_jitcodes.append(jitcode)` — the
+    /// RPython `codewriter.py CodeWriter.make_jitcodes all_jitcodes.append(jitcode)` — the
     /// sole append site in upstream's `make_jitcodes` loop. `jitcode.index`
     /// is already set by `transform_graph_to_jitcode` (upstream line 68);
     /// this method is the final positional append.

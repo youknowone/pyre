@@ -877,7 +877,16 @@ fn prepare_bridge_trace_for_optimizer(
     let inputargs = bridge_inputargs
         .iter()
         .zip(iter.inputargs.iter())
-        .map(|(arg, ia)| InputArg::from_type(arg.tp, ia.opref().raw()))
+        .map(|(arg, ia)| {
+            let reminted = InputArg::from_type(arg.tp, ia.opref().raw());
+            // The inputarg half carries its value for the same reason as the op
+            // loop above: `pyjitpl.py compile_trace` keeps original InputArg and Op
+            // boxes alike.
+            if let Some(value) = arg.get_value() {
+                reminted.set_value(value);
+            }
+            reminted
+        })
         .collect();
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
@@ -6477,7 +6486,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // `unroll.py disable_retracing_if_max_retrace_guards` writes
         // `retraced_count = sys.maxint`, and the one reader of that value is
-        // `unroll.py if cell_token.retraced_count < limit` — it stops the
+        // `unroll.py UnrollOptimizer.optimize_bridge if cell_token.retraced_count < limit` — it stops the
         // cell from RETRACING and nothing else. Upstream never lets it decide
         // whether a loop may be compiled: `pyjitpl.py:3185-3189` gives up on a
         // key that already has compiled targets, which the
@@ -6501,7 +6510,7 @@ impl<M: Clone> MetaInterp<M> {
         // gets a fresh `JitCellToken` (`compile.py:220` and `:266` both call
         // `make_jitcell_token`), whose count starts at zero. Only
         // `compile_retrace` reuses a token, and it reuses the live one
-        // (`compile.py get_procedure_token`), so that is where a retrace
+        // (`compile.py compile_retrace get_procedure_token`), so that is where a retrace
         // budget legitimately persists.
 
         // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
@@ -6746,6 +6755,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
+        unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -8575,6 +8585,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
+        unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
         let (
             mut retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
@@ -9833,12 +9844,6 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.front_target_tokens.clone())
                         .unwrap_or_default();
-                    let rc = self
-                        .compiled_loops
-                        .get(&green_key)
-                        .and_then(|c| c.live_token())
-                        .map(|tok| tok.get_retraced_count())
-                        .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
                     // Carried forward for the same reason as the compile_loop site.
                     let mut carried_loop_header_pc = None;
@@ -9851,7 +9856,16 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens =
                             self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
-                    token.set_retraced_count(rc);
+                    // The retired entry's count does not follow it here. The
+                    // token this compile installs came out of
+                    // `make_jitcell_token`, and upstream's `retraced_count`
+                    // starts at the `history.py JitCellToken` class default on every
+                    // token minted that way — see the fresh-token note in
+                    // `compile_loop`. Carrying it would hand the new loop a
+                    // spent retrace budget, and, since
+                    // `unroll.py disable_retracing_if_max_retrace_guards`'s
+                    // sentinel is odd, the predecessor's
+                    // `FORCE_BRIDGE_SEGMENTING` bit along with it.
                     // `compile.py:1079-1083` — a FINISH trace
                     // (`compile_done_with_this_frame` → `compile_trace` with
                     // `info.final()`) sets `target_token =
@@ -10705,6 +10719,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata: result.savedata,
             exception,
             status: result.status,
+            guard_value_operand: result.guard_value_operand,
         })
     }
 
@@ -10740,6 +10755,7 @@ impl<M: Clone> MetaInterp<M> {
         // does not belong on a path every entry takes.
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
+        let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
         // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
@@ -10872,6 +10888,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
+            guard_value_operand,
         })
     }
 
@@ -10904,6 +10921,21 @@ impl<M: Clone> MetaInterp<M> {
         // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
         self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
+    }
+
+    /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
+    /// deadframe while it is still alive; `must_compile` runs after the frame
+    /// is gone. Both compiled-entry hand-back points therefore take the read
+    /// here and pass the value forward. `None` covers the arms `must_compile`
+    /// never hashes a value on (TY_NONE, busy) and the backends whose slot
+    /// space is the fail-argument vector, which resolve the index later.
+    fn resolve_guard_value_operand(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        frame: &majit_backend::DeadFrame,
+    ) -> Option<i64> {
+        majit_backend::guard_value_counter_slot(descr)
+            .map(|slot| self.backend.get_value_direct(frame, slot))
     }
 
     /// `compile.py _DoneWithThisFrameDescr.get_result` and
@@ -11051,10 +11083,12 @@ impl<M: Clone> MetaInterp<M> {
                     ovf_flag: false,
                 },
                 status: 0,
+                guard_value_operand: None,
             });
         }
 
         let status = descr.get_status();
+        let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
         Self::finish_compiled_run_io();
@@ -11137,6 +11171,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
+            guard_value_operand,
         })
     }
 
@@ -12054,6 +12089,14 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     // compile.py:687-696 status encoding constants.
+    //
+    // `status >> ST_SHIFT` is a jitcounter hash under TY_NONE and a backend
+    // value-slot index under TY_INT/REF/FLOAT. That index is only meaningful
+    // to the backend that recorded it: dynasm records a deadframe slot, so
+    // `must_compile_with_values` takes the `guard_value_operand` its caller
+    // read off the live deadframe as authoritative; cranelift and wasm record
+    // a fail-argument position and supply no operand, so the same index is
+    // resolved out of `fail_values` instead.
     const ST_BUSY_FLAG: u64 = 0x01;
     const ST_TYPE_MASK: u64 = 0x06;
     const ST_SHIFT: u32 = 3;
@@ -12085,6 +12128,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
+        guard_value_operand: Option<i64>,
         fallback_green_key: u64,
     ) -> (bool, u64) {
         crate::mc_diag_bump(0); // must_compile_with_values entered
@@ -12182,9 +12226,12 @@ impl<M: Clone> MetaInterp<M> {
             // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
             // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
             // host (codewriter/longlong.py:28) — the double's raw bit pattern.
-            // `fail_values` already holds every slot as that raw word, so all
-            // three tags hash the stored value unchanged.
-            let intval: i64 = fail_values.get(index as usize).copied().unwrap_or(0);
+            // A caller that still held the deadframe performed
+            // `get_value_direct` at the recorded slot. Backends whose slot
+            // space is the dense fail-arg vector resolve the recorded index
+            // from `fail_values` here.
+            let intval: i64 = guard_value_operand
+                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
             //   + intval * 1442968193
             (descr_addr as u64)
@@ -12606,6 +12653,40 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // Bridge inputarg `InputArg*.value` stamp.
+        //
+        // bridgeopt.py `deserialize_optimizer_knowledge` receives
+        // `frontend_boxes` (the source guard's live boxes) alongside
+        // `liveboxes` (the bridge inputargs). It reads class knowledge
+        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
+        // and heap knowledge through `decode_box` at :153-157.
+        //
+        // Pyre stamps the `frontend_boxes` concrete values onto the
+        // bridge inputarg operands here, so `runtime_value_of` and
+        // `cls_of_box` consumers in the optimizer can read them.
+        // The stamp must precede `closing_jump_runtime_boxes`, which folds a
+        // valued inputarg JUMP arg into an inline Const.
+        if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
+            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
+            // failed source-guard `fail_args` must be paired 1:1 with
+            // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
+            // length mismatch is a fail_args-vs-liveboxes plumbing bug,
+            // not a "partial fill" mode RPython tolerates.
+            assert_eq!(
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+                "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
+                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+            );
+            for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
+                let value = heap_value_for(ia.tp, raw);
+                // Stamp the concrete value on the canonical bridge `InputArg`
+                // identity (`history.py *FrontendOp(pos, value)`).
+                ia.set_value(value);
+            }
+        }
         // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
         // separately from the trace iterator and stay as the original live
         // boxes from the closing JUMP.
@@ -12660,38 +12741,6 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
-        // Bridge inputarg `InputArg*.value` stamp.
-        //
-        // bridgeopt.py `deserialize_optimizer_knowledge` receives
-        // `frontend_boxes` (the source guard's live boxes) alongside
-        // `liveboxes` (the bridge inputargs). It reads class knowledge
-        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
-        // and heap knowledge through `decode_box` at :153-157.
-        //
-        // Pyre stamps the `frontend_boxes` concrete values onto the
-        // bridge inputarg operands here, so `runtime_value_of` and
-        // `cls_of_box` consumers in the optimizer can read them.
-        if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
-            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
-            // failed source-guard `fail_args` must be paired 1:1 with
-            // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
-            // length mismatch is a fail_args-vs-liveboxes plumbing bug,
-            // not a "partial fill" mode RPython tolerates.
-            assert_eq!(
-                frontend_boxes.len(),
-                bridge_inputargs.len(),
-                "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
-                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
-                frontend_boxes.len(),
-                bridge_inputargs.len(),
-            );
-            for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
-                let value = heap_value_for(ia.tp, raw);
-                // Stamp the concrete value on the canonical bridge `InputArg`
-                // identity (`history.py *FrontendOp(pos, value)`).
-                ia.set_value(value);
-            }
-        }
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -12959,12 +13008,6 @@ impl<M: Clone> MetaInterp<M> {
                 // leaves a key whose loop nothing can close into again, and every
                 // later trace reaching it declines for want of a front target.
                 let mut front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
-                let retraced_count = self
-                    .compiled_loops
-                    .get(&original_green_key)
-                    .and_then(|c| c.live_token())
-                    .map(|tok| tok.get_retraced_count())
-                    .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward for the same reason as `front_target_tokens`
                 // just below: the replacement entry inherits the retired loop's
@@ -12987,7 +13030,12 @@ impl<M: Clone> MetaInterp<M> {
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                token.set_retraced_count(retraced_count);
+                // The labels carry over, the retrace budget does not. `token`
+                // came out of `make_jitcell_token`, so its count is the
+                // `history.py JitCellToken` default — see the fresh-token note in
+                // `compile_loop`. The count read at the top of this function is
+                // the one `unroll.py optimize_bridge` charges, and it stays on the
+                // token it was read from.
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
@@ -13096,7 +13144,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
-    /// `unroll.py cell_token = jump_op.getdescr()` and
+    /// `unroll.py UnrollOptimizer.optimize_bridge cell_token = jump_op.getdescr()` and
     /// `unroll.py jitcelltoken = jump_op.getdescr()`: the jitcell whose
     /// `target_tokens` `optimize_bridge` scans, and whose `retraced_count` it
     /// reads and charges, is the one the closing JUMP *enters* — never the loop
@@ -13302,6 +13350,24 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        if let Some(prd) = pending_bridge_rd.as_ref() {
+            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`.
+            // The concrete values belong on the pre-iterator bridge InputArg
+            // objects themselves, mirroring `FrontendOp(pos, value)` rather
+            // than a side table keyed by OpRef.
+            assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
+            for (&livebox, &raw) in prd.liveboxes.iter().zip(prd.frontend_boxes.iter()) {
+                let tp = livebox
+                    .ty()
+                    .expect("bridge livebox OpRef must carry box.type");
+                if tp == Type::Void {
+                    continue;
+                }
+                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
+                    ia.set_value(heap_value_for(tp, raw));
+                }
+            }
+        }
         // compile.py: BridgeCompileData is built from the original
         // history trace/runtime boxes. The explicit Rust TraceIterator
         // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
@@ -13368,24 +13434,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        if let Some(prd) = pending_bridge_rd.as_ref() {
-            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`.
-            // The concrete values belong on the fresh bridge InputArg objects
-            // themselves, mirroring `FrontendOp(pos, value)` rather than a
-            // side table keyed by OpRef.
-            assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
-            for (&livebox, &raw) in prd.liveboxes.iter().zip(prd.frontend_boxes.iter()) {
-                let tp = livebox
-                    .ty()
-                    .expect("bridge livebox OpRef must carry box.type");
-                if tp == Type::Void {
-                    continue;
-                }
-                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
-                    ia.set_value(heap_value_for(tp, raw));
-                }
-            }
-        }
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
@@ -13943,7 +13991,7 @@ impl<M: Clone> MetaInterp<M> {
         // runs once per LIVE box while `rebuild_from_resumedata` walks the
         // resume data, not once per `fail_arg_types` slot, and `compile_bridge`
         // already does exactly that: it zips `liveboxes` with `frontend_boxes`
-        // under `bridgeopt.py assert len(frontend_boxes) == len(liveboxes)`
+        // under `bridgeopt.py deserialize_optimizer_knowledge assert len(frontend_boxes) == len(liveboxes)`
         // and stamps only the InputArg whose OpRef IS a livebox.
         //
         // Stamping every slot positionally instead gives a value to slots the
@@ -18179,7 +18227,7 @@ pub struct MetaInterpStaticData {
     /// The one flat jitcode table. `codewriter.py:68` stamps each entry with
     /// its position (`jitcode.index = len(all_jitcodes)` at the drain in
     /// `codewriter.py:80`), and every resume frame carries that absolute index,
-    /// so `resume.py jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
+    /// so `resume.py rebuild_from_resumedata jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
     /// resolves a frame with no per-driver or parent-relative bookkeeping.
     ///
     /// Upstream fills this once at translation, but the structure itself is a
@@ -18700,7 +18748,7 @@ impl MetaInterpStaticData {
         // reshuffle.
     }
 
-    /// Narrow `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+    /// Narrow `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
     /// slice intended for state-field JIT.  Copies the
     /// already-populated `Assembler::all_liveness` byte stream into
     /// `self.liveness_info` and seeds the cached opcode-id fields
@@ -23088,6 +23136,31 @@ mod tests {
         );
     }
 
+    /// `pyjitpl.py compile_trace` + `unroll.py optimize_bridge`: original
+    /// inputarg boxes retain their
+    /// observed runtime values across the fresh trace iterator.
+    #[test]
+    fn prepare_bridge_trace_carries_inputarg_runtime_values() {
+        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        bridge_inputargs[0].set_value(Value::Int(42));
+
+        let prepared = prepare_bridge_trace_for_optimizer(
+            &[],
+            &bridge_inputargs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            10,
+        );
+
+        assert_eq!(prepared.inputargs[0].get_value(), Some(Value::Int(42)));
+        assert_eq!(prepared.inputargs[1].get_value(), None);
+    }
+
     #[test]
     fn test_front_target_inputarg_types_uses_saved_front_label_contract() {
         let mut meta = MetaInterp::<()>::new(1);
@@ -25188,6 +25261,161 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
             "and it is a new token, not the invalidated one"
+        );
+    }
+
+    /// The same rule on the FINISH path. `finish_and_compile` mints its token
+    /// through `make_jitcell_token` too, so the retired entry's count — and the
+    /// `FORCE_BRIDGE_SEGMENTING` bit riding in its low bit — stays behind.
+    #[test]
+    fn a_finish_compile_does_not_inherit_the_retrace_count() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 43;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        assert!(meta.tracing.is_some());
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+
+        let stale = std::sync::Arc::new(JitCellToken::new(4));
+        stale.set_retraced_count(u32::MAX);
+        assert_ne!(
+            stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the sentinel arms bridge segmenting, which is what must not travel"
+        );
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&stale),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 102,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        let _ = meta.finish_and_compile(&[OpRef::input_arg_int(0)], vec![Type::Int], (), false);
+
+        let fresh = meta
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|c| c.live_token())
+            .expect("the compile installed a live token");
+        assert!(
+            !std::sync::Arc::ptr_eq(&fresh, &stale),
+            "the FINISH compile installed a new token"
+        );
+        assert_eq!(
+            fresh.get_retraced_count(),
+            0,
+            "and it starts at zero, so its own bridges decide segmenting for themselves"
+        );
+    }
+
+    /// The third minting site. `compile.py
+    /// ResumeFromInterpDescr.compile_and_attach` gives the entry bridge a token
+    /// from `make_jitcell_token`, so it starts at the `history.py JitCellToken` default
+    /// however far the entry it replaces had run its own budget down — and the
+    /// `FORCE_BRIDGE_SEGMENTING` bit riding in bit 0 stays behind with it.
+    #[test]
+    fn an_entry_bridge_does_not_inherit_the_retrace_count() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 44;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        assert!(meta.tracing.is_some());
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+
+        let jump_descr = meta
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|entry| entry.front_target_tokens.first())
+            .expect("the target loop installed a front target")
+            .as_jump_target_descr();
+        let original_green_key = green_key;
+        let stale = std::sync::Arc::new(JitCellToken::new(5));
+        stale.set_inputarg_types(vec![Type::Int]);
+        stale.set_retraced_count(u32::MAX);
+        assert_ne!(
+            stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the sentinel arms bridge segmenting, which is what must not travel"
+        );
+        meta.compiled_loops
+            .get_mut(&green_key)
+            .expect("the target loop remains installed")
+            .token = std::sync::Arc::downgrade(&stale);
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                jump_descr,
+            ),
+        ];
+        assert!(meta.compile_entry_bridge(
+            green_key,
+            original_green_key,
+            (),
+            None,
+            std::ptr::null(),
+            &bridge_ops,
+            &bridge_inputargs,
+            majit_ir::ConstMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let fresh = meta
+            .compiled_loops
+            .get(&original_green_key)
+            .and_then(|entry| entry.live_token())
+            .expect("the entry bridge installed a live token");
+        assert!(
+            !std::sync::Arc::ptr_eq(&fresh, &stale),
+            "the entry bridge installed a new token"
+        );
+        assert_eq!(
+            fresh.get_retraced_count(),
+            0,
+            "and it starts at zero, so the retired entry's sentinel decides \
+             nothing for the bridges this token will own"
         );
     }
 

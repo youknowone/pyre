@@ -250,7 +250,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 return None;
             }
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
-            // `jitcode.py self.name = name`.  This is the root JitCode of
+            // `jitcode.py JitCode.__init__ self.name = name`.  This is the root JitCode of
             // the machine, so it names the dispatch function itself; its arms'
             // sub-JitCodes name the arm they came from.
             __builder.set_name(#dispatch_jitcode_name);

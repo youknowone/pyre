@@ -7525,7 +7525,7 @@ where
                     let _ = dst;
                 } else {
                     // ResKind::Ref intentionally rejects ReleaseGil per
-                    // `resoperation.py # no such thing`. The
+                    // `resoperation.py rop.call_release_gil_for_descr # no such thing`. The
                     // producer rejects this combination at
                     // `pyre-jit/src/jit/assembler.rs`'s
                     // `dispatch_residual_call` so the

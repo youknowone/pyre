@@ -429,6 +429,15 @@ fn default_enable_opts() -> Vec<String> {
 /// mark the green key `DONT_TRACE_HERE`.  Pyre walker aborts are structural
 /// and recur identically on retrace; without a ceiling the same body would
 /// retrace forever, each attempt executing its residual calls concretely.
+///
+/// The ban is permanent, and permanent in a way upstream cannot express: the
+/// flag it sets is the one `should_remove_jitcell` keeps forever on a cell that
+/// never saw a procedure token, and `abort_count` is never reset.  It is
+/// load-bearing rather than defensive — 17 of 24 sampled fixtures reach it, and
+/// removing it buys no compiled loop on any of them while multiplying
+/// `loops_aborted` by 4-6x (see [`WarmEnterState::maybe_compile_decision`] for
+/// why the upstream cell lifecycle that would retire these cells first cannot
+/// be ported as written).  `mc_diag` slots 79/80 measure it.
 const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
@@ -823,6 +832,39 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_threshold)
     }
 
+    /// The `dead_token` gate below is narrower than
+    /// `warmstate.py maybe_compile_and_run`'s tokenless arm, and
+    /// deliberately so. Upstream drops EVERY tokenless cell there — "it was an
+    /// aborted compilation, or maybe a weakref that has been freed" — because
+    /// upstream has exactly one way to make a cell: `bound_reached` builds it
+    /// and immediately stamps `JC_TRACING | JC_TRACING_OCCURRED`
+    /// (`warmstate.py bound_reached`), so tokenless really does mean the trace it
+    /// started never compiled.
+    ///
+    /// That inference does not survive the port, because one pyre green key can
+    /// own two cells: a hash-only entry point installs a cell that can carry no
+    /// `comparekey`, and the typed path then chains its own behind it (proven
+    /// by `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`).
+    /// A key whose trace compiled has its token on one of the two; the other is
+    /// tokenless with `JC_TRACING_OCCURRED` set and is indistinguishable here
+    /// from an aborted cell. Dropping it also resets the bucket counter its
+    /// sibling was climbing, since `cleanup_chain` is `reset` + a sweep of the
+    /// whole bucket.
+    ///
+    /// Measured, both ways: taking the upstream arm costs `loops_compiled`
+    /// 7 -> 6 on `synth/loops_comprehension`, whose baseline aborts nothing at
+    /// all — the loss is entirely twin cells being read as aborted ones — and
+    /// narrowing it to `JC_TRACING_OCCURRED` cells does not recover the loop,
+    /// because the twin carries that flag too. On the fixtures where the arm
+    /// does what it is meant to (it retires the cell before pyre's
+    /// `MAX_TRACE_ABORT_COUNT` ceiling can ban the green key, 17 of 24 sampled
+    /// fixtures reach that ban today) it buys nothing: `loops_compiled` is
+    /// unchanged on every one of them and `loops_aborted` rises 4-6x, e.g.
+    /// 5 -> 28 on `synth/handler_tb_frame_locals_after_declined_flush`.
+    ///
+    /// So the arm stays narrow until one green key owns one cell. `mc_diag`
+    /// slots 80/81 (`abort_ceiling_banned` / `abort_ceiling_refused`) are the
+    /// standing measure of what the narrowing costs.
     pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
@@ -862,6 +904,7 @@ impl WarmEnterState {
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
@@ -977,6 +1020,7 @@ impl WarmEnterState {
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
@@ -1062,11 +1106,13 @@ impl WarmEnterState {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            if disable_noninlinable_function
-                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
-                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
-            {
+            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
+            }
+            if ceiling_reached && !already_banned && !disable_noninlinable_function {
+                crate::mc_diag_bump(80); // abort_ceiling_banned
             }
             cell.state = BaseJitCellState::NotHot;
         }
@@ -1122,6 +1168,7 @@ impl WarmEnterState {
             // Give up after too many failed trace attempts to prevent
             // infinite retrace loops (e.g. InvalidLoop every time).
             if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
         }
@@ -1146,6 +1193,7 @@ impl WarmEnterState {
                 return HotResult::NotHot;
             }
             if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
         }
@@ -1186,11 +1234,13 @@ impl WarmEnterState {
             cell.abort_count += 1;
             // The last disjunct is pyre's abort ceiling: too many failed
             // attempts permanently disable tracing here.
-            if disable_noninlinable_function
-                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
-                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
-            {
+            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
+            }
+            if ceiling_reached && !already_banned && !disable_noninlinable_function {
+                crate::mc_diag_bump(80); // abort_ceiling_banned
             }
             cell.state = BaseJitCellState::NotHot;
         }
@@ -2006,6 +2056,25 @@ impl WarmEnterState {
                 }
                 return false;
             }
+            // An invalidated procedure token — one the cell saw and no longer
+            // holds — has to reach `cleanup_chain` below rather than take any
+            // early return (`warmstate.py maybe_compile_and_run`).
+            let dead_token =
+                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
+            // The function-entry door owns the same decision the back-edge
+            // doors do, and its caller runs `decay_all_counters()`
+            // (`warmstate.py bound_reached`) on the way to `force_start_tracing*`. So the
+            // ceiling answers here too, or a latched location decays every
+            // OTHER location's counter once per function entry. See
+            // [`Self::maybe_compile_decision`].
+            // A latched cell that is ALSO dead takes the cleanup path instead,
+            // as it does at both back-edge doors: refusing here would leave the
+            // stale entry in the chain for every later call, and its bucket's
+            // counter would never re-arm.
+            if !dead_token && cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
+                return false;
+            }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
                     // A live TEMPORARY token still declines; a token that was
@@ -2019,7 +2088,7 @@ impl WarmEnterState {
                     return true;
                 }
             }
-            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+            if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
@@ -4177,6 +4246,79 @@ mod tests {
         assert!(cell.flags & jc_flags::DONT_TRACE_HERE == 0);
     }
 
+    /// `warmstate.py bound_reached` traces unconditionally once
+    /// entered, and its first act is `jitcounter.decay_all_counters()`
+    /// (`warmstate.py bound_reached`), so upstream never pays a decay for a trace
+    /// that
+    /// then refuses to start. A cell latched by `MAX_TRACE_ABORT_COUNT` must
+    /// therefore be turned down at the decision, not several frames down in
+    /// `force_start_tracing*` — otherwise every back edge over a location that
+    /// can never trace again decays every OTHER location's counter.
+    ///
+    /// `StartTracing` here is the defect: it is the answer that sends the
+    /// caller into `bound_reached`.
+    #[test]
+    fn a_ceiling_latched_cell_is_turned_down_at_the_decision() {
+        // Each door is driven through itself: a cell installed by the hash door
+        // carries no `comparekey`, so the typed door would never find it.
+        for use_typed_key in [false, true] {
+            let mut ws = WarmEnterState::new(2);
+            let green = GreenKey::new(vec![0xCE, 0x11]);
+            let key = green.get_uhash();
+            let mut ask = |ws: &mut WarmEnterState| {
+                if use_typed_key {
+                    ws.maybe_compile_with_key(&green)
+                } else {
+                    ws.maybe_compile(key)
+                }
+            };
+
+            // Latch the ceiling: every attempt aborts without
+            // disable_noninlinable_function.
+            for _ in 0..MAX_TRACE_ABORT_COUNT {
+                let mut started = false;
+                for _ in 0..64 {
+                    match ask(&mut ws) {
+                        HotResult::StartTracing => {
+                            started = true;
+                            break;
+                        }
+                        HotResult::NotHot => {}
+                        _ => panic!("the door answered for a live token"),
+                    }
+                }
+                assert!(started, "the location never became hot");
+                if use_typed_key {
+                    ws.abort_tracing_for_key(&green, false);
+                } else {
+                    ws.abort_tracing(key, false);
+                }
+            }
+
+            // From here the decision must never send the caller into
+            // `bound_reached`, however many back edges arrive.
+            for _ in 0..64 {
+                assert!(
+                    matches!(ask(&mut ws), HotResult::NotHot),
+                    "a ceiling-latched cell reached bound_reached (typed={use_typed_key})",
+                );
+            }
+
+            // The function-entry door decides for the same cell and its caller
+            // decays on the way to the tracer, so it answers the same way. Its
+            // own threshold has to be low enough that the counter underneath
+            // would fire, or a `false` here proves nothing.
+            ws.set_function_threshold(2);
+            for _ in 0..64 {
+                assert!(
+                    !ws.should_trace_function_entry(key),
+                    "a ceiling-latched cell reached bound_reached through the \
+                     function-entry door (typed={use_typed_key})",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_tracing_generation_increments() {
         let mut ws = WarmEnterState::new(2);
@@ -4551,6 +4693,45 @@ mod tests {
 
         assert!(!ws.should_trace_function_entry(key));
         assert!(ws.get_cell(key).is_none());
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+    }
+
+    /// A cell that has latched the pyre-local abort ceiling AND holds a
+    /// procedure token that was since invalidated must still be removed from
+    /// the chain: `warmstate.py maybe_compile_and_run` re-counts such a location
+    /// from cold,
+    /// and both back-edge doors already exempt a dead token from the ceiling.
+    /// Refusing at the ceiling first leaves the stale entry in place for every
+    /// later call, so its bucket's counter never re-arms.
+    #[test]
+    fn test_function_entry_ceiling_still_cleans_up_a_dead_token() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = 0xD010;
+        let qmut = 0xFA14;
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+        ws.force_start_tracing(key);
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        attach_alive(&mut ws, key, token);
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing(key, false);
+        }
+        assert!(ws.get_cell(key).unwrap().abort_count >= MAX_TRACE_ABORT_COUNT);
+
+        assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(
+            ws.get_cell(key).is_none(),
+            "a dead token at the abort ceiling must reach cleanup_chain"
+        );
         assert!(!ws.should_trace_function_entry(key));
         assert!(ws.should_trace_function_entry(key));
     }

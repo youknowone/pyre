@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn register_task_overwrites_on_duplicate_preserving_order_position() {
-        // Upstream `taskengine.py tasks[task_name] = task, task_deps`
+        // Upstream `taskengine.py SimpleTaskEngine.__init__ tasks[task_name] = task, task_deps`
         // is dict assignment. Re-registering must overwrite the
         // callable/deps/title/idempotent and preserve the existing key's
         // position in the iteration order (Python dict-assignment

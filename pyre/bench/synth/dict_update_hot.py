@@ -1,9 +1,15 @@
-# pyre-check: max-pypy-ratio=15
-# The ceiling sits between the two measured states: folded this runs 11.4x
-# pypy, and with `builtin_dict_get` suppressed about 20.2x. That 1.8x gap is
-# the whole `builtin_dict_get` effect, so the margin either side is only
-# ~1.3x -- loosen this ceiling rather than delete the loop if a slower host
-# proves it flaky.
+# pyre-check: max-pypy-ratio=20
+# The ceiling sits between the two measured states. Re-measured 2026-08-22 on
+# darwin-arm64, user CPU less startup, median of 3: pypy 0.169s, folded 1.996s
+# (11.8x), and with `builtin_dict_get` suppressed 4.596s (27.2x). The fold is
+# worth 2.3x, wider than the 1.8x first recorded here, so suppressing it stays
+# far outside the ceiling.
+# The ceiling moved 15 -> 20 because the ubuntu-24.04 runner measures the
+# FOLDED state at 14.6x, 15.5x and 15.6x across three runs -- it straddled the
+# old ceiling and flipped the gate run to run while the fold was working. 20
+# clears the worst folded reading by 1.25x and stays 1.36x under the suppressed
+# state, which restores the margin the old ceiling had against the host it was
+# first measured on.
 # N/ITERS are sized to prove the opcode compiles and to drive the compiled
 # loop thousands of times, not to race pypy.
 # A hot exact `dict.get` loop rides along: without the `builtin_dict_get` fold

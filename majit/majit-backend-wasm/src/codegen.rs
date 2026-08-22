@@ -2595,6 +2595,26 @@ pub fn build_wasm_module(
                 "wasm backend: inlined bridge stream has an empty region".into(),
             ));
         }
+        // The back edge rebinds the target LABEL's args from the region's
+        // closing JUMP as a parallel move bounded by `min(jump, label)`, so a
+        // JUMP naming fewer args leaves the remaining loop-carried locals
+        // holding whatever the failing iteration left in them. Nothing
+        // downstream reports that: wasm offset 0 is valid linear memory, so a
+        // stale or zero Ref is read as an object instead of trapping.
+        // `resolve_cross_loop_jump_target` refuses an arity mismatch before a
+        // region is ever retained; this asserts the same invariant where the
+        // move is emitted, rather than trusting a check in another file.
+        if let Some(jump) = bridge.ops.last().filter(|op| op.opcode == OpCode::Jump) {
+            let label_args = find_label_args(analysis_ops, jump);
+            let jump_arity = jump.getarglist().len();
+            if jump_arity < label_args.len() {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: inlined bridge JUMP rebinds {jump_arity} of the \
+                     target LABEL's {} args",
+                    label_args.len()
+                )));
+            }
+        }
         // A region can carry a CALL_ASSEMBLER this build has no arm for. The
         // dedicated arm is selected by `ca.emit_ca`, which is decided when the
         // OWNER is compiled, and it reads the callee's geometry out of

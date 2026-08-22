@@ -2401,7 +2401,7 @@ fn make_jitcodes(
         }
     }
 
-    // RPython `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
+    // RPython `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`.
     // Snapshot the assembler's shared `all_liveness` byte stream so the runtime
     // can resolve the `BC_LIVE` offsets baked into `JitCode.code`.
     let all_liveness = codewriter.assembler.all_liveness().to_vec();

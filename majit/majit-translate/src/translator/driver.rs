@@ -391,7 +391,7 @@ pub struct TranslationDriver {
 
     /// Upstream `self.config = config` at `:80`. Held as `Rc<Config>`
     /// to mirror upstream's mutable-Config-handed-around contract
-    /// (`interactive.py self.config = self.driver.config`).
+    /// (`interactive.py Translation.__init__ self.config = self.driver.config`).
     pub config: Rc<Config>,
 
     /// Upstream `self.exe_name = exe_name` at `:87`. `None` ↔ upstream

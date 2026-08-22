@@ -149,7 +149,7 @@ pub fn decode_builtin_call(
         // `support.py:756-759`: op.opname == 'direct_call' → resolve via fnobj
         OpKind::Call { target, args, .. } => {
             let args: &[crate::flowspace::model::Variable] = args.as_slice();
-            // `support.py fnobj = op.args[0].value._obj` →
+            // `support.py decode_builtin_call fnobj = op.args[0].value._obj` →
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
             // Pyre's analogue: the spec string is registered on the
@@ -187,7 +187,7 @@ pub fn decode_builtin_call(
                     (oopspec_name, normalized)
                 }
                 None => {
-                    // `support.py opargs = op.args[1:]`: pyre's
+                    // `support.py decode_builtin_call opargs = op.args[1:]`: pyre's
                     // `OpKind::Call::args` already excludes the funcptr
                     // so the positional args flow through directly,
                     // wrapped as `Pass(Variable)` for the uniform return
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ValueError(op.opname)")]
     fn decode_builtin_call_panics_on_non_call_opkind() {
-        // `support.py raise ValueError(op.opname)`: any opname
+        // `support.py decode_builtin_call raise ValueError(op.opname)`: any opname
         // outside {direct_call, gc_identityhash, gc_id} raises.  Pyre
         // mirrors the raise via panic.  IndirectCall is included
         // because upstream does NOT have an `indirect_call` arm

@@ -652,6 +652,15 @@ fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhS
     // the codewriter-to-runtime transport object that described it. Keep a
     // layout only when the lazy opcode `BhDescr::Field` itself keeps the Arc;
     // the eager GcCache replay drops this wire value after publication.
+    //
+    // Deliberately NOT interned behind a per-index `OnceLock`: two fields
+    // naming one layout index do each decode their own copy, but those copies
+    // are transport and die with the field that holds them.  A cache would
+    // instead pin every layout it ever decoded for the life of the process,
+    // trading a bounded transient for permanent retention — the opposite of
+    // what the canonical-owner rule above is for, and against the startup-RSS
+    // work that motivated it.  Share the canonical object through
+    // `_cache_size`, not through this decoder.
     std::sync::Arc::new(
         bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
             panic!(

@@ -5034,6 +5034,12 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
+    // A non-null `w_code` does not make the inner pointer non-null; every other
+    // caller of `w_code_get_ptr` in the tree checks the result before
+    // dereferencing it.
+    if raw_code.is_null() {
+        return None;
+    }
     let code = unsafe { &*raw_code };
     let nlocals = code.varnames.len();
     let ncells = pyre_interpreter::pyframe::ncells(code);
@@ -5159,7 +5165,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
     // quasiimmut.py:125 `self.constantfieldbox =
     // self.get_current_constant_fieldvalue()` — the field's value at the moment
-    // the trace baked it.  `heap.py is_still_valid_for` compares it against
+    // the trace baked it.  `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` compares it against
     // the live value and abandons the loop when they disagree, so it has to be
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
@@ -5212,7 +5218,7 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 /// get_current_qmut_instance`), so it exists for the rest of the recording,
 /// which is what arms `opimpl_jit_force_quasi_immutable`'s `mutatebox.nonnull()`
 /// (`pyjitpl.py:1112`) for a write reached later in that same trace. The
-/// instance rides on the descr from here to `heap.py is_still_valid_for`
+/// instance rides on the descr from here to `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for`
 /// and `compile.py register_loop_token`, so neither has to walk from
 /// the struct back to the hidden `mutate_*` slot a second time.
 ///
@@ -5559,9 +5565,13 @@ fn flush_walk_end_state_to_frame_inner(
             let recorded_null = matches!(
                 ctx.concrete_of_opref(opref),
                 Some(Value::Ref(r)) if r.0 == 0
-            ) || ctx.virtualizable_slot_stored_live_null(base + abs);
+            ) || ctx.virtualizable_slot_stored_live_null(base + abs)
+                || crate::jitcode_dispatch::null_ref_is_a_value(opref);
             if !allow_known_null_stack || !recorded_null {
-                return decline("NULL operand-stack shadow slot (mid-expression)");
+                return decline(&format!(
+                    "NULL operand-stack shadow slot (mid-expression) at abs={abs} \
+                     nlocals={nlocals} depth={depth} box={opref:?}"
+                ));
             }
         }
     }
@@ -5657,9 +5667,16 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
     // `Value::Void` is the shadow's "no concrete half" sentinel, not a NULL
     // local: writing it back would box to `PY_NULL` and DESTROY the slot the
     // walk is holding in a register.  Decline instead.
+    //
+    // `Ref(NO_CONCRETE)` is the same answer in the other representation — "the
+    // shadow has no concrete pointer for this slot" — and it is worse to write
+    // back, because `boxed_slot_value_for_type` maps `Ref(r)` straight to
+    // `r.as_usize()`: the slot would receive `usize::MAX - 1` as if it were an
+    // object pointer.
     for abs in 0..nlocals {
         match ctx.virtualizable_entry_at(base + abs) {
             Some((_, Value::Void)) | None => return false,
+            Some((_, Value::Ref(gc))) if gc == majit_ir::GcRef::NO_CONCRETE => return false,
             Some(_) => {}
         }
     }
@@ -12395,6 +12412,10 @@ mod tests {
         }
         fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
             unimplemented!("FieldLoadTestCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            // FieldLoadTestCpu's slot space is the dense fail-value vector.
+            self.get_int_value(frame, slot)
         }
         fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
             unimplemented!("FieldLoadTestCpu::get_float_value")

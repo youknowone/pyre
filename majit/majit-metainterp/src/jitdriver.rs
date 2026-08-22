@@ -1641,7 +1641,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Copy `shared_asm`'s `all_liveness` byte
     /// stream into `staticdata.liveness_info`, mirroring
-    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
+    /// `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`.
     ///
     /// Must run while `staticdata` Arc is uniquely owned (i.e. before
     /// the first trace clones it), after macro-emitted prebuild has
@@ -1654,7 +1654,7 @@ impl<S: JitState> JitDriver<S> {
     /// Install the state-field JIT canonical liveness payload before
     /// any tracing path runs.  Mirrors RPython `warmspot.py:281-289`'s
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
-    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+    /// `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
     /// slice — full `finish_setup` requires `CodeWriter` /
     /// `CallControl` construction, which is not yet wired.
     ///
@@ -1782,7 +1782,7 @@ impl<S: JitState> JitDriver<S> {
     /// A driver that has not registered a dispatch jitcode has nothing to
     /// publish and is left alone.
     ///
-    /// `warmspot.py metainterp_sd.jitcodes` now owns the table
+    /// `warmspot.py WarmRunnerDesc.__init__ metainterp_sd.jitcodes` now owns the table
     /// (`MetaInterp::install_jitcodes`), but one `MetaInterpStaticData` per
     /// driver is still not upstream's ONE table, and this store is a separate
     /// per-thread copy of it besides. Re-aiming on entry only removes the
@@ -5282,6 +5282,7 @@ impl<S: JitState> JitDriver<S> {
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+            let guard_value_operand = result.guard_value_operand;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
             // (cpu.grab_exc_value) must seed the blackhole resume so an
@@ -5330,9 +5331,12 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 green_key
             };
-            let (must_compile, owning_key) =
-                self.meta
-                    .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
+            let (must_compile, owning_key) = self.meta.must_compile_with_values(
+                &descr_arc,
+                &raw_values,
+                guard_value_operand,
+                fallback_green_key,
+            );
             // compile.py: must_compile() and not stack_almost_full().
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
             // guard failure resumes via blackhole — isolates bridge-record
@@ -6821,6 +6825,7 @@ impl<S: JitState> JitDriver<S> {
         // `result` is dropped just below, so neither buffer has a reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
         let raw_values = std::mem::take(&mut result.values).into_vec();
+        let guard_value_operand = result.guard_value_operand;
         // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
@@ -6856,9 +6861,12 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (must_compile, owning_key) =
-            self.meta
-                .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
+        let (must_compile, owning_key) = self.meta.must_compile_with_values(
+            &descr_arc,
+            &raw_values,
+            guard_value_operand,
+            fallback_green_key,
+        );
         // compile.py: must_compile() and not stack_almost_full().
         // `no_bridge_enabled()` is the same opt-out the two sibling loops
         // apply; this is the loop pyre actually runs, so leaving it out made
@@ -9310,7 +9318,7 @@ mod tests {
         //   3. Forward to `JitDriver::install_canonical_liveness`.
         //
         // RPython parity: `warmspot.py:281-289` →
-        // `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+        // `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
         // — the metainterp-side test
         // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the

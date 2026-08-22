@@ -1,5 +1,6 @@
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PyFrame;
 
@@ -213,7 +214,23 @@ impl WRootFinalizerQueue {
     }
 }
 
+/// How many times the collector has run the death-queue trigger below.
+///
+/// The collector skips a queue whose deque is empty
+/// (`majit-gc` `Collector::execute_finalizer_triggers`), so a collection bumps
+/// this exactly when that collection put something finalizable on the queue.
+/// Reading it either side of a collection is therefore the collector's own
+/// answer to "did that sweep find anything to finalize", which is why the
+/// drain it feeds keeps its upstream shape and reports nothing.
+static FINALIZER_TRIGGER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Read [`FINALIZER_TRIGGER_COUNT`].
+pub fn finalizer_trigger_count() -> usize {
+    FINALIZER_TRIGGER_COUNT.load(Ordering::Relaxed)
+}
+
 fn finalizer_queue_trigger() {
+    FINALIZER_TRIGGER_COUNT.fetch_add(1, Ordering::Relaxed);
     let action = space_user_del_action();
     if !action.is_null() {
         unsafe { (*action).fire() };

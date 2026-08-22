@@ -144,6 +144,11 @@ impl crate::Backend for SyntheticCpu {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_int_value unreachable")
     }
 
+    fn get_value_direct(&self, frame: &crate::DeadFrame, slot: usize) -> i64 {
+        // SyntheticCpu's slot space is the dense fail-value vector.
+        self.get_int_value(frame, slot)
+    }
+
     fn get_float_value(&self, _frame: &crate::DeadFrame, _index: usize) -> f64 {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_float_value unreachable")
     }

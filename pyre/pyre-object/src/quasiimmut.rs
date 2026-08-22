@@ -29,7 +29,7 @@ pub struct QuasiImmut {
     tokens: parking_lot::Mutex<LoopTokens>,
     /// Whether [`QuasiImmutField::invalidate`] has already unlinked and swept
     /// this instance. Upstream asks the same question by identity —
-    /// `quasiimmut.py if qmut is not self.qmut` compares the recorded
+    /// `quasiimmut.py QuasiImmutDescr.is_still_valid_for if qmut is not self.qmut` compares the recorded
     /// instance against the field's current one, and the two differ exactly
     /// when the recorded one was unlinked, since a fresh instance is only ever
     /// minted into a nulled field.
@@ -206,7 +206,7 @@ impl QuasiImmutField {
     /// Upstream calls this while RECORDING the read: `pyjitpl.py:1081` builds a
     /// `QuasiImmutDescr`, whose `__init__` `bh_setfield_gc_r`s a fresh instance
     /// into the hidden field (`quasiimmut.py:26`) and keeps it as
-    /// `self.qmut`. That binding is what `heap.py is_still_valid_for` and
+    /// `self.qmut`. That binding is what `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` and
     /// `compile.py register_loop_token` both read later; pyre returns it
     /// for the same two consumers.
     pub fn get_current_qmut_instance(&self) -> Arc<QuasiImmut> {
@@ -371,7 +371,7 @@ mod tests {
         assert!(flag2.load(Ordering::Acquire));
     }
 
-    /// `quasiimmut.py if qmut is not self.qmut` — a recording holds the
+    /// `quasiimmut.py QuasiImmutDescr.is_still_valid_for if qmut is not self.qmut` — a recording holds the
     /// instance it resolved, so an invalidation that lands before the compile
     /// is visible on that handle rather than being hidden by the field having
     /// already minted a replacement.

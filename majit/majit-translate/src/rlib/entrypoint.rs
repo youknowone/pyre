@@ -41,7 +41,7 @@ use crate::flowspace::model::HostObject;
 ///
 /// Non-function host objects are returned unchanged: upstream
 /// `export_symbol` only ever runs on Python function objects (called
-/// from `interactive.py self.entry_point = export_symbol(entry_point)`
+/// from `interactive.py Translation.__init__ self.entry_point = export_symbol(entry_point)`
 /// right after the caller selects a function as the translation
 /// entry point), so any other input passing through this helper is
 /// outside the upstream contract. Silently passing through keeps the

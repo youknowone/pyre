@@ -4216,15 +4216,21 @@ impl Optimizer {
         self.skip_flush = skip_flush_saved;
         let optimized_ops = optimized_ops?;
 
-        // A bridge trace carries no GUARD_FUTURE_CONDITION
-        // (reached_loop_header's GFC lives in pyre's loop-creation path,
-        // which bridges skip), so `self.patchguardop` is None where upstream
-        // always has one: `_jump_to_existing_trace` dereferences
+        // `reached_loop_header` emits the GUARD_FUTURE_CONDITION before both
+        // of its closes, so upstream always has a `patchguardop`:
+        // `_jump_to_existing_trace` dereferences
         // `self.optimizer.patchguardop` unconditionally for the extra guards
         // (unroll.py) and passes it to `inline_short_preamble`, which
         // dereferences it again per replayed guard (unroll.py:409).
-        // Synthesize it from the bridge's own last body guard (highest resume
-        // position, closest to the close).
+        // Pyre emits it on the merge-point crossing that closes a bridge
+        // (`jitcode_dispatch/mod.rs`) and on the own-loop close
+        // (`close_loop_args_at`); a crossing that skipped the emit — a
+        // previously declined close, or a walk that is not the authoritative
+        // top-level executor — still reaches here without one. Synthesize it
+        // from the bridge's own last body guard (highest resume position,
+        // closest to the close); that guard's resume coordinate is mid-trace
+        // where the merge point's is the loop header, so it is a fallback, not
+        // an equivalent.
         //
         // Gated only on there being such a guard, NOT on `retarget_close_jump`.
         // Every path that reaches `try_jump_to_existing_trace` below can read

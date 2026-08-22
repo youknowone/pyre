@@ -439,7 +439,7 @@ pub(crate) fn fbw_store_journal_push(
     // gh#467: a journaled store still mutated the heap this iteration; the
     // forward-flush gate counts it so a callee sub-walk that appends/setitems
     // cannot be committed-then-re-executed (a double).
-    fbw_bump_executed_effect();
+    fbw_bump_executed_effect("store_journal");
 }
 
 /// Record the live length a walked eager list append grew past, for the
@@ -461,7 +461,7 @@ pub(crate) fn fbw_list_journal_push_append(
         })
     });
     // gh#467: see `fbw_store_journal_push`.
-    fbw_bump_executed_effect();
+    fbw_bump_executed_effect("list_append");
 }
 
 /// Record an eagerly executed Integer-strategy end-pop and its boxed displaced
@@ -479,7 +479,7 @@ pub(crate) fn fbw_list_journal_push_pop_end(
             w_item,
         })
     });
-    fbw_bump_executed_effect();
+    fbw_bump_executed_effect("list_pop_end");
 }
 
 /// Record an Empty-list first append whose eager execution promoted the list
@@ -512,7 +512,7 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
     }
     FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().push((cell, intvalue_before)));
     // gh#467: see `fbw_store_journal_push`.
-    fbw_bump_executed_effect();
+    fbw_bump_executed_effect("cell_store_journal");
 }
 
 /// Record the `sys_exc_value` a walked eager `set_current_exception`
@@ -1468,8 +1468,18 @@ pub(crate) fn fbw_opcode_entry_effects_at(py_pc: usize) -> Option<usize> {
 }
 
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
-pub(crate) fn fbw_bump_executed_effect() {
-    FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(c.get() + 1));
+///
+/// `site` names the bumping journal or fold.  The forward-flush gate reads only
+/// the count, so a refusal reports `effects>0` without saying which of the six
+/// bumps moved it; the tag is what turns that into an attributable reading.
+pub(crate) fn fbw_bump_executed_effect(site: &'static str) {
+    FBW_EXECUTED_EFFECT_COUNT.with(|c| {
+        let count = c.get() + 1;
+        c.set(count);
+        if fbw_debug_abort_enabled() {
+            eprintln!("[fbw-effect-bump] site={site} count={count}");
+        }
+    });
 }
 
 /// gh#467 latch the inline-abort forward-flush carrier (see

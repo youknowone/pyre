@@ -58,9 +58,27 @@ use crate::resume_value::ResumeData;
 //   - bits 1..3      : `ST_TYPE_MASK` — `TY_NONE` / `TY_INT` / `TY_REF` /
 //                      `TY_FLOAT`, set by `make_a_counter_per_value` to
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
-//   - bits 3..end    : jitcounter hash (when TY_NONE) or guard_value
-//                      failarg index (when TY_INT/REF/FLOAT), accessed via
-//                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
+//   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
+//                      index (when TY_INT/REF/FLOAT), read here as
+//                      `status >> STATUS_SHIFT` masked with
+//                      `STATUS_SHIFT_MASK` (`compile.py
+//                      AbstractResumeGuardDescr.ST_SHIFT` /
+//                      `ST_SHIFT_MASK`).
+//
+// What the value-slot index NAMES is backend-specific, because
+// `make_a_counter_per_value` (`regalloc.py consider_guard_value`) records a
+// register or frame position of the trace that failed:
+//
+//   * dynasm records a DEADFRAME slot.  Only the caller still holding the
+//     deadframe can read it, so it does so with `Backend::get_value_direct`
+//     and hands the result to `must_compile_with_values` as
+//     `guard_value_operand`.  When that operand is present it is the
+//     authoritative value; nothing indexes `fail_values` with the slot.
+//   * cranelift and wasm record a FAIL-ARGUMENT position, because their slot
+//     space IS the dense fail-argument vector.  They supply no
+//     `guard_value_operand`, and `must_compile_with_values` resolves the same
+//     index out of `fail_values` — which is why leaving it `None` there is
+//     the contract, not a gap.
 pub const STATUS_BUSY_FLAG: u64 = 0x01;
 pub const STATUS_TYPE_MASK: u64 = 0x06;
 pub const STATUS_SHIFT: u32 = 3;
@@ -69,6 +87,23 @@ pub const STATUS_TY_NONE: u64 = 0x00;
 pub const STATUS_TY_INT: u64 = 0x02;
 pub const STATUS_TY_REF: u64 = 0x04;
 pub const STATUS_TY_FLOAT: u64 = 0x06;
+
+/// The deadframe slot `compile.py must_compile` reads the failing GUARD_VALUE
+/// operand from, or `None` when this failure does not take that arm:
+/// TY_NONE is the per-guard hash and a busy status is `must_compile`'s
+/// early `return False` (`compile.py must_compile`).
+///
+/// The slot is only meaningful to the backend that recorded it — see the
+/// status-layout note above: dynasm reads it as a deadframe slot (through
+/// `get_value_direct`), cranelift and wasm resolve the same index out of the
+/// fail-argument vector.
+pub fn guard_value_counter_slot(descr: &dyn FailDescr) -> Option<usize> {
+    let status = descr.get_status();
+    if status & STATUS_TYPE_MASK == 0 || status & STATUS_BUSY_FLAG != 0 {
+        return None;
+    }
+    Some((status >> STATUS_SHIFT) as usize)
+}
 
 /// Global counter for unique fail_index allocation.
 ///

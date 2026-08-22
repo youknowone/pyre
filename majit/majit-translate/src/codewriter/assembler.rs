@@ -18,7 +18,7 @@ use std::{
 
 use vecset::VecSet;
 
-use crate::call::CallControl;
+use crate::call::{CallControl, extract_element_type_from_str};
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 
 fn reg_label(reg: crate::flatten::Register) -> String {
@@ -4518,27 +4518,6 @@ fn vable_arraydescrof(
     }
 }
 
-fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    let s = type_str.trim();
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>'))
-        && start < end
-    {
-        return Some(s[start + 1..end].trim().to_string());
-    }
-    if s.starts_with('[') && s.ends_with(']') {
-        let inner = &s[1..s.len() - 1];
-        let elem = if let Some(semi) = inner.find(';') {
-            inner[..semi].trim()
-        } else {
-            inner.trim()
-        };
-        if !elem.is_empty() {
-            return Some(elem.to_string());
-        }
-    }
-    None
-}
-
 /// Convert OpKind to an opname string for the assembler's instruction table.
 /// RPython: the opname comes from SpaceOperation.opname.
 /// Convert OpKind to a typed opname matching RPython's jtransform output.
@@ -4907,7 +4886,7 @@ impl Assembler {
         self.insns.insert(name.to_string(), opnum);
     }
 
-    /// RPython `assembler.py self.all_liveness = []` — the shared
+    /// RPython `assembler.py Assembler.__init__ self.all_liveness = []` — the shared
     /// liveness byte stream populated by `_encode_liveness`.  Returned
     /// as a contiguous `&[u8]` view so consumers (notably
     /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py`) can

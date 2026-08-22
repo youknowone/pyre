@@ -4237,6 +4237,11 @@ impl majit_backend::Backend for WasmBackend {
         data.raw_values[index]
     }
 
+    fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64 {
+        // Wasm's slot space is the dense fail-value vector.
+        self.get_int_value(frame, slot)
+    }
+
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
         let data = frame
             .boxed_data()

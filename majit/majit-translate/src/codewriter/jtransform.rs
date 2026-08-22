@@ -795,7 +795,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// Attach the portal JitDriverStaticData index for the current
-    /// graph. RPython `jtransform.py self.portal_jd = portal_jd`
+    /// graph. RPython `jtransform.py Transformer.__init__ self.portal_jd = portal_jd`
     /// — "non-None only for the portal graph(s)". Pyre stores the
     /// index into `CallControl::jitdrivers_sd` rather than a direct
     /// reference so the builder does not force a second borrow of
@@ -2883,7 +2883,7 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
             crate::hints::HintKind::PromoteUnicode => {
-                // `rpython/jit/codewriter/jtransform.py promote_unicode`:
+                // `rpython/jit/codewriter/jtransform.py Transformer.rewrite_op_hint promote_unicode`:
                 //     U = lltype.Ptr(rstr.UNICODE)
                 //     assert op.args[0].concretetype == U
                 //     ...register OS_UNIEQ_NONNULL + emit str_guard_value...
@@ -7280,7 +7280,7 @@ fn remap_op(
 /// call `SomeBool` via the `we_are_jitted` `ExtRegistryEntry`) and
 /// before per-op rewriting.  `rewrite_operation` then folds the
 /// symbolic to `ConstBool(true)` keyed on the `SpecTag` identity,
-/// mirroring `jtransform.py value is _we_are_jitted`.  Running on
+/// mirroring `jtransform.py Transformer.rewrite_op_int_is_true value is _we_are_jitted`.  Running on
 /// the model graph rather than the annotated flowspace oracle keeps the
 /// un-annotatable `SpecTag` out of `Bookkeeper.immutablevalue` (which
 /// has no symbolic branch — in RPython the symbolic is likewise

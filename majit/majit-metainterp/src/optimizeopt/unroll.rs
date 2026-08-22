@@ -244,6 +244,43 @@ fn refresh_forwarded_const_ref(
     }
 }
 
+/// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` -
+/// `runtime_boxes` are
+/// the original boxes, InputArg and Op alike. Phase 2 recovers an Op arg's
+/// observed value through its producing op, but `find_producer_op` has
+/// nothing to return for an InputArg arg, so materialize the entry box's
+/// value as an inline Const, which carries it namespace-independently.
+/// `runtime_boxes` are only ever READ by `generate_guards`
+/// (`virtualstate.py generate_guards`); the guard it emits carries the target
+/// state's own constant, never this one.
+fn fold_recorded_jump_args(
+    args: Vec<OpRef>,
+    inputarg_boxes: &[majit_ir::InputArgRc],
+) -> Vec<OpRef> {
+    args.into_iter()
+        .map(|arg| {
+            let inputarg_index = match arg {
+                OpRef::InputArgInt(i) | OpRef::InputArgFloat(i) | OpRef::InputArgRef(i) => {
+                    Some(i as usize)
+                }
+                _ => None,
+            };
+            let Some(inputarg_box) = inputarg_index.and_then(|i| inputarg_boxes.get(i)) else {
+                return arg;
+            };
+            if Some(inputarg_box.tp) != arg.ty() {
+                return arg;
+            }
+            match inputarg_box.get_value() {
+                Some(value) if !matches!(value, Value::Void) => {
+                    OpRef::const_inline_from_value(&value)
+                }
+                _ => arg,
+            }
+        })
+        .collect()
+}
+
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -334,6 +371,13 @@ pub struct UnrollOptimizer {
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputargs
     /// so value_types covers inputarg OpRefs.
     pub trace_inputargs: Vec<majit_ir::OpRef>,
+    /// compile.py `PreambleCompileData(trace, jumpargs, ...)` - the
+    /// ORIGINAL history boxes behind `runtime_boxes`. `trace_inputargs`
+    /// carries only each entry slot's position and type; these are the boxes
+    /// themselves, whose observed value `virtualstate.py`'s `_generate_guards`
+    /// / `_generate_guards_unkown` / `_generate_guards_nonnull` /
+    /// `_generate_guards_knownclass` read un-forwarded off `runtime_boxes[i]`.
+    pub trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
@@ -503,6 +547,7 @@ impl UnrollOptimizer {
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
+            trace_inputarg_boxes: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
@@ -856,11 +901,13 @@ impl UnrollOptimizer {
             // exported state below so the peeled-loop close reads it as
             // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
             // peeled body's own jump args.
-            let recorded_jump_args: Vec<OpRef> = ops
-                .iter()
-                .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default();
+            let recorded_jump_args = fold_recorded_jump_args(
+                ops.iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .unwrap_or_default(),
+                &self.trace_inputarg_boxes,
+            );
             // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated. trace.get_iter() per-call
             // inputarg_from_tp(...) / cls() — each phase optimizes against a
@@ -3674,16 +3721,18 @@ impl OptUnroll {
             // `_jump_to_existing_trace` runs `self.optimizer.patchguardop` is
             // always populated.
             //
-            // pyre mirrors that on the LOOP path only: the GFC comes from the
-            // close-loop path and Phase 1 captures it into `patchguardop`,
-            // which Phase 2 inherits. A bridge records no GFC at all, so on
-            // the `optimize_bridge` -> `try_jump_to_existing_trace` route the
-            // only patchguardop is the stand-in `optimize_bridge` synthesizes
-            // from one of the bridge's own body guards — and a bridge whose
-            // body carries no guard with a resume position leaves even that
-            // unset. Upstream cannot reach that state, because :2991-2993
-            // emits the GFC before the closing JUMP of every trace that
-            // reaches `reached_loop_header`, a bridge grown from a
+            // pyre emits the GFC on both closes: the own-loop close gets it
+            // from `close_loop_args_at` and Phase 1 captures it into
+            // `patchguardop`, which Phase 2 inherits; the merge-point crossing
+            // that closes a bridge emits it in `jitcode_dispatch/mod.rs`. A
+            // crossing that skipped that emit — a previously declined close, or
+            // a walk that is not the authoritative top-level executor — reaches
+            // `optimize_bridge` without one, and falls back to the stand-in it
+            // synthesizes from one of the bridge's own body guards; a bridge
+            // whose body carries no guard with a resume position leaves even
+            // that unset. Upstream cannot reach that state, because
+            // `reached_loop_header` emits the GFC before the closing JUMP of
+            // every trace that reaches it, a bridge grown from a
             // ResumeGuardDescr included.
             //
             // Decline this target token rather than dereference a None, the
@@ -7219,6 +7268,46 @@ mod tests {
     }
 
     #[test]
+    fn test_recorded_jump_inputarg_keeps_observed_runtime_value() {
+        let mut unroll_opt = UnrollOptimizer::new();
+        unroll_opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);
+        let inputarg_box = majit_ir::InputArg::new_int_rc(0);
+        inputarg_box.set_value(Value::Int(73));
+        unroll_opt.trace_inputarg_boxes = vec![inputarg_box];
+
+        let mut ops = vec![
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_inputarg_operand(Type::Int, 0),
+                    rooted_inputarg_operand(Type::Int, 0),
+                ],
+            ),
+            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
+        ];
+        assign_positions(&mut ops, 1);
+        let mut constants = majit_ir::ConstMap::new();
+        let mut phase1_out = None;
+
+        unroll_opt
+            .optimize_trace_with_constants_and_inputs_vable_out(
+                &ops,
+                &mut constants,
+                1,
+                None,
+                Some(&mut phase1_out),
+            )
+            .expect("tiny loop should optimize");
+        let state = phase1_out.expect("Phase 1 should export loop state").1;
+
+        assert_eq!(
+            state.runtime_boxes[0],
+            OpRef::const_int(73),
+            "recorded closing-JUMP entry InputArg must retain observed runtime value",
+        );
+    }
+
+    #[test]
     fn test_unroll_optimizer_count_guards() {
         let ops = vec![
             Op::new(OpCode::GuardTrue, &[rooted_resop_operand(Type::Int, 0)]),
@@ -8016,7 +8105,7 @@ mod tests {
     /// case, with the producer's `make_equal_to(source, value)` forwarding
     /// installed (`shortpreamble.rs::produce_heap_field`).
     /// `force_op_from_preamble_op` returns `preamble_source` (RPython
-    /// `unroll.py return preamble_op.op` ≡ `self.res`); the producer's
+    /// `unroll.py UnrollOptimizer.force_op_from_preamble return preamble_op.op` ≡ `self.res`); the producer's
     /// `get_box_replacement(source)` lookup is consumed inside `force_box`
     /// (`shortpreamble.py:436 op = preamble_op.op.get_box_replacement()`)
     /// when it runs `add_preamble_op`.
@@ -8072,7 +8161,7 @@ mod tests {
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
-        // RPython `unroll.py return preamble_op.op` ≡ self.res.
+        // RPython `unroll.py UnrollOptimizer.force_op_from_preamble return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
         assert_eq!(forced, OpRef::ref_op(19));
 
