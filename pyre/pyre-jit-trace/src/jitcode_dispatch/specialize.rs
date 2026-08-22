@@ -522,6 +522,44 @@ pub(crate) fn try_walker_specialize_unary_invert_int<Sym: WalkSym>(
 /// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
+/// The raw machine int of an int/bool operand, for the specialized IR.
+///
+/// The ordinary path guards the operand's exact class and loads `intval` out
+/// of the box.  A bool this same walk boxed still carries the truth Int it was
+/// built from ([`bool_box_truth_lookup`]), so the arithmetic reads that
+/// directly and the box, its class guard and its `intval` load all go dead —
+/// the arithmetic twin of the `POP_JUMP_IF_*` fold, which is this walker's
+/// runtime reconstruction of `jtransform.py optimize_goto_if_not`.
+///
+/// The branch consumer may take the truth operand as it stands because it only
+/// asks whether it is nonzero.  Arithmetic may not: `jit_bool_value_from_truth`
+/// maps *every* nonzero truth to `intval` 1, so the value the box would have
+/// yielded is the normalized `int_is_true`, not the operand itself.
+fn walker_int_operand_raw<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    operand_obj: pyre_object::PyObjectRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    concrete: i64,
+) -> Result<OpRef, DispatchError> {
+    if let Some(truth) = bool_box_truth_lookup(operand) {
+        let normalized = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[truth]);
+        ctx.trace_ctx
+            .set_opref_concrete(normalized, majit_ir::Value::Int(concrete));
+        return Ok(normalized);
+    }
+    let raw = walker_unbox_int_typed(ctx, op_pc, operand, type_addr, intval_descr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        operand,
+        walker_numeric_builtin_class(operand_obj),
+    )?;
+    Ok(raw)
+}
+
 pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -697,10 +735,8 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
-    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
+    let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr, la)?;
+    let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr, rb)?;
     if overflows {
         let concrete_value = match op_code {
             OpCode::IntAddOvf => la.wrapping_add(rb),
