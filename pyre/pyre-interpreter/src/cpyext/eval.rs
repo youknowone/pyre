@@ -2,6 +2,7 @@
 
 use super::pyobject::{self, CPyObject};
 use pyre_object::{PY_NULL, PyObjectRef};
+use std::ffi::{c_char, c_int};
 
 /// The namespace a name lookup running here would fall back to —
 /// `eval.py:32-45 PyEval_GetBuiltins`.
@@ -58,6 +59,43 @@ fn dict_of(w_obj: PyObjectRef) -> PyObjectRef {
     crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(slot))
 }
 
+/// `eval.py Py_EnterRecursiveCall` — the point a C-level recursive call is
+/// about to be made.
+///
+/// Answers 0 when there is room and 1 with a `RecursionError` recorded when
+/// there is not.  `location` names what the caller was about to do and is
+/// concatenated onto the message, which is why the two spellings of the limit
+/// -- " while calling a Python object" and the bare one -- read differently.
+///
+/// # Safety
+/// `location` must be null or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_EnterRecursiveCall(location: *const c_char) -> c_int {
+    if crate::stack_check::stack_check().is_ok() {
+        return 0;
+    }
+    let location = match location.is_null() {
+        true => String::new(),
+        false => unsafe { std::ffi::CStr::from_ptr(location) }
+            .to_string_lossy()
+            .into_owned(),
+    };
+    super::pyerrors::trap::<()>(Err(crate::PyError::recursion_error(format!(
+        "maximum recursion depth exceeded{location}"
+    ))));
+    1
+}
+
+/// `eval.py Py_LeaveRecursiveCall` — the close of a successful
+/// [`Py_EnterRecursiveCall`].
+///
+/// Nothing is counted: the entry asks the stack how much room is left rather
+/// than keeping a depth of its own, so there is nothing to give back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_LeaveRecursiveCall() {}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyEval_GetBuiltins as *const ());
+    std::hint::black_box(Py_EnterRecursiveCall as *const ());
+    std::hint::black_box(Py_LeaveRecursiveCall as *const ());
 }

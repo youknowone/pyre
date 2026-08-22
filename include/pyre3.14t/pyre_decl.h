@@ -164,6 +164,8 @@ PyAPI_FUNC(PyObject *) PyDict_Values(PyObject *);
 
 /* cpyext/eval.rs */
 PyAPI_FUNC(PyObject *) PyEval_GetBuiltins(void);
+PyAPI_FUNC(int) Py_EnterRecursiveCall(const char *);
+PyAPI_FUNC(void) Py_LeaveRecursiveCall(void);
 
 /* cpyext/exception.rs */
 PyAPI_FUNC(int) PyExceptionClass_Check(PyObject *);
@@ -556,10 +558,13 @@ PyAPI_FUNC(PyObject *) PySequence_Tuple(PyObject *);
 
 /* cpyext/setobject.rs */
 PyAPI_FUNC(int) PyAnySet_Check(PyObject *);
+PyAPI_FUNC(int) PyAnySet_CheckExact(PyObject *);
 PyAPI_FUNC(int) PyFrozenSet_Check(PyObject *);
+PyAPI_FUNC(int) PyFrozenSet_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFrozenSet_New(PyObject *);
 PyAPI_FUNC(int) PySet_Add(PyObject *, PyObject *);
 PyAPI_FUNC(int) PySet_Check(PyObject *);
+PyAPI_FUNC(int) PySet_CheckExact(PyObject *);
 PyAPI_FUNC(int) PySet_Clear(PyObject *);
 PyAPI_FUNC(int) PySet_Contains(PyObject *, PyObject *);
 PyAPI_FUNC(int) PySet_Discard(PyObject *, PyObject *);

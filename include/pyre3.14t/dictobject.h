@@ -17,6 +17,8 @@ typedef struct {
     PyObject *_tmpkeys; /* a private place to put keys during PyDict_Next */
 } PyDictObject;
 
+#define PyDict_GET_SIZE(ob) PyDict_Size((PyObject *)(ob))
+
 #define PyDoc_STRVAR(name, str) static const char name[] = str
 #define PyDoc_STR(str) str
 
