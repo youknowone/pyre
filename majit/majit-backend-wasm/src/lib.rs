@@ -92,8 +92,10 @@ use std::sync::{Arc, Mutex};
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
 /// has been entered `INLINE_TRIP_THRESHOLD` times; 55 = that trip fired and the
-/// merge was attempted.
-pub static BRIDGE_DIAG: [AtomicU64; 56] = [const { AtomicU64::new(0) }; 56];
+/// merge was attempted; 56 = eligible but not deferrable, because the region
+/// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
+/// it reads.
+pub static BRIDGE_DIAG: [AtomicU64; 57] = [const { AtomicU64::new(0) }; 57];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -1810,6 +1812,32 @@ thread_local! {
     /// trip only appends here, and [`take_tripped_inlines`]'s caller installs
     /// the merge once the trace has returned.
     static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops a registered [`PendingInline`] unless the bridge whose probe would
+/// fire its callback actually got published.
+///
+/// Registration has to precede the module build — the probe is one of the
+/// build's inputs — so a build or host rejection after it would otherwise leave
+/// an entry nothing can ever reach, holding the owner's `Arc<JitCellToken>`,
+/// the copied region and its pool for the life of the thread, once per
+/// rejected attempt. The counter stays leaked either way; it is eight bytes,
+/// and on this path no module was published to increment it.
+struct PendingInlineGuard(Option<i64>);
+
+impl PendingInlineGuard {
+    /// The bridge is published, so the entry is the callback's to remove.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PendingInlineGuard {
+    fn drop(&mut self) {
+        if let Some(pending_id) = self.0 {
+            PENDING_INLINES.with(|pending| pending.borrow_mut().remove(&pending_id));
+        }
+    }
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
@@ -3817,7 +3845,22 @@ impl majit_backend::Backend for WasmBackend {
                     let outside_loop = source_in_preamble
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
                     self.collect_constants_from_ops(ops);
-                    if outside_loop {
+                    if outside_loop && codegen::has_invalidation_guard(ops) {
+                        // A quasi-immutable fold's dependencies are registered
+                        // once, against whatever flag the token names when this
+                        // compile returns — the bridge's own, because deferring
+                        // takes the out-of-line path below. The merge cannot
+                        // move a registration that has already happened, so
+                        // merged, the region would read the owner's root flag
+                        // while its dependencies still hold the bridge's: a
+                        // field mutated before the trip would be forgotten, and
+                        // one mutated after would leave the fold in place. The
+                        // eager arm below has no such window — it merges before
+                        // this compile returns, so the flag it records is the
+                        // one the dependencies then attach to.
+                        diag_bump(56);
+                        decline("defer_invalidation_guard");
+                    } else if outside_loop {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
                         // trips. Everything else about this compile is the
@@ -3938,6 +3981,7 @@ impl majit_backend::Backend for WasmBackend {
                 });
             register_pending_inline(owner, region, self.constants.clone(), cells_base_ptr)
         });
+        let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
@@ -4009,6 +4053,9 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+        // Past every path that can fail with no module published: from here the
+        // probe exists and its callback owns the pending entry.
+        pending_guard.disarm();
         // Only a bridge that survived the decline above gets its reference
         // constants rooted. The table is attached to the long-lived original
         // loop token, so rooting a rejected bridge's table would keep its

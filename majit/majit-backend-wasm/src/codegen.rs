@@ -2343,6 +2343,13 @@ pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
     }
 }
 
+/// Whether these ops carry a `GUARD_NOT_INVALIDATED`, so their validity is
+/// watched through the invalidation flag of whichever module emits them.
+pub fn has_invalidation_guard(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| op.opcode == OpCode::GuardNotInvalidated)
+}
+
 /// Position in `ops` of the exit with ordinal `fail_index`.
 fn exit_op_index(ops: &[Op], fail_index: u32) -> Option<usize> {
     ops.iter()
