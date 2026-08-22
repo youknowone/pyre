@@ -3328,7 +3328,6 @@ mod tests {
             "newlist/idddd>r",
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",
-            "newstringbuilder/d>r",
             "record_exact_class/ri",
             "record_known_result_i_ir_v/iiIRd",
             "record_known_result_r_ir_v/riIRd",

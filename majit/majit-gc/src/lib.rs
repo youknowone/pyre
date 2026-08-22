@@ -31,6 +31,33 @@ pub mod weakref;
 
 static AFTER_MINOR_COLLECTION_FN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
+// Runtime type ids for RPython's varsize `rstr.STR` / `rstr.UNICODE` leaves.
+// The object model publishes them after `TypeInfo` registration; both JIT
+// backends read the same ids when constructing their builtin string
+// ArrayDescrs, so interpreter, blackhole, and compiled allocations share one
+// collector identity.
+static LOWLEVEL_STR_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LOWLEVEL_UNICODE_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_lowlevel_str_type_id(id: u32) {
+    debug_assert_ne!(id, 0);
+    LOWLEVEL_STR_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
+}
+
+pub fn set_lowlevel_unicode_type_id(id: u32) {
+    debug_assert_ne!(id, 0);
+    LOWLEVEL_UNICODE_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
+}
+
+pub fn lowlevel_str_type_id() -> u32 {
+    LOWLEVEL_STR_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn lowlevel_unicode_type_id() -> u32 {
+    LOWLEVEL_UNICODE_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Register the callback installed as `finished_minor_collection` by
 /// framework.py:135-138. Called once when the JIT counter is initialized.
 pub fn register_after_minor_collection_hook(f: fn()) {

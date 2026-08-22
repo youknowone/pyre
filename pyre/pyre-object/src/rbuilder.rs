@@ -1,16 +1,12 @@
 //! Runtime GC type-id registry for the `StringBuilder` (rbuilder) value.
 //!
 //! The JIT models RPython's `StringBuilder` as a bare `GcStruct` (no `w_class`)
-//! that the `New{"stringbuilder"}` opcode allocates. `current_buf` points at a
-//! raw `std::alloc` low-level string (pyre's `rstr.STR` equivalent), off-GC and
-//! immobile, so the tid carries drop glue (`StringBuilderBox::drop` in
-//! `pyre-jit::eval`) to free it on sweep. `extra_pieces` is a **GC edge**: the
-//! grow path allocates each chain node with `malloc(STRINGPIECE)` (a GC alloc),
-//! so the collector traces that field (the tid registers `gc_ptr_offsets` for
-//! it) and reclaims the STRINGPIECE nodes itself. The tid is assigned at runtime
-//! by `pyre-jit::eval` after the fixed-constant type registrations and published
-//! here so `pyre-jit-trace`'s size descriptor can stamp it into the allocation
-//! shape.
+//! allocated by the ordinary `new` operation. `current_buf` is a GC pointer to
+//! the low-level `STR`, and `extra_pieces` is a GC pointer to the linked
+//! `STRINGPIECE` nodes. This mirrors `rpython/rtyper/lltypesystem/rbuilder.py`:
+//! ownership is expressed entirely by traced fields rather than Rust drop glue.
+//! The runtime type id is published here so `pyre-jit-trace` can stamp it into
+//! the allocation descriptor.
 
 /// Field byte offsets and total body size of the `StringBuilder` bare GcStruct.
 /// Single source of truth shared by the runtime `StringBuilderBox` layout
@@ -40,7 +36,7 @@ static STRINGBUILDER_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 
 /// Record the GC type id registered for the `StringBuilder` box. `Release` so
 /// the `gc.register_type` entry `pyre-jit::eval build_gc` filled before this
-/// store (drop glue + `gc_ptr_offsets`) is visible to any `Acquire` reader.
+/// store (including its `gc_ptr_offsets`) is visible to any `Acquire` reader.
 pub fn set_stringbuilder_gc_type_id(id: u32) {
     debug_assert_ne!(id, 0, "0 is the unpublished sentinel");
     STRINGBUILDER_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
@@ -59,16 +55,15 @@ pub fn stringbuilder_gc_type_id() -> u32 {
 
 /// Runtime-assigned GC type id for a `StringPiece` chain node — the
 /// `extra_pieces` chain the builder grows when its `current_buf` fills. Each
-/// node is a bare `GcStruct("stringpiece", {buf, prev_piece})`: `buf` is a raw
-/// off-GC low-level string (drop glue frees it), `prev_piece` is a `Ref` edge to
-/// the previous node (traced). Registered by `pyre-jit::eval` right after the
-/// builder tid; read by `pyre-jit-trace`'s size descriptor and by the grow
-/// primitive's `malloc(STRINGPIECE)`.
+/// node is a bare `GcStruct("stringpiece", {buf, prev_piece})`; both fields are
+/// traced GC references, matching the RPython definition. Registered by
+/// `pyre-jit::eval` right after the builder tid; read by `pyre-jit-trace`'s size
+/// descriptor and by the grow primitive's `malloc(STRINGPIECE)`.
 static STRINGPIECE_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Record the GC type id registered for the `StringPiece` node. `Release` so
 /// the `gc.register_type` entry `pyre-jit::eval build_gc` filled before this
-/// store (drop glue + `gc_ptr_offsets`) is visible to any `Acquire` reader.
+/// store (including its `gc_ptr_offsets`) is visible to any `Acquire` reader.
 pub fn set_stringpiece_gc_type_id(id: u32) {
     debug_assert_ne!(id, 0, "0 is the unpublished sentinel");
     STRINGPIECE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);

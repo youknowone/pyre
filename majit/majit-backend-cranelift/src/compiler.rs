@@ -4150,6 +4150,21 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
     })
 }
 
+extern "C" fn gc_alloc_lowlevel_string_shim(
+    type_id: u64,
+    base_size: u64,
+    item_size: u64,
+    length: u64,
+) -> u64 {
+    oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    ))
+}
+
 /// `_build_frame_realloc_slowpath` parity
 /// (`rpython/jit/backend/llsupport/assembler.py` setup;
 /// `rpython/jit/backend/aarch64/assembler.py:434` body).  PyPy's bridge
@@ -4683,17 +4698,25 @@ fn cl_type_for_size(size: usize) -> cranelift_codegen::ir::Type {
 /// as an `ArrayDescr`.  See the parallel helper in
 /// `majit-backend-dynasm/src/runner.rs` for rationale.
 fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
-    let (base_size, item_size) = match opcode {
+    let (base_size, item_size, type_id) = match opcode {
         OpCode::Newstr
         | OpCode::Strlen
         | OpCode::Strgetitem
         | OpCode::Strsetitem
-        | OpCode::Copystrcontent => (BUILTIN_STR_TOKEN_BASE_SIZE, 1),
+        | OpCode::Copystrcontent => (
+            BUILTIN_STR_TOKEN_BASE_SIZE,
+            1,
+            majit_gc::lowlevel_str_type_id(),
+        ),
         OpCode::Newunicode
         | OpCode::Unicodelen
         | OpCode::Unicodegetitem
         | OpCode::Unicodesetitem
-        | OpCode::Copyunicodecontent => (BUILTIN_UNICODE_TOKEN_BASE_SIZE, 4),
+        | OpCode::Copyunicodecontent => (
+            BUILTIN_UNICODE_TOKEN_BASE_SIZE,
+            4,
+            majit_gc::lowlevel_unicode_type_id(),
+        ),
         _ => return None,
     };
 
@@ -4706,7 +4729,7 @@ fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
     Some(Arc::new(BuiltinArrayDescr {
         base_size,
         item_size,
-        type_id: 0,
+        type_id,
         item_type: Type::Int,
         signed: false,
         len_descr,
@@ -15203,6 +15226,7 @@ impl CraneliftBackend {
                     let len = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
@@ -15214,8 +15238,8 @@ impl CraneliftBackend {
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                        gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, len],
+                        gc_alloc_lowlevel_string_shim as *const () as usize,
+                        &[type_id, base_size, item_size, len],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");

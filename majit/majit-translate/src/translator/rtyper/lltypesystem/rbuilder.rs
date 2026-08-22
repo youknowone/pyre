@@ -1,8 +1,7 @@
 //! RPython `rpython/rtyper/lltypesystem/rbuilder.py` parity module.
 //!
-//! This slice lands the low-level builder container shapes and repr
-//! class names. The append/grow/build helper graphs are still pending,
-//! but the public lltype names now match upstream:
+//! This module carries the low-level builder container shapes, reprs, and
+//! append/grow/build helper graphs. The public lltype names match upstream:
 //! `STRINGPIECE`, `STRINGBUILDER`, `UNICODEPIECE`, `UNICODEBUILDER`,
 //! `BaseStringBuilderRepr`, `StringBuilderRepr`, and
 //! `UnicodeBuilderRepr`.
@@ -778,22 +777,35 @@ pub fn build_ll_shrink_final_helper_graph(
 /// Synthesise `ll_grow_and_append(ll_builder, ll_str, start, size)`
 /// (`rbuilder.py`):
 ///
-/// Copy the head that still fits into the current buffer, `ll_grow_by` a fresh
-/// buffer, then copy the tail into it. `rbuilder.py`'s `size > 1280`
-/// single-big-string fast path *aliases* `ll_str` into the piece chain with no
-/// copy; here a piece owns and frees its own `buf`, so that alias would free a
-/// caller-owned buffer on the builder's death — so this always copies, the one
-/// deviation from `rbuilder.py` (the blackhole runtime's `ll_grow_and_append`
-/// makes the same choice, which also keeps `current_pos > 0` after a grow so
-/// the fold's single-piece adopt path stays unreachable). `copy_string_contents`
-/// / `ll_grow_by` are `direct_call` callee consts. Returns `Void`.
+/// Fast path when `size > 1280 and current_pos == 0 and start == 0 and
+/// size == len(ll_str.chars)`: append `ll_str` directly as a new piece
+/// (`total_size = ovfcheck(total_size + size)`, malloc PIECE, link it).
+/// Else the slow path copies the head into the current buffer, `ll_grow_by`s
+/// a fresh buffer, and copies the tail. The short-circuit `and` becomes four
+/// chained tests each falling to the slow path; the `except OverflowError:
+/// pass` overflow edge is unmodelled (bare `int_add_ovf`, so the fast body
+/// always runs when the four tests hold). `mallocfn` / `copy_string_contents`
+/// / `ll_grow_by` are `direct_call` callee consts. Debug-only `ll_assert`s
+/// omitted. Returns `Void`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_ll_grow_and_append_helper_graph(
     name: &str,
     builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
+    chars_array_ptr_lltype: LowLevelType,
     copy_fn: Constant,
     grow_by_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let bool_case = |b: bool| {
+        Some(constant_with_lltype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
     let void_result = || variable_with_lltype("v", LowLevelType::Void);
     let none_const = || {
         Hlvalue::Constant(Constant::with_concretetype(
@@ -842,6 +854,93 @@ pub fn build_ll_grow_and_append_helper_graph(
         startblock.clone(),
         Hlvalue::Variable(return_var),
     );
+
+    // ---- block_fast: append ll_str as a new big piece ----
+    let f = arg_tuple(&builder_ptr_lltype, &buf_lltype);
+    let block_fast = Block::shared(tuple_vals(&f));
+    let f_orig_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        &block_fast,
+        "getfield",
+        vec![
+            Hlvalue::Variable(f.0.clone()),
+            void_field_const("total_size"),
+        ],
+        Hlvalue::Variable(f_orig_total.clone()),
+    );
+    let f_total_new = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        &block_fast,
+        "int_add_ovf",
+        vec![
+            Hlvalue::Variable(f_orig_total),
+            Hlvalue::Variable(f.3.clone()),
+        ],
+        Hlvalue::Variable(f_total_new.clone()),
+    );
+    let f_piece = variable_with_lltype("old_piece", piece_ptr_lltype.clone());
+    push(
+        &block_fast,
+        "malloc",
+        vec![
+            lowlevel_type_const(piece_struct.clone()),
+            gc_flavor_const()?,
+        ],
+        Hlvalue::Variable(f_piece.clone()),
+    );
+    push(
+        &block_fast,
+        "setfield",
+        vec![
+            Hlvalue::Variable(f_piece.clone()),
+            void_field_const("buf"),
+            Hlvalue::Variable(f.1.clone()),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    let f_extra = variable_with_lltype("extra_pieces", piece_ptr_lltype.clone());
+    push(
+        &block_fast,
+        "getfield",
+        vec![
+            Hlvalue::Variable(f.0.clone()),
+            void_field_const("extra_pieces"),
+        ],
+        Hlvalue::Variable(f_extra.clone()),
+    );
+    push(
+        &block_fast,
+        "setfield",
+        vec![
+            Hlvalue::Variable(f_piece.clone()),
+            void_field_const("prev_piece"),
+            Hlvalue::Variable(f_extra),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    push(
+        &block_fast,
+        "setfield",
+        vec![
+            Hlvalue::Variable(f.0.clone()),
+            void_field_const("total_size"),
+            Hlvalue::Variable(f_total_new),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    push(
+        &block_fast,
+        "setfield",
+        vec![
+            Hlvalue::Variable(f.0.clone()),
+            void_field_const("extra_pieces"),
+            Hlvalue::Variable(f_piece),
+        ],
+        Hlvalue::Variable(void_result()),
+    );
+    block_fast.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
 
     // ---- block_slow: copy head, grow, copy tail ----
     let s = arg_tuple(&builder_ptr_lltype, &buf_lltype);
@@ -964,11 +1063,96 @@ pub fn build_ll_grow_and_append_helper_graph(
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    // No fast path: `rbuilder.py`'s `size > 1280` alias path is dropped (see
-    // the doc comment), so the startblock jumps unconditionally to block_slow.
+    // ---- Condition chain: size > 1280 -> pos == 0 -> start == 0 ->
+    //      size == len(ll_str.chars); any failure jumps to block_slow. ----
+    // block_b3: size == len(ll_str.chars)
+    let b3 = arg_tuple(&builder_ptr_lltype, &buf_lltype);
+    let block_b3 = Block::shared(tuple_vals(&b3));
+    let b3_chars = variable_with_lltype("chars", chars_array_ptr_lltype);
+    push(
+        &block_b3,
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(b3.1.clone()),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(b3_chars.clone()),
+    );
+    let b3_len = variable_with_lltype("length", LowLevelType::Signed);
+    push(
+        &block_b3,
+        "getarraysize",
+        vec![Hlvalue::Variable(b3_chars)],
+        Hlvalue::Variable(b3_len.clone()),
+    );
+    let b3_eq = variable_with_lltype("size_eq_len", LowLevelType::Bool);
+    push(
+        &block_b3,
+        "int_eq",
+        vec![Hlvalue::Variable(b3.3.clone()), Hlvalue::Variable(b3_len)],
+        Hlvalue::Variable(b3_eq.clone()),
+    );
+    block_b3.borrow_mut().exitswitch = Some(Hlvalue::Variable(b3_eq));
+    block_b3.closeblock(vec![
+        Link::new(tuple_vals(&b3), Some(block_fast), bool_case(true)).into_ref(),
+        Link::new(tuple_vals(&b3), Some(block_slow.clone()), bool_case(false)).into_ref(),
+    ]);
+
+    // block_b2: start == 0
+    let b2 = arg_tuple(&builder_ptr_lltype, &buf_lltype);
+    let block_b2 = Block::shared(tuple_vals(&b2));
+    let b2_eq = variable_with_lltype("start_eq0", LowLevelType::Bool);
+    push(
+        &block_b2,
+        "int_eq",
+        vec![Hlvalue::Variable(b2.2.clone()), signed(0)],
+        Hlvalue::Variable(b2_eq.clone()),
+    );
+    block_b2.borrow_mut().exitswitch = Some(Hlvalue::Variable(b2_eq));
+    block_b2.closeblock(vec![
+        Link::new(tuple_vals(&b2), Some(block_b3), bool_case(true)).into_ref(),
+        Link::new(tuple_vals(&b2), Some(block_slow.clone()), bool_case(false)).into_ref(),
+    ]);
+
+    // block_b1: current_pos == 0
+    let b1 = arg_tuple(&builder_ptr_lltype, &buf_lltype);
+    let block_b1 = Block::shared(tuple_vals(&b1));
+    let b1_pos = variable_with_lltype("current_pos", LowLevelType::Signed);
+    push(
+        &block_b1,
+        "getfield",
+        vec![
+            Hlvalue::Variable(b1.0.clone()),
+            void_field_const("current_pos"),
+        ],
+        Hlvalue::Variable(b1_pos.clone()),
+    );
+    let b1_eq = variable_with_lltype("pos_eq0", LowLevelType::Bool);
+    push(
+        &block_b1,
+        "int_eq",
+        vec![Hlvalue::Variable(b1_pos), signed(0)],
+        Hlvalue::Variable(b1_eq.clone()),
+    );
+    block_b1.borrow_mut().exitswitch = Some(Hlvalue::Variable(b1_eq));
+    block_b1.closeblock(vec![
+        Link::new(tuple_vals(&b1), Some(block_b2), bool_case(true)).into_ref(),
+        Link::new(tuple_vals(&b1), Some(block_slow.clone()), bool_case(false)).into_ref(),
+    ]);
+
+    // startblock (block_b0): size > 1280
+    let b0_gt = variable_with_lltype("big", LowLevelType::Bool);
+    push(
+        &startblock,
+        "int_gt",
+        vec![Hlvalue::Variable(size.clone()), signed(1280)],
+        Hlvalue::Variable(b0_gt.clone()),
+    );
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(b0_gt));
     let b0 = (llb, ll_str, start, size);
     startblock.closeblock(vec![
-        Link::new(tuple_vals(&b0), Some(block_slow), None).into_ref(),
+        Link::new(tuple_vals(&b0), Some(block_b1), bool_case(true)).into_ref(),
+        Link::new(tuple_vals(&b0), Some(block_slow), bool_case(false)).into_ref(),
     ]);
 
     let func = GraphFunc::new(
@@ -4521,6 +4705,13 @@ pub fn build_ll__ll_append_helper_graph(
 /// final_size = BaseStringBuilderRepr.ll_getlength(ll_builder)
 /// extra = ll_builder.extra_pieces
 /// ll_builder.extra_pieces = lltype.nullptr(...)
+/// if ll_builder.current_pos == 0 and not extra.prev_piece:   # fast path
+///     piece = extra.buf
+///     ll_builder.total_size = final_size
+///     ll_builder.current_buf = piece
+///     ll_builder.current_pos = final_size
+///     ll_builder.current_end = final_size
+///     return
 /// result = ll_builder.mallocfn(final_size)
 /// piece = ll_builder.current_buf
 /// piece_lgt = ll_builder.current_pos
@@ -4539,32 +4730,25 @@ pub fn build_ll__ll_append_helper_graph(
 ///     extra = extra.prev_piece
 /// ```
 ///
-/// `rbuilder.py`'s empty-`current_buf` single-piece fast path (adopt `extra.buf`
-/// as `current_buf` with no copy) is dropped: it aliases a piece-owned buffer,
-/// and the state that would reach it (`current_pos == 0` with a non-null
-/// `extra`) never arises because both append paths leave `current_pos > 0` after
-/// a grow — so the header falls straight through to the general fold, matching
-/// the blackhole runtime `ll_fold_pieces`. That path also reclaims the displaced
-/// old `current_buf`: it is builder-owned raw memory with no node of its own, so
-/// it is wrapped in an unrooted STRINGPIECE the collector frees through the piece
-/// drop glue (the detached `extra` nodes free their own bufs). `ll_getlength` /
-/// `mallocfn` / `copy_string_contents` are baked in as `direct_call` callee
-/// consts. `piece_ptr_lltype` = `STRINGPIECEPTR`/`UNICODEPIECEPTR`, `buf_lltype`
-/// = `STRPTR`/`UNICODEPTR`, `chars_array_ptr_lltype` the `getsubstruct('chars')`
-/// interior array pointer. Returns `Void`.
+/// `ll_getlength` / `mallocfn` / `copy_string_contents` are baked in as
+/// `direct_call` callee consts. The short-circuit `and` splits the header
+/// into a `current_pos == 0` test then a `not extra.prev_piece` test; both
+/// `not <ptr>` conditions use `ptr_nonzero` with the null case on the False
+/// arm (the ported string-helper convention). Debug-only `ll_assert`s
+/// omitted. `piece_ptr_lltype` = `STRINGPIECEPTR`/`UNICODEPIECEPTR`,
+/// `buf_lltype` = `STRPTR`/`UNICODEPTR`, `chars_array_ptr_lltype` the
+/// `getsubstruct('chars')` interior array pointer. Returns `Void`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_ll_fold_pieces_helper_graph(
     name: &str,
     builder_ptr_lltype: LowLevelType,
     piece_ptr_lltype: LowLevelType,
-    piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
     chars_array_ptr_lltype: LowLevelType,
     getlength_fn: Constant,
     mallocfn: Constant,
     copy_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
     let bool_case = |b: bool| {
         Some(constant_with_lltype(
             ConstValue::Bool(b),
@@ -4720,6 +4904,41 @@ pub fn build_ll_fold_pieces_helper_graph(
         .into_ref(),
     ]);
 
+    // ---- block_fast(ll_builder, extra, final_size) ----
+    let f_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let f_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
+    let f_fs = variable_with_lltype("final_size", LowLevelType::Signed);
+    let block_fast = Block::shared(vec![
+        Hlvalue::Variable(f_llb.clone()),
+        Hlvalue::Variable(f_extra.clone()),
+        Hlvalue::Variable(f_fs.clone()),
+    ]);
+    let f_piece = variable_with_lltype("piece", buf_lltype.clone());
+    block_fast.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(f_extra), void_field_const("buf")],
+        Hlvalue::Variable(f_piece.clone()),
+    ));
+    for (field, value) in [
+        ("total_size", Hlvalue::Variable(f_fs.clone())),
+        ("current_buf", Hlvalue::Variable(f_piece)),
+        ("current_pos", Hlvalue::Variable(f_fs.clone())),
+        ("current_end", Hlvalue::Variable(f_fs)),
+    ] {
+        block_fast.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(f_llb.clone()),
+                void_field_const(field),
+                value,
+            ],
+            Hlvalue::Variable(void_result()),
+        ));
+    }
+    block_fast.closeblock(vec![
+        Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
     // ---- block_slow(ll_builder, extra, final_size) ----
     let s_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
     let s_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
@@ -4753,42 +4972,6 @@ pub fn build_ll_fold_pieces_helper_graph(
         ],
         Hlvalue::Variable(s_piece_lgt.clone()),
     ));
-    // The displaced current_buf (`s_piece`) is a raw, builder-owned buffer with
-    // no GC node of its own; overwriting `current_buf` with `result` below would
-    // orphan it — the destructor frees only the new current_buf, and the sweep
-    // reclaims only the detached `extra_pieces` nodes. Wrap it in a STRINGPIECE
-    // so the collector frees it through `StringPieceBox::drop`. The wrapper is
-    // intentionally unrooted (not linked into `extra_pieces`, which stays null
-    // so a later append/build does not re-fold this buffer): no allocation runs
-    // between this malloc and the loop's first copy of `s_piece`, so `s_piece`
-    // stays valid until it has been copied into `result`.
-    let s_wrap = variable_with_lltype("displaced_piece", piece_ptr_lltype.clone());
-    block_slow.borrow_mut().operations.push(SpaceOperation::new(
-        "malloc",
-        vec![lowlevel_type_const(piece_struct), gc_flavor_const()?],
-        Hlvalue::Variable(s_wrap.clone()),
-    ));
-    block_slow.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
-        vec![
-            Hlvalue::Variable(s_wrap.clone()),
-            void_field_const("buf"),
-            Hlvalue::Variable(s_piece.clone()),
-        ],
-        Hlvalue::Variable(void_result()),
-    ));
-    block_slow.borrow_mut().operations.push(SpaceOperation::new(
-        "setfield",
-        vec![
-            Hlvalue::Variable(s_wrap),
-            void_field_const("prev_piece"),
-            Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::None,
-                piece_ptr_lltype.clone(),
-            )),
-        ],
-        Hlvalue::Variable(void_result()),
-    ));
     for (field, value) in [
         ("total_size", Hlvalue::Variable(s_fs.clone())),
         ("current_buf", Hlvalue::Variable(s_result.clone())),
@@ -4820,10 +5003,63 @@ pub fn build_ll_fold_pieces_helper_graph(
         .into_ref(),
     ]);
 
+    // ---- block_cond2(ll_builder, extra, final_size): not extra.prev_piece ----
+    let c_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let c_extra = variable_with_lltype("extra", piece_ptr_lltype.clone());
+    let c_fs = variable_with_lltype("final_size", LowLevelType::Signed);
+    let block_cond2 = Block::shared(vec![
+        Hlvalue::Variable(c_llb.clone()),
+        Hlvalue::Variable(c_extra.clone()),
+        Hlvalue::Variable(c_fs.clone()),
+    ]);
+    let c_prev = variable_with_lltype("prev_piece", piece_ptr_lltype.clone());
+    block_cond2
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(c_extra.clone()),
+                void_field_const("prev_piece"),
+            ],
+            Hlvalue::Variable(c_prev.clone()),
+        ));
+    let c_has_prev = variable_with_lltype("has_prev", LowLevelType::Bool);
+    block_cond2
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "ptr_nonzero",
+            vec![Hlvalue::Variable(c_prev)],
+            Hlvalue::Variable(c_has_prev.clone()),
+        ));
+    block_cond2.borrow_mut().exitswitch = Some(Hlvalue::Variable(c_has_prev));
+    block_cond2.closeblock(vec![
+        // prev_piece non-null -> slow path.
+        Link::new(
+            vec![
+                Hlvalue::Variable(c_llb.clone()),
+                Hlvalue::Variable(c_extra.clone()),
+                Hlvalue::Variable(c_fs.clone()),
+            ],
+            Some(block_slow.clone()),
+            bool_case(true),
+        )
+        .into_ref(),
+        // not prev_piece -> fast path.
+        Link::new(
+            vec![
+                Hlvalue::Variable(c_llb),
+                Hlvalue::Variable(c_extra),
+                Hlvalue::Variable(c_fs),
+            ],
+            Some(block_fast),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
     // ---- startblock: header ----
-    // No fast path and no `current_pos`/`prev_piece` branching (the single-piece
-    // adopt path is dropped — see the doc comment): read `final_size`, detach the
-    // `extra` chain, then fall straight through to the general fold.
     let fs = variable_with_lltype("final_size", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
@@ -4854,7 +5090,35 @@ pub fn build_ll_fold_pieces_helper_graph(
         ],
         Hlvalue::Variable(void_result()),
     ));
+    let pos0 = variable_with_lltype("current_pos", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder.clone()),
+            void_field_const("current_pos"),
+        ],
+        Hlvalue::Variable(pos0.clone()),
+    ));
+    let is_empty = variable_with_lltype("is_empty", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![Hlvalue::Variable(pos0), signed_zero()],
+        Hlvalue::Variable(is_empty.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_empty));
     startblock.closeblock(vec![
+        // current_pos == 0 -> evaluate `not extra.prev_piece`.
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(extra.clone()),
+                Hlvalue::Variable(fs.clone()),
+            ],
+            Some(block_cond2),
+            bool_case(true),
+        )
+        .into_ref(),
+        // current_pos != 0 -> slow path.
         Link::new(
             vec![
                 Hlvalue::Variable(ll_builder),
@@ -4862,7 +5126,7 @@ pub fn build_ll_fold_pieces_helper_graph(
                 Hlvalue::Variable(fs),
             ],
             Some(block_slow),
-            None,
+            bool_case(false),
         )
         .into_ref(),
     ]);
@@ -5522,6 +5786,7 @@ fn rtype_builder_getlength(
 #[allow(clippy::too_many_arguments)]
 fn rtype_builder_append(
     self_repr: &dyn Repr,
+    string_repr: &dyn Repr,
     hop: &HighLevelOp,
     builder_ptr_lltype: LowLevelType,
     piece_ptr_lltype: LowLevelType,
@@ -5537,10 +5802,9 @@ fn rtype_builder_append(
     // (lowleveltype == STRPTR == buf_lltype) so `ll_append`'s second
     // param receives an STRPTR, mirroring `rtype_method_append`'s
     // `hop.inputargs(self, rstr.string_repr)`.
-    let piece_repr = crate::translator::rtyper::rstr::string_repr();
     let vlist = hop.inputargs(vec![
         ConvertedTo::Repr(self_repr),
-        ConvertedTo::Repr(piece_repr.as_ref() as &dyn Repr),
+        ConvertedTo::Repr(string_repr),
     ])?;
     hop.exception_cannot_occur()?;
 
@@ -5609,7 +5873,10 @@ fn rtype_builder_append(
 
             // grow_and_append_fn = ll_grow_and_append(ll_builder, ll_str, start, size)
             let ga_builder = outer_builder.clone();
+            let ga_piece_ptr = piece_ptr_lltype.clone();
+            let ga_piece = piece_struct.clone();
             let ga_buf = outer_buf.clone();
+            let ga_chars = chars_ptr.clone();
             let ga_copy_fn = copy_fn.clone();
             let grow_and_append = rtyper.lowlevel_helper_function_with_builder(
                 "ll_grow_and_append".to_string(),
@@ -5624,7 +5891,10 @@ fn rtype_builder_append(
                     build_ll_grow_and_append_helper_graph(
                         "ll_grow_and_append",
                         ga_builder,
+                        ga_piece_ptr,
+                        ga_piece,
                         ga_buf,
+                        ga_chars,
                         ga_copy_fn,
                         grow_by_fn,
                     )
@@ -5693,6 +5963,79 @@ fn rtype_builder_append(
     hop.gendirectcall(&helper, vlist)
 }
 
+/// RPython `AbstractStringBuilderRepr.rtype_method_append`'s character arm:
+/// select `self.char_repr` and call `ll_append_char` rather than coercing the
+/// character through the string repr.
+#[allow(clippy::too_many_arguments)]
+fn rtype_builder_append_char(
+    self_repr: &dyn Repr,
+    char_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    char_lltype: LowLevelType,
+    malloc_name: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
+    };
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(char_repr),
+    ])?;
+    hop.exception_cannot_occur()?;
+
+    let outer_builder = builder_ptr_lltype.clone();
+    let outer_buf = buf_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_append_char".to_string(),
+        vec![builder_ptr_lltype, char_lltype.clone()],
+        LowLevelType::Void,
+        move |rtyper, _args, _result| {
+            let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
+            let malloc_buf = outer_buf.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+            let gb_builder = outer_builder.clone();
+            let gb_piece_ptr = piece_ptr_lltype.clone();
+            let gb_piece = piece_struct.clone();
+            let gb_buf = outer_buf.clone();
+            let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![outer_builder.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        gb_builder,
+                        gb_piece_ptr,
+                        gb_piece,
+                        gb_buf,
+                        mallocfn,
+                    )
+                },
+            )?;
+            let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+            build_ll_append_char_helper_graph(
+                "ll_append_char",
+                outer_builder.clone(),
+                char_lltype,
+                chars_ptr,
+                outer_buf.clone(),
+                grow_by_fn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
 /// RPython `AbstractStringBuilderRepr.rtype_method_build(self, hop)`
 /// (`rbuilder.py`):
 ///
@@ -5708,13 +6051,11 @@ fn rtype_builder_append(
 /// buffer (`ll_getlength` / `mallocfn` / `copy`); `ll_shrink_final` trims the
 /// single-buffer case with `rgc.ll_shrink_array` (an oopspec residual).  The
 /// nested funcptr consts are built bottom-up exactly as [`rtype_builder_append`].
-#[allow(clippy::too_many_arguments)]
 fn rtype_builder_build(
     self_repr: &dyn Repr,
     hop: &HighLevelOp,
     builder_ptr_lltype: LowLevelType,
     piece_ptr_lltype: LowLevelType,
-    piece_struct: LowLevelType,
     buf_lltype: LowLevelType,
     malloc_name: &'static str,
     copy_opname: &'static str,
@@ -5727,7 +6068,6 @@ fn rtype_builder_build(
 
     let outer_builder = builder_ptr_lltype.clone();
     let outer_piece_ptr = piece_ptr_lltype.clone();
-    let outer_piece_struct = piece_struct.clone();
     let outer_buf = buf_lltype.clone();
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
         "ll_build".to_string(),
@@ -5781,7 +6121,6 @@ fn rtype_builder_build(
             // fold_pieces_fn = ll_fold_pieces(ll_builder)
             let fp_builder = outer_builder.clone();
             let fp_piece_ptr = outer_piece_ptr.clone();
-            let fp_piece_struct = outer_piece_struct.clone();
             let fp_buf = outer_buf.clone();
             let fp_chars = chars_ptr.clone();
             let fold_pieces = rtyper.lowlevel_helper_function_with_builder(
@@ -5793,7 +6132,6 @@ fn rtype_builder_build(
                         "ll_fold_pieces",
                         fp_builder,
                         fp_piece_ptr,
-                        fp_piece_struct,
                         fp_buf,
                         fp_chars,
                         getlength_fn,
@@ -5974,22 +6312,45 @@ impl Repr for StringBuilderRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, STRINGBUILDERPTR.clone()),
-            "append" => rtype_builder_append(
-                self,
-                hop,
-                STRINGBUILDERPTR.clone(),
-                STRINGPIECEPTR.clone(),
-                STRINGPIECE.clone(),
-                STRPTR.clone(),
-                "mallocstr",
-                "copystrcontent",
-            ),
+            "append" => {
+                let is_char = matches!(
+                    hop.args_s.borrow().get(1),
+                    Some(crate::annotator::model::SomeValue::Char(_))
+                        | Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
+                );
+                if is_char {
+                    let char_repr = crate::translator::rtyper::rstr::char_repr();
+                    rtype_builder_append_char(
+                        self,
+                        char_repr.as_ref(),
+                        hop,
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        LowLevelType::Char,
+                        "mallocstr",
+                    )
+                } else {
+                    let string_repr = crate::translator::rtyper::rstr::string_repr();
+                    rtype_builder_append(
+                        self,
+                        string_repr.as_ref(),
+                        hop,
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        "mallocstr",
+                        "copystrcontent",
+                    )
+                }
+            }
             "build" => rtype_builder_build(
                 self,
                 hop,
                 STRINGBUILDERPTR.clone(),
                 STRINGPIECEPTR.clone(),
-                STRINGPIECE.clone(),
                 STRPTR.clone(),
                 "mallocstr",
                 "copystrcontent",
@@ -6060,6 +6421,49 @@ impl Repr for UnicodeBuilderRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, UNICODEBUILDERPTR.clone()),
+            "append" => {
+                let is_char = matches!(
+                    hop.args_s.borrow().get(1),
+                    Some(crate::annotator::model::SomeValue::Char(_))
+                        | Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
+                );
+                if is_char {
+                    let char_repr = crate::translator::rtyper::rstr::unichar_repr();
+                    rtype_builder_append_char(
+                        self,
+                        char_repr.as_ref(),
+                        hop,
+                        UNICODEBUILDERPTR.clone(),
+                        UNICODEPIECEPTR.clone(),
+                        UNICODEPIECE.clone(),
+                        UNICODEPTR.clone(),
+                        LowLevelType::UniChar,
+                        "mallocunicode",
+                    )
+                } else {
+                    let string_repr = crate::translator::rtyper::rstr::unicode_repr();
+                    rtype_builder_append(
+                        self,
+                        string_repr.as_ref(),
+                        hop,
+                        UNICODEBUILDERPTR.clone(),
+                        UNICODEPIECEPTR.clone(),
+                        UNICODEPIECE.clone(),
+                        UNICODEPTR.clone(),
+                        "mallocunicode",
+                        "copyunicodecontent",
+                    )
+                }
+            }
+            "build" => rtype_builder_build(
+                self,
+                hop,
+                UNICODEBUILDERPTR.clone(),
+                UNICODEPIECEPTR.clone(),
+                UNICODEPTR.clone(),
+                "mallocunicode",
+                "copyunicodecontent",
+            ),
             _ => Err(TyperError::message(format!(
                 "missing {}.rtype_method_{method_name}",
                 self.class_name()
@@ -6823,41 +7227,48 @@ mod tests {
     }
 
     #[test]
-    fn build_ll_grow_and_append_always_copies_via_slow_path() {
+    fn build_ll_grow_and_append_fastpath_and_copy_grow_slowpath() {
         use super::Hlvalue;
         let helper = super::build_ll_grow_and_append_helper_graph(
             "ll_grow_and_append",
             super::STRINGBUILDERPTR.clone(),
+            super::STRINGPIECEPTR.clone(),
+            super::STRINGPIECE.clone(),
             super::STRPTR.clone(),
-            dummy_funcptr_const(), // copy_fn
-            dummy_funcptr_const(), // grow_by_fn
+            super::STRPTR.clone(), // chars array ptr placeholder
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
         )
         .expect("build_ll_grow_and_append_helper_graph");
         assert_eq!(helper.func.name, "ll_grow_and_append");
         let inner = helper.graph.borrow();
 
-        // No fast path: the startblock has no test and enters the split-copy
-        // slow path unconditionally (the >1280 alias path is dropped).
+        // header: size > 1280 test, first of the four short-circuit conditions.
         let startblock = inner.startblock.borrow();
-        assert!(startblock.operations.is_empty());
-        assert_eq!(startblock.exits.len(), 1);
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["int_gt"]);
+        assert_eq!(startblock.exits.len(), 2);
         drop(startblock);
 
         let (count, all_ops) = walk_ops(&inner.startblock);
-        // startblock, block_slow, returnblock
-        assert_eq!(count, 3);
+        // b0, b1, b2, b3, fast, slow, returnblock
+        assert_eq!(count, 7);
         let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
-        assert_eq!(n("int_gt"), 0);
-        assert_eq!(n("int_eq"), 0);
-        assert_eq!(n("getsubstruct"), 0);
-        assert_eq!(n("getarraysize"), 0);
-        assert_eq!(n("int_add_ovf"), 0);
-        assert_eq!(n("malloc"), 0);
-        assert_eq!(n("getfield"), 4); // current_pos, current_end, current_buf ×2
-        assert_eq!(n("setfield"), 1); // current_pos
-        assert_eq!(n("int_sub"), 2); // part1, size-part1
-        assert_eq!(n("int_add"), 1); // start+part1
-        assert_eq!(n("direct_call"), 3); // copy head, grow_by, copy tail
+        assert_eq!(n("int_gt"), 1);
+        assert_eq!(n("int_eq"), 3); // pos==0, start==0, size==len
+        assert_eq!(n("getsubstruct"), 1);
+        assert_eq!(n("getarraysize"), 1);
+        assert_eq!(n("int_add_ovf"), 1); // fast: total_size + size
+        assert_eq!(n("malloc"), 1); // fast: new piece
+        assert_eq!(n("getfield"), 7);
+        assert_eq!(n("setfield"), 5); // 4 fast + 1 slow (current_pos)
+        assert_eq!(n("int_sub"), 2); // slow: part1, size-part1
+        assert_eq!(n("int_add"), 1); // slow: start+part1
+        assert_eq!(n("direct_call"), 3); // slow: copy, grow_by, copy
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
@@ -7046,25 +7457,23 @@ mod tests {
     }
 
     #[test]
-    fn build_ll_fold_pieces_assembles_general_fold_and_copy_loop_cfg() {
+    fn build_ll_fold_pieces_assembles_fastpath_and_copy_loop_cfg() {
         use super::Hlvalue;
         let helper = super::build_ll_fold_pieces_helper_graph(
             "ll_fold_pieces",
             super::STRINGBUILDERPTR.clone(),
             super::STRINGPIECEPTR.clone(),
-            super::STRINGPIECE.clone(),
             super::STRPTR.clone(),
             super::STRPTR.clone(), // chars array ptr placeholder
-            dummy_funcptr_const(), // getlength_fn
-            dummy_funcptr_const(), // mallocfn
-            dummy_funcptr_const(), // copy_fn
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
         )
         .expect("build_ll_fold_pieces_helper_graph");
         assert_eq!(helper.func.name, "ll_fold_pieces");
         let inner = helper.graph.borrow();
 
-        // header: getlength call, read+null extra_pieces, then unconditional
-        // entry to the general fold (no single-piece fast path).
+        // header: getlength call, read+null extra_pieces, current_pos==0 test.
         let startblock = inner.startblock.borrow();
         let start_ops: Vec<&str> = startblock
             .operations
@@ -7077,22 +7486,23 @@ mod tests {
                 "direct_call", // ll_getlength
                 "getfield",    // extra_pieces
                 "setfield",    // extra_pieces = null
+                "getfield",    // current_pos
+                "int_eq",
             ]
         );
-        assert_eq!(startblock.exits.len(), 1);
+        assert_eq!(startblock.exits.len(), 2);
         drop(startblock);
 
         let (count, all_ops) = walk_ops(&inner.startblock);
-        // start, slow, loop, loop_next, returnblock
-        assert_eq!(count, 5);
+        // start, cond2, fast, slow, loop, loop_next, returnblock
+        assert_eq!(count, 7);
         let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
         assert_eq!(n("direct_call"), 3); // ll_getlength, mallocfn, copy_string_contents
-        assert_eq!(n("getfield"), 5); // extra_pieces, current_buf, current_pos, loop: buf + prev_piece
-        assert_eq!(n("malloc"), 1); // throwaway piece wrapping the displaced current_buf
-        assert_eq!(n("setfield"), 7); // extra_pieces=null + 4 fields + 2 displaced-piece wrap
-        assert_eq!(n("int_eq"), 0); // no current_pos==0 test
+        assert_eq!(n("getfield"), 8);
+        assert_eq!(n("setfield"), 9); // extra_pieces=null + 4 fast + 4 slow
+        assert_eq!(n("int_eq"), 1);
         assert_eq!(n("int_sub"), 1); // dst -= piece_lgt
-        assert_eq!(n("ptr_nonzero"), 1); // not extra
+        assert_eq!(n("ptr_nonzero"), 2); // not prev_piece, not extra
         assert_eq!(n("getsubstruct"), 1); // len(piece.chars)
         assert_eq!(n("getarraysize"), 1);
 

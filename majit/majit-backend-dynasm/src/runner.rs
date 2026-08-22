@@ -1148,6 +1148,24 @@ pub extern "C" fn dynasm_malloc_array_nonstandard(
     ))
 }
 
+/// Typed varsize allocation for RPython `STR` / `UNICODE`. The string layout
+/// always stores its length at byte offset 8; the ArrayDescr supplies the
+/// collector type id plus base/item sizes.
+pub extern "C" fn dynasm_malloc_lowlevel_string(
+    type_id: u64,
+    base_size: u64,
+    item_size: u64,
+    length: u64,
+) -> u64 {
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    ))
+}
+
 /// Old-generation twin of [`dynasm_malloc_array`], selected by
 /// `gen_malloc_array` for a `non_moving` array descr.  Same signature.
 pub extern "C" fn dynasm_malloc_array_oldgen(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
@@ -5004,17 +5022,25 @@ impl majit_ir::ArrayDescr for BuiltinArrayDescr {
 /// (see `builtin_string_hash_field_descr` below).
 fn builtin_string_array_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::DescrRef> {
     use majit_ir::OpCode;
-    let (base_size, item_size) = match opcode {
+    let (base_size, item_size, type_id) = match opcode {
         OpCode::Newstr
         | OpCode::Strlen
         | OpCode::Strgetitem
         | OpCode::Strsetitem
-        | OpCode::Copystrcontent => (BUILTIN_STR_TOKEN_BASE_SIZE, 1),
+        | OpCode::Copystrcontent => (
+            BUILTIN_STR_TOKEN_BASE_SIZE,
+            1,
+            majit_gc::lowlevel_str_type_id(),
+        ),
         OpCode::Newunicode
         | OpCode::Unicodelen
         | OpCode::Unicodegetitem
         | OpCode::Unicodesetitem
-        | OpCode::Copyunicodecontent => (BUILTIN_UNICODE_TOKEN_BASE_SIZE, 4),
+        | OpCode::Copyunicodecontent => (
+            BUILTIN_UNICODE_TOKEN_BASE_SIZE,
+            4,
+            majit_gc::lowlevel_unicode_type_id(),
+        ),
         _ => return None,
     };
     let len_descr = Arc::new(BuiltinFieldDescr {
@@ -5026,7 +5052,7 @@ fn builtin_string_array_descr(opcode: majit_ir::OpCode) -> Option<majit_ir::Desc
     Some(Arc::new(BuiltinArrayDescr {
         base_size,
         item_size,
-        type_id: 0,
+        type_id,
         item_type: Type::Int,
         signed: false,
         len_descr,

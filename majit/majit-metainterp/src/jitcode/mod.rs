@@ -805,13 +805,12 @@ mod tests {
 
     /// The `pyre_extension_insns()` quarantine holds 8 keys arising from
     /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
-    /// state addressing (6), plus 4 more pyre-only
+    /// state addressing (6), plus 3 more pyre-only
     /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
     /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
     /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
-    /// reification), and `newstringbuilder/d>r` (the rbuilder `StringBuilder`
-    /// allocation, `BC_NEWSTRINGBUILDER`) — so the `pyre_extension_insns()`
-    /// table now holds 12 entries total.  `wellknown_bh_insns()` is a strict
+    /// reification) — so the `pyre_extension_insns()` table now holds 11
+    /// entries total.  `wellknown_bh_insns()` is a strict
     /// subset of RPython's canonical opname universe; `insn_byte` merges both
     /// tables so build-time `write_insn(...)` callers continue to resolve
     /// unchanged.
@@ -839,11 +838,6 @@ mod tests {
             (
                 "vtable_method_ptr/rd>i",
                 majit_translate::insns::BC_VTABLE_METHOD_PTR,
-            ),
-            // rbuilder `StringBuilder` allocation (rbuilder epic).
-            (
-                "newstringbuilder/d>r",
-                majit_translate::insns::BC_NEWSTRINGBUILDER,
             ),
         ];
 

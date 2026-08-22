@@ -555,20 +555,6 @@ pub const BC_ASSERT_NOT_NONE: u8 = 200;
 // `blackhole.py @arguments("r", "i")`.
 pub const BC_RECORD_EXACT_CLASS: u8 = 201;
 
-// pyre-only `newstringbuilder/d>r` — the rbuilder-epic (#40) allocation of a
-// `StringBuilder` GcStruct.  RPython has no counterpart: upstream models
-// `StringBuilder` as a virtualizable in the optimizer and residualises it to
-// `newstr` / `copystrcontent`, so no `newstringbuilder` resop or bhimpl exists
-// there.  Pyre instead allocates a real headerless `StringBuilder` struct
-// (`OpKind::NewStringBuilder`, descr resolved from owner `"stringbuilder"`) and
-// keeps the op distinct from `new`/`new_with_vtable` so the value retains its
-// `StringBuilder` identity through the pipeline.  Takes the next free byte above
-// the prior high-water (`BC_INT_MUL_JUMP_IF_OVF` = 233); the handler
-// (`handler_new`, aliased) allocates via `bh_new(sizedescr)`.  Dormant — the
-// front does not emit it until the builder-mode lift path is wired — so it is
-// listed in `production_bh_builder_overlay_only_gap_snapshot` like `newlist`.
-pub const BC_NEWSTRINGBUILDER: u8 = 234;
-
 pub const MAX_HOST_CALL_ARITY: usize = 16;
 
 /// Lookup a bytecode opcode by its `opname/argcodes` key.
@@ -1289,12 +1275,6 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // pyre's Rust port hits this only on `dyn Trait` calls, where the
     // backend epic must look up the vtable slot itself.
     m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
-    // pyre-only `newstringbuilder/d>r` — the rbuilder-epic `StringBuilder`
-    // allocation.  Emitted by `OpKind::NewStringBuilder` (assembler
-    // `encode_op`); the blackhole handler allocates via `bh_new(sizedescr)`
-    // (aliased to `handler_new` in `wire_bhimpl_handlers`).  See
-    // [`BC_NEWSTRINGBUILDER`] for why it has no RPython counterpart.
-    m.insert("newstringbuilder/d>r", BC_NEWSTRINGBUILDER);
     m
 }
 

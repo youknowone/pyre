@@ -374,7 +374,6 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
-            builder_variant: None,
         }
     }
 
@@ -426,7 +425,6 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
-            builder_variant: None,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
         assert!(!policy.look_inside_graph(&loopy));
@@ -444,7 +442,6 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
-            builder_variant: None,
         };
         assert!(policy.look_inside_graph(&unroll_safe));
     }

@@ -974,13 +974,10 @@ fn build_bare_gcstruct_descr_group(
 /// Upstream `rpython/rtyper/lltypesystem/rbuilder.py` STRINGBUILDER:
 ///   `GcStruct("stringbuilder", ("current_buf", STRPTR), ("current_pos", Signed),
 ///     ("current_end", Signed), ("total_size", Signed), ("extra_pieces", STRINGPIECEPTR))`
-/// A bare GcStruct (not a PyObject). `current_buf` is a raw off-GC low-level
-/// string pointer modeled as scalar `Int` so it stays out of `gc_fielddescrs`
-/// (the box tid's drop glue reclaims it — `pyre-jit::eval` `StringBuilderBox`).
-/// `extra_pieces` is a `Ref`: the grow path allocates each STRINGPIECE chain node
-/// with `malloc(STRINGPIECE)` (a GC alloc), so it must be a traced edge — the
-/// `Ref` flag puts it into `gc_fielddescrs`, and the runtime tid's
-/// `gc_ptr_offsets = [32]` mirrors that so the collector reclaims the chain. The
+/// A bare GcStruct (not a PyObject). Both `current_buf: Ptr(STR)` and
+/// `extra_pieces: Ptr(STRINGPIECE)` are ordinary traced references, matching the
+/// upstream lltype fields. The `Ref` flags put both into `gc_fielddescrs`; the
+/// runtime tid carries the same offsets. The
 /// body size and field offsets are the `pyre_object::rbuilder` constants that
 /// `pyre-jit::eval` pins to `StringBuilderBox` with `offset_of!` const asserts.
 static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -993,8 +990,8 @@ static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new
                 "current_buf",
                 rb::STRINGBUILDER_CURRENT_BUF_OFFSET,
                 8,
-                Type::Int,
-                true,
+                Type::Ref,
+                false,
                 false,
                 false,
             ),
@@ -1051,10 +1048,8 @@ pub fn stringbuilder_size_descr() -> DescrRef {
 ///   `GcStruct("stringpiece", ("buf", STRPTR), ("prev_piece", Ptr(STRINGPIECE)))`
 /// A bare GcStruct chain node the builder's grow path allocates
 /// (`malloc(STRINGPIECE)` = `New{"stringpiece"}`) when `current_buf` fills.
-/// `buf` (offset 0) is a raw off-GC low-level string modeled as scalar `Int`
-/// (drop glue frees it — `pyre-jit::eval` `StringPieceBox`). `prev_piece`
-/// (offset 8) is a `Ref` edge to the previous node, so it is traced
-/// (`gc_fielddescrs = [8]`, tid `gc_ptr_offsets = [8]`). 16-byte body.
+/// `buf: Ptr(STR)` and `prev_piece: Ptr(STRINGPIECE)` are both traced references
+/// (`gc_fielddescrs = [0, 8]`, mirrored by the runtime tid). 16-byte body.
 static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::rbuilder as rb;
     build_bare_gcstruct_descr_group(
@@ -1065,8 +1060,8 @@ static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 "buf",
                 rb::STRINGPIECE_BUF_OFFSET,
                 8,
-                Type::Int,
-                true,
+                Type::Ref,
+                false,
                 false,
                 false,
             ),
@@ -6079,15 +6074,13 @@ mod tests {
             "stringbuilder must be a headered GcStruct"
         );
         assert!(sd.is_gc_managed(), "stringbuilder is GC-managed");
-        // `current_buf` (offset 0) is a raw off-GC low-level string modeled as
-        // scalar `Int`, so it is NOT traced — the box tid's drop glue
-        // (`StringBuilderBox::drop`) reclaims it. `extra_pieces` (offset 32) is a
-        // `Ref` edge to a GC-managed STRINGPIECE chain, so exactly it is traced.
+        // `current_buf: Ptr(STR)` and `extra_pieces: Ptr(STRINGPIECE)` are both
+        // normal GC edges, exactly as in rbuilder.py.
         let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
         assert_eq!(
             traced,
-            vec![32],
-            "stringbuilder must trace only extra_pieces@32; got offsets {traced:?}",
+            vec![0, 32],
+            "stringbuilder must trace current_buf@0 and extra_pieces@32; got offsets {traced:?}",
         );
         assert_eq!(
             sd.type_id(),
@@ -6120,7 +6113,7 @@ mod tests {
             .iter()
             .map(|f| f.offset())
             .collect();
-        assert_eq!(resolved_traced, vec![32]);
+        assert_eq!(resolved_traced, vec![0, 32]);
     }
 
     #[test]
@@ -6142,14 +6135,13 @@ mod tests {
         assert_eq!(sd.size(), 16, "stringpiece body must be 16 bytes");
         assert!(!sd.headerless(), "stringpiece must be a headered GcStruct");
         assert!(sd.is_gc_managed(), "stringpiece is GC-managed");
-        // `buf` (offset 0) is a raw off-GC low-level string modeled as scalar
-        // `Int`, so it is NOT traced — the node tid's drop glue frees it.
-        // `prev_piece` (offset 8) is a `Ref` edge to the previous node, traced.
+        // Both `buf` (offset 0) and `prev_piece` (offset 8) are GC `Ref`
+        // edges, matching RPython's STRINGPIECE {buf: Ptr(STR), prev_piece}.
         let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
         assert_eq!(
             traced,
-            vec![8],
-            "stringpiece must trace only prev_piece@8; got offsets {traced:?}",
+            vec![0, 8],
+            "stringpiece must trace buf@0 and prev_piece@8; got offsets {traced:?}",
         );
         assert_eq!(
             sd.type_id(),
@@ -6180,7 +6172,7 @@ mod tests {
             .iter()
             .map(|f| f.offset())
             .collect();
-        assert_eq!(resolved_traced, vec![8]);
+        assert_eq!(resolved_traced, vec![0, 8]);
     }
 
     #[test]

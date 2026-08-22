@@ -1616,16 +1616,8 @@ impl Assembler {
             }
             // RPython `jtransform.py rewrite_op_malloc`: a fixed-size
             // GC struct without a vtable lowers to `new(descr)`.
-            OpKind::New { owner } | OpKind::NewStringBuilder { owner } => {
-                // `New` and `NewStringBuilder` share the descr-keyed allocation
-                // shape — `owner` resolves the size descriptor and the op lowers
-                // to `bh_new(sizedescr)` — and differ only in the opname, so the
-                // `StringBuilder` value keeps its distinct identity
-                // (`newstringbuilder/d>r` vs `new/d>r`).
-                let opname = match &op.kind {
-                    OpKind::NewStringBuilder { .. } => "newstringbuilder",
-                    _ => "new",
-                };
+            OpKind::New { owner } => {
+                let opname = "new";
                 let spec = bh_size_spec_from_callcontrol(
                     callcontrol.expect("new assembly requires a CallControl"),
                     owner,
@@ -2867,7 +2859,6 @@ impl Assembler {
                 OpKind::NewList { .. } => "NewList",
                 OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
-                OpKind::NewStringBuilder { .. } => "NewStringBuilder",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
                 OpKind::NewArrayClear { .. } => "NewArrayClear",
                 OpKind::NewListClear { .. } => "NewListClear",
@@ -4659,7 +4650,6 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         }
         OpKind::FieldWrite { ty, .. } => format!("setfield_gc_{}", value_type_to_kind(ty)),
         OpKind::New { .. } => "new".into(),
-        OpKind::NewStringBuilder { .. } => "newstringbuilder".into(),
         OpKind::NewWithVtable { .. } => "new_with_vtable".into(),
         // `NewArrayClear` (`new_array_clear/id>r`) and `NewListClear`
         // (`newlist_clear/idddd>r`) both carry descriptor operands and are

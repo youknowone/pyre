@@ -2050,29 +2050,6 @@ fn analyze_pipeline_from_module_paths(
     ] {
         call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
     }
-    // Register builder-variant graphs into the side-map the two-phase
-    // `make_jitcodes` driver consults. Keyed by funcobj `GraphStore` key so
-    // free functions and impl methods land under the same `CallPath` spellings
-    // their concat graphs already occupy (see
-    // `CallControl::register_builder_variants_by_key`). Empty unless a lowered
-    // body had a builder-mode string accumulator.
-    let builder_variants_by_key: std::collections::HashMap<
-        (Option<String>, String),
-        crate::model::FunctionGraph,
-    > = program
-        .functions
-        .iter()
-        .filter_map(|f| {
-            f.builder_variant.as_ref().map(|v| {
-                let key = (
-                    v.source_identity.clone().or_else(|| v.owner_root.clone()),
-                    v.name.clone(),
-                );
-                (key, v.clone())
-            })
-        })
-        .collect();
-    call_control.register_builder_variants_by_key(&builder_variants_by_key);
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
     prof.mark("  find_all_graphs");
@@ -2287,11 +2264,6 @@ fn make_jitcodes(
     // `type_error`) is unioned across all its callers before being rtyped.
     codewriter.run_two_phase_prepass(call_control);
     prof.mark("  run_two_phase_prepass");
-    // Two-pass builder lift gate (design B): swap the StringBuilder variant into
-    // every builder-mode graph the concat prepass proved lifts, and re-drive it,
-    // before the drain publishes any graph.
-    codewriter.swap_in_builder_variants(call_control);
-    prof.mark("  swap_in_builder_variants");
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
     prof.mark("  drain_pending_graphs");
 

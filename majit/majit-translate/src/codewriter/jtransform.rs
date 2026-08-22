@@ -6810,7 +6810,6 @@ fn remap_op(
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewStringBuilder { .. }
         | OpKind::NewWithVtable { .. } => op.kind.clone(),
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
