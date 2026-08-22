@@ -222,7 +222,13 @@ fn path_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
             "path should be string, bytes, os.PathLike or integer, not NoneType",
         ));
     }
-    Ok(crate::gateway::fspath_buf(obj)?
+    // `PyUnicode_FSConverter`: a path is named by a `str`, by the filesystem
+    // `bytes` that `str` encodes to, or by an `os.PathLike`, and all three
+    // reach the host as those bytes. `fspath_buf` takes a `str` its caller has
+    // already established — reading a `bytes` through it decodes the payload
+    // as text and takes a length word out of the middle of the path.
+    let bytes = crate::gateway::fsencode_bytes_w(obj)?;
+    Ok(crate::gateway::os_string_from_fs_bytes(&bytes)
         .to_string_lossy()
         .into_owned())
 }
