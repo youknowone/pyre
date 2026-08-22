@@ -7688,8 +7688,27 @@ pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
     };
     // Decide before emitting: every decline below this point would have to
     // rewind guards for a fold that is no longer there.
-    let Some((w_type, version_tag, map, _storageindex)) = (unsafe {
+    //
+    // Presence is a property of the map, so either resolution answers it and
+    // neither storage kind changes the answer — an int attribute lands in an
+    // unboxed slot, which the boxed resolution alone declines.  Both twins run
+    // the same refusals first (custom `__getattribute__`, an `INVALID`
+    // classify, an uncacheable `version_tag`), so a `Some` from either means
+    // the lookup this fold replaces cannot raise.
+    let Some((w_type, version_tag, map)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name)
+            .map(|(w_type, version_tag, map, _storageindex)| (w_type, version_tag, map))
+            .or_else(|| {
+                pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
+                    concrete_obj,
+                    name,
+                )
+                .map(
+                    |(w_type, version_tag, map, _storageindex, _listindex, _unbox)| {
+                        (w_type, version_tag, map)
+                    },
+                )
+            })
     }) else {
         return Ok(None);
     };
