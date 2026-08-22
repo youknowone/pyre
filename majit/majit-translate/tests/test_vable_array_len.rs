@@ -300,8 +300,8 @@ fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
     );
 }
 
-/// DIAGNOSTIC (#24): can `frame_locals_proxy_snapshot` carry the
-/// `unroll_safe` hint the way `fast2locals` does?
+/// REGRESSION GUARD (#24): `frame_locals_proxy_snapshot` carries the
+/// `unroll_safe` hint, and this pins the read shape that lets it.
 ///
 /// The hint is the arming switch, not a consumer: it lets the codewriter
 /// walk a graph with a backedge, and only then does the virtualizable
@@ -312,10 +312,11 @@ fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
 /// they fail independently: the read must not be `taken_by_address`, and
 /// it must be consumed by an array operation in its own block.
 ///
-/// The reads live in the `insert_slot` **closure**, which charon renders
-/// as its own function, so a probe that lowered only the outer method
-/// would find no reads at all and pass vacuously.  This walks every
-/// function whose path mentions the method, closures included.
+/// The reads once lived in an `insert_slot` **closure**, which charon
+/// renders as its own function, so a probe that lowered only the outer
+/// method would have found no reads at all and passed vacuously.  The
+/// walk still covers every function whose path mentions the method,
+/// closures included, so reintroducing one cannot hide from it.
 #[test]
 fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
     let Some(llbc) = interpreter_llbc() else {
@@ -421,20 +422,21 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
          `frame_locals_proxy_snapshot` graph — probe is inert"
     );
 
-    // Pin the measured shape rather than only reporting it, so that a change
-    // which makes this body eligible for the hint surfaces here instead of
-    // going unnoticed.  The read is the closure's capture of
-    // `self.locals_cells_stack_w`: RFC 2229 captures the field precisely and
-    // by reference, so the place is `&(*self).locals_cells_stack_w` —
-    // field-last, a genuine address-of, correctly suppressed.  `fast2locals`
-    // reads through a raw-pointer local instead and keeps the deref-last
-    // shape, which is why only it can carry `unroll_safe` today.
+    // Pin the measured shape rather than only reporting it.  Both reads now
+    // pair: the body is a plain loop, so each `locals_w!(self)` copies the
+    // raw pointer out of the field into a temp and borrows `&(*temp)` —
+    // deref-last, which is not an address-of.  While the body was a closure
+    // the capture path was truncated at that raw-pointer deref, so the
+    // closure captured the field itself and the borrow read as
+    // `&(*self).locals_cells_stack_w` — field-last, a genuine address-of,
+    // correctly suppressed.  That is what kept the hint off this body, and
+    // why `fast2locals`, which never had a closure, could always carry it.
     //
-    // If this assertion fails, the body may have become eligible: re-check
-    // whether `frame_locals_proxy_snapshot` can take the hint.
+    // If this assertion fails, the body has regressed: check whether a
+    // closure was reintroduced over `locals_cells_stack_w`.
     assert_eq!(
         (by_address, unconsumed),
-        (1, 1),
+        (0, 0),
         "`frame_locals_proxy_snapshot`'s virtualizable-array read changed shape"
     );
 }

@@ -2946,6 +2946,11 @@ impl PyFrame {
     /// 709 hidden slot makes the proxy active; CPython's
     /// `framelocalsproxy_keys/getitem` read only the fast array and
     /// `f_extra_locals` (`Objects/frameobject.c:187-213,370-405`).
+    /// `@jit.unroll_safe` on `PyFrame.fast2locals` cancels `contains_loop` in
+    /// `look_inside_graph`, and the slot loop below needs the same treatment:
+    /// without it the whole function is one residual call, and the `f_locals`
+    /// read behind it forces the virtualizable for the length of that call.
+    #[majit_macros::unroll_safe]
     pub fn frame_locals_proxy_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
         let roots = pyre_object::gc_roots::push_roots();
         let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2962,31 +2967,31 @@ impl PyFrame {
         }
 
         let code = self.code();
-        let mut insert_slot =
-            |index: usize, name: &str, cell_slot: bool| -> Result<(), crate::PyError> {
-                if index >= locals_w!(self).len() {
-                    return Ok(());
-                }
-                let slot = locals_w!(self)[index];
-                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
-                {
-                    unsafe { pyre_object::w_cell_get(slot) }
-                } else {
-                    slot
-                };
-                if value.is_null() {
-                    return Ok(());
-                }
-                // `setitem_str_object` allocates the string key and can move
-                // `value`; keep it in a shadow-stack slot and reload it for
-                // the store.
-                let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = roots.pin_root(value);
-                setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))
-            };
-
+        // A plain loop rather than a closure over `self`: a capture path is
+        // truncated at a raw-pointer deref, so a closure would capture the
+        // `locals_cells_stack_w` field itself and the borrow would read as the
+        // address of the virtualizable array instead of a load from it, which
+        // suppresses the protocol.  `fast2locals` keeps this shape for the same
+        // reason.
         for (index, name, cell_slot) in locals_plus_names(code) {
-            insert_slot(index, name, cell_slot)?;
+            if index >= locals_w!(self).len() {
+                continue;
+            }
+            let slot = locals_w!(self)[index];
+            let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                unsafe { pyre_object::w_cell_get(slot) }
+            } else {
+                slot
+            };
+            if value.is_null() {
+                continue;
+            }
+            // `setitem_str_object` allocates the string key and can move
+            // `value`; keep it in a shadow-stack slot and reload it for
+            // the store.
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(value);
+            setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))?;
         }
         Ok(roots.get(snapshot_slot))
     }
