@@ -1242,6 +1242,12 @@ impl Drop for LiveLastInstrGuard {
         // guard displaced (see [`capture_escape_flush_undo`]), so a later
         // commit withdrawal still restores the resume pc rather than the
         // executing one.
+        // The test is "did an escape happen on THIS frame", not "did a flush
+        // write a resume pc".  Both legs arm the capture and both leave the
+        // frame heap-authoritative at the published executing coordinate, so
+        // narrowing this to the committing leg restores the PRE-call coordinate
+        // on the locals-only escapes — the withdrawn-too-early defect
+        // `getframe_caller_resume_coord_two_call_sites` measures and prints.
         let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
