@@ -49,7 +49,7 @@ struct PyModuleDef {
 };
 
 #define PyModuleDef_HEAD_INIT \
-    { { 1, 0, 0, NULL }, NULL, 0, NULL }
+    { { 1, 0, NULL }, NULL, 0, NULL }
 
 #define PyModule_Create(module) PyModule_Create2((module), PYTHON_API_VERSION)
 
