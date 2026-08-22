@@ -23472,9 +23472,30 @@ fn unicode_decode_error_msg(
 /// `error_len == None` is a truncated multibyte sequence; otherwise a valid
 /// leading byte at `valid_up_to` means the following byte was an invalid
 /// continuation, and every other offending byte is an invalid start.
+///
+/// # Panics
+///
+/// `bytes` must not be valid UTF-8: the error details are read off the
+/// `Utf8Error` a strict decode of it raises, so a valid buffer has none.
 pub(crate) fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
-    let error = std::str::from_utf8(bytes).unwrap_err();
-    let start = error.valid_up_to();
+    utf8_decode_error_from(bytes, 0)
+}
+
+/// The same, resumed at the position a `surrogatepass` validator stopped at.
+///
+/// A strict scan cannot find that position itself: an encoded surrogate is
+/// what stops it, and `surrogatepass` accepts one, so scanning `bytes` from
+/// the front names the surrogate instead of the byte that was actually
+/// rejected.  `pos` comes from `rutf8::wtf8_from_bytes`, and the strict scan
+/// resumed there stops immediately, because everything WTF-8 rejects at a
+/// position UTF-8 rejects there too.
+///
+/// # Panics
+///
+/// `bytes[pos..]` must not be valid UTF-8, for the reason above.
+pub(crate) fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError {
+    let error = std::str::from_utf8(&bytes[pos..]).unwrap_err();
+    let start = pos + error.valid_up_to();
     let reason = match error.error_len() {
         None => "unexpected end of data",
         Some(_)
