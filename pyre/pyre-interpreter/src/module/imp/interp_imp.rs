@@ -117,6 +117,7 @@ static FROZEN_MODULES: &[FrozenModule] = &[
 /// `frozen_code`, so this compatibility view cannot become a second semantic
 /// owner of the modules.
 #[repr(C)]
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 struct FrozenAbiEntry {
     name: *const std::ffi::c_char,
     code: *const u8,
@@ -124,6 +125,7 @@ struct FrozenAbiEntry {
     is_package: i32,
 }
 
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 fn build_frozen_abi_table(entries: &[FrozenModule]) -> usize {
     let mut table = Vec::with_capacity(entries.len() + 1);
     for entry in entries {
@@ -157,6 +159,7 @@ fn build_frozen_abi_table(entries: &[FrozenModule]) -> usize {
 /// table.  The split matches CPython's Bootstrap/Stdlib/Test ABI while the
 /// concatenated order remains exactly `FROZEN_MODULES`, the list returned by
 /// `_imp._frozen_module_names()`.
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_abi_pointer_variable(name: &str) -> Option<usize> {
     static BOOTSTRAP: OnceLock<usize> = OnceLock::new();
     static STDLIB: OnceLock<usize> = OnceLock::new();
@@ -321,6 +324,7 @@ impl ImportRLock {
     /// Registered upstream as the `child` fork hook
     /// (`pypy/module/imp/moduledef.py:45`, driven by
     /// `pypy/module/posix/interp_posix.py:1560`) and never exposed to Python.
+    #[cfg(not(target_arch = "wasm32"))]
     fn reinit_lock(&self) {
         if self.lockcounter.load(Ordering::Relaxed) > 1 {
             // importing.py:216-224 — the old lock object is abandoned rather
@@ -378,6 +382,7 @@ fn release_lock() -> Result<(), crate::PyError> {
 /// `interp_imp.py reinit_lock`.  Deliberately absent from the `_imp`
 /// namespace: `moduledef.py:26` exposes only `lock_held`, `acquire_lock` and
 /// `release_lock`.
+#[cfg(not(target_arch = "wasm32"))]
 fn reinit_lock() {
     getimportlock().reinit_lock();
 }
@@ -386,16 +391,19 @@ fn reinit_lock() {
 /// exact before/parent/child trio with the process fork-hook lists.  Keep the
 /// gateways private to the interpreter: `_imp` exposes only the three public
 /// lock operations above.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn before_fork() {
     acquire_lock();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_parent() -> Result<(), crate::PyError> {
     // moduledef.py registers `interp_imp.release_lock`, whose gateway passes
     // `silent_after_fork=False`; only native importhook cleanup uses `True`.
     getimportlock().release_lock(false)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_child() {
     reinit_lock();
 }

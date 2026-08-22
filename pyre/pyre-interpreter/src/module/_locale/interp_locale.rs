@@ -105,6 +105,7 @@ fn windows_encoding_too_long(locale: &str) -> bool {
     })
 }
 
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn locale_error(message: &str) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("_locale.Error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))

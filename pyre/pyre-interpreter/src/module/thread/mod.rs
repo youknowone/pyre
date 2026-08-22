@@ -151,6 +151,7 @@ pub fn runtime_thread_entered() -> bool {
 /// The calls that arrive here are C runtime calls, so the Windows invalid
 /// parameter handler is silenced for the duration (`crt_call`) and the saved
 /// code is the runtime's `errno` rather than `GetLastError`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
     let _blocked = before_external_block();
     let result = crate::builtins::crt_call!(f());
@@ -565,6 +566,7 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
 }
 
 /// `pypy/module/thread/os_thread.py:reinit_threads`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_child() {
     let ident = current_ident();
     {
@@ -1436,6 +1438,7 @@ mod local_class {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         pub(super) fn after_fork_reinit(&self) {
             let this = self as *const Self as *mut Self;
             unsafe {

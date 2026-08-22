@@ -6966,6 +6966,7 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
 /// The call is made for the caller: it is a C runtime entry point taking
 /// arguments the caller has already checked, and silencing the handler is a
 /// thread-local store the runtime itself offers for the purpose.
+#[cfg(not(target_arch = "wasm32"))]
 macro_rules! crt_call {
     ($call:expr) => {{
         #[cfg(all(windows, feature = "host_env"))]
@@ -6977,6 +6978,7 @@ macro_rules! crt_call {
         ret
     }};
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use crt_call;
 
 /// `lseek`, taking and reporting the whole 64-bit file position.
@@ -16699,6 +16701,7 @@ fn fd_bytes_to_obj(self_obj: PyObjectRef, data: Vec<u8>) -> Result<PyObjectRef, 
     }
 }
 
+#[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn fd_io_err(e: std::io::Error) -> crate::PyError {
     crate::PyError::os_error_with_errno(io_error_posix_errno(&e, 5), e.to_string())
 }

@@ -2042,6 +2042,7 @@ pub(crate) struct StartupPathConfig {
     /// Bootstrap search entries in PyPy's order.  A source checkout keeps
     /// `lib_pypy` before `lib-python/3`; an installed tree has one merged
     /// `lib/pyre3.14t` entry.
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     pub stdlib_paths: Vec<PathBuf>,
     /// The language stdlib root (the entry containing `os.py` / `site.py`).
     /// This is exposed as `sys._stdlib_dir` and is deliberately distinct from
@@ -2570,6 +2571,7 @@ fn compute_startup_path_config_from(
         base_executable,
         prefix,
         base_prefix,
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         stdlib_paths,
         stdlib,
     }
@@ -2600,6 +2602,7 @@ fn compute_startup_path_config() -> StartupPathConfig {
         prefix: PathBuf::from("/bin"),
         base_prefix: PathBuf::from("/bin"),
         executable,
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         stdlib_paths: stdlib.iter().cloned().collect(),
         stdlib,
     }
@@ -2614,6 +2617,7 @@ fn compute_startup_path_config() -> StartupPathConfig {
         base_executable: PathBuf::new(),
         prefix: PathBuf::new(),
         base_prefix: PathBuf::new(),
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         stdlib_paths: Vec::new(),
         stdlib: None,
     }
