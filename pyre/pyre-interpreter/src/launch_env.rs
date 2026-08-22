@@ -168,6 +168,12 @@ fn locale_implies_utf8_mode() -> bool {
 pub struct PreConfigError(pub &'static str);
 
 fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
+    // `preconfig_init_utf8_mode` opens with this, ahead of every other source:
+    // the legacy filesystem codec and UTF-8 mode cannot both be on, and the
+    // codec turns the mode off whether `-X utf8` or `PYTHONUTF8` asked for it.
+    if flags.legacy_windows_fs_encoding {
+        return Ok(0);
+    }
     if let Some(value) = flags.utf8_mode {
         return Ok(value);
     }
@@ -242,6 +248,17 @@ fn fold_presence_flag(flags: &LaunchFlags, set: bool, name: &str) -> bool {
 /// Fold the environment over the options a command line named. An embedding
 /// without a command line passes `LaunchFlags::default()`.
 pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
+    // Read in `preconfig_read`, so it takes the same integer fold as the
+    // other variables there rather than the presence one: `=0` leaves the
+    // filesystem codec on the PEP 529 pair.
+    #[cfg(windows)]
+    {
+        flags.legacy_windows_fs_encoding = fold_int_flag(
+            &flags,
+            flags.legacy_windows_fs_encoding,
+            "PYTHONLEGACYWINDOWSFSENCODING",
+        );
+    }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
     flags.optimize = resolve_optimize(&flags);
     // Which of the two shapes a name takes is per-variable, not a category:
@@ -261,17 +278,6 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         flags.warn_default_encoding,
         "PYTHONWARNDEFAULTENCODING",
     );
-    // Read in `preconfig_read`, so it takes the same integer fold as the
-    // other variables there rather than the presence one: `=0` leaves the
-    // filesystem codec on the PEP 529 pair.
-    #[cfg(windows)]
-    {
-        flags.legacy_windows_fs_encoding = fold_int_flag(
-            &flags,
-            flags.legacy_windows_fs_encoding,
-            "PYTHONLEGACYWINDOWSFSENCODING",
-        );
-    }
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {
