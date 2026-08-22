@@ -23841,16 +23841,25 @@ pub(crate) fn fsdecode_wtf8_total(data: &[u8]) -> Wtf8Buf {
 /// Unicode scalar values via `char::from_u32`, or a WTF-8 `CodePoint` for
 /// the `surrogatepass` path.
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate::PyError> {
-    decode_utf8_with_errors_incremental(data, err_mode, true).map(|(decoded, _)| decoded)
+    decode_utf8_with_errors_incremental(data, err_mode, true, false).map(|(decoded, _)| decoded)
 }
 
 /// PyPy `unicodehelper.str_decode_utf8`: the incremental form additionally
 /// returns the byte position consumed and leaves a valid but incomplete
 /// trailing sequence untouched when `final_` is false.
+///
+/// `allow_surrogates` is the caller's, as it is upstream: `str_decode_utf8`
+/// defaults it to false and only `interp_codecs.utf_8_decode` turns it on.
+/// Deriving it from `err_mode` here instead made both entry points take the
+/// `_codecs` answer, and the two do not agree — with it off, `ED A0` stops as
+/// an invalid continuation byte at 0..1 and `surrogatepass_errors` decodes a
+/// complete surrogate itself; with it on, the same bytes are an incomplete
+/// sequence at 0..2.
 pub(crate) fn decode_utf8_with_errors_incremental(
     data: &[u8],
     err_mode: &str,
     final_: bool,
+    allow_surrogates: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
     // A custom error handler may replace exc.object; decoding then resumes
     // from the new bytes (`s`), re-evaluating `size` each iteration.  The
@@ -23859,11 +23868,6 @@ pub(crate) fn decode_utf8_with_errors_incremental(
     let mut size = s.len();
     let mut result = Wtf8Buf::new();
     let mut pos = 0;
-    // PyPy `interp_codecs.utf_8_decode` passes
-    // `allow_surrogates=True` specifically for `surrogatepass`, so a valid
-    // ED A0..BF 80..BF sequence is decoded directly and an incomplete one is
-    // retained for the next incremental chunk.
-    let allow_surrogates = err_mode == "surrogatepass";
     // Run a utf-8 error handler and rebind `s`/`size` when it returns
     // replacement bytes; then advance `pos` to the resume position.
     macro_rules! run_err {
