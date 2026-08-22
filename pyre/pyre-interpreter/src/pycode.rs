@@ -3230,7 +3230,13 @@ pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> PyObjectRef {
     if obj.is_null() {
         return pyre_object::PY_NULL;
     }
-    unsafe { (*(obj as *const PyCode)).w_globals }
+    // Paired with the publication in `w_code_frame_stores_global`.
+    unsafe {
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
+            (*(obj as *mut PyCode)).w_globals
+        ))
+        .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// PyPy: `PyCode.w_globals = w_globals`.
@@ -3243,7 +3249,10 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
         return;
     }
     unsafe {
-        (*(obj as *mut PyCode)).w_globals = w_globals;
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
+            (*(obj as *mut PyCode)).w_globals
+        ))
+        .store(w_globals, std::sync::atomic::Ordering::Release);
     }
     // A bootstrap code slot is reached only by the prebuilt root walk, which
     // clean minor collections may skip; record the store.
@@ -3264,16 +3273,36 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
-    let code = unsafe { &mut *(obj as *mut PyCode) };
-    if code.w_globals.is_null() {
-        code.w_globals = w_globals;
-        // Prebuilt-family store (see `w_code_set_w_globals`).
-        publish_code_slot_store(obj);
-        register_live_code_wrapper(code.code_ptr, obj);
-        register_w_globals_stamped_code(obj);
-        return false;
+    // `pycode.py frame_stores_global` reads the slot and stores into it under
+    // the GIL, which makes the pair indivisible. Pyre is free-threaded, and a
+    // `false` answer is what makes a frame take its globals from the code
+    // object: two threads first running one code object in different globals
+    // both read the null, and an unsynchronized store would let both answer
+    // `false`, leaving the loser's frame reading the winner's namespace.
+    // Publish by compare-exchange and answer against whichever pointer won.
+    let code = obj as *mut PyCode;
+    let slot = unsafe {
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!((*code).w_globals))
+    };
+    let mut published = slot.load(std::sync::atomic::Ordering::Acquire);
+    if published.is_null() {
+        match slot.compare_exchange(
+            pyre_object::PY_NULL,
+            w_globals,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Prebuilt-family store (see `w_code_set_w_globals`).
+                publish_code_slot_store(obj);
+                register_live_code_wrapper(unsafe { (*code).code_ptr }, obj);
+                register_w_globals_stamped_code(obj);
+                return false;
+            }
+            Err(winner) => published = winner,
+        }
     }
-    !std::ptr::eq(code.w_globals, w_globals)
+    !std::ptr::eq(published, w_globals)
 }
 
 /// The state of a code object's `co_positions` rows once its own `locations`
