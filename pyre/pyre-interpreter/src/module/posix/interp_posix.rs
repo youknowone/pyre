@@ -878,12 +878,15 @@ mod win_nt {
         Ok((path, as_bytes, resolved))
     }
 
+    /// The wide name these helpers read, answered as the caller spelled the
+    /// path it asked about: `PyUnicode_FromWideChar`, and
+    /// `PyUnicode_EncodeFSDefault` over that when the argument was `bytes`.
     fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
         // One decode feeds both arms: the bytes form is the filesystem
         // encoding of the same text, not the UTF-8 of a lossy rendering of it.
         let text = crate::gateway::fsdecode_os_str_wtf8(s);
         if as_bytes {
-            pyre_object::w_bytes_from_bytes(text.as_bytes())
+            pyre_object::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(text.as_bytes()))
         } else {
             pyre_object::w_str_from_wtf8(text)
         }
@@ -924,9 +927,15 @@ mod win_nt {
     /// (`ntpath.py:648-655`). Only the leaf is returned; the caller splits the
     /// parent off itself.
     pub fn _findfirstfile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let (path, as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
+        let (path, _as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
         match host_nt::find_first_file_name(&path) {
-            Ok(name) => Ok(wrap_path(&name, as_bytes)),
+            // The one name here that is answered as `str` whatever the
+            // argument was: `os__findfirstfile_impl` reports `cFileName`
+            // through `PyUnicode_FromWideChar` and asks no codec for a
+            // `bytes` spelling of it.
+            Ok(name) => Ok(pyre_object::w_str_from_wtf8(
+                crate::gateway::fsdecode_os_str_wtf8(&name),
+            )),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
     }
