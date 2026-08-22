@@ -12396,6 +12396,10 @@ mod tests {
         fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
             unimplemented!("FieldLoadTestCpu::get_int_value")
         }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            // FieldLoadTestCpu's slot space is the dense fail-value vector.
+            self.get_int_value(frame, slot)
+        }
         fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
             unimplemented!("FieldLoadTestCpu::get_float_value")
         }
