@@ -4262,7 +4262,8 @@ where
             // `add_gc_byte_array_descr`).  Concrete eval reads byte at
             // `array_addr + index` and zero-extends to i64 (matching
             // CPython `ord()` 0..=255 semantics).
-            jitcode::insns::BC_GETARRAYITEM_GC_I => {
+            jitcode::insns::BC_GETARRAYITEM_GC_I
+            | jitcode::insns::BC_GETARRAYITEM_GC_I_PURE => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
                     let array_reg = frame.next_reg() as usize;
@@ -4281,6 +4282,22 @@ where
                 };
                 let (array_opref, array_addr) = self.read_ref_reg(array_reg);
                 let (index_opref, index_value) = self.read_int_reg(index_reg);
+                // `getarrayitem_gc_i_pure` shares this body: the load, the
+                // heapcache handling and the register write are identical, and
+                // only the recorded opcode differs — the same reason
+                // `blackhole.py` aliases `bhimpl_getarrayitem_gc_i_pure` onto
+                // the plain impl.  The distinction that does matter is which
+                // opcode reaches the optimizer: `GetarrayitemGcPureI` is inside
+                // the always-pure range, so `OpHelpers.is_pure_with_descr`
+                // admits it, while the plain read is admitted by no descr.
+                // The codewriter has already made that choice —
+                // `OpKind::ArrayRead { pure }` picks the spelling from whether
+                // the list is ever mutated (`ll_getitem_foldable_nonneg`).
+                let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_I_PURE {
+                    OpCode::GetarrayitemGcPureI
+                } else {
+                    OpCode::GetarrayitemGcI
+                };
                 let descr_index = descr.index();
                 // pyjitpl.py `_do_getarrayitem_gc_any`: check
                 // `heapcache.getarrayitem(arraybox, indexbox, arraydescr)`
@@ -4323,7 +4340,7 @@ where
                         (4, false) => *(item_addr as *const u32) as i64,
                         (8, _) => *(item_addr as *const i64),
                         other => panic!(
-                            "BC_GETARRAYITEM_GC_I: unsupported (itemsize, signed) = {:?}",
+                            "getarrayitem_gc_i: unsupported (itemsize, signed) = {:?}",
                             other,
                         ),
                     }
@@ -4351,7 +4368,7 @@ where
                         // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
                         // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
                         ctx.profiler().count_ops(
-                            OpCode::GetarrayitemGcI,
+                            opcode,
                             crate::pyjitpl::counters::HEAPCACHED_OPS,
                         );
                         // pyjitpl.py:644-668 sanity check: compare the
@@ -4394,20 +4411,20 @@ where
                             // is `mark_escaped` escaping `array_opref` and
                             // `index_opref` — match that structure here.
                             ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::GetarrayitemGcI,
+                                opcode,
                                 None,
                                 &[array_opref, index_opref],
                             );
                             let _ = ctx.record_op_with_descr(
-                                OpCode::GetarrayitemGcI,
+                                opcode,
                                 &[array_opref, index_opref],
                                 descr,
                             );
                             debug_assert!(
                                 false,
-                                "BC_GETARRAYITEM_GC_I sanity check failed: \
+                                "{:?} sanity check failed: \
                              cached={:?} concrete={}",
-                                expected, concrete,
+                                opcode, expected, concrete,
                             );
                         }
                         let reg_concrete = if stale {
@@ -4418,7 +4435,7 @@ where
                         (cached, reg_concrete)
                     } else {
                         let opref = ctx.record_op_with_descr(
-                            OpCode::GetarrayitemGcI,
+                            opcode,
                             &[array_opref, index_opref],
                             descr,
                         );
