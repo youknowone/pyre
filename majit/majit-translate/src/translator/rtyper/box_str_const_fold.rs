@@ -183,6 +183,33 @@ mod tests {
         assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
     }
 
+    /// The other arm of [`str_literal_bytes`]. A front pass sees the literal
+    /// as an unlowered `__str_const` call, because `fold_str_consts` runs later
+    /// in the codewriter — so this fold must not depend on having run it, which
+    /// the test above cannot show because it runs it first.
+    #[test]
+    fn folds_an_unlowered_str_const_call() {
+        let mut graph = FunctionGraph::new("box_literal_front");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__instancecheck__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal.clone()), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        // Only the box call folds; its producer is left for the codewriter.
+        assert_eq!(
+            graph.block(entry).operations[0].kind,
+            str_const_call("__instancecheck__")
+        );
+        let folded = &graph.block(entry).operations[1];
+        assert_eq!(folded.result.as_ref(), Some(&boxed));
+        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+    }
+
     #[test]
     fn leaves_dynamic_argument_call_unchanged() {
         let mut graph = FunctionGraph::new("box_dynamic");

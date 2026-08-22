@@ -2930,6 +2930,10 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
 /// A value that is neither produced nor an input in the block it is read from
 /// is looked for in the predecessors unrenamed, mirroring the walk above; the
 /// entry block has none, so a parameter is not a literal and stops the proof.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn message_is_str_literal(
     graph: &FunctionGraph,
     block: usize,
@@ -2937,12 +2941,11 @@ fn message_is_str_literal(
     var: &Variable,
 ) -> bool {
     let mut work = vec![(block, before, var.clone())];
-    let mut seen: Vec<(usize, Variable)> = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, Variable)> = std::collections::HashSet::new();
     while let Some((bi, before, value)) = work.pop() {
-        if seen.contains(&(bi, value.clone())) {
+        if !seen.insert((bi, value.clone())) {
             continue;
         }
-        seen.push((bi, value.clone()));
         let block = &graph.blocks[bi];
         if let Some(producer) = block.operations[..before]
             .iter()

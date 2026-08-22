@@ -3908,6 +3908,43 @@ mod tests {
     /// fallback (which SEGVs at trace time); a typo in either the
     /// module-qualified or root alias would silently regress to a
     /// symbolic hash, so pin both spellings against the live fnaddr.
+    /// The lowered raise path spells both of these as string literals in
+    /// another crate (`front::result_exc`, which takes the fused leaf from its
+    /// `FUSED_KIND_CTORS` table), and nothing links the two spellings at build
+    /// time: a typo on either side degrades the residual call to a
+    /// `symbolic_fnaddr_for_path` hash instead of failing to compile.  Pinning
+    /// the registration against the live trampoline catches a drift on this
+    /// side; a drift in the consumer's literal still shows up only as a
+    /// declined descent.
+    #[test]
+    fn jit_trace_fnaddrs_covers_raise_path_exception_materialisation() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let materialise: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_to_exc_object;
+        let materialise = materialise as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_to_exc_object"],
+            materialise
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_to_exc_object"],
+            materialise
+        );
+
+        let fused: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_type_error_to_exc_object;
+        let fused = fused as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_type_error_to_exc_object"],
+            fused
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_type_error_to_exc_object"],
+            fused
+        );
+    }
+
     #[test]
     fn jit_trace_fnaddrs_covers_pop_value_and_exception_tls_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
