@@ -309,10 +309,10 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_tag_small_call(call) {
                     return Some(binding);
                 }
-                // A helper that hands its argument straight back is opened by
-                // the inliner upstream and its residue dropped by
-                // `jtransform.py` `rewrite_op_same_as`; the LLBC tracer sees
-                // the call, so drop it here instead.
+                // A helper that hands its argument straight back is opened
+                // by `inline.auto_inline_graphs` upstream, before the
+                // codewriter ever sees the graph. This front end has no such
+                // stage, so the drop is declared and applied here.
                 if let Some(binding) = self.lower_native_identity_call(call) {
                     return Some(binding);
                 }
@@ -2059,6 +2059,11 @@ impl<'c> Lowerer<'c> {
     ///
     /// The argument is still lowered, so a receiver that mutates state keeps
     /// running; only the wrapper around its result goes away.
+    ///
+    /// This runs ahead of the `calls` policy machinery, so a path in both
+    /// would take this route and leave its policy dead; the config parse
+    /// rejects that pair rather than let it lower
+    /// (`reject_overlapping_call_vocabularies`).
     fn lower_native_identity_call(&mut self, call: &ExprCall) -> Option<Binding> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(&call.func)?;
