@@ -1210,21 +1210,36 @@ impl GcCache {
     /// order (insertion order). Assigns sequential descr_index.
     pub fn setup_descrs(&self) -> Vec<DescrRef> {
         let mut all_descrs: Vec<DescrRef> = Vec::new();
-        // descr.py:27-29: _cache_size
-        for v in self._cache_size.values().chain(&self._external_size_order) {
+        // One object, one dense slot.  Upstream gets that for free: a
+        // `_cache_*` dict holds each descr once and there is no second
+        // sequence to chain.  Pyre's keyed caches are chained WITH the
+        // `_external_*_order` migration Vecs, and a key can be aliased, so the
+        // same Arc can be reached twice — which would take two slots and leave
+        // the object carrying only the last `descr_index`, breaking the
+        // one-object/one-index assumption descriptor encoding and the bridge
+        // tables rely on.  Identity is `Arc::ptr_eq`, matching the
+        // `register_external_*` de-dup rule; structurally equal but distinct
+        // Arcs stay separate, as upstream's post-mint dict identity does.
+        let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
+        let mut push = |all_descrs: &mut Vec<DescrRef>, v: &DescrRef| {
+            if !seen.insert(Arc::as_ptr(v) as *const ()) {
+                return;
+            }
             v.set_descr_index(all_descrs.len() as i32);
             all_descrs.push(v.clone());
+        };
+        // descr.py:27-29: _cache_size
+        for v in self._cache_size.values().chain(&self._external_size_order) {
+            push(&mut all_descrs, v);
         }
         // descr.py:30-33: _cache_field (nested)
         for fields in self._cache_field.values() {
             for v in fields.values() {
-                v.set_descr_index(all_descrs.len() as i32);
-                all_descrs.push(v.clone() as DescrRef);
+                push(&mut all_descrs, &(v.clone() as DescrRef));
             }
         }
         for v in &self._external_field_order {
-            v.set_descr_index(all_descrs.len() as i32);
-            all_descrs.push(v.clone());
+            push(&mut all_descrs, v);
         }
         // descr.py:34-36: _cache_array
         for v in self
@@ -1232,8 +1247,7 @@ impl GcCache {
             .values()
             .chain(&self._external_array_order)
         {
-            v.set_descr_index(all_descrs.len() as i32);
-            all_descrs.push(v.clone());
+            push(&mut all_descrs, v);
         }
         // descr.py:37-39: _cache_arraylen
         for v in self
@@ -1241,13 +1255,11 @@ impl GcCache {
             .values()
             .chain(&self._external_arraylen_order)
         {
-            v.set_descr_index(all_descrs.len() as i32);
-            all_descrs.push(v.clone());
+            push(&mut all_descrs, v);
         }
         // descr.py:40-42: _cache_call
         for v in self._cache_call.values() {
-            v.set_descr_index(all_descrs.len() as i32);
-            all_descrs.push(v.clone());
+            push(&mut all_descrs, v);
         }
         // descr.py:43-45: _cache_interiorfield
         for v in self
@@ -1255,8 +1267,7 @@ impl GcCache {
             .values()
             .chain(&self._external_interiorfield_order)
         {
-            v.set_descr_index(all_descrs.len() as i32);
-            all_descrs.push(v.clone());
+            push(&mut all_descrs, v);
         }
         assert!(
             all_descrs.len() < (1 << 15),
@@ -2658,6 +2669,15 @@ impl GcCache {
                 self._size_keepalive.push(old.clone());
             }
             self._cache_size.insert(key.clone(), descr.clone());
+            // `register_external_size` refuses an Arc the keyed cache already
+            // holds; this is the other direction of the same rule.  A mint site
+            // that published externally first and was later keyed — the exact
+            // migration this surface exists for — would otherwise sit in both,
+            // and `setup_descrs` chains the cache values WITH the order Vec, so
+            // the descr would take two dense slots and keep only the second
+            // `descr_index`.  Dedup is by `Arc::ptr_eq`, as documented above.
+            self._external_size_order
+                .retain(|external| !Arc::ptr_eq(external, &descr));
             if let Some(fields) = self._cache_field.get(&key) {
                 for field in fields.values() {
                     field.set_parent_descr(&descr);
