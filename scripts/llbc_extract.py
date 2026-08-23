@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -2125,7 +2126,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     ]
 
     prepared_std: set[str] = set()
-    host_triple = charon_host_triple(charon_bin, eng.root)
+    charon_host = charon_host_triple(charon_bin, eng.root)
     parallel_layouts = layout_passes_in_parallel()
     if parallel_layouts and any(
         crate_layout_targets(eng, eng.spec(crate))
@@ -2211,7 +2212,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # Dependency crates stay cached (their MIR reaches Charon via rlib
         # metadata), so re-runs remain cheap.
         target_dir, package = cargo_unit_location(path)
-        invalidate_cargo_unit(target_dir, host_triple, package)
+        invalidate_cargo_unit(target_dir, charon_host, package)
 
         host_env = {**env, **host_config_env}
         command = [
@@ -2244,7 +2245,9 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # gets its own target directory: cargo locks each layout's
         # `.cargo-lock`, and both passes would otherwise serialise on the
         # host layout they share for build scripts and proc macros.
-        layout_passes: list[tuple[str, Path, Path, subprocess.Popen | None]] = []
+        layout_passes: list[
+            tuple[str, Path, Path, subprocess.Popen | None, typing.BinaryIO | None]
+        ] = []
         for target in crate_layout_targets(eng, spec):
             if target not in prepared_std:
                 ensure_charon_std(charon_bin, [target], eng.root)
@@ -2278,16 +2281,23 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 # Output is held back and printed only on failure: two
                 # interleaved cargo streams are unreadable, and the host
                 # pass is the one whose progress a reader follows.
+                #
+                # Held in a file, not a pipe. Nothing reads this stream until
+                # the host pass has finished, and a Charon pass writes far
+                # more than a pipe buffer holds, so a pipe stops the child at
+                # the first full buffer -- for exactly the span the two
+                # passes exist to overlap.
+                log = tempfile.TemporaryFile()
                 proc = subprocess.Popen(
                     layout_command,
                     cwd=path,
                     env=layout_env,
-                    stdout=subprocess.PIPE,
+                    stdout=log,
                     stderr=subprocess.STDOUT,
                 )
-                layout_passes.append((target, sidecar, full, proc))
+                layout_passes.append((target, sidecar, full, proc, log))
             else:
-                layout_passes.append((target, sidecar, full, None))
+                layout_passes.append((target, sidecar, full, None, None))
                 # Sequential: the host pass holds the shared layout's lock,
                 # so run this one only after it has finished.
                 if host_pass is not None:
@@ -2300,12 +2310,14 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             host_pass = None
 
         layout_tables: dict[str, set[Path]] = {}
-        for target, sidecar, full, proc in layout_passes:
+        for target, sidecar, full, proc, log in layout_passes:
             if proc is not None:
-                output, _ = proc.communicate()
-                if proc.returncode != 0:
-                    sys.stdout.write(output.decode("utf-8", errors="replace"))
-                    raise subprocess.CalledProcessError(proc.returncode, proc.args)
+                returncode = proc.wait()
+                with log:
+                    if returncode != 0:
+                        log.seek(0)
+                        sys.stdout.write(log.read().decode("utf-8", errors="replace"))
+                        raise subprocess.CalledProcessError(returncode, proc.args)
             if not full.exists() or full.stat().st_size == 0:
                 raise SystemExit(
                     f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
