@@ -624,6 +624,34 @@ static inline int PyArg_ParseTupleAndKeywords(PyObject *args, PyObject *kwargs,
     return parsed;
 }
 
+/* `getargs.c _PyArg_CheckPositional`.  The count a caller is told about is
+   the bound it missed, and the message names the callable without the `()`
+   every other argument error here carries. */
+static inline int _PyArg_CheckPositional(const char *name, Py_ssize_t given,
+                                         Py_ssize_t least, Py_ssize_t most)
+{
+    if (given >= least && given <= most) {
+        return 1;
+    }
+    Py_ssize_t bound = given < least ? least : most;
+    const char *qualifier = least == most ? ""
+                          : (given < least ? "at least " : "at most ");
+    const char *plural = bound == 1 ? "" : "s";
+    char buffer[256];
+    if (name != NULL) {
+        snprintf(buffer, sizeof(buffer),
+                 "%.200s expected %s%zd argument%s, got %zd",
+                 name, qualifier, bound, plural, given);
+    }
+    else {
+        snprintf(buffer, sizeof(buffer),
+                 "unpacked tuple should have %s%zd element%s, but has %zd",
+                 qualifier, bound, plural, given);
+    }
+    PyErr_SetString(PyExc_TypeError, buffer);
+    return 0;
+}
+
 static inline int PyArg_UnpackTuple(PyObject *args, const char *name,
                                     Py_ssize_t least, Py_ssize_t most, ...)
 {
@@ -631,11 +659,7 @@ static inline int PyArg_UnpackTuple(PyObject *args, const char *name,
     if (given < 0) {
         return 0;
     }
-    if (given < least || given > most) {
-        char buffer[128];
-        snprintf(buffer, sizeof(buffer),
-                 "expected %zd-%zd arguments (%zd given)", least, most, given);
-        _PyPyre_ArgError(name, buffer);
+    if (!_PyArg_CheckPositional(name, given, least, most)) {
         return 0;
     }
     va_list va;

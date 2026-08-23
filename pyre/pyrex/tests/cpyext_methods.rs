@@ -115,6 +115,21 @@ assert m.apply(abs, -4) == 4
 assert m.apply(str, 12) == '12'
 rejects(m.apply, abs)
 
+# The count reported is the bound the call missed, and the callable is named
+# without the `()` every other argument error carries.
+def message(call, *args):
+    try:
+        call(*args)
+    except TypeError as error:
+        return str(error)
+    raise AssertionError('%r accepted %r' % (call, args))
+
+assert message(m.apply, abs) == 'apply expected 2 arguments, got 1'
+assert message(m.apply) == 'apply expected 2 arguments, got 0'
+assert message(m.apply, abs, 1, 2) == 'apply expected 2 arguments, got 3'
+assert message(m.at_most_two, 1, 2, 3) == 'at_most_two expected at most 2 arguments, got 3'
+assert message(m.at_most_two) == 'at_most_two expected at least 1 argument, got 0'
+
 # A carrier's block holds the definition, the receiver and the module it was
 # built with, and the module is the same reference that was handed over.
 assert m.carrier_fields(m, 'a-module-name') == (True, True, True, True, True)

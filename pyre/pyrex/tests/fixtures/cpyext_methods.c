@@ -156,6 +156,18 @@ static PyObject *m_carrier_fields(PyObject *self, PyObject *args)
     return result;
 }
 
+/* An unpack whose bounds differ, which reports the bound the call missed. */
+static PyObject *m_at_most_two(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *first = NULL;
+    PyObject *second = NULL;
+    if (!PyArg_UnpackTuple(args, "at_most_two", 1, 2, &first, &second)) {
+        return NULL;
+    }
+    return PyLong_FromSsize_t(second == NULL ? 1 : 2);
+}
+
 /* PyArg_UnpackTuple and the object protocol. */
 static PyObject *m_apply(PyObject *self, PyObject *args)
 {
@@ -1695,6 +1707,7 @@ static PyMethodDef methods[] = {
     {"layout", (PyCFunction)(void (*)(void))m_layout,
      METH_FASTCALL | METH_KEYWORDS, NULL},
     {"apply", (PyCFunction)m_apply, METH_VARARGS, NULL},
+    {"at_most_two", (PyCFunction)m_at_most_two, METH_VARARGS, NULL},
     {"carrier_fields", (PyCFunction)m_carrier_fields, METH_VARARGS, NULL},
     {"inspect", (PyCFunction)m_inspect, METH_VARARGS, NULL},
     {"build", (PyCFunction)m_build, METH_NOARGS, NULL},
