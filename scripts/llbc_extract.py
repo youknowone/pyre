@@ -3232,6 +3232,14 @@ def run_cli(
     # everywhere else, and argparse can refuse it here.
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--fingerprint", action="store_true")
+    parser.add_argument(
+        "--per-crate",
+        action="store_true",
+        help="with --fingerprint: one `<field>[<crate>]=` line per crate and"
+        " field, instead of one digest over all the crates named. One process"
+        " shares the cargo metadata and include walks every crate needs, where"
+        " one process per crate repeats them",
+    )
     modes.add_argument("--list-inputs", action="store_true")
     modes.add_argument(
         "--check",
@@ -3305,10 +3313,18 @@ def run_cli(
         # BOTH fields. Printing only `source=` here previously cost a session:
         # three legs returned identical hashes that were consistent with every
         # hypothesis, because the field under test was not in the output.
-        print(f"source={source_fingerprint(eng, crates, cargo_features)}")
-        print(f"closure={closure_fingerprint(eng, crates, cargo_features)}")
-        print(f"external={external_fingerprint(eng, crates, cargo_features)}")
+        groups = (
+            [(f"[{crate}]", [crate]) for crate in crates]
+            if args.per_crate
+            else [("", crates)]
+        )
+        for suffix, group in groups:
+            print(f"source{suffix}={source_fingerprint(eng, group, cargo_features)}")
+            print(f"closure{suffix}={closure_fingerprint(eng, group, cargo_features)}")
+            print(f"external{suffix}={external_fingerprint(eng, group, cargo_features)}")
         return
+    if args.per_crate:
+        parser.error("--per-crate only applies with --fingerprint")
     if args.self_test:
         # The parser test runs first because it mutates only a temporary file;
         # the live probe below briefly changes the shared working tree.
