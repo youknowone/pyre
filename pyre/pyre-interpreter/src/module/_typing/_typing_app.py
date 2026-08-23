@@ -8,10 +8,10 @@ module-level helpers (_typevar_subst, _paramspec_subst, _generic_class_getitem,
 ...), exactly as the C objects call back into the typing module.
 """
 
-# CPython exposes these runtime classes as members of `typing`, and their
-# repr/pickle/substitution semantics depend on that public owner. Mixed-module
-# applevel code executes in a private globals dict, so declare it explicitly
-# instead of inheriting that dict's default `builtins` module name.
+# `_typing.c` names each of these types `typing.X`, because `typing` is the
+# public owner their repr, their pickle and their substitution semantics all
+# report.  This file backs `_typing`, so the name the install binds is that
+# one; rebind it to the owner the classes below must claim.
 __name__ = "typing"
 
 import sys

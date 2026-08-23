@@ -5,6 +5,9 @@
 # instead exposes countOf as a non-binding interp-level builtin
 # (space.sequence_count), matching _operator.c's C countOf.
 
+# `_operator.c` names the three factory types `operator.X`: they are reached
+# through the pure-Python `operator`, which re-exports this module wholesale.
+# The install binds `_operator` here, so rebind it to that public owner.
 __name__ = 'operator'
 
 

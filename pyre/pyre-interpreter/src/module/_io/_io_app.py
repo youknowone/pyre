@@ -117,6 +117,3 @@ class IncrementalNewlineDecoder:
             ("\r", "\r\n"),
             ("\r", "\n", "\r\n"),
         )[self.seennl]
-
-
-IncrementalNewlineDecoder.__module__ = "_io"

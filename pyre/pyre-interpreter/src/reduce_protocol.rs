@@ -59,6 +59,11 @@ fn handle(which: usize) -> PyObjectRef {
         pyre_object::gc_roots::shadow_stack_get(save_point),
         include_str!("reduce_protocol_app.py"),
         "reduce_protocol_app.py",
+        // `objectobject.py` builds these with a bare `applevel(...)`, so they
+        // take the `ApplevelClass.__init__` default rather than a module's
+        // name.  Nothing binds them into a module, so this reaches app level
+        // only as their `__globals__['__name__']`.
+        "__builtin__",
         &["reduce_1", "reduce_2", "get_slotvalues"],
     );
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);

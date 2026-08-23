@@ -493,6 +493,7 @@ crate::py_module! {
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
+            "_contextvars",
             &["Context"],
             &[("ContextVar", context_var)],
         );

@@ -995,6 +995,7 @@ crate::py_module! {
             ns,
             include_str!("app_abc.py"),
             "app_abc.py",
+            "_abc",
             &["SimpleWeakSet"],
             &[],
         );

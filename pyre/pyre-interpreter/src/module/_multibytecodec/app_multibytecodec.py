@@ -1,10 +1,5 @@
 """PyPy-compatible app-level surface over the cjkcodecs engine."""
 
-# These are the module's own classes, so `__module__` should say so; without
-# it the exec namespace leaves them looking like builtins.  Same reason
-# `app_operator.py` sets it.
-__name__ = "_multibytecodec"
-
 
 # `PyArg_ParseTupleAndKeywords` leaves an argument the caller omitted at the C
 # NULL its variable was initialized to, and `internal_error_callback(NULL)`
