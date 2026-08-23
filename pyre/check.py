@@ -220,11 +220,17 @@ STARTUP_SAMPLES = 5
 # Re-measured no more often than this, and only at a fixture boundary: the
 # pairing argument above requires a fixture's numerator and denominator to be
 # reduced by the SAME estimate, which a refresh between one fixture's backends
-# would break.  A pass costs one empty-program spawn per interpreter per
-# sample, seconds against a job of tens of minutes.  Lengthening it trades that
-# back for an estimate allowed to drift further from what it is subtracted
-# from.
-STARTUP_REFRESH_S = 300
+# would break.
+#
+# Sized against the phase it has to resolve, which is NOT the job's wall time:
+# of a ~50min ubuntu job, the part between the startup line and the last
+# comparison is 592s (macos 402s, windows 661s) -- the rest is cargo.  Over
+# that, 300s bought 1 refresh on ubuntu and macos; 120s buys 4/3/5, and each
+# pass costs one empty-program spawn per interpreter per sample, which the
+# pass's own line reports so this can be re-sized from a measurement rather
+# than an estimate.  Lengthening it trades that resolution back for an estimate
+# allowed to drift further from what it is subtracted from.
+STARTUP_REFRESH_S = 120
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # `exec` is `bench - startup`, and startup is a measured median rather than a
 # constant, so whatever the estimate is off by lands whole in `exec`.  That
@@ -2064,12 +2070,17 @@ class Check:
         return self.args.timeout_scale
 
     def _sample_startups(self):
-        """One sampling pass: {key: [user-CPU seconds]} per timed interpreter.
+        """One sampling pass: ({key: [user-CPU seconds]}, wall seconds spent).
 
         A target whose empty program exits non-zero yields an empty list, which
         `_adopt_startups` reads as "this pass has no estimate for it" rather
         than as zero.
+
+        The wall cost is returned so every pass states its own price in the
+        log: it is what STARTUP_REFRESH_S is traded against, and it is paid per
+        interpreter, so it moves with the backend set and the host.
         """
+        started = time.monotonic()
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False
         ) as handle:
@@ -2096,7 +2107,7 @@ class Check:
                         break
                     got.append(elapsed)
                 samples[key] = got
-            return samples
+            return samples, time.monotonic() - started
         finally:
             try:
                 os.unlink(empty_path)
@@ -2136,11 +2147,12 @@ class Check:
         """
         if self.args.no_startup_subtract:
             return
+        samples, cost = self._sample_startups()
         print(dim(
-            f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}, "
-            f"shown as median[min..max]; ratios/gates are "
+            f"startup (empty-program user-CPU, median {STARTUP_SAMPLES} "
+            f"in {cost:.1f}s, shown as median[min..max]; ratios/gates are "
             f"execution-only): "
-            + self._adopt_startups(self._sample_startups())
+            + self._adopt_startups(samples)
         ))
 
     def maybe_refresh_startups(self):
@@ -2155,9 +2167,10 @@ class Check:
             return
         if time.monotonic() - self.startup_sampled_at < STARTUP_REFRESH_S:
             return
+        samples, cost = self._sample_startups()
         print(dim(
-            "startup re-measured (median[min..max]): "
-            + self._adopt_startups(self._sample_startups())
+            f"startup re-measured in {cost:.1f}s (median[min..max]): "
+            + self._adopt_startups(samples)
         ))
 
     def _exec_time(self, key, t):
@@ -3998,9 +4011,16 @@ def main():
     print(bold("pyre pre-merge check"))
     chk.print_backend_config()
     print()
-    chk.measure_startups()
+    # After the warmup, not before it. The startup pass runs on whatever state
+    # the cargo build left behind -- cold page cache for each binary, and a
+    # machine that has just had every core busy -- while the benches it is
+    # subtracted from run one process at a time on paged-in binaries. The
+    # warmup is the one thing between the two, so it belongs on the build's
+    # side of the measurement.
     if not args.synthetic_only:
         chk.warmup(f"{BENCH_DIR}/int_loop.py")
+    chk.measure_startups()
+    if not args.synthetic_only:
         print()
 
         B = BENCH_DIR
