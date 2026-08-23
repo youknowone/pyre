@@ -323,6 +323,37 @@ def a_shadowed_typeerror_global_is_consulted():
     assert 'weak reference' in message, message
 
 
+def an_empty_cache_still_builds_the_probe():
+    import builtins
+
+    class Fresh(metaclass=ABCMeta):
+        pass
+
+    class Claims:
+        __class__ = 3
+
+    class Missing(Exception):
+        pass
+
+    # Nothing has been recorded, so the collection is empty.  `__contains__`
+    # still evaluates `ref(item)` first, and an item that cannot carry one
+    # raises before `wr in self.data` is ever reached -- so an empty collection
+    # does not decide this case.  With the handler's name rebound, that raise
+    # is what escapes, exactly as it does for a populated collection.
+    assert not _abc._get_dump(Fresh)[1], 'the cache was not empty'
+    original = builtins.TypeError
+    builtins.TypeError = Missing
+    try:
+        isinstance(Claims(), Fresh)
+    except original as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('an empty cache answered before the probe')
+    finally:
+        builtins.TypeError = original
+    assert 'weak reference' in message, message
+
+
 def a_rebound_builtin_typeerror_is_consulted():
     import builtins
 
@@ -373,4 +404,5 @@ if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     a_mutated_ref_global_is_consulted()
     a_shadowed_typeerror_global_is_consulted()
     a_rebound_builtin_typeerror_is_consulted()
+    an_empty_cache_still_builds_the_probe()
 print('OK')

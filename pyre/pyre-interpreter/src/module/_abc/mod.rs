@@ -291,12 +291,6 @@ fn simple_weak_set_contains(
         return Ok(None);
     }
     let data_slot = roots.publish(&[data]);
-    // An empty collection holds no entry to match, and building the probe has
-    // no other effect, so the two answers agree.  `_in_weak_set` takes the same
-    // shortcut on `PySet_GET_SIZE(set) == 0`.
-    if unsafe { pyre_object::w_set_len(roots.get(data_slot)) } == 0 {
-        return Ok(Some(false));
-    }
     // `wr = ref(item)`.  The app-level spelling answers False for an item that
     // cannot carry a weakref and lets every other error out, so match both.
     let probe = match crate::module::_weakref::interp__weakref::descr__new__weakref(
@@ -321,6 +315,15 @@ fn simple_weak_set_contains(
         }
         Err(err) => return Err(err),
     };
+    // An empty collection holds no entry to match, so the membership answer is
+    // `False` once the probe exists.  The order is what `__contains__` spells:
+    // `ref(item)` runs before `wr in self.data` is reached, so an item that
+    // cannot carry one raises whatever `ref` raises whether the collection is
+    // empty or not.  Answering `False` before the probe would decide the case
+    // the arm below hands back.
+    if unsafe { pyre_object::w_set_len(roots.get(data_slot)) } == 0 {
+        return Ok(Some(false));
+    }
     let probe_slot = roots.publish(&[probe]);
     // `wr in self.data`.  The probe carries no callback, and a weakref hashes
     // and compares by its referent, so it finds the callback-carrying entry
