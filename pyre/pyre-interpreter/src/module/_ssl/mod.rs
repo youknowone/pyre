@@ -121,7 +121,7 @@ fn set_library_reason(exception: PyObjectRef, message: &str) {
 fn ssl_error(message: impl Into<String>) -> crate::PyError {
     let message = message.into();
     let mut err = crate::PyError::os_error(message.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("_ssl.SSLError")
+    if let Some(cls) = crate::builtins::lookup_exc_class("ssl.SSLError")
         && let Ok(exc) =
             crate::builtins::exc_exception_new(&[cls, w_int_new(0), w_str_new(&message)])
     {
@@ -165,12 +165,12 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
     let verify_code = (code >= pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE)
         .then_some(code - pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE);
     let class_name = match code {
-        pyre_native::ssl::TLS_ERROR_WANT_READ => "_ssl.SSLWantReadError",
-        pyre_native::ssl::TLS_ERROR_WANT_WRITE => "_ssl.SSLWantWriteError",
-        pyre_native::ssl::TLS_ERROR_ZERO_RETURN => "_ssl.SSLZeroReturnError",
-        pyre_native::ssl::TLS_ERROR_EOF => "_ssl.SSLEOFError",
-        _ if verify_code.is_some() => "_ssl.SSLCertVerificationError",
-        _ => "_ssl.SSLError",
+        pyre_native::ssl::TLS_ERROR_WANT_READ => "ssl.SSLWantReadError",
+        pyre_native::ssl::TLS_ERROR_WANT_WRITE => "ssl.SSLWantWriteError",
+        pyre_native::ssl::TLS_ERROR_ZERO_RETURN => "ssl.SSLZeroReturnError",
+        pyre_native::ssl::TLS_ERROR_EOF => "ssl.SSLEOFError",
+        _ if verify_code.is_some() => "ssl.SSLCertVerificationError",
+        _ => "ssl.SSLError",
     };
     // `ssl_error` would build a complete `_ssl.SSLError` only for the
     // class-specific instance below to replace it, and WANT_READ/WANT_WRITE
@@ -2608,34 +2608,34 @@ crate::py_module! {
         "_SSLSocket" => ssl_socket_methods::type_object(),
         "Certificate" => certificate_methods::type_object(),
         "SSLError" => crate::builtins::make_exc_type(
-            "_ssl.SSLError",
+            "ssl.SSLError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("OSError").expect("OSError installed"),
         ),
         "SSLZeroReturnError" => crate::builtins::make_exc_type(
-            "_ssl.SSLZeroReturnError",
+            "ssl.SSLZeroReturnError",
             crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
+            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         "SSLWantReadError" => crate::builtins::make_exc_type(
-            "_ssl.SSLWantReadError",
+            "ssl.SSLWantReadError",
             crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
+            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         "SSLWantWriteError" => crate::builtins::make_exc_type(
-            "_ssl.SSLWantWriteError",
+            "ssl.SSLWantWriteError",
             crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
+            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         "SSLSyscallError" => crate::builtins::make_exc_type(
-            "_ssl.SSLSyscallError",
+            "ssl.SSLSyscallError",
             crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
+            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         "SSLEOFError" => crate::builtins::make_exc_type(
-            "_ssl.SSLEOFError",
+            "ssl.SSLEOFError",
             crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
+            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         // OpenSSL-shaped compatibility fields are required by `ssl.py` and
         // consumers such as urllib3, while the suffix names the real backend.
@@ -2740,7 +2740,7 @@ crate::py_module! {
         ] {
             crate::module_ns_store(ns, name, crate::gateway::with_module("_ssl", func));
         }
-        let ssl_error = crate::builtins::lookup_exc_class("_ssl.SSLError")
+        let ssl_error = crate::builtins::lookup_exc_class("ssl.SSLError")
             .expect("SSLError installed");
         let ssl_error_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(ssl_error) as PyObjectRef };
@@ -2754,7 +2754,7 @@ crate::py_module! {
         let value_error = crate::builtins::lookup_exc_class("ValueError")
             .expect("ValueError installed");
         let cert_error = crate::builtins::make_exc_type_multi(
-            "_ssl.SSLCertVerificationError",
+            "ssl.SSLCertVerificationError",
             crate::builtins::exc_os_error_new,
             &[ssl_error, value_error],
         );

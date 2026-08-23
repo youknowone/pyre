@@ -943,13 +943,27 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // produced outside the constructor path (`gateway.rs` raise
             // sites that bypass `exc_constructor!`).
             let class_name = if let Some(cls) = crate::typedef::r#type(obj) {
-                pyre_object::w_type_get_name(cls.as_ptr()).to_string()
+                // `w_type_get_name_obj` is the accessor the `__name__` getter
+                // reads, so the two answers cannot drift.  A class registered
+                // as `"termios.error"` is named `error` in the module
+                // `termios` — `new_exception_class` splits the dotted name
+                // before it calls `type` — while `w_type_get_name` keeps the
+                // undivided registration name, which spells the module twice
+                // here.
+                let w_name = unsafe { pyre_object::w_type_get_name_obj(cls.as_ptr()) };
+                pyre_object::w_str_get_wtf8(w_name).to_wtf8_buf()
             } else {
-                pyre_object::interp_exceptions::exc_kind_name(pyre_object::w_exception_get_kind(
-                    obj,
-                ))
-                .to_string()
+                Wtf8Buf::from_string(
+                    pyre_object::interp_exceptions::exc_kind_name(
+                        pyre_object::w_exception_get_kind(obj),
+                    )
+                    .to_string(),
+                )
             };
+            // The name object above is minted on its first read of a class, so
+            // that read is a collection point and the receiver comes back off
+            // the shadow stack.
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
             let mut inner = Wtf8Buf::new();
             if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
@@ -983,7 +997,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 }
             }
             let mut out = Wtf8Buf::new();
-            out.push_str(&class_name);
+            out.push_wtf8(&class_name);
             out.push_str("(");
             out.push_wtf8(&inner);
             out.push_str(")");

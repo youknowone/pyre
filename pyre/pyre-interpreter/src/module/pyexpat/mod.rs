@@ -1617,9 +1617,14 @@ fn maybe_reject_amplification(parser: PyObjectRef, input: &str) -> Result<(), cr
     Ok(())
 }
 
+/// The name `pyexpat.c` registers the module's exception class under.  It is
+/// reached as `pyexpat.error`, `pyexpat.ExpatError` and
+/// `xml.parsers.expat.ExpatError`, and the last is the one it is named for.
+const EXPAT_ERROR_NAME: &str = "xml.parsers.expat.ExpatError";
+
 fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyError {
     let mut err = crate::PyError::value_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("pyexpat.error") {
+    if let Some(cls) = crate::builtins::lookup_exc_class(EXPAT_ERROR_NAME) {
         let args = [cls, w_str_new(&msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
             // The fresh exception is named only by this local while the three
@@ -2116,10 +2121,6 @@ crate::py_module! {
         "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE" => w_int_new(1),
         "XML_PARAM_ENTITY_PARSING_ALWAYS" => w_int_new(2),
     },
-    exceptions: {
-        "error" => crate::builtins::lookup_exc_class("Exception")
-            .expect("Exception must be installed before pyexpat init"),
-    },
     inline_functions: {
         fn ParserCreate(
             #[default(w_none())] encoding: PyObjectRef,
@@ -2136,10 +2137,20 @@ crate::py_module! {
         "ErrorString"  / 1 = error_string,
     },
     extra_init: |ns| {
-        // `ExpatError` is an alias of `error` (pyexpat exposes both).
-        if let Some(err) = crate::module_ns_get(ns, "error") {
-            crate::module_ns_store(ns, "ExpatError", err);
-        }
+        // The class is registered under the name `xml.parsers.expat` publishes
+        // it as, not under this module's own — `pyexpat.c` builds it with
+        // `PyErr_NewException("xml.parsers.expat.ExpatError", NULL, NULL)` — so
+        // it cannot come from the `exceptions:` arm, which qualifies the key
+        // with the module it is declared in.  Both `error` and `ExpatError`
+        // name the one class.
+        let err = crate::builtins::make_exc_type(
+            EXPAT_ERROR_NAME,
+            crate::builtins::exc_exception_new,
+            crate::builtins::lookup_exc_class("Exception")
+                .expect("Exception must be installed before pyexpat init"),
+        );
+        crate::module_ns_store(ns, "error", err);
+        crate::module_ns_store(ns, "ExpatError", err);
 
         // model — content-model integer constants.
         // Each submodule object is a fresh instance named only by its local

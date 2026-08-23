@@ -107,7 +107,7 @@ fn windows_encoding_too_long(locale: &str) -> bool {
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn locale_error(message: &str) -> crate::PyError {
-    let cls = crate::builtins::lookup_exc_class("_locale.Error")
+    let cls = crate::builtins::lookup_exc_class("locale.Error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed");
     let args = vec![cls, pyre_object::w_str_new(message)];
@@ -314,7 +314,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     let exception_base = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _locale init");
     let w_error = crate::builtins::make_exc_type(
-        "_locale.Error",
+        "locale.Error",
         crate::builtins::exc_exception_new,
         exception_base,
     );
