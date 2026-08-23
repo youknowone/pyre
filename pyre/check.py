@@ -917,8 +917,13 @@ def effective_wasm_module():
     set it. A gate that asks about `WASM_MODULE_PATH` under an override checks
     a file the run never opens, and clears the way for the stale module the
     override names.
+
+    Both `pyre_env` and the runner read the key by presence, so an empty value
+    survives into the child and is opened as the empty path; resolving it here
+    by falsiness would vouch for the built module while every invocation failed.
     """
-    return os.environ.get("PYRE_WASM_MODULE") or WASM_MODULE_PATH
+    override = os.environ.get("PYRE_WASM_MODULE")
+    return WASM_MODULE_PATH if override is None else override
 
 
 def same_file(one, other):
