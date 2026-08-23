@@ -13,8 +13,12 @@
 /// registered `termios.error` class (falling back to `OSError` before
 /// the module finishes installing) and stamp it onto the `PyError`.
 #[cfg(all(unix, feature = "host_env"))]
-fn termios_converted_error(errno: i32, message: impl Into<String>) -> crate::PyError {
-    let message = message.into();
+fn termios_converted_error(errno: i32) -> crate::PyError {
+    // `wrap_oserror` spells the message with the platform's `strerror` alone;
+    // `PyErr_SetFromErrno` does the same.  Neither names the syscall that
+    // failed, and neither carries Rust's `(os error N)` tail, which would
+    // repeat the code the first argument already holds.
+    let message = crate::PyError::clean_strerror(errno);
     let cls = crate::builtins::lookup_exc_class("termios.error")
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
         .expect("OSError must be installed");
@@ -64,10 +68,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let t = host_termios::tcgetattr(fd).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcgetattr: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 let ispeed = host_termios::cfgetispeed(&t);
                 let ospeed = host_termios::cfgetospeed(&t);
@@ -137,26 +138,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
             // Start from the current settings so we preserve any platform-private fields.
             let mut t = host_termios::tcgetattr(fd).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("tcsetattr: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             t.c_iflag = iflag;
             t.c_oflag = oflag;
             t.c_cflag = cflag;
             t.c_lflag = lflag;
             host_termios::cfsetispeed(&mut t, ispeed).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("cfsetispeed: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             host_termios::cfsetospeed(&mut t, ospeed).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("cfsetospeed: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
 
             // interp_termios.py:30-33 — c_cc is any iterable; an int element
@@ -193,10 +185,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 t.c_cc[i] = byte;
             }
             host_termios::tcsetattr(fd, when, &t).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("tcsetattr: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             Ok(pyre_object::w_none())
         }),
@@ -217,10 +206,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(duration=int)`.
                 let dur = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcsendbreak(fd, dur).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsendbreak: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -239,10 +225,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 host_termios::tcdrain(fd).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcdrain: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -263,10 +246,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(queue=int)`.
                 let q = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflush(fd, q).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcflush: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -287,10 +267,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(action=int)`.
                 let action = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflow(fd, action).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcflow: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -314,10 +291,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcgetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 // `interp_termios.py:99-101` returns `(ws_row, ws_col)`.
                 Ok(pyre_object::w_tuple_new(vec![
@@ -361,10 +335,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 ws.ws_row = rows as libc::c_ushort;
                 ws.ws_col = cols as libc::c_ushort;
@@ -377,10 +348,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 Ok(pyre_object::w_none())
             },
