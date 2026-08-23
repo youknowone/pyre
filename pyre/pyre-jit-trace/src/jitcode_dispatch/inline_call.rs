@@ -8645,6 +8645,20 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
+/// Drops one host-stack level claimed by [`run_sub_jitcode_walk`].
+///
+/// A plain decrement at the end of that function would leak the level on every
+/// `?` return inside it, and the count would then only ever grow.
+struct SubWalkLevel<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl Drop for SubWalkLevel<'_> {
+    fn drop(&mut self) {
+        self.session.borrow_mut().subwalk_depth -= 1;
+    }
+}
+
 /// Seed a callee jitcode's register banks with positional args and walk
 /// its body, returning the callee's terminal [`DispatchOutcome`]
 /// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
@@ -8676,6 +8690,24 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
+    // Claim a host-stack level before anything is allocated, so a refusal
+    // costs the caller nothing to undo. The guard drops on every exit path,
+    // including the `?` returns below and a panic unwinding through them.
+    let depth = {
+        let mut session = ctx.session.borrow_mut();
+        session.subwalk_depth += 1;
+        session.subwalk_depth
+    };
+    let _level = SubWalkLevel {
+        session: ctx.session,
+    };
+    if depth > fbw_max_subwalk_depth() {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[subwalk-depth] jitcode_pc={pc} depth={depth} declined");
+        }
+        return Err(DispatchError::SubWalkDepthExceeded { pc, depth });
+    }
+
     let (
         mut callee_regs_r,
         mut callee_regs_i,
