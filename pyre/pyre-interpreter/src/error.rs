@@ -1226,10 +1226,37 @@ impl PyError {
                 (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
             }
         }
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            pyre_object::w_int_new(errno as i64),
-            pyre_object::w_str_new(&strerror),
-        ]);
+        // `PyErr_SetExcFromWindowsErrWithFilenameObjects` builds the exception
+        // from `(errno, strerror, filename, winerror, filename2)`, and
+        // `oserror_init` trims that back to the leading pair only once there is
+        // a filename to carry the rest.  A Win32 failure naming no file keeps
+        // all five, which is what lets `.winerror` survive the round trip
+        // through `args` that a pickle or a re-raise makes.
+        //
+        // Each element is pinned as it is built and read back only once the
+        // last one exists: they are young objects held in a Rust local, so
+        // allocating the next one can relocate the ones already in hand.
+        let mut arg_slots = Vec::with_capacity(5);
+        {
+            let mut push = |obj: PyObjectRef| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(obj);
+                arg_slots.push(slot);
+            };
+            push(pyre_object::w_int_new(errno as i64));
+            push(pyre_object::w_str_new(&strerror));
+            if let Some(code) = winerror.filter(|_| filename_slot.is_none()) {
+                push(pyre_object::w_none());
+                push(pyre_object::w_int_new(code as i64));
+                push(pyre_object::w_none());
+            }
+        }
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(
+            arg_slots
+                .iter()
+                .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                .collect(),
+        );
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
             pyre_object::interp_exceptions::w_exception_set_errno(
