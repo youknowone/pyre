@@ -503,7 +503,13 @@ pub fn no_bridge_enabled() -> bool {
 /// than a rebuild per arm.  Consumes fuel only when the rest of `should_bridge`
 /// already held, so the count is bridges actually taken — place it last in the
 /// `&&` chain.  `MAJIT_BRIDGE_FUEL_LOG` reports each one taken.
-fn bridge_fuel_take() -> bool {
+///
+/// Public for the same reason `no_bridge_enabled` is: a frontend with its own
+/// guard-failure entry point spends fuel there too, and a counter that only
+/// half the bridges draw from makes `MAJIT_MAX_BRIDGES=0` disagree with
+/// `MAJIT_NO_BRIDGE=1` — the arm that reads as "no bridges" still compiles
+/// every bridge that entry point reaches.
+pub fn bridge_fuel_take() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let Some(limit) = *LIMIT.get_or_init(|| {
         std::env::var("MAJIT_MAX_BRIDGES")
