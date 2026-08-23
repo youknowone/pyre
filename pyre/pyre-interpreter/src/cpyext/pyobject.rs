@@ -203,6 +203,7 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     super::pyerrors::attach(raw, w_obj);
     super::cdatetime::attach(raw, w_obj);
     super::complexobject::attach(raw, w_obj);
+    super::methodobject::attach(raw, w_obj);
     super::typeobject::descriptor_attach(raw, w_obj);
     raw
 }
@@ -523,6 +524,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::sliceobject::forget_block(raw);
     super::pyerrors::forget_block(raw);
     super::cdatetime::forget_block(raw);
+    super::methodobject::forget_block(raw);
     super::typeobject::forget_descriptor_block(raw);
     unsafe { super::typeobject::forget_type_mirror(raw) };
     super::gc::forget(address);

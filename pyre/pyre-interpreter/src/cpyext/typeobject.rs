@@ -746,6 +746,7 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
         super::pyerrors::basicsize(w_type),
         super::cdatetime::basicsize(w_type),
         super::complexobject::basicsize(w_type),
+        super::methodobject::basicsize(w_type),
         descriptor_basicsize(w_type),
     ]
     .into_iter()

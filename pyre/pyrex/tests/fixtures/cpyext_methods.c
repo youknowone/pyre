@@ -126,6 +126,36 @@ static PyObject *m_layout(PyObject *self, PyObject *const *args,
     return result;
 }
 
+/* The fields a carrier's block holds.  cffi reads `m_ml` and `m_module` off
+   the block rather than through the entry points (`lib_obj.c
+   _cpyextfunc_get`), and the module read is an identity test against the
+   reference it handed `PyCFunction_NewEx`. */
+static PyMethodDef carried_def = {"carried", (PyCFunction)m_bump, METH_NOARGS, NULL};
+
+static PyObject *m_carrier_fields(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *receiver = NULL;
+    PyObject *module = NULL;
+    if (!PyArg_UnpackTuple(args, "carrier_fields", 2, 2, &receiver, &module)) {
+        return NULL;
+    }
+    PyObject *carrier = PyCFunction_NewEx(&carried_def, receiver, module);
+    if (carrier == NULL) {
+        return NULL;
+    }
+    PyCFunctionObject *block = (PyCFunctionObject *)carrier;
+    PyObject *result = Py_BuildValue(
+        "(OOOOO)",
+        PyCFunction_Check(carrier) ? Py_True : Py_False,
+        block->m_ml == &carried_def ? Py_True : Py_False,
+        block->m_self == receiver ? Py_True : Py_False,
+        block->m_module == module ? Py_True : Py_False,
+        PyCFunction_GetFunction(carrier) == carried_def.ml_meth ? Py_True : Py_False);
+    Py_DECREF(carrier);
+    return result;
+}
+
 /* PyArg_UnpackTuple and the object protocol. */
 static PyObject *m_apply(PyObject *self, PyObject *args)
 {
@@ -1665,6 +1695,7 @@ static PyMethodDef methods[] = {
     {"layout", (PyCFunction)(void (*)(void))m_layout,
      METH_FASTCALL | METH_KEYWORDS, NULL},
     {"apply", (PyCFunction)m_apply, METH_VARARGS, NULL},
+    {"carrier_fields", (PyCFunction)m_carrier_fields, METH_VARARGS, NULL},
     {"inspect", (PyCFunction)m_inspect, METH_VARARGS, NULL},
     {"build", (PyCFunction)m_build, METH_NOARGS, NULL},
     {"roundtrip", (PyCFunction)m_roundtrip, METH_VARARGS, NULL},

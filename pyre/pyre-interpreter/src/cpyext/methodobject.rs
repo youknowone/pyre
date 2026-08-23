@@ -635,6 +635,144 @@ pub fn new_pycfunction_in_class(
     Ok(pyre_object::gc_roots::shadow_stack_get(carrier_slot))
 }
 
+/// C-visible `PyCFunctionObject`, the twin of the struct in
+/// `include/pyre3.14t/methodobject.h`.
+///
+/// cffi reads `m_ml` and `m_module` off the block rather than through an entry
+/// point (`lib_obj.c _cpyextfunc_get`), and the module read is an identity
+/// test against the reference the caller passed to `PyCFunction_NewEx`.
+#[repr(C)]
+pub struct CPyCFunctionObject {
+    pub ob_base: CPyObject,
+    pub m_ml: *mut CPyMethodDef,
+    pub m_self: *mut CPyObject,
+    pub m_module: *mut CPyObject,
+    pub m_weakreflist: *mut CPyObject,
+    pub vectorcall: *mut c_void,
+}
+
+/// C-visible `PyCMethodObject` — a `METH_METHOD` carrier, which holds the
+/// defining class past everything the function carrier holds.
+#[repr(C)]
+pub struct CPyCMethodObject {
+    pub func: CPyCFunctionObject,
+    pub mm_class: *mut super::typeobject::CPyTypeObject,
+}
+
+/// The layouts are written out twice -- here and in the header -- so a field
+/// added to one without the other stops compiling rather than writing
+/// somewhere unclaimed.
+const _: () = {
+    assert!(std::mem::offset_of!(CPyCFunctionObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_ml) == 24);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_self) == 32);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_module) == 40);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_weakreflist) == 48);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, vectorcall) == 56);
+    assert!(std::mem::offset_of!(CPyCMethodObject, mm_class) == 64);
+};
+
+/// A carrier type that has been built, and null before it has.
+///
+/// [`pycfunction_type`] mints its type on first call, and this runs from
+/// inside the mint of some other type's mirror; a type that does not exist yet
+/// has no instances, so the answer for one is the same either way.
+fn built_carrier_type(cell: &OnceLock<usize>) -> PyObjectRef {
+    cell.get().copied().unwrap_or(0) as PyObjectRef
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries --
+/// `methodobject.py basestruct=PyCFunctionObject.TO` for a function carrier
+/// and `PyCMethodObject.TO` for a `METH_METHOD` one, and 0 for every other
+/// type, which asks for the plain header.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    if w_type.is_null() {
+        return 0;
+    }
+    let derived_from = |carrier: PyObjectRef| {
+        !carrier.is_null() && unsafe { crate::baseobjspace::issubtype_w(w_type, carrier) }
+    };
+    if derived_from(built_carrier_type(&PYCMETHOD_TYPE_OBJ)) {
+        return size_of::<CPyCMethodObject>() as isize;
+    }
+    match derived_from(built_carrier_type(&PYCFUNCTION_TYPE_OBJ)) {
+        true => size_of::<CPyCFunctionObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill a freshly allocated mirror -- `methodobject.py cfunction_attach`, and
+/// `cmethod_attach` for the one field past it.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    if w_obj.is_null() || !is_carrier(w_obj) {
+        return;
+    }
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null() || unsafe { (*tp).tp_basicsize } < size_of::<CPyCFunctionObject>() as isize {
+        return;
+    }
+    // Every value is read out of the namespace before the first `make_ref`,
+    // which allocates and may move the rest.
+    let ml = method_def(w_obj).unwrap_or(std::ptr::null_mut());
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_get(w_obj, SELF_KEY).unwrap_or_else(pyre_object::w_none));
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_get(w_obj, MODULE_KEY).unwrap_or_else(pyre_object::w_none));
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_class(w_obj).unwrap_or(pyre_object::PY_NULL));
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    let m_self = pyobject::make_ref(reload(self_slot));
+    let m_module = pyobject::make_ref(reload(module_slot));
+    let block = raw as *mut CPyCFunctionObject;
+    unsafe {
+        (*block).m_ml = ml;
+        (*block).m_self = m_self;
+        (*block).m_module = m_module;
+    }
+    if unsafe { (*tp).tp_basicsize } < size_of::<CPyCMethodObject>() as isize {
+        return;
+    }
+    let mm_class = pyobject::make_ref(reload(class_slot)) as *mut super::typeobject::CPyTypeObject;
+    unsafe { (*(raw as *mut CPyCMethodObject)).mm_class = mm_class };
+}
+
+/// Release the references a carrier mirror owns -- `methodobject.py
+/// cfunction_dealloc` and `cmethod_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    if raw.is_null() {
+        return;
+    }
+    let tp = unsafe { (*raw).ob_type } as usize;
+    // `as_pyobj` rather than a realizing read: this runs while a mirror is
+    // being deallocated, where nothing may build an interpreter object.  The
+    // type decides it rather than the size, as it does for a slice mirror: a
+    // C-defined type whose own storage reaches this far fills and frees these
+    // words itself.
+    let carrier = |cell| pyobject::as_pyobj(built_carrier_type(cell)) as usize;
+    let function = carrier(&PYCFUNCTION_TYPE_OBJ);
+    let method = carrier(&PYCMETHOD_TYPE_OBJ);
+    if tp == 0 || (tp != function && tp != method) {
+        return;
+    }
+    let block = raw as *mut CPyCFunctionObject;
+    unsafe {
+        pyobject::decref((*block).m_self);
+        pyobject::decref((*block).m_module);
+        (*block).m_self = std::ptr::null_mut();
+        (*block).m_module = std::ptr::null_mut();
+        (*block).m_ml = std::ptr::null_mut();
+    }
+    if tp != method {
+        return;
+    }
+    let block = raw as *mut CPyCMethodObject;
+    unsafe {
+        pyobject::decref((*block).mm_class as *mut CPyObject);
+        (*block).mm_class = std::ptr::null_mut();
+    }
+}
+
 fn method_def(carrier: PyObjectRef) -> Option<*mut CPyMethodDef> {
     let ml = carrier_get(carrier, ML_KEY)?;
     if !unsafe { pyre_object::is_int(ml) } {

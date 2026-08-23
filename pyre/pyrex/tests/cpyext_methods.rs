@@ -115,6 +115,10 @@ assert m.apply(abs, -4) == 4
 assert m.apply(str, 12) == '12'
 rejects(m.apply, abs)
 
+# A carrier's block holds the definition, the receiver and the module it was
+# built with, and the module is the same reference that was handed over.
+assert m.carrier_fields(m, 'a-module-name') == (True, True, True, True, True)
+
 present, text, shown, size, truth = m.inspect([1, 2], 'append')
 assert (present, text, shown, size, truth) == (1, '[1, 2]', '[1, 2]', 2, 1)
 present, text, shown, size, truth = m.inspect(7, 'append')
