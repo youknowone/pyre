@@ -1799,7 +1799,18 @@ pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
     FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&callee_code_key))
 }
 
-fn fbw_deny_hazardous_inline(callee_code_key: usize) {
+/// Refuse to INLINE one callee for the rest of this thread's tracing, and
+/// nothing else: the set this writes is read at the CALL
+/// ([`fbw_hazardous_inline_denied`]), so the callee keeps its own portal and
+/// stays free to compile a function-entry trace of its own.
+///
+/// That separation is what the caller has to choose between.  The warm state's
+/// `disable_noninlinable_function` sets `JC_DONT_TRACE_HERE` on the callee's
+/// green key at pc 0, which is the callee's ENTRY key, so it suppresses that
+/// entry trace as well.  Measured on `locals_in_inlined_callee`, where the four
+/// loops that compile ARE the callees' entry traces: taking the warm-state half
+/// as well reads `loops_compiled=2`, against 4 without any deny.
+pub(crate) fn fbw_deny_inline_callee_here(callee_code_key: usize) {
     FBW_HAZARDOUS_INLINE_DENY.with(|c| {
         c.borrow_mut().insert(callee_code_key);
     });
@@ -1976,22 +1987,22 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
     callee_code_key: Option<usize>,
 ) -> DispatchError {
     if let Some(callee_code_key) = callee_code_key {
-        fbw_deny_hazardous_inline(callee_code_key);
-        // The walk's own profiling green, not the ambient one: `make_green_key`
-        // builds the `u64` key at a site that holds no frame, and a walk-internal
-        // caller names it from `WalkSession`, seeded once per walk from the
-        // concrete frame.  Read before `try_driver_pair` so the session borrow
-        // is released across the driver call.
-        let is_being_profiled = ctx.session.borrow().is_being_profiled;
-        // `fbw_deny_hazardous_inline` writes a thread-local set that only
-        // this walker reads, so the deny stayed invisible to the warm
-        // state: `dont_trace_here` counted zero on every fixture that
-        // reaches here.  The upstream answer cited above is
+        fbw_deny_inline_callee_here(callee_code_key);
+        // The set above is read only by this walker, so the deny stayed
+        // invisible to the warm state: `dont_trace_here` counted zero on every
+        // fixture that reaches here.  The upstream answer cited above is
         // `disable_noninlinable_function(greenkey_of_huge_function)`
         // (`pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`), which sets `JC_DONT_TRACE_HERE` on the
         // callee's cell (`warmstate.py` `WarmEnterState.disable_noninlinable_function`).  The recursion-bound deny
         // in `inline_call.rs` already calls it for the callee it names;
         // this one names a callee the same way and had no reason not to.
+        //
+        // The key names the walk's own profiling green, not the ambient one:
+        // `make_green_key` builds the `u64` form at a site that holds no frame,
+        // so a walk-internal caller reads it from `WalkSession`, seeded once
+        // per walk from the concrete frame.  Taken before `try_driver_pair` so
+        // the session borrow is released across the driver call.
+        let is_being_profiled = ctx.session.borrow().is_being_profiled;
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
                 .meta_interp_mut()
