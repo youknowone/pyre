@@ -3280,7 +3280,16 @@ fn try_adopt_multi_frame_blackhole(
     // full-coverage dispatch table, not the inline-call-only builder.
     let (mut mf_builder, _unwired) =
         crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
-    mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
+    // `pyre_production_cpu` is gated on a native backend, and this crate no
+    // longer receives one implicitly: the workspace entry turns
+    // `pyre-jit-trace`'s defaults off, so a build that names no backend --
+    // wasm32, where `majit-backend-wasm` is chosen by target_arch -- reaches
+    // here with neither feature. Same gate `build_inline_call_only_bh_builder`
+    // puts on its own `builder.cpu` assignment.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    {
+        mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
+    }
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
         terminal: mf_terminal,
