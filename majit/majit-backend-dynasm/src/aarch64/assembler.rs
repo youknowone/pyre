@@ -1924,12 +1924,14 @@ impl<'a> AssemblerARM64<'a> {
             input_slot_depth.max(JITFRAME_FIXED_SIZE + ra.get_final_frame_depth());
         self.frame_depth = self.frame_depth.max(frame_slot_depth);
 
-        // Sync regalloc frame positions to opref_to_slot for the emitters that
-        // still read resolve_opref instead of arglocs: emit_call,
-        // genop_discard_setfield, genop_cond_call_value, genop_alloc_varsize
-        // and genop_discard_zero_array reach it through load_arg_to_rax /
-        // load_arg_to_rcx. When regalloc spills a value to a frame slot, that
-        // slot's position must be visible to resolve_opref.
+        // Sync regalloc frame positions to opref_to_slot, the map `resolve_opref`
+        // reads. No live emitter reaches it any more: every remaining consumer
+        // (`load_arg_to_rax` / `load_arg_to_rcx` / `resolve_const_or` and the
+        // genops that call them) is `#[allow(dead_code)]`, kept for the upstream
+        // method boundary. The map cannot express what the regalloc actually
+        // decides — `before_call` leaves a value bound to a callee-saved member
+        // of the allocation pool in its register, with no frame slot at all — so
+        // an emitter that needs an operand location must take it from `arglocs`.
         // opref_to_slot stores ABSOLUTE jitframe slots (user position +
         // JITFRAME_FIXED_SIZE) so slot_offset(slot) gives the correct byte
         // offset without further adjustment.
@@ -2654,13 +2656,31 @@ impl<'a> AssemblerARM64<'a> {
             }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
-                    let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
-                    let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
-                    self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
-                } else {
-                    self.genop_discard_setfield(op);
-                }
+                // `rewrite.rs transform_to_gc_load` lowers both opcodes to
+                // GC_STORE / GC_STORE_INDEXED through `emit_gc_store_or_indexed`
+                // before the regalloc ever sees them, and `consider_setfield_j2`
+                // force-allocates a register for every non-constant base, so the
+                // only shape that could reach the else arm is a constant base on
+                // an op the rewriter did not consume.  Emitting it from
+                // `resolve_opref` would read whichever slot the lifetime's
+                // end-of-allocation `current_frame_loc` happens to name and
+                // clobber x0/x1 behind the regalloc's back; decline instead.
+                let [base_loc, val_loc] = arglocs else {
+                    panic!(
+                        "{:?} expects two regalloc locations, got {arglocs:?}",
+                        op.opcode,
+                    );
+                };
+                let Loc::Reg(base) = base_loc else {
+                    panic!(
+                        "{:?} reached the backend with a non-register base {base_loc:?} \
+                         — `rewrite.rs transform_to_gc_load` must have consumed it",
+                        op.opcode,
+                    );
+                };
+                let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
+                self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
             }
             // ── aarch64/opassembler.py _emit_op_gc_load ──
             // arglocs = [base_loc, ofs_loc, res_loc, imm(nsize)]
@@ -3127,9 +3147,9 @@ impl<'a> AssemblerARM64<'a> {
             // ── Allocation (raw, when GC rewriter is not active) ──
             OpCode::New => self.genop_new(op),
             OpCode::NewWithVtable => self.genop_new_with_vtable(op),
-            OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op),
-            OpCode::Newstr => self.genop_newstr(op),
-            OpCode::Newunicode => self.genop_newunicode(op),
+            OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op, arglocs),
+            OpCode::Newstr => self.genop_newstr(op, arglocs),
+            OpCode::Newunicode => self.genop_newunicode(op, arglocs),
             // ── Allocation (rewritten by GC rewriter) ──
             // aarch64/regalloc.py:958 + assembler.py:682 malloc_cond parity
             OpCode::CallMallocNursery => {
@@ -5223,43 +5243,6 @@ impl<'a> AssemblerARM64<'a> {
     // x86/assembler.py:1747 genop_getfield_gc etc.
     // ----------------------------------------------------------------
 
-    /// Extract the byte offset from an op's FieldDescr.
-    /// Returns 0 if no field descriptor is present.
-    fn field_offset_from_descr(op: &Op) -> i32 {
-        op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0)
-    }
-
-    /// Extract the field size from an op's FieldDescr.
-    /// Returns 8 (WORD) if no field descriptor is present.
-    fn field_size_from_descr(op: &Op) -> usize {
-        op.with_field_descr(|fd| fd.field_size()).unwrap_or(8)
-    }
-
-    /// SETFIELD_GC: [arg0 + offset] = arg1
-    fn genop_discard_setfield(&mut self, op: &Op) {
-        let offset = Self::field_offset_from_descr(op);
-        let size = Self::field_size_from_descr(op);
-
-        // Load object pointer into rax/x0 and value into rcx/x1.
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-
-        match size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; strb w1, [x0, offset as u32]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; strh w1, [x0, offset as u32]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; str w1, [x0, offset as u32]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; str x1, [x0, offset as u32]
-            ),
-        }
-    }
-
     // ----------------------------------------------------------------
     // genop_* — calls
     // x86/assembler.py _genop_call
@@ -5270,42 +5253,6 @@ impl<'a> AssemblerARM64<'a> {
             Some(Loc::Immed(i)) => i.value,
             _ => 0,
         }
-    }
-
-    /// Emit a function call. `func_arg` is the index of the function
-    /// pointer arg; call arguments start at `func_arg + 1`.
-    fn emit_call(&mut self, op: &Op, func_arg: usize) {
-        let arg_count = op.num_args();
-
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-
-        for i in (func_arg + 1)..arg_count.min(func_arg + 7) {
-            let arg = op.arg(i).to_opref();
-            let abi_idx = i - func_arg - 1;
-            match self.resolve_opref(arg) {
-                ResolvedArg::Slot(offset) => {
-                    let reg = abi_idx as u8;
-                    self.emit_ldr_fp(reg, offset);
-                }
-                ResolvedArg::Const(val) => {
-                    let reg = abi_idx as u32;
-                    self.emit_mov_imm64(reg, val);
-                }
-            }
-        }
-
-        match self.resolve_opref(op.arg(func_arg).to_opref()) {
-            ResolvedArg::Slot(offset) => {
-                self.emit_ldr_fp(8, offset);
-                dynasm!(self.mc ; .arch aarch64 ; blr x8);
-            }
-            ResolvedArg::Const(val) => {
-                self.emit_mov_imm64(8, val);
-                dynasm!(self.mc ; .arch aarch64 ; blr x8);
-            }
-        }
-
-        dynasm!(self.mc ; .arch aarch64 ; ldp x29, x30, [sp], #16);
     }
 
     /// aarch64/opassembler.py _emit_call + aarch64/callbuilder.py:21-67
@@ -5393,7 +5340,10 @@ impl<'a> AssemblerARM64<'a> {
                 Loc::Immed(im) => {
                     immed_args.push((abi_idx, im.value, im.is_float));
                 }
-                _ => {}
+                // See the x86 twin: Reg/Frame/Immed is the whole range the
+                // regalloc produces, and silently skipping anything else
+                // passes a stale register as that argument.
+                other => panic!("call argument {abi_idx} has unsupported location {other:?}"),
             }
         }
 
@@ -5449,11 +5399,15 @@ impl<'a> AssemblerARM64<'a> {
         if fnloc_in_ip1 {
             dynasm!(self.mc ; .arch aarch64 ; blr x17);
         } else {
-            if let Some(Loc::Immed(i)) = fnloc {
-                let val = i.value;
-                self.emit_mov_imm64(8, val);
-                dynasm!(self.mc ; .arch aarch64 ; blr x8);
-            }
+            // Unlike x86, which always ends in `call rax`, this arm is the
+            // only place a `blr` is emitted — an unhandled fnloc spelling
+            // would emit no call at all and fall through with a stale x0.
+            let Some(Loc::Immed(i)) = fnloc else {
+                panic!("unsupported AArch64 call target {fnloc:?}");
+            };
+            let val = i.value;
+            self.emit_mov_imm64(8, val);
+            dynasm!(self.mc ; .arch aarch64 ; blr x8);
         }
 
         if stack_bytes != 0 {
@@ -5493,11 +5447,6 @@ impl<'a> AssemblerARM64<'a> {
             }
             _ => {}
         }
-    }
-
-    /// assembler.py _genop_call — internal call implementation.
-    fn _genop_call(&mut self, op: &Op) {
-        self.emit_call(op, 0);
     }
 
     fn _genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
@@ -6381,11 +6330,11 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate an array.
-    fn genop_new_array(&mut self, op: &Op) {
+    fn genop_new_array(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size) = op
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
-        self.genop_alloc_varsize(op, base_size, item_size);
+        self.genop_alloc_varsize(op, arglocs, base_size, item_size);
     }
 
     // ----------------------------------------------------------------
@@ -6652,17 +6601,21 @@ impl<'a> AssemblerARM64<'a> {
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
     ///
-    /// The predicate comes from its regalloc location, not `resolve_opref`,
-    /// which only recognises constants and frame slots — a predicate left
-    /// register-resident has no slot mapping.  It is loaded into x0 rather
-    /// than the ip0 scratch because on the not-taken path the predicate IS the
-    /// result, and `store_rax_to_result` reads it from there.
+    /// Every operand comes from its regalloc location, not `resolve_opref`,
+    /// which only recognises constants and frame slots.  `before_call` spills
+    /// only `CALLER_RESP` (x0..x13), so a value bound to x19/x20 stays
+    /// register-resident across it and has no slot mapping at all.
+    ///
+    /// The predicate is loaded into x0 rather than the ip0 scratch because on
+    /// the not-taken path the predicate IS the result, and
+    /// `store_rax_to_result` reads it from there.  x0 is caller-saved, so
+    /// `before_call` guarantees it is not itself one of the arglocs.
     fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
         self.emit_load_to_rax(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
-        self.emit_call(op, 1);
+        self.emit_call_from_arglocs(arglocs, 1);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 
@@ -6680,16 +6633,16 @@ impl<'a> AssemblerARM64<'a> {
     /// (`builtin_string_array_descr` in `runner.rs`), which encodes
     /// `get_array_token(rstr.STR, ...)` — basesize includes the +1
     /// extra_item_after_alloc null terminator.
-    fn genop_newstr(&mut self, op: &Op) {
+    fn genop_newstr(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 1);
-        self.genop_alloc_lowlevel_string(op, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
     /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
-    fn genop_newunicode(&mut self, op: &Op) {
+    fn genop_newunicode(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 4);
-        self.genop_alloc_lowlevel_string(op, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
     }
 
     /// Read `(base_size, item_size)` from the injected ArrayDescr.
@@ -6709,11 +6662,20 @@ impl<'a> AssemblerARM64<'a> {
     fn genop_alloc_lowlevel_string(
         &mut self,
         op: &Op,
+        arglocs: &[Loc],
         type_id: i64,
         base_size: i64,
         item_size: i64,
     ) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
+        // The length comes from its regalloc location, for the reason
+        // `genop_alloc_varsize` states below: `consider_raw_call_like` plans
+        // these opcodes, and `before_call` leaves a value bound to a
+        // callee-saved member of the allocation pool in its register, where
+        // `resolve_opref` cannot see it.
+        let [len_loc, ..] = arglocs else {
+            panic!("lowlevel string allocation expects a length location, got {arglocs:?}");
+        };
+        self.emit_load_to_rax(*len_loc);
         dynasm!(self.mc ; .arch aarch64 ; mov x3, x0);
         self.emit_mov_imm64(0, type_id);
         self.emit_mov_imm64(1, base_size);
@@ -6732,12 +6694,19 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Shared implementation for NEWSTR / NEWUNICODE / NEW_ARRAY.
+    /// Shared implementation for NEW_ARRAY.
     /// Allocates base_size + length * item_size bytes, zero-fills,
     /// and writes length to the header.
-    fn genop_alloc_varsize(&mut self, op: &Op, base_size: i64, item_size: i64) {
-        // arg(0) = length
-        self.load_arg_to_rax(op.arg(0).to_opref());
+    fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
+        // The length comes from its regalloc location.  `consider_raw_call_like_j2`
+        // plans these opcodes, and `before_call` leaves a value bound to a
+        // callee-saved member of the allocation pool in its register, where
+        // `resolve_opref` cannot see it.  The load is consumed by the very next
+        // instruction, so rax/x0 doubling as ABI arg0 is safe here.
+        let [len_loc, ..] = arglocs else {
+            panic!("varsize allocation expects a length location, got {arglocs:?}");
+        };
+        self.emit_load_to_rax(*len_loc);
         let malloc_ptr = libc::malloc as *const () as i64;
         let memset_ptr = libc::memset as *const () as i64;
 
@@ -6779,7 +6748,14 @@ impl<'a> AssemblerARM64<'a> {
     /// ZERO_ARRAY: zero a range in an array.
     /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
     fn genop_discard_zero_array(&mut self, op: &Op, arglocs: &[Loc]) {
-        let [base_loc, start_loc, size_loc, ..] = arglocs else {
+        let [
+            base_loc,
+            start_loc,
+            size_loc,
+            scale_start_loc,
+            scale_size_loc,
+        ] = arglocs
+        else {
             panic!("ZERO_ARRAY expects five regalloc locations, got {arglocs:?}");
         };
         if matches!(size_loc, Loc::Immed(i) if i.value == 0) {
@@ -6789,8 +6765,20 @@ impl<'a> AssemblerARM64<'a> {
             .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
-        let scale_start = self.resolve_const_or(op.arg(3).to_opref(), 1);
-        let scale_size = self.resolve_const_or(op.arg(4).to_opref(), 1);
+        // The scale operands are the `st.const_int(scale)` pair that
+        // `rewrite.rs` emits for every ZERO_ARRAY, so `make_sure_var_in_reg`
+        // hands them back as bare immediates (`return_constant` with no
+        // selected_reg).  Read them from there rather than re-resolving the
+        // op: a non-constant scale is an invariant break the emitter cannot
+        // encode, and failing loud declines the trace instead of silently
+        // scaling by one.
+        let Loc::Immed(scale_start) = scale_start_loc else {
+            panic!("ZERO_ARRAY scale_start must be an immediate, got {scale_start_loc:?}");
+        };
+        let Loc::Immed(scale_size) = scale_size_loc else {
+            panic!("ZERO_ARRAY scale_size must be an immediate, got {scale_size_loc:?}");
+        };
+        let (scale_start, scale_size) = (scale_start.value, scale_size.value);
 
         // aarch64/opassembler.py:755-839: first compute the byte destination
         // in ip0/x16.  ip0/ip1 are never managed by regalloc.
