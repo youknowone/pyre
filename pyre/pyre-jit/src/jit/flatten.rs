@@ -4531,14 +4531,28 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    lower_frame_only_ref_hlop_to_insn(
-        op,
-        "load_import_locals",
+    if op.opname != "load_import_locals" || op.args.len() != 1 {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    // Analyzed with concrete-empty effect sets, exactly as the sibling
+    // `load_import` lookup is: peeking the debug slot neither runs Python nor
+    // writes the GC heap. Routing this through the generic frame-only helper
+    // instead would take the Plain "no graph was analyzed" path and become
+    // RANDOM_EFFECTS / CALL_MAY_FORCE -- forcing the frame twice per
+    // IMPORT_NAME, against the zero-forcing trace the other half preserves.
+    let mut effect_info = majit_ir::EffectInfo::default();
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadImportLocals;
+    Some(build_residual_call_r_r_insn_with_effect_info(
         ctx.load_import_locals_fn_idx,
-        majit_ir::PyreHelperKind::LoadImportLocals,
-        get_register,
-        lower_constant,
-    )
+        vec![frame_operand],
+        effect_info,
+        dst_reg,
+    ))
 }
 
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
@@ -13613,6 +13627,14 @@ mod tests {
                             assert_eq!(
                                 stub.effect_info.pyre_helper,
                                 majit_ir::PyreHelperKind::LoadImportLocals
+                            );
+                            assert_eq!(
+                                stub.effect_info.extraeffect,
+                                majit_ir::ExtraEffect::CanRaise
+                            );
+                            assert_eq!(
+                                dispatch_kind_for_effect_info(&stub.effect_info),
+                                CallFlavor::Plain
                             );
                             assert!(!stub.effect_info.has_random_effects());
                         }
