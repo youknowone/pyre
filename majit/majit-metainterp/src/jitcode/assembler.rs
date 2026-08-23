@@ -846,6 +846,18 @@ impl JitCodeBuilder {
     /// resolves the `d` argcode to a FieldDescr carrying the byte
     /// offset; the flag/sign follow the field kind.
     fn add_scalar_field_descr(&mut self, offset: usize, field_type: majit_ir::value::Type) -> u16 {
+        self.add_scalar_field_descr_with_immutability(offset, field_type, false)
+    }
+
+    /// [`Self::add_scalar_field_descr`] for a field the codewriter declared in
+    /// `_immutable_fields_`, so `SimpleFieldDescr::is_always_pure` answers
+    /// true and the read is foldable.
+    fn add_scalar_field_descr_with_immutability(
+        &mut self,
+        offset: usize,
+        field_type: majit_ir::value::Type,
+        is_immutable: bool,
+    ) -> u16 {
         let (field_flag, is_field_signed) = match field_type {
             majit_ir::value::Type::Ref => (majit_ir::descr::ArrayFlag::Pointer, false),
             majit_ir::value::Type::Float => (majit_ir::descr::ArrayFlag::Float, false),
@@ -857,7 +869,7 @@ impl JitCodeBuilder {
             field_type,
             field_flag,
             is_field_signed,
-            is_immutable: false,
+            is_immutable,
             is_quasi_immutable: false,
             // Same as the vable synthesizers: no parent, so no slot claim.
             index_in_parent: None,
@@ -1055,6 +1067,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(struct_reg, "getfield_gc_i struct");
         self.push_u16(descr);
         self.push_reg_u8(dest, "getfield_gc_i result");
+    }
+
+    /// Emit `getfield_gc_i_pure/rd>i` (`blackhole.py
+    /// bhimpl_getfield_gc_i_pure`): the same load as
+    /// [`Self::getfield_gc_i`], off a field declared immutable. The bytecode
+    /// pair carries no separate op-kind — the recorded `GetfieldGcI` carries
+    /// the immutable descr, and that descr is what licenses the fold.
+    pub fn getfield_gc_i_pure(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_reg(dest);
+        let descr =
+            self.add_scalar_field_descr_with_immutability(offset, majit_ir::value::Type::Int, true);
+        self.write_insn("getfield_gc_i_pure/rd>i");
+        self.push_reg_u8(struct_reg, "getfield_gc_i_pure struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_i_pure result");
     }
 
     /// Emit `getfield_gc_r/rd>r` (`blackhole.py bhimpl_getfield_gc_r`):

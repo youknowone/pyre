@@ -478,7 +478,13 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             }
             (
                 *offset,
-                majit_ir::descr::make_field_descr(*offset, *field_size, *field_type, *field_flag),
+                majit_ir::descr::make_field_descr_with_immutability(
+                    *offset,
+                    *field_size,
+                    *field_type,
+                    *field_flag,
+                    *is_immutable,
+                ),
             )
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
@@ -4107,13 +4113,26 @@ where
                 } else {
                     OpCode::GetfieldGcI
                 };
-                let op = ctx.record_op_with_descr(kind, &[struct_opref], fielddescr);
                 let value = if is_ref {
                     Value::Ref(majit_ir::GcRef(loaded as usize))
                 } else {
                     Value::Int(loaded)
                 };
-                ctx.set_opref_concrete(op, value);
+                // `is_pure_with_descr` admits GETFIELD_GC_{I,R} only for a
+                // descr that answers `is_always_pure`, so only an immutable
+                // field off a constant struct folds. The null case hands the
+                // funnel no concrete: `loaded` is a fabricated 0 rather than a
+                // real load, and `llmodel.py protect_speculative_field` rejects
+                // a null gcptr before any fold — the executor row would
+                // dereference it.
+                let op = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    kind,
+                    Some(fielddescr),
+                    &[struct_opref],
+                    (struct_ptr != 0).then_some(value),
+                    self.last_exception_value,
+                );
                 if is_ref {
                     self.set_ref_reg(dest, Some(op), Some(loaded));
                 } else {
@@ -4141,8 +4160,16 @@ where
                 } else {
                     0
                 };
-                let op = ctx.record_op_with_descr(OpCode::GetfieldGcF, &[struct_opref], fielddescr);
-                ctx.set_opref_concrete(op, Value::Float(f64::from_bits(loaded as u64)));
+                // See the `BC_GETFIELD_GC_I` arm on the descr gate and the
+                // null case.
+                let op = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    OpCode::GetfieldGcF,
+                    Some(fielddescr),
+                    &[struct_opref],
+                    (struct_ptr != 0).then_some(Value::Float(f64::from_bits(loaded as u64))),
+                    self.last_exception_value,
+                );
                 self.set_float_reg(dest, Some(op), Some(loaded));
             }
             jitcode::insns::BC_SETFIELD_VABLE_I => {
@@ -13279,6 +13306,54 @@ mod tests {
                 .count(),
             2,
         );
+    }
+
+    #[test]
+    fn pure_getfield_folds_off_a_constant_struct() {
+        // One-word header + an i64 payload at offset 8, the layout
+        // `getfield_gc_fold_accepts_plain_spelling` (`executor.rs`) uses.
+        let storage: Box<[i64; 2]> = Box::new([0, 42]);
+        let base = storage.as_ref().as_ptr() as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, base);
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::GetfieldGcI));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), base)],
+        );
+        assert!(recorded.contains(&OpCode::GetfieldGcI));
+    }
+
+    #[test]
+    fn a_pure_getfield_off_a_null_struct_records() {
+        // `loaded` is a fabricated 0 on this leg, and the executor row would
+        // dereference the null; the arm hands the funnel no concrete so it
+        // records.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0);
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::GetfieldGcI));
+    }
+
+    #[test]
+    fn a_mutable_getfield_records_off_a_constant_struct() {
+        // `getfield_gc_i` builds a mutable descr, so `is_pure_with_descr`
+        // answers false and the read records however constant the struct is.
+        let storage: Box<[i64; 2]> = Box::new([0, 42]);
+        let base = storage.as_ref().as_ptr() as i64;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, base);
+        builder.getfield_gc_i(1, 0, 8, 0, "payload");
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::GetfieldGcI));
     }
 
     fn switch_return_jitcode() -> JitCode {
