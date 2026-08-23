@@ -1425,8 +1425,12 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `memoryview.readonly` — true for a bytes / array (Stage-1) backing or a
 /// view explicitly made read-only via `toreadonly`.
+fn memoryview_getset_receiver(args: &[PyObjectRef]) -> PyObjectRef {
+    args.get(1).copied().unwrap_or(w_none())
+}
+
 fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_bool_from(pyre_object::memoryview::w_memoryview_readonly(
@@ -1437,7 +1441,7 @@ fn memoryview_readonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// `memoryview.nbytes` — `product(shape) * itemsize`, the accessible bytes.
 fn memoryview_nbytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_int_new(pyre_object::memoryview::w_memoryview_length(mv)))
@@ -1462,7 +1466,7 @@ fn memoryview_raw_address(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// `memoryview.format` — the struct format string of an element.
 fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_str_new(pyre_object::memoryview::w_memoryview_format_str(
@@ -1473,7 +1477,7 @@ fn memoryview_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// `memoryview.ndim` — the number of dimensions.
 fn memoryview_ndim(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_int_new(pyre_object::memoryview::w_memoryview_ndim(mv)))
@@ -1482,7 +1486,7 @@ fn memoryview_ndim(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `memoryview.obj` — the original exporter the view was built from.
 fn memoryview_obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(pyre_object::memoryview::w_memoryview_obj(mv))
@@ -1491,7 +1495,7 @@ fn memoryview_obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `memoryview.itemsize` — the byte width of one element.
 fn memoryview_itemsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_int_new(pyre_object::memoryview::w_memoryview_itemsize(
@@ -1502,7 +1506,7 @@ fn memoryview_itemsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 
 /// `memoryview.shape` — `tuple[int]` of per-dimension element counts.
 fn memoryview_shape(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(memoryview_wrap_dims(
@@ -1513,7 +1517,7 @@ fn memoryview_shape(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 /// `memoryview.strides` — `tuple[int]` of per-dimension byte steps.
 fn memoryview_strides(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(memoryview_wrap_dims(
@@ -2401,7 +2405,7 @@ pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
 
 /// `memoryview.c_contiguous` — the buffer is C-contiguous.
 fn memoryview_c_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_bool_from(memoryview_contiguity(mv).0))
@@ -2410,7 +2414,7 @@ fn memoryview_c_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
 /// `memoryview.f_contiguous` — the buffer is Fortran-contiguous.
 fn memoryview_f_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(w_bool_from(memoryview_contiguity(mv).1))
@@ -2419,7 +2423,7 @@ fn memoryview_f_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
 /// `memoryview.contiguous` — the buffer is C- or Fortran-contiguous.
 fn memoryview_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         let (c, f) = memoryview_contiguity(mv);
@@ -2429,7 +2433,7 @@ fn memoryview_contiguous(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `memoryview.suboffsets` — always the empty tuple (no PIL-style views).
 fn memoryview_suboffsets(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
         Ok(pyre_object::w_tuple_new(vec![]))
@@ -2681,6 +2685,9 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
+    // memoryobject.py:777-788 — `format` / `itemsize` / … are
+    // `GetSetProperty(W_MemoryView.w_get_*)`.  `fget` is called
+    // `(descriptor, receiver)`.
     for (attr, getter) in [
         ("obj", memoryview_obj as MvFn),
         ("format", memoryview_format),
@@ -2698,10 +2705,9 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         type_ns_store(
             ns_slot,
             attr,
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity(attr, getter, 1),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
+            crate::typedef::make_getset_descriptor_named(
+                make_builtin_function_with_arity(attr, getter, 2),
+                attr,
             ),
         );
     }
@@ -4649,21 +4655,39 @@ unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
 }
 
 fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    // `operation.py`'s `abs` hands the operand to `space.abs`, which reaches
-    // `__abs__` through the type, so a subtype that replaced the builtin one —
-    // `__abs__ = None` included — is dispatched by the lookup below rather than
-    // answered structurally.
+    // operation.py `abs` → `space.abs` → descroperation `_make_unaryop_impl`
+    // (`__abs__`).  The exact-type shortcut is `use_special_method_shortcut`:
+    // a receiver whose `w_class` is still the builtin numeric type cannot
+    // carry a replacement.  Anything else looks `__abs__` up on the live
+    // type (typedef.py user-subclass shortcut reset) and calls it.
     if unsafe { abs_uses_builtin(obj) } {
         return abs_structural(obj);
     }
     unsafe {
-        if let Some(tp) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__abs__")
-        {
-            return crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[]);
+        let Some(tp) = crate::typedef::r#type(obj) else {
+            return Err(abs_bad_operand(obj));
+        };
+        // Uncached MRO walk: the method cache projects only the value half
+        // and a stale slot would resolve a heap-type override back to
+        // `int.__abs__`.
+        match crate::baseobjspace::lookup_where(tp.as_ptr(), "__abs__") {
+            Some((src, method))
+                if [
+                    &pyre_object::INT_TYPE,
+                    &pyre_object::FLOAT_TYPE,
+                    &pyre_object::COMPLEX_TYPE,
+                ]
+                .into_iter()
+                .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp))) =>
+            {
+                abs_structural(obj)
+            }
+            Some((_, method)) => {
+                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])
+            }
+            None => Err(abs_bad_operand(obj)),
         }
     }
-    Err(abs_bad_operand(obj))
 }
 
 /// `int.__abs__` / `float.__abs__`: the layout arms on their own.  These are
@@ -10536,8 +10560,8 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
-        if let Some(method) =
-            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") }
+        if let Some((_, method)) =
+            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__float__") }
         {
             let result = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -10567,8 +10591,8 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 "__float__ returned non-float (type '{result_type}')",
             )));
         }
-        if let Some(method) =
-            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__") }
+        if let Some((_, method)) =
+            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__index__") }
         {
             let r = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -15217,8 +15241,23 @@ impl crate::listsort::SortLt<usize> for SortCompare {
         // WTF-8 byte order the str arm compares on.
         unsafe {
             match self {
-                Self::Int(_) => Ok(crate::objspace::descroperation::int_value(left)
-                    < crate::objspace::descroperation::int_value(right)),
+                Self::Int(_) => {
+                    // IntegerListStrategy / IntSort only unwraps a machine
+                    // word.  A W_LongObject that slipped past is_plain_int1
+                    // has a *mut BigInt where W_IntObject keeps intval;
+                    // comparing those words orders by payload address.
+                    if pyre_object::is_long(left) || pyre_object::is_long(right) {
+                        let result = crate::baseobjspace::compare(
+                            left,
+                            right,
+                            crate::baseobjspace::CompareOp::Lt,
+                        )?;
+                        crate::baseobjspace::is_true(result)
+                    } else {
+                        Ok(crate::objspace::descroperation::int_value(left)
+                            < crate::objspace::descroperation::int_value(right))
+                    }
+                }
                 Self::Float(_) => Ok(
                     pyre_object::w_float_get_value(left) < pyre_object::w_float_get_value(right)
                 ),
@@ -18648,8 +18687,8 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
     // argument.  The slot skips this: it is the lookup's own target.
     if let Some(tp) = crate::typedef::r#type(obj)
         && !slot
-        && let Some(method) =
-            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__round__") }
+        && let Some((_, method)) =
+            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__round__") }
     {
         let result = unsafe {
             match ndigits {
