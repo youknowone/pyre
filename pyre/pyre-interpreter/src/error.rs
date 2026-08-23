@@ -1388,6 +1388,19 @@ impl PyError {
         w_name: PyObjectRef,
         w_path: PyObjectRef,
     ) -> Self {
+        Self::import_error_name_path_from(msg, w_name, w_path, pyre_object::PY_NULL)
+    }
+
+    /// `_PyErr_SetImportErrorWithNameFrom` — the same error carrying the name
+    /// the `from` list asked for.  `traceback.py:1096-1101` gates its spelling
+    /// suggestion on `.name_from` being other than `None`, so only a raise that
+    /// stamps it can offer one.
+    pub fn import_error_name_path_from(
+        msg: impl Into<Wtf8Buf>,
+        w_name: PyObjectRef,
+        w_path: PyObjectRef,
+        w_name_from: PyObjectRef,
+    ) -> Self {
         let message = msg.into();
         // Root the caller's name/path and the fresh exception across the
         // exception and message allocations below: they live only in Rust
@@ -1402,6 +1415,10 @@ impl PyError {
         let path_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_path.is_null() {
             let _ = pyre_object::gc_roots::pin_root(w_path);
+        }
+        let name_from_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_name_from.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(w_name_from);
         }
         let exc = w_exception_new_wtf8(ExcKind::ImportError, &message);
         let exc = pyre_object::gc_roots::pin_root(exc);
@@ -1426,10 +1443,16 @@ impl PyError {
         } else {
             pyre_object::gc_roots::shadow_stack_get(path_slot)
         };
+        let w_name_from = if w_name_from.is_null() {
+            w_name_from
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(name_from_slot)
+        };
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
             pyre_object::interp_exceptions::w_exception_set_name(exc, w_name);
             pyre_object::interp_exceptions::w_exception_set_import_path(exc, w_path);
+            pyre_object::interp_exceptions::w_exception_set_import_name_from(exc, w_name_from);
         }
         PyError {
             kind: PyErrorKind::ImportError,
