@@ -1461,6 +1461,23 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // when the CALL_ASSEMBLER forces the virtual. Uses `SetfieldGc` + a real
     // `FieldDescr` (the same field-set the builder uses), so
     // `optimize_setfield_gc` records it into the virtual's `vinfo.fields`.
+    //
+    // MEASURED INCONSISTENCY, no failing case known.  That seeded depth is the
+    // right one only for a header whose static operand-stack depth is zero,
+    // which is what "empty stack at the while-header" above assumes.  A `for`
+    // header is entered with the iterator on the stack.  Census over the 447
+    // `pyre/bench/synth` fixtures (a `stack_depth_at(target_pc)` probe on this
+    // arm, dynasm, 84131dc4da8): 36 emits reach here, 25 at depth 0 and 11 at
+    // depth 1 — all 11 in `str_search_index_bounds.py`, all with `ForIter` at
+    // `target_pc`, pinning `last_instr` beside an operand height one slot short
+    // of what that header executes against.  That fixture still passes its own
+    // asserts and its output comparison, and pinning the analysis depth here
+    // instead changed nothing on it, so no wrong answer is attributable to this
+    // and no gate is warranted yet.  Written down because a measured inconsistency nobody
+    // recorded is one somebody re-derives: see
+    // `pyre/bench/synth/_pending/loop_callee_for_header_resume.py` for the same
+    // "resume pc pinned without its operand height" shape that DOES produce a
+    // wrong answer, through a different writer.
     let last_instr = ctx.trace_ctx.const_int(target_pc as i64 - 1);
     let last_instr_descr = crate::descr::pyframe_next_instr_descr();
     let last_instr_idx = last_instr_descr.index();
