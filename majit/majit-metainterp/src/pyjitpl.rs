@@ -2448,6 +2448,13 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(gcref);
             }
         }
+        // The per-guard snapshot side table copies inline gcrefs out of the
+        // `ref_regs` slots walked above into words of its own; see
+        // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
+        // forwards them.
+        for snapshot in trace_ctx.snapshots.iter_mut() {
+            snapshot.walk_const_ptr_refs(&mut visitor);
+        }
         // pyjitpl.py:3290-3306 `self.virtualizable_boxes` stores ordinary
         // BoxPtr objects whose concrete refs are traced by RPython's object
         // graph.  Pyre keeps their concrete half in `virtualizable_values`;
@@ -22910,6 +22917,61 @@ mod tests {
             inputargs[0].get_value(),
             Some(Value::Ref(GcRef(0x8000)))
         ));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
+        // `get_list_of_active_snapshot_boxes` copies a constant ref register's
+        // gcref into a raw `SnapshotTagged::Const` word, and the vable / vref
+        // lists can hold an inline `ConstPtr` operand. Both accumulate across
+        // the whole trace, so a collection during tracing must forward them.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.snapshots.push(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 4,
+                py_pc: 4,
+                boxes: vec![
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Ref),
+                    // Same bits, non-Ref type: an integer, not an address.
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
+                ],
+            }],
+            vable_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::const_ptr(GcRef(0xA000)),
+                Type::Ref,
+            )],
+            vref_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::input_arg_ref(0),
+                Type::Ref,
+            )],
+        });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
+        assert_eq!(
+            snapshot.frames[0].boxes[0],
+            crate::recorder::SnapshotTagged::Const(0xB000, Type::Ref)
+        );
+        assert_eq!(
+            snapshot.frames[0].boxes[1],
+            crate::recorder::SnapshotTagged::Const(0xA000, Type::Int)
+        );
+        assert_eq!(
+            snapshot.vable_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::const_ptr(GcRef(0xB000)), Type::Ref)
+        );
+        assert_eq!(
+            snapshot.vref_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::input_arg_ref(0), Type::Ref)
+        );
     }
 
     #[test]
