@@ -97,8 +97,22 @@ struct Host {
     /// trampoline invocations). Compare against `jit_execute_count` to test
     /// whether per-op crossings or per-guard-exit crossings dominate.
     jit_call_count: u64,
-    /// Wall time inside `jit_call_trampoline`, in nanoseconds.
+    /// Wall time inside `jit_call_trampoline`, in nanoseconds, with nested
+    /// crossings subtracted out. A residual callee is itself a guest function
+    /// (`bh_call_fn` and friends live in the module's table), so running one
+    /// re-enters the guest and every crossing it makes lands inside this
+    /// frame's sample. Summing raw samples counts those seconds once per
+    /// enclosing frame: on `fib_recursive`, 15168 crossings nest 7 deep and
+    /// the raw sum reads 621ms against a 191ms non-overlapping total.
     jit_call_time_ns: u128,
+    /// Time the crossings nested inside the one currently running have taken.
+    /// Saved and restored by each frame, so it always names the innermost.
+    jit_call_child_ns: u128,
+    /// Crossings currently on the stack, and the deepest that has ever been.
+    jit_call_depth: u32,
+    jit_call_depth_max: u32,
+    /// Crossings entered with at least one already on the stack.
+    jit_call_nested: u64,
     /// Diagnostic (PYRE_WASM_EXEC_TRACE=1): histogram of (trace func_id,
     /// guard-exit fail_index) over every host round-trip, so we can see which
     /// guard keeps returning to the host instead of chaining in-module.
@@ -998,6 +1012,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} jit_call_ms={:.1} \
+             jit_call_nested={} jit_call_depth_max={} \
              wasm_ops={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
@@ -1005,6 +1020,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
             host.jit_call_time_ns as f64 / 1.0e6,
+            host.jit_call_nested,
+            host.jit_call_depth_max,
             wasm_ops.map_or(-1, |n| n as i64),
             lin_mem,
             gc_oldgen,
@@ -1942,14 +1959,27 @@ pub(crate) fn probe_call_hist_dump() {
 /// Time every residual crossing, including the paths that return early, so the
 /// share of a run spent leaving the guest is measured rather than inferred from
 /// `jit_call_count` alone.
+///
+/// The frame's own cost is its sample less whatever its nested crossings took
+/// (see `Host::jit_call_time_ns`). The parent's accumulator lives in a local
+/// for the duration, so the Rust call stack is the stack this needs.
 fn jit_call_trampoline(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
 ) -> Result<()> {
+    let host = caller.data_mut();
+    let outer_child_ns = std::mem::take(&mut host.jit_call_child_ns);
+    host.jit_call_nested += u64::from(host.jit_call_depth != 0);
+    host.jit_call_depth += 1;
+    host.jit_call_depth_max = host.jit_call_depth_max.max(host.jit_call_depth);
     let entered = std::time::Instant::now();
     let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs);
-    caller.data_mut().jit_call_time_ns += entered.elapsed().as_nanos();
+    let elapsed = entered.elapsed().as_nanos();
+    let host = caller.data_mut();
+    host.jit_call_depth -= 1;
+    host.jit_call_time_ns += elapsed.saturating_sub(host.jit_call_child_ns);
+    host.jit_call_child_ns = outer_child_ns + elapsed;
     r
 }
 
