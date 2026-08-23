@@ -269,13 +269,8 @@ pub(crate) fn register_interactive_code(
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_code);
     let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let linecache = importing::importhook(
-        "linecache",
-        w_globals,
-        pyre_object::PY_NULL,
-        0,
-        ctx_ptr,
-    )?;
+    let linecache =
+        importing::importhook("linecache", w_globals, pyre_object::PY_NULL, 0, ctx_ptr)?;
     let _ = pyre_object::gc_roots::pin_root(linecache);
     let linecache_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let register = pyre_interpreter::baseobjspace::getattr_str(
