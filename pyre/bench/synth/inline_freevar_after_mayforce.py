@@ -64,6 +64,18 @@ from fractions import Fraction
 # -- while its guard failures stayed at 1004, so on that backend the arm costs a
 # loop and no guard failure.
 #
+# DO NOT RE-RECORD `loops_compiled` here on a six. Seven is base-dependent,
+# not merely a value some tree happens to produce. Measured across three CI
+# runs: main alone at base `5bf59e1f008` reads seven and passes (32565716769);
+# a branch adding `PyreHelperKind::LoadDeref` to the replay-safe read set reads
+# seven on the older base `68a6351bfbf` and passes (32556952922); the *same*
+# six commits on `5bf59e1f008` read six and fail (32572034383). On that branch
+# the loop that goes missing is `forward`'s own portal trace, which vanishes
+# because the admission change inlines the freevar callee -- an improvement,
+# and a different loop from the `catch_exception/L` arm above. A six is a
+# question about which change interacted; re-recording it pins a number the
+# next tracer change moves again.
+#
 # The committed baselines are seven loops, five bridges, and 1005 dynasm / 1009
 # cranelift / 1004 wasm. Only the loop count answers whether the arm compiles,
 # so treat a one-count guard-failure move as the unattributed remainder rather
