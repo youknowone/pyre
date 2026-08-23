@@ -9,6 +9,7 @@ once, and rejects anything below `-1` with its own message.
 """
 
 import gc
+import sys
 
 # Every generation the module reports is accepted, and the answer is the count
 # `gc.collect` documents rather than the generation echoed back.
@@ -41,3 +42,18 @@ except ValueError as exc:
     assert str(exc) == "generation parameter cannot be negative", str(exc)
 else:
     raise AssertionError("gc.get_objects(-2) did not raise")
+
+# The range check runs after the audit event, so a rejected generation is still
+# reported to a hook.  Only the event is asserted, not what it carries: the
+# audited generation is the argument in `gc_get_objects_impl` and the constant
+# -1 in `referents.py:get_objects`, and this one keeps the constant.
+audited = []
+sys.addaudithook(lambda event, args: audited.append(event))
+
+try:
+    gc.get_objects(3)
+except ValueError:
+    pass
+else:
+    raise AssertionError("gc.get_objects(3) did not raise")
+assert "gc.get_objects" in audited, audited
