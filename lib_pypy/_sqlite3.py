@@ -282,6 +282,8 @@ _sqlite_version_triple = tuple(int(x) for x in sqlite_version.split('.'))
 # flag that signals if base types need adaption
 BASE_TYPE_ADAPTED = False
 
+NoneType = types.NoneType
+
 # set of base types that are supported by SQLite3
 BASE_TYPES = {bytearray, bytes, float, int, str, NoneType}
 
