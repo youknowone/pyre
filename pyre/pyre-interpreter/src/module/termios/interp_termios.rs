@@ -750,6 +750,170 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pyre_object::w_int_new(host_termios::VTIME as i64),
     );
 
+    // `rtermios.CONSTANT_NAMES` names most of these and `rffi_platform`
+    // keeps whichever the platform defines, but `host_env::termios`
+    // re-exports only a subset of them.  `Modules/termios.c` publishes
+    // every one darwin defines, so they are read straight from `libc`
+    // here; the twenty-five `libc` has no constant for are spelled out
+    // with the value `<sys/termios.h>` / `<sys/ttydefaults.h>` /
+    // `<sys/ttycom.h>` gives.
+    #[cfg(target_vendor = "apple")]
+    {
+        macro_rules! tc {
+            ($name:literal, $val:expr) => {
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        // `c_iflag` bits.
+        tc!("IMAXBEL", libc::IMAXBEL);
+        tc!("IUTF8", libc::IUTF8);
+
+        // `c_oflag` bits and the delay masks they select with.
+        tc!("OFILL", libc::OFILL);
+        tc!("OFDEL", libc::OFDEL);
+        tc!("ONOEOT", libc::ONOEOT);
+        tc!("OXTABS", libc::OXTABS);
+        tc!("NLDLY", libc::NLDLY);
+        tc!("CRDLY", libc::CRDLY);
+        tc!("TABDLY", libc::TABDLY);
+        tc!("BSDLY", libc::BSDLY);
+        tc!("VTDLY", libc::VTDLY);
+        tc!("FFDLY", libc::FFDLY);
+
+        // Delay values.  `<sys/termios.h>` defines `NL2` / `NL3` without a
+        // matching `libc` constant.
+        tc!("NL0", libc::NL0);
+        tc!("NL1", libc::NL1);
+        tc!("NL2", 0x200);
+        tc!("NL3", 0x300);
+        tc!("CR0", libc::CR0);
+        tc!("CR1", libc::CR1);
+        tc!("CR2", libc::CR2);
+        tc!("CR3", libc::CR3);
+        tc!("TAB0", libc::TAB0);
+        tc!("TAB1", libc::TAB1);
+        tc!("TAB2", libc::TAB2);
+        tc!("TAB3", libc::TAB3);
+        tc!("BS0", libc::BS0);
+        tc!("BS1", libc::BS1);
+        tc!("VT0", libc::VT0);
+        tc!("VT1", libc::VT1);
+        tc!("FF0", libc::FF0);
+        tc!("FF1", libc::FF1);
+
+        // `c_cflag` bits.  The `_OFLOW` / `_IFLOW` spellings name the same bits
+        // as `CRTSCTS` and its two halves.
+        tc!("CRTSCTS", libc::CRTSCTS);
+        tc!("CCTS_OFLOW", 0x10000);
+        tc!("CRTS_IFLOW", 0x20000);
+        tc!("CDTR_IFLOW", 0x40000);
+        tc!("CDSR_OFLOW", 0x80000);
+        tc!("CCAR_OFLOW", 0x100000);
+        tc!("MDMBUF", libc::MDMBUF);
+        tc!("CIGNORE", libc::CIGNORE);
+
+        // `c_lflag` bits.
+        tc!("ECHOCTL", libc::ECHOCTL);
+        tc!("ECHOPRT", libc::ECHOPRT);
+        tc!("ECHOKE", libc::ECHOKE);
+        tc!("FLUSHO", libc::FLUSHO);
+        tc!("PENDIN", libc::PENDIN);
+        tc!("ALTWERASE", libc::ALTWERASE);
+        tc!("EXTPROC", libc::EXTPROC);
+        tc!("NOKERNINFO", libc::NOKERNINFO);
+
+        // `c_cc` length and the indices `rtermios` does not name.
+        tc!("NCCS", libc::NCCS);
+        tc!("VEOL2", libc::VEOL2);
+        tc!("VWERASE", libc::VWERASE);
+        tc!("VREPRINT", libc::VREPRINT);
+        tc!("VDISCARD", libc::VDISCARD);
+        tc!("VLNEXT", libc::VLNEXT);
+        tc!("VSTATUS", libc::VSTATUS);
+        tc!("VDSUSP", libc::VDSUSP);
+
+        // `<sys/ttydefaults.h>` — the default `c_cc` values, each a `CTRL()`
+        // of its letter, so `libc` carries none of them.
+        tc!("CEOF", 4);
+        tc!("CEOL", 255);
+        tc!("CEOT", 4);
+        tc!("CERASE", 127);
+        tc!("CINTR", 3);
+        tc!("CKILL", 21);
+        tc!("CQUIT", 28);
+        tc!("CSUSP", 26);
+        tc!("CDSUSP", 25);
+        tc!("CSTART", 17);
+        tc!("CSTOP", 19);
+        tc!("CWERASE", 23);
+        tc!("CLNEXT", 22);
+        tc!("CRPRNT", 18);
+        tc!("CFLUSH", 15);
+
+        // Baud rates.
+        tc!("B7200", libc::B7200);
+        tc!("B14400", libc::B14400);
+        tc!("B28800", libc::B28800);
+        tc!("B76800", libc::B76800);
+        tc!("EXTA", libc::EXTA);
+        tc!("EXTB", libc::EXTB);
+
+        // `tcsetattr` action flag.
+        tc!("TCSASOFT", 16);
+
+        // Terminal ioctls.  `TIOCGSIZE` / `TIOCSSIZE` are the `<sys/ttycom.h>`
+        // aliases for the winsize pair.
+        tc!("TIOCSTI", libc::TIOCSTI);
+        tc!("TIOCGWINSZ", libc::TIOCGWINSZ);
+        tc!("TIOCSWINSZ", libc::TIOCSWINSZ);
+        tc!("TIOCGSIZE", 0x40087468);
+        tc!("TIOCSSIZE", 0x80087467);
+        tc!("TIOCGPGRP", libc::TIOCGPGRP);
+        tc!("TIOCSPGRP", libc::TIOCSPGRP);
+        tc!("TIOCGETD", libc::TIOCGETD);
+        tc!("TIOCSETD", libc::TIOCSETD);
+        tc!("TIOCNOTTY", libc::TIOCNOTTY);
+        tc!("TIOCSCTTY", libc::TIOCSCTTY);
+        tc!("TIOCEXCL", libc::TIOCEXCL);
+        tc!("TIOCNXCL", libc::TIOCNXCL);
+        tc!("TIOCCONS", libc::TIOCCONS);
+        tc!("TIOCOUTQ", libc::TIOCOUTQ);
+        tc!("TIOCPKT", libc::TIOCPKT);
+
+        // Modem-line bits for `TIOCMGET` / `TIOCMSET`.
+        tc!("TIOCMGET", libc::TIOCMGET);
+        tc!("TIOCMSET", libc::TIOCMSET);
+        tc!("TIOCMBIS", libc::TIOCMBIS);
+        tc!("TIOCMBIC", libc::TIOCMBIC);
+        tc!("TIOCM_LE", libc::TIOCM_LE);
+        tc!("TIOCM_DTR", libc::TIOCM_DTR);
+        tc!("TIOCM_RTS", libc::TIOCM_RTS);
+        tc!("TIOCM_ST", libc::TIOCM_ST);
+        tc!("TIOCM_SR", libc::TIOCM_SR);
+        tc!("TIOCM_CTS", libc::TIOCM_CTS);
+        tc!("TIOCM_CAR", libc::TIOCM_CAR);
+        tc!("TIOCM_CD", libc::TIOCM_CD);
+        tc!("TIOCM_RNG", libc::TIOCM_RNG);
+        tc!("TIOCM_RI", libc::TIOCM_RI);
+        tc!("TIOCM_DSR", libc::TIOCM_DSR);
+
+        // `TIOCPKT` mode bits.
+        tc!("TIOCPKT_DATA", libc::TIOCPKT_DATA);
+        tc!("TIOCPKT_FLUSHREAD", libc::TIOCPKT_FLUSHREAD);
+        tc!("TIOCPKT_FLUSHWRITE", libc::TIOCPKT_FLUSHWRITE);
+        tc!("TIOCPKT_STOP", libc::TIOCPKT_STOP);
+        tc!("TIOCPKT_START", libc::TIOCPKT_START);
+        tc!("TIOCPKT_NOSTOP", libc::TIOCPKT_NOSTOP);
+        tc!("TIOCPKT_DOSTOP", libc::TIOCPKT_DOSTOP);
+
+        // File ioctls `Modules/termios.c` publishes beside the terminal ones.
+        tc!("FIONREAD", libc::FIONREAD);
+        tc!("FIONBIO", libc::FIONBIO);
+        tc!("FIOASYNC", libc::FIOASYNC);
+        tc!("FIOCLEX", libc::FIOCLEX);
+        tc!("FIONCLEX", libc::FIONCLEX);
+    }
+
     // `interp_termios.py Cache.__init__`:
     //   self.w_error = space.new_exception_class("termios.error")
     // `new_exception_class` with no bases derives from `Exception`, so
