@@ -787,7 +787,46 @@ fn pin_referents(w_obj: PyObjectRef) {
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     majit_gc::get_referents(majit_ir::GcRef(source as usize), pin_object);
     pin_unboxed_container_referents(source_slot);
+    pin_heaptype_referent(source_slot);
     remove_root_slot_preserving_tail(source_slot);
+}
+
+/// `subtype_traverse` visits an object's own type when that type is a heap
+/// type — "for a heaptype, the instances count as references to the type" — and
+/// so does `type_traverse` for a class whose metaclass is one.  The collector
+/// has no edge to report for it: `PyObject.ob_type` addresses a
+/// `try_gc_alloc_stable_raw` header that never moves and that nothing traces.
+/// Materialise it here, the same way `pin_unboxed_container_referents`
+/// materialises the logical half of an unboxed container entry.
+///
+/// Some layouts already arrive with it — a tuple subclass carries its type
+/// among the collector's own edges — so the referents pinned so far are scanned
+/// and the type is appended only when it is not already among them.  The append
+/// is at the end, which is where `subtype_traverse` puts it for an instance
+/// with managed-dict values; a class or a tuple subclass reports it first
+/// instead, and this module does not reproduce that order.
+///
+/// Gated on `cpython_object_is_gc` because that is the flag that decides
+/// whether `tp_traverse` runs at all: a non-GC object has no referents, which
+/// is why `gc.get_referents(1)` is empty.
+fn pin_heaptype_referent(source_slot: usize) {
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(source_slot);
+    if w_obj.is_null() || !crate::typedef::cpython_object_is_gc(w_obj) {
+        return;
+    }
+    let Some(w_type) = crate::typedef::r#type(w_obj) else {
+        return;
+    };
+    let w_type = w_type.as_ptr();
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
+        return;
+    }
+    for slot in source_slot + 1..pyre_object::gc_roots::shadow_stack_len() {
+        if pyre_object::gc_roots::shadow_stack_get(slot) == w_type {
+            return;
+        }
+    }
+    let _ = pyre_object::gc_roots::pin_root(w_type);
 }
 
 /// Wrap every raw collector node rooted in `[first, last)` as
@@ -803,7 +842,8 @@ fn wrap_raw_nodes(first: usize, last: usize) -> usize {
     for slot in first..last {
         let raw = majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(slot) as usize);
         let wrapped = if majit_gc::is_app_level_object(raw) {
-            // The query can park behind a moving collection; reload the slot.
+            // The query enters the collector; the address comes back out of
+            // the slot rather than out of the word held across it.
             pyre_object::gc_roots::shadow_stack_get(slot)
         } else {
             gcref::wrap_rooted(slot)
@@ -1371,7 +1411,7 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `referents.py:116-126 get_objects` returns "a list of all
+            // `referents.py get_objects` returns "a list of all
             // app-level objects" and takes no generation, but `do_get_objects`
             // already filters by one: -1 is every object, 0 is the nursery, 2
             // is what is not in it, and 1 is the generation this collector
