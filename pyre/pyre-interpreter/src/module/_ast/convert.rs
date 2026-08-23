@@ -105,7 +105,11 @@ pub fn preprocess_object_to_object(
     let mut module = converter.module(object)?;
     crate::astcompiler::validate::validate_ast(&module)?;
     preprocess_module(&mut module, mode, opts, syntax_check_only);
-    let source = if source.is_empty() { &synthetic } else { source };
+    let source = if source.is_empty() {
+        &synthetic
+    } else {
+        source
+    };
     module_to_object(module, source, mode, ast_module)
 }
 
@@ -161,7 +165,8 @@ impl ObjectConverter {
         if !self.is_node(object, "AST")? {
             return Ok(());
         }
-        for (line_field, column_field) in [("lineno", "col_offset"), ("end_lineno", "end_col_offset")]
+        for (line_field, column_field) in
+            [("lineno", "col_offset"), ("end_lineno", "end_col_offset")]
         {
             if let Some(value) = self.optional_field(object, line_field)?
                 && let Ok(line) = self.obj_to_int(value)
