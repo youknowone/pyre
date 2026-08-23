@@ -948,10 +948,10 @@ impl VirtualizableInfo {
             //   identity, and the macro can emit one only when the state has no
             //   fixed array (`codegen_state.rs` `identity_live_index_stmt`) —
             //   with one present the position depends on that array's runtime
-            //   length. `MetaInterp::current_virtualizable_optimizer_config`
-            //   patches in the position the trace resolved against `vable_ptr`;
-            //   absent both, this stays `None` and `VirtualizableTracker`
-            //   declines to track. Declining costs optimization; probing slot 0
+            //   length. Nothing supplies it later — this function is the only
+            //   writer of `identity_input_index` — so such a layout stays
+            //   `None` for the whole trace and `VirtualizableTracker` declines
+            //   to track it. Declining costs optimization; probing slot 0
             //   costs correctness — it installs `PtrInfo::Virtualizable` on an
             //   Int scalar and the loop-close Jump then fails to match the
             //   Ref-typed preview (`VirtualStatesCantMatch`), so nothing

@@ -6581,10 +6581,19 @@ pub mod fbw_diag {
     pub const ROLLED_BACK_WITH_EFFECTS: usize = 1;
     /// Reachability of the two walk-end flush legs whose resume pc can precede
     /// an effect the walk already recorded, and of the hazardous subset of
-    /// each.  The native corpus reached neither leg when these were added — so
-    /// a nonzero value on native is itself the news, and both readers print
-    /// them (a native run that starts reaching a leg must not be the run that
-    /// says nothing).
+    /// each.  Both readers print them, so a run that starts reaching a leg is
+    /// never the run that says nothing.
+    ///
+    /// The mid-body leg IS reached, and was already reached when the counter
+    /// was added: measured over the whole synth corpus on dynasm and
+    /// cranelift, five fixtures take it exactly once —
+    /// `foriter_exempt_nested_foriter`, `foriter_exempt_shared_generator`,
+    /// `inline_subwalk_user_iterator`, `list_append_write_barrier_gc`,
+    /// `wasm_ca_trampoline_decline` — with a sixth,
+    /// `str_search_index_bounds`, on wasm only.  So `MIDBODY_LATCH` has no
+    /// healthy value and `check.py` cannot gate it at zero; what carries the
+    /// news is `..._NEW_UNJOURNALED`, the hazardous subset, which is zero on
+    /// every fixture of that corpus on all three backends and IS gated there.
     pub const MIDBODY_LATCH: usize = 2;
     pub const MIDBODY_LATCH_NEW_UNJOURNALED: usize = 3;
     pub const ESCAPE_PLAIN_FALLBACK: usize = 4;

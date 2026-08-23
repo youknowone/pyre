@@ -125,11 +125,17 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 ///   remove — it is what keeps the base from being forced, which is the one
 ///   virtualizable job upstream's optimizer does have.
 /// - the STATIC field map (`VirtualizableFieldState.fields`), still seeded
-///   from input args. Retiring it needs the same argument the array half
-///   got: that no recorded op reads a static vable field on the standard
-///   path. That has not been established.
-/// - `is_standard_ref` / `mirror_setarrayitem` / `invalidate_array`, which
-///   exist to keep the static map honest and follow it.
+///   from input args and read by the `GETFIELD_GC` fold arm below. The
+///   argument the array half got carries over unchanged:
+///   `opimpl_getfield_vable_i` and `_opimpl_getarrayitem_vable` both return
+///   `virtualizable_boxes[index]` without executing an op, and
+///   `_opimpl_setfield_vable` and `_opimpl_setarrayitem_vable` are the same
+///   two statements over a different index. The measurement is what is
+///   missing, not the argument, so the map stays until that is run.
+/// - `is_standard_ref`, which resolves the identity slot for both maps.
+/// - `mirror_setarrayitem` / `invalidate_array` / `tracked_array_element`,
+///   which follow `VirtualizableFieldState.arrays`, populated from recorded
+///   SETARRAYITEM_GC in the body rather than from the retired entry seeding.
 pub(crate) struct VirtualizableTracker {
     config: VirtualizableConfig,
     needs_setup: bool,

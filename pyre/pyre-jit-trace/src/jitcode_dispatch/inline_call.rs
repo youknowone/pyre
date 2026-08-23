@@ -8019,12 +8019,6 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 // transparent-helper exclusions at the abort-coordinate claim
                 // and the post-step trace-limit check exist to prevent.
                 transparent_helper_subwalk: true,
-                // For the same reason: a helper descent inside an inlined
-                // `__init__` is not itself the `__init__` level, so it must
-                // not inherit the instance that would make its guards record
-                // `descr_call`'s tail.  `walker_capture_multi_frame_inline_
-                // snapshot` routes this mode away before it reads the field,
-                // so this is the statement of intent rather than the fix.
                 ..ctx.fbw_mode
             },
             session: ctx.session,

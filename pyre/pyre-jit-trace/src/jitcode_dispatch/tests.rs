@@ -915,8 +915,11 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
 /// supply one — the array slot would otherwise be picked from a value the
 /// trace never pinned.
 ///
-/// The abort itself never fires on the synth corpus (measured: 0 across the
-/// 374 fixtures that trace, where `VableEscapedDuringResidualCall` takes 123).
+/// The abort itself never fires on the synth corpus (measured: 0, against
+/// `VableEscapedDuringResidualCall`'s 149 events over 20 of 446 fixtures — the
+/// `[fbw-census]` rows count events, not fixtures, and exist only for a
+/// fixture that declined at least once, so they carry no corpus-wide
+/// denominator).
 /// That is the reason to pin it rather than not: nothing else would notice if
 /// a refactor made this path unreachable, or made it fire where the promote
 /// should have carried the index.

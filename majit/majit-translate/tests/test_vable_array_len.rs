@@ -299,3 +299,146 @@ fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
         "no read of the virtualizable array in `fast2locals`"
     );
 }
+
+/// REGRESSION GUARD (#24): `frame_locals_proxy_snapshot` carries the
+/// `unroll_safe` hint, and this pins the read shape that lets it.
+///
+/// The hint is the arming switch, not a consumer: it lets the codewriter
+/// walk a graph with a backedge, and only then does the virtualizable
+/// protocol decide whether each `locals_w!` read becomes a
+/// `VableArrayRead` or a plain `getarrayitem_gc` — the latter being a
+/// STALE read of a heap array synchronised only at entry/exit and guard
+/// failure, not a slower equivalent.  Two preconditions decide it, and
+/// they fail independently: the read must not be `taken_by_address`, and
+/// it must be consumed by an array operation in its own block.
+///
+/// The reads once lived in an `insert_slot` **closure**, which charon
+/// renders as its own function, so a probe that lowered only the outer
+/// method would have found no reads at all and passed vacuously.  The
+/// walk still covers every function whose path mentions the method,
+/// closures included, so reintroducing one cannot hide from it.
+#[test]
+fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let mut graphs: Vec<FunctionGraph> = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        let path = fd.item_meta.name_path();
+        if path.contains("frame_locals_proxy_snapshot")
+            && let Ok(g) = lower_fun_decl(&llbc, fd)
+        {
+            eprintln!("[vable-probe] lowered {path}");
+            graphs.push(g);
+        }
+    }
+    assert!(
+        !graphs.is_empty(),
+        "no `frame_locals_proxy_snapshot` graph in the shipped LLBC"
+    );
+
+    let mut reads = 0;
+    let mut by_address = 0;
+    let mut unconsumed = 0;
+    let mut escapes: Vec<String> = Vec::new();
+
+    for graph in &graphs {
+        for (index, block) in graph.blocks.iter().enumerate() {
+            for op in &block.operations {
+                let OpKind::FieldRead { field, .. } = &op.kind else {
+                    continue;
+                };
+                if field.name != "locals_cells_stack_w" {
+                    continue;
+                }
+                let Some(result) = op.result.as_ref() else {
+                    continue;
+                };
+                reads += 1;
+                if field.suppresses_virtualizable() {
+                    by_address += 1;
+                    eprintln!(
+                        "[vable-probe] {:?} block {index}: read is taken_by_address \
+                         => lowers to a PLAIN getarrayitem_gc (stale read)",
+                        graph.name
+                    );
+                }
+                let consumed = block.operations.iter().any(|o| {
+                    matches!(
+                        &o.kind,
+                        OpKind::ArrayRead { base, .. }
+                            | OpKind::ArrayWrite { base, .. }
+                            | OpKind::ArrayLen { base, .. }
+                            if base == result
+                    )
+                });
+                if !consumed {
+                    unconsumed += 1;
+                    eprintln!(
+                        "[vable-probe] {:?} block {index}: read NOT consumed by an \
+                         array op in its own block",
+                        graph.name
+                    );
+                }
+                // The escape routes `check_no_vable_array` names.
+                for (bi, b) in graph.blocks.iter().enumerate() {
+                    if b.inputargs.contains(result) {
+                        escapes.push(format!("{:?}: inputarg of block {bi}", graph.name));
+                    }
+                    for (ei, link) in b.exits.iter().enumerate() {
+                        if link
+                            .args
+                            .iter()
+                            .any(|a| matches!(a, LinkArg::Value(v) if v == result))
+                        {
+                            escapes.push(format!(
+                                "{:?}: link argument, block {bi} exit {ei}",
+                                graph.name
+                            ));
+                        }
+                    }
+                    for o in &b.operations {
+                        if let OpKind::Call { args, .. } = &o.kind
+                            && args.contains(result)
+                        {
+                            escapes.push(format!("{:?}: call argument in block {bi}", graph.name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "[vable-probe] SUMMARY graphs={} reads={reads} taken_by_address={by_address} \
+         unconsumed={unconsumed} escapes={}",
+        graphs.len(),
+        escapes.len()
+    );
+    for e in &escapes {
+        eprintln!("[vable-probe]   escape: {e}");
+    }
+    assert!(
+        reads > 0,
+        "no `locals_cells_stack_w` read found in any \
+         `frame_locals_proxy_snapshot` graph — probe is inert"
+    );
+
+    // Pin the measured shape rather than only reporting it.  Both reads now
+    // pair: the body is a plain loop, so each `locals_w!(self)` copies the
+    // raw pointer out of the field into a temp and borrows `&(*temp)` —
+    // deref-last, which is not an address-of.  While the body was a closure
+    // the capture path was truncated at that raw-pointer deref, so the
+    // closure captured the field itself and the borrow read as
+    // `&(*self).locals_cells_stack_w` — field-last, a genuine address-of,
+    // correctly suppressed.  That is what kept the hint off this body, and
+    // why `fast2locals`, which never had a closure, could always carry it.
+    //
+    // If this assertion fails, the body has regressed: check whether a
+    // closure was reintroduced over `locals_cells_stack_w`.
+    assert_eq!(
+        (by_address, unconsumed),
+        (0, 0),
+        "`frame_locals_proxy_snapshot`'s virtualizable-array read changed shape"
+    );
+}

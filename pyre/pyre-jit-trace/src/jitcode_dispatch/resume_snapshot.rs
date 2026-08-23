@@ -2683,6 +2683,15 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
     Ok(())
 }
 
+/// A guard inside a canonical helper body, whose descent pushes no Python
+/// frame of its own: the chain is the paused levels alone.
+///
+/// `parent_frames` is the whole framestack's paused levels flattened in
+/// order, so a level that ran between two frames arrives already at its own
+/// depth — `descr_call`'s tail, held on the `__init__` frame that owns it,
+/// reaches here as `[caller, tail, __init__]` without this path inserting
+/// anything. Nothing here may re-position a level relative to the innermost
+/// callee; a helper descent is not that callee's depth.
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
