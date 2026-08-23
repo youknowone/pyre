@@ -47,10 +47,11 @@ pub const TRANSLATION_NURSERY_SIZE: usize = 896 * 1024;
 
 /// env.py `NURSERY_SIZE_UNKNOWN_CACHE`.
 ///
-/// PyPy's translated incminimark normally estimates the nursery from cache
-/// size, but its documented fallback is 4MB.  majit does not yet implement
-/// the platform-specific cache probe, so `GcConfig::default` uses this after
-/// checking `PYPY_GC_NURSERY`.
+/// PyPy's translated incminimark estimates the nursery from cache size and
+/// falls back to 4MB.  `estimate_best_nursery_size` implements that probe, so
+/// this is the fallback arm of `best_nursery_size_for_l2cache`, taken when the
+/// reported L2 is 8MB or smaller — not the default `GcConfig::default` reaches
+/// on its own.
 pub const DEFAULT_NURSERY_SIZE: usize = 4 * 1024 * 1024;
 
 /// Nursery memory region with bump-pointer allocation.
