@@ -3407,165 +3407,6 @@ fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, Disp
     Ok(None)
 }
 
-/// The byte ranges of `code`'s exception handlers. A handler begins at a table
-/// entry's `target` and runs to where the next handler begins.
-///
-/// One `except` body routinely spans several table ranges: binding the caught
-/// exception to a name, or a handler body that can itself raise, emits the
-/// cleanup as further ranges whose `start` is nobody's `target`. Accepting only
-/// the range that a `target` opens therefore sees the first few opcodes of the
-/// handler and nothing after them -- for `except E as m: ... raise` it stops
-/// before the `raise`.
-///
-/// Those further ranges are not always contiguous. A nested block whose body
-/// cannot raise covers no table range at all, so the handler's own ranges sit
-/// on either side of a hole -- `except E: (try: pass finally: pass); raise`
-/// leaves the `raise` past the gap. Ending the handler at the first
-/// discontinuity puts that `raise` outside every span. So the run ends only at
-/// the next range a `target` opens, and a gap inside it is carried over.
-fn callee_handler_spans(code: &pyre_interpreter::CodeObject) -> Vec<(u32, u32)> {
-    let mut entries: Vec<_> =
-        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
-    entries.sort_by_key(|entry| entry.start);
-    let targets: std::collections::HashSet<u32> =
-        entries.iter().map(|entry| entry.target).collect();
-    let mut spans = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if !targets.contains(&entry.start) {
-            continue;
-        }
-        let mut end = entry.end;
-        for next in &entries[index + 1..] {
-            if targets.contains(&next.start) {
-                break;
-            }
-            end = next.end;
-        }
-        spans.push((entry.start, end));
-    }
-    spans
-}
-
-/// True when every `RAISE_VARARGS` in `code` is a bare re-raise sitting inside
-/// one of the callee's own handlers -- the callee spells `except E: raise` and
-/// holds no other way to raise.
-///
-/// The screen exemption below rests on the abort coordinate being a handler's
-/// own re-raise, so it has to hold for whichever raise the walk reaches, not
-/// merely for one of them. Two shapes make the difference. A callee that also
-/// raises on an ordinary path (`if bad: raise ValueError(x)`) can abort at that
-/// raise, where the callee-rebuild would replay an effectful opcode the screen
-/// exists to protect. And 3.14 emits a `finally` body twice, so a bare `raise`
-/// there appears once inside the exceptional copy and once outside it, in the
-/// normal copy -- where no exception is active and it raises `RuntimeError`
-/// rather than re-raising. Requiring every raise to qualify declines both.
-fn callee_only_bare_reraises_in_handlers(code: &pyre_interpreter::CodeObject) -> bool {
-    let spans = callee_handler_spans(code);
-    if spans.is_empty() {
-        return false;
-    }
-    let mut arg_state = pyre_interpreter::bytecode::OpArgState::default();
-    let mut saw_raise = false;
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instruction, op_arg) = arg_state.get(unit);
-        let pyre_interpreter::bytecode::Instruction::RaiseVarargs { argc } = instruction else {
-            continue;
-        };
-        saw_raise = true;
-        if !matches!(
-            argc.get(op_arg),
-            pyre_interpreter::bytecode::oparg::RaiseKind::BareRaise
-        ) {
-            return false;
-        }
-        // The table is keyed by byte offset; `pc` is the instruction-unit index.
-        let byte_offset = (pc * 2) as u32;
-        if !spans
-            .iter()
-            .any(|(start, end)| (*start..*end).contains(&byte_offset))
-        {
-            return false;
-        }
-    }
-    saw_raise && !callee_handler_can_return(code, &spans)
-}
-
-/// True when a `return` is reachable from one of `spans`, so some handler path
-/// leaves the callee without raising.
-///
-/// Every raise qualifying is not enough on its own, because the raises are only
-/// the paths that DO raise. A callee whose sole `RAISE_VARARGS` is a handler's
-/// bare re-raise still qualifies when a sibling clause returns instead --
-/// `except ValueError: raise` beside `except TypeError: g += 1; return 0` has
-/// one raise, bare, inside a span. The exemption's resume argument covers the
-/// re-raise coordinate; on the returning path it suppresses the screen for a
-/// body whose write a callee rebuild would replay. The same hole opens inside a
-/// single clause that re-raises conditionally (`if c: raise` then `return 0`).
-///
-/// Answered by forward reachability from each span start over the same
-/// successor model `codewriter.rs` builds: a raise or re-raise ends its path
-/// (that is the coordinate the exemption is about), a `return` answers true,
-/// and the exception edges are followed too, which can only make the answer
-/// stricter. Anything not decodable stops that path rather than continuing into
-/// whatever instruction happens to sit next.
-fn callee_handler_can_return(code: &pyre_interpreter::CodeObject, spans: &[(u32, u32)]) -> bool {
-    use pyre_interpreter::bytecode::Instruction as I;
-
-    let num_instrs = code.instructions.len();
-    // `spans` are byte offsets; the instruction stream is indexed in units.
-    let mut work: Vec<usize> = spans
-        .iter()
-        .map(|(start, _)| *start as usize / 2)
-        .filter(|pc| *pc < num_instrs)
-        .collect();
-    let mut seen = vec![false; num_instrs];
-    while let Some(pc) = work.pop() {
-        if pc >= num_instrs || seen[pc] {
-            continue;
-        }
-        seen[pc] = true;
-        for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
-            if (entry.start as usize / 2..entry.end as usize / 2).contains(&pc) {
-                work.push(entry.target as usize / 2);
-            }
-        }
-        let Some((instruction, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-            continue;
-        };
-        match instruction {
-            I::ReturnValue | I::ReturnGenerator => return true,
-            // The coordinate the exemption is about; the path ends here.
-            I::RaiseVarargs { .. } | I::Reraise { .. } => continue,
-            I::JumpForward { delta } => {
-                work.push(pyre_interpreter::jump_target_forward(
-                    &code.instructions,
-                    pc + 1,
-                    delta.get(op_arg).as_usize(),
-                ));
-                continue;
-            }
-            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => {
-                work.push((pc + 1).saturating_sub(delta.get(op_arg).as_usize()));
-                continue;
-            }
-            I::PopJumpIfFalse { delta }
-            | I::PopJumpIfTrue { delta }
-            | I::PopJumpIfNone { delta }
-            | I::PopJumpIfNotNone { delta }
-            | I::ForIter { delta } => {
-                work.push(pyre_interpreter::jump_target_forward(
-                    &code.instructions,
-                    pc + 1,
-                    delta.get(op_arg).as_usize(),
-                ));
-            }
-            _ => {}
-        }
-        work.push(pc + 1);
-    }
-    false
-}
-
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -4054,12 +3895,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return resolved_inline_decline(op.pc, line!());
     }
-    // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
-    // at the caller's CALL boundary, so deopt re-executes the whole callee.
-    // Replaying a live-heap mutation would double it, so a Dirty body stays on
-    // the residual call path.  The keyed instance-`__next__` route is excluded:
-    // it seeds the callee frame and resumes keyed guards through the multi-frame
-    // snapshot instead of replaying the caller boundary.
+    // An unseeded inline sub-walk inside a FOR_ITER body resumes a guard at the
+    // caller's CALL boundary and replays the whole callee, so a live-heap write
+    // would execute twice.  A seeded callee frame answers that hazard exactly:
+    // the guard carries the callee's own resume coordinate, matching the
+    // per-call MIFrame shape of `MetaInterp.perform_call`.  The Dirty admission
+    // therefore asks for that resume shape directly.  A constant callable, one
+    // paused caller, and the callee's own exception table remain required
+    // because the resume shape alone does not imply any of them.  The keyed
+    // instance-`__next__` route is excluded because it already resumes keyed
+    // guards through the seeded multi-frame snapshot.
     //
     // A body whose only unproven ops are Python-level CALL residuals is
     // admitted too: this same gate re-runs for each callee the lever resolves
@@ -4068,12 +3913,99 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // deferred body commits nothing either.  Without that the whole nest
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
+    // The inlined callee body is entered at pc=0 with the fast-path
+    // register convention `registers_r[0..nparams] = positional args` —
+    // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
+    // inline calls and the retired `can_skip_traced_callee_frame` branch used
+    // (`sym.registers_r = args.to_vec()`). This only holds for a callee
+    // that reads its params straight from `r0`/`r1` (ref_copy +
+    // residual_call args).  A callee that materializes a frame — any
+    // `*_vable_*` op, emitted when a local must survive a sub-call —
+    // reads from the unseeded frame box; inlining it would abort the
+    // *whole* enclosing trace with `VableBoxNotSeeded`.
+    //
+    // A param-bearing Python callee that is otherwise inline-eligible but
+    // whose body is not a straight-line leaf (loop / branch / non-static
+    // vable) cannot be served by the fast-path register seeding.  Emitting
+    // the residual leaves it re-interpreted per iteration and lets its short
+    // inner loops compile + deopt-storm — strictly slower than interpreting.
+    // Decline the enclosing key to interpretation
+    // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
+    // Resolve the callee's own portal frame register up-front so both the
+    // strict predicate (own-frame vable acceptance) and the multiframe gate
+    // share one `ensure_jitcode_index` + `portal_red_regs_at` lookup.  A
+    // portal-shaped strict straight-line leaf's LOAD_FAST / STORE_FAST carry
+    // the frame-vable locals prologue, folded register-to-register against
+    // this frame reg (see the `*_vable_via_metainterp` short-circuits).
+    // `u16::MAX` for a non-portal callee keeps the strict predicate
+    // byte-identical (`inline_resolvable_seeded_frame_op` declines).
+    let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
+        .filter(|&jc| crate::state::built_as_portal_at(jc))
+        .map(|jc| crate::state::portal_red_regs_at(jc).0)
+        .unwrap_or(u16::MAX);
+    let strict_inlinable =
+        callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
+    // #68: a forward-branch-bearing callee is inlinable with a multi-frame
+    // guard snapshot (its in-callee branch
+    // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
+    // than collapsing to the caller boundary).  The relaxed predicate also
+    // accepts a callee whose only non-strict ops are reads off its OWN seeded
+    // frame register, so resolve that register up-front (the same
+    // `ensure_jitcode_index` + `portal_red_regs_at` the seeding below uses).
+    // A multiframe caller no longer needs to be TOP-LEVEL: a nested caller's
+    // paused frame is computed from the framestack's top (the live
+    // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
+    // a depth cap on the inline stack (the `n_parents == n_callees` valve in
+    // the snapshot path is the real desync safety net).
+    let multiframe_eligible = !strict_inlinable;
+    let callee_frame_reg = if multiframe_eligible {
+        crate::state::ensure_jitcode_index(callee_code_key as *const ())
+            .map(|jc| crate::state::portal_red_regs_at(jc).0)
+            .unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    };
+    let inline_depth = ctx.session.borrow().framestack.len();
+    let contains_raise = body_facts.contains_raise;
+    // A callee that raises inline needs the cross-frame bridge the carrier
+    // drain builds once a guard inside the compiled chain fails.  The drain
+    // walks the paused middle frames between the raising leaf and the root, so
+    // one intermediate frame may sit between the loop and the raise; a middle
+    // that CATCHES is still declined, which is what holds the cap here instead
+    // of letting a raising chain run to `fbw_max_multiframe_depth`.  A
+    // value-returning chain (no raise) inlines to the full depth either way.
+    //
+    // Measured against one drain-complete binary, nine interleaved reps per
+    // arm: `bench/synth/exception_escape_caller_frame_tb_node` runs at 0.70x
+    // of the one-level cap, `bench/synth/gc_bug_bridge_flavor_traceback_names`
+    // at 1.02x and `bench/synth/selfrec_tail_exception_unwind` at 0.99x.  A
+    // third level regresses — `selfrec_tail_exception_unwind` takes
+    // `guard_failures` from 937 to 7408 — because the unwind then crosses two
+    // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
+    // bounds above.
+    let effective_multiframe_depth = if contains_raise {
+        2
+    } else {
+        fbw_max_multiframe_depth()
+    };
+    // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
+    // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
+    // conversion, so neither replay safety nor an unseeded caller-boundary
+    // resume is part of that route's deopt discipline.
+    let try_multiframe = multiframe_eligible
+        && inline_depth < effective_multiframe_depth
+        && callee_fast_path_inlinable_allowing_forward_branch(
+            body.code,
+            callee_descr_refs,
+            ctx,
+            callee_frame_reg,
+        );
     let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
     // The keyed route bypasses the legacy caller-replay classification, but it
     // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
-    let mut foriter_dirty_raise_handler_admit = false;
+    let mut foriter_dirty_seeded_resume_admit = false;
     // The pcs handed to this callee's sub-walk, set by whichever admission
     // below admitted a body the scan could not prove clean everywhere.
     let mut inline_poison_pcs: Option<std::sync::Arc<[usize]>> = None;
@@ -4172,29 +4104,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
-                // `MetaInterp.perform_call` pushes one MIFrame for every
-                // inlined call; whether Python spelled it as `f(x)` or
-                // `obj.m(x)` does not change the callee frame or its exception
-                // edges. Route a supported CALL through the same multi-frame
-                // red-frame path below whichever way it is spelled -- the
-                // admission tests the callee body, not the call syntax.
-                //
-                // The generated resume chain is currently sound for one
-                // paused caller around a callee with a bare re-raise in its
-                // own handler when the callable is a trace constant. Keep
-                // red-polymorphic calls and the remaining Dirty shapes
-                // residual until their bridge snapshots can encode every
-                // callable-specific traceback node. A stored bound method
-                // reaches the path on `bound_method` alone as it always has;
-                // one that also meets the body terms takes the same screen
-                // exemption below, because it holds the same seeded frame.
-                let bare_reraise_handler = body_facts.has_exception_table
+                // The generated resume chain is sound for a constant callable
+                // with one paused caller when the callee owns an exception
+                // table and `try_multiframe` gives it a seeded frame.  That
+                // frame makes each in-callee guard carry the callee's own
+                // resume coordinate, so deopt does not replay the whole body
+                // from the caller's CALL boundary.  A stored bound method
+                // reaches the path on `bound_method` alone; one that also meets
+                // these terms takes the same screen exemption below.
+                let seeded_callee_resume = body_facts.has_exception_table
                     && callable_guard_op.is_constant()
-                    && ctx.session.borrow().framestack.len() < 2
-                    && callee_only_bare_reraises_in_handlers(callee_code);
-                foriter_dirty_raise_handler_admit = entry_is_call_boundary && bare_reraise_handler;
+                    && inline_depth < 2
+                    && try_multiframe;
+                foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
                 foriter_dirty_bound = entry_is_call_boundary
-                    && (bound_method.is_some() || bare_reraise_handler)
+                    && (bound_method.is_some() || seeded_callee_resume)
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 foriter_dirty_bound
@@ -4293,38 +4217,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             shown += 1;
         }
     }
-    // The inlined callee body is entered at pc=0 with the fast-path
-    // register convention `registers_r[0..nparams] = positional args` —
-    // the same seeding `dispatch_inline_call_dr_kind` uses for `n_*`
-    // inline calls and the retired `can_skip_traced_callee_frame` branch used
-    // (`sym.registers_r = args.to_vec()`). This only holds for a callee
-    // that reads its params straight from `r0`/`r1` (ref_copy +
-    // residual_call args).  A callee that materializes a frame — any
-    // `*_vable_*` op, emitted when a local must survive a sub-call —
-    // reads from the unseeded frame box; inlining it would abort the
-    // *whole* enclosing trace with `VableBoxNotSeeded`.
-    //
-    // A param-bearing Python callee that is otherwise inline-eligible but
-    // whose body is not a straight-line leaf (loop / branch / non-static
-    // vable) cannot be served by the fast-path register seeding.  Emitting
-    // the residual leaves it re-interpreted per iteration and lets its short
-    // inner loops compile + deopt-storm — strictly slower than interpreting.
-    // Decline the enclosing key to interpretation
-    // (`FBW_DECLINED_KEYS`) instead of recording the slow residual.
-    // Resolve the callee's own portal frame register up-front so both the
-    // strict predicate (own-frame vable acceptance) and the multiframe gate
-    // share one `ensure_jitcode_index` + `portal_red_regs_at` lookup.  A
-    // portal-shaped strict straight-line leaf's LOAD_FAST / STORE_FAST carry
-    // the frame-vable locals prologue, folded register-to-register against
-    // this frame reg (see the `*_vable_via_metainterp` short-circuits).
-    // `u16::MAX` for a non-portal callee keeps the strict predicate
-    // byte-identical (`inline_resolvable_seeded_frame_op` declines).
-    let callee_portal_frame_reg = crate::state::ensure_jitcode_index(callee_code_key as *const ())
-        .filter(|&jc| crate::state::built_as_portal_at(jc))
-        .map(|jc| crate::state::portal_red_regs_at(jc).0)
-        .unwrap_or(u16::MAX);
-    let strict_inlinable =
-        callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
     // other straight-line leaf.  The residual it would otherwise fall back to
@@ -4347,28 +4239,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `max_unroll_recursion`.  Carrier-resume frames participate in that same
     // count: `drive_bridge_frame_subwalk` reconstructs their `W_Code` green
     // identities before entering this path.
-    // #68: a forward-branch-bearing callee is inlinable with a multi-frame
-    // guard snapshot (its in-callee branch
-    // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
-    // than collapsing to the caller boundary).  The relaxed predicate also
-    // accepts a callee whose only non-strict ops are reads off its OWN seeded
-    // frame register, so resolve that register up-front (the same
-    // `ensure_jitcode_index` + `portal_red_regs_at` the seeding below uses).
-    // A multiframe caller no longer needs to be TOP-LEVEL: a nested caller's
-    // paused frame is computed from the framestack's top (the live
-    // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
-    // a depth cap on the inline stack (the `n_parents == n_callees` valve in
-    // the snapshot path is the real desync safety net).
-    let multiframe_eligible = !strict_inlinable;
-    let callee_frame_reg = if multiframe_eligible {
-        crate::state::ensure_jitcode_index(callee_code_key as *const ())
-            .map(|jc| crate::state::portal_red_regs_at(jc).0)
-            .unwrap_or(u16::MAX)
-    } else {
-        u16::MAX
-    };
-    let inline_depth = ctx.session.borrow().framestack.len();
-    let contains_raise = body_facts.contains_raise;
     // Evaluated only behind the three cheaper terms, so the short-circuit order
     // is the same one the single condition had.  Keeping the class lets the
     // decline census say which admission would widen it.
@@ -4418,13 +4288,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         inline_poison_pcs = Some(branchy_poisoned.into());
     }
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
-        && !foriter_dirty_raise_handler_admit
+        && !foriter_dirty_seeded_resume_admit
         && !branchy_poison_admit
     {
-        // Keep the legacy whole-body replay screen everywhere except the
-        // re-raise shape admitted above. That shape owns a seeded callee frame
-        // and follows RPython `MetaInterp.perform_call`: the live path is
-        // traced in its MIFrame and guards carry its precise resume coordinate.
+        // Keep the whole-body replay screen when the sub-walk is unseeded: its
+        // guard resumes at the caller's CALL boundary, so replaying the callee
+        // would double a live-heap write.  The admission above requires the
+        // seeded-frame shape of `MetaInterp.perform_call`, whose guard carries
+        // the callee's own resume coordinate instead.
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
                 "InlineCallee::BranchyHandlerDeferredCall"
@@ -4434,39 +4305,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
         return resolved_inline_decline(op.pc, line!());
     }
-    // A callee that raises inline needs the cross-frame bridge the carrier
-    // drain builds once a guard inside the compiled chain fails.  The drain
-    // walks the paused middle frames between the raising leaf and the root, so
-    // one intermediate frame may sit between the loop and the raise; a middle
-    // that CATCHES is still declined, which is what holds the cap here instead
-    // of letting a raising chain run to `fbw_max_multiframe_depth`.  A
-    // value-returning chain (no raise) inlines to the full depth either way.
-    //
-    // Measured against one drain-complete binary, nine interleaved reps per
-    // arm: `bench/synth/exception_escape_caller_frame_tb_node` runs at 0.70x
-    // of the one-level cap, `bench/synth/gc_bug_bridge_flavor_traceback_names`
-    // at 1.02x and `bench/synth/selfrec_tail_exception_unwind` at 0.99x.  A
-    // third level regresses — `selfrec_tail_exception_unwind` takes
-    // `guard_failures` from 937 to 7408 — because the unwind then crosses two
-    // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
-    // bounds above.
-    let effective_multiframe_depth = if contains_raise {
-        2
-    } else {
-        fbw_max_multiframe_depth()
-    };
-    // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
-    // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
-    // conversion, so neither replay safety nor an unseeded caller-boundary
-    // resume is part of that route's deopt discipline.
-    let try_multiframe = multiframe_eligible
-        && inline_depth < effective_multiframe_depth
-        && callee_fast_path_inlinable_allowing_forward_branch(
-            body.code,
-            callee_descr_refs,
-            ctx,
-            callee_frame_reg,
-        );
     // A strict straight-line callee at the top inline level is seeded with
     // its own frame red so guards can carry a real two-frame snapshot.  A
     // callee needing fresh cellvar allocation is not seeded — the seed block
@@ -9180,90 +9018,6 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
             )
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::callee_only_bare_reraises_in_handlers;
-
-    fn callee(source: &str) -> pyre_interpreter::CodeObject {
-        use pyre_interpreter::ConstantData;
-        let module = pyre_interpreter::compile_exec(source).expect("test code should compile");
-        module
-            .constants
-            .iter()
-            .find_map(|constant| match constant {
-                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
-                    Some((**code).clone())
-                }
-                _ => None,
-            })
-            .expect("module should define `f`")
-    }
-
-    #[test]
-    fn only_a_handler_owned_bare_reraise_qualifies() {
-        // A handler that binds the caught exception spreads over several table
-        // ranges, and the `raise` lands past the first one -- accepting only the
-        // range a `target` opens rejects the very shape this admits.
-        for source in [
-            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        raise\n",
-            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError as m:\n        raise\n",
-        ] {
-            assert!(
-                callee_only_bare_reraises_in_handlers(&callee(source)),
-                "should qualify: {source:?}"
-            );
-        }
-        for source in [
-            // Duplicated `finally` body: the normal copy's bare raise sits
-            // outside every handler, where it raises `RuntimeError`.
-            "def f(x, g):\n    try:\n        return g(x)\n    finally:\n        raise\n",
-            // Reachable on an ordinary path, so the walk can abort at a raise
-            // the exemption does not account for.
-            "def f(x, g):\n    try:\n        if x:\n            raise ValueError(x)\n        return g(x)\n    except ValueError:\n        raise\n",
-            // Raises a second exception rather than re-raising.
-            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        raise KeyError\n",
-            // No exception table at all.
-            "def f(x):\n    raise ValueError(x)\n",
-        ] {
-            assert!(
-                !callee_only_bare_reraises_in_handlers(&callee(source)),
-                "should not qualify: {source:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_handler_path_that_returns_disqualifies() {
-        // Every raise qualifying does not settle the paths that do NOT raise.
-        // Both bodies below hold exactly one `RAISE_VARARGS`, bare, inside a
-        // handler span, and both leave the callee through a handler without
-        // raising -- the sibling clause in the first, the untaken branch of the
-        // one clause in the second. A callee rebuild on that path replays the
-        // write, which is what the screen this exempts exists to stop.
-        for source in [
-            "def f(x, g):\n    global e\n    try:\n        return g(x)\n    except ValueError:\n        raise\n    except TypeError:\n        e += 1\n        return 0\n",
-            "def f(x, g, c):\n    global e\n    try:\n        return g(x)\n    except ValueError:\n        if c:\n            raise\n        e += 1\n        return 0\n",
-        ] {
-            assert!(
-                !callee_only_bare_reraises_in_handlers(&callee(source)),
-                "should not qualify: {source:?}"
-            );
-        }
-        // A handler that does its own work and still leaves only by re-raising
-        // keeps qualifying, including through a nested block of its own.
-        for source in [
-            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError as m:\n        g(m)\n        raise\n",
-            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        try:\n            pass\n        finally:\n            pass\n        raise\n",
-            "def f(x, g):\n    try:\n        return g(x)\n    except:\n        raise\n",
-        ] {
-            assert!(
-                callee_only_bare_reraises_in_handlers(&callee(source)),
-                "should qualify: {source:?}"
-            );
         }
     }
 }
