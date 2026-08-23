@@ -28,11 +28,17 @@ pub fn compile_object(
     let mut converter = ObjectConverter {
         ast_module,
         depth: 0,
+        line_len: 0,
     };
+    // The compiler reads a node's position out of the source text the range
+    // indexes, so a tree that came from objects needs a text to index.  Stand
+    // one up whose lines are wide enough for every column the tree names; the
+    // characters are never read, only counted.
+    let text = converter.synthetic_source(object)?;
     let module = converter.module(object)?;
     // compiling.py:73 — the tree is walked before it reaches the compiler.
     crate::astcompiler::validate::validate_ast(&module)?;
-    let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, "").finish();
+    let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, text).finish();
     rustpython_compiler::codegen::compile::compile_top(module, source_file, mode, opts)
         .map_err(|error| crate::PyError::syntax_error(error.to_string()))
 }
@@ -89,19 +95,115 @@ pub fn preprocess_object_to_object(
     let mut converter = ObjectConverter {
         ast_module,
         depth: 0,
+        line_len: 0,
     };
+    // Both directions have to read positions out of the same text, and a tree
+    // handed in as objects arrives without one.  The synthetic source stands
+    // in for it so the round trip gives every node back the line and column it
+    // came with.
+    let synthetic = converter.synthetic_source(object)?;
     let mut module = converter.module(object)?;
     crate::astcompiler::validate::validate_ast(&module)?;
     preprocess_module(&mut module, mode, opts, syntax_check_only);
+    let source = if source.is_empty() { &synthetic } else { source };
     module_to_object(module, source, mode, ast_module)
 }
 
 struct ObjectConverter {
     ast_module: PyObjectRef,
     depth: usize,
+    /// Characters on each line of the synthetic source, excluding the newline.
+    /// Zero until `synthetic_source` has measured the tree.
+    line_len: usize,
 }
 
 impl ObjectConverter {
+    /// Blank text with a line for every line the tree names and columns for
+    /// the widest of them, so that `location` can turn a node's `lineno` and
+    /// `col_offset` into an offset the compiler can map back.
+    fn synthetic_source(&mut self, object: PyObjectRef) -> AstResult<String> {
+        let mut extent = (0usize, 0usize);
+        self.scan_extent(object, &mut extent)?;
+        let (max_line, max_col) = extent;
+        if max_line == 0 {
+            return Ok(String::new());
+        }
+        self.line_len = max_col.saturating_add(1);
+        let mut source = String::new();
+        let width = self.line_len.saturating_add(1);
+        source
+            .try_reserve(width.saturating_mul(max_line))
+            .map_err(|_| crate::PyError::memory_error("source location is too large"))?;
+        for _ in 0..max_line {
+            source.extend(core::iter::repeat_n(' ', self.line_len));
+            source.push('\n');
+        }
+        Ok(source)
+    }
+
+    /// Widen `extent` to the last line and rightmost column any node in the
+    /// tree claims.  The walk is over `_fields` rather than the typed
+    /// conversion below, because it runs before anything has been validated
+    /// and must not reject a tree the converter would go on to accept.
+    fn scan_extent(&mut self, object: PyObjectRef, extent: &mut (usize, usize)) -> AstResult<()> {
+        if unsafe { pyre_object::is_list(object) } {
+            for item in unsafe { pyre_object::w_list_items_copy_as_vec(object) } {
+                self.recurse(|this| this.scan_extent(item, extent))?;
+            }
+            return Ok(());
+        }
+        if unsafe { pyre_object::is_tuple(object) } {
+            for item in unsafe { pyre_object::w_tuple_items_copy_as_vec(object) } {
+                self.recurse(|this| this.scan_extent(item, extent))?;
+            }
+            return Ok(());
+        }
+        if !self.is_node(object, "AST")? {
+            return Ok(());
+        }
+        for (line_field, column_field) in [("lineno", "col_offset"), ("end_lineno", "end_col_offset")]
+        {
+            if let Some(value) = self.optional_field(object, line_field)?
+                && let Ok(line) = self.obj_to_int(value)
+                && line > 0
+            {
+                extent.0 = extent.0.max(line as usize);
+            }
+            if let Some(value) = self.optional_field(object, column_field)?
+                && let Ok(column) = self.obj_to_int(value)
+                && column > 0
+            {
+                extent.1 = extent.1.max(column as usize);
+            }
+        }
+        let Some(fields) = self.optional_field(object, "_fields")? else {
+            return Ok(());
+        };
+        if !unsafe { pyre_object::is_tuple(fields) } {
+            return Ok(());
+        }
+        for name in unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) } {
+            if !unsafe { pyre_object::is_str(name) } {
+                continue;
+            }
+            let name = unsafe { pyre_object::w_str_get_value(name) }.to_string();
+            if let Some(value) = self.optional_field(object, &name)? {
+                self.recurse(|this| this.scan_extent(value, extent))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Offset of a one-based line and a zero-based column in the synthetic
+    /// source, clamped to the line it names.
+    fn offset_of(&self, line: i64, column: i64) -> u32 {
+        let line = usize::try_from(line).unwrap_or(1).max(1);
+        let column = usize::try_from(column).unwrap_or(0).min(self.line_len);
+        let width = self.line_len.saturating_add(1);
+        let offset = (line - 1).saturating_mul(width).saturating_add(column);
+        u32::try_from(offset).unwrap_or(u32::MAX)
+    }
+
     fn recurse<T>(&mut self, f: impl FnOnce(&mut Self) -> AstResult<T>) -> AstResult<T> {
         // PyPy's generated ast_from_object calls space.getexecutioncontext()
         // recursion guards around nested ASDL nodes.  Keep the state on this
@@ -175,19 +277,26 @@ impl ObjectConverter {
         crate::builtins::space_index_w(value)
     }
 
-    /// The source range an object carries as attributes.  A tree compiled
-    /// from objects has no source to map a range back onto, so these are read
-    /// only for what the boundary owes them: `lineno` and `col_offset` are
-    /// required, and the two end fields are optional.
-    fn location(&self, object: PyObjectRef, node: &str) -> AstResult<()> {
-        self.int_field(object, "lineno", node)?;
-        self.int_field(object, "col_offset", node)?;
-        for field in ["end_lineno", "end_col_offset"] {
-            if let Some(value) = self.optional_field(object, field)? {
-                self.obj_to_int(value)?;
-            }
-        }
-        Ok(())
+    /// The source range an object carries as attributes, placed in the
+    /// synthetic source.  `lineno` and `col_offset` are required; the two end
+    /// fields are optional and fall back to the start, which is what a node
+    /// built by hand without them describes.
+    fn location(&self, object: PyObjectRef, node: &str) -> AstResult<ruff_text_size::TextRange> {
+        let line = self.int_field(object, "lineno", node)?;
+        let column = self.int_field(object, "col_offset", node)?;
+        let end_line = match self.optional_field(object, "end_lineno")? {
+            Some(value) => self.obj_to_int(value)?,
+            None => line,
+        };
+        let end_column = match self.optional_field(object, "end_col_offset")? {
+            Some(value) => self.obj_to_int(value)?,
+            None => column,
+        };
+        let start = self.offset_of(line, column);
+        // A tree can name an end before its start; the compiler indexes the
+        // range and a reversed one would panic, so it collapses to the start.
+        let end = self.offset_of(end_line, end_column).max(start);
+        Ok(ruff_text_size::TextRange::new(start.into(), end.into()))
     }
 
     /// `Module.type_ignores` (ast.py) holds the `# type: ignore` comments
@@ -248,7 +357,7 @@ impl ObjectConverter {
     }
 
     fn stmt(&mut self, object: PyObjectRef) -> AstResult<ast::Stmt> {
-        self.location(object, "stmt")?;
+        let range = self.location(object, "stmt")?;
         if self.is_node(object, "FunctionDef")? || self.is_node(object, "AsyncFunctionDef")? {
             let is_async = self.is_node(object, "AsyncFunctionDef")?;
             let node = if is_async {
@@ -265,7 +374,7 @@ impl ObjectConverter {
             let type_params = self.type_params(object, node)?;
             Ok(ast::Stmt::FunctionDef(ast::StmtFunctionDef {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 is_async,
                 decorator_list,
                 name,
@@ -281,20 +390,20 @@ impl ObjectConverter {
         } else if self.is_node(object, "Pass")? {
             Ok(ast::Stmt::Pass(ast::StmtPass {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
             }))
         } else if self.is_node(object, "Expr")? {
             let value = self.field(object, "value", "Expr")?;
             Ok(ast::Stmt::Expr(ast::StmtExpr {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
             }))
         } else if self.is_node(object, "Return")? {
             let value = self.optional_field(object, "value")?;
             Ok(ast::Stmt::Return(ast::StmtReturn {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: value
                     .map(|value| self.recurse(|this| this.expr(value)).map(Box::new))
                     .transpose()?,
@@ -311,7 +420,7 @@ impl ObjectConverter {
             let value = self.field(object, "value", "Assign")?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 targets,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
                 runtime_targets: None,
@@ -336,7 +445,7 @@ impl ObjectConverter {
             } else {
                 Some(Box::new(ast::Arguments {
                     node_index: Default::default(),
-                    range: Default::default(),
+                    range,
                     args: bases.into_boxed_slice(),
                     keywords: keywords.into_boxed_slice(),
                     runtime_args: None,
@@ -345,7 +454,7 @@ impl ObjectConverter {
             };
             Ok(ast::Stmt::ClassDef(ast::StmtClassDef {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 decorator_list,
                 name,
                 type_params,
@@ -357,7 +466,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Delete")? {
             Ok(ast::Stmt::Delete(ast::StmtDelete {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 targets: self.exprs(object, "targets", "Delete")?,
                 runtime_targets: None,
             }))
@@ -367,7 +476,7 @@ impl ObjectConverter {
             let value = self.req_expr(object, "value", "TypeAlias")?;
             Ok(ast::Stmt::TypeAlias(ast::StmtTypeAlias {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 name,
                 type_params,
                 value,
@@ -378,7 +487,7 @@ impl ObjectConverter {
             let value = self.req_expr(object, "value", "AugAssign")?;
             Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 target,
                 op: self.operator(op)?,
                 value,
@@ -390,7 +499,7 @@ impl ObjectConverter {
             let simple = self.int_field(object, "simple", "AnnAssign")?;
             Ok(ast::Stmt::AnnAssign(ast::StmtAnnAssign {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 target,
                 annotation,
                 value,
@@ -406,7 +515,7 @@ impl ObjectConverter {
             let orelse = self.body(object, "orelse", node)?;
             Ok(ast::Stmt::For(ast::StmtFor {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 is_async,
                 target,
                 iter,
@@ -423,7 +532,7 @@ impl ObjectConverter {
             let orelse = self.body(object, "orelse", "While")?;
             Ok(ast::Stmt::While(ast::StmtWhile {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 test,
                 body,
                 orelse,
@@ -445,7 +554,7 @@ impl ObjectConverter {
                     let clause_test = self.req_expr(nested, "test", "If")?;
                     let clause_body = self.body(nested, "body", "If")?;
                     elif_else_clauses.push(ast::ElifElseClause {
-                        range: Default::default(),
+                        range,
                         node_index: Default::default(),
                         test: Some(*clause_test),
                         body: clause_body,
@@ -463,7 +572,7 @@ impl ObjectConverter {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     elif_else_clauses.push(ast::ElifElseClause {
-                        range: Default::default(),
+                        range,
                         node_index: Default::default(),
                         test: None,
                         body: clause_body,
@@ -474,7 +583,7 @@ impl ObjectConverter {
             }
             Ok(ast::Stmt::If(ast::StmtIf {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 test,
                 body,
                 elif_else_clauses,
@@ -491,7 +600,7 @@ impl ObjectConverter {
             let body = self.body(object, "body", node)?;
             Ok(ast::Stmt::With(ast::StmtWith {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 is_async,
                 items,
                 body,
@@ -502,7 +611,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Raise")? {
             Ok(ast::Stmt::Raise(ast::StmtRaise {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 exc: self.opt_expr(object, "exc")?,
                 cause: self.opt_expr(object, "cause")?,
             }))
@@ -519,7 +628,7 @@ impl ObjectConverter {
             let finalbody = self.body(object, "finalbody", node)?;
             Ok(ast::Stmt::Try(ast::StmtTry {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 body,
                 handlers,
                 orelse,
@@ -535,14 +644,14 @@ impl ObjectConverter {
             let msg = self.opt_expr(object, "msg")?;
             Ok(ast::Stmt::Assert(ast::StmtAssert {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 test,
                 msg,
             }))
         } else if self.is_node(object, "Import")? {
             Ok(ast::Stmt::Import(ast::StmtImport {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 names: self.aliases(object, "Import")?,
                 is_lazy: false,
             }))
@@ -565,7 +674,7 @@ impl ObjectConverter {
             })?;
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 module,
                 names,
                 level,
@@ -575,24 +684,24 @@ impl ObjectConverter {
         } else if self.is_node(object, "Global")? {
             Ok(ast::Stmt::Global(ast::StmtGlobal {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 names: self.identifiers(object, "names", "Global")?,
             }))
         } else if self.is_node(object, "Nonlocal")? {
             Ok(ast::Stmt::Nonlocal(ast::StmtNonlocal {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 names: self.identifiers(object, "names", "Nonlocal")?,
             }))
         } else if self.is_node(object, "Break")? {
             Ok(ast::Stmt::Break(ast::StmtBreak {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
             }))
         } else if self.is_node(object, "Continue")? {
             Ok(ast::Stmt::Continue(ast::StmtContinue {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
             }))
         } else if self.is_node(object, "Match")? {
             let subject = self.req_expr(object, "subject", "Match")?;
@@ -603,7 +712,7 @@ impl ObjectConverter {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Stmt::Match(ast::StmtMatch {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 subject,
                 cases,
             }))
@@ -704,9 +813,9 @@ impl ObjectConverter {
     }
 
     fn parameter(&mut self, object: PyObjectRef) -> AstResult<ast::Parameter> {
-        self.location(object, "arg")?;
+        let range = self.location(object, "arg")?;
         Ok(ast::Parameter {
-            range: Default::default(),
+            range,
             node_index: Default::default(),
             name: self.identifier(object, "arg", "arg")?,
             annotation: self.opt_expr(object, "annotation")?,
@@ -726,7 +835,7 @@ impl ObjectConverter {
     }
 
     fn handler(&mut self, object: PyObjectRef) -> AstResult<ast::ExceptHandler> {
-        self.location(object, "excepthandler")?;
+        let range = self.location(object, "excepthandler")?;
         if !self.is_node(object, "ExceptHandler")? {
             return Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "expected some sort of excepthandler, but got ",
@@ -735,7 +844,7 @@ impl ObjectConverter {
         }
         Ok(ast::ExceptHandler::ExceptHandler(
             ast::ExceptHandlerExceptHandler {
-                range: Default::default(),
+                range,
                 node_index: Default::default(),
                 type_: self.opt_expr(object, "type")?,
                 name: self.opt_identifier(object, "name")?,
@@ -777,9 +886,9 @@ impl ObjectConverter {
         self.list(object, "names", node)?
             .into_iter()
             .map(|value| {
-                self.location(value, "alias")?;
+                let range = self.location(value, "alias")?;
                 Ok(ast::Alias {
-                    range: Default::default(),
+                    range,
                     node_index: Default::default(),
                     name: self.identifier(value, "name", "alias")?,
                     asname: self.opt_identifier(value, "asname")?,
@@ -835,12 +944,12 @@ impl ObjectConverter {
     }
 
     fn type_param(&mut self, object: PyObjectRef) -> AstResult<ast::TypeParam> {
-        self.location(object, "type_param")?;
+        let range = self.location(object, "type_param")?;
         if self.is_node(object, "TypeVar")? {
             let name = self.identifier(object, "name", "TypeVar")?;
             Ok(ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 name,
                 bound: self.opt_expr(object, "bound")?,
                 default: self.opt_expr(object, "default_value")?,
@@ -849,7 +958,7 @@ impl ObjectConverter {
             let name = self.identifier(object, "name", "TypeVarTuple")?;
             Ok(ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 name,
                 default: self.opt_expr(object, "default_value")?,
             }))
@@ -857,7 +966,7 @@ impl ObjectConverter {
             let name = self.identifier(object, "name", "ParamSpec")?;
             Ok(ast::TypeParam::ParamSpec(ast::TypeParamParamSpec {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 name,
                 default: self.opt_expr(object, "default_value")?,
             }))
@@ -895,11 +1004,11 @@ impl ObjectConverter {
     }
 
     fn pattern(&mut self, object: PyObjectRef) -> AstResult<ast::Pattern> {
-        self.location(object, "pattern")?;
+        let range = self.location(object, "pattern")?;
         if self.is_node(object, "MatchValue")? {
             Ok(ast::Pattern::MatchValue(ast::PatternMatchValue {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: self.req_expr(object, "value", "MatchValue")?,
             }))
         } else if self.is_node(object, "MatchSingleton")? {
@@ -921,13 +1030,13 @@ impl ObjectConverter {
             };
             Ok(ast::Pattern::MatchSingleton(ast::PatternMatchSingleton {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value,
             }))
         } else if self.is_node(object, "MatchSequence")? {
             Ok(ast::Pattern::MatchSequence(ast::PatternMatchSequence {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 patterns: self.patterns(object, "patterns", "MatchSequence")?,
                 runtime_patterns: None,
             }))
@@ -936,7 +1045,7 @@ impl ObjectConverter {
             let patterns = self.patterns(object, "patterns", "MatchMapping")?;
             Ok(ast::Pattern::MatchMapping(ast::PatternMatchMapping {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 keys,
                 patterns,
                 rest: self.opt_identifier(object, "rest")?,
@@ -957,7 +1066,7 @@ impl ObjectConverter {
                 .into_iter()
                 .zip(kwd_patterns)
                 .map(|(attr, pattern)| ast::PatternKeyword {
-                    range: Default::default(),
+                    range,
                     node_index: Default::default(),
                     attr,
                     pattern,
@@ -965,10 +1074,10 @@ impl ObjectConverter {
                 .collect();
             Ok(ast::Pattern::MatchClass(ast::PatternMatchClass {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 cls,
                 arguments: ast::PatternArguments {
-                    range: Default::default(),
+                    range,
                     node_index: Default::default(),
                     patterns,
                     keywords,
@@ -980,7 +1089,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "MatchStar")? {
             Ok(ast::Pattern::MatchStar(ast::PatternMatchStar {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 name: self.opt_identifier(object, "name")?,
             }))
         } else if self.is_node(object, "MatchAs")? {
@@ -990,14 +1099,14 @@ impl ObjectConverter {
                 .transpose()?;
             Ok(ast::Pattern::MatchAs(ast::PatternMatchAs {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 pattern,
                 name: self.opt_identifier(object, "name")?,
             }))
         } else if self.is_node(object, "MatchOr")? {
             Ok(ast::Pattern::MatchOr(ast::PatternMatchOr {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 patterns: self.patterns(object, "patterns", "MatchOr")?,
                 runtime_patterns: None,
             }))
@@ -1118,13 +1227,13 @@ impl ObjectConverter {
     }
 
     fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
-        self.location(object, "expr")?;
+        let range = self.location(object, "expr")?;
         if self.is_node(object, "UnaryOp")? {
             let operand = self.field(object, "operand", "UnaryOp")?;
             let op = self.field(object, "op", "UnaryOp")?;
             Ok(ast::Expr::UnaryOp(ast::ExprUnaryOp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 op: self.unaryop(op)?,
                 operand: Box::new(self.recurse(|this| this.expr(operand))?),
             }))
@@ -1134,7 +1243,7 @@ impl ObjectConverter {
             let op = self.field(object, "op", "BinOp")?;
             Ok(ast::Expr::BinOp(ast::ExprBinOp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 left: Box::new(self.recurse(|this| this.expr(left))?),
                 op: self.operator(op)?,
                 right: Box::new(self.recurse(|this| this.expr(right))?),
@@ -1156,11 +1265,11 @@ impl ObjectConverter {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Expr::Call(ast::ExprCall {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 func: Box::new(self.recurse(|this| this.expr(func))?),
                 arguments: ast::Arguments {
                     node_index: Default::default(),
-                    range: Default::default(),
+                    range,
                     args: args.into_boxed_slice(),
                     keywords: keywords.into_boxed_slice(),
                     runtime_args: None,
@@ -1172,7 +1281,7 @@ impl ObjectConverter {
             let ctx = self.field(object, "ctx", "Attribute")?;
             Ok(ast::Expr::Attribute(ast::ExprAttribute {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
                 attr: ast::Identifier::new(
                     self.string(object, "attr", "Attribute")?,
@@ -1194,7 +1303,7 @@ impl ObjectConverter {
             if is_tuple {
                 Ok(ast::Expr::Tuple(ast::ExprTuple {
                     node_index: Default::default(),
-                    range: Default::default(),
+                    range,
                     elts: elements,
                     ctx,
                     parenthesized: true,
@@ -1203,7 +1312,7 @@ impl ObjectConverter {
             } else {
                 Ok(ast::Expr::List(ast::ExprList {
                     node_index: Default::default(),
-                    range: Default::default(),
+                    range,
                     elts: elements,
                     ctx,
                     runtime_elts: None,
@@ -1213,7 +1322,7 @@ impl ObjectConverter {
             let ctx = self.context(self.field(object, "ctx", "Name")?)?;
             Ok(ast::Expr::Name(ast::ExprName {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 id: ast::name::Name::new(self.string(object, "id", "Name")?),
                 ctx,
             }))
@@ -1221,7 +1330,7 @@ impl ObjectConverter {
             let value = self.field(object, "value", "Constant")?;
             Ok(ast::Expr::Constant(ast::ExprConstant {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: self.constant_value(value)?,
                 kind: self.constant_kind(object)?,
                 invalid_type: None,
@@ -1230,7 +1339,7 @@ impl ObjectConverter {
             let op = self.field(object, "op", "BoolOp")?;
             Ok(ast::Expr::BoolOp(ast::ExprBoolOp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 op: self.boolop(op)?,
                 values: self.exprs(object, "values", "BoolOp")?,
                 runtime_values: None,
@@ -1240,7 +1349,7 @@ impl ObjectConverter {
             let value = self.req_expr(object, "value", "NamedExpr")?;
             Ok(ast::Expr::Named(ast::ExprNamed {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 target,
                 value,
             }))
@@ -1250,7 +1359,7 @@ impl ObjectConverter {
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 parameters: Some(Box::new(parameters)),
                 body,
             }))
@@ -1260,7 +1369,7 @@ impl ObjectConverter {
             let orelse = self.req_expr(object, "orelse", "IfExp")?;
             Ok(ast::Expr::If(ast::ExprIf {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 test,
                 body,
                 orelse,
@@ -1292,14 +1401,14 @@ impl ObjectConverter {
                 .collect::<Result<Vec<_>, crate::PyError>>()?;
             Ok(ast::Expr::Dict(ast::ExprDict {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 items,
                 runtime_values: None,
             }))
         } else if self.is_node(object, "Set")? {
             Ok(ast::Expr::Set(ast::ExprSet {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 elts: self.exprs(object, "elts", "Set")?,
                 runtime_elts: None,
             }))
@@ -1308,7 +1417,7 @@ impl ObjectConverter {
             let generators = self.comprehensions(object, "ListComp")?;
             Ok(ast::Expr::ListComp(ast::ExprListComp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 elt,
                 generators,
             }))
@@ -1317,7 +1426,7 @@ impl ObjectConverter {
             let generators = self.comprehensions(object, "SetComp")?;
             Ok(ast::Expr::SetComp(ast::ExprSetComp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 elt,
                 generators,
             }))
@@ -1327,7 +1436,7 @@ impl ObjectConverter {
             let generators = self.comprehensions(object, "DictComp")?;
             Ok(ast::Expr::DictComp(ast::ExprDictComp {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 key,
                 value,
                 generators,
@@ -1337,7 +1446,7 @@ impl ObjectConverter {
             let generators = self.comprehensions(object, "GeneratorExp")?;
             Ok(ast::Expr::Generator(ast::ExprGenerator {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 elt,
                 generators,
                 parenthesized: true,
@@ -1345,19 +1454,19 @@ impl ObjectConverter {
         } else if self.is_node(object, "Await")? {
             Ok(ast::Expr::Await(ast::ExprAwait {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: self.req_expr(object, "value", "Await")?,
             }))
         } else if self.is_node(object, "Yield")? {
             Ok(ast::Expr::Yield(ast::ExprYield {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: self.opt_expr(object, "value")?,
             }))
         } else if self.is_node(object, "YieldFrom")? {
             Ok(ast::Expr::YieldFrom(ast::ExprYieldFrom {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value: self.req_expr(object, "value", "YieldFrom")?,
             }))
         } else if self.is_node(object, "Compare")? {
@@ -1370,7 +1479,7 @@ impl ObjectConverter {
             let comparators = self.exprs(object, "comparators", "Compare")?;
             Ok(ast::Expr::Compare(ast::ExprCompare {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 left,
                 ops: ops.into_boxed_slice(),
                 comparators: comparators.into_boxed_slice(),
@@ -1382,7 +1491,7 @@ impl ObjectConverter {
             let ctx = self.context(self.field(object, "ctx", "Subscript")?)?;
             Ok(ast::Expr::Subscript(ast::ExprSubscript {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value,
                 slice,
                 ctx,
@@ -1392,14 +1501,14 @@ impl ObjectConverter {
             let ctx = self.context(self.field(object, "ctx", "Starred")?)?;
             Ok(ast::Expr::Starred(ast::ExprStarred {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 value,
                 ctx,
             }))
         } else if self.is_node(object, "Slice")? {
             Ok(ast::Expr::Slice(ast::ExprSlice {
                 node_index: Default::default(),
-                range: Default::default(),
+                range,
                 lower: self.opt_expr(object, "lower")?,
                 upper: self.opt_expr(object, "upper")?,
                 step: self.opt_expr(object, "step")?,
@@ -1493,7 +1602,7 @@ impl ObjectConverter {
     }
 
     fn keyword(&mut self, object: PyObjectRef) -> AstResult<ast::Keyword> {
-        self.location(object, "keyword")?;
+        let range = self.location(object, "keyword")?;
         let arg = self
             .optional_field(object, "arg")?
             .map(|value| {
@@ -1511,7 +1620,7 @@ impl ObjectConverter {
         let value = self.field(object, "value", "keyword")?;
         Ok(ast::Keyword {
             node_index: Default::default(),
-            range: Default::default(),
+            range,
             arg,
             value: self.recurse(|this| this.expr(value))?,
         })
