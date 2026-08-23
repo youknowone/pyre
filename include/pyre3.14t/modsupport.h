@@ -30,9 +30,40 @@ static inline void _PyPyre_ArgError(const char *fname, const char *message)
 static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
                                     Py_ssize_t *required, const char **fname);
 
+/* The buffers an `es`/`et` unit allocated -- `getargs.c addcleanup`, whose
+   freelist exists so that a unit failing further along the format hands back
+   what the units before it took.  Sixteen is past any format an extension
+   writes; a format naming more gets the error rather than a silent leak. */
+#define _PyPyre_ARG_OWNED_MAX 16
+typedef struct {
+    Py_ssize_t count;
+    char **buffers[_PyPyre_ARG_OWNED_MAX];
+} _PyPyre_ArgOwned;
+
+static inline int _PyPyre_ArgOwn(_PyPyre_ArgOwned *owned, char **buffer)
+{
+    if (owned->count >= _PyPyre_ARG_OWNED_MAX) {
+        return 0;
+    }
+    owned->buffers[owned->count++] = buffer;
+    return 1;
+}
+
+/* `cleanup_ptr`: hand every buffer back and leave its destination naming
+   nothing, so a caller that frees on failure anyway frees nothing twice. */
+static inline void _PyPyre_ArgDisown(_PyPyre_ArgOwned *owned)
+{
+    for (Py_ssize_t index = 0; index < owned->count; index++) {
+        PyMem_Free(*owned->buffers[index]);
+        *owned->buffers[index] = NULL;
+    }
+    owned->count = 0;
+}
+
 /* Convert one argument according to *format, advancing it past the unit. */
 static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
-                                     va_list *va, const char *fname)
+                                     va_list *va, const char *fname,
+                                     _PyPyre_ArgOwned *owned)
 {
     char code = **format;
     (*format)++;
@@ -177,6 +208,91 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
         *va_arg(*va, int *) = (unsigned char)text[0];
         return 1;
     }
+    case 'e': {
+        /* `es`/`et`, with the encoding as the unit's own first argument. The
+           buffer is freshly allocated and the caller frees it with
+           `PyMem_Free`; `et` takes an object already in that encoding as it
+           stands, `es` re-encodes everything through `str`. */
+        const char *encoding = va_arg(*va, const char *);
+        char recode = **format;
+        if (recode != 's' && recode != 't') {
+            _PyPyre_ArgError(fname, "(unknown parser marker combination)");
+            return 0;
+        }
+        (*format)++;
+        char **buffer = va_arg(*va, char **);
+        int with_size = (**format == '#');
+        Py_ssize_t *psize = NULL;
+        if (with_size) {
+            (*format)++;
+            psize = va_arg(*va, Py_ssize_t *);
+        }
+        if (buffer == NULL || (with_size && psize == NULL)) {
+            _PyPyre_ArgError(fname, "(buffer is NULL)");
+            return 0;
+        }
+        PyObject *encoded = NULL;
+        const char *text = NULL;
+        Py_ssize_t size = 0;
+        if (recode == 't' && PyByteArray_Check(arg)) {
+            encoded = Py_NewRef(arg);
+            text = PyByteArray_AS_STRING(arg);
+            size = PyByteArray_GET_SIZE(arg);
+        } else if (recode == 't' && PyBytes_Check(arg)) {
+            encoded = Py_NewRef(arg);
+            text = PyBytes_AS_STRING(arg);
+            size = PyBytes_GET_SIZE(arg);
+        } else if (PyUnicode_Check(arg)) {
+            encoded = PyUnicode_AsEncodedString(arg, encoding, NULL);
+            if (encoded == NULL) {
+                return 0;
+            }
+            text = PyBytes_AS_STRING(encoded);
+            size = PyBytes_GET_SIZE(encoded);
+        } else {
+            _PyPyre_ArgError(fname, recode == 's'
+                                        ? "argument must be str"
+                                        : "argument must be str, bytes or bytearray");
+            return 0;
+        }
+        if (!with_size && (Py_ssize_t)strlen(text) != size) {
+            Py_DECREF(encoded);
+            _PyPyre_ArgError(fname, "encoded string without null bytes");
+            return 0;
+        }
+        if (with_size && *buffer != NULL) {
+            /* The caller's own buffer, whose room `*psize` states.  It has to
+               hold the trailing zero as well as the bytes. */
+            if (size + 1 > *psize) {
+                Py_DECREF(encoded);
+                PyErr_Format(PyExc_ValueError,
+                             "encoded string too long (%zd, maximum length %zd)",
+                             size, *psize - 1);
+                return 0;
+            }
+        } else {
+            *buffer = (char *)PyMem_Malloc((size_t)size + 1);
+            if (*buffer == NULL) {
+                Py_DECREF(encoded);
+                PyErr_NoMemory();
+                return 0;
+            }
+            if (!_PyPyre_ArgOwn(owned, buffer)) {
+                PyMem_Free(*buffer);
+                *buffer = NULL;
+                Py_DECREF(encoded);
+                _PyPyre_ArgError(fname, "(cleanup problem)");
+                return 0;
+            }
+        }
+        memcpy(*buffer, text, (size_t)size);
+        (*buffer)[size] = '\0';
+        if (with_size) {
+            *psize = size;
+        }
+        Py_DECREF(encoded);
+        return 1;
+    }
     case 'S': {
         if (!PyBytes_Check(arg)) {
             _PyPyre_ArgError(fname, "argument must be bytes");
@@ -221,7 +337,7 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
             if (item == NULL) {
                 return 0;
             }
-            int converted = _PyPyre_ArgConvert(item, format, va, fname);
+            int converted = _PyPyre_ArgConvert(item, format, va, fname, owned);
             Py_DECREF(item);
             if (!converted) {
                 return 0;
@@ -283,6 +399,18 @@ static inline void _PyPyre_ArgSkip(const char **format, va_list *va)
             (void)va_arg(*va, void *);
         }
         break;
+    case 'e':
+        /* The encoding, then the buffer, and the size if the unit names one. */
+        (void)va_arg(*va, void *);
+        if (**format == 's' || **format == 't') {
+            (*format)++;
+        }
+        (void)va_arg(*va, void *);
+        if (**format == '#') {
+            (*format)++;
+            (void)va_arg(*va, void *);
+        }
+        break;
     case 'O':
         if (**format == '!' || **format == '&') {
             (*format)++;
@@ -326,6 +454,14 @@ static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
             goto done;
         case '#': case '!': case '&': case '*':
             break;
+        case 'e':
+            /* One argument, spelled `es`, `et`, `es#` or `et#`: the letter
+               that follows says which and is not a unit of its own. */
+            if (cursor[1] == 's' || cursor[1] == 't') {
+                cursor++;
+            }
+            count++;
+            break;
         case ')':
             /* The end of the nested unit this format is the inside of. */
             goto done;
@@ -360,19 +496,22 @@ static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
 {
     Py_ssize_t total = 0;
     Py_ssize_t required = 0;
+    /* Whatever an `es`/`et` unit allocated, so that a unit failing after it
+       hands it back: one exit does that for every path below. */
+    _PyPyre_ArgOwned owned = {0, {NULL}};
+    const char *cursor = format;
     _PyPyre_ArgCount(format, &total, &required, &fname);
     Py_ssize_t given = args == NULL ? 0 : PyTuple_Size(args);
     if (given < 0) {
-        return 0;
+        goto failed;
     }
     if (given > total) {
         char buffer[128];
         snprintf(buffer, sizeof(buffer),
                  "takes at most %zd arguments (%zd given)", total, given);
         _PyPyre_ArgError(fname, buffer);
-        return 0;
+        goto failed;
     }
-    const char *cursor = format;
     for (Py_ssize_t index = 0; index < total; index++) {
         while (*cursor == '|' || *cursor == '$') {
             cursor++;
@@ -384,7 +523,7 @@ static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
         if (index < given) {
             arg = PyTuple_GetItem(args, index);
             if (arg == NULL) {
-                return 0;
+                goto failed;
             }
         } else if (kwargs != NULL && keywords != NULL && keywords[index] != NULL) {
             arg = PyDict_GetItemString(kwargs, keywords[index]);
@@ -395,15 +534,15 @@ static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
                 snprintf(buffer, sizeof(buffer),
                          "requires at least %zd arguments (%zd given)", required, given);
                 _PyPyre_ArgError(fname, buffer);
-                return 0;
+                goto failed;
             }
             /* Absent optional: the destination keeps whatever the caller left
                in it, but its pointer still leaves the `va_list`. */
             _PyPyre_ArgSkip(&cursor, va);
             continue;
         }
-        if (!_PyPyre_ArgConvert(arg, &cursor, va, fname)) {
-            return 0;
+        if (!_PyPyre_ArgConvert(arg, &cursor, va, fname, &owned)) {
+            goto failed;
         }
     }
     if (kwargs != NULL && keywords != NULL) {
@@ -419,10 +558,14 @@ static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
         }
         if (matched != size) {
             _PyPyre_ArgError(fname, "got an unexpected keyword argument");
-            return 0;
+            goto failed;
         }
     }
     return 1;
+
+failed:
+    _PyPyre_ArgDisown(&owned);
+    return 0;
 }
 
 static inline int PyArg_ParseTuple(PyObject *args, const char *format, ...)
@@ -460,8 +603,12 @@ static inline int PyArg_Parse(PyObject *args, const char *format, ...)
     va_list va;
     va_start(va, format);
     const char *cursor = format;
-    int parsed = _PyPyre_ArgConvert(args, &cursor, &va, fname);
+    _PyPyre_ArgOwned owned = {0, {NULL}};
+    int parsed = _PyPyre_ArgConvert(args, &cursor, &va, fname, &owned);
     va_end(va);
+    if (!parsed) {
+        _PyPyre_ArgDisown(&owned);
+    }
     return parsed;
 }
 
