@@ -15,6 +15,23 @@ use std::ffi::c_int;
 
 /// Reject a receiver that is not a `set` or `frozenset`, as upstream's
 /// `PySet_Check` guard does (`setobject.py:86-89`).
+/// The receiver an entry point that empties or removes accepts -- `PySet_Check`
+/// rather than `PyAnySet_Check`.
+///
+/// A frozenset caches its hash, and reaching its storage past that would leave
+/// a value already used as a dictionary key answering a digest its contents no
+/// longer produce.  Upstream refuses it: `PySet_Discard` on `PySet_Check`, and
+/// `PySet_Pop` and `PySet_Clear` by calling `set`'s own unbound method.
+fn mutable_set(object: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::setobject::is_set(object) } {
+        return Ok(object);
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::SystemError,
+        format!("{name}() argument is not a set"),
+    ))
+}
+
 fn any_set(object: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { pyre_object::setobject::is_set_or_frozenset(object) } {
         return Ok(object);
@@ -131,7 +148,7 @@ pub unsafe extern "C" fn PySet_Discard(set: *mut CPyObject, key: *mut CPyObject)
     let Some([set, key]) = arguments([set, key]) else {
         return -1;
     };
-    let call = any_set(set, "PySet_Discard").and_then(|set| discard_element(set, key));
+    let call = mutable_set(set, "PySet_Discard").and_then(|set| discard_element(set, key));
     match super::pyerrors::trap(call) {
         Some(removed) => removed as c_int,
         None => -1,
@@ -167,7 +184,7 @@ pub unsafe extern "C" fn PySet_Pop(set: *mut CPyObject) -> *mut CPyObject {
     let Some(set) = argument(set) else {
         return std::ptr::null_mut();
     };
-    result(any_set(set, "PySet_Pop").and_then(|set| {
+    result(mutable_set(set, "PySet_Pop").and_then(|set| {
         unsafe { pyre_object::w_set_popitem(set) }.ok_or_else(|| {
             crate::PyError::new(crate::PyErrorKind::KeyError, "pop from an empty set")
         })
@@ -183,7 +200,7 @@ pub unsafe extern "C" fn PySet_Clear(set: *mut CPyObject) -> c_int {
     let Some(set) = argument(set) else {
         return -1;
     };
-    let call = any_set(set, "PySet_Clear").map(|set| unsafe { pyre_object::w_set_clear(set) });
+    let call = mutable_set(set, "PySet_Clear").map(|set| unsafe { pyre_object::w_set_clear(set) });
     match super::pyerrors::trap(call) {
         Some(()) => 0,
         None => -1,

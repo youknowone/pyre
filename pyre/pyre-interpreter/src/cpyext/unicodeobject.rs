@@ -41,27 +41,33 @@ pub unsafe extern "C" fn PyUnicode_FromStringAndSize(
     from_utf8_bytes(bytes)
 }
 
+/// `bytes.decode("utf-8")`, strict as the codec is -- what every entry point
+/// that takes a C string in that encoding owes its caller.
+pub(super) fn utf8_text(bytes: &[u8]) -> Result<&str, crate::PyError> {
+    std::str::from_utf8(bytes).map_err(|error| {
+        let start = error.valid_up_to();
+        // The five arguments a decode error carries, so the instance reads
+        // back the way the `utf-8` decoder's own does rather than as a
+        // message with an empty `str()`.
+        let (end, reason) = match error.error_len() {
+            None => (bytes.len(), "unexpected end of data"),
+            Some(length) => (
+                start + length,
+                match matches!(bytes[start], 0x00..=0x7f | 0xc2..=0xf4) {
+                    true => "invalid continuation byte",
+                    false => "invalid start byte",
+                },
+            ),
+        };
+        crate::typedef::unicode_decode_error("utf-8", bytes, start, end, reason)
+    })
+}
+
 fn from_utf8_bytes(bytes: &[u8]) -> *mut CPyObject {
-    match std::str::from_utf8(bytes) {
+    match utf8_text(bytes) {
         Ok(text) => pyobject::make_ref(pyre_object::w_str_new(text)),
         Err(error) => {
-            let start = error.valid_up_to();
-            // The five arguments a decode error carries, so the instance reads
-            // back the way the `utf-8` decoder's own does rather than as a
-            // message with an empty `str()`.
-            let (end, reason) = match error.error_len() {
-                None => (bytes.len(), "unexpected end of data"),
-                Some(length) => (
-                    start + length,
-                    match matches!(bytes[start], 0x00..=0x7f | 0xc2..=0xf4) {
-                        true => "invalid continuation byte",
-                        false => "invalid start byte",
-                    },
-                ),
-            };
-            super::pyerrors::set_pending_error(crate::typedef::unicode_decode_error(
-                "utf-8", bytes, start, end, reason,
-            ));
+            super::pyerrors::set_pending_error(error);
             std::ptr::null_mut()
         }
     }
@@ -493,6 +499,9 @@ pub unsafe extern "C" fn PyUnicode_Format(
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
+    // Both operands are realized before either is read: realizing one
+    // allocates, and the interpreter object the other names would move.
+    super::object::realize_all([format, args]);
     let Some(format) = str_argument(format, must_be_str) else {
         return std::ptr::null_mut();
     };

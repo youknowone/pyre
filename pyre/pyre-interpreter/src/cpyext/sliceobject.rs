@@ -84,11 +84,13 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let Some(py_slice) = fields(raw) else {
         return;
     };
-    // Each bound is read immediately before it is handed to `make_ref`, which
-    // allocates: nothing read here is carried across one.
-    let start = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_start(w_obj) });
-    let stop = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_stop(w_obj) });
-    let step = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_step(w_obj) });
+    // `make_ref` allocates, so the slice is read back through the mirror
+    // before each bound rather than kept in a local: the block's address does
+    // not move and the slice's does.
+    let slice = || unsafe { (*raw).ob_pyre_link };
+    let start = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_start(slice()) });
+    let stop = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_stop(slice()) });
+    let step = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_step(slice()) });
     unsafe {
         (*py_slice).start = start;
         (*py_slice).stop = stop;

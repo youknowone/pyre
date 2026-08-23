@@ -391,6 +391,9 @@ pub unsafe extern "C" fn _PyTimeZone_FromTimeZone(
         )?;
         let timezone_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(timezone);
+        // Both are realized before either is read: realizing one allocates,
+        // and the interpreter object the other names would move.
+        super::object::realize_all([offset, name]);
         let mut arguments = vec![unsafe { pyobject::from_ref(offset) }];
         if !name.is_null() {
             arguments.push(unsafe { pyobject::from_ref(name) });

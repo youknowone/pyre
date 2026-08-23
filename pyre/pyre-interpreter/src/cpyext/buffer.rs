@@ -12,11 +12,10 @@
 use super::object::{argument, result};
 use super::pyobject::{self, CPyObject};
 use super::typeobject::{CPyTypeObject, pending_or, slot_of};
-use parking_lot::Mutex;
 use pyre_object::PyObjectRef;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::OnceLock;
+use std::hash::BuildHasherDefault;
 
 /// `Py_buffer`.
 #[repr(C)]
@@ -74,6 +73,12 @@ fn releasebuffer_of(tp: *mut CPyTypeObject) -> *const c_void {
 
 // ── the exports this layer owns ─────────────────────────────────────────
 
+/// Keyed by an address this layer handed out, so the hasher is never fed a key
+/// C chose; the default one is spelled out because it is the const-
+/// constructible form a `static` needs.
+type BufferTable = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BufferSet = HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+
 /// The `Py_buffer` behind each live `memoryview` this layer built, keyed by the
 /// `BufferView` that memoryview carries.
 ///
@@ -83,24 +88,32 @@ fn releasebuffer_of(tp: *mut CPyTypeObject) -> *const c_void {
 /// `BufferView` allocation rather than the memoryview because the collector
 /// moves the object and not that block, and rather than the exported address
 /// because several exports can name the same one.
-fn exports() -> &'static Mutex<HashMap<usize, usize>> {
-    static EXPORTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    EXPORTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static EXPORTS: super::ForkMutex<BufferTable> =
+    super::ForkMutex::new(BufferTable::with_hasher(BuildHasherDefault::new()));
 
 /// The snapshots [`PyObject_GetBuffer`] took of interpreter objects, keyed by
 /// the address handed to C, with the byte length `PyBuffer_Release` frees.
-fn snapshots() -> &'static Mutex<HashMap<usize, usize>> {
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
-    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+static SNAPSHOTS: super::ForkMutex<BufferTable> =
+    super::ForkMutex::new(BufferTable::with_hasher(BuildHasherDefault::new()));
+
+/// Each table's lock word can be held by a thread the child does not have, and
+/// the payload is what the child keeps: `fork` copies the address space, so
+/// every exported address and every snapshot is still mapped and still owed a
+/// release.
+pub(super) unsafe fn after_fork_child() {
+    unsafe {
+        EXPORTS.reinit_after_fork();
+        SNAPSHOTS.reinit_after_fork();
+        GEOMETRIES.reinit_after_fork();
+    }
 }
 
 fn record_export(carrier: usize, view: *mut CPyBuffer) {
-    exports().lock().insert(carrier, view as usize);
+    EXPORTS.lock().insert(carrier, view as usize);
 }
 
 fn take_export(carrier: usize) -> Option<*mut CPyBuffer> {
-    exports()
+    EXPORTS
         .lock()
         .remove(&carrier)
         .map(|view| view as *mut CPyBuffer)
@@ -388,10 +401,8 @@ struct Export {
 
 /// The live [`Export`] blocks, so a release frees one this layer wrote and
 /// leaves a C exporter's own `internal` word alone.
-fn geometries() -> &'static Mutex<HashSet<usize>> {
-    static GEOMETRIES: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    GEOMETRIES.get_or_init(|| Mutex::new(HashSet::new()))
-}
+static GEOMETRIES: super::ForkMutex<BufferSet> =
+    super::ForkMutex::new(BufferSet::with_hasher(BuildHasherDefault::new()));
 
 /// What a request asks of the layout that this export does not answer, if
 /// anything -- `memory_getbuf`'s contiguity checks, in its order.
@@ -492,7 +503,7 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         };
         (*view).suboffsets = std::ptr::null_mut();
         (*view).internal = Box::into_raw(export) as *mut c_void;
-        geometries().lock().insert((*view).internal as usize);
+        GEOMETRIES.lock().insert((*view).internal as usize);
     }
     0
 }
@@ -513,7 +524,7 @@ pub(super) unsafe extern "C" fn interp_bf_releasebuffer(
         return;
     }
     let internal = unsafe { (*view).internal } as usize;
-    if internal == 0 || !geometries().lock().remove(&internal) {
+    if internal == 0 || !GEOMETRIES.lock().remove(&internal) {
         return;
     }
     unsafe { (*view).internal = std::ptr::null_mut() };
@@ -594,7 +605,7 @@ pub unsafe extern "C" fn PyObject_GetBuffer(
     };
     let length = bytes.len();
     let block = Box::into_raw(bytes.into_boxed_slice()) as *mut u8;
-    snapshots().lock().insert(block as usize, length);
+    SNAPSHOTS.lock().insert(block as usize, length);
     unsafe {
         fill_info(
             view,
@@ -679,7 +690,7 @@ pub unsafe extern "C" fn PyBuffer_Release(view: *mut CPyBuffer) {
         return;
     }
     let block = unsafe { (*view).buf } as usize;
-    let snapshot = snapshots().lock().remove(&block);
+    let snapshot = SNAPSHOTS.lock().remove(&block);
     match snapshot {
         Some(length) => drop(unsafe {
             Box::from_raw(std::ptr::slice_from_raw_parts_mut(block as *mut u8, length))

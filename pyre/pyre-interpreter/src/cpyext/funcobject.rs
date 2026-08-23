@@ -81,16 +81,6 @@ fn assert0() -> [u8; 6] {
 /// line and no columns, as `codeobject.c linetable` spells it.
 const ASSERT0_LINETABLE: [u8; 2] = [(1 << 7) | (13 << 3) | (3 - 1), 0];
 
-/// Hand `code.__new__`'s argument list to the interpreter's constructor.
-///
-/// The C entry points name their arguments in a different order and let the
-/// caller's `nlocals` disagree with `varnames`, which `codeobject.c` derives
-/// rather than reads; both are reconciled here so the interpreter constructor
-/// sees only what it accepts.
-unsafe fn build_code(args: &[pyre_object::PyObjectRef]) -> *mut CPyObject {
-    result(unsafe { crate::pycode::code_new(args) })
-}
-
 /// `funcobject.py:198 PyCode_NewEmpty(filename, funcname, firstlineno)` — a
 /// code object with the given source location and a body that raises
 /// `AssertionError`.
@@ -185,57 +175,61 @@ pub unsafe extern "C" fn PyUnstable_Code_NewWithPosOnlyArgs(
         linetable,
         exceptiontable,
     ];
-    super::object::realize_all(objects);
-    let mut arguments = [pyre_object::PY_NULL; 11];
-    for (slot, &raw) in arguments.iter_mut().zip(objects.iter()) {
-        match argument(raw) {
-            Some(object) => *slot = object,
-            None => return std::ptr::null_mut(),
-        }
+    if super::object::arguments(objects).is_none() {
+        return std::ptr::null_mut();
     }
-    let [
-        code,
-        consts,
-        names,
-        varnames,
-        freevars,
-        cellvars,
-        filename,
-        name,
-        qualname,
-        linetable,
-        exceptiontable,
-    ] = arguments;
+    // Read back through the mirror each time rather than kept in a local: a
+    // mirror's address does not move, and the interpreter object it names does.
+    let object = |raw| unsafe { pyobject::from_ref(raw) };
     // A name list that is not a tuple is a caller error, which the C entry
     // point reports the way every other bad argument to one is reported.
     for list in [names, varnames, freevars, cellvars] {
-        if !unsafe { pyre_object::is_tuple(list) } {
+        if !unsafe { pyre_object::is_tuple(object(list)) } {
             unsafe { super::pyerrors::PyErr_BadInternalCall() };
             return std::ptr::null_mut();
         }
     }
-    let nlocals = unsafe { pyre_object::tupleobject::w_tuple_len(varnames) };
+    // `nlocals` is derived from `varnames` rather than read from the argument
+    // of that name, which `PyUnstable_Code_NewWithPosOnlyArgs` also ignores.
+    let nlocals = unsafe { pyre_object::tupleobject::w_tuple_len(object(varnames)) };
+    // Every int here allocates, so they are built and rooted before any of the
+    // eleven objects is read: a collection while one is built moves the
+    // storage the earlier ones name.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for value in [
+        argcount as i64,
+        posonlyargcount as i64,
+        kwonlyargcount as i64,
+        nlocals as i64,
+        stacksize as i64,
+        flags as i64,
+        firstlineno as i64,
+    ] {
+        let _ = roots.pin_root(pyre_object::w_int_new(value));
+    }
+    let count = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     result(unsafe {
         crate::pycode::code_new(&[
             pyre_object::PY_NULL,
-            pyre_object::w_int_new(argcount as i64),
-            pyre_object::w_int_new(posonlyargcount as i64),
-            pyre_object::w_int_new(kwonlyargcount as i64),
-            pyre_object::w_int_new(nlocals as i64),
-            pyre_object::w_int_new(stacksize as i64),
-            pyre_object::w_int_new(flags as i64),
-            code,
-            consts,
-            names,
-            varnames,
-            filename,
-            name,
-            qualname,
-            pyre_object::w_int_new(firstlineno as i64),
-            linetable,
-            exceptiontable,
-            freevars,
-            cellvars,
+            count(0),
+            count(1),
+            count(2),
+            count(3),
+            count(4),
+            count(5),
+            object(code),
+            object(consts),
+            object(names),
+            object(varnames),
+            object(filename),
+            object(name),
+            object(qualname),
+            count(6),
+            object(linetable),
+            object(exceptiontable),
+            object(freevars),
+            object(cellvars),
         ])
     })
 }

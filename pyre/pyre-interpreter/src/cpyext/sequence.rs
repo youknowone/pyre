@@ -362,7 +362,7 @@ pub unsafe extern "C" fn PySequence_Fast_ITEMS(object: *mut CPyObject) -> *mut *
             item as usize
         })
         .collect();
-    pyobject::refill_items(object, items)
+    pyobject::publish_items(object, items)
 }
 
 pub(super) fn ensure_linked() {

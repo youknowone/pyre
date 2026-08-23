@@ -155,7 +155,7 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 /// first: `Py_TYPE(x)->tp_basicsize` is read off any type mirror, so a type may
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
-fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
     if existing != 0 {
         return existing as *mut CPyObject;
@@ -195,16 +195,21 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     let ob_type = type_mirror(w_obj);
     let size = mirror_size(ob_type);
     let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, size);
-    unsafe { super::typeobject::stamp_ob_size(raw, w_obj, size) };
+    // Each fill allocates, so the object is read back through the mirror
+    // before the next one rather than kept in a local: the block's address
+    // does not move and the object's does, and the link is what the collector
+    // updates.
+    let linked = || unsafe { (*raw).ob_pyre_link };
+    unsafe { super::typeobject::stamp_ob_size(raw, linked(), size) };
     // The types whose blocks carry fields past the header; every other block
     // this runtime hands out is exactly its header.
-    super::frameobject::attach(raw, w_obj);
-    super::sliceobject::attach(raw, w_obj);
-    super::pyerrors::attach(raw, w_obj);
-    super::cdatetime::attach(raw, w_obj);
-    super::complexobject::attach(raw, w_obj);
-    super::methodobject::attach(raw, w_obj);
-    super::typeobject::descriptor_attach(raw, w_obj);
+    super::frameobject::attach(raw, linked());
+    super::sliceobject::attach(raw, linked());
+    super::pyerrors::attach(raw, linked());
+    super::cdatetime::attach(raw, linked());
+    super::complexobject::attach(raw, linked());
+    super::methodobject::attach(raw, linked());
+    super::typeobject::descriptor_attach(raw, linked());
     raw
 }
 
@@ -803,20 +808,29 @@ static ITEM_ARRAYS: ForkMutex<ItemCache> =
 
 /// Give `raw`'s array `items` and answer where they sit.
 ///
-/// For a container that may have changed since the last ask: refilling is the
-/// reallocation upstream documents, and a caller may only read the array while
-/// the sequence does not change.
-pub(super) fn refill_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut CPyObject {
-    let (address, previous) = {
+/// An array that already holds these items keeps the address it was handed out
+/// at, and this call's references are given back instead: two reads of an
+/// unchanged sequence have to answer the same address, and one of them may be
+/// on another thread that is still holding the first.  Replacing the array is
+/// the reallocation upstream documents, which is why a caller may only read one
+/// while the sequence does not change.
+pub(super) fn publish_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut CPyObject {
+    let (address, spare) = {
         let mut cache = ITEM_ARRAYS.lock();
-        let previous = cache.insert(raw as usize, items.into_boxed_slice());
+        let unchanged = cache
+            .get(&(raw as usize))
+            .is_some_and(|array| array[..] == items[..]);
+        let spare = match unchanged {
+            true => Some(items.into_boxed_slice()),
+            false => cache.insert(raw as usize, items.into_boxed_slice()),
+        };
         (
             cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject,
-            previous,
+            spare,
         )
     };
     // Outside the lock: a deallocator this runs takes it again.
-    release_item_array(previous);
+    release_item_array(spare);
     address
 }
 
@@ -843,9 +857,11 @@ pub(super) fn items_or_build(
         return array;
     }
     // Built with the lock released: an entry is taken through `make_ref`,
-    // which allocates and takes locks of its own.
+    // which allocates and takes locks of its own.  Another thread reading the
+    // same container can have built and published one meanwhile, which is why
+    // publishing keeps whichever array is already there.
     let built = items();
-    refill_items(raw, built)
+    publish_items(raw, built)
 }
 
 /// Put `item` in one slot of an array already handed out, leaving its address

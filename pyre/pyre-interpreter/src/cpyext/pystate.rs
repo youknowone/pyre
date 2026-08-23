@@ -15,6 +15,7 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::pyobject::{self, CPyObject};
 
@@ -66,13 +67,19 @@ const _: () = {
     assert!(std::mem::offset_of!(CPyThreadState, status) == 24);
 };
 
+/// `State.threadstate_count` -- what a state's id is taken from, counted up
+/// so that no two live states share one.
+static THREAD_STATE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     /// Stable for as long as the thread lives, which is as long as a
     /// `PyThreadState *` naming it is valid.
     static THREAD_STATE: UnsafeCell<CPyThreadState> = UnsafeCell::new(CPyThreadState {
         interp: &INTERPRETER as *const CPyInterpreterState as *mut CPyInterpreterState,
         dict: std::ptr::null_mut(),
-        id: 0,
+        // `new_thread_state` counts from one, so every state that exists has
+        // an id an extension can key its own per-thread data by.
+        id: THREAD_STATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
         status: 0,
     });
     /// `ec.cpyext_threadstate_is_current`.  Swapping NULL in clears it, which
@@ -278,6 +285,12 @@ pub unsafe extern "C" fn PyThreadState_GetID(state: *mut CPyThreadState) -> u64 
 /// makes the borrowed answer good for as long as the caller holds the
 /// interpreter.
 static INTERPRETER_DICT: super::ForkMutex<usize> = super::ForkMutex::new(0);
+
+/// The lock word can be held by a thread the child does not have; the mirror
+/// the payload names is still mapped, because `fork` copies the address space.
+pub(super) unsafe fn after_fork_child() {
+    unsafe { INTERPRETER_DICT.reinit_after_fork() };
+}
 
 /// `PyInterpreterState_GetDict(interp)` — a namespace shared by every thread
 /// of an interpreter, as a borrowed reference.

@@ -822,6 +822,13 @@ static ITERATION_KEYS: super::ForkMutex<SnapshotMap> = super::ForkMutex::new(
     SnapshotMap::with_hasher(std::hash::BuildHasherDefault::new()),
 );
 
+/// The lock word can be held by a thread the child does not have; the
+/// snapshots the payload names are still mapped, because `fork` copies the
+/// address space, and each is still owed the release its walk ends with.
+pub(super) unsafe fn after_fork_child() {
+    unsafe { ITERATION_KEYS.reinit_after_fork() };
+}
+
 /// `PyDict_Next(dict, &pos, &key, &value)` — 1 for each pair, 0 once they are
 /// all reported.  `pos` starts at 0 and is only ever handed back
 /// (`dictobject.py:255-329`).

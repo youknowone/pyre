@@ -121,17 +121,19 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let Some(py_frame) = fields(raw) else {
         return;
     };
-    // Each value is taken from the frame immediately before it is handed to
-    // `make_ref`, which allocates: nothing read here is carried across one.
-    let frame = w_obj as *mut crate::pyframe::PyFrame;
-    let code = pyobject::make_ref(unsafe { (*frame).fget_f_code() });
-    let globals = pyobject::make_ref(unsafe { (*frame).get_w_globals() });
-    let locals = pyobject::make_ref(unsafe { (*frame).get_w_locals() });
+    // `make_ref` allocates, so the frame is read back through the mirror
+    // before each field rather than kept in a local: the block's address does
+    // not move and the frame's does.  What `make_ref` answers with is a block
+    // of its own, which is why those are held.
+    let frame = || unsafe { (*raw).ob_pyre_link } as *mut crate::pyframe::PyFrame;
+    let code = pyobject::make_ref(unsafe { (*frame()).fget_f_code() });
+    let globals = pyobject::make_ref(unsafe { (*frame()).get_w_globals() });
+    let locals = pyobject::make_ref(unsafe { (*frame()).get_w_locals() });
     // The line as a number.  `fget_f_lineno` is the property, which answers an
     // object and `None` where there is no line; `frame_attach`'s own comment
     // names `get_last_lineno` as what the field is owed.
-    let lineno = unsafe { (*frame).get_last_lineno() } as c_int;
-    let back = unsafe { (*frame).get_f_back() } as PyObjectRef;
+    let lineno = unsafe { (*frame()).get_last_lineno() } as c_int;
+    let back = unsafe { (*frame()).get_f_back() } as PyObjectRef;
     let back = pyobject::make_ref(back) as *mut CPyFrameObject;
     unsafe {
         (*py_frame).f_code = code;

@@ -78,9 +78,13 @@ pub unsafe extern "C" fn PyContextVar_New(
     let made = (|| -> Result<PyObjectRef, crate::PyError> {
         let text = match name.is_null() {
             true => String::new(),
-            false => unsafe { CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned(),
+            false => {
+                // `space.newbytes(...).decode("utf-8")`: a name this runtime
+                // cannot spell is the caller's error, not a name with
+                // replacement characters in it.
+                let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+                super::unicodeobject::utf8_text(bytes)?.to_owned()
+            }
         };
         let class = context_var_class()?;
         let roots = pyre_object::gc_roots::push_roots();

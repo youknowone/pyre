@@ -22,6 +22,14 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut CPyObject 
     let Some(module) = crate::importing::get_interpreter_sys_module() else {
         return std::ptr::null_mut();
     };
+    // The mirror the borrow is recorded against, minted first because minting
+    // allocates and the module has to be read again after that.  A borrow with
+    // no container is one nothing ever releases, and an extension that reads
+    // `stderr` for every report it writes reaches this once per report.
+    pyobject::ensure_mirror(module);
+    let Some(module) = crate::importing::get_interpreter_sys_module() else {
+        return std::ptr::null_mut();
+    };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     if w_dict.is_null() {
         return std::ptr::null_mut();

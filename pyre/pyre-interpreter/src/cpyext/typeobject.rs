@@ -673,7 +673,10 @@ fn mirror_itemsize(w_type: PyObjectRef) -> isize {
         return 1;
     }
     if derived(&pyre_object::pyobject::TUPLE_TYPE) {
-        return size_of::<CPyObject>() as isize;
+        // `rffi.sizeof(PyObject)`, where `PyObject` is the pointer type: one
+        // item of a tuple is one `PyObject *`, which is what a caller sizing
+        // its own allocation multiplies by.
+        return size_of::<*mut CPyObject>() as isize;
     }
     // `type` itself and no metaclass: the members follow the block a heap type
     // declared, and only a type declared in C has any.
@@ -1703,7 +1706,6 @@ bound_pool!(
 );
 
 /// Every pool, for the questions asked of all of them at once.
-#[cfg(test)]
 static BOUND_FAMILIES: &[&BoundFamily] = &[
     &UNARY_BOUND,
     &LENGTH_BOUND,
@@ -3006,6 +3008,8 @@ pub const T_LONG: c_int = 2;
 pub const T_FLOAT: c_int = 3;
 pub const T_DOUBLE: c_int = 4;
 pub const T_STRING: c_int = 5;
+/// The string is the storage itself rather than a pointer to it.
+pub const T_STRING_INPLACE: c_int = 13;
 pub const T_OBJECT: c_int = 6;
 pub const T_CHAR: c_int = 7;
 pub const T_BYTE: c_int = 8;
@@ -3076,6 +3080,7 @@ fn read_member(
                 let text = *(address as *const *const c_char);
                 text_or_none(text)
             }
+            T_STRING_INPLACE => text_or_none(address as *const c_char),
             T_NONE => pyre_object::w_none(),
             T_OBJECT | T_OBJECT_EX => {
                 let stored = *(address as *const *mut CPyObject);
@@ -3088,10 +3093,10 @@ fn read_member(
                     pyobject::from_ref(stored)
                 }
             }
-            other => {
+            _ => {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::SystemError,
-                    format!("cpyext member '{}' uses unsupported type {other}", name()),
+                    "bad memberdescr type",
                 ));
             }
         }
@@ -3109,15 +3114,16 @@ fn write_member(
             .to_string_lossy()
             .into_owned()
     };
-    if unsafe { (*member).flags } & MEMBER_READONLY != 0
-        || matches!(unsafe { (*member).type_code }, T_STRING | T_NONE)
-    {
-        return Err(crate::PyError::attribute_error(format!(
-            "attribute '{}' of a cpyext object is not writable",
-            name()
-        )));
+    if unsafe { (*member).flags } & MEMBER_READONLY != 0 {
+        return Err(crate::PyError::attribute_error("readonly attribute"));
     }
     let type_code = unsafe { (*member).type_code };
+    // A string member is the storage, not a reference to it, so there is
+    // nothing a write could give it -- and the refusal is a `TypeError`, which
+    // is what tells it apart from the flag above.
+    if matches!(type_code, T_STRING | T_STRING_INPLACE) {
+        return Err(crate::PyError::type_error("readonly attribute"));
+    }
     // Every branch below stores into the block, so the integer or float is
     // unwrapped first — the conversion can call back into Python and collect.
     let integer = matches!(
@@ -3189,10 +3195,10 @@ fn write_member(
                 *slot = pyobject::make_ref(value);
                 pyobject::decref(previous);
             }
-            other => {
+            _ => {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::SystemError,
-                    format!("cpyext member '{}' uses unsupported type {other}", name()),
+                    "bad memberdescr type",
                 ));
             }
         }
@@ -5589,6 +5595,12 @@ pub(super) unsafe fn after_fork_child() {
         TYPE_MODULES.reinit_after_fork();
         TYPE_TOKENS.reinit_after_fork();
         TYPE_NAMES.reinit_after_fork();
+        DESCRIPTOR_BLOCKS.reinit_after_fork();
+        DECLARED_TP_NEW.reinit_after_fork();
+        BOUND_MINTED.reinit_after_fork();
+        for family in BOUND_FAMILIES {
+            family.taken.reinit_after_fork();
+        }
     }
 }
 
