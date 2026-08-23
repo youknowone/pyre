@@ -4288,7 +4288,10 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
 /// when this walk is not inside an inline callee.  A callee `jit_pc` has no
 /// meaning in the outer jitcode's py_pc tables, so every consumer that writes
 /// a pc onto the callee's frame has to go through the callee's own metadata.
-fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usize) -> Option<u32> {
+pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(

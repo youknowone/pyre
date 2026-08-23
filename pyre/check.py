@@ -4005,7 +4005,7 @@ class Check:
     # ── self-checking regression guard ──
 
     def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
-                      require_jit=True):
+                      require_jit=True, spec_folds=()):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -4024,8 +4024,18 @@ class Check:
         guards stopped reaching the JIT, which is the change most likely to
         make the guard vacuous. `synth_selfcheck_interpreted` turns it off for
         a fixture whose invariant is not about compiled code.
+
+        *spec_folds* is the `# pyre-check: spec-folds=` list, read the same way
+        `run_synthetic_bench` reads it. A fixture written to guard a trace-time
+        fold asserts the ANSWER, and the residual answers identically -- so
+        without the census the fixture passes just as well with the fold gone,
+        which is the one failure it exists to catch.
         """
         print(f"  {name}")
+        if spec_folds and not self._check_spec_folds(
+            name, script, spec_folds, timeout, "-", "-",
+        ):
+            return
         for backend in ALL_BACKENDS:
             if not self.enabled(backend):
                 continue
@@ -4332,6 +4342,7 @@ class Check:
             try:
                 selfcheck = synth_selfcheck(path)
                 skip_backends = synth_skip_backends(path) if selfcheck else ()
+                selfcheck_folds = synth_spec_folds(path) if selfcheck else ()
             except ValueError as e:
                 print(f"{red('ERROR')}: {e}")
                 sys.exit(1)
@@ -4342,6 +4353,7 @@ class Check:
                     self.args.synthetic_timeout,
                     skip_backends=skip_backends,
                     require_jit=not synth_selfcheck_interpreted(path),
+                    spec_folds=selfcheck_folds,
                 )
             else:
                 self.run_synthetic_bench(

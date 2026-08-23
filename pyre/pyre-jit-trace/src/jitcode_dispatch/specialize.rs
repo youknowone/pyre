@@ -2627,6 +2627,136 @@ fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
         .vable_array_region_write_back(frame_op, 0, &slots)
 }
 
+/// The frame box and EXECUTING Python pc of a frame receiver the walk owns,
+/// or `None` for one it does not.
+///
+/// `pyjitpl.py` keeps one MIFrame per inlined call and each carries its own
+/// coordinate, so this resolves per level exactly as
+/// [`LiveLastInstrGuard::enter`] retargets its publication: inside an inline
+/// sub-walk the callee's own jitcode pc resolved through the callee's
+/// metadata, at the portal the walk's `vstack_cur_pypc`.
+///
+/// The virtualizable boxes are NOT a source here, which a probe against the
+/// residual's own answers settled rather than an argument: at three portal
+/// sites the boxes' `last_instr` entry read 110/165/185 against executing
+/// pcs of 115/170/197, and at an inlined-callee site it read 232 -- the
+/// caller's CALL boundary -- against the callee's own 22.  They describe the
+/// PORTAL frame and carry whichever of the field's two conventions their last
+/// writer left.
+///
+/// A receiver that is not this level's own frame declines, which is what keeps
+/// a suspended generator's frame, a traceback node's frame and a caller's
+/// frame read from inside a callee on the residual getter that reads the heap.
+fn walker_frame_executing_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    concrete_obj: pyre_object::PyObjectRef,
+    op_pc: usize,
+) -> Option<(OpRef, u32)> {
+    let inline_frame = current_inline_concrete_frame();
+    if inline_frame != 0 {
+        let shadow = ctx.callee_shadow.as_ref()?;
+        if shadow.concrete_frame != inline_frame
+            || shadow.frame_box == OpRef::NONE
+            || concrete_obj as usize != inline_frame
+        {
+            return None;
+        }
+        return Some((
+            shadow.frame_box,
+            residual_call::inline_callee_py_pc(ctx, op_pc)?,
+        ));
+    }
+    // An inline sub-walk with no concrete callee frame has no level-local
+    // coordinate to answer with: `vstack_cur_pypc` is the outer walk's mirror
+    // and a sub-walk never advances it.
+    if ctx.fbw_mode.inline_subwalk || !ctx.vstack_valid {
+        return None;
+    }
+    let vable_box = ctx.trace_ctx.standard_virtualizable_box()?;
+    if ctx.trace_ctx.standard_virtualizable_ptr() != Some(concrete_obj as usize) {
+        return None;
+    }
+    Some((vable_box, ctx.vstack_cur_pypc))
+}
+
+/// `pyframe.py fget_f_lasti` — `return self.last_instr`, loop-free and
+/// carrying no hint, so `policy.py look_inside_graph` admits it, `jtransform.py
+/// rewrite_op_jit_force_virtualizable` deletes the force
+/// `rvirtualizable.py hook_access_field` injects, and `pyjitpl.py
+/// opimpl_getfield_vable_i` answers the field out of `virtualizable_boxes`.
+/// The box there is a `ConstInt`, because the only writer is the bytecode
+/// dispatch's `_opimpl_setfield_vable` of the pc it is about to run — which is
+/// why upstream answers the read for less than a loop that does not perform
+/// it.  Nothing forces, so the generic reader's residual boundary buys nothing
+/// and this emits the same constant.
+///
+/// The constant owes two coordinates the residual boundary hides.
+/// `last_instr` is an instruction-unit index here while the getset reports the
+/// byte offset (`typedef.rs` returns `fget_f_lasti() * 2`), so the emission
+/// carries the factor; without it a `dis` consumer's `f_lasti // 2` lands on
+/// half the instruction index.  And the field has two writers on two
+/// conventions — `flush_walk_end_state_to_frame` stores the resume coordinate
+/// `pc - 1`, `LiveLastInstrGuard::enter_frame` stores the executing pc
+/// unshifted — and a getter owes the executing one, which is what
+/// [`walker_frame_executing_py_pc`] resolves.
+///
+/// `last_instr` travels as half of a pair — `capture_frame_scalars` records it
+/// beside `valuestackdepth` because the interpreter derives its next opcode
+/// from `last_instr + 1` and reads the operand stack at `valuestackdepth`, so
+/// a consumer restoring one of them owes the other.  This emission assumes
+/// nothing about `valuestackdepth` and is entitled to: it is a pure read that
+/// never reaches the frame at all.  The pc it answers with comes from the
+/// walk's own trace-time coordinate, not from the frame's field, so no state
+/// is captured, none is restored, and the pair is never split.  Writing
+/// `last_instr` from here would incur that obligation, which is the second
+/// reason this path never does.
+///
+/// The receiver is pinned two ways.  Its class, its `w_class` and the frame
+/// type's `version_tag` are guarded, so rebinding `f_lasti` on the type
+/// revokes the loop instead of the constant outliving the getset that produced
+/// it.  And when the receiver arrives in a box other than the frame's own —
+/// a local the loop hoisted the frame into — a `ptr_eq` against that box is
+/// guarded, so a later entry holding a different frame side-exits to the
+/// residual rather than reading this trace's coordinate.
+fn try_walker_specialize_frame_lasti<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some((frame_box, py_pc)) = walker_frame_executing_py_pc(ctx, concrete_obj, op_pc) else {
+        return Ok(None);
+    };
+    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(None);
+    }
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    if obj != frame_box {
+        let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_own_frame, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_own_frame])?;
+    }
+    let value = py_pc as i64 * 2;
+    let raw = ctx.trace_ctx.const_int(value);
+    let boxed = walker_box_int(ctx, op_pc, raw, value)?;
+    // `walker_box_int` emits a heap `NewWithVtable`, so the recording-time
+    // shadow has to be a heap `W_IntObject` too — the same pairing
+    // [`box_int_concrete`] makes for a residual whose result arrived tagged.
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(
+            pyre_object::intobject::w_int_new_unique(value) as usize,
+        )),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -2741,6 +2871,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_proxy as usize)),
         );
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, proxy)?;
+        return Ok(Some(()));
+    }
+    if name == "f_lasti"
+        && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
+        && spec_gate("frame_lasti", || {
+            try_walker_specialize_frame_lasti(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
+        })?
+        .is_some()
+    {
         return Ok(Some(()));
     }
     // `mapdict.py` resolution, returning the fold ingredients (the
@@ -9377,7 +9516,7 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
 /// frame is always the portal, so the residual always escapes.  Removing it
 /// removes the force with it, and nothing has to replace it: `last_instr` is
 /// published onto the portal frame at every may-force boundary
-/// (`LiveLastInstrGuard`).  Generic `f_lasti` / `f_lineno` readers retain that
+/// (`LiveLastInstrGuard`).  A generic `f_lineno` reader still retains that
 /// residual boundary.  Upstream does not: `pyframe.py fget_f_lasti` and
 /// `fget_f_lineno` are loop-free and carry no hint, so `policy.py
 /// look_inside_graph` admits them, `jtransform.py
@@ -9385,17 +9524,18 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
 /// `pyjitpl.py opimpl_getfield_vable_i` answers `last_instr` out of
 /// `virtualizable_boxes`.  Measured over a 200k-iteration read against a
 /// same-shape loop that does not read the frame: pypy3 answers `f_lasti`
-/// faster than that control loop -- the trace constant -- and pyre is 53x it,
+/// faster than that control loop -- the trace constant -- and pyre was 53x it,
 /// while `f_lineno` keeps one non-forcing residual on both and pyre is 2.1x.
-/// Closing the gap is an optimization over a correct path, not a fix, and it
-/// owes two coordinates the boundary currently hides.  `last_instr` is an
-/// instruction-unit index here and the app-level getter reports it doubled
-/// (`typedef.rs`, matching `location.py offset2lineno`'s `stopat // 2` on the
-/// byte offset upstream stores), so an emission at the app level owes the
-/// factor.  And the field has two writers on two conventions:
-/// `flush_walk_end_state_to_frame` writes `resume_py_pc - 1` while
-/// `LiveLastInstrGuard::enter_frame` writes the executing pc unshifted, and a
-/// getter owes the executing one.
+/// [`try_walker_specialize_frame_lasti`] closes the `f_lasti` half by emitting
+/// the constant, leaving `f_lineno` the open one.  Closing either is an
+/// optimization over a correct path, not a fix, and it owes two coordinates
+/// the boundary hides.  `last_instr` is an instruction-unit index here and the
+/// app-level getter reports it doubled (`typedef.rs`, matching `location.py
+/// offset2lineno`'s `stopat // 2` on the byte offset upstream stores), so an
+/// emission at the app level owes the factor.  And the field has two writers
+/// on two conventions: `flush_walk_end_state_to_frame` writes
+/// `resume_py_pc - 1` while `LiveLastInstrGuard::enter_frame` writes the
+/// executing pc unshifted, and a getter owes the executing one.
 /// An exact optimized-frame `f_locals` read is specialized
 /// below instead: `pyframe.py fast2locals` is `@jit.unroll_safe`, so upstream
 /// traces through it and reads the virtualizable boxes rather than forcing.
