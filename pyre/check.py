@@ -160,15 +160,25 @@ WASM_TIMEOUT_SCALE = 4.0
 #
 # What does is the rest of the census, and it is worth stating because the
 # ceiling has now been widened twice by a fixture that was never going to be
-# caught by widening it. Two ubuntu runs on one base gate 273 fixtures in
-# common; outside the two that still carry an allowance (builtin_folds_hot
-# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst any of them reaches is
-# short_circuit_boxed_int_cross_fn at 3.0x then 3.5x, with
-# pickle_terminal_raise_resume steady at 3.4x. Under the same
-# highest-observed-plus-15% rule the allowances are fitted with, that puts the
-# floor at 4.03x: 4.0 is the fitted value today, not slack, and it comes down
-# when short_circuit_boxed_int_cross_fn does. Its 0.49x swing between two runs
-# of one base is also the scale to read any single reading against.
+# caught by widening it. Two ubuntu runs of one base gate 299 fixtures between
+# them. Outside the two that still carry an allowance (builtin_folds_hot
+# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst is foriter_make_function_body at
+# 3.74x, then short_circuit_boxed_int_cross_fn 3.0x/3.5x and
+# pickle_terminal_raise_resume steady at 3.4x.
+#
+# Under the highest-observed-plus-15% rule the allowances are fitted with, that
+# 3.74x asks for 4.30x -- ABOVE this constant. 4.0 is therefore not slack: it
+# leaves its worst gated fixture 7% of headroom where the rule wants 15%, and
+# short_circuit_boxed_int_cross_fn's own 0.49x swing between those two runs is
+# the scale that headroom is being measured against. ⛔That is a reason to fix
+# or exempt foriter_make_function_body, NOT to raise the constant to 4.3: the
+# ceiling has been widened for a fixture twice already and stayed red both
+# times.
+#
+# Census the union of runs, not their intersection. A fixture whose jit-stats
+# gate fails prints SNAPDIFF where its time and ratio go, so it leaves the table
+# of whichever run it failed in -- which is exactly how foriter_make_function_body
+# stayed out of the first version of this paragraph, and 3.5 looked reachable.
 WASM_MAX_DYNASM_RATIO = 4.0
 # The headroom every `max-wasm-ratio` allowance is fitted with, and the same
 # margin the summary requires before it will call one outgrown -- a fixture
