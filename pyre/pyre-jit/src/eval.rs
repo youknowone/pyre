@@ -11105,7 +11105,7 @@ fn bound_reached(
     // callee's `JitVirtualRef` published in `topframeref`, and this door
     // reaches the same traces.
     let _topframeref_guard =
-        TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
+        TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
     // The token stays bound for the whole run, which is what
     // `EnterJitAssembler(procedure_token, ...)` does with it upstream; the run
     // resolves the key itself, so it is only the pin.
@@ -11408,7 +11408,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // function-entry door: the trace a function entry runs inlines the same
         // callees and exits through the same guards.
         let _topframeref_guard =
-            TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
+            TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
         let outcome = {
             let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
             driver.run_compiled_detailed_with_bridge_keyed(
