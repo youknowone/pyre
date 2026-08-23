@@ -35,6 +35,14 @@ static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 static GC_THRESHOLD: [AtomicI64; 3] =
     [AtomicI64::new(2000), AtomicI64::new(10), AtomicI64::new(10)];
 
+/// How many generations this module reports.  `get_threshold` answers a
+/// three-tuple and `set_threshold` writes three slots, so three is the count
+/// every generation argument is checked against — the same `NUM_GENERATIONS`
+/// `gc_collect_impl` and `gc_get_objects_impl` bound theirs by.  The collector
+/// underneath has two physical generations; the middle one is simply always
+/// empty, which is what `do_get_objects` already answers for it.
+const NUM_GENERATIONS: i64 = 3;
+
 const STATE_SCANNING: u8 = 0;
 const STATE_MARKING: u8 = 1;
 const STATE_SWEEPING: u8 = 2;
@@ -1319,13 +1327,18 @@ crate::py_module! {
         fn collect(
             #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `interp_gc.py collect` unwraps the optional generation
-            // as an int, but deliberately ignores its value.  In particular,
-            // unlike a three-generation frontend, every integer is accepted
-            // and the default is 0.
-            let _generation = crate::baseobjspace::int_w(
+            // `interp_gc.py collect` unwraps the optional generation as an
+            // int and ignores its value, because PyPy's frontend has no
+            // generations to select between.  This one reports three, so the
+            // argument is bounded the way `gc_collect_impl` bounds it; the
+            // value is still ignored below, since every collection here is a
+            // full one.
+            let generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
+            if !(0..NUM_GENERATIONS).contains(&generation) {
+                return Err(crate::PyError::value_error("invalid generation"));
+            }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
@@ -1358,24 +1371,38 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `referents.py:116-126 get_objects`: "Return a list of all
-            // app-level objects." The audit event always reports -1 and fires
-            // before the argument is examined, so a non-None value is still
-            // audited; only None is then accepted, because the collector has
-            // no generations to select between.
+            // `referents.py:116-126 get_objects` returns "a list of all
+            // app-level objects" and takes no generation, but `do_get_objects`
+            // already filters by one: -1 is every object, 0 is the nursery, 2
+            // is what is not in it, and 1 is the generation this collector
+            // keeps empty.  So the argument is passed through rather than
+            // refused, bounded the way `gc_get_objects_impl` bounds it.  The
+            // audit event always reports -1 and fires before the argument is
+            // examined, so an out-of-range value is still audited.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(generation);
             crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
             let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
-            if !unsafe { is_none(generation) } {
-                return Err(crate::PyError::not_implemented(
-                    "get_objects(generation=None) accepts only None on PyPy",
+            let generation = if unsafe { is_none(generation) } {
+                -1
+            } else {
+                crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?
+            };
+            if generation >= NUM_GENERATIONS {
+                return Err(crate::PyError::value_error(format!(
+                    "generation parameter must be less than the number of \
+                     available generations ({NUM_GENERATIONS})"
+                )));
+            }
+            if generation < -1 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter cannot be negative",
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_cpython_tracked_object);
+            majit_gc::get_objects(generation as i8, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
