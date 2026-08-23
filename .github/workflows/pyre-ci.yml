@@ -421,7 +421,7 @@ jobs:
       # selected package: without it the build script writes placeholders and
       # refuses outside an LLBC extraction.
       run: |
-        cargo test --no-default-features --features dynasm,prepass \
+        cargo test --no-default-features --features dynasm,prepass,cpyext \
           -p pyre-jit-trace --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)
