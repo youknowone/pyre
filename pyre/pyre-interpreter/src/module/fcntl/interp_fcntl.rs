@@ -32,13 +32,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // number it wraps.
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                if args.len() >= 3 && unsafe { pyre_object::bytesobject::is_bytes_like(args[2]) } {
-                    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[2]) };
-                    let mut buf = data.to_vec();
-                    buf.push(0);
-                    // `interp_fcntl.py fcntl` tries the string-buffer
-                    // path before falling back to the integer path, and
-                    // returns exactly the original buffer length.
+                // `interp_fcntl.py fcntl` tries the string-buffer path before
+                // falling back to the integer one and returns exactly the
+                // original buffer's length; `fcntl_fcntl_impl` takes its
+                // integer arm first, on `PyIndex_Check`.
+                if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
+                    let data = arg_readbuf(args[2], "fcntl")?;
+                    let Some(mut buf) = stage_arg(data) else {
+                        return Err(crate::PyError::value_error(
+                            "fcntl argument 3 is too long",
+                        ));
+                    };
                     loop {
                         let outcome = {
                             let _blocked = crate::module::thread::before_external_block();
@@ -46,6 +50,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         };
                         match outcome {
                             Ok(_) => {
+                                guard_intact(&buf, data.len())?;
                                 return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
                                     &buf[..data.len()],
                                 ));
@@ -60,11 +65,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                 }
                 let arg = if args.len() >= 3 {
-                    if !unsafe { pyre_object::is_int(args[2]) } {
-                        return Err(crate::PyError::type_error(
-                            "fcntl() arguments must be integers",
-                        ));
-                    }
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
                 } else {
                     0
@@ -103,14 +103,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("ioctl", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
-                if !(2..=3).contains(&args.len()) {
-                    return Err(crate::PyError::type_error(
-                        "ioctl() takes 2 or 3 arguments",
-                    ));
+                // `interp_fcntl.py ioctl(space, w_fd, w_request, w_arg,
+                // mutate_flag=-1)` / `fcntl_ioctl_impl(module, fd, code, arg,
+                // mutate_arg)`.
+                if !(2..=4).contains(&args.len()) {
+                    return Err(crate::PyError::type_error(format!(
+                        "ioctl expected at most 4 arguments, got {}",
+                        args.len()
+                    )));
                 }
-                if !unsafe { pyre_object::is_int(args[1]) }
-                    || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
-                {
+                if !unsafe { pyre_object::is_int(args[1]) } {
                     return Err(crate::PyError::type_error(
                         "ioctl() arguments must be integers",
                     ));
@@ -121,6 +123,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let raw_req = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i64;
                 let request = rustpython_host_env::fcntl::normalize_ioctl_request(raw_req);
+                // The integer arm comes first, before the argument is ever
+                // looked at as a buffer.
+                if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
+                    let arg = args[2];
+                    // `mutate_arg` defaults true, and is consulted only for an
+                    // exporter that is neither `bytes` nor `str` — those two
+                    // always take the read-only form however it is set.
+                    let mutate = if args.len() >= 4 {
+                        crate::baseobjspace::is_true(args[3])?
+                    } else {
+                        true
+                    };
+                    let immutable =
+                        unsafe { pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg) };
+                    if mutate
+                        && !immutable
+                        && let Ok((slice, _owner, _made_view)) =
+                            unsafe { crate::builtins::fileio_writebuf(arg) }
+                    {
+                        return ioctl_mutable(fd, request, slice);
+                    }
+                    return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
+                }
                 let arg = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
                 } else {
@@ -345,4 +370,115 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             cst!("F_GETPIPE_SZ", libc::F_GETPIPE_SZ);
         }
     }
+}
+
+/// `fcntl_ioctl_impl`'s `IOCTL_BUFSZ` / `fcntl_fcntl_impl`'s `FCNTL_BUFSZ` —
+/// the staging buffer a copied argument is handed to the kernel in.  Both are
+/// 1024.
+#[cfg(all(unix, feature = "host_env"))]
+const ARG_BUFSZ: usize = 1024;
+
+/// The `guard` both impls write after the staged argument.  A request
+/// whose payload is longer than the argument the caller supplied overwrites
+/// it, and that is the only way the overrun can be seen at all — so the bytes
+/// are the module's, verbatim, starting with the NUL the staged copy is
+/// terminated by.
+#[cfg(all(unix, feature = "host_env"))]
+const ARG_GUARD: [u8; 8] = [0x00, 0xfa, 0x69, 0xc4, 0x67, 0xa3, 0x6c, 0x58];
+
+/// The third argument as `PyArg_Parse(arg, "s*")` reads it: any readable
+/// buffer, or a `str`'s UTF-8, which `readbuf_w` alone does not accept.
+#[cfg(all(unix, feature = "host_env"))]
+fn arg_readbuf(
+    arg: pyre_object::PyObjectRef,
+    callable: &str,
+) -> Result<&'static [u8], crate::PyError> {
+    if unsafe { pyre_object::is_str(arg) } {
+        return Ok(crate::baseobjspace::str_utf8_w(arg)?.as_bytes());
+    }
+    unsafe { crate::builtins::acquire_readbuf(arg) }.map_err(|_| {
+        let type_name = unsafe { pyre_object::type_name_of(arg) };
+        crate::PyError::type_error(format!(
+            "{callable}() argument 3 must be an integer, a bytes-like object, \
+             or a string, not {type_name}"
+        ))
+    })
+}
+
+/// Run `ioctl` with `arg` as its third argument, reporting the errno on
+/// failure.
+#[cfg(all(unix, feature = "host_env"))]
+fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, crate::PyError> {
+    let ret = {
+        let _blocked = crate::module::thread::before_external_block();
+        unsafe { libc::ioctl(fd, request, ptr as *mut libc::c_void) }
+    };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(crate::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("ioctl: {e}"),
+        ));
+    }
+    Ok(ret)
+}
+
+/// A staging buffer holding `arg` followed by the guard, or `None` when `arg`
+/// is longer than the staging buffer and has to be handed over as it is.
+#[cfg(all(unix, feature = "host_env"))]
+fn stage_arg(arg: &[u8]) -> Option<Vec<u8>> {
+    if arg.len() > ARG_BUFSZ {
+        return None;
+    }
+    let mut buf = vec![0u8; ARG_BUFSZ + ARG_GUARD.len()];
+    buf[..arg.len()].copy_from_slice(arg);
+    buf[arg.len()..arg.len() + ARG_GUARD.len()].copy_from_slice(&ARG_GUARD);
+    Some(buf)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+fn guard_intact(buf: &[u8], len: usize) -> Result<(), crate::PyError> {
+    if buf[len..len + ARG_GUARD.len()] == ARG_GUARD {
+        return Ok(());
+    }
+    Err(crate::PyError::system_error("buffer overflow"))
+}
+
+/// The writable-exporter arm: the kernel's answer lands back in the caller's
+/// own storage and the call returns the syscall's value.  An argument longer
+/// than the staging buffer is handed over directly, so there is no guard to
+/// check and no length to refuse.
+#[cfg(all(unix, feature = "host_env"))]
+fn ioctl_mutable(
+    fd: i32,
+    request: libc::c_ulong,
+    arg: &mut [u8],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let Some(mut buf) = stage_arg(arg) else {
+        let ret = ioctl_ptr(fd, request, arg.as_mut_ptr())?;
+        return Ok(pyre_object::w_int_new(ret as i64));
+    };
+    let ret = ioctl_ptr(fd, request, buf.as_mut_ptr())?;
+    arg.copy_from_slice(&buf[..arg.len()]);
+    guard_intact(&buf, arg.len())?;
+    Ok(pyre_object::w_int_new(ret as i64))
+}
+
+/// The read-only arm: the answer is the staged copy, returned as bytes of the
+/// argument's own length.  This one does refuse an over-long argument, because
+/// the kernel can only be given the staging buffer.
+#[cfg(all(unix, feature = "host_env"))]
+fn ioctl_readonly(
+    fd: i32,
+    request: libc::c_ulong,
+    arg: &[u8],
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let Some(mut buf) = stage_arg(arg) else {
+        return Err(crate::PyError::value_error("ioctl argument 3 is too long"));
+    };
+    ioctl_ptr(fd, request, buf.as_mut_ptr())?;
+    guard_intact(&buf, arg.len())?;
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+        &buf[..arg.len()],
+    ))
 }
