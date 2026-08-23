@@ -519,6 +519,8 @@ pub struct InlineFrame {
 /// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py`,
 /// `:2487`; depth scan `:1390`). Innermost level last.
 pub struct WalkSession {
+    /// The root frame's `is_being_profiled` portal green for this walk.
+    pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
@@ -558,6 +560,7 @@ pub struct WalkSession {
 impl Default for WalkSession {
     fn default() -> Self {
         Self {
+            is_being_profiled: false,
             framestack: Vec::new(),
             abort_in_subwalk: false,
             tmpreg_r: OpRef::NONE,
@@ -2520,8 +2523,9 @@ pub enum DispatchError {
     /// `jit_merge_point/cIRFIRF` could not derive its green key from the
     /// op's green operands. pyre's portal jitdriver greens =
     /// `[next_instr, is_being_profiled, pycode]` (`eval.rs`), so the
-    /// green key is `make_green_key(concrete(gr[0]=pycode),
-    /// concrete(gi[0]=next_instr))`. This fires when the int/ref green
+    /// green key is `make_green_key` at `(concrete(gr[0]=pycode),
+    /// concrete(gi[0]=next_instr))`, with the walk's own
+    /// `is_being_profiled`. This fires when the int/ref green
     /// list is empty or its leading element has no concrete Int/Ref —
     /// either a codewriter shape mismatch or (pre-Phase-5) the greens
     /// weren't seeded with concretes. RPython parity:
@@ -9285,7 +9289,11 @@ fn walker_foriter_green_key<Sym: WalkSym>(
     }
     let foriter_start_pc =
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc) as usize;
-    Some(crate::driver::make_green_key(w_code, foriter_start_pc))
+    Some(crate::driver::make_green_key(
+        w_code,
+        foriter_start_pc,
+        ctx.session.borrow().is_being_profiled,
+    ))
 }
 
 fn mark_trace_reads_module_global(
@@ -11702,6 +11710,9 @@ fn handle<Sym: WalkSym>(
         // slot containing the jdindex; the `c` spelling stores the jdindex
         // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
+            // Copy the walk green before any mutable session borrow in this
+            // handler; key construction and greenboxes must use one value.
+            let is_being_profiled = ctx.session.borrow().is_being_profiled;
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
@@ -11839,12 +11850,15 @@ fn handle<Sym: WalkSym>(
                     fbw_root_code.is_none_or(|root| root as *const () != cc as *const ())
                 });
             if let Some(callee_code) = callee_code {
-                let callee_key =
-                    crate::driver::make_green_key(callee_code as *const (), next_instr);
+                let callee_key = crate::driver::make_green_key(
+                    callee_code as *const (),
+                    next_instr,
+                    is_being_profiled,
+                );
                 let (driver, _) = crate::driver::driver_pair();
                 let greenboxes = [
                     Value::Int(next_instr as i64),
-                    Value::Int(0),
+                    Value::Int(is_being_profiled as i64),
                     Value::Ref(majit_ir::GcRef(callee_code)),
                 ];
                 let red_types = [Type::Ref, Type::Ref];
@@ -11881,12 +11895,15 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        let callee_key =
-                            crate::driver::make_green_key(callee_code as *const (), next_instr);
+                        let callee_key = crate::driver::make_green_key(
+                            callee_code as *const (),
+                            next_instr,
+                            is_being_profiled,
+                        );
                         let (driver, _) = crate::driver::driver_pair();
                         let greenboxes = [
                             Value::Int(next_instr as i64),
-                            Value::Int(0),
+                            Value::Int(is_being_profiled as i64),
                             Value::Ref(majit_ir::GcRef(callee_code)),
                         ];
                         let red_types = [Type::Ref, Type::Ref];
@@ -11908,7 +11925,7 @@ fn handle<Sym: WalkSym>(
                         .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?
                 }
             };
-            let key = crate::driver::make_green_key(code_ptr, next_instr);
+            let key = crate::driver::make_green_key(code_ptr, next_instr, is_being_profiled);
 
             // pyjitpl.py: a jit_merge_point is a loop CROSSING
             // only when a `loop_header` op (the lowered `can_enter_jit`
@@ -12369,7 +12386,11 @@ fn handle<Sym: WalkSym>(
                     .collect();
                 ctx.trace_ctx.add_merge_point_with_key(
                     key,
-                    Some(crate::driver::make_green_key_typed(code_ptr, next_instr)),
+                    Some(crate::driver::make_green_key_typed(
+                        code_ptr,
+                        next_instr,
+                        is_being_profiled,
+                    )),
                     green_boxes,
                     next_instr,
                 );

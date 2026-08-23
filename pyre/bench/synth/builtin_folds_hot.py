@@ -13,6 +13,16 @@
 # arm on that host.  The gate clears the highest folded reading by 20% and still
 # sits an order of magnitude under the residual arm scaled to it.
 #
+# Those three-runner readings predate two changes to how these folds are
+# recorded.  The `Int1` and `Float1` channels became elidable calls, so a fold
+# whose operand does not change is hoisted out of the loop instead of called
+# once per iteration.  And `min` / `max` over a pair of exact machine ints
+# stopped emitting a call at all: what is guarded is the ordering of the two
+# unboxed values, and under that ordering the answer is the winning operand's
+# own reference.  darwin-arm64 reads 2.0x / 2.2x where it read 4.6x / 4.7x.
+# The ceiling is unchanged: it was fitted to a reading from all three runners,
+# and only a reading from all three can replace it.
+#
 # pyre-check: spec-folds=builtin_fold1,builtin_fold2
 # This fixture carried a wasm allowance of 13 while every folded builtin still
 # left the trace module: a fold removes the frame force, the argument rooting,
@@ -52,7 +62,10 @@
 #                      length, not a type.
 #   abs_int/abs_float  one builtin holding two rows, one per result channel.
 #   min_max            the `Ref2` channel — the helper returns one of its own
-#                      arguments, so nothing is allocated at all.
+#                      arguments, so nothing is allocated at all.  A pair of
+#                      exact machine ints does not reach the helper: the
+#                      ordering guard picks the winner and the answer is that
+#                      operand's own reference.
 HASH_N = 32000000
 ORD_N = 32000000
 ABS_N = 32000000

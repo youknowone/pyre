@@ -504,7 +504,7 @@ pub(crate) fn range_foriter_demoted(key: u64) -> bool {
 /// unrelated body guard at the same loop can never demote the site.
 ///
 /// `site_key` is the key the marker carries — the FOR_ITER's own
-/// `make_green_key(w_code, foriter_start_pc)`, which is what
+/// `make_green_key` at `(w_code, foriter_start_pc)`, which is what
 /// [`range_foriter_demoted`] is later asked about before the site specializes
 /// again.  It is not the key the failing trace was entered at.
 pub fn range_foriter_demote_once(site_key: u64) -> bool {
@@ -1241,7 +1241,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // so the decline is permanent for this process: retraces bypass the
     // walker and the key re-interprets without JIT instead of being
     // permanently blacklisted (`DONT_TRACE_HERE`).
-    if carrier.is_none() && !fbw_declined(crate::driver::make_green_key(w_code, start_pc)) {
+    if carrier.is_none()
+        && !fbw_declined(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            concrete_frame.get_is_being_profiled(),
+        ))
+    {
         let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr, WalkJournals::Reset);
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
@@ -1762,7 +1768,11 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let entry_depth = ctx.virtualref_boxes_len();
     let pre_virtualref_boxes = ctx.snapshot_virtualref_boxes();
     let pre_pos = ctx.get_trace_position();
-    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
+    let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
+    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
+        is_being_profiled,
+        ..Default::default()
+    });
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
     // A prior walk's blackhole image must not be adopted as this drain's
@@ -1808,6 +1818,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // frame vable, not a callee MIFrame).
     let Some((pending, argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
         ctx,
+        is_being_profiled,
         recipe,
         root_ec,
         root_ec_box,
@@ -2213,6 +2224,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
 ) -> Option<majit_ir::OpRef> {
+    let is_being_profiled = session.borrow().is_being_profiled;
     // `descr_call`'s tail: no frame to reconstruct and no bytecode to walk.
     // Discarding the child's result and answering with the instance IS its
     // whole body, so perform it here instead of driving a frame.
@@ -2244,6 +2256,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     }
     let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
         ctx,
+        is_being_profiled,
         middle,
         root_ec,
         root_ec_box,
@@ -3514,7 +3527,11 @@ fn run_perfn_walk<Sym: WalkSym>(
     cf_addr: usize,
     authoritative: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
-    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
+    let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
+    let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
+        is_being_profiled,
+        ..Default::default()
+    });
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         eprintln!("[walk-perfn] no per-CodeObject PyJitCode for code={w_code:?}");
         return None;
@@ -3570,7 +3587,11 @@ fn run_perfn_walk<Sym: WalkSym>(
             );
         }
         fbw_bridge_decline(ctx);
-        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        fbw_decline(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            is_being_profiled,
+        ));
         return None;
     };
     // A kept-stack branch-guard bridge resumes at the guard's OWN mid-opcode
@@ -3603,7 +3624,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                 );
             }
             fbw_bridge_decline(ctx);
-            fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+            fbw_decline(crate::driver::make_green_key(
+                w_code,
+                start_pc,
+                is_being_profiled,
+            ));
             return None;
         }
     }
@@ -3622,7 +3647,11 @@ fn run_perfn_walk<Sym: WalkSym>(
             );
         }
         fbw_bridge_decline(ctx);
-        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        fbw_decline(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            is_being_profiled,
+        ));
         return None;
     }
 
@@ -5870,6 +5899,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     cf_addr: usize,
     journals: WalkJournals,
 ) -> TraceAction {
+    let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
     // #125: decline up front when a loop body carries an `abort_permanent`
     // marker.  The authoritative walk would otherwise mis-seed the loop
     // guard, exit early, and concretely double-execute the post-loop tail;
@@ -5885,7 +5915,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             let owner = describe_abort_permanent_owner(w_code, abort_pc);
             eprintln!("[fbw-abort] start_pc={start_pc} abort_permanent_pc={abort_pc} {owner}");
         }
-        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        fbw_decline(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            is_being_profiled,
+        ));
         return TraceAction::Decline;
     }
     if loop_iterates_send_generator(cf_addr, start_pc) {
@@ -5895,7 +5929,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 "[fbw-abort] start_pc={start_pc} SEND generator iterator; declining before delegation"
             );
         }
-        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        fbw_decline(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            is_being_profiled,
+        ));
         return TraceAction::Decline;
     }
     // Sibling defense to the above, transitively through inlined callees: a
@@ -5913,7 +5951,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 hit.callee_name, hit.marker_jit_pc
             );
         }
-        fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+        fbw_decline(crate::driver::make_green_key(
+            w_code,
+            start_pc,
+            is_being_profiled,
+        ));
         return TraceAction::Decline;
     }
     // Register the initial merge point with typed input-arg boxes so the trace head
@@ -5946,7 +5988,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // treat the resume pc as a fresh loop header (the portal entry signature),
     // which only a MAIN trace should do.  So skip it for bridges.
     if !ctx.is_bridge_trace {
-        let start_key = crate::driver::make_green_key(w_code, start_pc);
+        let start_key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
         let input_types = ctx.inputarg_types();
         let input_args: Vec<majit_metainterp::GreenBox> = input_types
             .iter()
@@ -5957,7 +5999,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             .collect();
         ctx.add_merge_point_with_key(
             start_key,
-            Some(crate::driver::make_green_key_typed(w_code, start_pc)),
+            Some(crate::driver::make_green_key_typed(
+                w_code,
+                start_pc,
+                is_being_profiled,
+            )),
             input_args,
             start_pc,
         );
@@ -5993,12 +6039,13 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // green key to the true merge point (cut-to-inner-loop);
                 // start_pc closes at the trace head.
                 if loop_header_pc != start_pc {
-                    let target_key = crate::driver::make_green_key(w_code, loop_header_pc);
+                    let target_key =
+                        crate::driver::make_green_key(w_code, loop_header_pc, is_being_profiled);
                     ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
                     ctx.header_pc = loop_header_pc;
                     ctx.cut_inner_green_key = Some(target_key);
                 } else {
-                    let key = crate::driver::make_green_key(w_code, start_pc);
+                    let key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
                     ctx.set_green_key(key, (w_code as usize, start_pc));
                     ctx.header_pc = start_pc;
                 }
@@ -6172,7 +6219,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // concretely. Record the bridge-guard decline too, the way
                 // `ExcEdgeNoInFrameCatch` below does.
                 DE::GotoIfNotValueNotConcrete { .. } => {
-                    fbw_decline(crate::driver::make_green_key(w_code, start_pc));
+                    fbw_decline(crate::driver::make_green_key(
+                        w_code,
+                        start_pc,
+                        is_being_profiled,
+                    ));
                     fbw_bridge_decline(ctx);
                     TraceAction::Abort
                 }
@@ -6198,8 +6249,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!("[fbw-abort] start_pc={start_pc} run_perfn_walk returned None");
             }
-            if fbw_declined(crate::driver::make_green_key(w_code, start_pc))
-                || (ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()))
+            if fbw_declined(crate::driver::make_green_key(
+                w_code,
+                start_pc,
+                is_being_profiled,
+            )) || (ctx.is_bridge_trace && FBW_BRIDGE_DECLINED.with(|c| c.get()))
             {
                 TraceAction::Decline
             } else {

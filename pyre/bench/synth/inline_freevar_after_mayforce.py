@@ -32,8 +32,10 @@
 # failed decode leaves two guards failing on nearly every iteration, while
 # guarding the callee namespace through the portal/root frame compiles an
 # endless chain of equally failing bridges.  With both frame properties
-# preserved, guard failures stay at 471 and local native ratios are 10.3x
-# dynasm / 15.9x cranelift versus PyPy.
+# preserved the guard-failure count reaches a fixed point instead of growing
+# with the iteration count; the 471 it once settled at belongs to a smaller N
+# and an older baseline, and what it settles at now is what the committed
+# baselines carry.
 from fractions import Fraction
 
 
@@ -45,25 +47,27 @@ from fractions import Fraction
 # and moved between two runs of one binary -- 923/6 loops against 925/7 here,
 # 923/6 against 938/8 on ubuntu and 922 against 923 on windows. Convergence
 # completes by 48000 on both native backends, and past it every gated counter is
-# independent of N: dynasm holds 1003 guard failures and cranelift 1008, with
-# six loops and five bridges, unchanged from 48000 through 96000. This sits far
-# enough above that point to keep the fixed point on a host that needs a few
-# more iterations to reach it.
+# independent of N: the loop, bridge and guard-failure values the committed
+# baselines carry hold from 48000 through 96000. This sits far enough above that
+# point to keep the fixed point on a host that needs a few more iterations to
+# reach it.
 #
-# The fixed point was seven loops and 1007/1012 guard failures for as long as
-# the blackhole recognized `catch_exception/L`: once jd0's staticdata carries
-# the assembler's real opcode ids instead of the 255 `op_live` sentinel, an
-# exception it used to let escape is caught, and the extra loop plus three
-# guard failures are that arm being compiled. `driver_finish_setup` still
-# installs those ids, but the arm is no longer reached, so the counters sit
-# below that pair on both native backends. Whatever stopped reaching it is
-# unattributed; the wasm backend never reached the arm at all, which is why its
-# baseline never moved off six.
+# Seven loops and the third guard failure are the `catch_exception/L` arm being
+# compiled: once jd0's staticdata carries the assembler's real opcode ids
+# instead of the 255 `op_live` sentinel, an exception the blackhole used to let
+# escape is caught. That arm stopped being reached for a while and the counters
+# fell back to six loops; it is reached again as of `d6408935b3c`, and all three
+# legs agreed on the way back up, which is what the current baselines record.
+# Two things about that return are unattributed. The guard failures did not come
+# back to the 1007/1012 pair the arm earned historically but to 1005/1009. And
+# wasm gained the loop as well -- its baseline moved off six at the same commit
+# -- while its guard failures stayed at 1004, so on that backend the arm costs a
+# loop and no guard failure.
 #
-# At six loops the guard counts have alternated between 1004/1009 and 1003/1008
-# across runs while the loop and bridge counts held. Only the loop count answers
-# whether the arm compiles, so treat a one-count move here as the unattributed
-# remainder rather than as this fixture's subject.
+# The committed baselines are seven loops, five bridges, and 1005 dynasm / 1009
+# cranelift / 1004 wasm. Only the loop count answers whether the arm compiles,
+# so treat a one-count guard-failure move as the unattributed remainder rather
+# than as this fixture's subject.
 N = 64000
 
 

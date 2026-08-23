@@ -25,7 +25,17 @@
 //! answer where the builtin would have raised, returned something else, or run
 //! app-level code.  Nothing here allocates: the result box is emitted as
 //! `wrapint` / `wrapfloat` / `newbool` in the trace instead, where the
-//! optimizer can keep it virtual.
+//! optimizer can keep it virtual.  Every helper must also be a pure function
+//! of its arguments: the same operands must always produce the same answer.
+//! That is what lets the trace record a call as elidable, so the optimizer may
+//! serve a loop's copy from an earlier identical one; a helper whose answer
+//! drifted would be answered once and reused forever.  The int and float
+//! channels are recorded that way; the reference channel satisfies the same
+//! requirement but is still emitted as a plain call, for a reason that belongs
+//! with the emission and is recorded at
+//! `try_walker_specialize_builtin_fold2`.  That site also answers a pair of
+//! exact machine ints without reaching this module at all, by guarding the
+//! ordering of the two operands instead of calling anything.
 
 use pyre_object::{PY_NULL, PyObjectRef};
 
@@ -107,6 +117,14 @@ pub struct BuiltinFold {
 /// fresh `int`.  The trace emits this call as one that cannot collect, so it
 /// carries no gcmap and spills no reference registers; allocating under it
 /// would leave the collector blind.  Decline and let the interpreter allocate.
+///
+/// `hash_value` memoizes a string's digest through `w_str_set_hash`; that write
+/// is compatible with elidability because it stores the digest the next call
+/// would recompute, and `EffectInfo.__new__` drops `_write_descrs_*` for every
+/// `EF_ELIDABLE_*` for exactly this shape.  Every other admitted arm reads a
+/// content- or value-determined digest, and the one arm that is neither -- a
+/// NaN `float`, which reaches `default_identity_hash_value` -- already
+/// declines.
 extern "C" fn jit_builtin_hash(obj: i64) -> i64 {
     let obj = obj as PyObjectRef;
     if obj.is_null() {
@@ -247,6 +265,11 @@ fn compare_pair(a: PyObjectRef, b: PyObjectRef, want_second_wins: bool) -> Optio
 
 /// `min(a, b)` — `builtin_min`'s two-positional form: keep the first argument
 /// unless the second compares strictly smaller.
+///
+/// The helper returns one of its own arguments after comparing two exact
+/// machine ints or two non-NaN floats, so the answer is fixed by the pair, as
+/// the table requires.  A NaN operand, whose winner would depend on the scan
+/// order, already declines.
 extern "C" fn jit_builtin_min2(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
     if a.is_null() || b.is_null() {
@@ -260,6 +283,11 @@ extern "C" fn jit_builtin_min2(a: i64, b: i64) -> i64 {
 }
 
 /// `max(a, b)` — the `builtin_max` twin of [`jit_builtin_min2`].
+///
+/// Like [`jit_builtin_min2`], this helper returns one of its own arguments
+/// after an exact machine-int or non-NaN float comparison, so the answer is
+/// fixed by the pair.  A NaN operand already declines instead of preserving a
+/// scan-order-dependent winner.
 extern "C" fn jit_builtin_max2(a: i64, b: i64) -> i64 {
     let (a, b) = (a as PyObjectRef, b as PyObjectRef);
     if a.is_null() || b.is_null() {
