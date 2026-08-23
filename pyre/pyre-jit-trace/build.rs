@@ -67,7 +67,7 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/jitcodes.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/jitcodes_index.bin"),
-        bincode::serialize(&(Vec::<String>::new(), vec![0_u32])).unwrap(),
+        bincode::serialize(&(Vec::<String>::new(), Vec::<String>::new(), vec![0_u32])).unwrap(),
     )
     .unwrap();
     std::fs::write(
