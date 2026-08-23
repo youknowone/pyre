@@ -9976,12 +9976,32 @@ pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> String {
     }
 }
 
+/// `typeobject.py W_TypeObject.is_heaptype` as the four readers of a type's
+/// owner need it: true when `__module__` lives in the type's own dict rather
+/// than in the prefix of its name.
+///
+/// pyre carries two heaptype bits, because either kind of type can be
+/// published with the other's public flags — a `TypeDef` marked through
+/// `mark_cpython_heap_type`, and an app-level class marked with CPython's
+/// static-type flags (`_contextvars.Context`, a static `PyContext_Type`
+/// there).  A projection moves the flags a program reads; it does not move
+/// where the type stores its owner, so either bit means the dict is the
+/// place to look and the name prefix is for a type that has no dict entry.
+///
+/// # Safety
+/// `w_type` must be a valid `W_TypeObject`.
+pub unsafe fn type_owner_is_in_dict(w_type: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::w_type_is_cpython_heaptype(w_type) || pyre_object::w_type_is_heaptype(w_type)
+    }
+}
+
 /// [`getfulltypename`] for an already-resolved type.
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
+    if !unsafe { type_owner_is_in_dict(w_type) } {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
@@ -10002,7 +10022,7 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
     let name = w_type_get_name(w_type).to_string();
-    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
+    if !unsafe { type_owner_is_in_dict(w_type) } {
         return name;
     }
     let module = lookup_in_type_where(w_type, "__module__")
@@ -10073,7 +10093,7 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
+    if !unsafe { type_owner_is_in_dict(w_type) } {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();

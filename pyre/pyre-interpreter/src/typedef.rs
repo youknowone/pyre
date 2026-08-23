@@ -12100,11 +12100,13 @@ fn init_type_type(ns: PyObjectRef) {
             // `typeobject.py get_module`:
             //     if self.is_heaptype():
             //         return self.getdictvalue(space, '__module__')
-            // Only a heaptype reads `__module__` from its dict; a builtin
-            // type derives it from the qualified name.  `lookup_in_type`
-            // filters out null entries but preserves `w_none()`, matching
-            // PyPy's "value present even if it's None" semantic.
-            if unsafe { pyre_object::w_type_is_cpython_heaptype(cls) }
+            // A class reads `__module__` from its dict; a builtin type derives
+            // it from the qualified name.  `type_owner_is_in_dict` is that
+            // question, asked the same way by the three readers that render a
+            // name out of the answer.  `lookup_in_type` filters out null
+            // entries but preserves `w_none()`, matching PyPy's "value present
+            // even if it's None" semantic.
+            if unsafe { crate::baseobjspace::type_owner_is_in_dict(cls) }
                 && let Some(v) = crate::type_dict_lookup(cls, "__module__")
                 && !v.is_null()
             {
