@@ -39,7 +39,10 @@ struct ApplevelForkCallbacks {
 /// `known_type` half of `self.flags`), so `is_dir`/`is_file`/`is_symlink`
 /// answer from it without a stat when it is not `DT_UNKNOWN`; it defaults to
 /// `DT_UNKNOWN` (`0`) — the value for a host or filesystem that reports no
-/// type — which falls through to the stat.
+/// type — which falls through to the stat.  `enum_tag` is the reparse tag the
+/// same enumeration reported (`0` for a name that is no reparse point), which
+/// is what `is_junction` reads; only a Windows directory walk fills it, and
+/// `DirEntry_is_junction` reads the same tag off `win32_lstat` there.
 /// The layout carries no instance dict; `name`/`path` are read-only getset
 /// descriptors, so the type is not instantiable and not acceptable as a base.
 #[crate::pyre_class("posix.DirEntry", cpython_heaptype)]
@@ -52,6 +55,7 @@ pub struct W_DirEntry {
     pub dir_fd: i32,
     pub enum_ino: i64,
     pub enum_type: i32,
+    pub enum_tag: i64,
 }
 
 /// Native owner for `posix.ScandirIterator` entries and enumeration state.
@@ -1656,7 +1660,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(windows)]
         fn entry_fits(name: &[u8], value: &[u8]) -> Result<(), crate::PyError> {
             const MAX_ENV: usize = 32767;
-            let units = |bytes: &[u8]| String::from_utf8_lossy(bytes).encode_utf16().count();
+            // Through the same decoder the name reaches the API by, so a
+            // lone surrogate is counted as the one unit it is written as
+            // rather than as whatever a lossy decode substitutes for it.
+            let units =
+                |bytes: &[u8]| crate::typedef::fsdecode_wtf8_total(bytes).encode_wide().count();
             if units(name) + 1 + units(value) > MAX_ENV {
                 return Err(crate::PyError::value_error(format!(
                     "the environment variable is longer than {MAX_ENV} characters"
@@ -5125,6 +5133,170 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .map(|st| stat_fields_from_statstruct(&st))
     }
 
+    /// `find_data_to_file_info` followed by `_Py_attribute_data_to_stat` --
+    /// the `lstat` a directory walk already knows, read out of the
+    /// `WIN32_FIND_DATAW` it reported rather than from a call of its own.
+    ///
+    /// A find record carries no link count, no file index and no volume, and
+    /// `find_data_to_file_info` zeroes the `BY_HANDLE_FILE_INFORMATION` it
+    /// fills, so `st_nlink`, `st_ino` and `st_dev` all read `0` on an entry
+    /// that came out of `scandir`. `DirEntry.inode` is what goes back to the
+    /// name for the identity.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn stat_fields_from_find_data(
+        data: &windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW,
+    ) -> StatFields {
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+        // A `FILETIME` counts 100ns ticks from 1601-01-01.
+        const SECS_BETWEEN_EPOCHS: i64 = 11_644_473_600;
+
+        fn filetime_to_time(ft: windows_sys::Win32::Foundation::FILETIME) -> (i64, i64) {
+            let ticks = ((ft.dwHighDateTime as i64) << 32) | (ft.dwLowDateTime as i64);
+            (
+                ticks / 10_000_000 - SECS_BETWEEN_EPOCHS,
+                (ticks % 10_000_000) * 100,
+            )
+        }
+
+        let attrs = data.dwFileAttributes;
+        let reparse_tag = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            data.dwReserved0
+        } else {
+            0
+        };
+        let mut mode = if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            S_IFDIR | 0o111
+        } else {
+            S_IFREG
+        };
+        mode |= if attrs & FILE_ATTRIBUTE_READONLY != 0 {
+            0o444
+        } else {
+            0o666
+        };
+        if reparse_tag == IO_REPARSE_TAG_SYMLINK {
+            mode = (mode & !S_IFMT) | S_IFLNK;
+        }
+
+        let (birthtime, birthtime_nsec) = filetime_to_time(data.ftCreationTime);
+        let (mtime, mtime_nsec) = filetime_to_time(data.ftLastWriteTime);
+        let (atime, atime_nsec) = filetime_to_time(data.ftLastAccessTime);
+        StatFields {
+            mode: mode as i64,
+            ino: 0,
+            dev: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: ((data.nFileSizeHigh as i64) << 32) | (data.nFileSizeLow as i64),
+            atime,
+            mtime,
+            // `st_ctime` is the creation time here, which is the copy
+            // `DirEntry_from_find_data` makes across from `st_birthtime`.
+            ctime: birthtime,
+            atime_ns: whole_ns(atime, atime_nsec),
+            mtime_ns: whole_ns(mtime, mtime_nsec),
+            ctime_ns: whole_ns(birthtime, birthtime_nsec),
+            file_attributes: attrs,
+            reparse_tag,
+            birthtime,
+            birthtime_ns: whole_ns(birthtime, birthtime_nsec),
+        }
+    }
+
+    /// The `DT_*` an entry's find data decides, so `is_dir`, `is_file` and
+    /// `is_symlink` answer from the walk rather than from the name.  A reparse
+    /// point that is not a symlink -- a junction, or any other tag -- is the
+    /// directory or file its attribute word says it is, which is how
+    /// `DirEntry_test_mode` reads `FILE_ATTRIBUTE_DIRECTORY` for everything
+    /// its `win32_lstat` did not spell `S_IFLNK`.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn find_data_known_type(fields: &StatFields) -> u8 {
+        match fields.mode as u32 & S_IFMT {
+            S_IFLNK => DT_LNK,
+            S_IFDIR => DT_DIR,
+            _ => DT_REG,
+        }
+    }
+
+    /// `os_scandir_impl`'s Windows arm -- `FindFirstFileW` over the directory
+    /// joined to `*.*`.  It is the one directory walk that hands each entry's
+    /// `WIN32_FIND_DATAW` back, which is what lets a `DirEntry` answer
+    /// `is_dir`, `is_file` and `stat` without returning to the name, and so
+    /// keep answering after the name is removed.
+    ///
+    /// `join_path_filenameW` puts a separator between the directory and the
+    /// name unless the directory already ends in one or in a drive's colon,
+    /// and it leaves an empty directory empty -- `FindFirstFileW("")` then
+    /// fails the way `os.scandir("")` reports.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn win_scandir_each(
+        path: &[u8],
+        mut each: impl FnMut(&[u8], &[u8], StatFields),
+    ) -> std::io::Result<()> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
+        };
+
+        const SEP_UNIT: u16 = b'\\' as u16;
+        const ALTSEP_UNIT: u16 = b'/' as u16;
+        const COLON_UNIT: u16 = b':' as u16;
+
+        fn join_path_filename(prefix: &[u16], name: &[u16]) -> Vec<u16> {
+            let mut joined = prefix.to_vec();
+            if let Some(&last) = joined.last() {
+                if last != SEP_UNIT && last != ALTSEP_UNIT && last != COLON_UNIT {
+                    joined.push(SEP_UNIT);
+                }
+                joined.extend_from_slice(name);
+            }
+            joined
+        }
+
+        let prefix: Vec<u16> = os_str_from_bytes(path).encode_wide().collect();
+        let mut pattern = join_path_filename(&prefix, &[b'*' as u16, b'.' as u16, b'*' as u16]);
+        pattern.push(0);
+
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &mut data) };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        loop {
+            let len = data
+                .cFileName
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(data.cFileName.len());
+            let name_units = &data.cFileName[..len];
+            let dot = [b'.' as u16];
+            let dotdot = [b'.' as u16, b'.' as u16];
+            if name_units != dot && name_units != dotdot {
+                let name = std::ffi::OsString::from_wide(name_units);
+                let full = std::ffi::OsString::from_wide(&join_path_filename(&prefix, name_units));
+                each(
+                    name.as_encoded_bytes(),
+                    full.as_encoded_bytes(),
+                    stat_fields_from_find_data(&data),
+                );
+            }
+            if unsafe { FindNextFileW(handle, &mut data) } == 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { FindClose(handle) };
+                return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+        }
+    }
+
     /// Where the `host_env::posix`-backed implementations below are compiled.
     /// Elsewhere those names are the noop placeholders registered near the top
     /// of this function, which cannot serve a descriptor.
@@ -5462,7 +5634,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     /// Answer `is_dir`/`is_file`/`is_symlink` from the enumeration `d_type`
     /// when it decides the question, else `None` to fall through to a stat
-    /// (`interp_scandir.py:399-426`).  `target` is the `DT_*` the query wants.
+    /// (`W_DirEntry.is_dir` / `.is_file` / `.is_symlink`).  A Windows walk
+    /// reports the type for every entry, so only a followed query on a symlink
+    /// reaches the stat there -- which is the
+    /// `need_stat = follow_symlinks && is_symlink` of `DirEntry_test_mode`.
+    /// `target` is the `DT_*` the query wants.
     /// An unknown type never decides.  A symlink decides every query but a
     /// followed `is_dir`/`is_file`, which need the target's type instead.
     fn dir_entry_kind_from_type(known: u8, target: u8, follow: bool) -> Option<bool> {
@@ -5533,26 +5709,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         };
         Ok(pyre_object::w_bool_from(ans))
     }
+    /// `os_DirEntry_is_symlink_impl`.  `is_symlink` never follows, so a known
+    /// non-`DT_LNK` type answers `false` and `DT_LNK` answers `true`; only
+    /// `DT_UNKNOWN` needs the lstat.
+    fn dir_entry_is_symlink_value(args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
+        match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_LNK, false) {
+            Some(b) => Ok(b),
+            None => Ok(dir_entry_kind(args, false)? == Some(S_IFLNK)),
+        }
+    }
     fn dir_entry_is_symlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        // `is_symlink` never follows, so a known non-`DT_LNK` type answers `false`
-        // and `DT_LNK` answers `true`; only `DT_UNKNOWN` needs the lstat.
-        let ans = match dir_entry_kind_from_type(dir_entry_known_type(args[0]), DT_LNK, false) {
-            Some(b) => b,
-            None => dir_entry_kind(args, false)? == Some(S_IFLNK),
-        };
-        Ok(pyre_object::w_bool_from(ans))
+        Ok(pyre_object::w_bool_from(dir_entry_is_symlink_value(args)?))
     }
     fn dir_entry_is_junction(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `DirEntry_is_junction` -- the lstat's reparse tag naming a mount
         // point. A name that is no reparse point at all carries tag 0.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
-            let (w_path, path) = dir_entry_path(_args[0])?;
-            let fields =
-                win_stat_fields(&path, false).map_err(|e| fs_err_with_filename(e, w_path))?;
+            // The walk reported that tag, so the answer costs no call and
+            // survives the name being removed.
+            const IO_REPARSE_TAG_MOUNT_POINT: i64 = 0xA000_0003;
+            let de = W_DirEntry::from_obj(_args[0])
+                .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
             return Ok(pyre_object::w_bool_from(
-                fields.reparse_tag == IO_REPARSE_TAG_MOUNT_POINT,
+                de.enum_tag == IO_REPARSE_TAG_MOUNT_POINT,
             ));
         }
         // POSIX has no junction points.
@@ -5667,27 +5847,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// does.)  Only a successful fetch is cached; an error re-raises on each
     /// call.  The entry never moves (`allocate_stable`), so the raw receiver
     /// stays valid across the fetch's allocation.
-    fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = args[0];
-        let follow = dir_entry_follow(args)?;
+    fn dir_entry_get_lstat(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         {
             let de = W_DirEntry::from_obj(self_obj)
                 .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
-            let cached = if follow { de.w_stat } else { de.w_lstat };
-            if !cached.is_null() {
-                return Ok(cached);
+            if !de.w_lstat.is_null() {
+                return Ok(de.w_lstat);
             }
         }
         let dir_fd = dir_entry_dir_fd(self_obj)?;
         let (w_path, path) = dir_entry_path(self_obj)?;
-        let result = dir_entry_fetch_stat(w_path, &path, follow, dir_fd)?;
+        let result = dir_entry_fetch_stat(w_path, &path, false, dir_fd)?;
         let de = W_DirEntry::from_obj(self_obj)
             .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
-        if follow {
-            de.w_stat = result;
-        } else {
-            de.w_lstat = result;
+        de.w_lstat = result;
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+        Ok(result)
+    }
+    fn dir_entry_stat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = args[0];
+        let follow = dir_entry_follow(args)?;
+        if !follow {
+            return dir_entry_get_lstat(self_obj);
         }
+        {
+            let de = W_DirEntry::from_obj(self_obj)
+                .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+            if !de.w_stat.is_null() {
+                return Ok(de.w_stat);
+            }
+        }
+        // `os_DirEntry_stat_impl` returns to the name for a followed stat only
+        // where the entry is a symlink; anything else is its own `lstat`, and
+        // `get_stat` (interp_scandir.py) decides it the same way. An entry
+        // whose walk reported the `lstat` has therefore answered both.
+        let receiver = [self_obj];
+        let result = if dir_entry_is_symlink_value(&receiver)? {
+            let dir_fd = dir_entry_dir_fd(self_obj)?;
+            let (w_path, path) = dir_entry_path(self_obj)?;
+            dir_entry_fetch_stat(w_path, &path, true, dir_fd)?
+        } else {
+            dir_entry_get_lstat(self_obj)?
+        };
+        let de = W_DirEntry::from_obj(self_obj)
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
+        de.w_stat = result;
         // `result` may be a nursery object stored into the stable entry; join
         // the remembered set so the next minor collection forwards it.
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
@@ -6039,6 +6243,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         full.extend_from_slice(name);
         full
     }
+    /// The reparse tag a walk's stat carries.  Only Windows has one; every
+    /// other host answers `0`, which is the "no reparse point" the field means
+    /// there too.
+    fn stat_fields_reparse_tag(_fields: &StatFields) -> i64 {
+        #[cfg(windows)]
+        let tag = _fields.reparse_tag as i64;
+        #[cfg(not(windows))]
+        let tag = 0i64;
+        tag
+    }
+
+    /// `lstat` is the stat the enumeration itself reported, which only a walk
+    /// reading `WIN32_FIND_DATAW` has; it is built and cached here so
+    /// `entry.stat()` answers from it (`DirEntry_from_find_data`).  Elsewhere
+    /// it is `None` and the first `stat()` goes to the name.
     fn scandir_push_entry(
         list_slot: usize,
         bytes_mode: bool,
@@ -6047,19 +6266,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         dir_fd: i32,
         enum_ino: i64,
         enum_type: u8,
+        lstat: Option<StatFields>,
     ) {
         let _entry_scope = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, name));
         let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, full));
+        // The built result is pinned before the entry is allocated, so a
+        // moving collection during `allocate_stable` forwards it.
+        let lstat_slot = lstat.as_ref().map(|fields| {
+            let _ = pyre_object::gc_roots::pin_root(stat_result_from_fields(fields, 0));
+            pyre_object::gc_roots::shadow_stack_len() - 1
+        });
         let _ = pyre_object::gc_roots::pin_root(W_DirEntry::allocate_stable(W_DirEntry::default()));
-        let obj = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        let obj =
+            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         let de = W_DirEntry::from_obj(obj).expect("freshly allocated posix.DirEntry");
         de.w_name = pyre_object::gc_roots::shadow_stack_get(base);
         de.w_path = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        de.w_lstat = lstat_slot.map_or(pyre_object::PY_NULL, |slot| {
+            pyre_object::gc_roots::shadow_stack_get(slot)
+        });
         de.dir_fd = dir_fd;
         de.enum_ino = enum_ino;
         de.enum_type = enum_type as i32;
+        de.enum_tag = lstat.map_or(0, |fields| stat_fields_reparse_tag(&fields));
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe { pyre_object::w_list_append(list, obj) };
@@ -6101,7 +6332,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // so both come back as `str`. Every entry records the
                 // descriptor so its own stat resolves the bare name against it.
                 fd_readdir(fd, |name, ino, d_type| {
-                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type);
+                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type, None);
                 })
                 .map_err(|errno| errno_err_with_filename(errno, w_path()))?;
             }
@@ -6123,17 +6354,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let errno = readdir_collect(dirp, |name, ino, d_type| {
                     let full = join_dir_name(path, name);
-                    scandir_push_entry(list_slot, bytes_mode, name, &full, -1, ino, d_type);
+                    scandir_push_entry(
+                        list_slot, bytes_mode, name, &full, -1, ino, d_type, None,
+                    );
                 });
                 unsafe { libc::closedir(dirp) };
                 if errno != 0 {
                     return Err(errno_err_with_filename(errno, w_path()));
                 }
             }
+            // `FindFirstFileW` reports each entry's whole `WIN32_FIND_DATAW`,
+            // so the type and the `lstat` are both known without a second
+            // call and the entry keeps answering after the name is removed.
+            // A find record carries no file index, so `inode()` alone goes
+            // back to the name.
+            #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+            _ => {
+                win_scandir_each(path, |name, full, fields| {
+                    let known_type = find_data_known_type(&fields);
+                    scandir_push_entry(
+                        list_slot,
+                        bytes_mode,
+                        name,
+                        full,
+                        -1,
+                        -1,
+                        known_type,
+                        Some(fields),
+                    );
+                })
+                .map_err(|e| fs_err_with_filename(e, w_path()))?;
+            }
             // No raw `readdir` to read the dirent from (wasm, the sandbox seam,
             // or a build without `host_env`), so `d_type` is unknown and
             // `is_dir` stats; the inode is still free from the dirent on unix.
-            #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+            #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
             _ => {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                     .map_err(|e| fs_err_with_filename(e, w_path()))?;
@@ -6156,6 +6411,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         -1,
                         enum_ino,
                         DT_UNKNOWN,
+                        None,
                     );
                 }
             }
