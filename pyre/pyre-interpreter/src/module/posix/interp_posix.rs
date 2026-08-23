@@ -4468,6 +4468,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ),
     );
 
+    // ── posix._inputhook() / posix._is_inputhook_installed() ──
+    // `PyOS_InputHook` is the seam a C extension (readline, Tk) installs a
+    // callback in so the REPL can pump its event loop while it waits for a
+    // line.  `_pyrepl`'s console reads both at start-up — `unix_console.py`
+    // and `windows_console.py` each answer `input_hook` with
+    // `posix._inputhook` when `posix._is_inputhook_installed()` says one is
+    // there — so a missing name is an `AttributeError` out of the interactive
+    // prompt, not a feature nobody asks for.
+    //
+    // Nothing in pyre publishes that seam, so the answers are the ones the
+    // calls give with no hook installed: `False`, and the 0 the absent hook
+    // would have returned.
+    crate::module_ns_store(
+        ns,
+        "_inputhook",
+        crate::make_builtin_function_with_arity("_inputhook", |_| Ok(pyre_object::w_int_new(0)), 0),
+    );
+    crate::module_ns_store(
+        ns,
+        "_is_inputhook_installed",
+        crate::make_builtin_function_with_arity(
+            "_is_inputhook_installed",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
+    );
+
     // ── posix.urandom(n) → bytes ──
     crate::module_ns_store(
         ns,
