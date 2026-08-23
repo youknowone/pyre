@@ -927,13 +927,65 @@ fn walk_jitcode_code_roots_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    for jc in sd.jitcodes.iter() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let probe = probe14_enabled();
+    for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
         let wrapper =
             pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as usize;
-        if wrapper != 0 {
-            let mut root = majit_ir::GcRef(wrapper);
-            visitor(&mut root);
+        if wrapper == 0 {
+            continue;
         }
+        if probe {
+            PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
+            probe14_note_nursery(
+                "CODE WRAPPER",
+                wrapper,
+                jc.payload.jitcode.name(),
+                jitcode_index,
+            );
+        }
+        let mut root = majit_ir::GcRef(wrapper);
+        visitor(&mut root);
+        if probe && root.0 != wrapper {
+            let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+            if n <= 20 {
+                eprintln!(
+                    "[probe14] RELOCATION DISCARDED #{n}: code wrapper 0x{wrapper:x} -> 0x{:x} \
+                     (jitcode {jitcode_index}/{}) -- the `code_ptr -> wrapper` registry still \
+                     holds the old address",
+                    root.0,
+                    sd.jitcodes.len(),
+                );
+            }
+        }
+    }
+}
+
+/// Report a root that sits in the nursery at walk time.
+///
+/// Both halves of this area document an invariant that forbids it — the code
+/// wrappers because `malloc_typed_stable` places them outside the nursery, the
+/// constants because with tagged ints disabled they are old-gen or immortal —
+/// and the minor-collection skip is justified by exactly that.  One counter-
+/// example refutes the skip.
+fn probe14_note_nursery(kind: &str, addr: usize, name: &str, jitcode_index: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !majit_gc::gc_is_nursery_object(addr) {
+        return;
+    }
+    let n = PROBE14_NURSERY.fetch_add(1, Relaxed) + 1;
+    if n <= 20 {
+        // Address and header word only.  Reading the object's TYPE here is not
+        // sound: measured, on the run that aborts the slot is already invalid
+        // at walk time, and `type_name_of` returned a multi-kilobyte garbage
+        // string from unmapped bytes.  The header word says the same thing
+        // safely — a plausible type id means the corpse is still ahead.
+        let header = unsafe { (addr as *const usize).offset(-1).read_unaligned() };
+        eprintln!(
+            "[probe14] NURSERY ROOT #{n}: {kind} 0x{addr:x} header={header:#x} in jitcode \
+             {jitcode_index} {name:?} -- this area skips minor collections, so nothing \
+             keeps it alive"
+        );
     }
 }
 
@@ -1394,6 +1446,18 @@ pub static PROBE14_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static PROBE14_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Companion witnesses for the OTHER half of this area, the `code_ptr ->
+/// wrapper` roots, and for the invariant a relocation count cannot test.
+///
+/// The constants half skips minor collections outright, so a movable object in
+/// the pool is never offered for relocation there — it simply dies.  A
+/// relocation counter therefore cannot refute "no movable object is in this
+/// pool"; membership of the nursery at walk time can, and it is the property
+/// both halves' documented invariants actually assert.
+pub static PROBE14_CODE_SLOTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn probe14_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1414,6 +1478,14 @@ fn walk_jitcode_constants_refs_in(
         for (pool_slot, &slot) in jc.payload.jitcode.constants_r.iter().enumerate() {
             let mut gcref = majit_ir::GcRef(slot as usize);
             let before = gcref.0;
+            if probe {
+                probe14_note_nursery(
+                    "CONSTANT",
+                    before,
+                    jc.payload.jitcode.name(),
+                    jitcode_index,
+                );
+            }
             visitor(&mut gcref);
             if probe {
                 PROBE14_SLOTS.fetch_add(1, Relaxed);
@@ -1467,11 +1539,13 @@ fn walk_jitcode_constants_refs_in(
         // out.  Cover every early walk, then thin out.
         if walks <= 50 || walks % 50 == 0 {
             eprintln!(
-                "[probe14] ARMED walk={} slots_cumulative={} relocated_cumulative={} \
-                 jitcodes={}",
+                "[probe14] ARMED walk={} slots_cumulative={} code_slots_cumulative={} \
+                 relocated_cumulative={} nursery_cumulative={} jitcodes={}",
                 walks,
                 PROBE14_SLOTS.load(Relaxed),
+                PROBE14_CODE_SLOTS.load(Relaxed),
                 PROBE14_RELOCATED.load(Relaxed),
+                PROBE14_NURSERY.load(Relaxed),
                 sd.jitcodes.len(),
             );
         }

@@ -4771,49 +4771,69 @@ fn register_thread_root_areas() {
         register(
             pyframe_root_walker_area,
             pyre_interpreter::eval::capture_pyframe_root_area(),
+            "pyframe",
         );
         register(
             pyre_object_root_walker_area,
             pyre_object::gc_roots::capture_shadow_stack_area(),
+            "pyre_object_shadow_stack",
+        );
+        // Two registrations over one `data`, not one walker over two
+        // populations: the areas are what the collector names when a root
+        // fails validation, and `code wrappers` and `constants_r` have
+        // separate invariants, separate producers and separate fixes.  Fused,
+        // the report named neither.
+        register(
+            jitcode_code_root_walker_area,
+            pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+            "jitcode_code_wrappers",
         );
         register(
             jitcode_constants_root_walker_area,
             pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+            "jitcode_constants",
         );
         register(
             fbw_store_journal_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
+            "fbw_store_journal",
         );
         register(
             fbw_finish_concrete_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+            "fbw_finish_concrete",
         );
         register(
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
+            "walk_end",
         );
         register(
             mapdict_root_walker_area,
             pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
+            "mapdict",
         );
         register(
             repr_active_root_walker_area,
             pyre_interpreter::display::capture_repr_active_area(),
+            "repr_active",
         );
         #[cfg(not(target_arch = "wasm32"))]
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
+            "signal_handler",
         );
         register(
             jit_callee_frame_root_walker_area,
             crate::call_jit::capture_jit_callee_frame_root_area(),
+            "jit_callee_frame",
         );
-        register(rd_consts_root_walker_area, jit_driver);
-        register(partial_trace_root_walker_area, jit_driver);
-        register(active_trace_root_walker_area, jit_driver);
-        register(compile_snapshot_root_walker_area, jit_driver);
-        register(forced_virtuals_root_walker_area, jit_driver);
+        register(rd_consts_root_walker_area, jit_driver, "rd_consts");
+        register(partial_trace_root_walker_area, jit_driver, "partial_trace");
+        register(active_trace_root_walker_area, jit_driver, "active_trace");
+        register(compile_snapshot_root_walker_area, jit_driver, "compile_snapshot");
+        register(forced_virtuals_root_walker_area, jit_driver, "forced_virtuals");
         // The ephemeron half of the walker above, on the same `data` so the
         // prune reaches exactly the drivers the root walk reaches.
         majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
@@ -5597,10 +5617,27 @@ unsafe fn jitcode_constants_root_walker_area(
     {
         return;
     }
-    unsafe {
-        pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor);
-        pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor);
+    unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
+}
+
+/// The `code_ptr -> wrapper` half of the population the comment above
+/// describes, registered separately so a failing root names it.
+///
+/// Same minor-collection skip and the same justification for it: a wrapper is
+/// placed by `malloc_typed_stable`, so it is not a nursery object and a minor
+/// collection has nothing to do here.  `PYRE_PROBE14=1` tests that claim
+/// directly rather than by its relocation consequence.
+unsafe fn jitcode_code_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if !pyre_object::tagged_int::CAN_BE_TAGGED
+        && majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        return;
     }
+    unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
