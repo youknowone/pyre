@@ -750,14 +750,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pyre_object::w_int_new(host_termios::VTIME as i64),
     );
 
-    // `interp_termios.py:18 class W_TermiosError(OperationError)` —
-    // wraps OSError so `except termios.error` catches tcsetattr failures.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
-        .expect("OSError must be installed before termios init");
+    // `interp_termios.py Cache.__init__`:
+    //   self.w_error = space.new_exception_class("termios.error")
+    // `new_exception_class` with no bases derives from `Exception`, so
+    // `termios.error` is not an OSError subclass; `convert_error` still names
+    // it as the class to raise, which is what `except termios.error` catches.
+    let w_exception = crate::builtins::lookup_exc_class("Exception")
+        .expect("Exception must be installed before termios init");
     let w_error = crate::builtins::make_exc_type(
         "termios.error",
         crate::builtins::exc_exception_new,
-        w_os_error,
+        w_exception,
     );
     crate::module_ns_store(ns, "error", w_error);
 }
