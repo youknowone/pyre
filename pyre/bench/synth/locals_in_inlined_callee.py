@@ -30,6 +30,17 @@
 #   fastlocals, so the fold declines and the residual answers; the freevar's
 #   name is part of the expected set, which is what catches a fold that took
 #   the shape anyway.
+#
+# `probe_closure` is also what holds `loops_compiled` at 3.  Once
+# `load_deref_value` carries `PyreHelperKind::LoadDeref` its callee classifies
+# `DeferredCall` and is admitted for inlining, and the `locals()` the fold still
+# declines there residualizes and forces the callee virtualizable.  The abort
+# that follows is a property of the body, so without a deny the next attempt
+# rebuilds it byte for byte until `MAX_TRACE_ABORT_COUNT` retires the enclosing
+# green key: measured on this fixture, 2 loops against 10 aborts.  Refusing to
+# inline that callee from the first escape reads 3 against 6 -- the loop count
+# the fold alone reaches, and one abort more, which is the single attempt the
+# deny costs before it takes effect.
 
 
 def helper_locals(x):
