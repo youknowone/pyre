@@ -240,17 +240,6 @@ mod imp {
         ))
     }
 
-    /// Whether the call carried a keyword at all. The gateway appends its own
-    /// marker entry to the kwargs dict, which is not one of them.
-    fn has_keywords(kwargs: Option<PyObjectRef>) -> bool {
-        let Some(dict) = kwargs else {
-            return false;
-        };
-        unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
-            .iter()
-            .any(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
-    }
-
     /// The wording a boundary with no keyword table gives one anyway. It
     /// qualifies itself with the module, which the clinic's keyword binder
     /// does not.
@@ -266,7 +255,7 @@ mod imp {
         count: usize,
     ) -> Result<&'a [PyObjectRef], crate::PyError> {
         let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if has_keywords(kwargs) {
+        if crate::builtins::has_real_kwargs(kwargs) {
             return Err(no_keywords(name));
         }
         if pos.len() != count {
@@ -282,7 +271,7 @@ mod imp {
     /// count is checked by the call machinery rather than by a converter.
     fn single_arg(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
         let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if has_keywords(kwargs) {
+        if crate::builtins::has_real_kwargs(kwargs) {
             return Err(no_keywords(name));
         }
         if pos.len() != 1 {
