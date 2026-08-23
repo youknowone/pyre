@@ -407,12 +407,18 @@ jobs:
       # the format cannot silently turn every consumer into "not checked". It
       # is `#[ignore]`d because it spawns `python3`, which is why it is pinned
       # to Linux: `python3` is not a name that resolves on the windows runner.
-      # `prepass` is named because `--no-default-features` applies to the
-      # selected package: without it the build script writes placeholders and
-      # refuses outside an LLBC extraction.
+      # The test target is named under the same `--all` feature set as the
+      # two steps above so it reuses what they compiled: `-p pyre-jit-trace`
+      # resolves `pyre-interpreter` differently and rebuilt 61 crates, and
+      # `pyre-jit-trace` cannot name `cpyext` itself -- the feature belongs
+      # to `pyre-interpreter`. `prepass` need not be named either: the
+      # workspace selection enables it through `pyrex`, where naming it
+      # beside `-p pyre-jit-trace` was what kept the build script off its
+      # placeholder path. Measured locally, 139s and 281s for those two
+      # forms against 3s for this one, with 0 crates compiled.
       run: |
-        cargo test --no-default-features --features dynasm,prepass,cpyext \
-          -p pyre-jit-trace --test llbc_fingerprint_format_test -- --ignored
+        cargo test --all --no-default-features --features dynasm,cpyext \
+          --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)
       shell: bash
