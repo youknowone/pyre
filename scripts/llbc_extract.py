@@ -338,7 +338,7 @@ def include_closure(root: Path, files: set[Path]) -> set[Path]:
         source = root / rel_source
         if not source.is_file():
             continue
-        text = source.read_text(encoding="utf-8", errors="replace")
+        text = read_input_bytes(root, rel_source).decode("utf-8", errors="replace")
         for call in _INCLUDE_CALL.finditer(text):
             line = text.count("\n", 0, call.start()) + 1
             where = f"{rel_source.as_posix()}:{line}"
@@ -755,6 +755,31 @@ def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
     return result
 
 
+# File contents read while hashing and while scanning for `include*!`
+# arguments, keyed by repo-relative path and validated against the file's
+# size and mtime on every hit, so a caller that rewrites an input between two
+# walks (the selftest does, per case) reads the new bytes without having to
+# know about this memo. `forget_collected_inputs` drops it with the input
+# walks it serves. One `--fingerprint --per-crate` over the four pyre crates
+# hashes the interpreter's closure three times over (the `source=` fallback,
+# `closure=`, and the include scan) and the jit's on top, which on a windows
+# runner is the cost of the step — every read there goes through the
+# real-time scanner, where a stat does not.
+_file_bytes_cache: dict[Path, tuple[int, int, bytes]] = {}
+
+
+def read_input_bytes(root: Path, path: Path) -> bytes:
+    """`(root / path).read_bytes()`, memoised while the file's stat holds."""
+    full_path = root / path
+    stat = full_path.stat()
+    hit = _file_bytes_cache.get(path)
+    if hit is not None and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns:
+        return hit[2]
+    data = full_path.read_bytes()
+    _file_bytes_cache[path] = (stat.st_size, stat.st_mtime_ns, data)
+    return data
+
+
 def forget_collected_inputs() -> None:
     """Drop the memoised input sets, because the tree they describe has moved.
 
@@ -767,6 +792,7 @@ def forget_collected_inputs() -> None:
     input set.
     """
     _inputs_cache.clear()
+    _file_bytes_cache.clear()
 
 
 def _collect_inputs(
@@ -1202,7 +1228,7 @@ def _repo_fingerprint(
         digest.update(b"\0")
         full_path = eng.root / path
         if full_path.is_file():
-            digest.update(full_path.read_bytes())
+            digest.update(read_input_bytes(eng.root, path))
         elif full_path.exists():
             # A directory in the input list is never a source file. Hashing it
             # below would fold it to one constant token that no edit inside it
