@@ -4058,9 +4058,9 @@ impl MiniMarkGC {
                  (minor={}, header_addr={:#x}, nursery_start={:#x}, site={}, \
                  parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
-                 holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?}, \
+                 holder_type_id={:?}, holder_offset={:?}, holder_words={}, \
                  child_tid_and_flags={:#x}, child_flag_complement={:#x}, \
-                 child_words={:#x?}, child_vtable_type_id={:?}, \
+                 child_words={}, child_vtable_type_id={:?}, \
                  nearest_header={}, \
                  child_nursery_offset={:#x}, child_gen={}, holder_gen={}, \
                  holder_tid_and_flags={:#x}, holder_in_remembered={}, \
@@ -4077,12 +4077,12 @@ impl MiniMarkGC {
                 holder_addr,
                 holder_type_id,
                 slot_addr.checked_sub(holder_addr),
-                holder_words,
+                Self::hex_words(&holder_words),
                 unsafe { (*hdr_ptr).tid_and_flags },
                 // FORWARDED_MARKER sets every flag bit, so a corpse whose
                 // 64-bit equality no longer holds names the cleared bit here.
                 (!unsafe { (*hdr_ptr).flags() }) as u32,
-                child_words,
+                Self::hex_words(&child_words),
                 self.vtable_to_type_id.get(&child_words[0]).copied(),
                 self.describe_nearest_header(obj_addr),
                 obj_addr.wrapping_sub(self.nursery.start_ptr() as usize),
@@ -5454,6 +5454,18 @@ impl MiniMarkGC {
         Some(GcHeader::SIZE + payload_size)
     }
 
+    /// The eight words read out of a holder or a child, on one line.
+    ///
+    /// The crash-triage extractors in `check.py` and `cpython_tests/run.py`
+    /// keep only the first line of a panic body, and the two array formats Rust
+    /// offers each give up something: `{:x?}` drops the `0x` every other
+    /// address in the message carries, and `{:#x?}` puts each element on a line
+    /// of its own, which is a line those extractors never read.
+    fn hex_words(words: &[usize; 8]) -> String {
+        let hex: Vec<String> = words.iter().map(|word| format!("{word:#x}")).collect();
+        format!("[{}]", hex.join(", "))
+    }
+
     /// Which generation an address falls in.
     ///
     /// A corrupt child separates into two unrelated defects depending on the
@@ -5635,8 +5647,8 @@ impl MiniMarkGC {
                 panic!(
                     "GC BUG: invalid major child type_id={} at child_addr={:#x} \
                      holder_addr={:#x} holder_type_id={} slot_addr={:#x} \
-                     holder_offset={:?} site={} holder_words={:#x?} \
-                     child_vtable_type_id={:?} child_words={:#x?} \
+                     holder_offset={:?} site={} holder_words={} \
+                     child_vtable_type_id={:?} child_words={} \
                      holder_tid_and_flags={:#x} holder_in_remembered={} \
                      child_gen={} holder_gen={} \
                      enclosing={} gc_state={:?} minors={} majors={}",
@@ -5647,9 +5659,9 @@ impl MiniMarkGC {
                     slot_addr,
                     slot_addr.checked_sub(holder_addr),
                     site,
-                    holder_words,
+                    Self::hex_words(&holder_words),
                     child_vtable_type_id,
-                    child_words,
+                    Self::hex_words(&child_words),
                     holder_hdr.tid_and_flags,
                     self.remembered_set.contains(&holder_addr),
                     self.describe_generation(addr),

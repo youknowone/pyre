@@ -195,15 +195,18 @@ def jit_panic_reason(stderr: str) -> str | None:
         lines = stderr.splitlines()
         for idx, line in enumerate(lines):
             if "panicked" in line:
-                reason = f"rust panic: {line.strip()[:200]}"
+                reason = f"rust panic: {line.strip()[:80]}"
                 # Rust's default hook prints the panic MESSAGE on the line(s)
                 # after 'panicked at file:line:col:'. That body carries the
                 # actionable detail; the location line alone cannot triage a
-                # crash from a CI log, so append the first message line.
+                # crash from a CI log, so append the first message line, at the
+                # width check.py uses — 200 cut the GC's `invalid major child`
+                # diagnostic at `holder_words`, which is where the fields that
+                # name the culprit start.
                 for follow in lines[idx + 1:]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:200]}"
+                        reason += f" | {follow[:1200]}"
                         break
                 return reason
         return "rust panic"
