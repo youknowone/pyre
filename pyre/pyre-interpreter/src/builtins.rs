@@ -5912,16 +5912,14 @@ fn type_descr_new_with_metaclass(
         // not supply it.
         //
         // `ensure_module_attr` reaches the caller through
-        // `getexecutioncontext().gettopframe_nohidden()`, which starts at
-        // `gettopframe()`, whose `topframeref()` deref forces the frame.  The
-        // `CURRENT_FRAME` thread-local this used to read arrives at the same
-        // frame while forcing nothing, and the force is the whole point: it is
-        // what `tracing_after_residual_call` reads back as the callee having
-        // escaped the virtualizable, so a trace whose body creates a class
-        // aborts here instead of recording a class object it will then guard
-        // on.  Pyre's `gettopframe_nohidden` leaves the force to its consumers
-        // (see `force_frame`), and reading `w_globals` below is the consuming
-        // field read.
+        // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
+        // rather than through the `CURRENT_FRAME` thread-local.  No force is
+        // owed here: the walk only dereferences the vref and follows
+        // `f_backref`, and `force_frame` belongs to the consumers that hand a
+        // frame to application code.  `w_globals` is a declared virtualizable
+        // field, but no walk writes it on the live frame —
+        // `restore_resume_state_from` leaves it and `pycode` out of the resume
+        // restore as frame-invariant — so its heap slot is already current.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -5931,12 +5929,6 @@ fn type_descr_new_with_metaclass(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
-                // The force reaches the JIT's virtualizable writeback through a
-                // backend hook whose callee this crate cannot follow, so it is
-                // judged as able to collect.
-                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-                crate::executioncontext::force_frame(frame);
-                let frame = anchor.live();
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()
                     && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?
