@@ -35,6 +35,23 @@
 //! which would fold `float_truediv(1.0, 0.0)` to `inf`; widening it is one
 //! line in `execute_binary_float_const`, not in this funnel.
 //!
+//! # A caller holding only a `Backend` cannot be routed
+//!
+//! `TraceCtx::set_cpu` installs a `majit_backend::Backend`, and that is what
+//! `TraceCtx::field_sanity_load` reads a field through. The fold here needs a
+//! `majit_backend::model::Cpu` — an unrelated trait, no supertrait relation,
+//! its own `bh_getfield_gc_i`. So the `vable_getfield_{int,ref,float}` /
+//! `vable_arraylen_vable` family cannot be routed as it stands: reaching for
+//! `cpu::default_cpu()` would fold the memory read through a stand-in while
+//! the stamp came from the real backend — two readers of one field, which is
+//! the disagreement the D3 rule above exists to rule out.
+//!
+//! What makes it *only* a wiring gap is that `MetaInterp` holds both objects
+//! at the three sites where it calls `ctx.set_cpu(Some(&self.backend))`. Until
+//! it hands over the second one too, those arms stay on `record_op_with_descr`.
+//! Operations that read no memory are exempt and say so at the call site —
+//! `_nonstandard_virtualizable`'s `PTR_EQ` is the one that takes the exemption.
+//!
 //! # Heapcache invalidation stays outside
 //!
 //! Upstream's `_record_helper` calls `heapcache.invalidate_caches`. Here
