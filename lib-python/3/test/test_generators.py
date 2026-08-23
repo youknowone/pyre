@@ -317,17 +317,20 @@ class GeneratorTest(unittest.TestCase):
         # Test a freshly created generator (not suspended)
         g = generator(DetectDelete())
         g.close()
+        support.gc_collect()  # For PyPy or other GCs.
         self.assertTrue(DetectDelete.deleted)
 
         # Test a suspended generator
         g = generator(DetectDelete())
         next(g)
         g.close()
+        support.gc_collect()  # For PyPy or other GCs.
         self.assertTrue(DetectDelete.deleted)
 
         # Clear via gi_frame.clear()
         g = generator(DetectDelete())
         g.gi_frame.clear()
+        support.gc_collect()  # For PyPy or other GCs.
         self.assertTrue(DetectDelete.deleted)
 
 class ModifyUnderlyingIterableTest(unittest.TestCase):
