@@ -799,7 +799,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("htons() missing argument"));
                 }
-                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
+                let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
             },
             1,
@@ -814,7 +814,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("ntohs() missing argument"));
                 }
-                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
+                let x = c_uint_converter(args[0], 0xffff, "uint16_t")? as u16;
                 Ok(pyre_object::w_int_new(u16::from_be(x) as i64))
             },
             1,
@@ -829,7 +829,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("htonl() missing argument"));
                 }
-                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
+                let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
                 Ok(pyre_object::w_int_new(x.to_be() as i64))
             },
             1,
@@ -844,7 +844,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("ntohl() missing argument"));
                 }
-                let x = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u32;
+                let x = c_uint_converter(args[0], 0xffff_ffff, "uint32_t")? as u32;
                 Ok(pyre_object::w_int_new(u32::from_be(x) as i64))
             },
             1,
@@ -941,6 +941,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let r = unsafe {
                         rffi::inet_pton(af, c_ip.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void)
                     };
+                    // `inet_pton` separates the two failures: a negative
+                    // return is a family it has no parser for and leaves
+                    // `EAFNOSUPPORT` behind, a zero is an address string it
+                    // parsed and rejected.
+                    if r < 0 {
+                        return Err(crate::PyError::os_error_syscall(
+                            rffi::last_error_code(),
+                            pyre_object::PY_NULL,
+                        ));
+                    }
                     if r != 1 {
                         return Err(crate::PyError::os_error(
                             "illegal IP address string passed to inet_pton",
@@ -1105,37 +1115,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes.clone())
+                    let c = std::ffi::CString::new(host_bytes)
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let _netdb = rffi::netdb_lock();
-                    let he = unsafe { rffi::host_by_name(c.as_ptr()) };
-                    if he.is_null() {
-                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
+                    // `rsocket.gethostbyname` is `makeipaddr(name, INETAddress())`
+                    // and `socket_gethostbyname` is `setipaddr(name, AF_INET)`:
+                    // both resolve, neither calls the `gethostbyname` of the
+                    // same name, so a name that does not resolve reports
+                    // `gaierror` rather than a message of this module's own.
+                    let storage = resolve_ip_host(&c, rffi::AF_INET)?;
+                    let sin = unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in) };
+                    let packed = rffi::sockaddr_in_get_addr(sin);
+                    let Some(text) = rffi::inet_ntoa(packed.to_ne_bytes()) else {
                         return Err(socket_converted_error(
-                            "gaierror",
+                            "error",
                             None,
-                            &format!("gethostbyname failed for {host_repr}"),
+                            "gethostbyname: address is not representable",
                         ));
-                    }
-                    unsafe {
-                        let first_addr = rffi::pointer_at(rffi::hostent_addr_list(he), 0);
-                        if rffi::hostent_length(he) != 4 || first_addr.is_null() {
-                            return Err(socket_converted_error(
-                                "gaierror",
-                                None,
-                                "gethostbyname: no IPv4 address",
-                            ));
-                        }
-                        let packed = std::ptr::read_unaligned(first_addr as *const u32);
-                        let Some(text) = rffi::inet_ntoa(packed.to_ne_bytes()) else {
-                            return Err(socket_converted_error(
-                                "gaierror",
-                                None,
-                                "gethostbyname: address is not representable",
-                            ));
-                        };
-                        Ok(pyre_object::w_str_new(&text))
-                    }
+                    };
+                    Ok(pyre_object::w_str_new(&text))
                 },
                 1,
             ),
@@ -1156,17 +1153,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes.clone())
+                    let c = std::ffi::CString::new(host_bytes)
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    // `rsocket.gethostbyname_ex` resolves the name first and
+                    // only then reads the `hostent`, so an unresolvable name
+                    // reports `gaierror` and a name the resolver knows but the
+                    // host database does not reports `herror`.
+                    resolve_ip_host(&c, rffi::AF_INET)?;
                     let _netdb = rffi::netdb_lock();
                     let he = unsafe { rffi::host_by_name(c.as_ptr()) };
                     if he.is_null() {
-                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
-                        return Err(socket_converted_error(
-                            "gaierror",
-                            None,
-                            &format!("gethostbyname_ex failed for {host_repr}"),
-                        ));
+                        return Err(host_lookup_error());
                     }
                     unpack_hostent(he)
                 },
@@ -1190,92 +1187,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes.clone())
+                    let c = std::ffi::CString::new(host_bytes)
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let _netdb = rffi::netdb_lock();
-                    // Try IPv4 first, then IPv6, then fall back to
-                    // gethostbyname → hostent.h_addr to obtain a raw
-                    // bytestring for gethostbyaddr.
-                    let mut buf4 = [0u8; 4];
-                    let r4 = unsafe {
-                        rffi::inet_pton(
-                            rffi::AF_INET,
-                            c.as_ptr(),
-                            buf4.as_mut_ptr() as *mut libc::c_void,
-                        )
-                    };
-                    let (family, addr_ptr, addr_len) = if r4 == 1 {
-                        (
-                            rffi::AF_INET,
-                            buf4.as_ptr() as *const libc::c_void,
-                            4 as rffi::SockLen,
-                        )
+                    // `rsocket.gethostbyaddr` is `makeipaddr(ip)` — the
+                    // argument is resolved for whichever family answers, not
+                    // required to be numeric — and only the reverse lookup that
+                    // follows reports through `h_errno`.
+                    let storage = resolve_ip_host(&c, rffi::AF_UNSPEC)?;
+                    let family = storage.ss_family as libc::c_int;
+                    // `gethostbyaddr` takes the bare address bytes, not the
+                    // whole `sockaddr`, and the accessors are what read them on
+                    // both platforms — WinSock wraps them in anonymous unions.
+                    let mut raw = [0u8; 16];
+                    let addr_len = if family == rffi::AF_INET6 {
+                        let sin6 =
+                            unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in6) };
+                        raw = rffi::sockaddr_in6_get_addr(sin6);
+                        16 as rffi::SockLen
                     } else {
-                        let mut buf6 = [0u8; 16];
-                        let r6 = unsafe {
-                            rffi::inet_pton(
-                                rffi::AF_INET6,
-                                c.as_ptr(),
-                                buf6.as_mut_ptr() as *mut libc::c_void,
-                            )
-                        };
-                        if r6 == 1 {
-                            // Borrowed pointer: we copy into a stable
-                            // buffer below so the lifetime crosses the
-                            // FFI call safely.
-                            let mut owned: [u8; 16] = buf6;
-                            let he = unsafe {
-                                rffi::host_by_addr(
-                                    owned.as_mut_ptr() as *const libc::c_void,
-                                    16 as rffi::SockLen,
-                                    rffi::AF_INET6,
-                                )
-                            };
-                            if he.is_null() {
-                                let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
-                                return Err(socket_converted_error(
-                                    "herror",
-                                    None,
-                                    &format!("gethostbyaddr failed for {host_repr}"),
-                                ));
-                            }
-                            return unpack_hostent(he);
-                        }
-                        // Fall back: name → hostent → first IPv4 addr
-                        let he = unsafe { rffi::host_by_name(c.as_ptr()) };
-                        if he.is_null() {
-                            let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
-                            return Err(socket_converted_error(
-                                "herror",
-                                None,
-                                &format!("gethostbyaddr failed for {host_repr}"),
-                            ));
-                        }
-                        unsafe {
-                            let first_addr =
-                                rffi::pointer_at(rffi::hostent_addr_list(he), 0);
-                            if first_addr.is_null() {
-                                return Err(socket_converted_error(
-                                    "herror",
-                                    None,
-                                    "gethostbyaddr: empty address list",
-                                ));
-                            }
-                            (
-                                rffi::hostent_addr_type(he),
-                                first_addr as *const libc::c_void,
-                                rffi::hostent_length(he) as rffi::SockLen,
-                            )
-                        }
+                        let sin = unsafe { &*(&storage as *const _ as *const rffi::sockaddr_in) };
+                        raw[..4]
+                            .copy_from_slice(&rffi::sockaddr_in_get_addr(sin).to_ne_bytes());
+                        4 as rffi::SockLen
                     };
-                    let he = unsafe { rffi::host_by_addr(addr_ptr, addr_len, family) };
+                    let _netdb = rffi::netdb_lock();
+                    let he = unsafe {
+                        rffi::host_by_addr(raw.as_ptr() as *const libc::c_void, addr_len, family)
+                    };
                     if he.is_null() {
-                        let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
-                        return Err(socket_converted_error(
-                            "herror",
-                            None,
-                            &format!("gethostbyaddr failed for {host_repr}"),
-                        ));
+                        return Err(host_lookup_error());
                     }
                     unpack_hostent(he)
                 },
@@ -1323,10 +1263,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )
                 };
                 if p.is_null() {
+                    // `rsocket.getservbyname` raises
+                    // `RSocketError("service/proto not found")`; neither it nor
+                    // `socket_getservbyname` names the service it looked for.
                     return Err(socket_converted_error(
                         "error",
                         None,
-                        &format!("service/proto not found: {name}"),
+                        "service/proto not found",
                     ));
                 }
                 let port = unsafe { u16::from_be(rffi::servent_port(p)) };
@@ -1344,7 +1287,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "getservbyport() missing argument",
                     ));
                 }
-                let port = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u16;
+                // `getservbyport` rejects a port outside the range before it
+                // narrows: taking the low sixteen bits of 70000 would look up
+                // 4464 and answer for it.
+                let port = unsafe { pyre_object::w_int_get_value(args[0]) };
+                if !(0..=0xffff).contains(&port) {
+                    return Err(crate::PyError::overflow_error(
+                        "getservbyport: port must be 0-65535.",
+                    ));
+                }
+                let port = port as u16;
                 let proto_c: Option<std::ffi::CString> =
                     if args.len() >= 2 && unsafe { pyre_object::is_str(args[1]) } {
                         let p = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
@@ -1365,10 +1317,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )
                 };
                 if p.is_null() {
+                    // `rsocket.getservbyport` raises
+                    // `RSocketError("port/proto not found")`, without the port.
                     return Err(socket_converted_error(
                         "error",
                         None,
-                        &format!("port/proto not found: {port}"),
+                        "port/proto not found",
                     ));
                 }
                 let name = unsafe {
@@ -2228,7 +2182,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 }
                 if !unsafe { pyre_object::is_tuple(args[0]) } {
                     return Err(crate::PyError::type_error(
-                        "getnameinfo: sockaddr must be a tuple",
+                        "getnameinfo() argument 1 must be a tuple",
                     ));
                 }
                 if !unsafe { pyre_object::is_int(args[1]) } {
@@ -2240,19 +2194,37 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 // Resolve sockaddr via getaddrinfo(AF_UNSPEC, SOCK_DGRAM,
                 // AI_NUMERICHOST) so we get a real sockaddr_storage,
                 // matching `interp_func.py:142-152`.
-                let host_obj = unsafe { pyre_object::w_tuple_getitem(args[0], 0) }
-                    .ok_or_else(|| crate::PyError::value_error("sockaddr: missing host"))?;
-                let port_obj = unsafe { pyre_object::w_tuple_getitem(args[0], 1) }
-                    .ok_or_else(|| crate::PyError::value_error("sockaddr: missing port"))?;
-                if !unsafe { pyre_object::is_str(host_obj) } {
-                    return Err(crate::PyError::type_error(
-                        "getnameinfo: sockaddr[0] must be a string",
-                    ));
+                //
+                // The tuple is parsed with `"si|II"` and a `;`-suffixed custom
+                // message, so every shape it rejects — a length outside two to
+                // four, a non-string host, a non-integer port — is the one
+                // TypeError below rather than a per-item message.
+                let sockaddr_len = unsafe { pyre_object::w_tuple_len(args[0]) };
+                let item = |i: i64| unsafe { pyre_object::w_tuple_getitem(args[0], i) };
+                let illegal_sockaddr =
+                    || crate::PyError::type_error("getnameinfo(): illegal sockaddr argument");
+                if !(2..=4).contains(&sockaddr_len) {
+                    return Err(illegal_sockaddr());
                 }
-                if !unsafe { pyre_object::is_int(port_obj) } {
-                    return Err(crate::PyError::type_error(
-                        "getnameinfo: sockaddr[1] must be an integer",
-                    ));
+                let host_obj = item(0).ok_or_else(illegal_sockaddr)?;
+                let port_obj = item(1).ok_or_else(illegal_sockaddr)?;
+                if !unsafe { pyre_object::is_str(host_obj) } || !unsafe { pyre_object::is_int(port_obj) }
+                {
+                    return Err(illegal_sockaddr());
+                }
+                // `flowinfo` is the third item, and its twenty bits are the
+                // only thing checked about it here — the address itself comes
+                // from the lookup below.
+                if let Some(flowinfo_obj) = item(2) {
+                    if !unsafe { pyre_object::is_int(flowinfo_obj) } {
+                        return Err(illegal_sockaddr());
+                    }
+                    let flowinfo = unsafe { pyre_object::w_int_get_value(flowinfo_obj) };
+                    if !(0..=0xfffff).contains(&flowinfo) {
+                        return Err(crate::PyError::overflow_error(
+                            "getnameinfo(): flowinfo must be 0-1048575.",
+                        ));
+                    }
                 }
                 let host = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
                 let port_v = unsafe { pyre_object::w_int_get_value(port_obj) };
@@ -2282,6 +2254,17 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         "error",
                         None,
                         "sockaddr resolved to multiple addresses",
+                    ));
+                }
+                // The extra items only exist for IPv6, so an IPv4 answer with
+                // any of them is refused — after the lookup, because until it
+                // returns the family is not known.
+                if ai.ai_family == rffi::AF_INET && sockaddr_len != 2 {
+                    unsafe { rffi::freeaddrinfo(head) };
+                    return Err(socket_converted_error(
+                        "error",
+                        None,
+                        "IPv4 sockaddr must be 2 tuple",
                     ));
                 }
                 let mut host_buf = [0 as libc::c_char; rffi::NI_MAXHOST as usize];
@@ -3082,12 +3065,76 @@ fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObject
     ])
 }
 
-/// Resolve `host` for `family` and hand back the first answer's `sockaddr`.
+/// `_PyLong_UInt16_Converter` / `_PyLong_UInt32_Converter`, the argument
+/// clinic converters `htons` / `ntohs` / `htonl` / `ntohl` declare.
 ///
-/// `rsocket.py makeipaddr` ends in
-/// `getaddrinfo(name, None, family=family, address_to_fill=result)` for every
-/// family it serves, and `rsocket.py getaddrinfo` answers a non-zero return
-/// with `raise GAIError(error)` — so a name that does not resolve reports
+/// `Py_ASNATIVEBYTES_ALLOW_INDEX` takes anything with `__index__`,
+/// `Py_ASNATIVEBYTES_REJECT_NEGATIVE` answers a negative value with
+/// `ValueError("Cannot convert negative int")`, and a value wider than the C
+/// type is an `OverflowError` naming that type.  Narrowing instead would make
+/// `htons(70000)` answer for port 4464.
+fn c_uint_converter(
+    obj: pyre_object::PyObjectRef,
+    max: u64,
+    ctype: &str,
+) -> Result<u64, crate::PyError> {
+    let obj = crate::baseobjspace::space_index(obj)?;
+    let negative = unsafe {
+        if pyre_object::is_long(obj) {
+            pyre_object::w_long_get_value(obj).get_sign() < 0
+        } else {
+            pyre_object::w_int_get_value(obj) < 0
+        }
+    };
+    if negative {
+        return Err(crate::PyError::value_error("Cannot convert negative int"));
+    }
+    match crate::baseobjspace::uint_w(obj) {
+        Ok(value) if value <= max => Ok(value),
+        _ => Err(crate::PyError::overflow_error(format!(
+            "Python int too large for C {ctype}"
+        ))),
+    }
+}
+
+/// The failure `gethostbyname` / `gethostbyaddr` report, which they leave in
+/// `h_errno` rather than `errno`.
+///
+/// `set_herror` raises `herror(h_errno, hstrerror(h_errno))`.  `HSocketError`
+/// carries only the host name, because rsocket says `h_errno` is not reachable
+/// from RPython — a caller that classifies on `.errno` sees nothing there, so
+/// the code the resolver set is read here.
+#[cfg(any(unix, windows))]
+fn host_lookup_error() -> crate::PyError {
+    let (code, message) = rffi::host_error();
+    socket_converted_error("herror", Some(code), &message)
+}
+
+/// The length of the `sockaddr` a family stores, or `None` for a family this
+/// module has no address form for.
+#[cfg(any(unix, windows))]
+fn sockaddr_len_of(family: libc::c_int) -> Option<usize> {
+    if family == rffi::AF_INET {
+        Some(core::mem::size_of::<rffi::sockaddr_in>())
+    } else if family == rffi::AF_INET6 {
+        Some(core::mem::size_of::<rffi::sockaddr_in6>())
+    } else {
+        None
+    }
+}
+
+/// Resolve `host` for `family` and hand back the first answer's `sockaddr`.
+/// `AF_UNSPEC` takes whichever of the two families the resolver answers with.
+///
+/// `rsocket.py makeipaddr` / `setipaddr`: two names never reach the resolver.
+/// The empty one is the wildcard — `getaddrinfo(NULL, "0", AI_PASSIVE)` with a
+/// dummy socktype, and more than one answer means it did not name a single
+/// address.  `<broadcast>` and `255.255.255.255` are IPv4's all-ones address,
+/// which `inet_addr` cannot express because it reports failure with the same
+/// bit pattern.  Everything else ends in
+/// `getaddrinfo(name, None, family=family, address_to_fill=result)`, and
+/// `rsocket.py getaddrinfo` answers a non-zero return with
+/// `raise GAIError(error)` — so a name that does not resolve reports
 /// `gaierror(rc, gai_strerror(rc))`, which is what callers classify on.
 /// gethostbyname is not used here: its process-global result buffer is not
 /// re-entrant and was corrupted by socketserver worker threads.
@@ -3096,13 +3143,39 @@ fn resolve_ip_host(
     c_host: &std::ffi::CStr,
     family: libc::c_int,
 ) -> Result<rffi::sockaddr_storage, crate::PyError> {
+    let host = c_host.to_bytes();
+    if host == b"<broadcast>" || host == b"255.255.255.255" {
+        if family != rffi::AF_INET && family != rffi::AF_UNSPEC {
+            return Err(socket_converted_error(
+                "error",
+                None,
+                "address family mismatched",
+            ));
+        }
+        let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let sin = unsafe { &mut *(&mut storage as *mut _ as *mut rffi::sockaddr_in) };
+        sin.sin_family = rffi::AF_INET as rffi::SaFamily;
+        rffi::sockaddr_in_set_addr(sin, rffi::INADDR_BROADCAST);
+        return Ok(storage);
+    }
+    let wildcard = host.is_empty();
     let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
     hints.ai_family = family;
+    if wildcard {
+        hints.ai_socktype = rffi::SOCK_DGRAM;
+        hints.ai_flags = rffi::AI_PASSIVE;
+    }
+    let service = c"0";
+    let (name_ptr, service_ptr) = if wildcard {
+        (std::ptr::null(), service.as_ptr())
+    } else {
+        (c_host.as_ptr(), std::ptr::null())
+    };
     let mut result: *mut rffi::addrinfo = std::ptr::null_mut();
     // A name lookup goes to the resolver and can take seconds.
     let rc = {
         let _blocked = crate::module::thread::before_external_block();
-        unsafe { rffi::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result) }
+        unsafe { rffi::getaddrinfo(name_ptr, service_ptr, &hints, &mut result) }
     };
     if rc != 0 {
         return Err(socket_converted_error(
@@ -3111,16 +3184,18 @@ fn resolve_ip_host(
             &rffi::gai_strerror(rc),
         ));
     }
-    let want = if family == rffi::AF_INET {
-        core::mem::size_of::<rffi::sockaddr_in>()
-    } else {
-        core::mem::size_of::<rffi::sockaddr_in6>()
-    };
+    let ambiguous_wildcard =
+        wildcard && !result.is_null() && !unsafe { &*result }.ai_next.is_null();
     let mut current = result;
     let mut resolved = None;
     while !current.is_null() {
         let info = unsafe { &*current };
-        if info.ai_family == family && !info.ai_addr.is_null() && info.ai_addrlen as usize >= want {
+        let wanted = family == rffi::AF_UNSPEC || info.ai_family == family;
+        if wanted
+            && !info.ai_addr.is_null()
+            && let Some(want) = sockaddr_len_of(info.ai_family)
+            && info.ai_addrlen as usize >= want
+        {
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -3135,6 +3210,13 @@ fn resolve_ip_host(
         current = info.ai_next;
     }
     unsafe { rffi::freeaddrinfo(result) };
+    if ambiguous_wildcard {
+        return Err(socket_converted_error(
+            "error",
+            None,
+            "wildcard resolved to multiple address",
+        ));
+    }
     // The hints pin `ai_family`, so a success with no answer of that family
     // is a resolver that ignored them.  `getaddrinfo` returned no code to
     // carry, so this is the plain module error, the way "sockaddr resolved to
@@ -3155,7 +3237,7 @@ fn pack_inet_addr(
     // calling method in its messages and rejects any protocol but
     // `HV_PROTOCOL_RAW`.
     #[cfg(not(windows))]
-    let _ = (caller, proto);
+    let _ = proto;
     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
     // AF_UNIX is special: rsocket.py:RSocket.bind/connect accept a bare
     // bytes/str path (or a 1-tuple wrapping the path).  Pull the path
@@ -3250,7 +3332,11 @@ fn pack_inet_addr(
     }
     let port_raw = unsafe { pyre_object::w_int_get_value(port_obj) };
     if !(0..=0xFFFF).contains(&port_raw) {
-        return Err(crate::PyError::overflow_error("port must be 0-65535"));
+        // `getsockaddrarg` spells the message with the method it was called
+        // for: `bind(): port must be 0-65535.`
+        return Err(crate::PyError::overflow_error(format!(
+            "{caller}(): port must be 0-65535."
+        )));
     }
     let port = (port_raw as u16).to_be();
 
