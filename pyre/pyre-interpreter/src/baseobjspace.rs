@@ -1526,8 +1526,13 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
 /// user `__getattribute__`/`__getattr__` does not run), then bound and called.
 /// A missing `__set_name__` is a no-op.  When the call raises, the original
 /// exception is re-raised with an `"Error calling __set_name__ ..."` note
-/// attached (PEP 678), mirroring `_PyErr_FormatNote`.
-fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
+/// attached (PEP 678) by [`add_internal_exception_note`].
+///
+/// `_PyErr_FormatNote` — attach `text` to `error` as a PEP 678 note and leave
+/// the error itself otherwise untouched, so the caller re-raises the original
+/// with one more line of context under it.  Callers pass the message CPython
+/// formats at the corresponding site.
+pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
     // CPython 3.14 `_PyException_AddNote` writes the exception's `__notes__`
     // list directly.  It does not dispatch through a Python override of
     // `add_note`; this is interpreter bookkeeping, not a method call.
