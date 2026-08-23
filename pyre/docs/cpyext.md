@@ -113,6 +113,17 @@ reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
 `PYPY_VERSION` fills upstream. `cpyext_methods` compares the whole set against
 `sys.version_info`, `sys.hexversion` and `sys.pyre_version_info`.
 
+`PYPY_VERSION` itself is what an extension branches on to ask whose object
+layouts these headers describe, and it is defined -- except for a module cffi
+generated, which `_cffi_include.h` marks with `_CFFI_` before it includes
+`Python.h`. Such a module has two forms and picks between them on that macro:
+one built out of `_cffi_exports` whose init symbol is `PyInit_`, and one
+exporting `_cffi_pypyinit_` that hands its type context to a built-in backend.
+The backend here is cffi's own `_cffi_backend` extension, which is the first
+form's, so the macro is left out for that one translation unit and the module
+compiles to it. `cpyext_cffi_mode` stands where such a module stands and
+reports what it picked.
+
 ## What is implemented
 
 The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a

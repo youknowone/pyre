@@ -184,7 +184,8 @@ assert m.restore() == (1, 1, 1, 1, 1), m.restore()
 # patchlevel.h, as an extension expands it: a banner string, the parts, and the
 # packed hex.  Each is compared against what the runtime reports, so a header
 # that drifts from sys is a failure rather than a silent disagreement.
-banner, major, minor, micro, level, serial, version, hexversion = m.version_macros()
+(banner, major, minor, micro, level, serial, version, hexversion,
+ pypy_version, pypy_version_num) = m.version_macros()
 assert (major, minor, micro) == sys.version_info[:3], (major, minor, micro)
 assert version == '%d.%d.%d' % sys.version_info[:3], version
 assert (level, serial) == (0xF, 0), (level, serial)
@@ -192,6 +193,10 @@ assert sys.version_info.releaselevel == 'final'
 assert hexversion == sys.hexversion, (hex(hexversion), hex(sys.hexversion))
 assert banner.startswith('python ' + version + ' / pyre '), banner
 assert banner.endswith('.'.join(str(p) for p in sys.pyre_version_info[:3])), banner
+# The macro an extension branches on to ask whose object layouts these are, and
+# the number beside it.
+assert pypy_version.startswith('8.'), pypy_version
+assert pypy_version_num == 0x08000000, hex(pypy_version_num)
 # The swallowed exception must not leak into the caller.
 assert m.bump() == 4
 

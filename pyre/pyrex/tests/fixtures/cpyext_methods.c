@@ -418,9 +418,11 @@ static PyObject *m_version_macros(PyObject *self, PyObject *unused)
     (void)self;
     (void)unused;
     static const char banner[] = "python " PY_VERSION " / pyre " PYRE_VERSION;
-    return Py_BuildValue("(siiiiisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
+    /* `PYPY_VERSION` is one of them: an extension that is not a cffi-generated
+       module reads the layouts behind these headers as PyPy's. */
+    return Py_BuildValue("(siiiiisisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
                          PY_MICRO_VERSION, PY_RELEASE_LEVEL, PY_RELEASE_SERIAL,
-                         PY_VERSION, PY_VERSION_HEX);
+                         PY_VERSION, PY_VERSION_HEX, PYPY_VERSION, PYPY_VERSION_NUM);
 }
 
 /* `PyErr_Restore` puts back what `PyErr_Fetch` took, and its three degenerate
