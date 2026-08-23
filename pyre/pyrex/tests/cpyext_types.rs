@@ -497,6 +497,21 @@ assert live.read(live) == b'zbc'
 assert bytes(m.Blob(b'xy')) == b'xy'
 assert bytearray(m.Blob(b'xy')) == bytearray(b'xy')
 
+# `readinto` writes into an exporter that answers only through the slot, and
+# gives the export back when it is done.
+import io
+
+target = m.Blob(b'......')
+assert io.BytesIO(b'abcdef').readinto(target) == 6
+assert target.read(target) == b'abcdef'
+assert target.exports() == 0
+
+# A short source fills a prefix and leaves the rest, and reports what it wrote.
+short = m.Blob(b'zzzz')
+assert io.BytesIO(b'ab').readinto(short) == 2
+assert short.read(short) == b'abzz'
+assert short.exports() == 0
+
 # PyObject_GetBuffer driven from C, over a C exporter and over a pyre object.
 assert m.Blob(b'').read(m.Blob(b'held')) == b'held'
 assert m.Blob(b'').read(b'plain bytes') == b'plain bytes'

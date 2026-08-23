@@ -16165,6 +16165,10 @@ pub(crate) struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
+    /// A `memoryview` this acquisition made itself, over an exporter that
+    /// answers only through `bf_getbuffer`.  Nobody else holds it, so the
+    /// export it took ends here rather than whenever it is collected.
+    made_view: bool,
     address: *mut u8,
     length: usize,
 }
@@ -16178,7 +16182,7 @@ impl WritableBuffer {
         let roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let (data, owner) =
+        let (data, owner, made_view) =
             unsafe { fileio_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
         let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -16186,6 +16190,7 @@ impl WritableBuffer {
         let held = unsafe { buffer_export_incref(owner) };
         Ok(Self {
             _roots: roots,
+            made_view,
             owner_slot,
             held,
             address: data.as_mut_ptr(),
@@ -16200,9 +16205,15 @@ impl WritableBuffer {
 
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
+        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
         if self.held {
-            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
             unsafe { buffer_export_decref(owner) };
+        }
+        if self.made_view {
+            // The count above is what a release refuses over, so it goes
+            // first.  A failure has nowhere to be reported and nothing to
+            // report: the view is this one's own and no caller named it.
+            let _ = memoryview_release(&[owner]);
         }
     }
 }
@@ -16211,7 +16222,7 @@ impl Drop for WritableBuffer {
 /// writable exporters; a memoryview contributes its exact contiguous window.
 unsafe fn fileio_writebuf(
     obj: PyObjectRef,
-) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
         // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
         // type.  CPython 3.14's readinto gateways keep the same information
@@ -16224,12 +16235,13 @@ unsafe fn fileio_writebuf(
 
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
+            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj, false));
         }
         if pyre_object::interp_array::is_array(obj) {
             return Ok((
                 pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice(),
                 obj,
+                false,
             ));
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
@@ -16239,6 +16251,7 @@ unsafe fn fileio_writebuf(
                 return Ok((
                     std::slice::from_raw_parts_mut(address as *mut u8, length),
                     obj,
+                    false,
                 ));
             }
         }
@@ -16248,7 +16261,7 @@ unsafe fn fileio_writebuf(
         {
             let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
             if offset <= full.len() && length <= full.len() - offset {
-                return Ok((&mut full[offset..offset + length], backing));
+                return Ok((&mut full[offset..offset + length], backing, false));
             }
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
@@ -16268,7 +16281,25 @@ unsafe fn fileio_writebuf(
                     "memoryview buffer is no longer valid",
                 ));
             }
-            return Ok((&mut full[offset..offset + length], obj));
+            return Ok((&mut full[offset..offset + length], obj, false));
+        }
+        // An exporter whose storage only `bf_getbuffer` names -- a type an
+        // extension defined -- is asked for a writable window and answers with
+        // one this layer then reads as any other view.  The request is what
+        // decides: an exporter with nothing writable refuses it, and the
+        // refusal is the argument error the arms above raise.
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        if crate::cpyext::buffer::exports_buffer(obj) {
+            let Ok(view) = w_memoryview_new_with_flags(obj, 0x0001) else {
+                return Err(type_error(obj));
+            };
+            let _ = pyre_object::gc_roots::pin_root(view);
+            let (data, owner, _) = fileio_writebuf(view)?;
+            return Ok((data, owner, true));
         }
         Err(type_error(obj))
     }
