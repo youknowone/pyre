@@ -3311,7 +3311,10 @@ fn write_traceback_chain_from_tb<W: Write>(
             break;
         }
         let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(current_tb) };
-        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
+        // `Py_DisplayTraceback` prints whatever `tb_get_lineno` gave it,
+        // negative included, rather than skipping a node it cannot place.
+        let lineno =
+            unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) }.unwrap_or(-1);
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
             (b"<unknown>".to_vec(), String::from("<unknown>"), None)

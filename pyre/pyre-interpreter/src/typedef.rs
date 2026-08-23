@@ -7831,8 +7831,11 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             if tb.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let n = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
-            Ok(pyre_object::w_int_new(n))
+            // `tb_lineno_get` answers `None` when the offset names no line.
+            match unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) } {
+                Some(n) => Ok(pyre_object::w_int_new(n)),
+                None => Ok(pyre_object::w_none()),
+            }
         },
         2,
     );

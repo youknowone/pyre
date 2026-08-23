@@ -2888,6 +2888,36 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
     rows
 }
 
+/// `PyCode_Addr2Line` — the source line the byte offset `addrq` sits on, or
+/// `None` when the offset names no line.
+///
+/// ```c
+/// if (addrq < 0) {
+///     return co->co_firstlineno;
+/// }
+/// ...
+/// return _PyCode_CheckLineNumber(addrq, &bounds);
+/// ```
+///
+/// `addrq` counts bytes, two per instruction, so the row index is `addrq / 2`
+/// — the same conversion `traceback._get_code_position` makes app-level.  A
+/// negative offset names the code object's first line, which is the answer for
+/// a frame that has not run an instruction yet.
+///
+/// An offset past the last row answers `None`, and `tb_lineno` hands that back
+/// as `None`.  `_PyCode_CheckLineNumber` also answers `-1` for an in-range
+/// instruction that carries no line at all; pyre's rows cannot spell that,
+/// because `SourceLocation::line` is a `OneIndexed`.
+pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
+    if addrq < 0 {
+        return Some(code.first_line_number.map_or(1, |line| line.get()));
+    }
+    let index = usize::try_from(addrq / 2).ok()?;
+    code_locations(code)
+        .get(index)
+        .map(|(start, _)| start.line.get())
+}
+
 /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
 /// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
 /// the wrapper's `w_globals` — the only point both the raw pointer and the
@@ -3527,6 +3557,34 @@ mod tests {
         let w_code = w_code_new(std::ptr::null());
         let result = unsafe { w_code_const(w_code, 0) };
         assert_eq!(result, pyre_object::pyobject::PY_NULL);
+    }
+
+    /// `PyCode_Addr2Line` on a real code object: the byte offset halves into a
+    /// row index, a negative offset names the first line, and an offset past
+    /// the last row reports no line at all.
+    #[test]
+    fn w_code_addr2line_halves_the_offset_and_reports_a_miss() {
+        let code = compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile failed");
+        let firstlineno = code.first_line_number.map_or(1, |line| line.get());
+        assert_eq!(w_code_addr2line(&code, -1), Some(firstlineno));
+        assert_eq!(w_code_addr2line(&code, -2), Some(firstlineno));
+
+        let rows: Vec<usize> = code_locations(&code)
+            .iter()
+            .map(|(start, _)| start.line.get())
+            .collect();
+        assert!(!rows.is_empty());
+        for (index, line) in rows.iter().copied().enumerate() {
+            let addrq = index as i64 * 2;
+            assert_eq!(w_code_addr2line(&code, addrq), Some(line));
+            // The odd byte inside an instruction reads that instruction's row.
+            assert_eq!(w_code_addr2line(&code, addrq + 1), Some(line));
+        }
+        // Each of the three statements contributes at least one instruction.
+        assert!(rows.contains(&(firstlineno + 2)), "{rows:?}");
+
+        assert_eq!(w_code_addr2line(&code, rows.len() as i64 * 2), None);
+        assert_eq!(w_code_addr2line(&code, 1 << 30), None);
     }
 
     #[test]

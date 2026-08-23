@@ -2277,13 +2277,14 @@ enum TracebackWalkField {
     TbFrame,
     /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
     FCode,
-    /// `tb.tb_lineno` — the line the node froze at.  `get_lineno` resolves it
-    /// lazily upstream; pyre stamps it at `record_application_traceback` time,
-    /// so the getter is the slot read plus the `LINENO_NOT_COMPUTED` mapping.
+    /// `tb.tb_lineno` — the line the node froze at.  The getter resolves the
+    /// sentinel out of `w_code` and `lasti`; `record_application_traceback`
+    /// stamps the real line instead, so a recorded node reads as the slot and
+    /// only a hand-constructed one has to resolve.  The fold covers the stamped
+    /// case and declines the other.
     ///
-    /// `tb_lasti` is deliberately absent: its getter reports `lasti * 2`, so
-    /// the fold would have to carry the doubling rather than hand back the
-    /// slot.
+    /// `tb_lasti` is deliberately absent: it is the one traceback slot the
+    /// walker has no reason to reach, since nothing on the walk consumes it.
     TbLineno,
     /// `code.co_name` — `code_get_field` answers it with `w_code_name_obj`,
     /// which realizes the string once and retains it on the code object, so
@@ -2435,12 +2436,13 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     if field == TracebackWalkField::TbLineno {
         let live =
             unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_lineno_raw(concrete_obj) };
-        // `get_lineno` answers the sentinel with `-1`, so the slot value is the
-        // getter's value only once it is pinned against the sentinel.  A node
-        // that already carries it — built from a frame with no `pycode`, or
-        // handed the sentinel through `TracebackType(..., -sys.maxsize-1)` or
-        // the `tb_lineno` setter — has nothing to pin, so decline before
-        // recording anything.
+        // A slot holding the sentinel is not the getter's value — the getter
+        // resolves it out of `w_code` and `lasti`, which are two more slots
+        // this fold would have to pin — so the slot value is the getter's value
+        // only once it is pinned against the sentinel.  A node that already
+        // carries the sentinel — built from a frame with no `pycode`, or handed
+        // it through `TracebackType(..., -1)` or the `tb_lineno` setter — has
+        // nothing to pin, so decline before recording anything.
         if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
             return Ok(None);
         }

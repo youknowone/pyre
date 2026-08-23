@@ -1902,16 +1902,16 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 /// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
 /// Matches RPython: negative `stopat` means "frame not yet started", returns
 /// first-line.
+///
+/// The same row lookup as [`crate::pycode::w_code_addr2line`], which takes the
+/// byte offset `tb_lasti` carries rather than an instruction index and reports
+/// a miss instead of clamping.  This one clamps to the first line, so it can
+/// never express the `None` a `tb_lineno` read answers.
 #[inline]
 pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
-    let lineno = code.first_line_number.map(|n| n.get()).unwrap_or(1);
-    if stopat < 0 {
-        return lineno;
-    }
-    crate::pycode::code_locations(code)
-        .get(stopat as usize)
-        .map(|(start, _)| start.line.get())
-        .unwrap_or(lineno)
+    let addrq = (stopat as i64).saturating_mul(2);
+    crate::pycode::w_code_addr2line(code, addrq)
+        .unwrap_or_else(|| code.first_line_number.map_or(1, |n| n.get()))
 }
 
 // ─────────────────────────────────────────────────────────────────────
