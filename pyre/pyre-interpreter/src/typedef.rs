@@ -12114,7 +12114,7 @@ fn init_type_type(ns: PyObjectRef) {
             pyre_object::function::w_classmethod_new(
                 crate::gateway::make_builtin_function_with_text_signature(
                     "__prepare__",
-                    |_args| Ok(pyre_object::w_dict_new()),
+                    |_args| Ok(pyre_object::w_module_dict_new()),
                     "($cls, name, bases, /, **kwds)",
                 ),
             ),

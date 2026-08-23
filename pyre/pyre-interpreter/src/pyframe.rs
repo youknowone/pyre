@@ -2827,8 +2827,9 @@ impl PyFrame {
         if flags.contains(CodeFlags::NEWLOCALS) {
             // `build_class` replaces this with the `__prepare__` namespace via
             // `setdictscope`; an orphan NEWLOCALS frame still has a usable
-            // mapping.
-            let w_locals = unsafe { pyre_object::w_dict_new() };
+            // mapping.  `newdict(module=True)` — the mapping a class body binds
+            // names in carries `ModuleDictStrategy.version?`.
+            let w_locals = pyre_object::w_module_dict_new();
             self.getorcreate_debug_data(-1).w_locals = w_locals;
         } else {
             let w_globals = self.get_w_globals();
