@@ -1904,6 +1904,64 @@ where
         promoted_box
     }
 
+    /// `pyjitpl.py MIFrame.opimpl_goto_if_not(box, target, orgpc, replace)`.
+    ///
+    /// ```python
+    /// switchcase = box.getint()
+    /// if switchcase:
+    ///     assert switchcase == 1
+    ///     opnum = rop.GUARD_TRUE
+    ///     promoted_box = CONST_1
+    /// else:
+    ///     opnum = rop.GUARD_FALSE
+    ///     promoted_box = CONST_0
+    /// self.metainterp.generate_guard(opnum, box, resumepc=orgpc)
+    /// if not switchcase:
+    ///     self.pc = target
+    /// if isinstance(box, Const):
+    ///     return
+    /// if replace:
+    ///     self.metainterp.replace_box(box, promoted_box)
+    /// ```
+    ///
+    /// `replace_reg` carries upstream's `replace` flag *and* the register the
+    /// rebind lands in: `Some(reg)` is `replace=True`, `None` is the
+    /// `goto_if_not_int_is_true` caller's `replace=False`, whose condbox "does
+    /// not appear anywhere in any register" because the arm just made it.
+    /// `replace_box` has no whole-metainterp equivalent at this layer — see
+    /// [`Self::implement_guard_value`] for the same stand-in.
+    fn goto_if_not(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        opcode_pc: usize,
+        cond: OpRef,
+        cond_value: i64,
+        target: usize,
+        replace_reg: Option<usize>,
+    ) {
+        let (guard, promoted_value) = if cond_value != 0 {
+            // `assert switchcase == 1`. Every producer of this bytecode passes
+            // a Rust `bool`, so the operand is 0 or 1 by construction — and
+            // the `CONST_1` rebind below is only sound while that holds.
+            debug_assert_eq!(cond_value, 1, "goto_if_not: operand is not a bool");
+            (OpCode::GuardTrue, 1)
+        } else {
+            (OpCode::GuardFalse, 0)
+        };
+        self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
+        if cond_value == 0 {
+            self.frames.current_mut().code_cursor = target;
+        }
+        if cond.is_constant() {
+            return;
+        }
+        if let Some(reg) = replace_reg {
+            let promoted_box = ctx.const_int(promoted_value);
+            self.set_int_reg(reg, Some(promoted_box), Some(promoted_value));
+        }
+    }
+
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
     /// recording half.
     ///
@@ -5096,7 +5154,7 @@ where
             }
             jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
             jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
-            jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+            jitcode::insns::BC_GOTO_IF_NOT => {
                 // Canonical `iL` encoding (`assembler.py:165-174`):
                 // [cond:u8][target:u16].
                 let (opcode_pc, cond_idx, target) = {
@@ -5117,16 +5175,47 @@ where
                     )
                 };
                 let (cond, cond_value) = self.read_int_reg(cond_idx);
-                let branch_taken = cond_value == 0;
-                let opcode = if branch_taken {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
+                self.goto_if_not(
+                    ctx,
+                    sym,
+                    opcode_pc,
+                    cond,
+                    cond_value,
+                    target,
+                    Some(cond_idx),
+                );
+            }
+            // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
+            //   condbox = self.execute(rop.INT_IS_TRUE, box)
+            //   self.opimpl_goto_if_not(condbox, target, ..., replace=False)
+            //
+            // `jtransform.py optimize_goto_if_not` admits `int_is_true` into
+            // the folded-exitswitch set and `flatten.py` then emits
+            // `goto_if_not_int_is_true`, so this is a distinct opname with its
+            // own byte — only `blackhole.py:913` aliases the two, and only on
+            // the blackhole side, where there is no operation to re-record.
+            jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+                // Canonical `iL` encoding: [src:u8][target:u16].
+                let (opcode_pc, src_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    (
+                        opcode_pc,
+                        frame.next_reg() as usize,
+                        frame.next_u16() as usize,
+                    )
                 };
-                self.record_state_guard(ctx, sym, opcode, &[cond], opcode_pc, false);
-                if branch_taken {
-                    self.frames.current_mut().code_cursor = target;
-                }
+                let (src, src_value) = self.read_int_reg(src_idx);
+                let cond_value = (src_value != 0) as i64;
+                let cond = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    OpCode::IntIsTrue,
+                    None,
+                    &[src],
+                    Some(majit_ir::Value::Int(cond_value)),
+                    self.last_exception_value,
+                );
+                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, None);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
             //   condbox = execute(rop.INT_IS_ZERO, box)
@@ -13056,6 +13145,65 @@ mod tests {
             .iter()
             .map(|op| op.opcode)
             .collect()
+    }
+
+    /// `opimpl_goto_if_not`'s tail — `if replace: replace_box(box,
+    /// promoted_box)` — rebinds the condition register to the constant the
+    /// guard just proved, so a second read of it folds instead of re-guarding.
+    #[test]
+    fn goto_if_not_rebinds_its_condition_register_to_the_proved_constant() {
+        // `cond` is an input arg, so the guard cannot be elided; reading it
+        // again after the branch is what shows the rebind.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_true(0, target);
+        builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
+        builder.mark_label(target);
+        let jitcode = builder.finish();
+
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &jitcode,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 1)],
+        );
+        assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
+        assert!(
+            !recorded.contains(&OpCode::IntAdd),
+            "the rebound CONST_1 must let the following IntAdd fold: {recorded:?}",
+        );
+    }
+
+    /// `MIFrame.opimpl_goto_if_not_int_is_true` re-executes the `INT_IS_TRUE`
+    /// that `jtransform.py optimize_goto_if_not` folded into the exitswitch,
+    /// then branches with `replace=False`. No majit front end emits this byte
+    /// today — every condition it lowers is already a Rust `bool` — so the
+    /// jitcode is patched to it directly.
+    #[test]
+    fn goto_if_not_int_is_true_records_the_folded_int_is_true() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_true(0, target);
+        builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
+        builder.mark_label(target);
+        let mut jitcode = builder.finish();
+        let code = &mut jitcode.core_mut().body_mut().code;
+        let at = code
+            .iter()
+            .position(|&b| b == jitcode::insns::BC_GOTO_IF_NOT)
+            .expect("the builder writes the canonical goto_if_not byte");
+        code[at] = jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE;
+
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &jitcode,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+        );
+        assert!(recorded.contains(&OpCode::IntIsTrue), "{recorded:?}");
+        assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
+        assert!(
+            recorded.contains(&OpCode::IntAdd),
+            "replace=False leaves the source register alone: {recorded:?}",
+        );
     }
 
     /// `BC_RAW_LOAD_I` / `_F` advanced their register bank with the traced
