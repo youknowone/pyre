@@ -6809,11 +6809,14 @@ fn os_error_parsed_errno(args: &[PyObjectRef]) -> Option<PyObjectRef> {
 /// filename from `args_w` per `_init_error` (line 652).  Must run after the
 /// `w_class` retag so the `BlockingIOError` numeric-filename special-case can
 /// see the resolved class.
-fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
+/// `Err` when the `characters_written` conversion fails — `oserror_init`
+/// propagates it out of the constructor (`return -1`).
+fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
     use pyre_object::interp_exceptions;
-    // Both the errno parse and the `BlockingIOError` test below run `int_w`,
-    // which is a user `__index__`, so the arguments are read off the root
-    // stack rather than out of the caller's slice once either has run.
+    // The errno parse runs `int_w` and the `BlockingIOError` conversion below
+    // runs `getindex_w_written`, both a user `__index__`, so the arguments are
+    // read off the root stack rather than out of the caller's slice once
+    // either has run.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let exc = pyre_object::gc_roots::pin_root(exc);
@@ -6841,12 +6844,17 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             // `_init_error` line 636-643: for an exact `BlockingIOError`, a
             // numeric third argument is `characters_written`, not a filename —
             // it stays in `args_w` and the tuple is not trimmed.
-            let written = |f| {
-                exc_is_blocking_io_error(exc)
-                    .then(|| crate::baseobjspace::int_w(f).ok())
-                    .flatten()
-            };
-            if let Some(value) = w_filename.and_then(written) {
+            // `exceptions.c oserror_init` picks that branch on
+            // `PyNumber_Check` and only then converts, so a failed conversion
+            // propagates instead of falling back here.  PyPy catches
+            // (`_init_error` 637-643), consistent there because it never trims
+            // `args_w`; pyre does, so the fallback lands on neither.  gh#1150.
+            let is_written_arg = exc_is_blocking_io_error(exc)
+                && w_filename.is_some_and(|f| crate::baseobjspace::number_check(f));
+            if is_written_arg {
+                let value = crate::baseobjspace::getindex_w_written(
+                    w_filename.expect("is_written_arg implies a third argument"),
+                )?;
                 interp_exceptions::w_exception_set_written(exc, value);
                 interp_exceptions::w_exception_set_blocking_written_arg(exc);
             } else if let Some(fname) = w_filename {
@@ -6859,7 +6867,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
             }
         }
     }
-    // Assembled from the root stack, after the last `int_w`: the caller's
+    // Assembled from the root stack, after the last `__index__`: the caller's
     // slice is a pre-move view of the operands by then.
     let args_w: Vec<PyObjectRef> = match (parsed, trimmed) {
         (Some(w_errno), true) => vec![w_errno, arg(1)],
@@ -6870,6 +6878,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     };
     let args_list = interp_exceptions::w_exception_args_new(args_w);
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
+    Ok(())
 }
 
 /// `ESHUTDOWN` is a POSIX errno absent from the MSVC runtime's own `errno.h`,
@@ -7227,7 +7236,7 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             crate::typedef::r#type(w_self).map(|p| p.as_ptr()),
         ));
     }
-    os_error_fill_slots(w_self, positional);
+    os_error_fill_slots(w_self, positional)?;
     Ok(pyre_object::w_none())
 }
 
@@ -7705,7 +7714,7 @@ fn os_error_family_new(
     // Fill the slots after the retag so `os_error_fill_slots` can see the
     // resolved class (the `BlockingIOError` numeric-filename special-case).
     if !use_init {
-        os_error_fill_slots(exc, &positional);
+        os_error_fill_slots(exc, &positional)?;
     }
     Ok(exc)
 }

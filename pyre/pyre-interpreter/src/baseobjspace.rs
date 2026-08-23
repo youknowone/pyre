@@ -4211,6 +4211,41 @@ pub(crate) unsafe fn getindex_w_index(index: PyObjectRef) -> Result<i64, PyError
     }
 }
 
+/// `abstract.c PyNumber_Check` — `nb_index` / `nb_int` / `nb_float`, or a
+/// complex.  Looked up on the type, so an instance attribute does not answer.
+/// Deliberately wider than what [`getindex_w_written`] accepts: an
+/// `__int__`-only operand has to enter the numeric branch and fail there.
+pub(crate) unsafe fn number_check(w_obj: PyObjectRef) -> bool {
+    if w_obj.is_null() {
+        return false;
+    }
+    unsafe {
+        pyre_object::pyobject::is_int_or_long(w_obj)
+            || pyre_object::is_float(w_obj)
+            || pyre_object::pyobject::is_complex(w_obj)
+            || lookup(w_obj, "__index__").is_some()
+            || lookup(w_obj, "__int__").is_some()
+            || lookup(w_obj, "__float__").is_some()
+    }
+}
+
+/// `PyNumber_AsSsize_t(w_obj, PyExc_ValueError)` — [`getindex_w_index`] with
+/// the exception `exceptions.c oserror_init` passes.  The overflow names the
+/// ORIGINAL operand's type, not the `__index__` result's.
+pub(crate) unsafe fn getindex_w_written(w_obj: PyObjectRef) -> Result<i64, PyError> {
+    match int_w(space_index(w_obj)?) {
+        Ok(i) => Ok(i),
+        Err(e) if e.kind == PyErrorKind::OverflowError => Err(PyError::new(
+            PyErrorKind::ValueError,
+            format!(
+                "cannot fit '{}' into an index-sized integer",
+                object_functionstr_type_name(w_obj)
+            ),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     let mut value = value;

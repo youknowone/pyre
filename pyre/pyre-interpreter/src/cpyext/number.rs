@@ -456,20 +456,12 @@ pub unsafe extern "C" fn PyNumber_ToBase(object: *mut CPyObject, base: c_int) ->
 }
 
 /// `nb_index`, `nb_int` or `nb_float` — the test `PyNumber_Check` performs.
+/// The predicate lives in `baseobjspace::number_check`, shared with the
+/// interpreter-level caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { super::pyobject::from_ref(object) };
-    if object.is_null() {
-        return 0;
-    }
-    let numeric = unsafe {
-        pyre_object::pyobject::is_int_or_long(object)
-            || pyre_object::is_float(object)
-            || crate::baseobjspace::lookup(object, "__index__").is_some()
-            || crate::baseobjspace::lookup(object, "__int__").is_some()
-            || crate::baseobjspace::lookup(object, "__float__").is_some()
-    };
-    numeric as c_int
+    unsafe { crate::baseobjspace::number_check(object) as c_int }
 }
 
 /// `nb_index` alone — whether [`PyNumber_Index`] would have a slot to call.
