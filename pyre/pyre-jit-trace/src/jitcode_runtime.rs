@@ -27,6 +27,10 @@ use majit_translate::jitcode::{BhDescr, DescrTable, JitCode};
 
 struct JitCodeIndex {
     names: Vec<String>,
+    /// The `CallPath` each jitcode was allocated under, `::`-joined by
+    /// `CallPath::canonical_key`, index-aligned with `names`. Empty for a
+    /// jitcode the codewriter minted without a graph key.
+    paths: Vec<String>,
     offsets: Vec<u32>,
 }
 
@@ -69,8 +73,8 @@ thread_local! {
 fn load_jitcode_index() -> &'static JitCodeIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
-    let (names, offsets): (Vec<String>, Vec<u32>) = bincode::deserialize(INDEX_BYTES)
-        .unwrap_or_else(|e| {
+    let (names, paths, offsets): (Vec<String>, Vec<String>, Vec<u32>) =
+        bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
             panic!(
                 "pyre-jit-trace: failed to deserialize jitcodes_index.bin \
                  ({} bytes): {e}",
@@ -84,10 +88,21 @@ fn load_jitcode_index() -> &'static JitCodeIndex {
         names.len(),
         offsets.len(),
     );
+    assert_eq!(
+        paths.len(),
+        names.len(),
+        "pyre-jit-trace: jitcode index has {} names but {} graph keys",
+        names.len(),
+        paths.len(),
+    );
     assert_eq!(offsets.first().copied(), Some(0));
     assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-    Box::leak(Box::new(JitCodeIndex { names, offsets }))
+    Box::leak(Box::new(JitCodeIndex {
+        names,
+        paths,
+        offsets,
+    }))
 }
 
 fn jitcode_index() -> &'static JitCodeIndex {
@@ -405,6 +420,37 @@ fn compute_named_jitcode_index(name: &str) -> Option<usize> {
         );
     }
     first
+}
+
+/// Resolve a JitCode by the graph key the codewriter allocated it under,
+/// spelled as `CallPath::canonical_key` — the `::`-joined segments, e.g.
+/// `pyre_interpreter::opcode_ops::compare_value`.
+///
+/// `CallControl::get_jitcode` keys `self.jitcodes` by `CallPath`, mirroring
+/// `call.py get_jitcode`'s graph-keyed dict, and takes the JitCode's `name`
+/// from the path's last segment only so dumps stay readable. Two graphs may
+/// therefore share a name — 238 groups do — and the by-name resolver has no
+/// way to tell them apart, so it panics rather than pick a body. Resolving by
+/// the allocation key has no such ambiguity: `IndexMap<CallPath, _>` makes it
+/// unique by construction.
+///
+/// `None` when the pipeline holds no such graph, so a caller can decline
+/// rather than assume the helper was compiled.
+pub(crate) fn compute_pathed_jitcode_index(canonical_path: &str) -> Option<usize> {
+    if canonical_path.is_empty() {
+        return None;
+    }
+    jitcode_index()
+        .paths
+        .iter()
+        .position(|path| path == canonical_path)
+}
+
+/// The JitCode allocated under `canonical_path`, or `None` when the build-time
+/// pipeline does not contain that graph. See [`compute_pathed_jitcode_index`].
+#[allow(dead_code)]
+pub(crate) fn pathed_jitcode(canonical_path: &str) -> Option<Arc<JitCode>> {
+    get_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }
 
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.

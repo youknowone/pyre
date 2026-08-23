@@ -4770,6 +4770,80 @@ mod tests {
         assert_eq!(backend.get_ref_value(&frame, 0), second_payload);
     }
 
+    extern "C" fn return_int_passthrough(arg: i64) -> i64 {
+        arg
+    }
+
+    /// A `COND_CALL_VALUE_I` argument that is an op result — not an inputarg —
+    /// and is still live after the call.
+    ///
+    /// `consider_raw_call_like_j2` runs `before_call` before it reads the
+    /// locations, and `spill_or_move_registers_before_call` prefers *moving* a
+    /// survivor into a free callee-saved register over spilling it.  The
+    /// argument therefore reaches the emitter as a bare `Loc::Reg` (measured:
+    /// x19 on AArch64) whose lifetime has no frame slot at that point, which is
+    /// the one shape `resolve_opref` cannot represent.
+    ///
+    /// The callee is the identity, so a wrong argument location surfaces
+    /// directly in the result.  `i2` is deliberately NOT equal to `i1`: reading
+    /// the argument from the slot that the recycled frame position happens to
+    /// name would otherwise return the right answer by accident.
+    ///
+    /// The two older cond-call fixtures pass zero call arguments, so their
+    /// argument loop is empty and neither can see this.
+    #[test]
+    fn test_cond_call_value_passes_a_register_resident_op_result_argument() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        // arg 0 is the cond-call predicate, passed 0 so the call is taken.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(200, return_int_passthrough as *const () as usize as i64);
+        backend.set_constants(constants);
+
+        let cond_call = mk_op(
+            OpCode::CondCallValueI,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::int_op(200),
+                OpRef::int_op(2),
+            ],
+            3,
+        );
+        cond_call.setdescr(make_plain_call_descr(vec![Type::Int], Type::Int));
+
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            // i2 = i1 + i1, an op result distinct from every inputarg value.
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::input_arg_int(1)],
+                2,
+            ),
+            cond_call,
+            // Naming i2 again keeps it live across the cond-call, which is what
+            // sends it down `before_call`'s move-to-callee-saved arm instead of
+            // letting it die there.
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::int_op(3), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(1617);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 14);
+    }
+
     #[test]
     fn test_label_uses_absolute_jitframe_input_slots_for_resolve_opref_ops() {
         let mut gc = MiniMarkGC::with_config(GcConfig {

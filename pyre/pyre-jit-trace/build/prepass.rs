@@ -1217,16 +1217,47 @@ fn real_main() {
         let mut jitcodes_bin = Vec::new();
         let mut jitcode_names = Vec::with_capacity(frozen_jitcodes.len());
         let mut jitcode_offsets = Vec::with_capacity(frozen_jitcodes.len() + 1);
+        // Graph identity per jitcode, index-aligned with `jitcode_names`.
+        // `CallControl::get_jitcode` keys its map by `CallPath` exactly as
+        // `call.py get_jitcode` keys by graph, but the name it stores beside
+        // it is the path's last segment, chosen to stay readable in dumps.
+        // That display name is not unique — this pipeline has 238 colliding
+        // groups, `from_obj` 52 ways — so a runtime consumer resolving a
+        // descent target by name cannot address the collided bodies at all.
+        // Carrying the allocation key lets it name one unambiguously.
+        let mut jitcode_paths: Vec<String> = Vec::with_capacity(frozen_jitcodes.len());
+        let path_by_ptr: std::collections::HashMap<usize, String> = pipeline
+            .jitcodes_by_path
+            .iter()
+            .map(|(path, jitcode)| {
+                (
+                    std::sync::Arc::as_ptr(jitcode) as usize,
+                    path.canonical_key(),
+                )
+            })
+            .collect();
         jitcode_offsets.push(0_u32);
-        for jitcode in &frozen_jitcodes {
+        for (index, jitcode) in frozen_jitcodes.iter().enumerate() {
             jitcode_names.push(jitcode.name.clone());
+            // `frozen_jitcodes` is a clone-per-entry of `pipeline.jitcodes`
+            // built in place, so the two share an index but not an identity;
+            // key the lookup off the original Arc. A jitcode the codewriter
+            // minted without a graph key (synthetic shells) carries the empty
+            // string, which `compute_pathed_jitcode_index` refuses to match.
+            jitcode_paths.push(
+                path_by_ptr
+                    .get(&(std::sync::Arc::as_ptr(&pipeline.jitcodes[index]) as usize))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             jitcodes_bin.extend(bincode::serialize(jitcode).unwrap());
             jitcode_offsets.push(
                 u32::try_from(jitcodes_bin.len())
                     .expect("serialized jitcodes.bin exceeds the u32 offset range"),
             );
         }
-        let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
+        let jitcodes_index_bin =
+            bincode::serialize(&(jitcode_names, jitcode_paths, jitcode_offsets)).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
         // Keep the shell fnaddr beside each dense index.  A translated PyPy

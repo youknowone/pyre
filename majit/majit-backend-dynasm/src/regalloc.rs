@@ -5279,6 +5279,24 @@ impl<'a> RegAlloc<'a> {
         self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
     }
 
+    /// `emit_call_from_arglocs` silently falls back to all-Int argument types
+    /// when the descr's arity disagrees with the call, which would place a
+    /// float argument in a GPR. Every cond-call-value producer builds the arg
+    /// list and `arg_types` from the same source, so check it here rather than
+    /// letting the emitter guess — `consider_call_j2` carries the same check
+    /// for plain calls. `num_args` counts the leading value and function
+    /// operands, which the descr does not describe.
+    fn check_cond_call_value_descr_arity(op: &Op, num_args: usize) {
+        if !op.opcode.is_cond_call_value() {
+            return;
+        }
+        let descr_arc = op.getdescr().expect("cond_call_value without CallDescr");
+        let calldescr = descr_arc
+            .as_call_descr()
+            .expect("cond_call_value without CallDescr");
+        assert_eq!(calldescr.arg_types().len(), num_args - 2);
+    }
+
     fn consider_raw_call_like(
         &mut self,
         op: &Op,
@@ -5286,6 +5304,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
         save_regs: u8,
     ) {
+        Self::check_cond_call_value_descr_arity(op, op.num_args());
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
@@ -5339,6 +5358,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
         save_regs: u8,
     ) {
+        Self::check_cond_call_value_descr_arity(op, args.len());
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
