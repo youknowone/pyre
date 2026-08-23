@@ -3034,18 +3034,25 @@ impl PyFrame {
     /// consuming frame under `sys.settrace` on 3.14.2:
     ///
     /// ```text
-    /// for _ in CustomIter():  # Python-level __next__ raising StopIteration
-    ///     -> [('__next__', 'StopIteration'), ('run', 'StopIteration')]
-    /// for _ in gen():   -> []
-    /// for _ in [1]:     -> []
-    /// for _ in range(1):-> []
+    /// for _ in CustomIter():   # Python-level __next__ raising StopIteration
+    ///     -> [('__next__', 'StopIteration'), ('consume', 'StopIteration')]
+    /// for _ in map(stop, [1]): # native __next__, Python-raised StopIteration
+    ///     -> [('stop', 'StopIteration'), ('consume', 'StopIteration')]
+    /// for _ in gen():          -> []
+    /// for _ in [1]:            -> []
+    /// for _ in range(1):       -> []
+    /// for _ in iter(step, 3):  -> []
     /// ```
     ///
     /// So the report fires when the StopIteration carries a traceback and
     /// not otherwise; porting the generator arms would fire an event 3.14
-    /// does not.  A StopIteration raised inside a Python `__next__` picks up
-    /// its traceback on the way out of that frame, which is what makes the
-    /// two rules coincide.
+    /// does not.  The `map` row is what settles that the rule is about the
+    /// traceback rather than about the iterator's kind: its `__next__` is
+    /// native, and the event still fires, because the StopIteration passed
+    /// through a Python frame on the way out.
+    ///
+    /// `pyre/extra_tests/parity_tests/foriter_stopiteration_exception_event.py`
+    /// pins all of it.
     ///
     /// The exhaustion an iterator signals from Rust never materialises an
     /// exception, so the common loop exit answers `has_any_traceback` false

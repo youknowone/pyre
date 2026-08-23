@@ -61,6 +61,25 @@ def a_python_level_next_reports_to_the_consuming_frame():
     assert seen == [('__next__', 'StopIteration'), ('consume', 'StopIteration')], seen
 
 
+def the_rule_is_the_traceback_and_not_the_iterator():
+    """`map`'s `__next__` is native, but the StopIteration is not."""
+
+    def stop(_):
+        raise StopIteration
+
+    def consume():
+        for _ in map(stop, [1, 2]):
+            raise AssertionError('the map was not empty')
+
+    # The exhaustion came out of a native `__next__`, so a rule that keyed off
+    # the iterator's kind would report nothing here.  It travelled through
+    # `stop`'s frame on the way, which is what the consuming frame reports on.
+    assert exception_events_in(consume) == [
+        ('stop', 'StopIteration'),
+        ('consume', 'StopIteration'),
+    ], 'unexpected events'
+
+
 def a_natively_signalled_end_reports_nothing():
     def consume_generator():
         def empty():
@@ -82,7 +101,25 @@ def a_natively_signalled_end_reports_nothing():
         for _ in {'a': 1}:
             pass
 
-    for consumer in (consume_generator, consume_list, consume_range, consume_dict):
+    def consume_callable_iter():
+        box = [0]
+
+        def step():
+            box[0] += 1
+            return box[0]
+
+        # `iter(callable, sentinel)` ends by comparing, not by raising through
+        # `step`, so this is a native end even though `step` is Python.
+        for _ in iter(step, 3):
+            pass
+
+    for consumer in (
+        consume_generator,
+        consume_list,
+        consume_range,
+        consume_dict,
+        consume_callable_iter,
+    ):
         assert exception_events_in(consumer) == [], consumer.__name__
 
 
@@ -116,6 +153,7 @@ def the_loop_still_ends_normally():
 
 
 a_python_level_next_reports_to_the_consuming_frame()
+the_rule_is_the_traceback_and_not_the_iterator()
 a_natively_signalled_end_reports_nothing()
 the_loop_still_ends_normally()
 print('OK')
