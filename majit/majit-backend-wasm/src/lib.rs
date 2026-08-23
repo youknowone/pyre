@@ -1791,10 +1791,6 @@ struct PendingInline {
     /// The loop this region merges into.
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
-    /// The constants pool as it stood for the bridge's own compile.
-    /// `set_constants_pool` clears and refills the backend's pool per trace, so
-    /// by the time the callback fires it describes some unrelated trace.
-    constants: indexmap::IndexMap<u32, i64>,
 }
 
 thread_local! {
@@ -1888,7 +1884,6 @@ pub fn take_tripped_inlines() -> Vec<i64> {
 fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
-    constants: indexmap::IndexMap<u32, i64>,
     cells_base_ptr: u32,
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
@@ -1901,11 +1896,7 @@ fn register_pending_inline(
     PENDING_INLINES.with(|pending| {
         pending.borrow_mut().insert(
             pending_id,
-            PendingInline {
-                owner,
-                region,
-                constants,
-            },
+            PendingInline { owner, region },
         )
     });
     codegen::InlineTripProbe {
@@ -2188,14 +2179,9 @@ impl WasmBackend {
             return;
         };
         diag_bump(55);
-        let PendingInline {
-            owner,
-            region,
-            constants,
-            ..
-        } = pending;
+        let PendingInline { owner, region } = pending;
         let source_fail_index = region.source_fail_index;
-        if !self.install_inline_region(&owner, region, constants) {
+        if !self.install_inline_region(&owner, region) {
             // The probe cleared the dispatch cell to get here. A merge that
             // does not install leaves the out-of-line bridge as the only route
             // to that guard, so put the cell back rather than leave the guard
@@ -2238,7 +2224,6 @@ impl WasmBackend {
         &mut self,
         owner: &JitCellToken,
         mut region: codegen::InlinedBridge,
-        constants: indexmap::IndexMap<u32, i64>,
     ) -> bool {
         if owner.is_invalidated() {
             diag_bump(50);
@@ -2277,7 +2262,15 @@ impl WasmBackend {
         for region in &candidate.inlined_bridges {
             merged_ops.extend(region.ops.iter().cloned());
         }
-        candidate.constants = constants;
+        // `candidate.constants` keeps the pool of the compile that recorded
+        // these ops -- the owner's. The pool is keyed by value position, and
+        // the merge rebases every region off the owner's ids, so a region's
+        // own entries reach the build through `InlinedBridge::constants` and
+        // are replayed at the rebase offset. Assigning the merging bridge's
+        // pool here instead would leave the owner's window described by
+        // another trace's keys: an owner-only folded value loses its entry,
+        // and one the bridge happens to number the same way is seeded with the
+        // wrong bits.
         candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
         candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
         candidate.nursery = nursery_alloc_params(&merged_ops);
@@ -3942,7 +3935,7 @@ impl majit_backend::Backend for WasmBackend {
                             gc_table_base,
                             constants: self.constants.clone(),
                         };
-                        if self.install_inline_region(&owner, region, self.constants.clone()) {
+                        if self.install_inline_region(&owner, region) {
                             self.trace_counter += 1;
                             if let Some(table) = gc_table {
                                 Self::register_gc_table(original_token, table);
@@ -4040,7 +4033,7 @@ impl majit_backend::Backend for WasmBackend {
                 .map_or(0, |loop_| {
                     &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32
                 });
-            register_pending_inline(owner, region, self.constants.clone(), cells_base_ptr)
+            register_pending_inline(owner, region, cells_base_ptr)
         });
         let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
