@@ -1851,6 +1851,31 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
     dest.write_text(json.dumps(slim), encoding="utf-8")
 
 
+def charon_toolchain_path(charon_bin: Path, root: Path) -> Path:
+    """The rustup toolchain directory Charon's driver runs under.
+
+    The LAST NON-EMPTY LINE, not the whole capture: `charon toolchain-path`
+    shares its stream with rustup, which announces an install on a runner that
+    does not have the pinned nightly yet -- a macos job printed "The required
+    toolchain is not installed. Installing...", the toolchain it had just
+    installed, and only then the path. Reading the capture whole made a Path of
+    all three, and the `rustc -vV` built from it went looking for a file named
+    after the notice.
+    """
+    lines = [
+        line.strip()
+        for line in run_capture(
+            [str(charon_bin), "toolchain-path"], cwd=root
+        ).splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        raise SystemExit(
+            f"extract-llbc.py: {charon_bin} toolchain-path printed no path"
+        )
+    return Path(lines[-1])
+
+
 def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
     """Install the target `std` Charon's pinned toolchain needs.
 
@@ -1858,7 +1883,7 @@ def ensure_charon_std(charon_bin: Path, targets: list[str], root: Path) -> None:
     build toolchain is not necessarily installed for Charon's. Adding it is
     idempotent and fast when already present.
     """
-    toolchain_name = Path(run_capture([str(charon_bin), "toolchain-path"], cwd=root).strip()).name
+    toolchain_name = charon_toolchain_path(charon_bin, root).name
     for target in targets:
         command = ["rustup", "target", "add", target, "--toolchain", toolchain_name]
         if subprocess.run(command).returncode != 0:
@@ -1881,7 +1906,7 @@ def charon_host_triple(charon_bin: Path, root: Path) -> str:
     rather than `target/debug`. Read it from Charon's own rustc: the build
     toolchain can be a different host spelling on the same machine.
     """
-    toolchain = Path(run_capture([str(charon_bin), "toolchain-path"], cwd=root).strip())
+    toolchain = charon_toolchain_path(charon_bin, root)
     rustc = toolchain / "bin" / ("rustc.exe" if os.name == "nt" else "rustc")
     for line in run_capture([str(rustc), "-vV"], cwd=root).splitlines():
         if line.startswith("host:"):
