@@ -55,7 +55,7 @@ fn frame_builtins() -> Option<PyObjectRef> {
 fn dict_of(w_obj: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_obj);
+    let _ = roots.pin_root(w_obj);
     crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(slot))
 }
 

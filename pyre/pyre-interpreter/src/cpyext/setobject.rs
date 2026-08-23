@@ -143,8 +143,8 @@ pub unsafe extern "C" fn PySet_Discard(set: *mut CPyObject, key: *mut CPyObject)
 fn discard_element(set: PyObjectRef, key: PyObjectRef) -> Result<bool, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(set);
-    roots.pin_root(key);
+    let _ = roots.pin_root(set);
+    let _ = roots.pin_root(key);
     unsafe {
         pyre_object::setobject::w_set_discard_checked(
             pyre_object::gc_roots::shadow_stack_get(base),
@@ -227,8 +227,8 @@ pub unsafe extern "C" fn PySet_Contains(set: *mut CPyObject, key: *mut CPyObject
 fn contains_element(set: PyObjectRef, key: PyObjectRef) -> Result<bool, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(set);
-    roots.pin_root(key);
+    let _ = roots.pin_root(set);
+    let _ = roots.pin_root(key);
     unsafe {
         pyre_object::setobject::w_set_contains_checked(
             pyre_object::gc_roots::shadow_stack_get(base),

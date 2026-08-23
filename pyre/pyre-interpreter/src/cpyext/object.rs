@@ -1657,9 +1657,9 @@ unsafe fn call_vectorcall_slot(
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let w_tuple = unsafe { pyobject::from_ref(tuple) };
-    roots.pin_root(w_tuple);
+    let _ = roots.pin_root(w_tuple);
     let w_dict = unsafe { pyobject::from_ref(dict) };
-    roots.pin_root(w_dict);
+    let _ = roots.pin_root(w_dict);
     let at = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
 
     let positional: Vec<PyObjectRef> = match at(0).is_null() {
@@ -1681,10 +1681,10 @@ unsafe fn call_vectorcall_slot(
         .into_iter()
         .chain(keywords.iter().map(|&(_, value)| value))
     {
-        roots.pin_root(value);
+        let _ = roots.pin_root(value);
     }
     let names = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(match keywords.is_empty() {
+    let _ = roots.pin_root(match keywords.is_empty() {
         true => pyre_object::PY_NULL,
         false => pyre_object::w_tuple_new(keywords.iter().map(|&(name, _)| name).collect()),
     });

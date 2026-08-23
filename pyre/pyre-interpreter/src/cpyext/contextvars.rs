@@ -27,7 +27,7 @@ fn variable(raw: *mut CPyObject) -> Result<PyObjectRef, crate::PyError> {
     }
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_var);
+    let _ = roots.pin_root(w_var);
     let class = context_var_class()?;
     let w_var = pyre_object::gc_roots::shadow_stack_get(slot);
     if !unsafe { crate::baseobjspace::isinstance_w(w_var, class) } {
@@ -48,14 +48,14 @@ fn call_method(
     let w_var = variable(raw)?;
     let roots = pyre_object::gc_roots::push_roots();
     let var_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_var);
+    let _ = roots.pin_root(w_var);
     let w_argument = unsafe { pyobject::from_ref(argument) };
     let argument_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_argument);
+    let _ = roots.pin_root(w_argument);
     let method =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(var_slot), name)?;
     let method_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(method);
+    let _ = roots.pin_root(method);
     let arguments: Vec<PyObjectRef> = match argument.is_null() {
         true => Vec::new(),
         false => vec![pyre_object::gc_roots::shadow_stack_get(argument_slot)],
@@ -85,13 +85,13 @@ pub unsafe extern "C" fn PyContextVar_New(
         let class = context_var_class()?;
         let roots = pyre_object::gc_roots::push_roots();
         let class_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(class);
+        let _ = roots.pin_root(class);
         let default = unsafe { pyobject::from_ref(default_value) };
         let default_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(default);
+        let _ = roots.pin_root(default);
         // The name is minted last, so nothing above it is a pre-move address.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(pyre_object::w_str_new(&text));
+        let _ = roots.pin_root(pyre_object::w_str_new(&text));
         let class = pyre_object::gc_roots::shadow_stack_get(class_slot);
         let arguments = [pyre_object::gc_roots::shadow_stack_get(name_slot)];
         if default_value.is_null() {

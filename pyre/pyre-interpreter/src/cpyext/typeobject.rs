@@ -802,7 +802,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     // rooted across it and read back.
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_type);
+    let _ = roots.pin_root(w_type);
     // `inherit_special`'s "Setup fast subclass flags", which runs for every
     // type it builds and not only for one an extension declared: a `Py*_Check`
     // written for C is a flag test, so a mirror whose bit is clear answers no
@@ -812,7 +812,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     // `object` names no base, and the empty tuple is what says so: a null is
     // a length read off nothing.
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(
+    let _ = roots.pin_root(
         match unsafe {
             pyre_object::typeobject::w_type_get_bases(pyre_object::gc_roots::shadow_stack_get(
                 type_slot,
@@ -823,7 +823,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         },
     );
     let mro_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(unsafe {
+    let _ = roots.pin_root(unsafe {
         let mro = pyre_object::typeobject::w_type_get_mro(pyre_object::gc_roots::shadow_stack_get(
             type_slot,
         ));
@@ -952,13 +952,13 @@ fn call_slot_method(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_self);
+    let _ = roots.pin_root(w_self);
     for &argument in arguments {
-        roots.pin_root(argument);
+        let _ = roots.pin_root(argument);
     }
     // Last, so the indices above keep naming what they named.
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_owner);
+    let _ = roots.pin_root(w_owner);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let function = slot_method(
         pyre_object::gc_roots::shadow_stack_get(owner_slot),
@@ -966,7 +966,7 @@ fn call_slot_method(
         method,
     )?;
     let function_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(function);
+    let _ = roots.pin_root(function);
     let mut call = Vec::with_capacity(arguments.len() + 1);
     for index in 0..=arguments.len() {
         call.push(reload(index));
@@ -1113,9 +1113,9 @@ fn ssize_arg_body(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_self);
+    let _ = roots.pin_root(w_self);
     let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_owner);
+    let _ = roots.pin_root(w_owner);
     // Minting the index can collect, so both are read back.
     let w_index = pyre_object::w_int_new(index as i64);
     let w_self = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -1298,9 +1298,9 @@ fn call_slot_arguments(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(callable);
-    roots.pin_root(w_self);
-    roots.pin_root(unsafe { pyobject::from_ref(kwds) });
+    let _ = roots.pin_root(callable);
+    let _ = roots.pin_root(w_self);
+    let _ = roots.pin_root(unsafe { pyobject::from_ref(kwds) });
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     // Minted last, so nothing pinned above it is a pre-move address.
     let starargs = match args.is_null() {
@@ -1308,7 +1308,7 @@ fn call_slot_arguments(
         false => unsafe { pyobject::from_ref(args) },
     };
     let starargs_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(starargs);
+    let _ = roots.pin_root(starargs);
     crate::eval::CURRENT_FRAME.with(|current| {
         let frame = current.get();
         if frame.is_null() {
@@ -4051,11 +4051,11 @@ fn assign_index(
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(args[0]);
+    let _ = roots.pin_root(args[0]);
     let key_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(args[1]);
+    let _ = roots.pin_root(args[1]);
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let _ = roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
 
     let index = sequence_index(reload(self_slot), reload(key_slot))?;
@@ -4329,9 +4329,9 @@ fn init_descr(raw: *mut CPyObject, w_type: PyObjectRef, w_name: PyObjectRef) {
     // pinned and read back.
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_type);
+    let _ = roots.pin_root(w_type);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_name);
+    let _ = roots.pin_root(w_name);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
     let d_type = pyobject::make_ref(reload(type_slot)) as *mut CPyTypeObject;
     let d_name = pyobject::make_ref(reload(name_slot));
@@ -5033,7 +5033,7 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         };
         if !mro.is_null() {
             let mro_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(pyre_object::w_tuple_new(unsafe { (*mro).to_vec() }));
+            let _ = roots.pin_root(pyre_object::w_tuple_new(unsafe { (*mro).to_vec() }));
             unsafe {
                 (*tp).tp_mro =
                     pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(mro_slot));

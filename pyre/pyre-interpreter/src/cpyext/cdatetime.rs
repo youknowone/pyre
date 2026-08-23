@@ -137,7 +137,7 @@ fn build_api() -> Result<CPyDateTimeCAPI, crate::PyError> {
     let module = import_datetime()?;
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let reload = || pyre_object::gc_roots::shadow_stack_get(module_slot);
 
     let mut mirror = |name: &str| -> Result<*mut CPyTypeObject, crate::PyError> {
@@ -153,7 +153,7 @@ fn build_api() -> Result<CPyDateTimeCAPI, crate::PyError> {
     // `cdatetime.py:60-63`: the singleton is `datetime.timezone.utc`.
     let timezone = class_of(reload(), "timezone")?;
     let timezone_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(timezone);
+    let _ = roots.pin_root(timezone);
     let utc = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(timezone_slot),
         "utc",
@@ -206,20 +206,20 @@ fn construct(
     }
     let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(callable);
+    let _ = roots.pin_root(callable);
     let arguments_base = pyre_object::gc_roots::shadow_stack_len();
     let mut count = 0usize;
     for &value in values {
-        roots.pin_root(pyre_object::intobject::w_int_new(value));
+        let _ = roots.pin_root(pyre_object::intobject::w_int_new(value));
         count += 1;
     }
     if !tzinfo.is_null() {
-        roots.pin_root(unsafe { pyobject::from_ref(tzinfo) });
+        let _ = roots.pin_root(unsafe { pyobject::from_ref(tzinfo) });
         count += 1;
     }
     let fold_slot = pyre_object::gc_roots::shadow_stack_len();
     if let Some(fold) = fold {
-        roots.pin_root(pyre_object::intobject::w_int_new(fold));
+        let _ = roots.pin_root(pyre_object::intobject::w_int_new(fold));
     }
     // Each root was taken before the allocation that follows it, so what the
     // call is handed is read back rather than the pre-move words above.
@@ -384,13 +384,13 @@ pub unsafe extern "C" fn _PyTimeZone_FromTimeZone(
         let module = import_datetime()?;
         let roots = pyre_object::gc_roots::push_roots();
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(module);
+        let _ = roots.pin_root(module);
         let timezone = class_of(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             "timezone",
         )?;
         let timezone_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(timezone);
+        let _ = roots.pin_root(timezone);
         let mut arguments = vec![unsafe { pyobject::from_ref(offset) }];
         if !name.is_null() {
             arguments.push(unsafe { pyobject::from_ref(name) });
@@ -418,7 +418,7 @@ fn from_timestamp(
     }
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_type);
+    let _ = roots.pin_root(w_type);
     let found =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(type_slot), name);
     let Some(method) = trap(found) else {

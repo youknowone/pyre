@@ -192,8 +192,8 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     }
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.base();
-    roots.pin_root(w_code);
-    roots.pin_root(w_globals);
+    let _ = roots.pin_root(w_code);
+    let _ = roots.pin_root(w_globals);
     // `frameobject.py:72 space.FrameClass(space, code, w_globals,
     // outer_func=None)` — no arguments and no closure, so the locals array is
     // whatever the code object's own counts ask for.

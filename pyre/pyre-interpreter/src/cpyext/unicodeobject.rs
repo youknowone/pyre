@@ -1358,7 +1358,7 @@ pub unsafe extern "C" fn PyUnicode_Split(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let string_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(string);
+    let _ = roots.pin_root(string);
     let separator = match separator.is_null() {
         true => pyre_object::PY_NULL,
         false => match str_argument(separator, must_be_str) {
@@ -1367,10 +1367,10 @@ pub unsafe extern "C" fn PyUnicode_Split(
         },
     };
     let separator_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(separator);
+    let _ = roots.pin_root(separator);
     // Minting the count may collect, so both arguments are read back after.
     let count_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_int_new(maxsplit as i64));
+    let _ = roots.pin_root(pyre_object::w_int_new(maxsplit as i64));
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
     let separator = match reload(separator_slot) {
         separator if separator.is_null() => pyre_object::w_none(),

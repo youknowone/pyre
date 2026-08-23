@@ -438,13 +438,13 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_obj);
+    let w_obj = roots.pin_root(w_obj);
     let acquired = crate::builtins::w_memoryview_new_with_flags(w_obj, flags);
     let Some(w_view) = super::pyerrors::trap(acquired) else {
         return -1;
     };
     let view_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_view);
+    let _ = roots.pin_root(w_view);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
     let contiguous = unsafe { crate::builtins::memoryview_contiguity(reload(view_slot)) };
     if let Some(message) = contiguity_refusal(flags, contiguous) {
@@ -1131,7 +1131,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     };
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(mv);
+    let mv = roots.pin_root(mv);
     let view = unsafe { pyre_object::memoryview::w_memoryview_view(mv) };
     let refuse = |kind, message: &str| {
         super::pyerrors::set_pending_error(crate::PyError::new(kind, message.to_string()));

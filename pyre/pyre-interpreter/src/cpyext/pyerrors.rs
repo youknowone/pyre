@@ -988,9 +988,9 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         .unwrap_or_else(|_| error.to_exc_object());
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_value);
+    let w_value = roots.pin_root(w_value);
     let w_type = crate::baseobjspace::exception_getclass(w_value);
-    roots.pin_root(match w_type.is_null() {
+    let _ = roots.pin_root(match w_type.is_null() {
         true => pyre_object::w_none(),
         false => w_type,
     });
@@ -999,7 +999,7 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         false => pyre_object::PY_NULL,
     };
     unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
-    roots.pin_root(match w_tb.is_null() {
+    let _ = roots.pin_root(match w_tb.is_null() {
         true => pyre_object::w_none(),
         false => w_tb,
     });
@@ -1009,7 +1009,7 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         return;
     };
     let sys_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(sys_module);
+    let _ = roots.pin_root(sys_module);
     if set_sys_last_vars != 0 {
         // `last_exc` names the exception itself; the three beside it are the
         // triple that predates it.  A store that fails leaves that one name
@@ -1039,7 +1039,7 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         return;
     }
     let hook_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(w_hook);
+    let _ = roots.pin_root(w_hook);
     let arguments = [reload(1), reload(0), reload(2)];
     let reported = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(hook_slot),
