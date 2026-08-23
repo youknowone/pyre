@@ -32,6 +32,20 @@ const BADDR_KEY: &str = "_baddr_";
 /// Lazily-created keepalive dict on a root object.
 const OBJECTS_KEY: &str = "_objects_";
 
+/// The instance-dict keys above, which are the object's own storage rather
+/// than attributes anybody set.  `PyCData` keeps that state in C struct fields
+/// and hands `__dict__` back holding only what the program put there, so
+/// `__reduce__` leaves them out of the state it pickles.
+const STORAGE_KEYS: [&str; 7] = [
+    CDATA_BUFFER_KEY,
+    BOFF_KEY,
+    BSZ_KEY,
+    BBASE_KEY,
+    BINDEX_KEY,
+    BADDR_KEY,
+    OBJECTS_KEY,
+];
+
 static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 static SIMPLECDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
@@ -87,6 +101,166 @@ fn init_cdata_type(ns: PyObjectRef) {
         "__ctypes_from_outparam__",
         crate::make_builtin_function("__ctypes_from_outparam__", |args| Ok(args[0])),
     );
+    // The pickling pair, alongside it in `PyCData_methods`.
+    type_ns_store(
+        ns,
+        "__reduce__",
+        crate::make_builtin_function_with_arity("__reduce__", cdata_reduce, 1),
+    );
+    type_ns_store(
+        ns,
+        "__setstate__",
+        crate::make_builtin_function_with_arity("__setstate__", cdata_setstate, 3),
+    );
+}
+
+/// `_CData.__reduce__` -- `PyCData_reduce`.
+///
+/// The pickled state is the attributes the program set plus the raw view
+/// bytes, and [`unpickle`] is named as the callable that rebuilds the object
+/// from them.  A value that holds a pointer is refused: the address it carries
+/// means nothing in the process that reads the pickle back.
+fn cdata_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let info = super::stginfo::stginfo_of(cls)
+        .ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    if super::stginfo::stginfo_flags(info)
+        & (super::stginfo::TYPEFLAG_ISPOINTER | super::stginfo::TYPEFLAG_HASPOINTER)
+        != 0
+    {
+        return Err(crate::PyError::value_error(
+            "ctypes objects containing pointers cannot be pickled",
+        ));
+    }
+    // The instance dict is read once, before anything allocates: the pairs it
+    // hands back are raw words, so a collection between the read and the last
+    // store would leave them behind.  Everything built after that is pinned as
+    // it is built and read back out of its slot.
+    let d = crate::baseobjspace::getdict_native(obj);
+    let attributes: Vec<(PyObjectRef, PyObjectRef)> = if d.is_null() {
+        Vec::new()
+    } else {
+        unsafe { pyre_object::dictmultiobject::w_dict_items(d) }
+            .into_iter()
+            .filter(|&(key, _)| {
+                !unsafe { pyre_object::is_str(key) }
+                    || !STORAGE_KEYS.contains(&unsafe { pyre_object::w_str_get_value(key) })
+            })
+            .collect()
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(obj);
+    let cls_slot = obj_slot + 1;
+    let _ = roots.pin_root(cls);
+    let attribute_base = cls_slot + 1;
+    for &(key, value) in &attributes {
+        let _ = roots.pin_root(key);
+        let _ = roots.pin_root(value);
+    }
+    let state_slot = attribute_base + 2 * attributes.len();
+    let _ = roots.pin_root(pyre_object::w_dict_new());
+    for i in 0..attributes.len() {
+        crate::baseobjspace::setitem(
+            roots.get(state_slot),
+            roots.get(attribute_base + 2 * i),
+            roots.get(attribute_base + 2 * i + 1),
+        )?;
+    }
+    let buffer = cdata_bytes_object(roots.get(obj_slot))
+        .ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    let buffer_slot = state_slot + 1;
+    let _ = roots.pin_root(buffer);
+    let inner = pyre_object::w_tuple_new(vec![roots.get(state_slot), roots.get(buffer_slot)]);
+    let inner_slot = buffer_slot + 1;
+    let _ = roots.pin_root(inner);
+    let outer = pyre_object::w_tuple_new(vec![roots.get(cls_slot), roots.get(inner_slot)]);
+    let outer_slot = inner_slot + 1;
+    let _ = roots.pin_root(outer);
+    Ok(pyre_object::w_tuple_new(vec![
+        unpickle_function(),
+        roots.get(outer_slot),
+    ]))
+}
+
+/// `_CData.__setstate__` -- `PyCData_setstate`.
+///
+/// The bytes are written over the view and truncated to it, so a state saved
+/// from a wider object fills what fits; the dictionary is merged into the
+/// attributes rather than replacing them.
+fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    if !unsafe { pyre_object::is_dict(args[1]) } {
+        return Err(crate::PyError::type_error(format!(
+            "argument 1 must be dict, not {}",
+            crate::gateway::short_type_name(args[1])
+        )));
+    }
+    let source = crate::typedef::buffer_as_bytes_like(args[2])?.ok_or_else(|| {
+        crate::PyError::type_error(format!(
+            "argument 2 must be str, not {}",
+            crate::gateway::short_type_name(args[2])
+        ))
+    })?;
+    cdata_write(obj, 0, unsafe {
+        pyre_object::bytesobject::bytes_like_data(source)
+    });
+    let d = crate::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return Err(crate::PyError::type_error(
+            "ctypes instance has no instance dict",
+        ));
+    }
+    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(args[1]) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let d_slot = roots.base();
+    let _ = roots.pin_root(d);
+    let item_base = d_slot + 1;
+    for &(key, value) in &items {
+        let _ = roots.pin_root(key);
+        let _ = roots.pin_root(value);
+    }
+    for i in 0..items.len() {
+        crate::baseobjspace::setitem(
+            roots.get(d_slot),
+            roots.get(item_base + 2 * i),
+            roots.get(item_base + 2 * i + 1),
+        )?;
+    }
+    Ok(pyre_object::w_none())
+}
+
+static UNPICKLE_FUNCTION: OnceLock<usize> = OnceLock::new();
+
+/// `_ctypes._unpickle`, the callable [`cdata_reduce`] names.
+pub(super) fn unpickle_function() -> PyObjectRef {
+    *UNPICKLE_FUNCTION
+        .get_or_init(|| crate::make_builtin_function_with_arity("_unpickle", unpickle, 2) as usize)
+        as PyObjectRef
+}
+
+/// `_ctypes._unpickle` -- `_ctypes__unpickle_impl`.
+///
+/// Allocate an instance of the pickled class without running `__init__` -- the
+/// state is what decides its contents -- and hand it the state, so a subclass
+/// that writes its own `__setstate__` is the one that reads the state back.
+fn unpickle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args[0];
+    let state = args[1];
+    let new = crate::baseobjspace::getattr_str(cls, "__new__")?;
+    let obj = crate::call::call_function_impl_result(new, &[cls])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let _ = roots.pin_root(obj);
+    let state_slot = obj_slot + 1;
+    let _ = roots.pin_root(state);
+    let setstate = crate::baseobjspace::getattr_str(roots.get(obj_slot), "__setstate__")?;
+    let setstate_slot = state_slot + 1;
+    let _ = roots.pin_root(setstate);
+    let state_args = crate::baseobjspace::fixedview(roots.get(state_slot), -1)?;
+    crate::call::call_function_impl_result(roots.get(setstate_slot), &state_args)?;
+    Ok(roots.get(obj_slot))
 }
 
 pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
