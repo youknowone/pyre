@@ -338,7 +338,7 @@ def include_closure(root: Path, files: set[Path]) -> set[Path]:
         source = root / rel_source
         if not source.is_file():
             continue
-        text = source.read_text(encoding="utf-8", errors="replace")
+        text = read_input_bytes(root, rel_source).decode("utf-8", errors="replace")
         for call in _INCLUDE_CALL.finditer(text):
             line = text.count("\n", 0, call.start()) + 1
             where = f"{rel_source.as_posix()}:{line}"
@@ -755,6 +755,31 @@ def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
     return result
 
 
+# File contents read while hashing and while scanning for `include*!`
+# arguments, keyed by repo-relative path and validated against the file's
+# size and mtime on every hit, so a caller that rewrites an input between two
+# walks (the selftest does, per case) reads the new bytes without having to
+# know about this memo. `forget_collected_inputs` drops it with the input
+# walks it serves. One `--fingerprint --per-crate` over the four pyre crates
+# hashes the interpreter's closure three times over (the `source=` fallback,
+# `closure=`, and the include scan) and the jit's on top, which on a windows
+# runner is the cost of the step — every read there goes through the
+# real-time scanner, where a stat does not.
+_file_bytes_cache: dict[Path, tuple[int, int, bytes]] = {}
+
+
+def read_input_bytes(root: Path, path: Path) -> bytes:
+    """`(root / path).read_bytes()`, memoised while the file's stat holds."""
+    full_path = root / path
+    stat = full_path.stat()
+    hit = _file_bytes_cache.get(path)
+    if hit is not None and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns:
+        return hit[2]
+    data = full_path.read_bytes()
+    _file_bytes_cache[path] = (stat.st_size, stat.st_mtime_ns, data)
+    return data
+
+
 def forget_collected_inputs() -> None:
     """Drop the memoised input sets, because the tree they describe has moved.
 
@@ -767,6 +792,7 @@ def forget_collected_inputs() -> None:
     input set.
     """
     _inputs_cache.clear()
+    _file_bytes_cache.clear()
 
 
 def _collect_inputs(
@@ -1202,7 +1228,7 @@ def _repo_fingerprint(
         digest.update(b"\0")
         full_path = eng.root / path
         if full_path.is_file():
-            digest.update(full_path.read_bytes())
+            digest.update(read_input_bytes(eng.root, path))
         elif full_path.exists():
             # A directory in the input list is never a source file. Hashing it
             # below would fold it to one constant token that no edit inside it
@@ -1791,6 +1817,36 @@ def crate_layout_targets(eng: Engine, spec: CrateSpec) -> list[str]:
     return [t for t in extra if t != host]
 
 
+def scan_for_keys(
+    path: Path, keys: list[bytes], chunk_size: int = 1 << 22
+) -> dict[bytes, int]:
+    """Byte offset of the first occurrence of each key, in one streamed pass."""
+    found: dict[bytes, int] = {}
+    keep = max(len(key) for key in keys) - 1
+    buffer = b""
+    base = 0
+    with path.open("rb") as artefact:
+        while len(found) < len(keys):
+            piece = artefact.read(chunk_size)
+            if not piece:
+                break
+            buffer += piece
+            for key in keys:
+                if key not in found:
+                    index = buffer.find(key)
+                    if index >= 0:
+                        found[key] = base + index
+            base += len(buffer) - keep
+            buffer = buffer[-keep:]
+    return found
+
+
+# First decode window of `write_layout_sidecar`, in bytes; it widens fourfold
+# until the value closes. Wide enough for every scalar field in one read and
+# for the smaller crates' `type_decls`, small enough that a miss costs little.
+LAYOUT_DECODE_WINDOW = 1 << 22
+
+
 def write_layout_sidecar(source: Path, dest: Path) -> None:
     """Reduce a full `.ullbc` to its type declarations.
 
@@ -1801,33 +1857,55 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
     `.ullbc` — the reader needs no special case, and the consumer merges
     it ahead of the host artefacts so its layouts win.
 
-    Only the fields kept are decoded, not the whole file: bodies dominate
-    the input (the interpreter's are ~94% of it), and parsing them costs an
-    order of magnitude more memory than the text itself.
+    Only the fields kept are decoded, and only a window of the file around
+    each is ever in memory: the artefact is three quarters of a GB of
+    one-line JSON, and `read_text` on it peaked at 7 GB of RSS (measured on
+    the interpreter's), the entire memory of a 7 GB macos runner. The keys
+    are located by one streamed byte scan; each value is then decoded from
+    a window that starts at the value and widens until the value closes.
     """
-    text = source.read_text(encoding="utf-8")
     decoder = json.JSONDecoder()
+    keys = {
+        name: f'"{name}":'.encode("ascii")
+        for name in ("charon_version", "has_errors", "crate_name", "type_decls")
+    }
+    offsets = scan_for_keys(source, list(keys.values()))
+    size = source.stat().st_size
 
     def field(name: str, *, want: type):
-        key = f'"{name}":'
-        at = text.find(key)
-        if at < 0:
+        key = keys[name]
+        if key not in offsets:
             raise SystemExit(f"extract-llbc.py: {source.name} has no `{name}` field")
-        # `raw_decode` does not skip leading whitespace of its own.
-        start = at + len(key)
-        while text[start] in " \t\r\n":
-            start += 1
-        try:
-            value, _ = decoder.raw_decode(text, start)
-        except json.JSONDecodeError as exc:
-            # The substring scan is unscoped, so `"{name}":` could match inside
-            # a string literal before the real key; then `start` points at
-            # non-JSON and decoding fails.  Report it the same way the rest of
-            # this file does instead of surfacing a bare traceback.
-            raise SystemExit(
-                f"extract-llbc.py: {source.name} `{name}` did not decode as JSON "
-                f"({exc}); the reducer's key scan matched a non-field occurrence."
-            ) from exc
+        start = offsets[key] + len(key)
+        window = LAYOUT_DECODE_WINDOW
+        with source.open("rb") as artefact:
+            while True:
+                artefact.seek(start)
+                # A window cut inside a multi-byte character only loses bytes
+                # PAST the value being decoded; a value that does not close
+                # inside the window is retried with a wider one.
+                text = artefact.read(window).decode("utf-8", errors="replace")
+                # `raw_decode` does not skip leading whitespace of its own.
+                at = 0
+                while at < len(text) and text[at] in " \t\r\n":
+                    at += 1
+                try:
+                    value, _ = decoder.raw_decode(text, at)
+                except json.JSONDecodeError as exc:
+                    if start + window < size:
+                        window *= 4
+                        continue
+                    # The substring scan is unscoped, so `"{name}":` could
+                    # match inside a string literal before the real key; then
+                    # `start` points at non-JSON and decoding fails.  Report
+                    # it the same way the rest of this file does instead of
+                    # surfacing a bare traceback.
+                    raise SystemExit(
+                        f"extract-llbc.py: {source.name} `{name}` did not decode as"
+                        f" JSON ({exc}); the reducer's key scan matched a non-field"
+                        " occurrence."
+                    ) from exc
+                break
         # Shape guard: a wrong (earlier) match can still decode as valid JSON of
         # the wrong type.  `type_decls` in particular must reach the sidecar
         # intact — it is the sole source of the target field offsets.
@@ -1848,7 +1926,6 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
             "fun_decls": [],
         },
     }
-    del text
     dest.write_text(json.dumps(slim), encoding="utf-8")
 
 
@@ -2229,6 +2306,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         layout_passes: list[
             tuple[str, Path, Path, subprocess.Popen | None, typing.BinaryIO | None]
         ] = []
+        # Wall-clock marks for the per-phase figures printed below. Under CI
+        # stdout is block-buffered, so every line of a crate's extraction
+        # lands with one timestamp and the figures in the text are the only
+        # record of where the minutes went.
+        phase_started = time.monotonic()
         host_pass = subprocess.Popen(command, cwd=path, env=host_env)
         try:
             # One extra extraction per cross target, reduced to its type
@@ -2303,11 +2385,17 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     if host_pass is not None:
                         finish_charon_pass(host_pass, command, dest)
                         host_pass = None
+                        print(f"    host pass: {time.monotonic() - phase_started:.0f} s")
+                        phase_started = time.monotonic()
                     subprocess.run(layout_command, cwd=path, env=layout_env, check=True)
+                    print(f"    {target} pass: {time.monotonic() - phase_started:.0f} s")
+                    phase_started = time.monotonic()
 
             if host_pass is not None:
                 finish_charon_pass(host_pass, command, dest)
                 host_pass = None
+                print(f"    host pass: {time.monotonic() - phase_started:.0f} s")
+                phase_started = time.monotonic()
 
             layout_tables: dict[str, set[Path]] = {}
             for target, sidecar, full, proc, log in layout_passes:
@@ -2318,6 +2406,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                             log.seek(0)
                             sys.stdout.write(log.read().decode("utf-8", errors="replace"))
                             raise subprocess.CalledProcessError(returncode, proc.args)
+                    print(
+                        f"    {target} pass: {time.monotonic() - phase_started:.0f} s"
+                        " (beside the host pass)"
+                    )
+                    phase_started = time.monotonic()
                 if not full.exists() or full.stat().st_size == 0:
                     raise SystemExit(
                         f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
@@ -2333,7 +2426,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 # sidecar froze are consumed as current.
                 merge_readfiles(layout_tables, artefact_local_readfiles(full))
                 full.unlink()
-                print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+                print(
+                    f"    wrote {sidecar} ({sidecar.stat().st_size} bytes),"
+                    f" reduced in {time.monotonic() - phase_started:.0f} s"
+                )
+                phase_started = time.monotonic()
         finally:
             # A raise anywhere above -- a pass that failed, an artefact
             # that is missing, a layout std that will not build -- leaves
@@ -2472,7 +2569,10 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         stamp_path.write_text(
             current_stamp + "\n", encoding="utf-8", newline="\n"
         )
-        print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
+        print(
+            f"    wrote {dest} ({dest.stat().st_size} bytes),"
+            f" stamped in {time.monotonic() - phase_started:.0f} s"
+        )
 
     print()
     if unstamped:
@@ -3158,6 +3258,14 @@ def run_cli(
     # everywhere else, and argparse can refuse it here.
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--fingerprint", action="store_true")
+    parser.add_argument(
+        "--per-crate",
+        action="store_true",
+        help="with --fingerprint: one `<field>[<crate>]=` line per crate and"
+        " field, instead of one digest over all the crates named. One process"
+        " shares the cargo metadata and include walks every crate needs, where"
+        " one process per crate repeats them",
+    )
     modes.add_argument("--list-inputs", action="store_true")
     modes.add_argument(
         "--check",
@@ -3231,10 +3339,18 @@ def run_cli(
         # BOTH fields. Printing only `source=` here previously cost a session:
         # three legs returned identical hashes that were consistent with every
         # hypothesis, because the field under test was not in the output.
-        print(f"source={source_fingerprint(eng, crates, cargo_features)}")
-        print(f"closure={closure_fingerprint(eng, crates, cargo_features)}")
-        print(f"external={external_fingerprint(eng, crates, cargo_features)}")
+        groups = (
+            [(f"[{crate}]", [crate]) for crate in crates]
+            if args.per_crate
+            else [("", crates)]
+        )
+        for suffix, group in groups:
+            print(f"source{suffix}={source_fingerprint(eng, group, cargo_features)}")
+            print(f"closure{suffix}={closure_fingerprint(eng, group, cargo_features)}")
+            print(f"external{suffix}={external_fingerprint(eng, group, cargo_features)}")
         return
+    if args.per_crate:
+        parser.error("--per-crate only applies with --fingerprint")
     if args.self_test:
         # The parser test runs first because it mutates only a temporary file;
         # the live probe below briefly changes the shared working tree.

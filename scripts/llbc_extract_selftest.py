@@ -13,6 +13,7 @@ Runs on a synthetic tree in a temp dir: no cargo, no git, well under a second.
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import shutil
 import subprocess
@@ -176,9 +177,57 @@ def run_fingerprint(engine) -> int:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_layout_sidecar(engine) -> int:
+    """Reduce a synthetic full artefact whose shape mirrors Charon's.
+
+    `type_decls` is made wider than the reducer's first decode window so the
+    widening retry runs, the bodies around it carry non-ASCII text so a window
+    edge can fall inside a multi-byte character, and `has_errors` sits at the
+    tail of the file, past every body, the way Charon writes it.
+    """
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        type_decls = [
+            {"item_meta": {"name": f"ty{i}", "doc": "\u00e9" * 64}, "layout": [i]}
+            for i in range(60_000)
+        ]
+        fun_decls = [{"body": "\u2603" * 512, "index": i} for i in range(2_000)]
+        artefact = {
+            "charon_version": "probe",
+            "translated": {
+                "crate_name": "probe",
+                "files": [{"name": {"Local": "src/lib.rs"}}],
+                "type_decls": type_decls,
+                "fun_decls": fun_decls,
+            },
+            "has_errors": False,
+        }
+        full = root / "probe.full"
+        full.write_text(json.dumps(artefact, ensure_ascii=False), encoding="utf-8")
+        dest = root / "probe.layouts.ullbc"
+        engine.write_layout_sidecar(full, dest)
+        slim = json.loads(dest.read_text(encoding="utf-8"))
+        expected = {
+            "charon_version": "probe",
+            "has_errors": False,
+            "translated": {
+                "crate_name": "probe",
+                "type_decls": type_decls,
+                "fun_decls": [],
+            },
+        }
+        encoded = json.dumps(type_decls, ensure_ascii=False).encode("utf-8")
+        wide = len(encoded) > engine.LAYOUT_DECODE_WINDOW
+        ok = slim == expected and wide
+        print(f"{'ok  ' if ok else 'FAIL'} layout sidecar keeps type_decls and drops bodies")
+        return 0 if ok else 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> None:
     engine = load_engine()
-    failures = run(engine) + run_fingerprint(engine)
+    failures = run(engine) + run_fingerprint(engine) + run_layout_sidecar(engine)
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")
     print("llbc_extract_selftest: all passed")

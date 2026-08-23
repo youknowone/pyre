@@ -147,14 +147,22 @@ jobs:
       # artefact it will name exists. The narrow digest the stamp records is a
       # freshness verdict, not a key, and is not available here.
       #
-      # Take the `source=` line alone. `--fingerprint` prints three fields, and
-      # `$GITHUB_OUTPUT` parses one `name=value` per line, so passing the whole
-      # block through would file `closure=` and `external=` as outputs of their
-      # own and leave the key holding a stray `source=` prefix.
+      # Take each crate's `source[<crate>]=` line alone. `--fingerprint` prints
+      # three fields per crate, and `$GITHUB_OUTPUT` parses one `name=value`
+      # per line, so passing the whole block through would file `closure=` and
+      # `external=` as outputs of their own and leave the key holding a stray
+      # `source=` prefix. One `--per-crate` process for all four, not one
+      # process per crate: the cargo metadata and include walks are shared, and
+      # four processes cost 42 s on the windows runner.
       run: |
+        # Outside the checkout: the redirect creates the file before the walk
+        # that would otherwise see it as an untracked input.
+        fingerprints="$RUNNER_TEMP/llbc-fingerprints.txt"
+        scripts/extract-llbc.py --fingerprint --per-crate \
+          majit-rlib pyre-object pyre-interpreter pyre-jit > "$fingerprints"
         for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
-          value="$(scripts/extract-llbc.py --fingerprint "$crate" | sed -n 's/^source=//p')"
-          test -n "$value" || { echo "no source= for $crate" >&2; exit 1; }
+          value="$(sed -n "s/^source\[$crate\]=//p" "$fingerprints")"
+          test -n "$value" || { echo "no source[$crate]= for $crate" >&2; exit 1; }
           echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
         done
     # Per-crate caches (per-OS/arch because cfg(target_os)/cfg(target_arch)
