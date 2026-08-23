@@ -210,12 +210,13 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (70): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (71): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
-`PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
+`PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_BRIDGE_LATCH_AUDIT`,
+`PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
 `PYRE_CELL_CENSUS`, `PYRE_CHECK_INHERIT_ENV`,
 `PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,

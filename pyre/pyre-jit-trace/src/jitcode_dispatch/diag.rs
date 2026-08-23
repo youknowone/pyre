@@ -79,6 +79,26 @@ pub(crate) fn p2_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_P2_DIAG").is_some())
 }
 
+/// `PYRE_BRIDGE_LATCH_AUDIT`: report what the bridge sub-walk's abort latch
+/// would have been refused for at the walk-level latch site.
+///
+/// `drive_bridge_frame_subwalk` latches on any `Err`, where the walk-level site
+/// first requires the abort coordinate, `leaves_complete_image`, a carrier
+/// exclusion and `!abort_blackhole_latched`. Two of those are observable from
+/// the bridge site without inventing state: whether an image is *already*
+/// latched — the innermost abort owns the handoff, so a second latch replaces
+/// it with one rooted at the caller — and whether the error class leaves a
+/// complete image.
+///
+/// Both must be sampled **before** latching. Reading `abort_blackhole_latched`
+/// afterwards always reports `true` and witnesses nothing; the multi-frame arm
+/// this site always takes also prints nothing on accept, which is why the
+/// question has had no answer.
+pub(crate) fn bridge_latch_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_BRIDGE_LATCH_AUDIT").is_some())
+}
+
 pub(crate) fn pcmap_recipe_resultcolor_audit_probe(site: &'static str, verdict: &'static str) {
     if let Some(path) = std::env::var_os("PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE") {
         use std::io::Write;

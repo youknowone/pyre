@@ -8728,6 +8728,38 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     Ok(())
 }
 
+/// True when the payload `ob_type` already determines the Python-visible
+/// class, so pinning `w_class` against `w_type` is a tautology.
+///
+/// pyre carries the Python-visible class in `w_class` beside the payload
+/// `ob_type` that `GuardClass` reads, which is the whole reason a second pin
+/// exists: a builtin subclass shares the layout and retags `w_class`.  Three
+/// properties together remove that freedom.  `w_type` is the canonical class
+/// of the payload; it refuses to be a base class, so no subclass can share the
+/// layout; and it is not a heap type, so `__class__` assignment cannot retag an
+/// instance onto or off it — `objectobject.py descr_set___class__` requires
+/// both ends to be mutable heap types.  `frame`, `code` and `traceback` are all
+/// three, which is what makes the pin removable on a traceback walk.
+///
+/// This is the argument [`walker_numeric_builtin_class`] already makes for
+/// `bool`, stated for a receiver whose class is not known at codegen time.
+///
+/// # Safety
+/// `ob_type` must be null or a live `PyType`, and `w_type` a live type object.
+unsafe fn walker_payload_determines_w_class(
+    ob_type: *const pyre_object::PyType,
+    w_type: pyre_object::PyObjectRef,
+) -> bool {
+    if ob_type.is_null() {
+        return false;
+    }
+    unsafe {
+        !pyre_object::typeobject::w_type_get_acceptable_as_base_class(w_type)
+            && !pyre_object::typeobject::w_type_is_cpython_heaptype(w_type)
+            && std::ptr::eq(pyre_object::pyobject::get_instantiate(&*ob_type), w_type)
+    }
+}
+
 /// Pin every branch input preceding a raw typed exception-slot arm.
 /// `GuardClass` fixes the kind-specific `W_BaseException` layout and kind tag;
 /// `GuardValue(getfield(w_class))` distinguishes heap subclasses sharing that
@@ -8743,7 +8775,8 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
 ) -> Result<(), DispatchError> {
-    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
+    let ob_type = unsafe { (*concrete_obj).ob_type };
+    let physical_type = ob_type as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(physical_type);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
@@ -8751,18 +8784,25 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
             .heap_cache_mut()
             .class_now_known(obj, physical_type);
     }
-    let live_w_class =
-        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
-    let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[live_w_class, w_class_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(live_w_class, w_class_const);
+    // The `GuardClass` above pins the payload, and for a receiver whose payload
+    // determines its class there is nothing left for the `w_class` pin to
+    // exclude.  It is not free: the pin does not dedupe the way `GuardClass`
+    // does through `is_class_known`, so a traceback walk pays a load and a
+    // guard on every hop of every node.
+    if !unsafe { walker_payload_determines_w_class(ob_type, w_type) } {
+        let live_w_class =
+            crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
+        let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[live_w_class, w_class_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(live_w_class, w_class_const);
+    }
 
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_pin_type_version_tag(ctx, op_pc, type_const)?;

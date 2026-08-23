@@ -830,8 +830,22 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     unsafe {
         let walk_owns_resume =
             pyre_jit_trace::trace::active_walk_live_frame() == frame_ptr as usize;
-        if (*frame_ptr).last_instr < 0 && !walk_owns_resume {
+        let live = (*frame_ptr).last_instr;
+        if live < 0 && !walk_owns_resume {
             (*frame_ptr).last_instr = last_instruction as isize;
+        } else if m73_lastinstr_audit_enabled() && live != last_instruction as isize {
+            // The frame keeps a coordinate the node about to be minted does not
+            // carry, which is precisely the shape a later `tb.tb_frame.f_lasti`
+            // disagrees with `tb.tb_lasti` in.  Both values are doubled the way
+            // the two getters report them, and `walk` names which of the two
+            // conditions above declined the stamp.  This is the only record site
+            // that can diverge: every other one passes the frame's own
+            // `last_instr` or builds the frame it records.
+            eprintln!(
+                "[M73-LASTINSTR] mint-diverge frame={frame_ptr:p} f_lasti={} tb_lasti={} walk={walk_owns_resume}",
+                live * 2,
+                (last_instruction as isize) * 2,
+            );
         }
     }
     unsafe {

@@ -4959,7 +4959,12 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
         // Reached only for a code constant nested inside a container constant;
         // top-level `LOAD_CONST` routes through `co_consts_w` in `bh_load_const_fn`
-        // so the blackhole shares the interpreter's wrapper.
+        // so the blackhole shares the interpreter's wrapper.  The exceptions are
+        // this function's own fallbacks and `load_const_from_code`, which never
+        // consults `co_consts_w`, so a top-level code constant can arrive here
+        // too.  Either way the compiler does not emit a code object inside a
+        // container, so the copy is defensive; `box_code_constant` records why
+        // it is kept rather than removed.
         ConstantData::Code { code } => crate::pycode::box_code_constant(code),
         // `eval.rs` `none_constant`.
         ConstantData::None => pyre_object::w_none(),

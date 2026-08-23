@@ -3414,6 +3414,15 @@ impl ConstantOpcodeHandler for PyFrame {
         // (e.g. a tuple element), which has no top-level `co_consts_w` slot;
         // realize a wrapper directly.  Top-level `LOAD_CONST` of a code constant
         // goes through `constant_at` below.
+        //
+        // Defensive: the compiler does not emit that shape, and both routes into
+        // here are narrow.  `load_const_value` is entered either from the trait
+        // default `constant_at` — which `PyFrame`, the only implementor,
+        // overrides — or from `opcode_load_const` by way of
+        // `OpcodeStepExecutor::load_const`, which no caller in the tree invokes
+        // today, though `opcode_load_const` is registered as a JIT call target.
+        // So the copy this makes is not on a measured path; see
+        // `box_code_constant` for why removing it is not worth its price.
         Ok(crate::pycode::box_code_constant(code))
     }
 
