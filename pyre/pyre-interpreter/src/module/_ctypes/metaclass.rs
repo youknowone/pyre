@@ -1681,13 +1681,16 @@ fn set_type_attr(cls: PyObjectRef, key: &str, value: PyObjectRef) {
     }
 }
 
+/// `cls.__name__`, read the way `type.__name__` reads it.
+///
+/// An MRO lookup never finds it: the name is a `type` getset over the type
+/// object's own field, not an entry in any class dict along the chain.  Every
+/// caller here read `?` instead, so `c_int * 3` was named `?_Array_3`.
 fn type_name(cls: PyObjectRef) -> String {
-    match unsafe { crate::baseobjspace::lookup_in_type(cls, "__name__") } {
-        Some(o) if unsafe { pyre_object::is_str(o) } => {
-            unsafe { pyre_object::w_str_get_value(o) }.to_string()
-        }
-        _ => "?".to_string(),
+    if !unsafe { pyre_object::is_type(cls) } {
+        return "?".to_string();
     }
+    unsafe { pyre_object::w_str_get_value(pyre_object::w_type_get_name_obj(cls)) }.to_string()
 }
 
 // ── PyCArrayType + Array ───────────────────────────────────────────────
