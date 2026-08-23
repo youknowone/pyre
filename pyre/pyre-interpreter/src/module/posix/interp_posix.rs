@@ -1107,6 +1107,16 @@ fn nonstrict_wide_path(
     obj: PyObjectRef,
     func: &str,
 ) -> Result<(Vec<u16>, bool), crate::PyError> {
+    // `path_converter` reads a `str` argument's own wide units
+    // (`PyUnicode_AsWideCharString`) and reaches the filesystem codec only for
+    // `bytes`. Taking a `str` through the codec anyway costs a
+    // str -> bytes -> str round trip on every call -- and where the legacy
+    // filesystem encoding is in force it is not even a round trip, so a name
+    // no code page can spell would come back changed.
+    if unsafe { pyre_object::is_str(obj) } {
+        let units = wide_with_nul(unsafe { pyre_object::w_str_get_wtf8(obj) });
+        return Ok((units, false));
+    }
     let resolved = crate::gateway::fsencode_path_nonstrict_w(obj, func, "path")?;
     let as_bytes = unsafe { resolved.is_bytes() };
     let text = crate::gateway::fsdecode_filename_wtf8(&resolved.as_bytes);
