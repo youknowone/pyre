@@ -117,6 +117,17 @@ fn block_at(address: usize) -> Option<Block> {
     BLOCK_SIZES.lock().get(&address).copied()
 }
 
+/// Whether the block at `address` is one this layer handed out.
+///
+/// Only such a block arrives with a header worth reading: [`allocate_raw`]
+/// clears one.  An extension that allocates its own does not have to --
+/// `_cffi_backend.c allocate_owning_object` takes its blocks from plain
+/// `malloc` -- so what sits in the three header words of one of those means
+/// nothing until it is stamped.
+pub(super) fn is_own_block(address: usize) -> bool {
+    block_at(address).is_some()
+}
+
 pub(super) unsafe fn after_fork_child() {
     unsafe {
         BLOCK_SIZES.reinit_after_fork();
@@ -223,6 +234,20 @@ fn release_heap_type(ob_type: *mut CPyTypeObject) {
 /// `raw` must be a live block whose `ob_type` is either null or a live mirror.
 pub(super) unsafe fn set_ob_type(raw: *mut CPyObject, ob_type: *mut CPyTypeObject) {
     let previous = unsafe { (*raw).ob_type };
+    unsafe { exchange_ob_type(raw, ob_type, previous) };
+}
+
+/// [`set_ob_type`] where the caller says what the block named before, which a
+/// block that has never been an object does not: `Py_SET_TYPE` in
+/// `object.c _PyObject_Init` stores the type rather than exchanging it.
+///
+/// # Safety
+/// `raw` must be a live block, and `previous` either null or a live mirror.
+pub(super) unsafe fn exchange_ob_type(
+    raw: *mut CPyObject,
+    ob_type: *mut CPyTypeObject,
+    previous: *mut CPyTypeObject,
+) {
     unsafe { (*raw).ob_type = ob_type };
     // The new reference is taken first: the two can name the same mirror, and
     // releasing it to the bare link share and back would trip the floor a
@@ -510,7 +535,13 @@ unsafe fn dealloc(raw: *mut CPyObject) {
         // The generation and not just the address decides it: a `tp_dealloc`
         // that allocates after freeing can be handed the address back, and
         // what sits there then is somebody else's live block.
-        block_at(address) != block
+        //
+        // A block that never came from here is answered yes without asking:
+        // an extension allocating its instances itself frees them the same
+        // way -- `_cffi_backend.c allocate_owning_object` takes a block from
+        // plain `malloc` and its deallocator gives it back to `free` -- which
+        // leaves the census unchanged and the address unreadable.
+        block.is_none() || block_at(address) != block
     } else {
         false
     };
@@ -527,6 +558,10 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     }
     if !returned {
         unsafe { free_block(raw) };
+    } else {
+        // What this layer keys by the address goes with the block, and
+        // [`free_block`] is only reached for one it handed out itself.
+        super::gc::forget_finalized(address);
     }
     release_heap_type(ob_type);
 }

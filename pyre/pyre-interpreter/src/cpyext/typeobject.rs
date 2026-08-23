@@ -5928,8 +5928,18 @@ pub unsafe extern "C" fn PyObject_Init(
     if object.is_null() {
         return unsafe { super::pyerrors::PyErr_NoMemory() };
     }
-    unsafe { pyobject::set_ob_type(object, tp) };
-    if unsafe { !(*object).ob_pyre_link.is_null() } {
+    // `object.c _PyObject_Init`: a block reaching here is memory an allocator
+    // handed out, and only one this layer handed out arrives with a header
+    // that says anything -- so a type to release, and a link to stop at, are
+    // read from the block only then.
+    let stamped = pyobject::is_own_block(object as usize);
+    let previous = if stamped {
+        unsafe { (*object).ob_type }
+    } else {
+        std::ptr::null_mut()
+    };
+    unsafe { pyobject::exchange_ob_type(object, tp, previous) };
+    if stamped && unsafe { !(*object).ob_pyre_link.is_null() } {
         return object;
     }
     let w_type = interpreter_type(tp);
