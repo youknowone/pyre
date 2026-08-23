@@ -11618,11 +11618,10 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
             && (pyre_object::tagged_int::is_tagged_int(operands[0])
                 || pyre_object::tagged_int::is_tagged_int(operands[1]));
         let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-        let is_exact_int = |o: pyre_object::PyObjectRef| unsafe {
-            std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
-                && std::ptr::eq((*o).w_class, int_typeobj)
-        };
-        if !has_tagged_int && is_exact_int(operands[0]) && is_exact_int(operands[1]) {
+        if !has_tagged_int
+            && walker_is_exact_machine_int_concrete(operands[0])
+            && walker_is_exact_machine_int_concrete(operands[1])
+        {
             let (a_value, b_value) = unsafe {
                 (
                     pyre_object::w_int_get_value(operands[0]),
