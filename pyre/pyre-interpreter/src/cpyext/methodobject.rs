@@ -704,7 +704,14 @@ pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
 /// Fill a freshly allocated mirror -- `methodobject.py cfunction_attach`, and
 /// `cmethod_attach` for the one field past it.
 pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
-    if w_obj.is_null() || !is_carrier(w_obj) {
+    // `is_carrier` would mint the carrier type, and minting allocates: this
+    // runs inside another mirror's fill, whose caller is holding raw reads of
+    // objects a collection would move.
+    let carrier = built_carrier_type(&PYCFUNCTION_TYPE_OBJ);
+    if w_obj.is_null()
+        || carrier.is_null()
+        || !unsafe { crate::baseobjspace::issubtype_w((*w_obj).w_class, carrier) }
+    {
         return;
     }
     let tp = unsafe { (*raw).ob_type };
