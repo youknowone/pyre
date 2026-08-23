@@ -392,6 +392,34 @@ pub fn execute_varargs<M: Clone>(
     result
 }
 
+/// One row of `executor.EXECUTE_BY_NUM_ARGS`, resolved.
+///
+/// `_execute_arglist` raises `NotImplementedError` when the table holds no
+/// helper for the opcode — a different event from a registered helper refusing
+/// its operands, which upstream cannot express at all because every upstream
+/// helper is total. The `Option`-returning wrappers below collapse the two into
+/// `None`, so [`execute_nonspec_const`] consults the `*_row` functions instead
+/// and keeps [`NoConstExecutor`] for the missing helper alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConstFold<T> {
+    /// This row has no entry for the opcode.
+    Unregistered,
+    /// The entry exists and refused these operands.
+    Declined,
+    /// The folded constant.
+    Folded(T),
+}
+
+impl<T> ConstFold<T> {
+    /// The `Option` view: a decline and a missing row are both `None`.
+    pub fn folded(self) -> Option<T> {
+        match self {
+            ConstFold::Folded(value) => Some(value),
+            ConstFold::Unregistered | ConstFold::Declined => None,
+        }
+    }
+}
+
 /// `executor.py::execute_nonspec_const` for binary integer opcodes.
 ///
 /// Returns the folded `i64` result when the operation is recognized and
@@ -415,46 +443,56 @@ pub fn execute_varargs<M: Clone>(
 /// Mirrors the overflow helpers and binary-int rows generated in
 /// `executor.EXECUTE_BY_NUM_ARGS`.
 pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
-    let result = match opcode {
-        OpCode::IntAdd => a.wrapping_add(b),
-        OpCode::IntSub => a.wrapping_sub(b),
-        OpCode::IntMul => a.wrapping_mul(b),
-        OpCode::IntAddOvf => a.checked_add(b)?,
-        OpCode::IntSubOvf => a.checked_sub(b)?,
-        OpCode::IntMulOvf => a.checked_mul(b)?,
-        OpCode::IntAnd => a & b,
-        OpCode::IntOr => a | b,
-        OpCode::IntXor => a ^ b,
-        OpCode::IntLshift if (0..64).contains(&b) => a << b,
-        OpCode::IntRshift if (0..64).contains(&b) => a >> b,
-        OpCode::UintRshift if (0..64).contains(&b) => (a as u64 >> b as u64) as i64,
-        OpCode::IntLt => (a < b) as i64,
-        OpCode::IntLe => (a <= b) as i64,
-        OpCode::IntGt => (a > b) as i64,
-        OpCode::IntGe => (a >= b) as i64,
-        OpCode::IntEq => (a == b) as i64,
-        OpCode::IntNe => (a != b) as i64,
-        OpCode::UintLt => ((a as u64) < (b as u64)) as i64,
-        OpCode::UintLe => ((a as u64) <= (b as u64)) as i64,
-        OpCode::UintGe => ((a as u64) >= (b as u64)) as i64,
-        OpCode::UintGt => ((a as u64) > (b as u64)) as i64,
+    execute_binary_int_const_row(opcode, a, b).folded()
+}
+
+/// [`execute_binary_int_const`] with its two `None`s separated — see
+/// [`ConstFold`]. Every opcode named below has an entry, so an arm answering
+/// `None` is that entry declining, never a missing one.
+pub fn execute_binary_int_const_row(opcode: OpCode, a: i64, b: i64) -> ConstFold<i64> {
+    let folded = match opcode {
+        OpCode::IntAdd => Some(a.wrapping_add(b)),
+        OpCode::IntSub => Some(a.wrapping_sub(b)),
+        OpCode::IntMul => Some(a.wrapping_mul(b)),
+        OpCode::IntAddOvf => a.checked_add(b),
+        OpCode::IntSubOvf => a.checked_sub(b),
+        OpCode::IntMulOvf => a.checked_mul(b),
+        OpCode::IntAnd => Some(a & b),
+        OpCode::IntOr => Some(a | b),
+        OpCode::IntXor => Some(a ^ b),
+        OpCode::IntLshift => (0..64).contains(&b).then(|| a << b),
+        OpCode::IntRshift => (0..64).contains(&b).then(|| a >> b),
+        OpCode::UintRshift => (0..64).contains(&b).then(|| (a as u64 >> b as u64) as i64),
+        OpCode::IntLt => Some((a < b) as i64),
+        OpCode::IntLe => Some((a <= b) as i64),
+        OpCode::IntGt => Some((a > b) as i64),
+        OpCode::IntGe => Some((a >= b) as i64),
+        OpCode::IntEq => Some((a == b) as i64),
+        OpCode::IntNe => Some((a != b) as i64),
+        OpCode::UintLt => Some(((a as u64) < (b as u64)) as i64),
+        OpCode::UintLe => Some(((a as u64) <= (b as u64)) as i64),
+        OpCode::UintGe => Some(((a as u64) >= (b as u64)) as i64),
+        OpCode::UintGt => Some(((a as u64) > (b as u64)) as i64),
         // Truncating, as `_ll_2_int_floordiv` / `_ll_2_int_mod` are and as the
         // blackhole and every backend execute them. Wrapping keeps
         // `i64::MIN / -1` off the panic path; the trace guards that corner out
         // before it reaches either op.
-        OpCode::IntFloorDiv if b != 0 => a.wrapping_div(b),
-        OpCode::IntMod if b != 0 => a.wrapping_rem(b),
-        OpCode::IntSignext if (1..=8).contains(&b) => {
-            // `blackhole.bhimpl_int_signext` delegates to `support.int_signext`.
-            crate::support::int_signext(a, b)
-        }
+        OpCode::IntFloorDiv => (b != 0).then(|| a.wrapping_div(b)),
+        OpCode::IntMod => (b != 0).then(|| a.wrapping_rem(b)),
+        // `blackhole.bhimpl_int_signext` delegates to `support.int_signext`.
+        OpCode::IntSignext => (1..=8)
+            .contains(&b)
+            .then(|| crate::support::int_signext(a, b)),
         OpCode::UintMulHigh => {
             // blackhole.py bhimpl_uint_mul_high — high 64 of (a as u64) * (b as u64).
-            (((a as u64) as u128 * (b as u64) as u128) >> 64) as i64
+            Some((((a as u64) as u128 * (b as u64) as u128) >> 64) as i64)
         }
-        _ => return None,
+        _ => return ConstFold::Unregistered,
     };
-    Some(result)
+    match folded {
+        Some(value) => ConstFold::Folded(value),
+        None => ConstFold::Declined,
+    }
 }
 
 /// Pointer-comparison row of `executor.EXECUTE_BY_NUM_ARGS`.
@@ -507,14 +545,23 @@ pub fn execute_unary_float_const(opcode: OpCode, a: f64) -> Option<f64> {
 /// performs `a / b` through `blackhole.bhimpl_float_truediv`;
 /// only trace-time folding is suppressed.
 pub fn execute_binary_float_const(opcode: OpCode, a: f64, b: f64) -> Option<f64> {
-    let result = match opcode {
-        OpCode::FloatAdd => a + b,
-        OpCode::FloatSub => a - b,
-        OpCode::FloatMul => a * b,
-        OpCode::FloatTrueDiv if b != 0.0 => a / b,
-        _ => return None,
+    execute_binary_float_const_row(opcode, a, b).folded()
+}
+
+/// [`execute_binary_float_const`] with its two `None`s separated — see
+/// [`ConstFold`].
+pub fn execute_binary_float_const_row(opcode: OpCode, a: f64, b: f64) -> ConstFold<f64> {
+    let folded = match opcode {
+        OpCode::FloatAdd => Some(a + b),
+        OpCode::FloatSub => Some(a - b),
+        OpCode::FloatMul => Some(a * b),
+        OpCode::FloatTrueDiv => (b != 0.0).then(|| a / b),
+        _ => return ConstFold::Unregistered,
     };
-    Some(result)
+    match folded {
+        Some(value) => ConstFold::Folded(value),
+        None => ConstFold::Declined,
+    }
 }
 
 /// Float-comparison row of `executor.EXECUTE_BY_NUM_ARGS`, mirroring the
@@ -577,8 +624,10 @@ pub fn execute_nonspec_const(
         {
             return Ok(Some(Value::Float(folded)));
         }
-        if let Some(folded) = execute_cast_const(opnum, a) {
-            return Ok(Some(folded));
+        match execute_cast_const_row(opnum, a) {
+            ConstFold::Folded(folded) => return Ok(Some(folded)),
+            ConstFold::Declined => return Ok(None),
+            ConstFold::Unregistered => {}
         }
         // GETFIELD_GC_{I,R,F} — withdescr arity-1.
         // The executor helper is registered under the plain opnum
@@ -652,14 +701,18 @@ pub fn execute_nonspec_const(
 
     // ── arity == 2 row of EXECUTE_BY_NUM_ARGS ──
     if arity == 2 {
-        if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1])
-            && let Some(folded) = execute_binary_int_const(opnum, a, b)
-        {
-            return Ok(Some(Value::Int(folded)));
+        if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1]) {
+            match execute_binary_int_const_row(opnum, a, b) {
+                ConstFold::Folded(folded) => return Ok(Some(Value::Int(folded))),
+                ConstFold::Declined => return Ok(None),
+                ConstFold::Unregistered => {}
+            }
         }
         if let (Value::Float(a), Value::Float(b)) = (argboxes[0], argboxes[1]) {
-            if let Some(folded) = execute_binary_float_const(opnum, a, b) {
-                return Ok(Some(Value::Float(folded)));
+            match execute_binary_float_const_row(opnum, a, b) {
+                ConstFold::Folded(folded) => return Ok(Some(Value::Float(folded))),
+                ConstFold::Declined => return Ok(None),
+                ConstFold::Unregistered => {}
             }
             if let Some(folded) = execute_float_compare_const(opnum, a, b) {
                 return Ok(Some(Value::Int(folded)));
@@ -745,6 +798,11 @@ pub fn execute_nonspec_const(
 ///   CAST_PTR_TO_INT / CAST_INT_TO_PTR — pointer reinterpret
 /// Mirrors blackhole.py bhimpl_cast_*.
 pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_ir::Value> {
+    execute_cast_const_row(opcode, arg).folded()
+}
+
+/// [`execute_cast_const`] with its two `None`s separated — see [`ConstFold`].
+pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold<majit_ir::Value> {
     use majit_ir::{GcRef, Value};
     match (opcode, arg) {
         (OpCode::CastFloatToInt, Value::Float(f)) => {
@@ -759,26 +817,23 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
             // `i64::MIN ..= i64::MAX`; `i64::MAX + 1` rounds to the
             // same f64 as `i64::MAX` (precision loss), so use the
             // strictly-less-than upper bound `9.223372036854776e18`.
-            if !f.is_finite() {
-                return None;
+            if !f.is_finite() || f < (i64::MIN as f64) || f >= 9.223372036854776e18_f64 {
+                return ConstFold::Declined;
             }
-            if f < (i64::MIN as f64) || f >= 9.223372036854776e18_f64 {
-                return None;
-            }
-            Some(Value::Int(f as i64))
+            ConstFold::Folded(Value::Int(f as i64))
         }
-        (OpCode::CastIntToFloat, Value::Int(i)) => Some(Value::Float(i as f64)),
+        (OpCode::CastIntToFloat, Value::Int(i)) => ConstFold::Folded(Value::Float(i as f64)),
         (OpCode::CastFloatToSinglefloat, Value::Float(f)) => {
-            Some(Value::Int((f as f32).to_bits() as i64))
+            ConstFold::Folded(Value::Int((f as f32).to_bits() as i64))
         }
         (OpCode::CastSinglefloatToFloat, Value::Int(i)) => {
-            Some(Value::Float(f32::from_bits(i as u32) as f64))
+            ConstFold::Folded(Value::Float(f32::from_bits(i as u32) as f64))
         }
         (OpCode::ConvertFloatBytesToLonglong, Value::Float(f)) => {
-            Some(Value::Int(f.to_bits() as i64))
+            ConstFold::Folded(Value::Int(f.to_bits() as i64))
         }
         (OpCode::ConvertLonglongBytesToFloat, Value::Int(i)) => {
-            Some(Value::Float(f64::from_bits(i as u64)))
+            ConstFold::Folded(Value::Float(f64::from_bits(i as u64)))
         }
         // `assembler.py:1528-1529 genop_cast_ptr_to_int =
         // _genop_same_as` / `genop_cast_int_to_ptr = _genop_same_as`.
@@ -786,9 +841,9 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
         // backend, executor, and test_lltype.py:693-701 /
         // runner_test.py:1957-1966 expect
         // `cast_int_to_ptr(21) → cast_ptr_to_int == 21`.
-        (OpCode::CastPtrToInt, Value::Ref(r)) => Some(Value::Int(r.0 as i64)),
-        (OpCode::CastIntToPtr, Value::Int(i)) => Some(Value::Ref(GcRef(i as usize))),
-        _ => None,
+        (OpCode::CastPtrToInt, Value::Ref(r)) => ConstFold::Folded(Value::Int(r.0 as i64)),
+        (OpCode::CastIntToPtr, Value::Int(i)) => ConstFold::Folded(Value::Ref(GcRef(i as usize))),
+        _ => ConstFold::Unregistered,
     }
 }
 
@@ -1202,5 +1257,94 @@ mod execute_nonspec_const_tests {
             Ok(Some(Value::Int(42))) => {}
             other => panic!("{opnum:?} must fold to Ok(Some(Int(42))), got {other:?}"),
         }
+    }
+
+    /// Every registered helper that refuses its operands must answer
+    /// `Ok(None)`. `Err(NoConstExecutor)` is upstream's
+    /// `NotImplementedError`, and `Optimizer::constant_fold` spells it as a
+    /// `panic!` — so conflating the two turns a decline into a crash.
+    #[test]
+    fn a_registered_helper_that_refuses_its_operands_answers_ok_none() {
+        let cpu = crate::cpu::default_cpu();
+        let declines: &[(OpCode, Vec<Value>, Type)] = &[
+            // Shift count outside `blackhole.check_shift_count`'s range.
+            (
+                OpCode::IntLshift,
+                vec![Value::Int(1), Value::Int(64)],
+                Type::Int,
+            ),
+            (
+                OpCode::IntRshift,
+                vec![Value::Int(1), Value::Int(-1)],
+                Type::Int,
+            ),
+            // Zero divisor.
+            (
+                OpCode::IntFloorDiv,
+                vec![Value::Int(5), Value::Int(0)],
+                Type::Int,
+            ),
+            (
+                OpCode::IntMod,
+                vec![Value::Int(5), Value::Int(0)],
+                Type::Int,
+            ),
+            // OVF opcodes are spelled with `checked_*`.
+            (
+                OpCode::IntAddOvf,
+                vec![Value::Int(i64::MAX), Value::Int(1)],
+                Type::Int,
+            ),
+            (
+                OpCode::IntSubOvf,
+                vec![Value::Int(i64::MIN), Value::Int(1)],
+                Type::Int,
+            ),
+            (
+                OpCode::IntMulOvf,
+                vec![Value::Int(i64::MAX), Value::Int(2)],
+                Type::Int,
+            ),
+            // `test_optimizebasic.test_float_division_by_multiplication`
+            // keeps `float_truediv(f, 0.0)` in the optimized loop.
+            (
+                OpCode::FloatTrueDiv,
+                vec![Value::Float(1.0), Value::Float(0.0)],
+                Type::Float,
+            ),
+            // Non-finite and out-of-range `cast_float_to_int`.
+            (
+                OpCode::CastFloatToInt,
+                vec![Value::Float(f64::INFINITY)],
+                Type::Int,
+            ),
+            (
+                OpCode::CastFloatToInt,
+                vec![Value::Float(f64::NAN)],
+                Type::Int,
+            ),
+            (OpCode::CastFloatToInt, vec![Value::Float(1e30)], Type::Int),
+        ];
+        for (opnum, args, ty) in declines {
+            match execute_nonspec_const(cpu.as_ref(), *opnum, args, None, *ty) {
+                Ok(None) => {}
+                other => panic!("{opnum:?}{args:?} must decline with Ok(None), got {other:?}"),
+            }
+        }
+    }
+
+    /// The counterpart: an opcode with no row at all still reaches
+    /// `Err(NoConstExecutor)`, so the distinction is real in both directions.
+    #[test]
+    fn an_opcode_with_no_row_still_answers_err() {
+        let cpu = crate::cpu::default_cpu();
+        let folded = execute_nonspec_const(
+            cpu.as_ref(),
+            OpCode::SetfieldGc,
+            &[Value::Int(1), Value::Int(2)],
+            None,
+            Type::Void,
+        );
+        assert_eq!(folded, Err(NoConstExecutor));
     }
 }

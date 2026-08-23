@@ -150,16 +150,15 @@ impl TraceCtx {
     /// The constant the fold wraps, or `None` when the operation must be
     /// recorded after all.
     ///
-    /// Both non-folding outcomes of `execute_nonspec_const` record. `Ok(None)`
-    /// is a registered evaluator declining its operands, and declining is a
-    /// decision. `Err(NoConstExecutor)` is documented as the separate
-    /// "no helper registered" outcome — but the arity-2 integer arm reaches it
-    /// by falling through when `execute_binary_int_const` answers `None`, so
-    /// today it also carries every decline in that family (out-of-range shift,
-    /// div/mod by zero, OVF overflow). Recording on both keeps the decline
-    /// honoured; once the executor separates the two, this arm becomes the
-    /// `panic!` that `Optimizer::constant_fold` already spells for a genuinely
-    /// missing helper.
+    /// Both non-folding outcomes of `execute_nonspec_const` record.
+    /// `Ok(None)` is a registered evaluator declining its operands — an
+    /// out-of-range shift, a zero divisor, an OVF opcode that overflowed, a
+    /// non-finite `cast_float_to_int` — and declining is a decision.
+    /// `Err(NoConstExecutor)` is upstream's `NotImplementedError`, which
+    /// `Optimizer::constant_fold` spells as a `panic!`. This funnel records
+    /// instead: it runs inside the tracer, where a panic is caught and
+    /// downgraded to a silent `TraceAction::Abort`, so an evaluator gap would
+    /// cost the whole loop rather than one folded operation.
     fn fold_value(
         cpu: &dyn crate::cpu::Cpu,
         opnum: OpCode,
