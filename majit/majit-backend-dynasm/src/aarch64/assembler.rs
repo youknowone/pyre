@@ -1576,7 +1576,11 @@ impl<'a> AssemblerARM64<'a> {
                 Some(Loc::Frame(f)) => {
                     gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
                 }
-                _ => {}
+                None => {}
+                Some(other) => panic!(
+                    "guard_gcmap_from_faillocs: a Ref fail argument at {other:?} \
+                carries no gcmap bit"
+                ),
             }
         }
         gcmap
@@ -2719,7 +2723,11 @@ impl<'a> AssemblerARM64<'a> {
                             };
                             self.emit_op_gcload_regalloc(&base, ofs_loc, dst, nsize);
                         }
-                        _ => {}
+                        None => {}
+                        Some(other) => panic!(
+                            "GC_LOAD_INDEXED: unhandled base {other:?} — no load is emitted \
+                        and the destination keeps its previous value"
+                        ),
                     }
                 }
             }
@@ -3697,7 +3705,10 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
-            _ => {}
+            other => panic!(
+                "_cmp_guard_gc_type: unhandled expected typeid {other:?} — no cmp \
+            is emitted and the guard branches on stale flags"
+            ),
         }
     }
 
@@ -3783,7 +3794,10 @@ impl<'a> AssemblerARM64<'a> {
                 self.emit_mov_imm64(17, expected.value);
                 dynasm!(self.mc ; .arch aarch64 ; cmp x16, x17);
             }
-            _ => {}
+            other => panic!(
+                "emit_guard_exception: unhandled expected location {other:?} — no \
+            cmp is emitted and the guard branches on stale flags"
+            ),
         }
     }
 
@@ -3804,7 +3818,10 @@ impl<'a> AssemblerARM64<'a> {
                     );
                     self.emit_str_fp(17, frame.ebp_loc.value);
                 }
-                _ => {}
+                other => panic!(
+                    "emit_store_and_reset_exception: unhandled result location \
+                {other:?} — the exception value would be dropped"
+                ),
             }
         }
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x16]);
@@ -6358,7 +6375,10 @@ impl<'a> AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16]);
                 self.emit_str_fp(17, frame.ebp_loc.value);
             }
-            _ => {}
+            None => {}
+            Some(other) => {
+                panic!("genop_save_exc_class: unhandled result location {other:?}")
+            }
         }
     }
 
@@ -6377,7 +6397,10 @@ impl<'a> AssemblerARM64<'a> {
             }
             Loc::Frame(frame) => this.emit_ldr_fp(17, frame.ebp_loc.value),
             Loc::Immed(imm) => this.emit_mov_imm64(17, imm.value),
-            _ => {}
+            other => panic!(
+                "genop_restore_exception: unhandled operand {other:?} — x17 still \
+            holds the previously loaded operand, which the store below writes"
+            ),
         };
         load_to_x17(self, &arglocs[1]); // value
         self.emit_mov_imm64(16, crate::jit_exc_value_addr() as i64);

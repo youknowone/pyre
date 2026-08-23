@@ -1336,7 +1336,10 @@ impl<'a> Assembler386<'a> {
                     _ => {}
                 }
             }
-            _ => {}
+            other => panic!(
+                "emit_binop_reg_loc: unhandled source {other:?} — no arithmetic is \
+            emitted and the destination keeps its previous value"
+            ),
         }
     }
 
@@ -1386,7 +1389,10 @@ impl<'a> Assembler386<'a> {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD i.value ; test Rq(scratch), Rq(scratch));
             }
-            _ => {}
+            other => panic!(
+                "emit_test_loc: unhandled operand {other:?} — no test is emitted \
+            and the following branch reads stale flags"
+            ),
         }
     }
 
@@ -2333,7 +2339,11 @@ impl<'a> Assembler386<'a> {
                 Some(Loc::Frame(f)) => {
                     gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
                 }
-                _ => {}
+                None => {}
+                Some(other) => panic!(
+                    "guard_gcmap_from_faillocs: a Ref fail argument at {other:?} \
+                carries no gcmap bit"
+                ),
             }
         }
         gcmap
@@ -3067,7 +3077,10 @@ impl<'a> Assembler386<'a> {
                                     ; mul Rq(scratch)
                                 );
                             }
-                            _ => {}
+                            other => panic!(
+                                "UINT_MUL_HIGH: unhandled source {other:?} — no mul is \
+                            emitted and edx:eax keep their previous values"
+                            ),
                         }
                         if dst.value != crate::regloc::EDX.value {
                             dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), rdx);
@@ -3631,7 +3644,10 @@ impl<'a> Assembler386<'a> {
                                             ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(scratch)),
                                     }
                                 }
-                                _ => {}
+                                other => panic!(
+                                    "emit_store_scaled: unhandled value location {other:?} — no store \
+                                is emitted"
+                                ),
                             }
                         }};
                     }
@@ -3667,7 +3683,10 @@ impl<'a> Assembler386<'a> {
                                             ; mov [Rq(base.value) + Rq(ofs_reg.value) + offset], Rq(scratch)),
                                     }
                                 }
-                                _ => {}
+                                other => panic!(
+                                    "emit_store_unscaled: unhandled value location {other:?} — no store \
+                                is emitted"
+                                ),
                             }
                         }};
                     }
@@ -4990,7 +5009,10 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), [rbp + ofs]);
             }
             Loc::Immed(value) => self.emit_cmp_imm64(reg, value.value),
-            _ => {}
+            other => panic!(
+                "emit_cmp_reg_loc_i64: unhandled operand {other:?} — no cmp is \
+            emitted and the following branch reads stale flags"
+            ),
         }
     }
 
@@ -5067,7 +5089,10 @@ impl<'a> Assembler386<'a> {
                         ; mov [rbp + ofs], Rq(scratch)
                     );
                 }
-                _ => {}
+                other => panic!(
+                    "emit_store_and_reset_exception: unhandled result location \
+                {other:?} — the exception value would be dropped"
+                ),
             }
         }
         dynasm!(self.mc ; .arch x64
@@ -6436,7 +6461,10 @@ impl<'a> Assembler386<'a> {
             Loc::Reg(ofs_r) => {
                 self.emit_gcload_sized(base, 0, Some(ofs_r), dst, abs_size, signed);
             }
-            _ => {}
+            other => panic!(
+                "emit_op_gcload_regalloc: unhandled offset {other:?} — no load is \
+            emitted and the destination keeps its previous value"
+            ),
         }
     }
 
@@ -7712,7 +7740,10 @@ impl<'a> Assembler386<'a> {
                     ; mov [rbp + ofs], Rq(scratch)
                 );
             }
-            _ => {}
+            None => {}
+            Some(other) => {
+                panic!("genop_save_exc_class: unhandled result location {other:?}")
+            }
         }
     }
 
@@ -7749,7 +7780,10 @@ impl<'a> Assembler386<'a> {
                         ; pop rax
                     );
                 }
-                _ => {}
+                other => panic!(
+                    "genop_restore_exception: unhandled operand {other:?} — the store is \
+                skipped and the exception cell keeps its previous contents"
+                ),
             }
         };
         store_loc_to(self, crate::jit_exc_value_addr() as i64, &arglocs[1]);
