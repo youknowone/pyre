@@ -371,21 +371,19 @@ mod process {
     /// The two attribute arguments are security descriptors, which the call
     /// takes the defaults of.
     pub fn create_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let wide = |w: PyObjectRef| -> Result<Option<widestring::WideCString>, crate::PyError> {
-            if w.is_null() || unsafe { pyre_object::is_none(w) } {
-                return Ok(None);
-            }
-            let text = crate::baseobjspace::text_w(w)?;
-            widestring::WideCString::from_str(text)
-                .map(Some)
-                .map_err(|_| crate::PyError::value_error("embedded null character"))
-        };
+        use super::host::{WideArg, wide_or_none};
 
-        let application_name = wide(arg(args, 0, "CreateProcess")?)?;
+        let application_name = wide_or_none(arg(args, 0, "CreateProcess")?, WideArg::Unnamed)?;
         // `CreateProcessW` writes into the command line it is given, so it
         // takes a buffer rather than the string itself.
-        let mut command_line =
-            wide(arg(args, 1, "CreateProcess")?)?.map(|line| line.into_vec_with_nul());
+        let mut command_line = wide_or_none(
+            arg(args, 1, "CreateProcess")?,
+            WideArg::Numbered {
+                function: "CreateProcess",
+                position: 2,
+            },
+        )?
+        .map(|line| line.into_vec_with_nul());
         let inherit_handles = crate::baseobjspace::int_w(arg(args, 4, "CreateProcess")?)?;
         let creation_flags = crate::baseobjspace::c_uint_w(arg(args, 5, "CreateProcess")?)?;
         let w_env = arg(args, 6, "CreateProcess")?;
@@ -394,7 +392,7 @@ mod process {
         } else {
             Some(environment_block(w_env)?)
         };
-        let current_directory = wide(arg(args, 7, "CreateProcess")?)?;
+        let current_directory = wide_or_none(arg(args, 7, "CreateProcess")?, WideArg::Unnamed)?;
         let w_startup_info = arg(args, 8, "CreateProcess")?;
         let startup_info = host_winapi::StartupInfoData {
             flags: startup_info_field(w_startup_info, "dwFlags")? as u32,
