@@ -98,25 +98,44 @@ const _: () = {
     assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
 };
 
-/// virtualizable.py `clear_vable_ptr` — C-ABI helper that writes TOKEN_NONE
-/// (0) to a PyFrame's `vable_token`.
+/// virtualizable.py `clear_vable_ptr` — C-ABI helper behind the `COND_CALL`
+/// `emit_force_virtualizable` records, built out of `clear_vable_token`:
+/// force the virtualizable when the token is set, then leave TOKEN_NONE.
 ///
-/// Upstream builds that helper out of `clear_vable_token`, which FORCES the
-/// virtualizable when the token is set and only then asserts TOKEN_NONE.  This
-/// one only zeroes, so the citation covers the write and not the force.  The
-/// gap is unreachable rather than latent: `execute_assembler` clears the token
-/// before `func_execute_token`, and the `COND_CALL` `emit_force_virtualizable`
-/// records is gated on the token being non-null — measured over `pyre/bench`
-/// plus `pyre/bench/synth` (462 fixtures) the call was recorded 183 times and
-/// invoked 0 times.  Porting the force is deliberately left undone on that
-/// evidence.
+/// `force_now` has two arms and only one of them is a bare write.  On
+/// TOKEN_TRACING_RESCALL it clears the marker, which is what the post-residual
+/// probe reads as "the callee escaped".  On a machine-frame token it runs
+/// `ResumeGuardForcedDescr.force_now`, writing the compiled activation's
+/// registers back into the frame — a step this helper used to skip, on the
+/// evidence that the call was recorded 183 times and invoked 0 times over 462
+/// fixtures.  That measurement no longer holds: the call fires on the corpus
+/// today, so the arm is reachable and the frame it hands back has to carry the
+/// compiled values.  `force_frame` selects whichever arm the token names.
+///
+/// The trailing write is a backstop, not the port: `force_pyframe` declines a
+/// token the metainterp does not recognise as armed, and zeroing it anyway is
+/// what this helper did unconditionally before.  Upstream asserts there
+/// instead; a panic reached from compiled code is the worse failure.
 unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
     unsafe {
         let ptr = obj_ptr as *mut u8;
-        if !ptr.is_null() {
-            // `vable_token` is `usize` (pointer-width: 4 on wasm32). Writing
-            // 8 bytes would clobber the following field.
-            let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize;
+        if ptr.is_null() {
+            return;
+        }
+        // `vable_token` is `usize` (pointer-width: 4 on wasm32). Writing
+        // 8 bytes would clobber the following field.
+        let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize;
+        if *token_ptr == 0 {
+            return;
+        }
+        pyre_interpreter::executioncontext::force_frame(
+            ptr as *mut pyre_interpreter::PyFrame,
+        );
+        if *token_ptr != 0 {
+            if majit_metainterp::majit_log_enabled() {
+                let token = *token_ptr;
+                eprintln!("[jit][clear-vable] force left token=0x{token:x} frame={ptr:p}");
+            }
             *token_ptr = 0;
         }
     }
