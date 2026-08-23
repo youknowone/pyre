@@ -9365,7 +9365,25 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
 /// removes the force with it, and nothing has to replace it: `last_instr` is
 /// published onto the portal frame at every may-force boundary
 /// (`LiveLastInstrGuard`).  Generic `f_lasti` / `f_lineno` readers retain that
-/// residual boundary.  An exact optimized-frame `f_locals` read is specialized
+/// residual boundary.  Upstream does not: `pyframe.py fget_f_lasti` and
+/// `fget_f_lineno` are loop-free and carry no hint, so `policy.py
+/// look_inside_graph` admits them, `jtransform.py
+/// rewrite_op_jit_force_virtualizable` deletes the injected force, and
+/// `pyjitpl.py opimpl_getfield_vable_i` answers `last_instr` out of
+/// `virtualizable_boxes`.  Measured over a 200k-iteration read against a
+/// same-shape loop that does not read the frame: pypy3 answers `f_lasti`
+/// faster than that control loop -- the trace constant -- and pyre is 53x it,
+/// while `f_lineno` keeps one non-forcing residual on both and pyre is 2.1x.
+/// Closing the gap is an optimization over a correct path, not a fix, and it
+/// owes two coordinates the boundary currently hides.  `last_instr` is an
+/// instruction-unit index here and the app-level getter reports it doubled
+/// (`typedef.rs`, matching `location.py offset2lineno`'s `stopat // 2` on the
+/// byte offset upstream stores), so an emission at the app level owes the
+/// factor.  And the field has two writers on two conventions:
+/// `flush_walk_end_state_to_frame` writes `resume_py_pc - 1` while
+/// `LiveLastInstrGuard::enter_frame` writes the executing pc unshifted, and a
+/// getter owes the executing one.
+/// An exact optimized-frame `f_locals` read is specialized
 /// below instead: `pyframe.py fast2locals` is `@jit.unroll_safe`, so upstream
 /// traces through it and reads the virtualizable boxes rather than forcing.
 /// The force it drops was also the only writer of the frame's locals region,
