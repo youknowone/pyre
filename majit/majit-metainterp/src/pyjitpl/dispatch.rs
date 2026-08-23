@@ -4274,7 +4274,13 @@ where
                     Some(majit_ir::Value::Int(n)) => Some(*n),
                     _ => None,
                 };
-                let opref = ctx.opimpl_arraylen_gc(array_opref, descr, concrete);
+                let opref = ctx.opimpl_arraylen_gc(
+                    self.cpu.as_ref(),
+                    array_opref,
+                    descr,
+                    concrete,
+                    self.last_exception_value,
+                );
                 self.set_int_reg(dst, Some(opref), reg_concrete);
             }
             // ── BC_GETARRAYITEM_GC_I ──

@@ -5326,12 +5326,19 @@ impl TraceCtx {
     ///
     /// `concrete` is the runtime length the `execute_with_descr` box carries
     /// (`arraylen_sanity_load`); `None` leaves the recorded OpRef unstamped
-    /// (the cpu is unwired or the descr lacks a lendescr).
+    /// (the cpu is unwired or the descr lacks a lendescr) and, by
+    /// `execute_and_record`'s rule for a missing concrete, blocks the fold.
+    ///
+    /// `ARRAYLEN_GC` is always-pure, so a constant array base with a concrete
+    /// length folds and records nothing. `last_exc_value` is not consulted for
+    /// an always-pure opcode; only the overflow arm reads it.
     pub fn opimpl_arraylen_gc(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         array_opref: OpRef,
         arraydescr: DescrRef,
         concrete: Option<Value>,
+        last_exc_value: i64,
     ) -> OpRef {
         if let Some(cached_len) = self.heap_cache().arraylen(array_opref) {
             // pyjitpl.py:763 profiler.count_ops(rop.ARRAYLEN_GC, HEAPCACHED_OPS).
@@ -5339,16 +5346,30 @@ impl TraceCtx {
                 .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
             return cached_len;
         }
-        // pyjitpl.py `opimpl_arraylen_gc` miss.
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::RECORDED_OPS);
-        let len = self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], arraydescr);
-        if let Some(v) = concrete {
-            self.set_opref_concrete(len, v);
-        }
+        // `execute_nonspec_const`'s ARRAYLEN_GC row reads the length through
+        // `ArrayDescr::len_descr` and fails loud without one, while
+        // `arraylen_sanity_load` reaches the backend directly and answers even
+        // for a descr that has none. Withhold the concrete in that case so the
+        // funnel records rather than entering a fold it cannot complete.
+        let concrete = concrete.filter(|_| {
+            arraydescr
+                .as_array_descr()
+                .is_some_and(|a| a.len_descr().is_some())
+        });
+        // pyjitpl.py `opimpl_arraylen_gc` miss. The funnel owns the OPS /
+        // RECORDED_OPS pairing this leg used to count by hand.
+        let len = self.execute_and_record(
+            cpu,
+            OpCode::ArraylenGc,
+            Some(arraydescr),
+            &[array_opref],
+            concrete,
+            last_exc_value,
+        );
         // pyjitpl.py:761 heapcache.arraylen_now_known(arraybox, lengthbox).
+        // `HeapCache::arraylen_now_known` returns early for a constant array,
+        // so the fold path self-cancels rather than depositing under a key the
+        // cache does not track.
         self.heap_cache_mut().arraylen_now_known(array_opref, len);
         len
     }
@@ -5436,7 +5457,11 @@ impl TraceCtx {
             // nonstandard-virtualizable fallback reads the length through the GC
             // array; no runtime concrete to stamp here (the vable read supplies
             // the length on the standard path below).
-            return self.opimpl_arraylen_gc(array_opref, adescr, None);
+            // No runtime concrete on this leg, so `execute_and_record` records
+            // without consulting an evaluator; the default cpu stands in for
+            // an argument it cannot reach.
+            let cpu = crate::cpu::default_cpu();
+            return self.opimpl_arraylen_gc(cpu.as_ref(), array_opref, adescr, None, 0);
         }
         // arrayindex = vinfo.array_field_by_descrs[fdescr]
         // result = vinfo.get_array_length(virtualizable, arrayindex)
@@ -6705,5 +6730,95 @@ mod tests {
         // The identity slot itself left unseeded.
         ctx.virtualizable_boxes = Some(vec![OpRef::int_op(3), OpRef::NONE]);
         assert!(!ctx.vable_snapshot_buildable());
+    }
+
+    /// `[len][item0][item1][item2]`: the length word at offset 0, items from
+    /// offset 8 — the shape `get_field_arraylen_descr` describes.
+    fn boxed_int_array(items: &[i64]) -> (Box<Vec<i64>>, i64) {
+        let mut words = vec![items.len() as i64];
+        words.extend_from_slice(items);
+        let storage = Box::new(words);
+        let base = storage.as_ptr() as i64;
+        (storage, base)
+    }
+
+    fn int_array_descr(with_lendescr: bool) -> DescrRef {
+        let lendescr: Option<DescrRef> = with_lendescr.then(|| {
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new(
+                0,
+                0,
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+            )) as DescrRef
+        });
+        majit_ir::descr::make_array_descr_from_lltype_shape(
+            1,
+            std::mem::size_of::<i64>(),
+            std::mem::size_of::<i64>(),
+            None,
+            Type::Int,
+            false,
+            false,
+            true,
+            true,
+            lendescr,
+            false,
+            u32::MAX,
+            Vec::new(),
+        ) as DescrRef
+    }
+
+    /// `ARRAYLEN_GC` is always-pure, so a constant array with a trace-time
+    /// length folds; every other combination records.
+    #[test]
+    fn arraylen_gc_folds_only_a_constant_array_with_a_concrete_length() {
+        let cpu = crate::cpu::default_cpu();
+        let (_storage, base) = boxed_int_array(&[10, 20, 30]);
+
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(true),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert_eq!(len, OpRef::const_int(3));
+        assert!(ctx.into_recorder().ops().is_empty());
+
+        // No trace-time concrete: record, and leave the op unstamped.
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(true),
+            None,
+            0,
+        );
+        assert!(!len.is_constant());
+
+        // A descr with no `lendescr` is one the executor row cannot read; the
+        // concrete is withheld so the funnel records instead of failing loud.
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(false),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert!(!len.is_constant());
+
+        // Non-constant array base.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::input_arg_ref(0),
+            int_array_descr(true),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert!(!len.is_constant());
     }
 }
