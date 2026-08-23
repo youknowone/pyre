@@ -127,7 +127,10 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let code = pyobject::make_ref(unsafe { (*frame).fget_f_code() });
     let globals = pyobject::make_ref(unsafe { (*frame).get_w_globals() });
     let locals = pyobject::make_ref(unsafe { (*frame).get_w_locals() });
-    let lineno = unsafe { (*frame).fget_f_lineno() } as c_int;
+    // The line as a number.  `fget_f_lineno` is the property, which answers an
+    // object and `None` where there is no line; `frame_attach`'s own comment
+    // names `get_last_lineno` as what the field is owed.
+    let lineno = unsafe { (*frame).get_last_lineno() } as c_int;
     let back = unsafe { (*frame).get_f_back() } as PyObjectRef;
     let back = pyobject::make_ref(back) as *mut CPyFrameObject;
     unsafe {
