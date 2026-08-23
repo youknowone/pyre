@@ -3015,6 +3015,60 @@ unsafe fn load_global_via_cache(
     }
 }
 
+impl PyFrame {
+    /// `pyopcode.py _report_stopiteration_sometimes`.
+    ///
+    /// ```python
+    /// def _report_stopiteration_sometimes(self, w_iterator, operr):
+    ///     ...
+    ///     if (isinstance(w_iterator, GeneratorOrCoroutine) or
+    ///             isinstance(w_iterator, AsyncGenASend) or
+    ///             operr.has_any_traceback()):
+    ///         self.space.getexecutioncontext().exception_trace(self, operr)
+    /// ```
+    ///
+    /// Only the traceback arm is ported, and `w_iterator` is unused as a
+    /// result.  Upstream calls its two generator arms "an approximative
+    /// rule" for a case it says it cannot emulate; 3.14 turns out to be
+    /// exactly the third disjunct.  Counting `exception` events in the
+    /// consuming frame under `sys.settrace` on 3.14.2:
+    ///
+    /// ```text
+    /// for _ in CustomIter():  # Python-level __next__ raising StopIteration
+    ///     -> [('__next__', 'StopIteration'), ('run', 'StopIteration')]
+    /// for _ in gen():   -> []
+    /// for _ in [1]:     -> []
+    /// for _ in range(1):-> []
+    /// ```
+    ///
+    /// So the report fires when the StopIteration carries a traceback and
+    /// not otherwise; porting the generator arms would fire an event 3.14
+    /// does not.  A StopIteration raised inside a Python `__next__` picks up
+    /// its traceback on the way out of that frame, which is what makes the
+    /// two rules coincide.
+    ///
+    /// The exhaustion an iterator signals from Rust never materialises an
+    /// exception, so the common loop exit answers `has_any_traceback` false
+    /// off a null carrier and never reaches the tracer test.
+    fn _report_stopiteration_sometimes(
+        &mut self,
+        _w_iterator: PyObjectRef,
+        operr: &mut PyError,
+    ) -> Result<(), PyError> {
+        if !operr.has_any_traceback() {
+            return Ok(());
+        }
+        let ec = self.execution_context as *mut crate::PyExecutionContext;
+        if ec.is_null() {
+            return Ok(());
+        }
+        // The tracer runs Python, so the frame it is handed is read off the
+        // anchor rather than out of `self`.
+        let anchor = FrameAnchor::new(self);
+        unsafe { (*ec).exception_trace(anchor.live(), operr) }
+    }
+}
+
 /// PyPy: pyopcode.py GET_ITER → space.iter(w_iterable)
 ///       pyopcode.py FOR_ITER → space.next(w_iterator)
 impl IterOpcodeHandler for PyFrame {
@@ -3251,7 +3305,11 @@ impl IterOpcodeHandler for PyFrame {
         // iter_next), not by branching the interpreter opcode implementation.
         match crate::baseobjspace::next(iter) {
             Ok(result) => Ok(Some(result)),
-            Err(e) if e.matches_stop_iteration() => Ok(None),
+            Err(mut e) if e.matches_stop_iteration() => {
+                // iterator exhausted
+                self._report_stopiteration_sometimes(iter, &mut e)?;
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
