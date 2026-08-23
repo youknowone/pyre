@@ -2119,7 +2119,8 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
 /// physical frame's vsd must be corrected to that section's depth, else
 /// the interpreter resumes at the inner pc carrying the outer depth (an
 /// over-count that materializes a stray operand slot).  Returns `None`
-/// when the code or the liveness entry for `py_pc` is missing.
+/// when the code or the liveness entry for `py_pc` is missing, or when the
+/// forward analysis never reached `py_pc`.
 pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     if w_code == 0 {
         return None;
@@ -2133,11 +2134,17 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     }
     let code = unsafe { &*raw_code };
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let depth = crate::liveness::liveness_for(raw_code)
-        .depth_at_py_pc()
-        .get(py_pc)
-        .copied()?;
-    Some(stack_base + depth as usize)
+    // `depth_at_py_pc` collapses the forward pass's `usize::MAX` unreachable
+    // sentinel to `0`, which answers `stack_base` — a confidently empty operand
+    // stack — for a pc the analysis never reached.  `stack_depth_at` keeps the
+    // sentinel distinguishable; decline there instead, which every caller reads
+    // as "leave the frame's own `valuestackdepth` alone".  That table is one
+    // longer than the per-PC one, so keep the instruction-count bound.
+    if py_pc >= code.instructions.len() {
+        return None;
+    }
+    let depth = crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc)?;
+    Some(stack_base + depth)
 }
 
 /// Inputs `setup_bridge_sym` needs to rebuild the slot-indexed semantic
