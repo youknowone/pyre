@@ -156,3 +156,44 @@ pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
     bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, ITEM_SIZE);
     new_buf
 }
+
+pub fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
+    if item_size == 1 {
+        LOWLEVEL_STR_BASE_SIZE - 1
+    } else {
+        LOWLEVEL_UNICODE_BASE_SIZE
+    }
+}
+
+pub fn bh_read_lowlevel_string(string: i64, item_size: usize) -> Vec<i64> {
+    let len = bh_lowlevel_string_len(string);
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    let mut chars = Vec::with_capacity(len);
+    for index in 0..len {
+        let addr = unsafe { (string as *const u8).add(chars_offset + index * item_size) };
+        let value = unsafe {
+            match item_size {
+                1 => *addr as i64,
+                4 => *(addr as *const u32) as i64,
+                _ => *(addr as *const i64),
+            }
+        };
+        chars.push(value);
+    }
+    chars
+}
+
+pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: usize) {
+    if string == 0 {
+        return;
+    }
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    unsafe {
+        let addr = (string as *mut u8).add(chars_offset + index * item_size);
+        match item_size {
+            1 => addr.write(char as u8),
+            4 => (addr as *mut u32).write(char as u32),
+            _ => (addr as *mut i64).write(char),
+        }
+    }
+}
