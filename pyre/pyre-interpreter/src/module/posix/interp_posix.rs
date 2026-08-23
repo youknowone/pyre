@@ -43,6 +43,8 @@ struct ApplevelForkCallbacks {
 /// same enumeration reported (`0` for a name that is no reparse point), which
 /// is what `is_junction` reads; only a Windows directory walk fills it, and
 /// `DirEntry_is_junction` reads the same tag off `win32_lstat` there.
+/// `win32_lstat` is that walk's whole find record, kept so the first `stat()`
+/// builds the `stat_result` from it instead of returning to the name.
 /// The layout carries no instance dict; `name`/`path` are read-only getset
 /// descriptors, so the type is not instantiable and not acceptable as a base.
 #[crate::pyre_class("posix.DirEntry", cpython_heaptype)]
@@ -56,6 +58,35 @@ pub struct W_DirEntry {
     pub enum_ino: i64,
     pub enum_type: i32,
     pub enum_tag: i64,
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pub win32_lstat: Option<WinFindData>,
+}
+
+/// The `WIN32_FIND_DATAW` members `_Py_attribute_data_to_stat` reads, in the
+/// place `DirEntry.win32_lstat` keeps them: an entry carries the record its
+/// enumeration reported and turns it into a `stat_result` only when asked.
+/// Building that object at enumeration time instead costs one `os.stat_result`
+/// -- ten sequence slots and thirteen named extras -- for every name in the
+/// directory, which is most of what listing one used to cost.
+///
+/// Stored as plain integers rather than the `WIN32_FIND_DATAW` itself: the
+/// find record is around 600 bytes, nearly all of it the two name buffers the
+/// entry has already turned into its `name` and `path`.
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+#[derive(Clone, Copy)]
+pub struct WinFindData {
+    /// `dwFileAttributes`.
+    pub file_attributes: u32,
+    /// `dwReserved0`, which carries the reparse tag where the attribute word
+    /// says the name is a reparse point and is undefined otherwise.
+    pub reserved0: u32,
+    /// `nFileSizeHigh` and `nFileSizeLow` joined.
+    pub file_size: u64,
+    /// `ftCreationTime`, `ftLastAccessTime` and `ftLastWriteTime`, each as the
+    /// 100ns tick count its `FILETIME`'s two halves spell.
+    pub creation_ticks: u64,
+    pub last_access_ticks: u64,
+    pub last_write_ticks: u64,
 }
 
 /// Native owner for `posix.ScandirIterator` entries and enumeration state.
@@ -5143,9 +5174,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// that came out of `scandir`. `DirEntry.inode` is what goes back to the
     /// name for the identity.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    fn stat_fields_from_find_data(
-        data: &windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW,
-    ) -> StatFields {
+    fn stat_fields_from_find_data(data: &WinFindData) -> StatFields {
         const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -5153,17 +5182,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // A `FILETIME` counts 100ns ticks from 1601-01-01.
         const SECS_BETWEEN_EPOCHS: i64 = 11_644_473_600;
 
-        fn filetime_to_time(ft: windows_sys::Win32::Foundation::FILETIME) -> (i64, i64) {
-            let ticks = ((ft.dwHighDateTime as i64) << 32) | (ft.dwLowDateTime as i64);
+        fn filetime_to_time(ticks: u64) -> (i64, i64) {
+            let ticks = ticks as i64;
             (
                 ticks / 10_000_000 - SECS_BETWEEN_EPOCHS,
                 (ticks % 10_000_000) * 100,
             )
         }
 
-        let attrs = data.dwFileAttributes;
+        let attrs = data.file_attributes;
         let reparse_tag = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            data.dwReserved0
+            data.reserved0
         } else {
             0
         };
@@ -5181,9 +5210,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             mode = (mode & !S_IFMT) | S_IFLNK;
         }
 
-        let (birthtime, birthtime_nsec) = filetime_to_time(data.ftCreationTime);
-        let (mtime, mtime_nsec) = filetime_to_time(data.ftLastWriteTime);
-        let (atime, atime_nsec) = filetime_to_time(data.ftLastAccessTime);
+        let (birthtime, birthtime_nsec) = filetime_to_time(data.creation_ticks);
+        let (mtime, mtime_nsec) = filetime_to_time(data.last_write_ticks);
+        let (atime, atime_nsec) = filetime_to_time(data.last_access_ticks);
         StatFields {
             mode: mode as i64,
             ino: 0,
@@ -5191,7 +5220,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             nlink: 0,
             uid: 0,
             gid: 0,
-            size: ((data.nFileSizeHigh as i64) << 32) | (data.nFileSizeLow as i64),
+            size: data.file_size as i64,
             atime,
             mtime,
             // `st_ctime` is the creation time here, which is the copy
@@ -5235,7 +5264,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     fn win_scandir_each(
         path: &[u8],
-        mut each: impl FnMut(&[u8], &[u8], StatFields),
+        mut each: impl FnMut(&[u8], &[u8], WinFindData),
     ) -> std::io::Result<()> {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
@@ -5262,6 +5291,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let mut pattern = join_path_filename(&prefix, &[b'*' as u16, b'.' as u16, b'*' as u16]);
         pattern.push(0);
 
+        fn filetime_ticks(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+            ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+        }
+
         let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
         let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &mut data) };
         if handle == INVALID_HANDLE_VALUE {
@@ -5282,7 +5315,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 each(
                     name.as_encoded_bytes(),
                     full.as_encoded_bytes(),
-                    stat_fields_from_find_data(&data),
+                    WinFindData {
+                        file_attributes: data.dwFileAttributes,
+                        reserved0: data.dwReserved0,
+                        file_size: ((data.nFileSizeHigh as u64) << 32)
+                            | (data.nFileSizeLow as u64),
+                        creation_ticks: filetime_ticks(data.ftCreationTime),
+                        last_access_ticks: filetime_ticks(data.ftLastAccessTime),
+                        last_write_ticks: filetime_ticks(data.ftLastWriteTime),
+                    },
                 );
             }
             if unsafe { FindNextFileW(handle, &mut data) } == 0 {
@@ -5848,11 +5889,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// call.  The entry never moves (`allocate_stable`), so the raw receiver
     /// stays valid across the fetch's allocation.
     fn dir_entry_get_lstat(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        #[allow(unused_mut)]
+        let mut from_walk = None;
         {
             let de = W_DirEntry::from_obj(self_obj)
                 .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
             if !de.w_lstat.is_null() {
                 return Ok(de.w_lstat);
+            }
+            // A walk that read the find record answers from it rather than
+            // returning to the name, which is what keeps a removed entry
+            // answering. The build is deferred to here so a listing nobody
+            // stats never pays for one.
+            #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+            {
+                from_walk = de.win32_lstat;
+            }
+        }
+        if let Some(_found) = from_walk {
+            #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+            {
+                let result = stat_result_from_fields(&stat_fields_from_find_data(&_found), 0);
+                let de = W_DirEntry::from_obj(self_obj).ok_or_else(|| {
+                    crate::PyError::type_error("expected a 'posix.DirEntry' object")
+                })?;
+                de.w_lstat = result;
+                unsafe { pyre_object::gc_hook::try_gc_write_barrier(self_obj as *mut u8) };
+                return Ok(result);
             }
         }
         let dir_fd = dir_entry_dir_fd(self_obj)?;
@@ -6243,21 +6306,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         full.extend_from_slice(name);
         full
     }
-    /// The reparse tag a walk's stat carries.  Only Windows has one; every
-    /// other host answers `0`, which is the "no reparse point" the field means
-    /// there too.
-    fn stat_fields_reparse_tag(_fields: &StatFields) -> i64 {
-        #[cfg(windows)]
-        let tag = _fields.reparse_tag as i64;
-        #[cfg(not(windows))]
-        let tag = 0i64;
-        tag
-    }
-
-    /// `lstat` is the stat the enumeration itself reported, which only a walk
-    /// reading `WIN32_FIND_DATAW` has; it is built and cached here so
-    /// `entry.stat()` answers from it (`DirEntry_from_find_data`).  Elsewhere
-    /// it is `None` and the first `stat()` goes to the name.
+    /// Returns the appended entry so a caller with more to record -- the
+    /// Windows walk, which also carries the find record -- writes it without a
+    /// second lookup.  The entry is `allocate_stable`, so that address stays
+    /// valid for as long as the list holds it.
     fn scandir_push_entry(
         list_slot: usize,
         bytes_mode: bool,
@@ -6266,34 +6318,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         dir_fd: i32,
         enum_ino: i64,
         enum_type: u8,
-        lstat: Option<StatFields>,
-    ) {
+    ) -> PyObjectRef {
         let _entry_scope = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::shadow_stack_len();
+        // The names are pinned before the entry is allocated, so a moving
+        // collection during `allocate_stable` forwards them.
         let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, name));
         let _ = pyre_object::gc_roots::pin_root(fs_name_obj(bytes_mode, full));
-        // The built result is pinned before the entry is allocated, so a
-        // moving collection during `allocate_stable` forwards it.
-        let lstat_slot = lstat.as_ref().map(|fields| {
-            let _ = pyre_object::gc_roots::pin_root(stat_result_from_fields(fields, 0));
-            pyre_object::gc_roots::shadow_stack_len() - 1
-        });
         let _ = pyre_object::gc_roots::pin_root(W_DirEntry::allocate_stable(W_DirEntry::default()));
         let obj =
             pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         let de = W_DirEntry::from_obj(obj).expect("freshly allocated posix.DirEntry");
         de.w_name = pyre_object::gc_roots::shadow_stack_get(base);
         de.w_path = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        de.w_lstat = lstat_slot.map_or(pyre_object::PY_NULL, |slot| {
-            pyre_object::gc_roots::shadow_stack_get(slot)
-        });
         de.dir_fd = dir_fd;
         de.enum_ino = enum_ino;
         de.enum_type = enum_type as i32;
-        de.enum_tag = lstat.map_or(0, |fields| stat_fields_reparse_tag(&fields));
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8) };
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe { pyre_object::w_list_append(list, obj) };
+        obj
     }
     fn scandir_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (bound, _kwargs) = bind_path_args(args, "scandir", &["path"], 0, &[])?;
@@ -6332,7 +6376,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // so both come back as `str`. Every entry records the
                 // descriptor so its own stat resolves the bare name against it.
                 fd_readdir(fd, |name, ino, d_type| {
-                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type, None);
+                    scandir_push_entry(list_slot, false, name, name, fd, ino, d_type);
                 })
                 .map_err(|errno| errno_err_with_filename(errno, w_path()))?;
             }
@@ -6354,9 +6398,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let errno = readdir_collect(dirp, |name, ino, d_type| {
                     let full = join_dir_name(path, name);
-                    scandir_push_entry(
-                        list_slot, bytes_mode, name, &full, -1, ino, d_type, None,
-                    );
+                    scandir_push_entry(list_slot, bytes_mode, name, &full, -1, ino, d_type);
                 });
                 unsafe { libc::closedir(dirp) };
                 if errno != 0 {
@@ -6370,18 +6412,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // back to the name.
             #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
             _ => {
-                win_scandir_each(path, |name, full, fields| {
-                    let known_type = find_data_known_type(&fields);
-                    scandir_push_entry(
+                win_scandir_each(path, |name, full, found| {
+                    // The find record decides the type and the reparse tag
+                    // without allocating; only the `stat_result` waits for a
+                    // caller to ask for it.
+                    let fields = stat_fields_from_find_data(&found);
+                    let obj = scandir_push_entry(
                         list_slot,
                         bytes_mode,
                         name,
                         full,
                         -1,
                         -1,
-                        known_type,
-                        Some(fields),
+                        find_data_known_type(&fields),
                     );
+                    let de = W_DirEntry::from_obj(obj).expect("freshly appended posix.DirEntry");
+                    de.enum_tag = fields.reparse_tag as i64;
+                    de.win32_lstat = Some(found);
                 })
                 .map_err(|e| fs_err_with_filename(e, w_path()))?;
             }
@@ -6411,7 +6458,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         -1,
                         enum_ino,
                         DT_UNKNOWN,
-                        None,
                     );
                 }
             }
