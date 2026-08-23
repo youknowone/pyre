@@ -284,6 +284,32 @@ pub type MutatorExtraWalkFn = unsafe fn(*const (), &mut dyn FnMut(&mut GcRef));
 struct MutatorExtraArea {
     walk: MutatorExtraWalkFn,
     data: *const (),
+    /// Label the collector stamps on the refs this area yields.  Without it a
+    /// root that fails validation reports the bare `extra_area`, which names
+    /// the mechanism and not the registrar — and there are fifteen of them.
+    name: &'static str,
+}
+
+std::thread_local! {
+    /// The area [`walk_all_extra_areas`] / [`walk_my_extra_areas`] is currently
+    /// inside, on the collecting thread.  `extra_area` outside a walk.
+    static CURRENT_EXTRA_AREA: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("extra_area") };
+}
+
+/// The registered area whose walk is running on this thread, for a collector
+/// diagnostic that wants to name where a ref came from.
+pub fn current_extra_area() -> &'static str {
+    CURRENT_EXTRA_AREA.with(|cell| cell.get())
+}
+
+/// Run one area's walk with [`current_extra_area`] naming it.
+fn walk_one_extra_area(area: &MutatorExtraArea, visitor: &mut dyn FnMut(&mut GcRef)) {
+    let previous = CURRENT_EXTRA_AREA.with(|cell| cell.replace(area.name));
+    // SAFETY: the callers below establish the quiescence / ownership
+    // precondition; this helper only brackets the call.
+    unsafe { (area.walk)(area.data, visitor) };
+    CURRENT_EXTRA_AREA.with(|cell| cell.set(previous));
 }
 
 /// Pruner for one owner-keyed side table owned by a registered mutator.
@@ -340,14 +366,18 @@ pub fn register_mutator() {
 /// thread. `walk` must derive every address it dereferences from `data`, never
 /// from caller TLS, because a foreign collecting thread invokes `walk` during
 /// STW.
-pub unsafe fn register_mutator_extra_area(walk: MutatorExtraWalkFn, data: *const ()) {
+pub unsafe fn register_mutator_extra_area(
+    walk: MutatorExtraWalkFn,
+    data: *const (),
+    name: &'static str,
+) {
     let thread_id = std::thread::current().id();
     let mut registry = MUTATOR_REGISTRY.lock().unwrap();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_extra_area called before register_mutator");
-    entry.extra_areas.push(MutatorExtraArea { walk, data });
+    entry.extra_areas.push(MutatorExtraArea { walk, data, name });
 }
 
 /// Append an owner-keyed-table pruner to the current registered mutator.
@@ -427,7 +457,7 @@ pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
         for area in mutator.extra_areas.iter() {
             // SAFETY: gc_sync has quiesced every registered owner, and each
             // area remains valid until its MutatorEntry is removed.
-            unsafe { (area.walk)(area.data, &mut visitor) };
+            walk_one_extra_area(area, &mut visitor);
         }
     }
 }
@@ -444,7 +474,7 @@ pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
     };
     for area in mutator.extra_areas.iter() {
         // SAFETY: this is the owning thread's synchronous collection path.
-        unsafe { (area.walk)(area.data, &mut visitor) };
+        walk_one_extra_area(area, &mut visitor);
     }
 }
 
@@ -1642,7 +1672,7 @@ mod tests {
         // SAFETY: `root` remains valid until unregistration, and `walk_cell`
         // derives its sole dereference from the supplied `data` pointer.
         unsafe {
-            register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const ());
+            register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const (), "test_cell");
         }
         walk_my_extra_areas(|gcref| gcref.0 += 0x100);
         unregister_mutator();
