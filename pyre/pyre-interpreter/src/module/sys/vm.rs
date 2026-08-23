@@ -1730,12 +1730,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // carries its `st_*_ns` extras in. `test.support.os_helper` reads
     // `.platform` at import, so every `test.support` consumer needs it.
     //
-    // `major`/`minor`/`build` are kernel32's own file version rather than
-    // `GetVersionEx`'s answer: that call reports the version an unmanifested
-    // binary is shimmed to, and only an application manifest declaring
-    // compatibility makes it report the running one. `platform_version` — the
-    // field that exists because of exactly that shimming — therefore agrees
-    // with them here instead of correcting them.
+    // `major`/`minor`/`build` are `GetVersionEx`'s answer, which is the running
+    // version because the executable carries `python.manifest`; without one the
+    // call reports the version the process is shimmed to.  `platform_version`
+    // is kernel32's own file version
+    // (`_sys_getwindowsversion_from_kernel32`), which is a different number on
+    // a release shipped as an enablement package over the previous build.
     #[cfg(windows)]
     module_ns_store(
         ns,
@@ -1774,12 +1774,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ),
                     ) as usize
                 }) as PyObjectRef;
+                let (major, minor, build) =
+                    version_ex_triple().unwrap_or((info.major, info.minor, info.build));
                 Ok(crate::_structseq::new_instance_with_extra(
                     cls,
                     vec![
-                        w_int_new(info.major as i64),
-                        w_int_new(info.minor as i64),
-                        w_int_new(info.build as i64),
+                        w_int_new(major as i64),
+                        w_int_new(minor as i64),
+                        w_int_new(build as i64),
                         w_int_new(info.platform as i64),
                         w_str_new(&info.service_pack),
                     ],
@@ -3684,6 +3686,22 @@ pub fn init_stream_codecs() -> Result<(), crate::PyError> {
         }
     }
     Ok(())
+}
+
+/// The version `GetVersionEx` reports, which the manifest the executable
+/// carries makes the running one rather than the one an unmanifested process is
+/// shimmed to.  `None` where the call fails, leaving the caller its own answer.
+#[cfg(windows)]
+fn version_ex_triple() -> Option<(u32, u32, u32)> {
+    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    (unsafe { GetVersionExW(&mut info) } != 0).then_some((
+        info.dwMajorVersion,
+        info.dwMinorVersion,
+        info.dwBuildNumber,
+    ))
 }
 
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
