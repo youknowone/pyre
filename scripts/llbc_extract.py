@@ -2226,114 +2226,125 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             *flags,
             *host_config,
         ]
-        host_pass = subprocess.Popen(command, cwd=path, env=host_env)
-
-        # One extra extraction per cross target, reduced to its type
-        # declarations. Charon's own `--targets` aggregation would fold
-        # every target's layouts into this one artefact, but it aggregates
-        # the *bodies* too: a `cfg`-differing function lands two or three
-        # times over, and a portal that must resolve to an exact graph no
-        # longer does. Extracting each target separately keeps the host
-        # artefact's bodies untouched, and dropping everything but
-        # `type_decls` from the cross-target one leaves only what a
-        # cross-target build actually lacks — its own field offsets.
-        #
-        # The cross-target pass does not depend on the host one, and each is
-        # a single-threaded Charon translation of the same crate (the bulk of
-        # the pass), so on a machine with the cores and memory for two they
-        # run side by side; see `layout_passes_in_parallel`. A parallel pass
-        # gets its own target directory: cargo locks each layout's
-        # `.cargo-lock`, and both passes would otherwise serialise on the
-        # host layout they share for build scripts and proc macros.
         layout_passes: list[
             tuple[str, Path, Path, subprocess.Popen | None, typing.BinaryIO | None]
         ] = []
-        for target in crate_layout_targets(eng, spec):
-            if target not in prepared_std:
-                ensure_charon_std(charon_bin, [target], eng.root)
-                prepared_std.add(target)
-            sidecar = dest_dir / spec.layout_sidecar_name(target)
-            full = sidecar.with_suffix(sidecar.suffix + ".full")
-            layout_env = dict(env)
-            if eng.layout_target_rustflags:
-                layout_env["RUSTFLAGS"] = (
-                    layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
-                ).strip()
-            layout_target_dir = target_dir
-            if parallel_layouts:
-                layout_target_dir = target_dir / "llbc-layouts"
-                layout_env["CARGO_TARGET_DIR"] = str(layout_target_dir)
-            invalidate_cargo_unit(layout_target_dir, target, package)
-            layout_command = [
-                str(charon_bin),
-                "cargo",
-                "--ullbc",
-                "--dest-file",
-                str(full),
-                "--targets",
-                target,
-                *charon_flags,
-                "--",
-                *layout_flags,
-            ]
-            print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
-            if parallel_layouts:
-                # Output is held back and printed only on failure: two
-                # interleaved cargo streams are unreadable, and the host
-                # pass is the one whose progress a reader follows.
-                #
-                # Held in a file, not a pipe. Nothing reads this stream until
-                # the host pass has finished, and a Charon pass writes far
-                # more than a pipe buffer holds, so a pipe stops the child at
-                # the first full buffer -- for exactly the span the two
-                # passes exist to overlap.
-                log = tempfile.TemporaryFile()
-                proc = subprocess.Popen(
-                    layout_command,
-                    cwd=path,
-                    env=layout_env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
-                layout_passes.append((target, sidecar, full, proc, log))
-            else:
-                layout_passes.append((target, sidecar, full, None, None))
-                # Sequential: the host pass holds the shared layout's lock,
-                # so run this one only after it has finished.
-                if host_pass is not None:
-                    finish_charon_pass(host_pass, command, dest)
-                    host_pass = None
-                subprocess.run(layout_command, cwd=path, env=layout_env, check=True)
+        host_pass = subprocess.Popen(command, cwd=path, env=host_env)
+        try:
+            # One extra extraction per cross target, reduced to its type
+            # declarations. Charon's own `--targets` aggregation would fold
+            # every target's layouts into this one artefact, but it aggregates
+            # the *bodies* too: a `cfg`-differing function lands two or three
+            # times over, and a portal that must resolve to an exact graph no
+            # longer does. Extracting each target separately keeps the host
+            # artefact's bodies untouched, and dropping everything but
+            # `type_decls` from the cross-target one leaves only what a
+            # cross-target build actually lacks — its own field offsets.
+            #
+            # The cross-target pass does not depend on the host one, and each is
+            # a single-threaded Charon translation of the same crate (the bulk of
+            # the pass), so on a machine with the cores and memory for two they
+            # run side by side; see `layout_passes_in_parallel`. A parallel pass
+            # gets its own target directory: cargo locks each layout's
+            # `.cargo-lock`, and both passes would otherwise serialise on the
+            # host layout they share for build scripts and proc macros.
+            for target in crate_layout_targets(eng, spec):
+                if target not in prepared_std:
+                    ensure_charon_std(charon_bin, [target], eng.root)
+                    prepared_std.add(target)
+                sidecar = dest_dir / spec.layout_sidecar_name(target)
+                full = sidecar.with_suffix(sidecar.suffix + ".full")
+                layout_env = dict(env)
+                if eng.layout_target_rustflags:
+                    layout_env["RUSTFLAGS"] = (
+                        layout_env.get("RUSTFLAGS", "") + " " + eng.layout_target_rustflags
+                    ).strip()
+                layout_target_dir = target_dir
+                if parallel_layouts:
+                    layout_target_dir = target_dir / "llbc-layouts"
+                    layout_env["CARGO_TARGET_DIR"] = str(layout_target_dir)
+                invalidate_cargo_unit(layout_target_dir, target, package)
+                layout_command = [
+                    str(charon_bin),
+                    "cargo",
+                    "--ullbc",
+                    "--dest-file",
+                    str(full),
+                    "--targets",
+                    target,
+                    *charon_flags,
+                    "--",
+                    *layout_flags,
+                ]
+                print(f"=== extracting {crate} layouts for {target} -> {sidecar} ===")
+                if parallel_layouts:
+                    # Output is held back and printed only on failure: two
+                    # interleaved cargo streams are unreadable, and the host
+                    # pass is the one whose progress a reader follows.
+                    #
+                    # Held in a file, not a pipe. Nothing reads this stream until
+                    # the host pass has finished, and a Charon pass writes far
+                    # more than a pipe buffer holds, so a pipe stops the child at
+                    # the first full buffer -- for exactly the span the two
+                    # passes exist to overlap.
+                    log = tempfile.TemporaryFile()
+                    proc = subprocess.Popen(
+                        layout_command,
+                        cwd=path,
+                        env=layout_env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                    layout_passes.append((target, sidecar, full, proc, log))
+                else:
+                    layout_passes.append((target, sidecar, full, None, None))
+                    # Sequential: the host pass holds the shared layout's lock,
+                    # so run this one only after it has finished.
+                    if host_pass is not None:
+                        finish_charon_pass(host_pass, command, dest)
+                        host_pass = None
+                    subprocess.run(layout_command, cwd=path, env=layout_env, check=True)
 
-        if host_pass is not None:
-            finish_charon_pass(host_pass, command, dest)
-            host_pass = None
+            if host_pass is not None:
+                finish_charon_pass(host_pass, command, dest)
+                host_pass = None
 
-        layout_tables: dict[str, set[Path]] = {}
-        for target, sidecar, full, proc, log in layout_passes:
-            if proc is not None:
-                returncode = proc.wait()
-                with log:
-                    if returncode != 0:
-                        log.seek(0)
-                        sys.stdout.write(log.read().decode("utf-8", errors="replace"))
-                        raise subprocess.CalledProcessError(returncode, proc.args)
-            if not full.exists() or full.stat().st_size == 0:
-                raise SystemExit(
-                    f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
-                )
-            write_layout_sidecar(full, sidecar)
-            # This artefact was compiled on its own, so its file table names
-            # sources the host build never reaches: everything behind a
-            # `cfg(target_arch)`, such as the wasm backend `pyre-interpreter`
-            # picks up through `majit-metainterp` on wasm32. Only `type_decls`
-            # survive into the sidecar, so take the read set before the full
-            # artefact goes. Without it an edit to a wasm-only source moves
-            # `closure=` alone, which is a warning, and the layouts this
-            # sidecar froze are consumed as current.
-            merge_readfiles(layout_tables, artefact_local_readfiles(full))
-            full.unlink()
-            print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+            layout_tables: dict[str, set[Path]] = {}
+            for target, sidecar, full, proc, log in layout_passes:
+                if proc is not None:
+                    returncode = proc.wait()
+                    with log:
+                        if returncode != 0:
+                            log.seek(0)
+                            sys.stdout.write(log.read().decode("utf-8", errors="replace"))
+                            raise subprocess.CalledProcessError(returncode, proc.args)
+                if not full.exists() or full.stat().st_size == 0:
+                    raise SystemExit(
+                        f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
+                    )
+                write_layout_sidecar(full, sidecar)
+                # This artefact was compiled on its own, so its file table names
+                # sources the host build never reaches: everything behind a
+                # `cfg(target_arch)`, such as the wasm backend `pyre-interpreter`
+                # picks up through `majit-metainterp` on wasm32. Only `type_decls`
+                # survive into the sidecar, so take the read set before the full
+                # artefact goes. Without it an edit to a wasm-only source moves
+                # `closure=` alone, which is a warning, and the layouts this
+                # sidecar froze are consumed as current.
+                merge_readfiles(layout_tables, artefact_local_readfiles(full))
+                full.unlink()
+                print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+        finally:
+            # A raise anywhere above -- a pass that failed, an artefact
+            # that is missing, a layout std that will not build -- leaves
+            # every pass not yet waited for still running, each a cargo
+            # and a Charon holding multiple GB. Below this point there is
+            # nothing left to reap.
+            for _, _, _, pending, _ in layout_passes:
+                if pending is not None and pending.poll() is None:
+                    pending.kill()
+            if host_pass is not None and host_pass.poll() is None:
+                host_pass.kill()
         # Persist the read set before computing the stamp it governs. The
         # artefacts are the oracle: repo-relative Local entries are exactly the
         # Rust sources Charon parsed, across the host translation and every
