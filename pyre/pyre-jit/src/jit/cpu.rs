@@ -343,6 +343,10 @@ pub struct Cpu {
     /// call itself so the generated jitcode has the same ordinary Python
     /// call boundary as PyPy's `IMPORT_NAME` implementation.
     pub load_import_fn: extern "C" fn(i64) -> i64,
+    /// Load IMPORT_NAME's locals argument.  Separate from `load_import_fn`
+    /// because `pyopcode.py:1119-1125` reads two independent things off the
+    /// frame before the call.
+    pub load_import_locals_fn: extern "C" fn(i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -544,6 +548,7 @@ impl Cpu {
             load_locals_fn: crate::call_jit::bh_load_locals_fn,
             load_build_class_fn: crate::call_jit::bh_load_build_class_fn,
             load_import_fn: crate::call_jit::bh_load_import_fn,
+            load_import_locals_fn: crate::call_jit::bh_load_import_locals_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,

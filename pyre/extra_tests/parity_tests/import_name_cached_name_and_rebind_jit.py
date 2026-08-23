@@ -22,6 +22,11 @@ def run():
         assert name is expected_name
         assert globals_arg is expected_globals
         assert locals_arg is None
+        # `import os` compiles to IMPORT_NAME with no fromlist and an absolute
+        # level. Both hooks return os_module regardless, so a wrong value
+        # reaches nothing that would fail unless it is asserted here.
+        assert fromlist is None
+        assert level == 0
         calls[0] += 1
         return os_module
 
@@ -29,6 +34,11 @@ def run():
         assert name is expected_name
         assert globals_arg is expected_globals
         assert locals_arg is None
+        # `import os` compiles to IMPORT_NAME with no fromlist and an absolute
+        # level. Both hooks return os_module regardless, so a wrong value
+        # reaches nothing that would fail unless it is asserted here.
+        assert fromlist is None
+        assert level == 0
         calls[1] += 1
         return os_module
 

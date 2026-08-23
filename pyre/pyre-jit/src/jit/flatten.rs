@@ -2641,6 +2641,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "delete_global"
             | "load_build_class"
             | "load_import"
+            | "load_import_locals"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -3334,6 +3335,10 @@ pub struct LoweringContext {
     /// `load_import_fn` descrs-pool index. This is the builtin-lookup half of
     /// IMPORT_NAME; the subsequent invocation uses the ordinary CallFn path.
     pub load_import_fn_idx: u16,
+    /// `load_import_locals_fn` descrs-pool index. IMPORT_NAME's locals
+    /// argument lowers to the same one-Ref shape as
+    /// [`Self::load_locals_fn_idx`].
+    pub load_import_locals_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py`
@@ -4515,6 +4520,27 @@ where
     ))
 }
 
+/// Lower IMPORT_NAME's locals argument to a one-Ref residual call.
+pub fn lower_load_import_locals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_import_locals",
+        ctx.load_import_locals_fn_idx,
+        majit_ir::PyreHelperKind::LoadImportLocals,
+        get_register,
+        lower_constant,
+    )
+}
+
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
 pub fn lower_delete_global_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -5464,6 +5490,10 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_load_import_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_import_locals_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
         return Some(insn);
     }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -13524,6 +13554,74 @@ mod tests {
                 }
             }
             _ => panic!("expected Insn::Op, got {insn3:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_import_locals_hlop_emits_infallible_frame_residual() {
+        // `pyopcode.py:1119-1125` reads the frame's debug locals before the
+        // call.  Peeking that slot creates nothing and cannot raise, so this
+        // is the plain one-Ref frame-receiver shape, not the CanRaise shape
+        // the sibling `load_import` lookup carries.
+        let frame = Variable::new(VariableId(8), Kind::Ref);
+        let result = Variable::new(VariableId(9), Kind::Ref);
+        let op = SpaceOperation::new(
+            "load_import_locals",
+            vec![frame.into()],
+            Some(result.into()),
+            0,
+        );
+        let ctx = LoweringContext {
+            load_import_locals_fn_idx: 135,
+            ..Default::default()
+        };
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+        let insn = lower_load_import_locals_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("load_import_locals lowering must succeed");
+
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(dst),
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(matches!(args[0], Operand::ConstInt(135)));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(matches!(
+                            &list.content[..],
+                            [Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 8
+                            })]
+                        ));
+                    }
+                    other => panic!("expected one-Ref ListR, got {other:?}"),
+                }
+                assert_eq!(dst, Register::new(Kind::Ref, 9));
+                match &args[2] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info.pyre_helper,
+                                majit_ir::PyreHelperKind::LoadImportLocals
+                            );
+                            assert!(!stub.effect_info.has_random_effects());
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected call descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
         }
     }
 

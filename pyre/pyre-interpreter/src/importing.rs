@@ -4587,6 +4587,18 @@ pub fn lookup_dunder_import(frame: &PyFrame) -> Result<PyObjectRef, crate::PyErr
         .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))
 }
 
+/// IMPORT_NAME's third argument (`pyopcode.py:1119-1125`).  `getdebug()`
+/// peeks: a frame that never materialized its locals mapping passes `None`
+/// instead of creating one, which is what separates this from LOAD_LOCALS'
+/// `getorcreatedebug()`.  Split out so the JIT's `LoadImportLocals` residual
+/// and the interpreter answer from the same code.
+pub fn import_locals(frame: &PyFrame) -> PyObjectRef {
+    match frame.getdebug() {
+        Some(d) if !d.w_locals.is_null() => d.w_locals,
+        _ => pyre_object::w_none(),
+    }
+}
+
 pub fn import_name(
     frame: &mut PyFrame,
     w_modulename: PyObjectRef,
@@ -4595,10 +4607,7 @@ pub fn import_name(
 ) -> Result<PyObjectRef, crate::PyError> {
     let w_import = lookup_dunder_import(frame)?;
 
-    let w_locals = match frame.getdebug() {
-        Some(d) if !d.w_locals.is_null() => d.w_locals,
-        _ => pyre_object::w_none(),
-    };
+    let w_locals = import_locals(frame);
     let w_globals = frame.get_w_globals();
     crate::call::call_callable(
         frame,
