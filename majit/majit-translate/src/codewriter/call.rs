@@ -7703,6 +7703,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref(_)
                             | crate::model::ValueType::Str
+                            | crate::model::ValueType::StringBuilder
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
@@ -7755,6 +7756,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref(_)
                             | crate::model::ValueType::Str
+                            | crate::model::ValueType::StringBuilder
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
@@ -8711,7 +8713,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         // and `INT_TYPE` under the same `'int'` kind for descriptor
         // indexing (`lltypesystem/lloperation.py:108 getkind`).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) | ValueType::Str => 1,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,
@@ -10808,6 +10810,54 @@ mod tests {
             compute_struct_size(&cc, "list"),
             16,
             "two word-sized fields → 16-byte struct",
+        );
+    }
+
+    #[test]
+    fn rtyper_synthesised_stringbuilder_struct_resolves_its_field_descrs() {
+        // The rtyper synthesises `GcStruct("stringbuilder", ("current_buf",
+        // STRPTR), ("current_pos", Signed), ("current_end", Signed),
+        // ("total_size", Signed), ("extra_pieces", STRINGPIECEPTR))`
+        // (`translator/rtyper/lltypesystem/rbuilder.rs`).  Like the resizable
+        // `"list"` header it never appears in `program.struct_fields` (it is
+        // rtyper-synthesised, not a Charon-extracted Rust type), so its
+        // `{field → type-string}` shape must be registered for `fielddescrof`
+        // to resolve offsets and `bh_size_spec_from_callcontrol` to size a
+        // `new(descr)`.  The two GC-pointer fields (`current_buf`,
+        // `extra_pieces`) carry the bare `"&()"` pointer spelling — they
+        // classify as `(Pointer, Ref, word)`, and the real pointee type is
+        // inert to the container layout.  Five word-sized fields accumulate
+        // buf@0, pos@8, end@16, total@24, pieces@32, size 40.
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "stringbuilder".to_string(),
+            vec![
+                ("current_buf".to_string(), "&()".to_string()),
+                ("current_pos".to_string(), "i64".to_string()),
+                ("current_end".to_string(), "i64".to_string()),
+                ("total_size".to_string(), "i64".to_string()),
+                ("extra_pieces".to_string(), "&()".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+
+        let offset_of = |index: u32, field: &str| {
+            cc.fielddescrof(index, "stringbuilder", None, field)
+                .unwrap_or_else(|| panic!("stringbuilder.{field} descr resolves"))
+                .as_field_descr()
+                .unwrap_or_else(|| panic!("stringbuilder.{field} is a field descr"))
+                .offset()
+        };
+        assert_eq!(offset_of(0, "current_buf"), 0, "buf is the first field");
+        assert_eq!(offset_of(1, "current_pos"), 8, "pos follows the buf word");
+        assert_eq!(offset_of(2, "current_end"), 16, "end follows pos");
+        assert_eq!(offset_of(3, "total_size"), 24, "total follows end");
+        assert_eq!(offset_of(4, "extra_pieces"), 32, "pieces is last");
+        assert_eq!(
+            compute_struct_size(&cc, "stringbuilder"),
+            40,
+            "five word-sized fields → 40-byte struct",
         );
     }
 

@@ -2643,6 +2643,55 @@ fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValu
     SomeValue::Bool(SomeBool::new())
 }
 
+/// `StringBuilder.append(self, s_str)` (rstring.py) — void; the
+/// model asserts the arg is str/char and the call binds Impossible.
+fn stringbuilder_method_append(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeStringBuilder,
+    s_str: &SomeValue,
+) -> Option<SomeValue> {
+    let _ = s_self.method_append(s_str);
+    None
+}
+
+/// `StringBuilder.append_slice(self, s_str, s_start, s_end)` (rstring.py) —
+/// void; the model asserts a str arg with integer bounds and the call binds
+/// Impossible.
+fn stringbuilder_method_append_slice(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeStringBuilder,
+    s_str: &SomeValue,
+    s_start: &SomeValue,
+    s_end: &SomeValue,
+) -> Option<SomeValue> {
+    let _ = s_self.method_append_slice(s_str, s_start, s_end);
+    None
+}
+
+/// `StringBuilder.build(self)` (rstring.py) → `SomeString`.
+fn stringbuilder_method_build(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeStringBuilder,
+) -> SomeValue {
+    s_self.method_build()
+}
+
+/// `StringBuilder.getlength(self)` (rstring.py) → `SomeInteger`.
+fn stringbuilder_method_getlength(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeStringBuilder,
+) -> SomeValue {
+    s_self.method_getlength()
+}
+
+/// `UnicodeBuilder.getlength(self)` (rstring.py) → `SomeInteger`.
+fn unicodebuilder_method_getlength(
+    _ann: &RPythonAnnotator,
+    s_self: &super::model::SomeUnicodeBuilder,
+) -> SomeValue {
+    s_self.method_getlength()
+}
+
 /// RPython `SomeObject.find_method(self, name)` (unaryop.py).
 pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
     let analyser_name = match s_self {
@@ -2752,6 +2801,22 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "isdigit" => "str_method_isdigit",
             "isalpha" => "str_method_isalpha",
             "isalnum" => "str_method_isalnum",
+            _ => return None,
+        },
+        // rstring.py — the `StringBuilder` call surface.  Only the
+        // methods the rtyper lowers (`StringBuilderRepr::rtype_method`) are
+        // exposed here: append/append_slice/build/getlength.
+        SomeValue::StringBuilder(_) => match name {
+            "append" => "stringbuilder_method_append",
+            "append_slice" => "stringbuilder_method_append_slice",
+            "build" => "stringbuilder_method_build",
+            "getlength" => "stringbuilder_method_getlength",
+            _ => return None,
+        },
+        // rstring.py — the `UnicodeBuilder` surface the rtyper
+        // lowers so far (`UnicodeBuilderRepr::rtype_method`): getlength.
+        SomeValue::UnicodeBuilder(_) => match name {
+            "getlength" => "unicodebuilder_method_getlength",
             _ => return None,
         },
         // unaryop.py — `method_next = next` on SomeIterator.  Lets
@@ -3561,6 +3626,68 @@ pub(crate) fn call_builtin_method(
                 unreachable!();
             };
             someiterator_next(ann, s_self)
+        }
+        "stringbuilder_method_append" => {
+            let SomeValue::StringBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope =
+                bind_builtin_method_args(args_s, kwds, &["s_str"], None, &method.analyser_name)?;
+            let [s_str] = scope.as_slice() else {
+                unreachable!();
+            };
+            // Void analyser (None = no result): early-return the threaded
+            // Option so the simple_call binds Impossible without blocking.
+            return Ok(stringbuilder_method_append(ann, s_self, s_str));
+        }
+        "stringbuilder_method_append_slice" => {
+            let SomeValue::StringBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(
+                args_s,
+                kwds,
+                &["s_str", "s_start", "s_end"],
+                None,
+                &method.analyser_name,
+            )?;
+            let [s_str, s_start, s_end] = scope.as_slice() else {
+                unreachable!();
+            };
+            // Void analyser: early-return the threaded Option (see append).
+            return Ok(stringbuilder_method_append_slice(
+                ann, s_self, s_str, s_start, s_end,
+            ));
+        }
+        "stringbuilder_method_build" => {
+            let SomeValue::StringBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            stringbuilder_method_build(ann, s_self)
+        }
+        "stringbuilder_method_getlength" => {
+            let SomeValue::StringBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            stringbuilder_method_getlength(ann, s_self)
+        }
+        "unicodebuilder_method_getlength" => {
+            let SomeValue::UnicodeBuilder(s_self) = &*method.s_self else {
+                return Err(builtin_method_receiver_error(method));
+            };
+            let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
+            let [] = scope.as_slice() else {
+                unreachable!();
+            };
+            unicodebuilder_method_getlength(ann, s_self)
         }
         _ => {
             return Err(AnnotatorError::new(format!(
@@ -5980,6 +6107,72 @@ mod tests {
             panic!("str.split must be recognized");
         };
         assert_eq!(str_split.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn find_method_exposes_stringbuilder_append_build_getlength() {
+        let ann = mk_ann();
+        let s_builder = SomeValue::StringBuilder(super::super::model::SomeStringBuilder::new());
+
+        for (method_name, analyser) in [
+            ("append", "stringbuilder_method_append"),
+            ("build", "stringbuilder_method_build"),
+            ("getlength", "stringbuilder_method_getlength"),
+        ] {
+            let SomeValue::BuiltinMethod(bound) = s_builder.find_method(method_name).unwrap()
+            else {
+                panic!("StringBuilder.{method_name} must be recognized");
+            };
+            assert_eq!(bound.analyser_name, analyser);
+        }
+        assert!(s_builder.find_method("frobnicate").is_none());
+
+        // build() → SomeString.
+        let build =
+            SomeBuiltinMethod::new("stringbuilder_method_build", s_builder.clone(), "build");
+        let no_args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+        assert!(matches!(
+            call_builtin_method(&ann, &build, &no_args).expect("build call"),
+            Some(SomeValue::String(_))
+        ));
+
+        // getlength() → SomeInteger.
+        let getlength = SomeBuiltinMethod::new(
+            "stringbuilder_method_getlength",
+            s_builder.clone(),
+            "getlength",
+        );
+        let no_args2 = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
+        assert!(matches!(
+            call_builtin_method(&ann, &getlength, &no_args2).expect("getlength call"),
+            Some(SomeValue::Integer(_))
+        ));
+
+        // append(str) → void (None).
+        let append =
+            SomeBuiltinMethod::new("stringbuilder_method_append", s_builder.clone(), "append");
+        let str_arg = super::super::argument::ArgumentsForTranslation::new(
+            vec![Some(SomeValue::String(SomeString::new(false, false)))],
+            None,
+            None,
+        );
+        assert!(
+            call_builtin_method(&ann, &append, &str_arg)
+                .expect("append call")
+                .is_none(),
+            "append is a void analyser → None"
+        );
+    }
+
+    #[test]
+    fn consider_newstringbuilder_types_as_stringbuilder() {
+        // The `newstringbuilder` ctor op — the front-emitted `StringBuilder()`
+        // — types its result as `SomeStringBuilder` (rlib/rstring.py
+        // ExtRegistryEntry `compute_result_annotation`).
+        let ann = mk_ann();
+        let hl = HLOperation::new(OpKind::NewStringBuilder, vec![]);
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::StringBuilder(_)), "got {r:?}");
     }
 
     #[test]

@@ -1999,6 +1999,19 @@ fn analyze_pipeline_from_module_paths(
         );
     }
 
+    // rbuilder.py `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,
+    // whose `@jit.oopspec("rgc.ll_shrink_array")` is minted by the rtyper
+    // (`rtype_builder_build`'s nested `ll_shrink_array` helper) with a stub
+    // body, so there is no source-level `#[oopspec]` for the walker to
+    // harvest.  Attach the spec here, keyed on the minted graph's NAME — the
+    // codewriter's `_handle_rgc_call` then lowers the `direct_call` to a
+    // `ShrinkArray` residual with a trailing `-live-` instead of tracing the
+    // stub body.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_shrink_array"]),
+        "rgc.ll_shrink_array".to_string(),
+    );
+
     // `collectanalyze.py analyze_simple_operation` answers True for the
     // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,
     // and any LLOp declared `canmallocgc=True`.  Upstream sees them because

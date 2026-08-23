@@ -808,11 +808,11 @@ mod tests {
     /// state addressing (6), plus 3 more pyre-only
     /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
     /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
-    /// `abort/`), and `vtable_method_ptr/rd>i` (dyn-trait method-pointer
+    /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
     /// reification) — so the `pyre_extension_insns()` table now holds 11
-    /// entries total.  `wellknown_bh_insns()` is a strict subset of
-    /// RPython's canonical opname universe; `insn_byte` merges both tables
-    /// so build-time `write_insn(...)` callers continue to resolve
+    /// entries total.  `wellknown_bh_insns()` is a strict
+    /// subset of RPython's canonical opname universe; `insn_byte` merges both
+    /// tables so build-time `write_insn(...)` callers continue to resolve
     /// unchanged.
     #[test]
     fn pyre_extension_insns_quarantines_pyre_only_keys_out_of_wellknown() {

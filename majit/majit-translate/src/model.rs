@@ -97,6 +97,13 @@ pub enum ValueType {
     /// string-typed struct field seeds a `SomeString` shell rather than
     /// the classdef-less `SomeInstance(None)` the `Ref` fallback yields.
     Str,
+    /// RPython `SomeStringBuilder` (`rlib/rstring.py`) — the annotator
+    /// shell for a `StringBuilder()` value.  Distinct from `Ref` so the
+    /// annotator seeds a `SomeValue::StringBuilder` shell that the rtyper
+    /// binds to `StringBuilderRepr` (`lltypesystem/rbuilder.rs`), lowering
+    /// to `Ptr(STRINGBUILDER)`.  `getkind(Ptr(Gc)) == 'ref'` places it in
+    /// the GC-ref register bank alongside every `Ref` / `Str`.
+    StringBuilder,
     Void,
     State,
     Unknown,

@@ -1259,7 +1259,7 @@ impl<'a> Transformer<'a> {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref(_) | ValueType::Str => {
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
                 crate::codewriter::type_state::ConcreteType::GcRef
             }
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
@@ -4361,24 +4361,37 @@ impl<'a> Transformer<'a> {
         &mut self,
         oopspec_name: &str,
         op: &SpaceOperation,
-        target: &CallTarget,
+        // The incoming target names the identity stub helper; the one handled
+        // spelling retargets to `jit_ll_shrink_array`, so it is intentionally
+        // unused here.
+        _target: &CallTarget,
         args: &[crate::flowspace::model::Variable],
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut FunctionGraph,
     ) -> Option<RewriteResult> {
         match oopspec_name {
-            "rgc.ll_shrink_array" => Some(self._handle_oopspec_call(
-                graph,
-                op,
-                target,
-                args,
-                result_ty,
-                graph_name,
-                OopSpecIndex::ShrinkArray,
-                Some(majit_ir::descr::ExtraEffect::CanRaise),
-                None,
-            )),
+            "rgc.ll_shrink_array" => {
+                // The residual's funcaddr resolves through `fnaddr_for_target`.
+                // The helper graph named `ll_shrink_array` is an identity stub
+                // (drain-safe, holds the oopspec markup), so retarget the
+                // residual to the real realloc-shrink
+                // (`pyre_object::lowlevel_string::jit_ll_shrink_array`, registered
+                // in `jit_fnaddr.rs`). Only the non-virtual buffer reaches this;
+                // a virtual buffer is folded by `opt_call_shrink_array`.
+                let shrink_target = CallTarget::function_path(["jit_ll_shrink_array"]);
+                Some(self._handle_oopspec_call(
+                    graph,
+                    op,
+                    &shrink_target,
+                    args,
+                    result_ty,
+                    graph_name,
+                    OopSpecIndex::ShrinkArray,
+                    Some(majit_ir::descr::ExtraEffect::CanRaise),
+                    None,
+                ))
+            }
             _ => None,
         }
     }
@@ -6457,7 +6470,7 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         // return `'int'` (ll Bool / Unsigned share register class
         // with Signed at the codewriter register-kind layer).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => 'i',
-        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => 'r',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
         ValueType::Int128 | ValueType::UInt128 => {
@@ -6526,7 +6539,9 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
             majit_ir::value::Type::Int
         }
-        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => majit_ir::value::Type::Ref,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+            majit_ir::value::Type::Ref
+        }
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
         ValueType::Int128 | ValueType::UInt128 => {
@@ -12745,7 +12760,9 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+                "String"
+            }
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
@@ -12997,7 +13014,9 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+                "String"
+            }
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",

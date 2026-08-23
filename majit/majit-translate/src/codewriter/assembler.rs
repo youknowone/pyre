@@ -1617,11 +1617,14 @@ impl Assembler {
             // RPython `jtransform.py rewrite_op_malloc`: a fixed-size
             // GC struct without a vtable lowers to `new(descr)`.
             OpKind::New { owner } => {
+                let opname = "new";
                 let spec = bh_size_spec_from_callcontrol(
                     callcontrol.expect("new assembly requires a CallControl"),
                     owner,
                 )
-                .unwrap_or_else(|| panic!("new: no struct layout registered for owner {owner:?}"));
+                .unwrap_or_else(|| {
+                    panic!("{opname}: no struct layout registered for owner {owner:?}")
+                });
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
@@ -1639,7 +1642,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push('>');
                 argcodes.push('r');
-                let key = format!("new/{argcodes}");
+                let key = format!("{opname}/{argcodes}");
                 state.code[startposition] = self.get_opnum(&key);
             }
             // RPython `new_array_clear(v_length, arraydescr)` — the cleared
@@ -3249,7 +3252,7 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         // shares register class with Signed/Unsigned — all `'i'` for
         // the codewriter.
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
-        ValueType::Ref(_) | ValueType::Str => 'r',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
         ValueType::Float => 'f',
         ValueType::Void | ValueType::State | ValueType::Unknown => 'v',
         ValueType::Int128 | ValueType::UInt128 => {

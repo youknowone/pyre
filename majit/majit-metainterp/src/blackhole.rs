@@ -9414,7 +9414,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("new_array/id>r", handler_new_array);
     builder.wire_handler("new_array_clear/id>r", handler_new_array_clear);
     builder.wire_handler("new_array_clear/cd>r", handler_new_array_clear_c);
-
     // String operations (blackhole.py:1200-1283)
     builder.wire_handler("strlen/r>i", handler_strlen);
     builder.wire_handler("strgetitem/ri>i", handler_strgetitem);

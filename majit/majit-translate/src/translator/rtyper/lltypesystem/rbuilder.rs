@@ -1,8 +1,7 @@
 //! RPython `rpython/rtyper/lltypesystem/rbuilder.py` parity module.
 //!
-//! This slice lands the low-level builder container shapes and repr
-//! class names. The append/grow/build helper graphs are still pending,
-//! but the public lltype names now match upstream:
+//! This module carries the low-level builder container shapes, reprs, and
+//! append/grow/build helper graphs. The public lltype names match upstream:
 //! `STRINGPIECE`, `STRINGBUILDER`, `UNICODEPIECE`, `UNICODEBUILDER`,
 //! `BaseStringBuilderRepr`, `StringBuilderRepr`, and
 //! `UnicodeBuilderRepr`.
@@ -298,6 +297,55 @@ pub fn build_ll_getlength_helper_graph(
     ))
 }
 
+/// SPIKE (L4-first, task #49): a minimal `ll_build(ll_builder)` helper
+/// that returns `ll_builder.current_buf` unchanged. Used only to prove
+/// the rtyper method-dispatch pipeline; **not runtime-correct** (it does
+/// not fold `extra_pieces` or shrink to `current_pos`). The full
+/// `build_ll_build_helper_graph` (fold_pieces + shrink_final closure)
+/// replaces it in L2-full.
+pub fn build_ll_build_spike_helper_graph(
+    name: &str,
+    builder_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(ll_builder.clone())]);
+    let return_var = variable_with_lltype("result", buf_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let current_buf = variable_with_lltype("current_buf", buf_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(ll_builder),
+            void_field_const("current_buf"),
+        ],
+        Hlvalue::Variable(current_buf.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(current_buf)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["ll_builder".to_string()],
+        func,
+    ))
+}
+
 pub fn ll_build() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_build"))
 }
@@ -378,6 +426,76 @@ pub fn build_ll_bool_helper_graph(
 /// (`rbuilder.py:54`/`72`) — both baked in as `direct_call` callee consts,
 /// mirroring [`build_ll_call_lookup_function_helper_graph`]. `buf_lltype`
 /// is `STRPTR`/`UNICODEPTR` (the `current_buf` field and `mallocfn` result).
+/// Synthesise `copy_string_contents(src, dst, srcstart, dststart, length)`
+/// (`rstr.py` `copy_string_contents` / `copy_unicode_contents`): a single
+/// `copystrcontent` / `copyunicodecontent` op over whole string objects.
+/// The builder append/build trees thread this as a `direct_call` callee
+/// const (`copy_fn`), so the shared copy primitive is materialised once and
+/// baked in via [`functionptr_const`], mirroring the `ll_min` / `mallocstr`
+/// consts of [`build_ll_new_helper_graph`]. `buf_lltype` is `STRPTR` /
+/// `UNICODEPTR`; `copy_opname` selects `copystrcontent` (STR) vs
+/// `copyunicodecontent` (UNICODE). Returns `Void`.
+pub fn build_ll_copy_string_contents_helper_graph(
+    name: &str,
+    buf_lltype: LowLevelType,
+    copy_opname: &'static str,
+) -> Result<PyGraph, TyperError> {
+    let src = variable_with_lltype("src", buf_lltype.clone());
+    let dst = variable_with_lltype("dst", buf_lltype);
+    let srcstart = variable_with_lltype("srcstart", LowLevelType::Signed);
+    let dststart = variable_with_lltype("dststart", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(src.clone()),
+        Hlvalue::Variable(dst.clone()),
+        Hlvalue::Variable(srcstart.clone()),
+        Hlvalue::Variable(dststart.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let void_result = variable_with_lltype("v", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        copy_opname,
+        vec![
+            Hlvalue::Variable(src),
+            Hlvalue::Variable(dst),
+            Hlvalue::Variable(srcstart),
+            Hlvalue::Variable(dststart),
+            Hlvalue::Variable(length),
+        ],
+        Hlvalue::Variable(void_result),
+    ));
+    let none_const = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ));
+    startblock.closeblock(vec![
+        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "src".to_string(),
+            "dst".to_string(),
+            "srcstart".to_string(),
+            "dststart".to_string(),
+            "length".to_string(),
+        ],
+        func,
+    ))
+}
+
 pub fn build_ll_new_helper_graph(
     name: &str,
     builder_ptr_lltype: LowLevelType,
@@ -497,6 +615,53 @@ pub fn build_ll_new_helper_graph(
     ))
 }
 
+/// Stub `ll_shrink_array(buf, smallerlength) -> buf` — an identity the
+/// codewriter never executes.  `rgc.ll_shrink_array` is an `@jit.oopspec`
+/// (`rgc.py`), so the `direct_call` naming this helper lowers to a
+/// `ShrinkArray` residual (`jtransform._handle_rgc_call`), which does the real
+/// shrink at runtime (`eval.rs ll_shrink_array` / `opt_call_shrink_array`).
+/// The body exists only so [`functionptr_const`] has a graph to name; it
+/// carries NO `shrink_array` op (which has no rtyper lowering arm), so it
+/// stays drain-safe even if the codewriter enumerates it as a helper.  The
+/// binding is `mark_oopspec(["ll_shrink_array"], "rgc.ll_shrink_array")` in
+/// `lib.rs`.
+pub fn build_ll_shrink_array_stub_helper_graph(
+    name: &str,
+    buf_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let buf = variable_with_lltype("buf", buf_lltype.clone());
+    let smallerlength = variable_with_lltype("smallerlength", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(buf.clone()),
+        Hlvalue::Variable(smallerlength),
+    ]);
+    let return_var = variable_with_lltype("result", buf_lltype);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(buf)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["buf".to_string(), "smallerlength".to_string()],
+        func,
+    ))
+}
+
 /// Synthesise `ll_shrink_final(ll_builder)` (`rbuilder.py`):
 ///
 /// ```python
@@ -610,7 +775,7 @@ pub fn build_ll_shrink_final_helper_graph(
 }
 
 /// Synthesise `ll_grow_and_append(ll_builder, ll_str, start, size)`
-/// (`rbuilder.py:117-150`):
+/// (`rbuilder.py`):
 ///
 /// Fast path when `size > 1280 and current_pos == 0 and start == 0 and
 /// size == len(ll_str.chars)`: append `ll_str` directly as a new piece
@@ -5594,6 +5759,634 @@ fn rtype_builder_getlength(
     hop.gendirectcall(&helper, vlist)
 }
 
+/// RPython `AbstractStringBuilderRepr.rtype_method_append(self, hop)`
+/// (`rbuilder.py`):
+///
+/// ```python
+/// def rtype_method_append(self, hop):
+///     vlist = hop.inputargs(self, rstr.string_repr)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(self.ll_append, *vlist)
+/// ```
+///
+/// `self.ll_append` resolves to the O(n) `build_ll_append_helper_graph`
+/// tree: a `we_are_jitted()` branch whose jit arm delegates to
+/// `ll_append_res0` and whose no-jit arm inlines the same
+/// `_ll_append(builder, str, 0, len)`. Both funnel into `_ll_append`,
+/// which either copies into the current buffer or, when it would
+/// overflow, calls `ll_grow_and_append` (which chains the filled buffer
+/// into a fresh `STRINGPIECE` via `ll_grow_by` + `mallocfn`). The whole
+/// callee closure — `copy_string_contents`, `mallocfn`, `ll_grow_by`,
+/// `ll_grow_and_append`, `_ll_append`, `ll_append_res0` — is materialised
+/// here and baked in as `direct_call` callee consts by [`functionptr_const`],
+/// mirroring the `ll_min` / `mallocstr` consts of [`rtype_builder_new`].
+/// `piece_ptr_lltype` / `piece_struct` are `STRINGPIECEPTR` / `STRINGPIECE`
+/// (or the UNICODE pair); `malloc_name` and `copy_opname` select the
+/// STR (`mallocstr` / `copystrcontent`) vs UNICODE variants.
+#[allow(clippy::too_many_arguments)]
+fn rtype_builder_append(
+    self_repr: &dyn Repr,
+    string_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    malloc_name: &'static str,
+    copy_opname: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
+    };
+    // The appended piece is a string; coerce it through `string_repr`
+    // (lowleveltype == STRPTR == buf_lltype) so `ll_append`'s second
+    // param receives an STRPTR, mirroring `rtype_method_append`'s
+    // `hop.inputargs(self, rstr.string_repr)`.
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(string_repr),
+    ])?;
+    hop.exception_cannot_occur()?;
+
+    let outer_builder = builder_ptr_lltype.clone();
+    let outer_buf = buf_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_append".to_string(),
+        vec![builder_ptr_lltype, buf_lltype],
+        LowLevelType::Void,
+        move |rtyper, _args, _result| {
+            let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
+
+            // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
+            let copy_buf = outer_buf.clone();
+            let copy = rtyper.lowlevel_helper_function_with_builder(
+                "ll_copy_string_contents".to_string(),
+                vec![
+                    outer_buf.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_copy_string_contents_helper_graph(
+                        "ll_copy_string_contents",
+                        copy_buf,
+                        copy_opname,
+                    )
+                },
+            )?;
+            let copy_fn = functionptr_const(rtyper, &copy)?;
+
+            // mallocfn = mallocstr / mallocunicode
+            let malloc_buf = outer_buf.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+
+            // grow_by_fn = ll_grow_by(ll_builder, needed)
+            let gb_builder = outer_builder.clone();
+            let gb_piece_ptr = piece_ptr_lltype.clone();
+            let gb_piece = piece_struct.clone();
+            let gb_buf = outer_buf.clone();
+            let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![outer_builder.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        gb_builder,
+                        gb_piece_ptr,
+                        gb_piece,
+                        gb_buf,
+                        mallocfn,
+                    )
+                },
+            )?;
+            let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+
+            // grow_and_append_fn = ll_grow_and_append(ll_builder, ll_str, start, size)
+            let ga_builder = outer_builder.clone();
+            let ga_piece_ptr = piece_ptr_lltype.clone();
+            let ga_piece = piece_struct.clone();
+            let ga_buf = outer_buf.clone();
+            let ga_chars = chars_ptr.clone();
+            let ga_copy_fn = copy_fn.clone();
+            let grow_and_append = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_and_append".to_string(),
+                vec![
+                    outer_builder.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_and_append_helper_graph(
+                        "ll_grow_and_append",
+                        ga_builder,
+                        ga_piece_ptr,
+                        ga_piece,
+                        ga_buf,
+                        ga_chars,
+                        ga_copy_fn,
+                        grow_by_fn,
+                    )
+                },
+            )?;
+            let grow_and_append_fn = functionptr_const(rtyper, &grow_and_append)?;
+
+            // _ll_append(ll_builder, ll_str, start, size): inline-copy or grow.
+            let lla_builder = outer_builder.clone();
+            let lla_buf = outer_buf.clone();
+            let lla_copy_fn = copy_fn.clone();
+            let ll_append_inner = rtyper.lowlevel_helper_function_with_builder(
+                "_ll_append".to_string(),
+                vec![
+                    outer_builder.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll__ll_append_helper_graph(
+                        "_ll_append",
+                        lla_builder,
+                        lla_buf,
+                        grow_and_append_fn,
+                        lla_copy_fn,
+                    )
+                },
+            )?;
+            let ll_append_fn = functionptr_const(rtyper, &ll_append_inner)?;
+
+            // jit arm: ll_append_res0(ll_builder, ll_str) = _ll_append(builder,
+            // str, 0, len). Correctness-first — identical to the no-jit arm;
+            // the per-size JIT specialisation (try_append_slice) is a later task.
+            let res0_builder = outer_builder.clone();
+            let res0_buf = outer_buf.clone();
+            let res0_chars = chars_ptr.clone();
+            let res0_ll_append_fn = ll_append_fn.clone();
+            let res0 = rtyper.lowlevel_helper_function_with_builder(
+                "ll_append_res0".to_string(),
+                vec![outer_builder.clone(), outer_buf.clone()],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_append_res0_helper_graph(
+                        "ll_append_res0",
+                        res0_builder,
+                        res0_buf,
+                        res0_chars,
+                        res0_ll_append_fn,
+                    )
+                },
+            )?;
+            let jit_append_fn = functionptr_const(rtyper, &res0)?;
+
+            build_ll_append_helper_graph(
+                "ll_append",
+                outer_builder.clone(),
+                outer_buf.clone(),
+                chars_ptr,
+                jit_append_fn,
+                ll_append_fn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `AbstractStringBuilderRepr.rtype_method_append`'s character arm:
+/// select `self.char_repr` and call `ll_append_char` rather than coercing the
+/// character through the string repr.
+#[allow(clippy::too_many_arguments)]
+fn rtype_builder_append_char(
+    self_repr: &dyn Repr,
+    char_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    char_lltype: LowLevelType,
+    malloc_name: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
+    };
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(char_repr),
+    ])?;
+    hop.exception_cannot_occur()?;
+
+    let outer_builder = builder_ptr_lltype.clone();
+    let outer_buf = buf_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_append_char".to_string(),
+        vec![builder_ptr_lltype, char_lltype.clone()],
+        LowLevelType::Void,
+        move |rtyper, _args, _result| {
+            let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
+            let malloc_buf = outer_buf.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+            let gb_builder = outer_builder.clone();
+            let gb_piece_ptr = piece_ptr_lltype.clone();
+            let gb_piece = piece_struct.clone();
+            let gb_buf = outer_buf.clone();
+            let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![outer_builder.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        gb_builder,
+                        gb_piece_ptr,
+                        gb_piece,
+                        gb_buf,
+                        mallocfn,
+                    )
+                },
+            )?;
+            let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+            build_ll_append_char_helper_graph(
+                "ll_append_char",
+                outer_builder.clone(),
+                char_lltype,
+                chars_ptr,
+                outer_buf.clone(),
+                grow_by_fn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `AbstractStringBuilderRepr.rtype_method_append_slice(self, hop)`
+/// (`rbuilder.py`):
+///
+/// ```python
+/// def rtype_method_append_slice(self, hop):
+///     vlist = hop.inputargs(self, self.string_repr, lltype.Signed, lltype.Signed)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(self.ll_append_slice, *vlist)
+/// ```
+///
+/// `ll_append_slice` branches on `we_are_jitted`; both arms funnel into
+/// `_ll_append(builder, str, start, size)`.  The jit arm is wired to the general
+/// `ll_append_res_slice` residual rather than the per-size-specialised
+/// `ll_jit_append_slice`; that size specialisation is a later task, matching
+/// `rtype_builder_append`'s own correctness-first jit arm.  The nested funcptr
+/// consts are built bottom-up exactly as `rtype_builder_append`; the identical
+/// `(name, args, result)` keys share its cached sub-graphs.
+#[allow(clippy::too_many_arguments)]
+fn rtype_builder_append_slice(
+    self_repr: &dyn Repr,
+    string_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    piece_struct: LowLevelType,
+    buf_lltype: LowLevelType,
+    malloc_name: &'static str,
+    copy_opname: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
+    };
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(string_repr),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_cannot_occur()?;
+
+    let outer_builder = builder_ptr_lltype.clone();
+    let outer_buf = buf_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_append_slice".to_string(),
+        vec![
+            builder_ptr_lltype,
+            buf_lltype,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Void,
+        move |rtyper, _args, _result| {
+            let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
+
+            // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
+            let copy_buf = outer_buf.clone();
+            let copy = rtyper.lowlevel_helper_function_with_builder(
+                "ll_copy_string_contents".to_string(),
+                vec![
+                    outer_buf.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_copy_string_contents_helper_graph(
+                        "ll_copy_string_contents",
+                        copy_buf,
+                        copy_opname,
+                    )
+                },
+            )?;
+            let copy_fn = functionptr_const(rtyper, &copy)?;
+
+            // mallocfn = mallocstr / mallocunicode
+            let malloc_buf = outer_buf.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+
+            // grow_by_fn = ll_grow_by(ll_builder, needed)
+            let gb_builder = outer_builder.clone();
+            let gb_piece_ptr = piece_ptr_lltype.clone();
+            let gb_piece = piece_struct.clone();
+            let gb_buf = outer_buf.clone();
+            let grow_by = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![outer_builder.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        gb_builder,
+                        gb_piece_ptr,
+                        gb_piece,
+                        gb_buf,
+                        mallocfn,
+                    )
+                },
+            )?;
+            let grow_by_fn = functionptr_const(rtyper, &grow_by)?;
+
+            // grow_and_append_fn = ll_grow_and_append(ll_builder, ll_str, start, size)
+            let ga_builder = outer_builder.clone();
+            let ga_piece_ptr = piece_ptr_lltype.clone();
+            let ga_piece = piece_struct.clone();
+            let ga_buf = outer_buf.clone();
+            let ga_chars = chars_ptr.clone();
+            let ga_copy_fn = copy_fn.clone();
+            let grow_and_append = rtyper.lowlevel_helper_function_with_builder(
+                "ll_grow_and_append".to_string(),
+                vec![
+                    outer_builder.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_grow_and_append_helper_graph(
+                        "ll_grow_and_append",
+                        ga_builder,
+                        ga_piece_ptr,
+                        ga_piece,
+                        ga_buf,
+                        ga_chars,
+                        ga_copy_fn,
+                        grow_by_fn,
+                    )
+                },
+            )?;
+            let grow_and_append_fn = functionptr_const(rtyper, &grow_and_append)?;
+
+            // _ll_append(ll_builder, ll_str, start, size): inline-copy or grow.
+            let lla_builder = outer_builder.clone();
+            let lla_buf = outer_buf.clone();
+            let lla_copy_fn = copy_fn.clone();
+            let ll_append_inner = rtyper.lowlevel_helper_function_with_builder(
+                "_ll_append".to_string(),
+                vec![
+                    outer_builder.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll__ll_append_helper_graph(
+                        "_ll_append",
+                        lla_builder,
+                        lla_buf,
+                        grow_and_append_fn,
+                        lla_copy_fn,
+                    )
+                },
+            )?;
+            let ll_append_fn = functionptr_const(rtyper, &ll_append_inner)?;
+
+            // jit arm = ll_append_res_slice(ll_builder, ll_str, start, end):
+            // `_ll_append(builder, str, start, end - start)`. Correctness-first —
+            // both arms reach the same `_ll_append`; the per-size specialisation
+            // (`ll_jit_append_slice`) is a later task.
+            let rs_builder = outer_builder.clone();
+            let rs_buf = outer_buf.clone();
+            let rs_ll_append_fn = ll_append_fn.clone();
+            let res_slice = rtyper.lowlevel_helper_function_with_builder(
+                "ll_append_res_slice".to_string(),
+                vec![
+                    outer_builder.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_append_res_slice_helper_graph(
+                        "ll_append_res_slice",
+                        rs_builder,
+                        rs_buf,
+                        rs_ll_append_fn,
+                    )
+                },
+            )?;
+            let res_slice_fn = functionptr_const(rtyper, &res_slice)?;
+
+            build_ll_append_slice_helper_graph(
+                "ll_append_slice",
+                outer_builder.clone(),
+                outer_buf.clone(),
+                res_slice_fn,
+                ll_append_fn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `AbstractStringBuilderRepr.rtype_method_build(self, hop)`
+/// (`rbuilder.py`):
+///
+/// ```python
+/// def rtype_method_build(self, hop):
+///     vlist = hop.inputargs(self)
+///     hop.exception_cannot_occur()
+///     return hop.gendirectcall(self.ll_build, *vlist)
+/// ```
+///
+/// `self.ll_build` is [`build_ll_build_helper_graph`] (fold_pieces +
+/// shrink_final).  `ll_fold_pieces` folds the `extra_pieces` chain into one
+/// buffer (`ll_getlength` / `mallocfn` / `copy`); `ll_shrink_final` trims the
+/// single-buffer case with `rgc.ll_shrink_array` (an oopspec residual).  The
+/// nested funcptr consts are built bottom-up exactly as [`rtype_builder_append`].
+fn rtype_builder_build(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    builder_ptr_lltype: LowLevelType,
+    piece_ptr_lltype: LowLevelType,
+    buf_lltype: LowLevelType,
+    malloc_name: &'static str,
+    copy_opname: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_mallocstr_helper_graph, chars_array_ptr_lltype_from_strptr,
+    };
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(self_repr)])?;
+    hop.exception_cannot_occur()?;
+
+    let outer_builder = builder_ptr_lltype.clone();
+    let outer_piece_ptr = piece_ptr_lltype.clone();
+    let outer_buf = buf_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_build".to_string(),
+        vec![builder_ptr_lltype],
+        buf_lltype,
+        move |rtyper, _args, _result| {
+            let chars_ptr = chars_array_ptr_lltype_from_strptr(&outer_buf)?;
+
+            // getlength_fn = ll_getlength(ll_builder)
+            let gl_builder = outer_builder.clone();
+            let getlength = rtyper.lowlevel_helper_function_with_builder(
+                "ll_getlength".to_string(),
+                vec![outer_builder.clone()],
+                LowLevelType::Signed,
+                move |_r, _a, _res| build_ll_getlength_helper_graph("ll_getlength", gl_builder),
+            )?;
+            let getlength_fn = functionptr_const(rtyper, &getlength)?;
+
+            // copy_fn = copy_string_contents(src, dst, srcstart, dststart, length)
+            let copy_buf = outer_buf.clone();
+            let copy = rtyper.lowlevel_helper_function_with_builder(
+                "ll_copy_string_contents".to_string(),
+                vec![
+                    outer_buf.clone(),
+                    outer_buf.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_copy_string_contents_helper_graph(
+                        "ll_copy_string_contents",
+                        copy_buf,
+                        copy_opname,
+                    )
+                },
+            )?;
+            let copy_fn = functionptr_const(rtyper, &copy)?;
+
+            // mallocfn = mallocstr / mallocunicode
+            let malloc_buf = outer_buf.clone();
+            let malloc = rtyper.lowlevel_helper_function_with_builder(
+                malloc_name.to_string(),
+                vec![LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| build_ll_mallocstr_helper_graph(malloc_name, malloc_buf),
+            )?;
+            let mallocfn = functionptr_const(rtyper, &malloc)?;
+
+            // fold_pieces_fn = ll_fold_pieces(ll_builder)
+            let fp_builder = outer_builder.clone();
+            let fp_piece_ptr = outer_piece_ptr.clone();
+            let fp_buf = outer_buf.clone();
+            let fp_chars = chars_ptr.clone();
+            let fold_pieces = rtyper.lowlevel_helper_function_with_builder(
+                "ll_fold_pieces".to_string(),
+                vec![outer_builder.clone()],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_fold_pieces_helper_graph(
+                        "ll_fold_pieces",
+                        fp_builder,
+                        fp_piece_ptr,
+                        fp_buf,
+                        fp_chars,
+                        getlength_fn,
+                        mallocfn,
+                        copy_fn,
+                    )
+                },
+            )?;
+            let fold_pieces_fn = functionptr_const(rtyper, &fold_pieces)?;
+
+            // shrink_array_fn = rgc.ll_shrink_array (oopspec residual; stub body).
+            let sa_buf = outer_buf.clone();
+            let shrink_array = rtyper.lowlevel_helper_function_with_builder(
+                "ll_shrink_array".to_string(),
+                vec![outer_buf.clone(), LowLevelType::Signed],
+                outer_buf.clone(),
+                move |_r, _a, _res| {
+                    build_ll_shrink_array_stub_helper_graph("ll_shrink_array", sa_buf)
+                },
+            )?;
+            let shrink_array_fn = functionptr_const(rtyper, &shrink_array)?;
+
+            // shrink_final_fn = ll_shrink_final(ll_builder)
+            let sf_builder = outer_builder.clone();
+            let sf_buf = outer_buf.clone();
+            let shrink_final = rtyper.lowlevel_helper_function_with_builder(
+                "ll_shrink_final".to_string(),
+                vec![outer_builder.clone()],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    build_ll_shrink_final_helper_graph(
+                        "ll_shrink_final",
+                        sf_builder,
+                        sf_buf,
+                        shrink_array_fn,
+                    )
+                },
+            )?;
+            let shrink_final_fn = functionptr_const(rtyper, &shrink_final)?;
+
+            build_ll_build_helper_graph(
+                "ll_build",
+                outer_builder.clone(),
+                outer_buf.clone(),
+                fold_pieces_fn,
+                shrink_final_fn,
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
 /// RPython `BaseStringBuilderRepr.rtype_bool(self, hop)`
 /// (`rbuilder.py:52-55`):
 ///
@@ -5722,6 +6515,65 @@ impl Repr for StringBuilderRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, STRINGBUILDERPTR.clone()),
+            "append" => {
+                // `SomeStringBuilder.method_append` accepts only `SomeString`
+                // or `SomeChar` (rstring.py) — a byte char, never a unicode
+                // code point.
+                let is_char = matches!(
+                    hop.args_s.borrow().get(1),
+                    Some(crate::annotator::model::SomeValue::Char(_))
+                );
+                if is_char {
+                    let char_repr = crate::translator::rtyper::rstr::char_repr();
+                    rtype_builder_append_char(
+                        self,
+                        char_repr.as_ref(),
+                        hop,
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        LowLevelType::Char,
+                        "mallocstr",
+                    )
+                } else {
+                    let string_repr = crate::translator::rtyper::rstr::string_repr();
+                    rtype_builder_append(
+                        self,
+                        string_repr.as_ref(),
+                        hop,
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        "mallocstr",
+                        "copystrcontent",
+                    )
+                }
+            }
+            "append_slice" => {
+                let string_repr = crate::translator::rtyper::rstr::string_repr();
+                rtype_builder_append_slice(
+                    self,
+                    string_repr.as_ref(),
+                    hop,
+                    STRINGBUILDERPTR.clone(),
+                    STRINGPIECEPTR.clone(),
+                    STRINGPIECE.clone(),
+                    STRPTR.clone(),
+                    "mallocstr",
+                    "copystrcontent",
+                )
+            }
+            "build" => rtype_builder_build(
+                self,
+                hop,
+                STRINGBUILDERPTR.clone(),
+                STRINGPIECEPTR.clone(),
+                STRPTR.clone(),
+                "mallocstr",
+                "copystrcontent",
+            ),
             _ => Err(TyperError::message(format!(
                 "missing {}.rtype_method_{method_name}",
                 self.class_name()
@@ -5788,6 +6640,51 @@ impl Repr for UnicodeBuilderRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             "getlength" => rtype_builder_getlength(self, hop, UNICODEBUILDERPTR.clone()),
+            "append" => {
+                // `SomeUnicodeBuilder.method_append` accepts only
+                // `SomeUnicodeString` or `SomeUnicodeCodePoint` (rstring.py) —
+                // a unicode code point, never a byte char.
+                let is_char = matches!(
+                    hop.args_s.borrow().get(1),
+                    Some(crate::annotator::model::SomeValue::UnicodeCodePoint(_))
+                );
+                if is_char {
+                    let char_repr = crate::translator::rtyper::rstr::unichar_repr();
+                    rtype_builder_append_char(
+                        self,
+                        char_repr.as_ref(),
+                        hop,
+                        UNICODEBUILDERPTR.clone(),
+                        UNICODEPIECEPTR.clone(),
+                        UNICODEPIECE.clone(),
+                        UNICODEPTR.clone(),
+                        LowLevelType::UniChar,
+                        "mallocunicode",
+                    )
+                } else {
+                    let string_repr = crate::translator::rtyper::rstr::unicode_repr();
+                    rtype_builder_append(
+                        self,
+                        string_repr.as_ref(),
+                        hop,
+                        UNICODEBUILDERPTR.clone(),
+                        UNICODEPIECEPTR.clone(),
+                        UNICODEPIECE.clone(),
+                        UNICODEPTR.clone(),
+                        "mallocunicode",
+                        "copyunicodecontent",
+                    )
+                }
+            }
+            "build" => rtype_builder_build(
+                self,
+                hop,
+                UNICODEBUILDERPTR.clone(),
+                UNICODEPIECEPTR.clone(),
+                UNICODEPTR.clone(),
+                "mallocunicode",
+                "copyunicodecontent",
+            ),
             _ => Err(TyperError::message(format!(
                 "missing {}.rtype_method_{method_name}",
                 self.class_name()
@@ -5808,6 +6705,30 @@ pub fn unicodebuilder_repr() -> Arc<UnicodeBuilderRepr> {
     static REPR: OnceLock<Arc<UnicodeBuilderRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(UnicodeBuilderRepr::new()))
         .clone()
+}
+
+/// The pyre adaptation of the RPython `rlib.rstring` ExtRegistryEntry
+/// `specialize_call`, which lowers the builder ctor to
+/// `hop.r_result.rtyper_new(hop)`.  The result repr — a
+/// `StringBuilderRepr` or `UnicodeBuilderRepr`, chosen by `makerepr`
+/// from the `SomeStringBuilder` / `SomeUnicodeBuilder` annotation —
+/// selects which `ll_new` helper graph the emitted direct call binds.
+pub fn rtype_newstringbuilder(hop: &HighLevelOp) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newstringbuilder: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    if let Some(r) = any_r.downcast_ref::<StringBuilderRepr>() {
+        return r.rtyper_new(hop);
+    }
+    if let Some(r) = any_r.downcast_ref::<UnicodeBuilderRepr>() {
+        return r.rtyper_new(hop);
+    }
+    Err(TyperError::message(
+        "rtype_newstringbuilder: hop.r_result is not a builder repr",
+    ))
 }
 
 #[cfg(test)]
@@ -7060,6 +7981,212 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_getlength");
     }
 
+    /// SPIKE (L4-first) — `rtype_method("build")` lowers to a single
+    /// `direct_call` against the `ll_build` helper graph. Proves the
+    /// method-dispatch pipeline reaches `rtype_builder_build`; the spike
+    /// helper is swapped for the full fold_pieces+shrink tree in L2-full.
+    #[test]
+    fn stringbuilder_rtype_method_build_emits_direct_call() {
+        use crate::flowspace::model::Hlvalue;
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let hop = build_builder_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "build",
+            super::STRINGBUILDERPTR.clone(),
+            super::STRPTR.clone(),
+            super::stringbuilder_repr() as std::sync::Arc<dyn Repr>,
+        );
+        let result = super::stringbuilder_repr()
+            .rtype_method("build", &hop)
+            .unwrap_or_else(|err| panic!("rtype_method build: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_build");
+    }
+
+    /// SPIKE (L4-first) — `rtype_method("append")` (builder, str) lowers
+    /// to a single `direct_call` against the `ll_append` helper graph.
+    /// Proves the binary method-dispatch pipeline reaches
+    /// `rtype_builder_append`; the spike helper is swapped for the full
+    /// jit_append/_ll_append/grow tree in L2-full.
+    #[test]
+    fn stringbuilder_rtype_method_append_emits_direct_call() {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        // args: (builder receiver, str piece).
+        let v_builder = Variable::new();
+        v_builder.set_concretetype(Some(super::STRINGBUILDERPTR.clone()));
+        let v_piece = Variable::new();
+        v_piece.set_concretetype(Some(super::STRPTR.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "append".to_string(),
+                vec![
+                    Hlvalue::Variable(v_builder.clone()),
+                    Hlvalue::Variable(v_piece.clone()),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        {
+            let LowLevelType::Ptr(inner) = super::STRINGBUILDERPTR.clone() else {
+                panic!("builder lltype must be a Ptr");
+            };
+            let mut s = hop.args_s.borrow_mut();
+            s.push(crate::annotator::model::SomeValue::Ptr(
+                crate::translator::rtyper::lltypesystem::lltype::SomePtr::new(*inner),
+            ));
+            s.push(crate::annotator::model::SomeValue::String(
+                crate::annotator::model::SomeString::new(false, false),
+            ));
+        }
+        {
+            let mut r = hop.args_r.borrow_mut();
+            r.push(Some(super::stringbuilder_repr() as std::sync::Arc<dyn Repr>));
+            r.push(Some(
+                crate::translator::rtyper::rstr::string_repr() as std::sync::Arc<dyn Repr>
+            ));
+        }
+        let result = super::stringbuilder_repr()
+            .rtype_method("append", &hop)
+            .unwrap_or_else(|err| panic!("rtype_method append: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_)) | None));
+        assert_single_direct_call_to(&llops, "ll_append");
+
+        // `lowlevel_helper_function_with_builder` is eager, so lowering
+        // `append` materialises the WHOLE nested callee tree, not just the
+        // top-level `ll_append`. Assert every sub-helper graph was minted +
+        // registered — a silently-empty or cache-key-collided sub-builder
+        // would pass the single-direct_call check above but fail here.
+        let graph_names: std::collections::HashSet<String> = _ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in [
+            "ll_append",
+            "ll_append_res0",
+            "_ll_append",
+            "ll_grow_and_append",
+            "ll_grow_by",
+            "ll_copy_string_contents",
+            "mallocstr",
+        ] {
+            assert!(
+                graph_names.contains(expected),
+                "append helper tree missing `{expected}`; minted graphs = {graph_names:?}"
+            );
+        }
+    }
+
+    /// `rtype_method("append_slice")` (builder, str, start, end) lowers to a
+    /// single `direct_call` against `ll_append_slice` and eagerly mints its
+    /// whole nested callee tree (res_slice + the shared `_ll_append` chain).
+    #[test]
+    fn stringbuilder_rtype_method_append_slice_emits_direct_call() {
+        use super::{ConstValue, constant_with_lltype};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        // args: (builder receiver, str piece, start, end); start/end are
+        // Signed constants so `inputarg` binds them via `inputconst`.
+        let v_builder = Variable::new();
+        v_builder.set_concretetype(Some(super::STRINGBUILDERPTR.clone()));
+        let v_piece = Variable::new();
+        v_piece.set_concretetype(Some(super::STRPTR.clone()));
+        let c_start = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+        let c_end = constant_with_lltype(ConstValue::Int(5), LowLevelType::Signed);
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "append_slice".to_string(),
+                vec![
+                    Hlvalue::Variable(v_builder.clone()),
+                    Hlvalue::Variable(v_piece.clone()),
+                    c_start,
+                    c_end,
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        {
+            let LowLevelType::Ptr(inner) = super::STRINGBUILDERPTR.clone() else {
+                panic!("builder lltype must be a Ptr");
+            };
+            let mut s = hop.args_s.borrow_mut();
+            s.push(crate::annotator::model::SomeValue::Ptr(
+                crate::translator::rtyper::lltypesystem::lltype::SomePtr::new(*inner),
+            ));
+            s.push(crate::annotator::model::SomeValue::String(
+                crate::annotator::model::SomeString::new(false, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+        }
+        {
+            let mut r = hop.args_r.borrow_mut();
+            r.push(Some(super::stringbuilder_repr() as std::sync::Arc<dyn Repr>));
+            r.push(Some(
+                crate::translator::rtyper::rstr::string_repr() as std::sync::Arc<dyn Repr>
+            ));
+            // start/end are constants; `inputarg` never reads their source repr.
+            r.push(None);
+            r.push(None);
+        }
+        let result = super::stringbuilder_repr()
+            .rtype_method("append_slice", &hop)
+            .unwrap_or_else(|err| panic!("rtype_method append_slice: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_)) | None));
+        assert_single_direct_call_to(&llops, "ll_append_slice");
+
+        let graph_names: std::collections::HashSet<String> = _ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in [
+            "ll_append_slice",
+            "ll_append_res_slice",
+            "_ll_append",
+            "ll_grow_and_append",
+            "ll_grow_by",
+            "ll_copy_string_contents",
+            "mallocstr",
+        ] {
+            assert!(
+                graph_names.contains(expected),
+                "append_slice helper tree missing `{expected}`; minted graphs = {graph_names:?}"
+            );
+        }
+    }
+
     /// rbuilder.py — `rtype_bool` lowers to a single `direct_call`
     /// against the `ll_bool` helper graph.
     #[test]
@@ -7125,6 +8252,36 @@ mod tests {
         let result = super::stringbuilder_repr()
             .rtyper_new(&hop)
             .unwrap_or_else(|err| panic!("rtyper_new: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_new");
+    }
+
+    /// The `newstringbuilder` ctor op flows through the rtyper's real
+    /// `translate_operation` dispatch: the result builder repr's
+    /// `rtyper_new` lowers it to a single `direct_call` against `ll_new`.
+    #[test]
+    fn translate_operation_newstringbuilder_routes_to_rtyper_new() {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(super::STRINGBUILDERPTR.clone()));
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "newstringbuilder".to_string(),
+                Vec::new(),
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        *hop.r_result.borrow_mut() = Some(super::stringbuilder_repr() as std::sync::Arc<dyn Repr>);
+        let result = rtyper
+            .translate_operation(&hop)
+            .unwrap_or_else(|err| panic!("translate_operation newstringbuilder: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         assert_single_direct_call_to(&llops, "ll_new");
     }

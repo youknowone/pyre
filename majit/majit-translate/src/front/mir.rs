@@ -972,12 +972,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
+        let builder_mode = graph_has_builder_accumulator(llbc, &body);
         let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
             &body,
             static_addrs,
             &struct_field_attrs,
+            &dont_look_inside,
+            builder_mode,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2123,6 +2126,20 @@ pub(crate) fn struct_field_attrs_of(
     struct_field_attrs
 }
 
+/// The `#[dont_look_inside]` marker set for this LLBC, keyed
+/// `strip_crate_prefix(name_path())` — the same derivation the
+/// whole-program loop harvests inline for the return-token stamp.
+/// Recovered per call on the standalone lowering entries so their
+/// call-target builder declines the `CallTarget::Method` hint for the
+/// same residual callees the whole-program build does.
+pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
+    crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+        .into_iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+        .map(|(path, _)| path)
+        .collect()
+}
+
 pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -2135,7 +2152,61 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
             fd.item_meta.name_path()
         ))
     })?;
-    lower_unstructured_with_static_addrs_and_attrs(llbc, fd, &u, static_addrs, struct_field_attrs)
+    // Standalone entry (the reader / tests / on-demand `GraphBodyProvider`):
+    // harvest the residual marker set from this LLBC so the call-target
+    // builder makes the SAME Method-hint decline the whole-program loop makes.
+    // The hot whole-program path passes its precomputed set directly to
+    // `lower_unstructured_with_static_addrs_and_attrs`, so this per-call
+    // harvest is only paid on the standalone paths.
+    let dont_look_inside = dont_look_inside_set_of(llbc);
+    let builder_mode = graph_has_builder_accumulator(llbc, &u);
+    lower_unstructured_with_static_addrs_and_attrs(
+        llbc,
+        fd,
+        &u,
+        static_addrs,
+        struct_field_attrs,
+        &dont_look_inside,
+        builder_mode,
+    )
+}
+
+/// The MIR locals that can be a fresh string-builder accumulator: the
+/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` CALL
+/// terminator in the accumulator range `(arg_count+1..n_locals)`.
+///
+/// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
+/// call-terminator arm, so no other local can pass it — iterating these
+/// candidates instead of every one of `n_locals` locals drops the
+/// `n_locals` factor that made the builder recognizers O(n_locals × body)
+/// per function.  Resolved on demand from the body, no per-local side table.
+fn builder_ctor_dest_locals<'a>(
+    body: &'a Unstructured,
+    llbc: &'a Llbc,
+) -> impl Iterator<Item = usize> + 'a {
+    let n_locals = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    body.body.iter().filter_map(move |bb| {
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && let PlaceKind::Local(i) = call.dest.kind
+            && (arg_count + 1..n_locals).contains(&(i as usize))
+            && matches!(
+                wtf8buf_method_leaf(llbc, &call),
+                Some("new") | Some("with_capacity")
+            )
+        {
+            Some(i as usize)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `u` (the body of `fd`) contains at least one builder-mode string
+/// accumulator ([`is_builder_mode_accumulator`]) — the pre-check that selects
+/// the canonical builder-form lowering.
+fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
+    builder_ctor_dest_locals(u, llbc).any(|c| is_builder_mode_accumulator(u, llbc, c))
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -2151,6 +2222,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
+    // When set, each strategy's `Lowering` is switched to builder form
+    // ([`Lowering::enable_builder_mode`]) so a string accumulator
+    // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
+    // caller sets this directly from [`graph_has_builder_accumulator`], so
+    // qualifying functions have one canonical marker-emitting graph.
+    builder_mode: bool,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -2568,7 +2646,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
-        let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
+        let mut lo = Lowering::new(
+            llbc,
+            name.clone(),
+            u,
+            static_addrs,
+            fd.generics.as_ref(),
+            dont_look_inside,
+        )?;
+        if builder_mode {
+            lo.enable_builder_mode();
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -2600,7 +2688,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             }
         }
     }
-    let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
+    let mut lo = Lowering::new(
+        llbc,
+        name.clone(),
+        u,
+        static_addrs,
+        fd.generics.as_ref(),
+        dont_look_inside,
+    )?;
+    if builder_mode {
+        lo.enable_builder_mode();
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -2618,7 +2716,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // inputargs), which is order-independent.  RPO only resolves the
         // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, u, static_addrs, fd.generics.as_ref())?;
+            let mut lo = Lowering::new(
+                llbc,
+                name,
+                u,
+                static_addrs,
+                fd.generics.as_ref(),
+                dont_look_inside,
+            )?;
+            if builder_mode {
+                lo.enable_builder_mode();
+            }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
@@ -2860,6 +2968,16 @@ struct IndexElemAlias {
 struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
+    /// Harvested `#[dont_look_inside]` marker set (keyed
+    /// `strip_crate_prefix(name_path())`, the same spelling
+    /// `stamp_return_token` uses at the whole-program registration loop).
+    /// A residual-marked inherent method must not route as
+    /// `CallTarget::Method`: that surfaces `getattr(recv, method)` on a
+    /// classed receiver whose classdict carries no method source, which
+    /// blocks at annotate. The call-target builder declines the Method
+    /// hint for a callee in this set so it routes as a `FunctionPath` the
+    /// registry resolves to the same residual fnaddr.
+    dont_look_inside: &'a std::collections::HashSet<String>,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
     arg_count: usize,
@@ -2914,6 +3032,16 @@ struct Lowering<'a> {
     /// Distinguishes the collapse case from a genuine Ref tuple `.N` read
     /// in [`Lowering::resolve_place`].
     binop_result_locals: std::collections::HashSet<usize>,
+    /// Whether this function contains a builder-form accumulator. The canonical
+    /// lowering sets it directly from [`graph_has_builder_accumulator`]; ctor /
+    /// append / terminal-`move` sites then emit the
+    /// `__pyre_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
+    /// `newstringbuilder` / `append` / `build`) instead of a parallel
+    /// `ll_strconcat` graph. Whether a given local *is* such an
+    /// accumulator is resolved on demand from `body`
+    /// ([`is_builder_mode_accumulator`]) at each emit site — no per-local side
+    /// table, so nothing can drift from the MIR that is the source of truth.
+    builder_mode: bool,
     /// MIR locals bound by a devirtualized workspace `Index::index` /
     /// `IndexMut::index_mut` call, mapped to the `(base, index)`
     /// operand pair.  Those impls bottom out at raw-slice
@@ -3072,6 +3200,7 @@ impl<'a> Lowering<'a> {
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
         generics: Option<&serde_json::Value>,
+        dont_look_inside: &'a std::collections::HashSet<String>,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
@@ -3222,6 +3351,7 @@ impl<'a> Lowering<'a> {
         Ok(Self {
             graph,
             llbc,
+            dont_look_inside,
             body,
             static_addrs,
             arg_count,
@@ -3237,6 +3367,7 @@ impl<'a> Lowering<'a> {
             ],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
+            builder_mode: false,
             index_elem_alias: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
@@ -3263,6 +3394,20 @@ impl<'a> Lowering<'a> {
             closure_select_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
         })
+    }
+
+    /// Switch this lowering to builder form so the ctor / append /
+    /// terminal-`move` sites of a builder-mode accumulator
+    /// ([`is_builder_mode_accumulator`]) emit the `StringBuilder` markers
+    /// instead of `ll_strconcat`. The canonical frontend selects this before
+    /// lowering whenever [`graph_has_builder_accumulator`] succeeds.
+    /// Returns whether any accumulator was found. Membership is resolved on demand at each emit site,
+    /// so this records no per-local table — only the mode flag.
+    fn enable_builder_mode(&mut self) -> bool {
+        self.builder_mode = true;
+        // Same "any builder-mode accumulator?" question as the pre-check, over
+        // the ctor-dest candidates only (see [`builder_ctor_dest_locals`]).
+        graph_has_builder_accumulator(self.llbc, self.body)
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -5234,9 +5379,53 @@ impl<'a> Lowering<'a> {
     /// Resolve an [`Operand`] to the Variable the IR should reference.
     fn resolve_operand(&mut self, mir_bb: usize, op: Operand) -> Result<Variable, LowerError> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => self.resolve_place(mir_bb, place),
+            Operand::Copy(place) => self.resolve_place(mir_bb, place),
+            Operand::Move(place) => {
+                // A `move c` of a builder-mode accumulator is its single
+                // `ll_build` materialisation point (`accumulator_move_site_count
+                // == 1`).  Emit the `__pyre_stringbuilder_build` marker
+                // (`flowspace_adapter` → getattr("build") + simple_call →
+                // `SomeString`) instead of moving the concat accumulator out.
+                // Only a bare `Local(c)` move qualifies; a projection falls
+                // through. Inert unless this function selected builder mode and
+                // the local is an accumulator (resolved on demand from `body`).
+                if let PlaceKind::Local(i) = place.kind
+                    && self.builder_mode
+                    && is_builder_mode_accumulator(self.body, self.llbc, i as usize)
+                {
+                    return self.resolve_builder_build(mir_bb, i as usize);
+                }
+                self.resolve_place(mir_bb, place)
+            }
             Operand::Const(value) => self.emit_constant(mir_bb, &value),
         }
+    }
+
+    /// Emit the `__pyre_stringbuilder_build(c)` marker for the terminal
+    /// `move c` of a builder-mode accumulator, returning the built
+    /// `SomeString` Variable.  The builder Ref was minted at the ctor and
+    /// mutated in place by the appends, so it is read (not rebound) here.
+    fn resolve_builder_build(&mut self, mir_bb: usize, c: usize) -> Result<Variable, LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let builder = self.local_var[c].clone().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "builder-mode accumulator local {c} unbound at its build site"
+            ))
+        })?;
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_build".to_string()],
+                },
+                args: vec![builder],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        Ok(result)
     }
 
     /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
@@ -7635,6 +7824,109 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Builder-mode ctor. In the canonical builder-form lowering, the
+                // single `Wtf8Buf`/`String` `new`/`with_capacity` def of a
+                // builder-mode accumulator (its dest local, proven single-def
+                // by that ctor in [`is_fresh_str_builder`]) mints the
+                // `StringBuilder` once via the `__pyre_stringbuilder_new`
+                // marker instead of the concat empty string; later appends
+                // mutate it in place.  Placed before the method-specific arms
+                // so it preempts any generic ctor lowering. Inert unless
+                // [`enable_builder_mode`] selected this canonical form; the
+                // accumulator test resolves on demand from `body`.
+                if self.builder_mode
+                    && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__pyre_stringbuilder_new".to_string()],
+                            },
+                            args: vec![],
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Wtf8Buf` / `String`::push_str(&mut buf, s) / push_wtf8(&mut
+                // buf, w) — and the argument-swapped `Wtf8Piece::push_onto(&s,
+                // &mut buf)` — an accumulator append.  A `Wtf8Buf` / `String`
+                // lifts to the single immutable `ValueType::Str`, so there is
+                // no builder to mutate in place; model the append functionally
+                // as `buf = ll_strconcat(buf, piece)` (the `add` BinOp the
+                // rtyper routes to `ll_strconcat`) and rebind the accumulator's
+                // MIR local so its later reads — and the loop-header phi that
+                // threads it across the back-edge — observe the concatenated
+                // string.  `str_builder_append_args` gives the accumulator and
+                // piece arg positions (push_str / push_wtf8: acc 0, piece 1;
+                // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
+                // arrives as a per-site ref-temp; `append_accumulator_of_arg_temp`
+                // traces it back to `buf` on demand from the MIR body, resolving
+                // to `buf` only when `buf` is a fresh `new` / `with_capacity`
+                // local whose every borrow feeds such an append, so a
+                // `&mut`-parameter accumulator (whose caller observes the
+                // real-buffer mutation) is excluded and keeps its residual
+                // rather than miscompiling.  The call returns `()`; its dead
+                // destination binds to a fresh Void var.
+                if args.len() == 2
+                    && let Some((acc_i, piece_i)) = str_builder_append_args(self.llbc, &reg)
+                    && let Some(buf_local) = arg_locals
+                        .get(acc_i)
+                        .copied()
+                        .flatten()
+                        .and_then(|rt| append_accumulator_of_arg_temp(self.body, self.llbc, rt))
+                {
+                    // Concatenate onto the accumulator's current binding
+                    // (`local_var[buf_local]`), not `args[acc_i]`: the latter is
+                    // the value the `&mut buf` borrow resolved to, which an
+                    // earlier append in the same block — or the loop-header phi —
+                    // may already have superseded.  Fall back to the borrow value
+                    // only if the slot is somehow unbound.
+                    let acc_val = self.local_var[buf_local]
+                        .clone()
+                        .unwrap_or_else(|| args[acc_i].clone());
+                    if self.builder_mode
+                        && is_builder_mode_accumulator(self.body, self.llbc, buf_local)
+                    {
+                        // Builder form: `b.append(piece)` mutates the buffer in
+                        // place and returns `()`, so — unlike the concat rebind
+                        // below — the accumulator binding is unchanged.  Emit the
+                        // void `__pyre_stringbuilder_append` marker
+                        // (`flowspace_adapter` → getattr("append") + simple_call).
+                        let void = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(void),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__pyre_stringbuilder_append".to_string()],
+                                },
+                                args: vec![acc_val, args[piece_i].clone()],
+                                result_ty: ValueType::Void,
+                            },
+                        });
+                    } else {
+                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
+                        self.local_var[buf_local] = Some(concat);
+                    }
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `*const T::cast_mut()` / `*mut T::cast_const()` /
                 // `<ptr>::cast()` — address-preserving pointer
                 // reinterprets the JIT models as identity (the
@@ -9720,6 +10012,25 @@ impl<'a> Lowering<'a> {
                         return (segments, None);
                     }
                     let method_hint = self.impl_method_owner(fd);
+                    // A `#[dont_look_inside]` inherent method is a residual
+                    // call, not a trace target. Routing it as
+                    // `CallTarget::Method` surfaces `getattr(recv, method)`
+                    // on a classed receiver whose classdict carries no
+                    // method source, which blocks at annotate
+                    // (`complete_pending_blocks failed: Blocked block`).
+                    // Decline the Method hint for such a callee so it routes
+                    // as a `FunctionPath` the registry resolves to the same
+                    // residual fnaddr — the getattr surface vanishes and the
+                    // enclosing carrier annotates with no annotator change.
+                    let method_hint = if method_hint.is_some()
+                        && self
+                            .dont_look_inside
+                            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+                    {
+                        None
+                    } else {
+                        method_hint
+                    };
                     // An impl-block associated function (the method
                     // gate rejected it — no `self` receiver) is
                     // spelled `[<qualified owner>, <fn>]`, the key the
@@ -14049,6 +14360,484 @@ fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashS
         .collect()
 }
 
+/// The owning type of a functional-concat string builder: `Wtf8Buf` (the
+/// interpreter's repr accumulator) or std `String` (the byte / leaf / module
+/// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a
+/// `push_str` append models identically as `buf = ll_strconcat(buf, arg)`;
+/// `push_wtf8` is `Wtf8Buf`-only but the leaf gate never matches it on a
+/// `String`, so one owner set serves both.
+fn is_str_builder_owner(owner: Option<&str>) -> bool {
+    matches!(owner, Some("Wtf8Buf") | Some("String"))
+}
+
+/// The string-builder ctor leaf a MIR call resolves to, restricted to the
+/// fresh-buffer constructors this pass models (`new` / `with_capacity`) on a
+/// `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
+/// runs before the impl-owner resolution so the type lookup only fires for the
+/// candidate names.  Appends are recognised separately by
+/// [`str_builder_append_args`].
+fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let np = fd.item_meta.name_path();
+    let leaf = match np.rsplit("::").next()? {
+        "new" => "new",
+        "with_capacity" => "with_capacity",
+        "push_str" => "push_str",
+        "push_wtf8" => "push_wtf8",
+        _ => return None,
+    };
+    is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
+}
+
+/// If `reg` is a functional-concat string append, its `(accumulator, piece)`
+/// argument positions.  `push_str` / `push_wtf8` (on `Wtf8Buf` / `String`)
+/// take the accumulator as `&mut self` (arg 0) and the appended piece as
+/// arg 1.  `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps them: the
+/// piece is `self` (arg 0) and the accumulator is `out` (arg 1).  Every
+/// `Wtf8Piece` impl body is `out.push_str(self)` / `out.push_wtf8(self)`, so
+/// `out = out ++ self` models all of them; the accumulator gate
+/// ([`append_accumulator_of_arg_temp`]) still restricts the rewrite to a fresh
+/// owned local, so a `&mut`-parameter `out` keeps its residual.
+fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usize)> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let np = fd.item_meta.name_path();
+    match np.rsplit("::").next()? {
+        "push_str" | "push_wtf8" => {
+            is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some((0, 1))
+        }
+        // `Wtf8Piece::push_onto`: the `str` / `String` / `Wtf8` impls live
+        // under `pyre_interpreter::display`; the `Wtf8Buf` impl resolves to the
+        // `Wtf8Buf` owner.  Both append `self` (arg 0) onto the `&mut Wtf8Buf`
+        // accumulator (arg 1).
+        "push_onto" => (np.split("::").take(2).eq(["pyre_interpreter", "display"])
+            || deref_impl_owner_leaf(llbc, fd).as_deref() == Some("Wtf8Buf"))
+        .then_some((1, 0)),
+        _ => None,
+    }
+}
+
+/// How an operand references accumulator local `c`: `Some(true)` = a bare
+/// `move c` (transfers the whole accumulated string, sound to pass on since
+/// the move leaves `c` dead), `Some(false)` = any other reference (`copy c`,
+/// or a `move`/`copy` of a projection of `c`) the functional-concat model
+/// cannot track, `None` = no reference to `c`.
+fn c_operand_kind(op: &Operand, c: usize) -> Option<bool> {
+    match op {
+        Operand::Move(p) => {
+            if matches!(p.kind, PlaceKind::Local(i) if i as usize == c) {
+                Some(true)
+            } else if place_references_local(p, c) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Operand::Copy(p) => place_references_local(p, c).then_some(false),
+        Operand::Const(_) => None,
+    }
+}
+
+/// Whether an operand reads local `l` (a `copy`/`move` whose place bottoms
+/// out at `l`).
+fn operand_reads_local(op: &Operand, l: usize) -> bool {
+    matches!(op, Operand::Copy(p) | Operand::Move(p) if place_references_local(p, l))
+}
+
+/// Whether a `&(mut) buf` ref-temp `rt` is used exactly once — as the
+/// accumulator argument of a recognised append (`push_str` / `push_wtf8`
+/// arg 0, or `Wtf8Piece::push_onto` arg 1) — and nowhere else, so rebinding
+/// `buf` to the concat captures the whole mutation.  A ref-temp that also
+/// escapes elsewhere would leave that other reader observing the pre-append
+/// buffer, so it declines.
+fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
+    let mut receiver = 0usize;
+    let mut other = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    // A write through a projection of `rt` (`*rt = v`) reads
+                    // `rt`; a bare `rt := ..` def does not.
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if operand_reads_local(&a.cond, rt) {
+                        other += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let acc_idx = match &call.func {
+                    CallFunc::Regular(reg) => {
+                        str_builder_append_args(llbc, reg).map(|(acc, _)| acc)
+                    }
+                    _ => None,
+                };
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                for (i, arg) in call.args.iter().enumerate() {
+                    if operand_reads_local(arg, rt) {
+                        if acc_idx == Some(i) {
+                            receiver += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(&discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if operand_reads_local(&assert.cond, rt) {
+                    other += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    receiver == 1 && other == 0
+}
+
+/// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
+/// `c`, return its append-receiver temps if every use of `c` is append-safe,
+/// else `None`.  Append-safe uses: the ctor def; a borrow `_r := &(mut) c`
+/// that reaches an append accumulator argument ([`append_receiver_of_borrow`],
+/// directly or through a single two-phase reborrow); or a bare `move c`
+/// (ownership transfer of the complete accumulated string).  Any other use — a
+/// `copy`, a projection read/write (`c.field` / `*c`), `&c.field`, `Len`/
+/// `Discriminant`, or `c` in an assert / switch — is an out-of-band access the
+/// functional model cannot track, so the whole local declines.  The returned
+/// temps are the call-argument locals the append arm resolves against
+/// ([`append_accumulator_of_arg_temp`]), which for a reborrowed `&mut` argument
+/// is the reborrow, not the direct borrow.
+fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Option<Vec<usize>> {
+    let mut ref_temps: Vec<usize> = Vec::new();
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    // A write into `c`'s storage through a projection
+                    // (`*c = ..` / `c.field = ..`) mutates the buffer
+                    // out-of-band.
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, c)
+                    {
+                        return None;
+                    }
+                    match &rvalue {
+                        Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } => {
+                            if matches!(rp.kind, PlaceKind::Local(i) if i as usize == c) {
+                                let PlaceKind::Local(r) = place.kind else {
+                                    return None; // borrow assigned into a projection
+                                };
+                                ref_temps.push(r as usize);
+                            } else if place_references_local(rp, c) {
+                                return None; // `&c.field` / `&*c` — escape
+                            }
+                        }
+                        Rvalue::Len(p) | Rvalue::Discriminant(p) => {
+                            if place_references_local(p, c) {
+                                return None;
+                            }
+                        }
+                        Rvalue::Use(op)
+                        | Rvalue::UnaryOp(_, op)
+                        | Rvalue::Cast(_, op, _)
+                        | Rvalue::Repeat(op, _, _)
+                        | Rvalue::ShallowInitBox(op, _) => {
+                            if c_operand_kind(op, c) == Some(false) {
+                                return None;
+                            }
+                        }
+                        Rvalue::BinaryOp(_, l, r) => {
+                            if c_operand_kind(l, c) == Some(false)
+                                || c_operand_kind(r, c) == Some(false)
+                            {
+                                return None;
+                            }
+                        }
+                        Rvalue::Aggregate(_, ops) => {
+                            if ops.iter().any(|op| c_operand_kind(op, c) == Some(false)) {
+                                return None;
+                            }
+                        }
+                        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if c_operand_kind(&a.cond, c).is_some() {
+                        return None;
+                    }
+                }
+                Ok(StmtKind::PlaceMention(_))
+                | Ok(StmtKind::StorageLive(_))
+                | Ok(StmtKind::StorageDead(_))
+                | Ok(StmtKind::Unknown) => {}
+                Err(_) => return None,
+            }
+        }
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && c_operand_kind(op, c).is_some()
+                {
+                    return None;
+                }
+                // `move c` into a call transfers the complete string (sound);
+                // a `copy` or projected reference declines.
+                if call
+                    .args
+                    .iter()
+                    .any(|a| c_operand_kind(a, c) == Some(false))
+                {
+                    return None;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if c_operand_kind(&discr, c).is_some() {
+                    return None;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if c_operand_kind(&assert.cond, c).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut receivers = Vec::with_capacity(ref_temps.len());
+    for &rt in &ref_temps {
+        receivers.push(append_receiver_of_borrow(body, llbc, rt)?);
+    }
+    Some(receivers)
+}
+
+/// Resolve a direct `&(mut) buf` borrow temp `rt` to the temp actually passed
+/// as the append's accumulator argument.  A method-autoref receiver
+/// (`buf.push_str(s)`) reaches the call unchanged, so `rt` is itself the sole
+/// append receiver.  An explicit `&mut buf` argument (`Wtf8Piece::push_onto(&s,
+/// &mut buf)`) is a two-phase reborrow — `rt := &Mut buf; recv := &TwoPhaseMut
+/// *rt` — so the call receives `recv` instead; accept it when `rt`'s only use
+/// is that single reborrow and `recv` is itself a sole append receiver.  The
+/// returned temp is the call's accumulator-argument local the append arm
+/// resolves against ([`append_accumulator_of_arg_temp`]).
+fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    if ref_temp_is_sole_append_receiver(body, llbc, rt) {
+        return Some(rt);
+    }
+    let mut recv: Option<usize> = None;
+    let mut other = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } =
+                        &rvalue
+                        && place_is_immediate_deref_of(rp, rt)
+                    {
+                        let PlaceKind::Local(r) = place.kind else {
+                            return None; // reborrow assigned into a projection
+                        };
+                        if recv.replace(r as usize).is_some() {
+                            return None; // more than one reborrow of `rt`
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if operand_reads_local(&a.cond, rt) {
+                        other += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `rt` is consumed by the reborrow statement; it must not reach any
+        // terminator (the append call receives `recv`, not `rt`).
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                if call.args.iter().any(|a| operand_reads_local(a, rt)) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(&discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if operand_reads_local(&assert.cond, rt) {
+                    other += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let recv = recv?;
+    if other != 0 {
+        return None;
+    }
+    ref_temp_is_sole_append_receiver(body, llbc, recv).then_some(recv)
+}
+
+/// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
+/// exactly one def and that def is a `Wtf8Buf` / `String` `new` /
+/// `with_capacity` call.  A local with a second def, or one defined by a
+/// non-ctor rvalue, is not a fresh accumulator and keeps its residual.
+fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    let mut def_count = 0usize;
+    let mut ctor_def = false;
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
+            {
+                def_count += 1;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
+        {
+            def_count += 1;
+            ctor_def = matches!(
+                wtf8buf_method_leaf(llbc, &call),
+                Some("new") | Some("with_capacity")
+            );
+        }
+    }
+    def_count == 1 && ctor_def
+}
+
+/// Resolve the accumulator local a recognised append rebinds, given the MIR
+/// local `rt` passed as the append's accumulator argument (`push_str` /
+/// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
+/// borrows the accumulator directly (method autoref) or through a single
+/// two-phase reborrow; the owning `buf` is the fresh `new` / `with_capacity`
+/// local whose every borrow feeds such an append and whose append-receiver set
+/// ([`clean_accumulator_ref_temps`]) contains `rt`.  Resolved on demand from
+/// the MIR body, so the recognizer keeps no per-local side table; the append
+/// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
+fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    // Only a `Wtf8Buf` / `String` ctor dest can pass [`is_fresh_str_builder`]
+    // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
+    // parameters), and a ref-temp borrows exactly one local so at most one
+    // accumulator's receiver set contains `rt`; check those candidates instead
+    // of every local — dropping the `n_locals` factor — and first-match order
+    // is therefore irrelevant.
+    builder_ctor_dest_locals(body, llbc).find(|&c| {
+        is_fresh_str_builder(body, llbc, c)
+            && clean_accumulator_ref_temps(body, llbc, c)
+                .is_some_and(|receivers| receivers.contains(&rt))
+    })
+}
+
+/// Count the by-value consumptions (`move c`) of a fresh accumulator local
+/// `c`.  [`clean_accumulator_ref_temps`] already proves every other use of `c`
+/// is the ctor def or an append borrow, so each `move c` is a terminal
+/// materialisation of the finished string — the point where a real builder
+/// must run `ll_build`.  Counted so the builder lift only fires when the build
+/// point is unambiguous (see [`is_builder_mode_accumulator`]).
+#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
+    let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
+    let mut moves = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind() {
+                match &rvalue {
+                    Rvalue::Use(op)
+                    | Rvalue::UnaryOp(_, op)
+                    | Rvalue::Cast(_, op, _)
+                    | Rvalue::Repeat(op, _, _)
+                    | Rvalue::ShallowInitBox(op, _) => {
+                        if is_move(op) {
+                            moves += 1;
+                        }
+                    }
+                    Rvalue::BinaryOp(_, l, r) => {
+                        moves += usize::from(is_move(l)) + usize::from(is_move(r));
+                    }
+                    Rvalue::Aggregate(_, ops) => {
+                        for op in ops {
+                            if is_move(op) {
+                                moves += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            for a in &call.args {
+                if is_move(a) {
+                    moves += 1;
+                }
+            }
+        }
+    }
+    moves
+}
+
+/// Whether fresh accumulator local `c` should lift to a real RPython
+/// `StringBuilder` (approach D) rather than the functional-concat fallback:
+///
+/// * a single-def `Wtf8Buf` / `String` `new` / `with_capacity` ctor
+///   ([`is_fresh_str_builder`]),
+/// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
+/// * exactly one by-value terminal consumption ([`accumulator_move_site_count`])
+///   — the single `ll_build` materialisation point.
+///
+/// Zero or several terminal moves keep the `ll_strconcat` fallback so the
+/// builder rewrite only fires where the ctor, the appends, and the one build
+/// point are all unambiguous.  Resolved on demand from `body`, so the
+/// recognizer keeps no per-local side table.
+#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+fn is_builder_mode_accumulator(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    is_fresh_str_builder(body, llbc, c)
+        && clean_accumulator_ref_temps(body, llbc, c).is_some()
+        && accumulator_move_site_count(body, c) == 1
+}
+
 /// Whether a statically-resolved [`RegularCall`] is a workspace
 /// `Index::index` / `IndexMut::index_mut` impl (the `FixedObjectArray`
 /// family) — those bottom out at raw-slice construction and are lowered
@@ -15669,7 +16458,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) | ValueType::Str => 1,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,
@@ -16043,7 +16832,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) | ValueType::Str => "ref",
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -17340,6 +18129,7 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
             tyref_to_value_type(&field.ty, llbc),
             ValueType::Ref(_)
                 | ValueType::Str
+                | ValueType::StringBuilder
                 | ValueType::Void
                 | ValueType::State
                 | ValueType::Unknown

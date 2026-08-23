@@ -328,6 +328,165 @@ fn transduce_op(
                 result,
             );
         }
+        // `getfield(s, "field")` → `FieldRead`.  The field name is a Void
+        // `ByteStr` constant (`void_field_const`); the owning struct identity
+        // is the pointee-struct leaf of the base pointer's `concretetype`
+        // (`Ptr(Struct("stringbuilder"))` → `"stringbuilder"`), which keys the
+        // layout registry the assembler resolves offsets through.  These are
+        // the mutable low-level fields of the builder container
+        // (`current_pos`/`current_end`/`total_size`), so the read is not
+        // `_pure`.
+        "getfield" => {
+            let base = expect_var(&op.args[0]);
+            let field_name = field_name_of(&op.args[1]);
+            let owner_root = owner_root_of(&base);
+            let result = expect_var(&op.result);
+            let ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    ty,
+                    pure: false,
+                },
+                result,
+            );
+        }
+        // `ptr_ne(p, NULL)` / `ptr_eq(p, NULL)` — a pointer null test.
+        // RPython `PtrRepr.rtype_bool` lowers it to the unary
+        // `ptr_nonzero` / `ptr_iszero` (`assembler.rs` `"r" => "ptr_nonzero"`);
+        // when one operand is the null pointer constant, emit that unary form
+        // over the non-null operand.  This is the orthodox shape and avoids
+        // materialising a null `Ref` constant (`materialize` handles only
+        // int/bool constants).  A compare between two live pointers keeps the
+        // binary `eq` / `ne`, which the assembler maps to `ptr_eq` / `ptr_ne`
+        // on the `rr` operand shape.
+        "ptr_ne" | "ptr_eq" => {
+            let is_ne = op.opname == "ptr_ne";
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            if let Some(null_i) = op.args.iter().position(is_null_const) {
+                let operand = expect_var(&op.args[1 - null_i]);
+                let unop = if is_ne { "ptr_nonzero" } else { "ptr_iszero" };
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::UnaryOp {
+                        op: unop.to_string(),
+                        operand,
+                        result_ty,
+                    },
+                    result,
+                );
+            } else {
+                let lhs = expect_var(&op.args[0]);
+                let rhs = expect_var(&op.args[1]);
+                let bare = if is_ne { "ne" } else { "eq" };
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::BinOp {
+                        op: bare.to_string(),
+                        lhs,
+                        rhs,
+                        result_ty,
+                    },
+                    result,
+                );
+            }
+        }
+        // `setfield(s, "field", v)` → `FieldWrite`.  Field name and owner are
+        // resolved exactly like `getfield`; the stored value is an
+        // `AbstractValue` — a `Variable` (register operand) or an inline
+        // `Constant` (e.g. `current_pos = 0`) — carried through the
+        // `LinkArg::Value`/`Const` union.  `ty` (the setfield kind i/r/f) is
+        // the stored value's kind: `current_buf` is a `Ref`, the size/offset
+        // fields `Int`.  Void result.
+        "setfield" => {
+            let base = expect_var(&op.args[0]);
+            let field_name = field_name_of(&op.args[1]);
+            let owner_root = owner_root_of(&base);
+            let value = linkarg_from_hlvalue(&op.args[2]);
+            let ty = hlvalue_value_type(&op.args[2]);
+            out.push_op_var(
+                block,
+                OpKind::FieldWrite {
+                    base,
+                    field: crate::model::FieldDescriptor::new(field_name, owner_root),
+                    value,
+                    ty,
+                },
+                false,
+            );
+        }
+        // `malloc(STRUCT, {'flavor':'gc'})` for a fixed-size GcStruct → `New`.
+        // The struct leaf (`"stringbuilder"`) is read off the first operand's
+        // `LowLevelType` constant and keys the assembler's size descriptor
+        // (`bh_size_spec_from_callcontrol`, `path_hash(owner)`).  A plain
+        // GcStruct with no boxed `ob_type`, so `New` (not `NewWithVtable`).
+        // The flavor operand must be `{'flavor': 'gc'}`: `jtransform.py
+        // rewrite_op_malloc` lowers only the gc flavor to `new(descr)`, so a
+        // `raw`/`nonmovable` allocation is rejected rather than silently
+        // lowered to a GC `New`.
+        "malloc" => {
+            assert!(
+                is_gc_flavor_const(&op.args[1]),
+                "jtransform_opname::lower_graph: malloc flavor operand is not {{'flavor': 'gc'}}: {:?}",
+                op.args[1]
+            );
+            let owner = malloc_struct_owner(&op.args[0]);
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(block, OpKind::New { owner }, result);
+        }
+        // `cast_int_to_uint` / `cast_uint_to_int` — identity at LL level
+        // (`getkind(Signed) == getkind(Unsigned) == 'int'`).  RPython
+        // `jtransform.py rewrite_op_cast_*` are explicit no-ops; the
+        // rich-`OpKind` `UnaryOp` carries the cast name so the shared
+        // jtransform tail drops it and aliases the result to the operand.
+        name @ ("cast_int_to_uint" | "cast_uint_to_int") => {
+            let operand = expect_var(&op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is the
+        // `_func._name` carried by the leading funcptr constant
+        // (`ConstValue::LLPtr` → `_ptr_obj::Func`); it becomes a
+        // `CallTarget::FunctionPath` whose single segment matches the helper's
+        // registered `CallPath`, so `register_opname_helper_graph` makes it
+        // resolve as a *regular* callee rather than a residual synthetic
+        // fnaddr.  The trailing operands are the call arguments; `OpKind::Call`
+        // takes `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
+        // are materialised through the same `ConstInt`/`ConstBool` path the
+        // `int_*` arm uses.  The builder helpers' `direct_call`s all return a
+        // value (`ll_min` → uint, `mallocfn` → the char buffer), so the result
+        // is bound as a result var.
+        "direct_call" => {
+            let callee = callee_name_from_funcptr(&op.args[0]);
+            let target = crate::model::CallTarget::function_path([callee]);
+            let args: Vec<FVar> = op.args[1..]
+                .iter()
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                },
+                result,
+            );
+        }
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
 }
@@ -370,6 +529,65 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
             result
         }
     }
+}
+
+/// Decode a `direct_call` callee operand — the leading funcptr constant.
+/// `ConstValue::LLPtr` wraps an `_ptr` whose underlying object is an
+/// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
+/// `CallPath` a helper is registered under.
+fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let Hlvalue::Constant(c) = hlv else {
+        panic!("jtransform_opname::lower_graph: direct_call callee operand is not a constant");
+    };
+    let ConstValue::LLPtr(ptr) = &c.value else {
+        panic!(
+            "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
+            c.value
+        );
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        other => panic!(
+            "jtransform_opname::lower_graph: direct_call callee funcptr does not resolve to a Func object: {other:?}"
+        ),
+    }
+}
+
+/// Decode a `getfield` / `setfield` field-name operand — the Void
+/// `ByteStr` constant `void_field_const` builds.
+fn field_name_of(hlv: &Hlvalue) -> String {
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::ByteStr(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            other => panic!(
+                "jtransform_opname::lower_graph: field-name operand is not a ByteStr: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("jtransform_opname::lower_graph: field-name operand is a Variable")
+        }
+    }
+}
+
+/// The owning struct leaf of a field access — the pointee-struct name of
+/// the base pointer's `concretetype` (`Ptr(Struct("stringbuilder"))` →
+/// `"stringbuilder"`).  `None` when the base is not a pointer-to-struct,
+/// in which case the layout layer falls back to its type-string heuristic.
+fn owner_root_of(base: &FVar) -> Option<String> {
+    match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Struct(s) => Some(s._name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether an operand is the null pointer constant (`ConstValue::None`),
+/// the second operand of the builder `ll_bool` `ptr_ne(builder, NULL)`.
+fn is_null_const(hlv: &Hlvalue) -> bool {
+    matches!(hlv, Hlvalue::Constant(c) if c.value == ConstValue::None)
 }
 
 /// Map a flowspace link arg (`Variable` or `Constant`) to the model
@@ -422,6 +640,69 @@ fn value_type_of(var: &FVar) -> ValueType {
     }
 }
 
+/// The stored-value kind of a `setfield` value operand — a `Variable`
+/// (register) or an inline `Constant`.  Drives `FieldWrite::ty` (the
+/// setfield `i`/`r`/`f` opcode), so it reads the operand's own
+/// `concretetype` rather than the container field's declared type.
+fn hlvalue_value_type(hlv: &Hlvalue) -> ValueType {
+    match hlv {
+        Hlvalue::Variable(v) => value_type_of(v),
+        Hlvalue::Constant(c) => match &c.concretetype {
+            Some(lltype) => value_type_from_lltype(lltype),
+            None => ValueType::Int,
+        },
+    }
+}
+
+/// Collapse an `lltype` to the `getkind` model `ValueType` (`Char`/`Bool`/
+/// `Signed`/`Unsigned` → int bank, GC `Ptr` → `Ref`).
+fn value_type_from_lltype(lltype: &LowLevelType) -> ValueType {
+    use crate::model::ConcreteType;
+    match crate::model::getkind(lltype) {
+        ConcreteType::Signed => ValueType::Int,
+        ConcreteType::GcRef => ValueType::Ref(None),
+        ConcreteType::Float => ValueType::Float,
+        ConcreteType::Void => ValueType::Void,
+        ConcreteType::Unknown => ValueType::Int,
+    }
+}
+
+/// The struct leaf named by a `malloc` type operand — a Void `LowLevelType`
+/// constant wrapping the fixed-size GcStruct (`Struct("stringbuilder")` →
+/// `"stringbuilder"`).
+fn malloc_struct_owner(hlv: &Hlvalue) -> String {
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => match &**lltype {
+                LowLevelType::Struct(s) => s._name.clone(),
+                other => panic!(
+                    "jtransform_opname::lower_graph: malloc type operand is not a Struct: {other:?}"
+                ),
+            },
+            other => panic!(
+                "jtransform_opname::lower_graph: malloc first operand is not a LowLevelType const: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("jtransform_opname::lower_graph: malloc first operand is a Variable")
+        }
+    }
+}
+
+/// Whether a `malloc` flavor operand is the `{'flavor': 'gc'}` dict constant
+/// (`gc_flavor_const`).  `jtransform.py rewrite_op_malloc` lowers only the gc
+/// flavor to `new(descr)`; a `raw`/`nonmovable` allocation has no such form,
+/// so the transducer rejects it rather than silently emitting a GC `New`.
+fn is_gc_flavor_const(hlv: &Hlvalue) -> bool {
+    let Hlvalue::Constant(c) = hlv else {
+        return false;
+    };
+    let Some(items) = c.value.dict_items() else {
+        return false;
+    };
+    items.get(&ConstValue::byte_str("flavor")) == Some(&ConstValue::byte_str("gc"))
+}
+
 /// A helper graph operates on a single string width, so the family is a
 /// graph-wide property: `unicode*` if any operand carries an
 /// `Array(UniChar)` pointer, else `str*`.
@@ -458,8 +739,11 @@ mod tests {
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link, SpaceOperation,
     };
-    use crate::model::{ExitCase, ExitSwitch, OpKind};
+    use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rbuilder::{
+        STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
+    };
     use crate::translator::rtyper::lltypesystem::rstr::{
         STRPTR, chars_array_ptr_lltype_from_strptr, struct_lltype_from_strptr,
     };
@@ -711,6 +995,87 @@ mod tests {
         assert_eq!(jitcode.try_index(), Some(0));
     }
 
+    /// `ll_bool(builder)` drains end-to-end with NO struct layout registered:
+    /// its only opname is `ptr_ne(builder, NULL)`, which lowers to the unary
+    /// `ptr_nonzero` and assembles to an `int_is_true`-family bytecode with no
+    /// field/size descr — so the builder container never needs a layout.  This
+    /// is the layer-2 floor: the simplest builder accessor commits a body
+    /// without any layer-2a registration.
+    #[test]
+    fn ll_bool_drains_without_a_struct_layout() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let helper = build_ll_bool_helper_graph("ll_bool", STRINGBUILDERPTR.clone())
+            .expect("build_ll_bool_helper_graph");
+        let flow = std::rc::Rc::try_unwrap(helper.graph)
+            .expect("sole owner of the ll_bool helper graph")
+            .into_inner();
+        let path = CallPath::from_segments(["ll_bool"]);
+
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, flow);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+
+        let body = jitcode
+            .try_body()
+            .expect("ll_bool drains to a jitcode body");
+        assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
+    }
+
+    /// `ll_getlength(builder)`'s three `getfield`s become `getfield_gc_i`
+    /// bytecodes whose FieldDescr the assembler resolves through
+    /// `CallControl.struct_fields`; with the synthetic STRINGBUILDER layout
+    /// registered (mirroring the resizable `"list"` header registration), the
+    /// getfield-bearing graph survives the regalloc/flatten/assemble tail and
+    /// commits a body.  This test proves survival-through-assembly, not the
+    /// resolved offsets themselves — the offsets (buf@0/pos@8/end@16/total@24/
+    /// pieces@32) are verified directly against `fielddescrof` in
+    /// `call::tests::rtyper_synthesised_stringbuilder_struct_resolves_its_field_descrs`.
+    /// (`fielddescrof` falls back to slot 0 rather than panicking when the
+    /// owner is unregistered, so a body-nonempty assertion alone cannot
+    /// discriminate the layout — that is the descr test's job.)
+    #[test]
+    fn ll_getlength_drains_with_the_stringbuilder_layout() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let helper = build_ll_getlength_helper_graph("ll_getlength", STRINGBUILDERPTR.clone())
+            .expect("build_ll_getlength_helper_graph");
+        let flow = std::rc::Rc::try_unwrap(helper.graph)
+            .expect("sole owner of the ll_getlength helper graph")
+            .into_inner();
+        let path = CallPath::from_segments(["ll_getlength"]);
+
+        let mut callcontrol = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "stringbuilder".to_string(),
+            vec![
+                ("current_buf".to_string(), "&()".to_string()),
+                ("current_pos".to_string(), "i64".to_string()),
+                ("current_end".to_string(), "i64".to_string()),
+                ("total_size".to_string(), "i64".to_string()),
+                ("extra_pieces".to_string(), "&()".to_string()),
+            ],
+        );
+        callcontrol.set_struct_fields(registry);
+
+        let jitcode = callcontrol.register_opname_helper_graph(path, flow);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+
+        let body = jitcode
+            .try_body()
+            .expect("ll_getlength drains to a jitcode body");
+        assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
+    }
+
     /// A `direct_call` to a registered opname helper must resolve as a
     /// *regular* callee (it owns a generated JitCode), not a residual call to
     /// a synthetic low-level helper.  Pre-fix the helper was visible only in
@@ -797,5 +1162,230 @@ mod tests {
         assert!(start.exitswitch.is_none(), "start exit is unconditional");
         assert_eq!(start.exits.len(), 1);
         assert_eq!(start.exits[0].target, model.returnblock);
+    }
+
+    /// `ll_bool(builder)` is `builder != nullptr(TO)`.  The `ptr_ne(builder,
+    /// NULL)` lowers to the orthodox unary null test `ptr_nonzero` rather than
+    /// a binary compare that would need a null `Ref` operand materialised.
+    #[test]
+    fn lower_graph_lowers_ll_bool_to_ptr_nonzero() {
+        let helper = build_ll_bool_helper_graph("ll_bool", STRINGBUILDERPTR.clone())
+            .expect("build_ll_bool_helper_graph");
+        let flow = helper.graph.borrow();
+        let model = lower_graph(&flow);
+
+        let mut unops = Vec::new();
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::UnaryOp { op, .. } => unops.push(op.clone()),
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(unops, vec!["ptr_nonzero"]);
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `ll_getlength(builder)` is `total_size - (current_end - current_pos)`.
+    /// The three `getfield`s lower to `FieldRead`s owned by the
+    /// `"stringbuilder"` struct (mutable, so not `_pure`), and the two
+    /// `int_sub`s to bare-named `BinOp("sub")`.
+    #[test]
+    fn lower_graph_lowers_ll_getlength_fields_and_subs() {
+        let helper = build_ll_getlength_helper_graph("ll_getlength", STRINGBUILDERPTR.clone())
+            .expect("build_ll_getlength_helper_graph");
+        let flow = helper.graph.borrow();
+        let model = lower_graph(&flow);
+
+        let mut fields = Vec::new();
+        let mut binops = Vec::new();
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead {
+                        field, ty, pure, ..
+                    } => {
+                        assert_eq!(field.owner_root.as_deref(), Some("stringbuilder"));
+                        assert_eq!(*ty, ValueType::Int);
+                        assert!(!pure, "builder length fields are mutable");
+                        fields.push(field.name.clone());
+                    }
+                    OpKind::BinOp { op, .. } => binops.push(op.clone()),
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(fields, vec!["current_end", "current_pos", "total_size"]);
+        assert_eq!(binops, vec!["sub", "sub"]);
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// The builder-construction op fragment: `malloc(STRINGBUILDER)` →
+    /// `New{owner:"stringbuilder"}`, `setfield(b, "current_pos", 0)` →
+    /// `FieldWrite` with the `0` kept as an inline `Const`, and
+    /// `cast_int_to_uint` → a droppable `UnaryOp`.  Exercised on a synthetic
+    /// graph rather than the full `ll_new` because `build_ll_new_helper_graph`'s
+    /// unit test wires its two `direct_call` callees as dummy `None` consts (no
+    /// real funcptr), which the `direct_call` arm rejects; a faithful `ll_new`
+    /// drain needs real funcptr consts (a live rtyper).
+    #[test]
+    fn lower_graph_lowers_malloc_setfield_and_cast() {
+        use crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDER;
+
+        let size = variable_with_lltype("size", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(size.clone())]);
+        let return_var = variable_with_lltype("b", STRINGBUILDERPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_builder_ctor_fragment",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+
+        let b = variable_with_lltype("b", STRINGBUILDERPTR.clone());
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc",
+            vec![
+                lowlevel_type_const(STRINGBUILDER.clone()),
+                gc_flavor_const().expect("gc flavor const"),
+            ],
+            Hlvalue::Variable(b.clone()),
+        ));
+        let void_res = variable_with_lltype("v", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(b.clone()),
+                constant_with_lltype(ConstValue::byte_str("current_pos"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void_res),
+        ));
+        let uint_size = variable_with_lltype("uint_size", LowLevelType::Unsigned);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_int_to_uint",
+            vec![Hlvalue::Variable(size)],
+            Hlvalue::Variable(uint_size),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(b)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+
+        let mut news = Vec::new();
+        let mut writes = Vec::new();
+        let mut casts = Vec::new();
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::New { owner } => news.push(owner.clone()),
+                    OpKind::FieldWrite {
+                        field, value, ty, ..
+                    } => {
+                        assert_eq!(field.owner_root.as_deref(), Some("stringbuilder"));
+                        assert!(
+                            matches!(value, LinkArg::Const(_)),
+                            "the `0` stays an inline setfield const"
+                        );
+                        writes.push((field.name.clone(), ty.clone()));
+                    }
+                    OpKind::UnaryOp { op, .. } => casts.push(op.clone()),
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(news, vec!["stringbuilder"]);
+        assert_eq!(writes, vec![("current_pos".to_string(), ValueType::Int)]);
+        assert_eq!(casts, vec!["cast_int_to_uint"]);
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `direct_call(funcptr, size, 1280)` (the `ll_min` shape from `ll_new`:
+    /// one Variable arg + one constant arg) → `Call{FunctionPath[callee]}`.
+    /// The callee name is read off the leading funcptr constant's
+    /// `_func._name`; the `1280` constant argument materialises through the
+    /// same `ConstInt` path the `int_*` arm uses because `OpKind::Call` takes
+    /// `Variable`s.  The funcptr is a hand-built `._example()` LLPtr whose
+    /// `_func._name` is the marker `"<example>"` (a live rtyper carries the
+    /// real helper name); this exercises the extraction + materialisation
+    /// mechanism without the `None` callee `build_ll_new_helper_graph`'s test
+    /// wires in.
+    #[test]
+    fn lower_graph_lowers_direct_call_to_a_function_path_call() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+
+        let size = variable_with_lltype("size", LowLevelType::Unsigned);
+        let startblock = Block::shared(vec![Hlvalue::Variable(size.clone())]);
+        let return_var = variable_with_lltype("out", LowLevelType::Unsigned);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_direct_call_fragment",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+
+        // A funcptr constant `_func._name == "<example>"`.  The concretetype is
+        // inert to the name extraction, so a Void spelling suffices (matching
+        // the `dummy_funcptr_const` convention for callee consts).
+        let func_type = FuncType {
+            args: vec![LowLevelType::Unsigned, LowLevelType::Unsigned],
+            result: LowLevelType::Unsigned,
+        };
+        let funcptr = Ptr {
+            TO: PtrTarget::Func(func_type),
+        }
+        ._example();
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+
+        let out = variable_with_lltype("out", LowLevelType::Unsigned);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee,
+                Hlvalue::Variable(size),
+                constant_with_lltype(ConstValue::Int(1280), LowLevelType::Unsigned),
+            ],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+
+        let mut calls = Vec::new();
+        let mut const_ints = 0;
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
+                    OpKind::ConstInt(_) => const_ints += 1,
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(const_ints, 1, "the 1280 constant arg materialises once");
+        assert_eq!(calls.len(), 1);
+        let (target, argc) = &calls[0];
+        assert_eq!(
+            *target,
+            crate::model::CallTarget::function_path(["<example>"])
+        );
+        assert_eq!(*argc, 2, "size + the materialised 1280");
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 }

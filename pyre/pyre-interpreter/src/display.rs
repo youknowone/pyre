@@ -298,7 +298,12 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // back at its use, the way `list_repr` re-reads its container: a copy
     // taken before a collection addresses the pre-move object.
     let _roots = pyre_object::gc_roots::push_roots();
-    let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+    let mut flat: Vec<PyObjectRef> = Vec::with_capacity(entries.len() * 2);
+    for i in 0..entries.len() {
+        let (k, v) = entries[i];
+        flat.push(k);
+        flat.push(v);
+    }
     let pair_base = pyre_object::gc_roots::pin_roots(&flat);
     let mut out = Wtf8Buf::new();
     out.push_str("{");

@@ -8018,23 +8018,50 @@ impl<'a> Assembler386<'a> {
     /// `get_array_token(rstr.STR, ...)` — basesize includes the +1
     /// extra_item_after_alloc null terminator.
     fn genop_newstr(&mut self, op: &Op) {
-        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 1);
-        self.genop_alloc_varsize(op, base_size, item_size);
+        let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 1);
+        self.genop_alloc_lowlevel_string(op, type_id, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
     /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
     fn genop_newunicode(&mut self, op: &Op) {
-        let (base_size, item_size) = Self::array_token_from_descr(op, 16, 4);
-        self.genop_alloc_varsize(op, base_size, item_size);
+        let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 4);
+        self.genop_alloc_lowlevel_string(op, type_id, base_size, item_size);
     }
 
     /// Read `(base_size, item_size)` from the injected ArrayDescr.
     /// Fallback used only when the descr is missing (should never happen
     /// for NEWSTR/NEWUNICODE after `inject_builtin_string_descrs`).
-    fn array_token_from_descr(op: &Op, fallback_base: i64, fallback_item: i64) -> (i64, i64) {
-        op.with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
-            .unwrap_or((fallback_base, fallback_item))
+    fn array_token_from_descr(op: &Op, fallback_base: i64, fallback_item: i64) -> (i64, i64, i64) {
+        op.with_array_descr(|ad| {
+            (
+                ad.base_size() as i64,
+                ad.item_size() as i64,
+                ad.type_id() as i64,
+            )
+        })
+        .unwrap_or((fallback_base, fallback_item, 0))
+    }
+
+    fn genop_alloc_lowlevel_string(
+        &mut self,
+        op: &Op,
+        type_id: i64,
+        base_size: i64,
+        item_size: i64,
+    ) {
+        self.load_arg_to_rax(op.arg(0).to_opref());
+        self.emit_abi_int_arg_from_reg(3, 0);
+        self.emit_abi_int_arg_from_imm(0, type_id);
+        self.emit_abi_int_arg_from_imm(1, base_size);
+        self.emit_abi_int_arg_from_imm(2, item_size);
+        dynasm!(self.mc ; .arch x64
+            ; mov rax, QWORD (crate::runner::dynasm_malloc_lowlevel_string as *const () as i64)
+        );
+        self.emit_abi_call_rax();
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
+        }
     }
 
     /// Shared implementation for NEWSTR / NEWUNICODE / NEW_ARRAY.
