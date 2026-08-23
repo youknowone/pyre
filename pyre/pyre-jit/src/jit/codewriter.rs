@@ -4300,10 +4300,13 @@ fn register_helper_fn_pointers(
         cpu.load_import_fn as *const (),
         CallFlavor::Plain,
     );
+    // The locals half only reads the frame's debug slot: it cannot raise and
+    // cannot collect, but it does read GC heap state, so it takes
+    // `PlainCannotRaise` rather than the no-heap flavor.
     let load_import_locals_fn = bind(
         assembler,
         cpu.load_import_locals_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::PlainCannotRaise,
     );
     // The hand-written PUSH_EXC_INFO lowering must complete the interpreter's
     // caught-exception ownership transfer.  Bind last so every existing

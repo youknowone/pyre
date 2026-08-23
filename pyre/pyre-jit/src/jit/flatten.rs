@@ -2627,8 +2627,9 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
     if binary_op_tag_for_opname(opname).is_some() || compare_op_tag_for_opname(opname).is_some() {
         return true;
     }
-    // `load_method_self`, `store_deref_value`, `unbound_local_error`
-    // lower with `PlainCannotRaise` and are intentionally absent.
+    // `load_method_self`, `store_deref_value`, `unbound_local_error`,
+    // `load_import_locals` lower with `PlainCannotRaise` and are intentionally
+    // absent.
     matches!(
         opname,
         "bool"
@@ -2641,7 +2642,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "delete_global"
             | "load_build_class"
             | "load_import"
-            | "load_import_locals"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -4539,18 +4539,20 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    // Analyzed with concrete-empty effect sets, exactly as the sibling
-    // `load_import` lookup is: peeking the debug slot neither runs Python nor
-    // writes the GC heap. Routing this through the generic frame-only helper
-    // instead would take the Plain "no graph was analyzed" path and become
-    // RANDOM_EFFECTS / CALL_MAY_FORCE -- forcing the frame twice per
-    // IMPORT_NAME, against the zero-forcing trace the other half preserves.
-    let mut effect_info = majit_ir::EffectInfo::default();
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadImportLocals;
-    Some(build_residual_call_r_r_insn_with_effect_info(
+    // Reads the frame's debug slot and returns what is already there, so it
+    // cannot raise and cannot collect -- `do_residual_call` then drops the
+    // trailing `GUARD_NO_EXCEPTION` the sibling `load_import` lookup needs.
+    // It does read GC heap state (`PyFrame.debugdata`, then `w_locals`), so
+    // this is `PlainCannotRaise` and not the no-heap flavor, the same
+    // distinction `for_iter_exception_match_fn` is bound under. The generic
+    // frame-only helper would instead take the Plain "no graph was analyzed"
+    // path and become RANDOM_EFFECTS / CALL_MAY_FORCE, forcing the frame that
+    // this opcode should not force at all.
+    Some(build_residual_call_r_r_insn_from_operands(
         ctx.load_import_locals_fn_idx,
         vec![frame_operand],
-        effect_info,
+        CallFlavor::PlainCannotRaise,
+        majit_ir::PyreHelperKind::LoadImportLocals,
         dst_reg,
     ))
 }
@@ -13630,11 +13632,11 @@ mod tests {
                             );
                             assert_eq!(
                                 stub.effect_info.extraeffect,
-                                majit_ir::ExtraEffect::CanRaise
+                                majit_ir::ExtraEffect::CannotRaise
                             );
                             assert_eq!(
                                 dispatch_kind_for_effect_info(&stub.effect_info),
-                                CallFlavor::Plain
+                                CallFlavor::PlainCannotRaise
                             );
                             assert!(!stub.effect_info.has_random_effects());
                         }

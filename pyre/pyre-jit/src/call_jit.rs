@@ -6504,6 +6504,15 @@ pub extern "C" fn bh_load_import_fn(frame_ptr: i64) -> i64 {
 /// [`bh_load_import_fn`].  Infallible — it peeks the debug slot rather than
 /// creating one — so like `bh_load_locals_fn` it has no exception-publishing
 /// arm.
+///
+/// The asymmetry with [`bh_load_import_fn`] is deliberate rather than an
+/// oversight. That one resolves `__import__` and genuinely raises ImportError
+/// when the name is absent, so it carries the publish-and-return-0 machinery
+/// and is bound `CanRaise`. This one is bound `PlainCannotRaise`, which makes
+/// `do_residual_call` drop the trailing `GUARD_NO_EXCEPTION` -- so a published
+/// exception here would have nothing to observe it. A null frame is a wiring
+/// bug in an emit site, not a runtime condition, and takes the same assert
+/// `bh_load_locals_fn` uses for the same reason.
 pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
     assert!(
         frame_ptr != 0,
