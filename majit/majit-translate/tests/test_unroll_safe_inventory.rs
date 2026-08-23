@@ -49,6 +49,35 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // No upstream counterpart by name; the loop is a bounded scan of a
     // fixed-size argument slice.
     ("leading_non_null_count", "flat builtin-keyword ABI scan"),
+    // `executioncontext.py` marks both `f_back`-chain walks `@jit.unroll_safe`.
+    //
+    // Evidence for the descent-scope change: neither graph is reachable from
+    // the portal BFS today, so admitting them and their callee closures moved
+    // no counter.  The whole corpus gates unchanged against its committed
+    // `.jitstats` baselines on all three backends, and
+    // `fbw_rolled_back_with_effects` stayed zero — it is a
+    // `JITSTATS_BADNESS_FIELDS` member in `check.py`, so it is gated
+    // corpus-wide rather than per fixture and a rise anywhere would have been
+    // a red rather than a statistic.
+    (
+        "gettopframe_nohidden",
+        "executioncontext.py gettopframe_nohidden",
+    ),
+    (
+        "getnextframe_nohidden",
+        "executioncontext.py getnextframe_nohidden",
+    ),
+    // No upstream counterpart: this materializes a 3.14 `FrameLocalsProxy`.
+    // Its slot loop scans the same fixed-size locals-plus array `fast2locals`
+    // does and takes the hint for the same reason — without it the function is
+    // one residual call, and the `f_locals` read behind it forces the
+    // virtualizable for that call's whole length.  Same evidence as the two
+    // above: the body is unreachable from the portal BFS, so the abort
+    // population and every baseline are unchanged.
+    (
+        "frame_locals_proxy_snapshot",
+        "fast2locals' scan of the same locals-plus array",
+    ),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`
