@@ -13,6 +13,19 @@
 # itself marks `?`. At the previous 406399 pypy measured 0.02s -- four times the
 # floor, and 2.5x short of the gate minimum -- so whether this fixture passed
 # came down to how loaded the runner was. Here pypy measures 0.17s.
+#
+# It is still the runner that decides, though not through load. Four Linux CI
+# legs measured pypy at 0.31s, 0.35s, 0.35s and 0.35s; one measured 0.05s, and
+# on that leg cpython read 1.20s against 1.36-1.42s and cranelift 4.49s against
+# 7.28-7.40s. Everything ran faster there and pypy by far the most, because
+# pypy's time here is almost all the two-million-object build: its read loops
+# JIT down to nothing, so what it measures is the cost of first-touching the
+# pages, which is the part that moves most between hosts. The ratio reached
+# 115x against the 63x ceiling with the numerator *smaller* than usual, and
+# check.py's own margin put it at 3.06x pypy startup -- so not a subtraction
+# artefact. Raising the ceiling to cover it would have to reach 230x, which
+# would stop the gate seeing a real 3x regression on every other runner, so the
+# ceiling stays where the other four legs put it.
 N = 2000000
 
 
