@@ -5047,6 +5047,9 @@ fn run_perfn_walk<Sym: WalkSym>(
     if committed {
         crate::jitcode_dispatch::fbw_store_journal_commit();
         crate::jitcode_dispatch::fbw_exit_last_instr_commit();
+        // The mirrored locals stand with the rest of the walk's end state: a
+        // resumed interpreter reads its fastlocals straight out of that array.
+        crate::jitcode_dispatch::fbw_locals_mirror_commit();
         // A committed bridge recording keeps its advanced iterator cursor (the
         // compiled bridge / adopted end state owns the iteration count).
         crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
@@ -5057,6 +5060,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         // instruction from that field, so a kept exit coordinate would restart
         // it past its own return or raise.
         crate::jitcode_dispatch::fbw_exit_last_instr_rollback();
+        // …and so do the locals a walk-time `f_locals` fold mirrored into the
+        // live array.  After `restore_escape_flush_undo` above, so that where a
+        // force flushed the same frame the older pre-fold image is the one that
+        // stands.
+        crate::jitcode_dispatch::fbw_locals_mirror_rollback();
         // A bridge/retrace recording that does not commit restores the
         // iterator cursor it eagerly advanced, so the interpreter resume
         // re-consumes the in-flight item exactly once (no drop).

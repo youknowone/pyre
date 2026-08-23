@@ -2607,7 +2607,18 @@ fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
             Some((value, _)) => slots.push((slot as i64, value)),
         }
     }
+    // The mirror below writes the live frame's locals array, and a walk that
+    // does not commit replays from its pre-walk instruction — so the pre-walk
+    // values have to be recoverable.  Journal them against the walk's own
+    // non-commit epilogue rather than the escape-flush capture: that capture is
+    // consumed by every non-forcing residual (`try_execute_residual_call_via_
+    // executor`'s tail restore), which would revert this mirror mid-walk and
+    // leave a live `FrameLocalsProxy` reading pre-fold values.
+    crate::jitcode_dispatch::fbw_note_locals_mirror_undo(concrete_frame, nlocals);
     if !crate::state::flush_locals_region_to_frame(ctx.trace_ctx, concrete_frame) {
+        // All-or-nothing decline: nothing was written.  The journal entry is
+        // harmless — restoring the values still in place is a no-op — and the
+        // first-per-frame rule means dropping it could discard a real one.
         return false;
     }
     ctx.trace_ctx
@@ -9615,6 +9626,10 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             .trace_ctx
             .virtualizable_entry_at(crate::virtualizable_spec::LAST_INSTR_VABLE_FIELD_INDEX)
     {
+        // Journaled like the per-opcode publication: this store lands whether
+        // or not the walk commits, and a walk that does not commit replays the
+        // frame from its pre-walk coordinate.
+        crate::jitcode_dispatch::fbw_note_last_instr_undo(cur_ptr as usize);
         unsafe { (*cur_ptr).last_instr = last_instr as isize };
     }
 
