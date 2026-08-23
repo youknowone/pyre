@@ -757,26 +757,29 @@ def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
 
 # File contents read while hashing and while scanning for `include*!`
 # arguments, keyed by repo-relative path and validated against the file's
-# size and mtime on every hit, so a caller that rewrites an input between two
-# walks (the selftest does, per case) reads the new bytes without having to
-# know about this memo. `forget_collected_inputs` drops it with the input
-# walks it serves. One `--fingerprint --per-crate` over the four pyre crates
-# hashes the interpreter's closure three times over (the `source=` fallback,
-# `closure=`, and the include scan) and the jit's on top, which on a windows
-# runner is the cost of the step — every read there goes through the
-# real-time scanner, where a stat does not.
-_file_bytes_cache: dict[Path, tuple[int, int, bytes]] = {}
+# stat on every hit, so a caller that rewrites an input between two walks
+# (the selftest does, per case) reads the new bytes without having to know
+# about this memo. Size and mtime alone would pass a metadata-preserving
+# rewrite (`cp -p` of a same-sized file), so the inode number and the ctime
+# join them: a replacement changes the inode, and an in-place write moves
+# ctime, which no file API sets backwards. `forget_collected_inputs` drops
+# the memo with the input walks it serves. One `--fingerprint --per-crate`
+# over the four pyre crates hashes the interpreter's closure three times
+# over (the `source=` fallback, `closure=`, and the include scan) and the
+# jit's on top, which on a windows runner is the cost of the step — every
+# read there goes through the real-time scanner, where a stat does not.
+_file_bytes_cache: dict[Path, tuple[tuple[int, int, int, int], bytes]] = {}
 
 
 def read_input_bytes(root: Path, path: Path) -> bytes:
     """`(root / path).read_bytes()`, memoised while the file's stat holds."""
-    full_path = root / path
-    stat = full_path.stat()
+    stat = (root / path).stat()
+    seen = (stat.st_size, stat.st_mtime_ns, stat.st_ino, stat.st_ctime_ns)
     hit = _file_bytes_cache.get(path)
-    if hit is not None and hit[0] == stat.st_size and hit[1] == stat.st_mtime_ns:
-        return hit[2]
-    data = full_path.read_bytes()
-    _file_bytes_cache[path] = (stat.st_size, stat.st_mtime_ns, data)
+    if hit is not None and hit[0] == seen:
+        return hit[1]
+    data = (root / path).read_bytes()
+    _file_bytes_cache[path] = (seen, data)
     return data
 
 
@@ -2304,7 +2307,9 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             *host_config,
         ]
         layout_passes: list[
-            tuple[str, Path, Path, subprocess.Popen | None, typing.BinaryIO | None]
+            tuple[
+                str, Path, Path, subprocess.Popen | None, typing.BinaryIO | None, float
+            ]
         ] = []
         # Wall-clock marks for the per-phase figures printed below. Under CI
         # stdout is block-buffered, so every line of a crate's extraction
@@ -2377,9 +2382,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                         stdout=log,
                         stderr=subprocess.STDOUT,
                     )
-                    layout_passes.append((target, sidecar, full, proc, log))
+                    layout_passes.append(
+                        (target, sidecar, full, proc, log, time.monotonic())
+                    )
                 else:
-                    layout_passes.append((target, sidecar, full, None, None))
+                    layout_passes.append(
+                        (target, sidecar, full, None, None, time.monotonic())
+                    )
                     # Sequential: the host pass holds the shared layout's lock,
                     # so run this one only after it has finished.
                     if host_pass is not None:
@@ -2398,7 +2407,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 phase_started = time.monotonic()
 
             layout_tables: dict[str, set[Path]] = {}
-            for target, sidecar, full, proc, log in layout_passes:
+            for target, sidecar, full, proc, log, launched in layout_passes:
                 if proc is not None:
                     returncode = proc.wait()
                     with log:
@@ -2406,9 +2415,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                             log.seek(0)
                             sys.stdout.write(log.read().decode("utf-8", errors="replace"))
                             raise subprocess.CalledProcessError(returncode, proc.args)
+                    # Its own duration, from ITS launch: the pass ran beside
+                    # the host pass, so the wait measured from the host pass's
+                    # end is only the tail it added to the wall clock.
                     print(
-                        f"    {target} pass: {time.monotonic() - phase_started:.0f} s"
-                        " (beside the host pass)"
+                        f"    {target} pass: {time.monotonic() - launched:.0f} s"
+                        f" ({time.monotonic() - phase_started:.0f} s beyond the"
+                        " host pass)"
                     )
                     phase_started = time.monotonic()
                 if not full.exists() or full.stat().st_size == 0:
@@ -2437,7 +2450,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             # every pass not yet waited for still running, each a cargo
             # and a Charon holding multiple GB. Below this point there is
             # nothing left to reap.
-            for _, _, _, pending, _ in layout_passes:
+            for _, _, _, pending, _, _ in layout_passes:
                 if pending is not None and pending.poll() is None:
                     pending.kill()
             if host_pass is not None and host_pass.poll() is None:
