@@ -542,6 +542,15 @@ pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
 }
 
 #[cfg(unix)]
+pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
+    sin6.sin6_addr.s6_addr
+}
+#[cfg(windows)]
+pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
+    unsafe { sin6.sin6_addr.u.Byte }
+}
+
+#[cfg(unix)]
 pub fn sockaddr_in6_set_addr(sin6: &mut sockaddr_in6, addr: [u8; 16]) {
     sin6.sin6_addr.s6_addr = addr;
 }

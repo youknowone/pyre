@@ -3082,6 +3082,68 @@ fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObject
     ])
 }
 
+/// Resolve `host` for `family` and hand back the first answer's `sockaddr`.
+///
+/// `rsocket.py makeipaddr` ends in
+/// `getaddrinfo(name, None, family=family, address_to_fill=result)` for every
+/// family it serves, and `rsocket.py getaddrinfo` answers a non-zero return
+/// with `raise GAIError(error)` — so a name that does not resolve reports
+/// `gaierror(rc, gai_strerror(rc))`, which is what callers classify on.
+/// gethostbyname is not used here: its process-global result buffer is not
+/// re-entrant and was corrupted by socketserver worker threads.
+#[cfg(any(unix, windows))]
+fn resolve_ip_host(
+    c_host: &std::ffi::CStr,
+    family: libc::c_int,
+) -> Result<rffi::sockaddr_storage, crate::PyError> {
+    let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = family;
+    let mut result: *mut rffi::addrinfo = std::ptr::null_mut();
+    // A name lookup goes to the resolver and can take seconds.
+    let rc = {
+        let _blocked = crate::module::thread::before_external_block();
+        unsafe { rffi::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result) }
+    };
+    if rc != 0 {
+        return Err(socket_converted_error(
+            "gaierror",
+            Some(rc),
+            &rffi::gai_strerror(rc),
+        ));
+    }
+    let want = if family == rffi::AF_INET {
+        core::mem::size_of::<rffi::sockaddr_in>()
+    } else {
+        core::mem::size_of::<rffi::sockaddr_in6>()
+    };
+    let mut current = result;
+    let mut resolved = None;
+    while !current.is_null() {
+        let info = unsafe { &*current };
+        if info.ai_family == family && !info.ai_addr.is_null() && info.ai_addrlen as usize >= want {
+            let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    info.ai_addr as *const u8,
+                    &mut storage as *mut _ as *mut u8,
+                    want,
+                );
+            }
+            resolved = Some(storage);
+            break;
+        }
+        current = info.ai_next;
+    }
+    unsafe { rffi::freeaddrinfo(result) };
+    // The hints pin `ai_family`, so a success with no answer of that family
+    // is a resolver that ignored them.  `getaddrinfo` returned no code to
+    // carry, so this is the plain module error, the way "sockaddr resolved to
+    // multiple addresses" is.
+    resolved.ok_or_else(|| {
+        socket_converted_error("error", None, "getaddrinfo returned no address of the requested family")
+    })
+}
+
 #[cfg(any(unix, windows))]
 fn pack_inet_addr(
     caller: &str,
@@ -3214,41 +3276,9 @@ fn pack_inet_addr(
             }
         };
         if r != 1 {
-            // `rsocket.makeipaddr` resolves names through getaddrinfo and
-            // copies the resulting address into its INETAddress.  Do the
-            // same here: gethostbyname's process-global result buffer is not
-            // re-entrant and was corrupted by socketserver worker threads.
-            let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
-            hints.ai_family = rffi::AF_INET;
-            let mut result: *mut rffi::addrinfo = std::ptr::null_mut();
-            let rc = {
-                let _blocked = crate::module::thread::before_external_block();
-                unsafe { rffi::getaddrinfo(c_host.as_ptr(), std::ptr::null(), &hints, &mut result) }
-            };
-            if rc != 0 || result.is_null() {
-                return Err(crate::PyError::os_error(format!(
-                    "name or service not known: {host}"
-                )));
-            }
-            let mut current = result;
-            let mut resolved = None;
-            while !current.is_null() {
-                let info = unsafe { &*current };
-                if info.ai_family == rffi::AF_INET
-                    && !info.ai_addr.is_null()
-                    && info.ai_addrlen as usize >= core::mem::size_of::<rffi::sockaddr_in>()
-                {
-                    let resolved_addr = unsafe { &*(info.ai_addr as *const rffi::sockaddr_in) };
-                    resolved = Some(rffi::sockaddr_in_get_addr(resolved_addr));
-                    break;
-                }
-                current = info.ai_next;
-            }
-            unsafe { rffi::freeaddrinfo(result) };
-            let resolved = resolved.ok_or_else(|| {
-                crate::PyError::os_error(format!("name or service not known: {host}"))
-            })?;
-            rffi::sockaddr_in_set_addr(sin, resolved);
+            let found = resolve_ip_host(&c_host, rffi::AF_INET)?;
+            let found = unsafe { &*(&found as *const _ as *const rffi::sockaddr_in) };
+            rffi::sockaddr_in_set_addr(sin, rffi::sockaddr_in_get_addr(found));
         }
         Ok((
             storage,
@@ -3271,9 +3301,13 @@ fn pack_inet_addr(
             }
         };
         if r != 1 {
-            return Err(crate::PyError::os_error(format!(
-                "invalid IPv6 address: {host}"
-            )));
+            let found = resolve_ip_host(&c_host, rffi::AF_INET6)?;
+            let found = unsafe { &*(&found as *const _ as *const rffi::sockaddr_in6) };
+            buf = rffi::sockaddr_in6_get_addr(found);
+            // `makeipaddr` fills the whole INET6Address from the answer, so
+            // the scope id the resolver picked stands unless items 2 and 3 of
+            // the tuple below name their own.
+            rffi::sockaddr_in6_set_scope_id(sin6, rffi::sockaddr_in6_get_scope_id(found));
         }
         rffi::sockaddr_in6_set_addr(sin6, buf);
         if len >= 3
