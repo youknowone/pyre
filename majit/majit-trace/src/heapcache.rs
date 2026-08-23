@@ -586,8 +586,26 @@ impl HeapCache {
         }
     }
 
-    /// RPython-compatible alias.
-    pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<Option<OpRef>> {
+    /// `heapcache.py HeapCache._get_deps`.
+    ///
+    /// ```text
+    ///  def _get_deps(self, box):
+    ///      if not isinstance(box, RefFrontendOp):
+    ///          return None
+    ///      self.update_version(box)
+    ///      if box._heapc_deps is None:
+    ///          box._heapc_deps = [None]
+    ///      return box._heapc_deps
+    /// ```
+    ///
+    /// The `isinstance` arm is why this returns an `Option`: a `Const` has no
+    /// `_heapc_deps` slot upstream and no `raw()` index here, so there is no
+    /// list to hand back. Dropping it would make `OpRef::raw()` panic, which
+    /// the tracer catches and downgrades to a silent `TraceAction::Abort`.
+    pub fn _get_deps(&mut self, opref: OpRef) -> Option<&mut Vec<Option<OpRef>>> {
+        if opref.is_constant() {
+            return None;
+        }
         self.update_version(opref);
         let i = opref.raw() as usize;
         if i >= self.heapc_deps.len() {
@@ -597,7 +615,7 @@ impl HeapCache {
         if deps.is_empty() {
             deps.push(None);
         }
-        deps
+        Some(deps)
     }
 
     /// heapcache.py:224-229
@@ -612,7 +630,9 @@ impl HeapCache {
     /// ```
     pub fn _escape_from_write(&mut self, r#box: OpRef, fieldbox: OpRef) {
         if self.is_unescaped(r#box) && self.is_unescaped(fieldbox) {
-            let deps = self._get_deps(r#box);
+            let deps = self
+                ._get_deps(r#box)
+                .expect("is_unescaped answers false for a Const");
             deps.push(Some(fieldbox));
         } else {
             // RPython's `elif fieldbox is not None` — pyre's OpRef is always
@@ -1932,7 +1952,9 @@ impl HeapCache {
         if array.is_constant() {
             return;
         }
-        let deps = self._get_deps(array);
+        let deps = self
+            ._get_deps(array)
+            .expect("assert deps is not None — the Const arm above returned");
         deps[0] = Some(length);
     }
 
@@ -2151,8 +2173,16 @@ impl HeapCache {
         self.heap_array_cache.clear();
     }
 
-    /// RPython-compatible alias kept for existing codepaths.
+    /// `update_version`'s `ref_frontend_op._heapc_deps = None`, split out.
+    ///
+    /// A `Const` has no slot to clear, exactly as `flags_for_ref` and
+    /// `set_flags_for_ref` already answer 0 and no-op for one. Without this
+    /// arm `update_version` is a no-op for a constant right up to its last
+    /// line, where `raw()` panics.
     pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
+        if opref.is_constant() {
+            return;
+        }
         let i = opref.raw() as usize;
         if i < self.heapc_deps.len() {
             self.heapc_deps[i] = None;
@@ -2236,6 +2266,27 @@ mod tests {
         let ci = OpRef::const_int(42);
         assert_eq!(entry._unique_const_heuristic(ci, &oracle), ci);
         assert!(entry.last_const_box.is_none());
+    }
+
+    /// `_get_deps`'s `if not isinstance(box, RefFrontendOp): return None`.
+    /// A `Const` has no `raw()` index, so without the arm the accessor
+    /// panics instead of declining.
+    #[test]
+    fn get_deps_declines_a_constant_instead_of_indexing_it() {
+        let mut cache = HeapCache::new();
+        assert!(cache._get_deps(OpRef::const_ptr(GcRef(0x1000))).is_none());
+        assert!(cache._get_deps(OpRef::const_int(42)).is_none());
+        assert!(cache._get_deps(OpRef::ref_op(0)).is_some());
+    }
+
+    /// `update_version` is already a no-op for a `Const` through
+    /// `flags_for_ref` / `set_flags_for_ref`; its last line must not then
+    /// index one.
+    #[test]
+    fn update_version_is_a_no_op_for_a_constant() {
+        let mut cache = HeapCache::new();
+        cache.update_version(OpRef::const_ptr(GcRef(0x1000)));
+        cache._remove_deps_for_box(OpRef::const_int(42));
     }
 
     #[test]
