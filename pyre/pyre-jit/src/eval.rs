@@ -6512,10 +6512,13 @@ pub(crate) fn call_depth() -> u32 {
 #[majit_macros::dont_look_inside]
 pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
     // Full `JitCell.get_uhash` over the pypyjit green tuple
-    // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
-    // computed allocation-free. The caller supplies the same frame green used
-    // by the portal markers, so this and the typed marker-path key resolve to
-    // the same cell.
+    // `[next_instr, is_being_profiled, pycode]` (warmstate.py `JitCell`),
+    // computed allocation-free. The caller supplies the same live frame green
+    // the portal markers use -- `PyFrame.dispatch` (extended in `interp_jit.py`)
+    // hoists `self.get_is_being_profiled()` into a local and hands that one
+    // value to `jit_merge_point` -- so this and the typed marker-path key
+    // (`green_key_typed_from_pycode`) resolve to the same cell, and a profiled
+    // portal gets its own.
     majit_ir::pypyjit_greenkey_uhash(pc, is_being_profiled, code_ptr as u64)
 }
 
@@ -8892,6 +8895,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
+        //
+        // This is `dispatch_bytecode`'s NON-jitted arm only.  Its jitted arm
+        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) has no
+        // counterpart here because this body is never traced: pyre records
+        // from a per-CodeObject JitCode built by `jit/codewriter.rs` and walked
+        // by `pyre-jit-trace`'s `run_perfn_walk`, not from this Rust loop.  The
+        // port of that arm is `record_portal_debugdata_guard`
+        // (`pyre-jit-trace/src/jitcode_dispatch/mod.rs`), which runs at the
+        // portal merge point — the walker's counterpart of this loop's top.
+        // `we_are_jitted()` here would be a runtime thread-local set only while
+        // cranelift-compiled code is on the stack, not the folded compile-time
+        // constant upstream's translator sees, so splitting on it would strip
+        // the ticker from nested interpreted frames rather than from traced
+        // ones.
         let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with

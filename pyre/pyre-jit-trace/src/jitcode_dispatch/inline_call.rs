@@ -2365,11 +2365,35 @@ fn walker_ec_enter(
 /// The profile-hook half (`if self.profilefunc: self._trace(frame,
 /// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
 /// [`pyre_interpreter::PyExecutionContext::leave`].  Omitting it here does not
-/// lose a leave event, because `is_being_profiled` is a portal-driver GREEN
-/// (`interp_jit.py greens = ['next_instr', 'is_being_profiled', 'pycode']`):
-/// a trace is keyed on it, so one recorded with profiling off is only ever
-/// entered with profiling off, and turning profiling on selects a different
-/// green key rather than reusing this trace.
+/// lose a PROFILE leave event, because `is_being_profiled` is a portal-driver
+/// GREEN (`interp_jit.py greens = ['next_instr', 'is_being_profiled',
+/// 'pycode']`): a trace is keyed on it, so one recorded with profiling off is
+/// only ever entered with profiling off, and turning profiling on selects a
+/// different green key rather than reusing this trace.
+///
+/// ⛔ That argument is sound for profiling and for nothing else, and it is not
+/// licence to omit another hook here.  TRACING has no green, so no key change
+/// separates a traced re-entry from an untraced one; and the events an inlined
+/// callee owes a tracer are `call_trace` / `return_trace`, which upstream runs
+/// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
+/// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
+/// upstream's trace carries a guard on them and a tracer installed later cannot
+/// be missed.  This walker inlines neither, so an inlined callee reports
+/// nothing for as long as the loop stays compiled.
+///
+/// Two things currently keep that from being observable, and neither is the
+/// green: `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routes any frame for
+/// which `frame_tracing_active` holds to `execute_frame_plain`, so a hooked
+/// frame never reaches the portal at all — measured, a profiled loop reads
+/// `loops_compiled = 0`, `loops_aborted = 0`; and a tracer armed mid-run on an
+/// already-compiled frame fails the portal frame's own `debugdata` guard
+/// (`record_portal_debugdata_guard`), which stops that frame running compiled
+/// at all.  Neither is a correctness argument for this omission.  The first is
+/// a compilation gate: the moment it is narrowed so a hooked frame can compile,
+/// this becomes a reporting bug for the profile half.  The second is about the
+/// CALLER's frame: it says nothing about a callee whose own `call_trace` /
+/// `return_trace` this walker declines to inline, and it does not fire at all
+/// for a global tracer that leaves the caller's `f_trace` unset.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as
