@@ -2643,11 +2643,19 @@ pub unsafe fn w_code_getname_w_or_new(
 /// directly; pyre wraps the raw write because the field is private
 /// to this module.
 ///
+/// Not every `Code` reaching here is a `PyCode`: `interp_w(Function, ...)`
+/// admits `BuiltinFunction(Function)` (`function.py`), whose `getcode()` is a
+/// `BuiltinCode`.  Upstream's assignment is a no-op for that one — `gateway.py
+/// BuiltinCode` already declares `hidden_applevel = True` at class level, and
+/// `eval.py Code` lists the field in `_immutable_fields_`.  pyre's write is a
+/// raw store at `PyCode`'s own offset, so it must first establish that the
+/// object has that layout; anything else keeps the value it already reports.
+///
 /// # Safety
-/// `obj` must point to a valid `PyCode`.
+/// `obj` must point to a valid object.
 #[inline]
 pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool) {
-    if obj.is_null() {
+    if obj.is_null() || !unsafe { is_code(obj) } {
         return;
     }
     unsafe {
