@@ -99,10 +99,13 @@ pub const LIMIT_MAP_ATTRIBUTES: usize = 80;
 
 /// mapdict.py `ALLOW_UNBOXING_INTS = LONG_BIT == 64`.
 ///
-/// False on a 32-bit target, which for pyre means the wasm guest: it builds for
-/// `wasm32-unknown-unknown`, so an int attribute stays boxed there while the
-/// native builds unbox it. Float unboxing is unaffected, as upstream.
-pub const ALLOW_UNBOXING_INTS: bool = usize::BITS == 64;
+/// `LONG_BIT` is the width of the interpreter's machine int. That int is `i64`
+/// on every pyre target — `sys.maxsize` is `i64::MAX` and the JIT lowers
+/// `LONG_BIT` to the literal 64 (`majit_metainterp::ruleopt::proof::LONG_BIT`)
+/// — so the predicate holds everywhere. Pointer width is a different quantity
+/// and does not decide this: reading it as one left int attributes boxed on
+/// the 32-bit wasm guest alone.
+pub const ALLOW_UNBOXING_INTS: bool = true;
 
 /// mapdict.py `DICT = 0` — attrkind for instance `__dict__` entries.
 pub const DICT: u16 = 0;
@@ -4412,7 +4415,7 @@ pub unsafe fn delattr_would_force_quasi_immut(
 /// mapdict.py `AbstractAttribute._pick_unbox_type`.
 ///
 /// Returns the unbox type when the terminator allows unboxing and the value is
-/// an unboxable int (only on 64-bit, `ALLOW_UNBOXING_INTS`) or float.
+/// an unboxable int (`ALLOW_UNBOXING_INTS`) or float.
 ///
 /// # Safety
 /// `self_node` and its chain must point to live map nodes; `w_value` to a live
