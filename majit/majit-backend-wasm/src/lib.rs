@@ -1894,10 +1894,9 @@ fn register_pending_inline(
         id
     });
     PENDING_INLINES.with(|pending| {
-        pending.borrow_mut().insert(
-            pending_id,
-            PendingInline { owner, region },
-        )
+        pending
+            .borrow_mut()
+            .insert(pending_id, PendingInline { owner, region })
     });
     codegen::InlineTripProbe {
         counter_addr,
