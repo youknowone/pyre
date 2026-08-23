@@ -1209,6 +1209,18 @@ pub fn make_builtin_function_with_doc(
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// `make_builtin_function_with_doc` for a caller that only sometimes has a
+/// docstring to attach -- `None` leaves the code object without one, the way
+/// `interp2app` does for a function whose `__doc__` is empty.
+pub fn make_builtin_function_with_opt_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, docstring);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// GatewayCache.build parity for an interp2app carrying the text signature
 /// produced by `interp2app._generate_text_signature`.
 pub fn make_builtin_function_with_text_signature(
@@ -1645,16 +1657,53 @@ pub fn fs_arg_bytes(data: Vec<u8>) -> Result<Vec<u8>, crate::PyError> {
 /// Win32 error ends the encode, and there is no caller here to report one to,
 /// so the interpreter's own spelling stands in for it.
 pub fn fs_result_bytes(data: &[u8]) -> Vec<u8> {
+    fsencode_wtf8_total(&crate::typedef::fsdecode_wtf8_total(data))
+}
+
+/// [`fs_result_bytes`] for a caller holding the name as text rather than as
+/// the bytes it decoded from — a path the interpreter folded or split before
+/// handing it back, where re-deriving the bytes would mean encoding the text
+/// itself.
+///
+/// Total for the same reason: every caller reached this text through the
+/// filesystem decode, so each escape in it folds back to the byte it stood
+/// for and no code point is left that the codec cannot spell.
+pub fn fsencode_wtf8_total(text: &rustpython_wtf8::Wtf8) -> Vec<u8> {
     #[cfg(windows)]
     if crate::typedef::legacy_windows_fs_encoding()
         && let Ok(bytes) = crate::unicodehelper_win32::encode_code_page_replace(
             windows_sys::Win32::Globalization::CP_ACP,
-            &crate::typedef::fsdecode_wtf8_total(data),
+            text,
         )
     {
         return bytes;
     }
-    data.to_vec()
+    if crate::typedef::FS_ERRORS == "surrogatepass" {
+        // The text's own WTF-8 spelling is the encoding: a surrogate keeps its
+        // three bytes rather than folding to the one byte an escape names.
+        return text.as_bytes().to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    for cp in text.code_points() {
+        if let Some(ch) = cp.to_char() {
+            let mut buf = [0; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        let code = cp.to_u32();
+        if (0xDC80..=0xDCFF).contains(&code) {
+            out.push((code - 0xDC00) as u8);
+        } else {
+            // A surrogate outside the escape range has no byte under
+            // `surrogateescape`, and no caller can reach one: the text came
+            // from the decode, which produces no others. Carry its own
+            // spelling rather than inventing a failure with nobody to report
+            // it to.
+            let mut buf = [0; 4];
+            out.extend_from_slice(cp.encode_wtf8(&mut buf).as_bytes());
+        }
+    }
+    out
 }
 
 /// [`fsencode_os_str`]'s other direction: the host name filesystem bytes
@@ -1710,7 +1759,7 @@ impl FsEncodedPath {
 /// a boundary spelling its path some other way than `path_converter` — Windows'
 /// `os.system`, whose argument is text rather than a path — falls back to.
 pub fn fsencode_path_w(obj: pyre_object::PyObjectRef) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, None, false, false)
+    path_or_fd_w(obj, None, false, false, false)
 }
 
 /// [`fsencode_path_w`] for a path-only boundary that names itself. The argument
@@ -1722,7 +1771,20 @@ pub fn fsencode_path_named_w(
     funcname: &str,
     argname: &str,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some((funcname, argname)), false, false)
+    path_or_fd_w(obj, Some((funcname, argname)), false, false, false)
+}
+
+/// [`fsencode_path_named_w`] for a boundary declaring `path_t(nonstrict=True)`
+/// — `_path_normpath` and `_path_splitroot_ex`, which fold and split the name
+/// as text and hand it to nobody. A null is a character like any other there,
+/// so the rejection every other boundary takes is lifted and the name comes
+/// back carrying it.
+pub fn fsencode_path_nonstrict_w(
+    obj: pyre_object::PyObjectRef,
+    funcname: &str,
+    argname: &str,
+) -> Result<FsEncodedPath, crate::PyError> {
+    path_or_fd_w(obj, Some((funcname, argname)), false, false, true)
 }
 
 /// [`fsencode_path_w`] for a boundary that also takes an open file descriptor —
@@ -1735,7 +1797,7 @@ pub fn fsencode_path_or_fd_w(
     funcname: &str,
     allow_fd: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, false)
+    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, false, false)
 }
 
 /// [`fsencode_path_or_fd_w`] for a boundary whose path argument also takes
@@ -1748,7 +1810,7 @@ pub fn fsencode_path_or_fd_nullable_w(
     funcname: &str,
     allow_fd: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
-    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, true)
+    path_or_fd_w(obj, Some((funcname, "path")), allow_fd, true, false)
 }
 
 /// `_PyType_Name` — the type's own name, with any module that qualifies it
@@ -1768,6 +1830,7 @@ fn path_or_fd_w(
     caller: Option<(&str, &str)>,
     allow_fd: bool,
     nullable: bool,
+    nonstrict: bool,
 ) -> Result<FsEncodedPath, crate::PyError> {
     // interp_posix.py:170-180 builds this list from the same two flags. The
     // caller pair is `path_converter`'s `function_name` and `argument_name`;
@@ -1908,8 +1971,18 @@ fn path_or_fd_w(
     };
     // baseobjspace.py `bytesbuf0_w` rejects embedded nulls. A
     // descriptor carries no bytes to check.
-    if as_fd == -1 && data.contains(&0) {
-        return Err(crate::PyError::value_error("embedded null byte"));
+    //
+    // `path_converter` names itself and the argument it was reading, so
+    // `link` reports a null in its first argument as `src` and in its second
+    // as `dst`. A boundary converting on nobody's behalf has neither to give
+    // and reports the character alone, the way `PyUnicode_FSConverter` does
+    // for the builtin `open`.
+    if as_fd == -1 && !nonstrict && data.contains(&0) {
+        let text = match caller {
+            Some((name, arg)) => format!("{name}: embedded null character in {arg}"),
+            None => "embedded null character".to_string(),
+        };
+        return Err(crate::PyError::value_error(text));
     }
     // Where the filesystem encoding is `surrogatepass`, the byte spelling of a
     // path is UTF-8 and a byte that begins no sequence names nothing at all.

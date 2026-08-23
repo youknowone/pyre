@@ -464,6 +464,7 @@ macro_rules! py_class {
         $name:literal
         $(, methods: {
             $(
+                $(#[doc = $mdoc:literal])?
                 fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
             )*
         })?
@@ -492,7 +493,12 @@ macro_rules! py_class {
                             unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                                 ns,
                                 stringify!($mname),
-                                $crate::make_builtin_function(stringify!($mname), $mname),
+                                $crate::make_builtin_function_with_opt_doc(
+                                    stringify!($mname),
+                                    $mname,
+                                    ::core::option::Option::<&'static str>::None
+                                        $(.or(::core::option::Option::Some($mdoc)))?,
+                                ),
                             ) };
                         }
                     )*)?
@@ -909,6 +915,7 @@ pub use gateway::{
     make_builtin_function, make_builtin_function_as_builtin_with_signature,
     make_builtin_function_maybe_sig, make_builtin_function_passthrough_args1,
     make_builtin_function_with_arity, make_builtin_function_with_arity_and_maybe_sig,
+    make_builtin_function_with_doc, make_builtin_function_with_opt_doc,
     make_builtin_function_with_signature, make_method_descriptor_with_arity,
     make_module_builtin_function, make_module_builtin_function_with_arity,
     make_module_builtin_function_with_arity_and_maybe_sig, make_module_builtin_function_with_doc,

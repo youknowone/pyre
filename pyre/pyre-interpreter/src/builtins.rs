@@ -17444,9 +17444,14 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             && !pyre_object::bytesobject::is_bytes(file_now)
             && !pyre_object::is_int(file_now)
     } {
-        let Some(fspath_fn) = crate::typedef::r#type(file_now).and_then(|pt| unsafe {
+        let fspath_fn = crate::typedef::r#type(file_now).and_then(|pt| unsafe {
             crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
-        }) else {
+        });
+        // A `None` left on the type switches the protocol off the way
+        // `__hash__ = None` does, so the object is turned away as not
+        // path-like rather than reported as an uncallable `None`.
+        let Some(fspath_fn) = fspath_fn.filter(|&fn_obj| unsafe { !pyre_object::is_none(fn_obj) })
+        else {
             return Err(crate::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",
                 crate::gateway::short_type_name(file_now)
