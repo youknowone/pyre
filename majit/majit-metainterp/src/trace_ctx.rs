@@ -4196,6 +4196,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_int(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4242,27 +4243,32 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
-            // the standard heap operation.
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
             // pyre stamps the frontend value slot for `op` with the live
             // load so subsequent `box_value(op)` sees the
             // executor-returned payload (RPython `IntFrontendOp(pos,
-            // intval)` construction-time field assignment).
+            // intval)` construction-time field assignment).  It is the
+            // funnel's `resvalue`, so the load runs before the record;
+            // `None` — no struct pointer, or an unwired backend — records
+            // without folding.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
+            // the standard heap operation.  GETFIELD_GC_I is not an OVF
+            // opcode, so the funnel never reads `last_exc_value` and 0 names
+            // no copy of it.
+            let op = self.execute_and_record(
+                cpu,
+                OpCode::GetfieldGcI,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4280,12 +4286,16 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        // Fallback for tests/missing layout
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
+        // Fallback for tests/missing layout.  No live load reached this leg,
+        // so the funnel's `resvalue` is `None` and it records unconditionally.
+        let op = self.execute_and_record(
+            cpu,
+            OpCode::GetfieldGcI,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
@@ -4538,6 +4548,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_ref(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4582,23 +4593,24 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
             // recorded opref so subsequent `box_value(op)` matches
-            // RPython's executor-returned Box.
+            // RPython's executor-returned Box.  It is the funnel's
+            // `resvalue`, so the load runs before the record.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            let op = self.execute_and_record(
+                cpu,
+                OpCode::GetfieldGcR,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4614,11 +4626,14 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
+        let op = self.execute_and_record(
+            cpu,
+            OpCode::GetfieldGcR,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
@@ -4644,6 +4659,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_float(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4690,22 +4706,23 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
-            // `box_value(op)` matches RPython's executor-returned Box.
+            // `box_value(op)` matches RPython's executor-returned Box.  It is
+            // the funnel's `resvalue`, so the load runs before the record.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            let op = self.execute_and_record(
+                cpu,
+                OpCode::GetfieldGcF,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4721,11 +4738,14 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
+        let op = self.execute_and_record(
+            cpu,
+            OpCode::GetfieldGcF,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
@@ -5840,7 +5860,13 @@ mod tests {
         let cached = ctx.const_int(42);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_int(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream
@@ -5996,7 +6022,13 @@ mod tests {
         let cached = ctx.const_ref(0xAAAA_BBBB);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_ref(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// vable_getfield_float cache-hit (pyjitpl.py:944
@@ -6021,7 +6053,13 @@ mod tests {
         let cached = ctx.const_float((1.5_f64).to_bits() as i64);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_float(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_float(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// Matched (loaded == cached) ref + float cache-hits — no panic;
@@ -6051,9 +6089,21 @@ mod tests {
         let field_index_f = fd_f.index();
         ctx.heapcache_getfield_now_known(vable, field_index_f, cached_f);
 
-        let (r_result, _) = ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd_r);
+        let (r_result, _) = ctx.vable_getfield_ref(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd_r,
+        );
         assert_eq!(r_result, cached_r);
-        let (f_result, _) = ctx.vable_getfield_float(0, vable, 0xCAFE_BABE, fd_f);
+        let (f_result, _) = ctx.vable_getfield_float(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd_f,
+        );
         assert_eq!(f_result, cached_f);
     }
 
@@ -6077,7 +6127,13 @@ mod tests {
         let cached = ctx.const_int(7);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
+        let (result, _) = ctx.vable_getfield_int(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
         assert_eq!(result, cached);
     }
 
@@ -6174,10 +6230,12 @@ mod tests {
         );
 
         // getfield with offset=8 → static field 0 → box0
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
         // getfield with offset=16 → static field 1 → box1
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd16);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -6217,10 +6275,12 @@ mod tests {
         ctx.vable_setfield(0, vable, fd8.clone(), new_val, Some(ph(Type::Int)));
 
         // Box 0 should now be new_val
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, new_val);
         // Box 1 unchanged
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd16);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -6243,7 +6303,7 @@ mod tests {
         );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let _result = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -6343,7 +6403,8 @@ mod tests {
 
         // Unknown offset (999) → fallback to heap op
         let fd999 = majit_ir::make_field_descr(999, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(0, vable, 0, fd999);
+        let _result =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd999);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -6369,7 +6430,8 @@ mod tests {
 
         ctx.init_virtualizable_boxes(&info, vable, ph(Type::Ref), &[box0], &[ph(Type::Ref)], &[]);
 
-        let (result, _) = ctx.vable_getfield_ref(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_ref(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -6402,7 +6464,8 @@ mod tests {
             &[],
         );
 
-        let (result, _) = ctx.vable_getfield_float(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_float(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);

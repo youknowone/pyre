@@ -3803,8 +3803,13 @@ where
                 // wires the check itself).
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_int(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
@@ -3822,8 +3827,13 @@ where
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_ref(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
@@ -3841,8 +3851,13 @@ where
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_float(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }

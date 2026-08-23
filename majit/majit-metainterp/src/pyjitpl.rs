@@ -5499,10 +5499,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_int requires active tracing")
-            .vable_getfield_int(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_r(box, fielddescr, pc)`.
@@ -5513,10 +5514,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_ref requires active tracing")
-            .vable_getfield_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -5527,10 +5529,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_float requires active tracing")
-            .vable_getfield_float(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
