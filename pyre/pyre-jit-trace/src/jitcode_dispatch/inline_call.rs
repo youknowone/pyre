@@ -47,8 +47,23 @@ enum DefaultsRepr {
 struct PositionalDefaultsInline {
     tuple: pyre_object::PyObjectRef,
     repr: DefaultsRepr,
+    /// `len(defs_w)` at trace time.  Every `tuple index` below was derived
+    /// from it, so a live re-read has to agree with it.
+    len: usize,
     /// `(parameter index, tuple index, concrete value)`.
     values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
+}
+
+/// The `ob_type` [`positional_defaults_for_inline`] matched to choose `repr`,
+/// and therefore what a `GuardClass` has to re-prove before the reads that
+/// `repr` selects run against a later tuple.
+fn defaults_repr_class_addr(repr: DefaultsRepr) -> i64 {
+    let ty: *const pyre_object::pyobject::PyType = match repr {
+        DefaultsRepr::ItemsBlock => &pyre_object::pyobject::TUPLE_TYPE,
+        DefaultsRepr::PairInt => &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+        DefaultsRepr::PairObject => &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+    };
+    ty as i64
 }
 
 /// `function.py:188-193,217-231` — which `defs_w` element fills each parameter
@@ -72,9 +87,9 @@ unsafe fn positional_defaults_for_inline(
     if tuple.is_null() {
         return None;
     }
-    // The layout is what `ob_type` names, and the identity guard the emitting
-    // half records pins this exact object — so the type test here decides
-    // which read to emit, and nothing later can invalidate it.
+    // The layout is what `ob_type` names.  The type test here only decides
+    // which read to emit; keeping that decision valid for a later tuple is the
+    // emitting half's job, through the shape guards it records.
     let ob_type = unsafe { (*tuple).ob_type };
     let repr = if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
         DefaultsRepr::ItemsBlock
@@ -102,6 +117,7 @@ unsafe fn positional_defaults_for_inline(
     Some(PositionalDefaultsInline {
         tuple,
         repr,
+        len: ndefaults,
         values,
     })
 }
@@ -4384,38 +4400,56 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
 
         // `defs_w?[*]`: the elements are read live below, so all trace time
-        // decided is WHICH element fills which missing parameter, and
-        // `positional_defaults_for_inline` derives that from `len(defs_w)`
-        // alone — the length is the only thing that has to be re-checked.
+        // decided is the SHAPE it read them with — which `ob_type` selected the
+        // element reads, and WHICH element fills which missing parameter, a
+        // mapping `positional_defaults_for_inline` derives from `len(defs_w)`
+        // alone.  Those two are what has to be re-checked.
         //
-        // Guard the tuple's identity all the same.  Replacing this with
-        // `arraylen_gc` + a length `GuardValue` was implemented and reverted:
-        // it answers correctly on every defaults shape, including the
-        // specialised two-int tuple, but `synth/pickle_terminal_raise_resume`
-        // then segfaults deterministically (EXC_BAD_ACCESS on a null in
-        // compiled code, 5/5), while keeping the added class guard and
-        // restoring this identity `GuardValue` is clean 3/3.  The length guard
-        // is what is unsound here; the class guard is not.
+        // For a callee whose identity changes every iteration, re-check them
+        // directly.  Upstream never pins the list: `funccall_valuestack` tests
+        // `natural_arity > nargs >= natural_arity - len(self.defs_w)` live, and
+        // `_flat_pycall_defaults` then reads `ndefs = len(self.defs_w)` and
+        // `self.defs_w[j]` live too (`function.py`).  Pinning the tuple here
+        // instead was a guard a `MAKE_FUNCTION` in the caller's own loop body
+        // can never satisfy twice, because a
+        // non-constant default expression (`def add(value=i)`, which emits
+        // `BUILD_TUPLE`) rebuilds the tuple every iteration.
+        // `synth/foriter_make_function_body` is exactly that shape and paid
+        // 980 guard failures in 3000 iterations for it, with no bridge — the
+        // per-value counter never fires on a value that is never seen twice —
+        // against 1 for the same fixture with a constant default.
         //
-        // Identity is stricter than needed and costs nothing measured.  All
-        // three compilers fold an all-constant defaults list into one code
-        // constant — `codegen.py _visit_defaults` takes the
-        // `_tuple_of_consts` branch, and pyre's own compiler emits the same
-        // single `LOAD_CONST (None, 7)` — so even a `def` re-executed inside
-        // the caller's loop hands out the same tuple every iteration.  Only a
-        // non-constant default expression (`def f(a=mk())`, which emits
-        // `BUILD_TUPLE`) rebuilds it; no fixture in `bench/` has that shape,
-        // and `make_function_inline`, the one loop-local `def` with a default,
-        // records `guard_failures=1` for its whole run.
-        let tuple_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        // `GuardClass` dereferences its operand and a callee with no defaults
+        // at all carries `PY_NULL` here, so the nullity check comes first.
+        // The length is checked in the `ItemsBlock` arm below; the two
+        // specialised reprs are arity-2 classes, so the class guard already
+        // fixes their length.
+        //
+        // A constant callable keeps the identity `GuardValue`.  There the
+        // function is pinned by its own guard, `defs_w` carries no
+        // quasi-immutable watcher (a baked `ConstPtr` must not be loaded
+        // through to reach the `mutate_defs_w` slot), and this guard is what
+        // stands in for the invalidation a later `f.__defaults__ = ...` would
+        // otherwise slip past.
+        if guards_the_callee_function {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[defaults_op])?;
+            walker_guard_class(
+                ctx,
+                op.pc,
+                defaults_op,
+                defaults_repr_class_addr(defaults.repr),
+            )?;
+        } else {
+            let tuple_expected = ctx.trace_ctx.const_ref(defaults.tuple as i64);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardValue, &[defaults_op, tuple_expected], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
 
         // Preserve the actual Ref boxes instead of baking one anchor's
         // concrete value.  Which read that is depends on where the element
-        // lives; the identity guard above already proved the layout, so no
-        // arm needs a class guard of its own.
+        // lives; the guards above already proved the layout, so no arm needs a
+        // class guard of its own.
         match defaults.repr {
             DefaultsRepr::ItemsBlock => {
                 let items = crate::state::opimpl_getfield_gc_r(
@@ -4423,6 +4457,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     defaults_op,
                     crate::descr::tuple_wrappeditems_descr(),
                 );
+                if guards_the_callee_function {
+                    // `arraylen_gc(wrappeditems)` IS `len(self.defs_w)`
+                    // (`tupleobject.py` `W_TupleObject` carries no length
+                    // field), and the tuple indexes below were derived from it.
+                    let len_op = crate::state::opimpl_arraylen_gc(
+                        ctx.trace_ctx,
+                        items,
+                        crate::state::pyobject_gcarray_descr(),
+                    );
+                    let expected_len = ctx.trace_ctx.const_int(defaults.len as i64);
+                    ctx.trace_ctx
+                        .record_guard(OpCode::GuardValue, &[len_op, expected_len], 0);
+                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                }
                 for (param_index, tuple_index, _) in defaults.values {
                     let index = ctx.trace_ctx.const_int(tuple_index as i64);
                     callee_args[param_index] = crate::state::trace_items_block_getitem_value_pure(
