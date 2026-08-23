@@ -4,7 +4,353 @@
 //! proc-macro path, it cannot call `#[jit_module]::__majit_helper_trace_fnaddrs()`
 //! on the analyzed sources, so pyre publishes the same shape explicitly here.
 
-fn push_fnaddr(entries: &mut Vec<(&'static str, i64)>, full_path: &'static str, fnptr: *const ()) {
+/// A type that occupies exactly one residual-call argument slot.
+///
+/// A residual call gives every argument one machine word, classified `'i'` /
+/// `'r'` / `'f'` by `type_to_argclass` (`majit-translate` `codewriter::call`).
+/// There is no two-register argument and no `sret`, so a parameter wider than
+/// a word cannot be described. `T: Sized` is implicit on the reference impls
+/// below, and that single fact is what rejects `&str`, `&[u8]`, `&Wtf8` and
+/// `&dyn Trait`: a fat pointer is two words and the callee would read the
+/// second one out of whatever the caller happened to leave there.
+pub trait ResidualSlot {}
+
+/// A type that fits the single residual-call result word.
+///
+/// `()` is result class `'v'` (`result_size == 0`). Everything else is one
+/// word. An `Option<*mut T>` is *not* one word — a raw pointer has no niche,
+/// so the option is 16 bytes and is returned in two registers with the
+/// discriminant in the first. A caller that reads one result register from
+/// such a function receives `1` for `Some(p)` and `0` for `None`, never `p`.
+/// That is a silent wrong value rather than a crash, which is why this trait
+/// is deliberately narrow.
+pub trait ResidualRet {}
+
+impl ResidualRet for () {}
+
+macro_rules! residual_scalar {
+    ($($t:ty),* $(,)?) => { $(
+        impl ResidualSlot for $t {}
+        impl ResidualRet for $t {}
+    )* };
+}
+
+// `f32` is deliberately absent: `return_type_string_to_value_type` maps it to
+// the integer class while the machine ABI returns it in the float bank.
+residual_scalar!(
+    i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool, char, f64
+);
+
+/// `OpArg` is `#[repr(transparent)] struct OpArg(u32)` — one word.
+impl ResidualSlot for rustpython_compiler_core::bytecode::OpArg {}
+
+/// `Arg<T>` is the zero-sized oparg marker (`struct Arg<T>(PhantomData<T>)`).
+/// It consumes no slot at all rather than one: a zero-sized parameter is not
+/// passed in the Rust ABI, and the codewriter classifies it `Type::Void`,
+/// which `resolve_non_void_arg_types_from_vars` skips. Both sides agree that
+/// it is absent, so it is describable — this trait means "the residual ABI can
+/// describe this parameter", not "this parameter is exactly one word".
+impl<T: rustpython_compiler_core::bytecode::OpArgType> ResidualSlot
+    for rustpython_compiler_core::bytecode::Arg<T>
+{
+}
+
+impl<T> ResidualSlot for &T {}
+impl<T> ResidualSlot for &mut T {}
+impl<T> ResidualSlot for *const T {}
+impl<T> ResidualSlot for *mut T {}
+impl<T> ResidualRet for *const T {}
+impl<T> ResidualRet for *mut T {}
+
+/// Publication helpers that check the signature instead of erasing it.
+///
+/// Taking `*const ()` means every caller casts, and a cast accepts any
+/// function whatsoever. These take the function itself, so the parameter and
+/// result types have to satisfy [`ResidualSlot`] / [`ResidualRet`] before the
+/// address can be taken. The bounds sit on the helper's *parameter* rather
+/// than on a trait's self type on purpose: a bound of the form
+/// `impl<A: ResidualSlot, R> Trait for fn(A) -> R` does not match a signature
+/// carrying a lifetime, such as `fn(&PyFrame) -> i64`, and fails with
+/// "implementation is not general enough". In parameter position the fn item
+/// coerces and the lifetime is inferred.
+///
+/// The digit is the arity. `p*` publishes a single path, `pa*` publishes the
+/// module-qualified path and the crate-root alias. `up*` is `unsafe fn`,
+/// `cp*` is `extern "C" fn`, `ucp*` is both. Only the shapes something below
+/// actually publishes exist; publishing a new shape means adding its helper.
+#[inline]
+fn p0<R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: fn() -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn pa0<R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: fn() -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cp0<R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: extern "C" fn() -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn cpa0<R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn() -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn p1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn pa1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn upa1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: unsafe fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cp1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: extern "C" fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn cpa1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn p2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn pa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn up2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: unsafe fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn upa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: unsafe fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cp2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: extern "C" fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn cpa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn pa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn upa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: unsafe fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cpa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn pa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: fn(A1, A2, A3, A4) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn upa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: unsafe fn(A1, A2, A3, A4) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cpa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2, A3, A4) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn cpa7<
+    A1: ResidualSlot,
+    A2: ResidualSlot,
+    A3: ResidualSlot,
+    A4: ResidualSlot,
+    A5: ResidualSlot,
+    A6: ResidualSlot,
+    A7: ResidualSlot,
+    R: ResidualRet,
+>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2, A3, A4, A5, A6, A7) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+/// Publish an address whose signature the residual-call ABI **cannot**
+/// express.
+///
+/// Every caller is a known defect kept only because unpublishing changes what
+/// the codewriter emits and that needs its own measurement. Each site states
+/// which part of the signature is unrepresentable. Do not add callers: use the
+/// checked publishers above, and if a helper does not fit, change the helper.
+///
+/// What "cannot express" costs, measured on this host: a caller that reads one
+/// result register from a function returning `Option<*mut T>` receives `1` for
+/// `Some(p)` and `0` for `None` — never `p`. A wrong pointer that passes a
+/// null check, not a crash.
+fn push_abi_unsound_fnaddr(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    fnptr: *const (),
+) {
+    push_raw_fnaddr(entries, full_path, fnptr);
+}
+
+/// Alias-pair form of [`push_abi_unsound_fnaddr`].
+fn push_abi_unsound_alias_pair(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    fnptr: *const (),
+) {
+    push_raw_fnaddr(entries, module_path, fnptr);
+    push_raw_fnaddr(entries, root_path, fnptr);
+}
+
+fn push_raw_fnaddr(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    fnptr: *const (),
+) {
     let fnaddr = fnptr as usize as i64;
     if fnaddr != 0 {
         entries.push((full_path, fnaddr));
@@ -17,8 +363,8 @@ fn push_alias_pair(
     root_path: &'static str,
     fnptr: *const (),
 ) {
-    push_fnaddr(entries, module_path, fnptr);
-    push_fnaddr(entries, root_path, fnptr);
+    push_raw_fnaddr(entries, module_path, fnptr);
+    push_raw_fnaddr(entries, root_path, fnptr);
 }
 
 const CALLABLE_HELPER_PATHS: &[(&str, &str)] = &[
@@ -389,11 +735,11 @@ pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
 pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     let mut entries = Vec::new();
 
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::builtins::builtin_kwargs_marker_dict",
         "builtins::builtin_kwargs_marker_dict",
-        crate::builtins::builtin_kwargs_marker_dict as *const (),
+        crate::builtins::builtin_kwargs_marker_dict,
     );
     // `builtin_unexpected_keyword_failure` deliberately remains unpublished:
     // its `&str` and `&Wtf8` arguments are two-word aggregates and its
@@ -410,7 +756,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // through the same link-time census used for pyre class descriptors.
     #[cfg(not(target_arch = "wasm32"))]
     for wrapper in crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS {
-        push_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
+        // ABI-UNSOUND: `Result<*mut PyObject, error::PyError>` does not fit one residual slot.
+        push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     }
 
     // `#[pyre_methods]` `type_object()` accessors are `dont_look_inside`
@@ -425,35 +772,35 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     #[cfg(not(target_arch = "wasm32"))]
     for desc in pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS {
         let fnptr = desc.func as *const ();
-        push_fnaddr(&mut entries, desc.path, fnptr);
+        push_raw_fnaddr(&mut entries, desc.path, fnptr);
         if let Some((_crate_seg, rest)) = desc.path.split_once("::") {
-            push_fnaddr(&mut entries, rest, fnptr);
+            push_raw_fnaddr(&mut entries, rest, fnptr);
         }
     }
 
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_make_function_from_globals",
         "pyre_interpreter::jit_make_function_from_globals",
-        crate::runtime_ops::jit_make_function_from_globals as *const (),
+        crate::runtime_ops::jit_make_function_from_globals,
     );
-    push_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_load_name_from_namespace",
         "pyre_interpreter::jit_load_name_from_namespace",
-        crate::runtime_ops::jit_load_name_from_namespace as *const (),
+        crate::runtime_ops::jit_load_name_from_namespace,
     );
-    push_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_store_name_to_namespace",
         "pyre_interpreter::jit_store_name_to_namespace",
-        crate::runtime_ops::jit_store_name_to_namespace as *const (),
+        crate::runtime_ops::jit_store_name_to_namespace,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_sequence_getitem",
         "pyre_interpreter::jit_sequence_getitem",
-        crate::runtime_ops::jit_sequence_getitem as *const (),
+        crate::runtime_ops::jit_sequence_getitem,
     );
     // `rpython/rlib/rrandom.py Random.genrand32` contains the Mersenne
     // Twister refill loops.  `JitPolicy.look_inside_graph` deliberately
@@ -465,17 +812,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // reaching the native residual.
     let random_genrand32: fn(&mut crate::module::_random::Random) -> u32 =
         crate::module::_random::Random::genrand32;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::module::_random::Random::genrand32",
         "module::_random::Random::genrand32",
-        random_genrand32 as *const (),
+        random_genrand32,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_next",
         "pyre_interpreter::jit_next",
-        crate::runtime_ops::jit_next as *const (),
+        crate::runtime_ops::jit_next,
     );
 
     // `unpackiterable_driver` (jd1) portal callees.  Its extracted body
@@ -491,27 +838,23 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `list.append` stays traced). The registered target is its uniform i64
     // carrier adapter: the raw pointer arguments are wasm i32 values, while
     // residual Int/Ref operands use i64 carriers.
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::baseobjspace::next",
         "pyre_interpreter::next",
-        crate::runtime_ops::bh_next as *const (),
+        crate::runtime_ops::bh_next,
     );
-    push_fnaddr(
-        &mut entries,
-        "next",
-        crate::runtime_ops::bh_next as *const (),
-    );
-    push_alias_pair(
+    cp1(&mut entries, "next", crate::runtime_ops::bh_next);
+    cpa2(
         &mut entries,
         "pyre_object::listobject::drain_list_append",
         "pyre_object::drain_list_append",
-        pyre_object::listobject::jit_drain_list_append as *const (),
+        pyre_object::listobject::jit_drain_list_append,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "drain_list_append",
-        pyre_object::listobject::jit_drain_list_append as *const (),
+        pyre_object::listobject::jit_drain_list_append,
     );
 
     // The drain's prologue (`w_list_new_empty`) wraps opaque host plumbing and
@@ -520,27 +863,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // unregistered; bind it too so any direct residual site resolves.
     let w_list_new_empty: fn() -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_empty;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::listobject::w_list_new_empty",
         "pyre_object::w_list_new_empty",
-        w_list_new_empty as *const (),
+        w_list_new_empty,
     );
-    push_fnaddr(
-        &mut entries,
-        "w_list_new_empty",
-        w_list_new_empty as *const (),
-    );
+    p0(&mut entries, "w_list_new_empty", w_list_new_empty);
     let w_none: fn() -> pyre_object::PyObjectRef = pyre_object::noneobject::w_none;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::noneobject::w_none",
         "pyre_object::w_none",
-        w_none as *const (),
+        w_none,
     );
     let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_object;
-    push_alias_pair(
+    // ABI-UNSOUND: `Vec<PyObjectRef>` is three words by value; a residual argument slot is one.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::listobject::w_list_new_object",
         "pyre_object::w_list_new_object",
@@ -549,65 +889,65 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `drain_collect_items` deliberately remains unpublished: its multiword
     // `Vec<PyObjectRef>` return has no one-word residual-call ABI.
 
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_truth_value",
         "pyre_interpreter::jit_truth_value",
-        crate::opcode_ops::jit_truth_value as *const (),
+        crate::opcode_ops::jit_truth_value,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_bool_value_from_truth",
         "pyre_interpreter::jit_bool_value_from_truth",
-        crate::opcode_ops::jit_bool_value_from_truth as *const (),
+        crate::opcode_ops::jit_bool_value_from_truth,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_binary_value_from_tag",
         "pyre_interpreter::jit_binary_value_from_tag",
-        crate::opcode_ops::jit_binary_value_from_tag as *const (),
+        crate::opcode_ops::jit_binary_value_from_tag,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_compare_value_from_tag",
         "pyre_interpreter::jit_compare_value_from_tag",
-        crate::opcode_ops::jit_compare_value_from_tag as *const (),
+        crate::opcode_ops::jit_compare_value_from_tag,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_unary_negative_value",
         "pyre_interpreter::jit_unary_negative_value",
-        crate::opcode_ops::jit_unary_negative_value as *const (),
+        crate::opcode_ops::jit_unary_negative_value,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_unary_invert_value",
         "pyre_interpreter::jit_unary_invert_value",
-        crate::opcode_ops::jit_unary_invert_value as *const (),
+        crate::opcode_ops::jit_unary_invert_value,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",
         "pyre_interpreter::jit_getitem",
-        crate::opcode_ops::jit_getitem as *const (),
+        crate::opcode_ops::jit_getitem,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_setitem",
         "pyre_interpreter::jit_setitem",
-        crate::opcode_ops::jit_setitem as *const (),
+        crate::opcode_ops::jit_setitem,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getattr",
         "pyre_interpreter::jit_getattr",
-        crate::opcode_ops::jit_getattr as *const (),
+        crate::opcode_ops::jit_getattr,
     );
-    push_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_setattr",
         "pyre_interpreter::jit_setattr",
-        crate::opcode_ops::jit_setattr as *const (),
+        crate::opcode_ops::jit_setattr,
     );
 
     // Production walker's `Instruction::StoreSubscr` arm emits a
@@ -625,21 +965,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // bake the wrapper address directly into `JitCode.constants_i`,
     // mirroring PyPy's `cpu.bh_call_*` -> linker-resolved C symbol
     // contract (`pyjitpl.py:1346 _opimpl_residual_call*`).
-    push_fnaddr(
+    cp1(
         &mut entries,
         "execute_store_subscr",
-        crate::opcode_ops::bh_execute_store_subscr as *const (),
+        crate::opcode_ops::bh_execute_store_subscr,
     );
 
     // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs`)
     // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`.
     // Registered here so a consumer can recover the runtime address via
     // `jit_trace_fnaddrs()` lookup without a cross-crate dependency edge.
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::opcode_ops::bh_store_subscr_fn",
         "pyre_interpreter::bh_store_subscr_fn",
-        crate::opcode_ops::bh_store_subscr_fn as *const (),
+        crate::opcode_ops::bh_store_subscr_fn,
     );
 
     // `dont_look_inside` runtime-state accessors residualised at trace
@@ -651,57 +991,57 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `PyFrame::nlocals` / `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_len",
         "pyre_object::shadow_stack_len",
-        pyre_object::gc_roots::shadow_stack_len as *const (),
+        pyre_object::gc_roots::shadow_stack_len,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_get",
         "pyre_object::shadow_stack_get",
-        pyre_object::gc_roots::shadow_stack_get as *const (),
+        pyre_object::gc_roots::shadow_stack_get,
     );
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_set",
         "pyre_object::shadow_stack_set",
-        pyre_object::gc_roots::shadow_stack_set as *const (),
+        pyre_object::gc_roots::shadow_stack_set,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_cell",
         "pyre_object::shadow_stack_cell",
-        pyre_object::gc_roots::shadow_stack_cell as *const (),
+        pyre_object::gc_roots::shadow_stack_cell,
     );
     // The other two thirds of the `push_roots` bracket.  Both take the cell
     // pointer `shadow_stack_cell` returns, so a descent that gets past the
     // resolution lands on these next; all three are one-word scalars in and
     // out, with no fat pointer, `Option`, or sret.
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_cell_len",
         "pyre_object::shadow_stack_cell_len",
-        pyre_object::gc_roots::shadow_stack_cell_len as *const (),
+        pyre_object::gc_roots::shadow_stack_cell_len,
     );
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_cell_truncate",
         "pyre_object::shadow_stack_cell_truncate",
-        pyre_object::gc_roots::shadow_stack_cell_truncate as *const (),
+        pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",
         "pyre_object::w_type_set_uses_object_setattr",
-        crate::opcode_ops::bh_w_type_set_uses_object_setattr as *const (),
+        crate::opcode_ops::bh_w_type_set_uses_object_setattr,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_getattribute",
         "pyre_object::w_type_set_uses_object_getattribute",
-        crate::opcode_ops::bh_w_type_set_uses_object_getattribute as *const (),
+        crate::opcode_ops::bh_w_type_set_uses_object_getattribute,
     );
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py), run under the JIT inside `_pure_issubtype`
@@ -710,42 +1050,42 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
     let w_type_issubtype: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> bool =
         pyre_object::w_type_issubtype;
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::typeobject::w_type_issubtype",
         "pyre_object::w_type_issubtype",
-        w_type_issubtype as *const (),
+        w_type_issubtype,
     );
     // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::interp_exceptions::lookup_exc_class_for_kind",
         "pyre_object::lookup_exc_class_for_kind",
-        crate::opcode_ops::bh_lookup_exc_class_for_kind as *const (),
+        crate::opcode_ops::bh_lookup_exc_class_for_kind,
     );
     // `exc_kind_discriminant` reads the caught exception object's `kind`
     // discriminant; its residual call rides a C-ABI bridge that returns the
     // `ExcKind` discriminant in the integer result slot a residual result
     // register wants.  Emitted by the `try_fuse_drain_match` recognizer
     // (`front::result_exc`) for the drain loop's exception-edge kind test.
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::interp_exceptions::exc_kind_discriminant",
         "pyre_object::exc_kind_discriminant",
-        crate::opcode_ops::bh_w_exception_get_kind as *const (),
+        crate::opcode_ops::bh_w_exception_get_kind,
     );
     // `exception_object_matches_stop_iteration` performs the cached
     // StopIteration class lookup and MRO match for the caught exception
     // object. Its residual call rides a C-ABI bridge that returns the boolean
     // in the integer result slot. Emitted by `try_fuse_drain_match` for the
     // drain loop's exception-edge subclass test.
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::error::exception_object_matches_stop_iteration",
         "pyre_interpreter::exception_object_matches_stop_iteration",
-        crate::opcode_ops::bh_exception_object_matches_stop_iteration as *const (),
+        crate::opcode_ops::bh_exception_object_matches_stop_iteration,
     );
     // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
     // twin), `dereference` reads the weakref `w_obj_weak` slot
@@ -754,28 +1094,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // all through closures the tracer cannot model.  Their `#[dont_look_inside]`
     // calls bind the Rust `fn` directly by qualified path (pointer / `-> ()`
     // / `-> Result<(), PyError>` signatures are JIT-representable).
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::gc_roots::pin_root",
         "pyre_object::pin_root",
-        pyre_object::gc_roots::pin_root as *const (),
+        pyre_object::gc_roots::pin_root,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
     // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
     // twins). Their `#[dont_look_inside]` calls bind the Rust `fn` directly by
     // qualified path (`-> ()` / `-> bool` signatures are JIT-representable).
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_roots::mark_prebuilt_roots_dirty",
         "pyre_object::mark_prebuilt_roots_dirty",
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty as *const (),
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::unicodeobject::w_str_from_codepoint",
         "pyre_object::w_str_from_codepoint",
-        pyre_object::unicodeobject::w_str_from_codepoint as *const (),
+        pyre_object::unicodeobject::w_str_from_codepoint,
     );
     let w_str_slice_codepoints: unsafe fn(
         pyre_object::PyObjectRef,
@@ -783,53 +1123,55 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         i64,
         i64,
     ) -> pyre_object::PyObjectRef = pyre_object::unicodeobject::w_str_slice_codepoints;
-    push_alias_pair(
+    upa4(
         &mut entries,
         "pyre_object::unicodeobject::w_str_slice_codepoints",
         "pyre_object::w_str_slice_codepoints",
-        w_str_slice_codepoints as *const (),
+        w_str_slice_codepoints,
     );
     let w_str_concat: unsafe fn(
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
     ) -> pyre_object::PyObjectRef = pyre_object::unicodeobject::w_str_concat;
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::unicodeobject::w_str_concat",
         "pyre_object::w_str_concat",
-        w_str_concat as *const (),
+        w_str_concat,
     );
     let w_str_first_surrogate: unsafe fn(pyre_object::PyObjectRef) -> i64 =
         pyre_object::unicodeobject::w_str_first_surrogate;
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::unicodeobject::w_str_first_surrogate",
         "pyre_object::w_str_first_surrogate",
-        w_str_first_surrogate as *const (),
+        w_str_first_surrogate,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::longobject::w_long_new",
         "pyre_object::w_long_new",
         pyre_object::longobject::w_long_new as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::longobject::w_long_new_fresh_rbigint_handle",
         "pyre_object::w_long_new_fresh_rbigint_handle",
         pyre_object::longobject::w_long_new_fresh_rbigint_handle as *const (),
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_add_root",
         "pyre_object::try_gc_add_root",
-        pyre_object::gc_hook::try_gc_add_root as *const (),
+        pyre_object::gc_hook::try_gc_add_root,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_remove_root",
         "pyre_object::try_gc_remove_root",
-        pyre_object::gc_hook::try_gc_remove_root as *const (),
+        pyre_object::gc_hook::try_gc_remove_root,
     );
     // #346: direct allocation roots residualised via `#[dont_look_inside]`;
     // each binds both the qualified module path and the glob-re-exported root
@@ -837,19 +1179,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `crate::`. The bytearray constructors allocate a GC-managed storage box
     // (off-GC storage) that is not phaseA-liftable, so they
     // residualise like the `malloc_typed` (`NewWithVtable`) roots below.
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::bytearrayobject::w_bytearray_new",
         "pyre_object::w_bytearray_new",
-        pyre_object::bytearrayobject::w_bytearray_new as *const (),
+        pyre_object::bytearrayobject::w_bytearray_new,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `&[u8]` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::bytearrayobject::w_bytearray_from_bytes",
         "pyre_object::w_bytearray_from_bytes",
         pyre_object::bytearrayobject::w_bytearray_from_bytes as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `W_DictObject` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::alloc_dict_object",
         "pyre_object::alloc_dict_object",
@@ -859,106 +1203,102 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `IndexMap::new` storage box); bind its zero-arg `fn() -> PyObjectRef`
     // so the residual call resolves, mirroring `w_list_new_empty`.
     let w_dict_new: fn() -> pyre_object::PyObjectRef = pyre_object::dictmultiobject::w_dict_new;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_new",
         "pyre_object::w_dict_new",
-        w_dict_new as *const (),
+        w_dict_new,
     );
-    push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
+    p0(&mut entries, "w_dict_new", w_dict_new);
     // `w_dict_new_instance` is `#[dont_look_inside]` (it dispatches through the
     // `MAKE_INSTANCE_DICT_HOOK` fn-pointer cell); bind its zero-arg
     // `fn() -> PyObjectRef` so the residual call resolves, mirroring `w_dict_new`.
     let w_dict_new_instance: fn() -> pyre_object::PyObjectRef =
         pyre_object::dictmultiobject::w_dict_new_instance;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_new_instance",
         "pyre_object::w_dict_new_instance",
-        w_dict_new_instance as *const (),
+        w_dict_new_instance,
     );
-    push_fnaddr(
-        &mut entries,
-        "w_dict_new_instance",
-        w_dict_new_instance as *const (),
-    );
+    p0(&mut entries, "w_dict_new_instance", w_dict_new_instance);
     // `bool_invert_deprecation_text` is `#[dont_look_inside]` (it hides a
     // `static` prebuilt cell the front-end cannot lift); bind its zero-arg
     // `fn() -> PyObjectRef` so `invert`'s residual call to it resolves.
     let bool_invert_deprecation_text: fn() -> pyre_object::PyObjectRef =
         crate::objspace::descroperation::bool_invert_deprecation_text;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::bool_invert_deprecation_text",
         "pyre_interpreter::bool_invert_deprecation_text",
-        bool_invert_deprecation_text as *const (),
+        bool_invert_deprecation_text,
     );
-    push_fnaddr(
+    p0(
         &mut entries,
         "bool_invert_deprecation_text",
-        bool_invert_deprecation_text as *const (),
+        bool_invert_deprecation_text,
     );
     // `emit_stdout` is `#[dont_look_inside]` (host stdio handle); bind it so
     // the residual call resolves.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
-    push_alias_pair(
+    // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::host_seam::emit_stdout",
         "pyre_interpreter::emit_stdout",
         emit_stdout as *const (),
     );
-    push_fnaddr(&mut entries, "emit_stdout", emit_stdout as *const ());
+    // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
+    push_abi_unsound_fnaddr(&mut entries, "emit_stdout", emit_stdout as *const ());
     // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
     // host `IndexMap::new` storage-box reason; bind their zero-arg
     // `fn() -> PyObjectRef` so the residual calls resolve.
     let w_set_new: fn() -> pyre_object::PyObjectRef = pyre_object::setobject::w_set_new;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::setobject::w_set_new",
         "pyre_object::w_set_new",
-        w_set_new as *const (),
+        w_set_new,
     );
-    push_fnaddr(&mut entries, "w_set_new", w_set_new as *const ());
+    p0(&mut entries, "w_set_new", w_set_new);
     let w_frozenset_new: fn() -> pyre_object::PyObjectRef = pyre_object::setobject::w_frozenset_new;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::setobject::w_frozenset_new",
         "pyre_object::w_frozenset_new",
-        w_frozenset_new as *const (),
+        w_frozenset_new,
     );
-    push_fnaddr(
-        &mut entries,
-        "w_frozenset_new",
-        w_frozenset_new as *const (),
-    );
+    p0(&mut entries, "w_frozenset_new", w_frozenset_new);
     // `w_set_copy_storage_from` is `#[dont_look_inside]` (its body clones the
     // host `SetItemsStorage` `IndexMap` and boxes it into `d.items`); bind its
     // `unsafe fn(PyObjectRef, PyObjectRef)` so the residual call resolves. The
     // void 2-arg fn registers exactly like the void `w_type_set_abstract`
     // sibling below.
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::setobject::w_set_copy_storage_from",
         "pyre_object::w_set_copy_storage_from",
-        pyre_object::setobject::w_set_copy_storage_from as *const (),
+        pyre_object::setobject::w_set_copy_storage_from,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_len",
         "pyre_object::w_dict_len",
-        pyre_object::dictmultiobject::w_dict_len as *const (),
+        pyre_object::dictmultiobject::w_dict_len,
     );
     // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
     // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
     // `wtf8_surrogate_key_str_object` wraps the cold lone-surrogate
     // `to_wtf8_buf` + `w_str_from_wtf8` into one objectptr call.
-    push_alias_pair(
+    // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::wtf8_key_is_utf8",
         "pyre_object::wtf8_key_is_utf8",
         pyre_object::dictmultiobject::wtf8_key_is_utf8 as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::wtf8_surrogate_key_str_object",
         "pyre_object::wtf8_surrogate_key_str_object",
@@ -967,55 +1307,61 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // The typed int/bytes dict-storage leaves residualise their
     // `IndexMap::{insert,get}` (an external-crate heap store/lookup the tracer
     // cannot model): the stores return `()`, the lookups `Option<PyObjectRef>`.
-    push_alias_pair(
+    upa3(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_store_int_strategy",
         "pyre_object::w_dict_store_int_strategy",
-        pyre_object::dictmultiobject::w_dict_store_int_strategy as *const (),
+        pyre_object::dictmultiobject::w_dict_store_int_strategy,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_lookup_int_strategy",
         "pyre_object::w_dict_lookup_int_strategy",
         pyre_object::dictmultiobject::w_dict_lookup_int_strategy as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::identitydict::w_dict_lookup_identity_strategy",
         "pyre_object::w_dict_lookup_identity_strategy",
         pyre_object::identitydict::w_dict_lookup_identity_strategy as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_lookup_object_entries",
         "pyre_object::w_module_dict_lookup_object_entries",
         pyre_object::dictmultiobject::w_module_dict_lookup_object_entries as *const (),
     );
-    push_alias_pair(
+    upa3(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_store_bytes_strategy",
         "pyre_object::w_dict_store_bytes_strategy",
-        pyre_object::dictmultiobject::w_dict_store_bytes_strategy as *const (),
+        pyre_object::dictmultiobject::w_dict_store_bytes_strategy,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy",
         "pyre_object::w_dict_lookup_bytes_strategy",
         pyre_object::dictmultiobject::w_dict_lookup_bytes_strategy as *const (),
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_new",
         "pyre_object::w_module_dict_new",
-        pyre_object::dictmultiobject::w_module_dict_new as *const (),
+        pyre_object::dictmultiobject::w_module_dict_new,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `&str` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::module::w_module_new_aliasing_dict",
         "pyre_object::w_module_new_aliasing_dict",
         pyre_object::module::w_module_new_aliasing_dict as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `FunctionName` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
@@ -1023,36 +1369,36 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     let pure_version_tag: extern "C" fn(i64) -> i64 =
         crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::baseobjspace::_pure_version_tag",
         "pyre_interpreter::_pure_version_tag",
-        pure_version_tag as *const (),
+        pure_version_tag,
     );
     let pure_lookup_where_with_method_cache: extern "C" fn(i64, i64, i64) -> i64 =
         crate::baseobjspace::__majit_call_target__pure_lookup_where_with_method_cache;
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::baseobjspace::_pure_lookup_where_with_method_cache",
         "pyre_interpreter::_pure_lookup_where_with_method_cache",
-        pure_lookup_where_with_method_cache as *const (),
+        pure_lookup_where_with_method_cache,
     );
     let pure_lookup_class_with_method_cache: extern "C" fn(i64, i64, i64) -> i64 =
         crate::baseobjspace::__majit_call_target__pure_lookup_class_with_method_cache;
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_interpreter::baseobjspace::_pure_lookup_class_with_method_cache",
         "pyre_interpreter::_pure_lookup_class_with_method_cache",
-        pure_lookup_class_with_method_cache as *const (),
+        pure_lookup_class_with_method_cache,
     );
     // #346: null-collapsing stable-alloc primitive residualised via
     // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
     // the trace.
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_object::gc_hook::try_gc_alloc_stable_raw",
         "pyre_object::try_gc_alloc_stable_raw",
-        pyre_object::gc_hook::try_gc_alloc_stable_raw as *const (),
+        pyre_object::gc_hook::try_gc_alloc_stable_raw,
     );
     // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
     // inside a descended body whenever a fold boxes an int. Bind the
@@ -1062,36 +1408,37 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `call_indirect` `(i64) -> i64` from the descr alone.
     let w_int_gc_alloc: extern "C" fn(i64) -> i64 =
         pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::intobject::w_int_gc_alloc",
         "pyre_object::w_int_gc_alloc",
-        w_int_gc_alloc as *const (),
+        w_int_gc_alloc,
     );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries
     // `#[dont_look_inside]` and binds its `()`-returning `fn` directly by
     // qualified path (sibling of `gc_interp::enabled`).
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::typeobject::w_type_set_abstract",
         "pyre_object::w_type_set_abstract",
-        pyre_object::w_type_set_abstract as *const (),
+        pyre_object::w_type_set_abstract,
     );
-    push_fnaddr(
+    p1(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::dereference",
-        crate::module::_weakref::interp__weakref::dereference as *const (),
+        crate::module::_weakref::interp__weakref::dereference,
     );
-    push_fnaddr(
+    // ABI-UNSOUND: `Result<(), error::PyError>` does not fit one residual slot.
+    push_abi_unsound_fnaddr(
         &mut entries,
         "pyre_interpreter::objspace::std::mapdict::_obj_setdict",
         crate::objspace::std::mapdict::_obj_setdict as *const (),
     );
-    push_fnaddr(
+    p1(
         &mut entries,
         "pyre_interpreter::objspace::std::mapdict::_obj_getdict",
-        crate::objspace::std::mapdict::_obj_getdict as *const (),
+        crate::objspace::std::mapdict::_obj_getdict,
     );
     // `compute_mro` deliberately remains unpublished: its multiword
     // `Vec<PyObjectRef>` return has no one-word residual-call ABI.
@@ -1105,11 +1452,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `bool`, so it is `#[dont_look_inside]` — keeping the hot cached-MRO
     // branch of `issubtype_w` a pure typed-slice iteration.  Bind its `fn` by
     // qualified path.
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_interpreter::baseobjspace::issubtype_slow_and_wrong",
         "pyre_interpreter::issubtype_slow_and_wrong",
-        crate::baseobjspace::issubtype_slow_and_wrong as *const (),
+        crate::baseobjspace::issubtype_slow_and_wrong,
     );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
@@ -1129,23 +1476,23 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // descended body reaches them yet — but they are the same latent shape.
     let gc_interp_enabled: extern "C" fn() -> i64 =
         pyre_object::gc_interp::__majit_call_target_enabled;
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::gc_interp::enabled",
         "pyre_object::enabled",
-        gc_interp_enabled as *const (),
+        gc_interp_enabled,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::longobject::bigint_gc_type_id",
         "pyre_object::bigint_gc_type_id",
-        pyre_object::longobject::bigint_gc_type_id as *const (),
+        pyre_object::longobject::bigint_gc_type_id,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::dictmultiobject::dict_view_iterator_gc_type_id",
         "pyre_object::dict_view_iterator_gc_type_id",
-        pyre_object::dictmultiobject::dict_view_iterator_gc_type_id as *const (),
+        pyre_object::dictmultiobject::dict_view_iterator_gc_type_id,
     );
     // The same shape over the object space's remaining runtime-mutable
     // globals: `sys_modules_dict` reads the `SYS_MODULES_DICT` pointer
@@ -1159,15 +1506,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // and binds its Rust `fn` directly by qualified path rather than taking a
     // `jit_static_*_addrs` address row.
     let sys_modules_dict: fn() -> pyre_object::PyObjectRef = crate::importing::sys_modules_dict;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::importing::sys_modules_dict",
         "pyre_interpreter::sys_modules_dict",
-        sys_modules_dict as *const (),
+        sys_modules_dict,
     );
     let sys_modules_registry_get: fn(&str) -> Option<pyre_object::PyObjectRef> =
         crate::importing::sys_modules_registry_get;
-    push_alias_pair(
+    // ABI-UNSOUND: `&str` is a fat pointer and `Option<PyObjectRef>` is two words.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::importing::sys_modules_registry_get",
         "pyre_interpreter::sys_modules_registry_get",
@@ -1183,100 +1531,101 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // the process-global `AUTOFLUSHER` handle table owned by the object space.
     let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =
         crate::module::_io::unsupported_operation_type;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::module::_io::unsupported_operation_type",
         "pyre_interpreter::unsupported_operation_type",
-        unsupported_operation_type as *const (),
+        unsupported_operation_type,
     );
     let current_frame: fn() -> *mut crate::pyframe::PyFrame = crate::eval::current_frame;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::eval::current_frame",
         "pyre_interpreter::current_frame",
-        current_frame as *const (),
+        current_frame,
     );
     let repr_enter: fn(pyre_object::PyObjectRef) -> bool = crate::display::repr_enter;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::display::repr_enter",
         "pyre_interpreter::repr_enter",
-        repr_enter as *const (),
+        repr_enter,
     );
     let repr_leave: fn(pyre_object::PyObjectRef) = crate::display::repr_leave;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::display::repr_leave",
         "pyre_interpreter::repr_leave",
-        repr_leave as *const (),
+        repr_leave,
     );
     let autoflusher_add: fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
         crate::module::_io::autoflusher_add;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::module::_io::autoflusher_add",
         "pyre_interpreter::autoflusher_add",
-        autoflusher_add as *const (),
+        autoflusher_add,
     );
     let allocate_buffered_lock: fn() -> usize = crate::module::_io::allocate_buffered_lock;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::module::_io::allocate_buffered_lock",
         "pyre_interpreter::allocate_buffered_lock",
-        allocate_buffered_lock as *const (),
+        allocate_buffered_lock,
     );
     let acquire_buffered_lock: fn(usize) -> bool = crate::module::_io::acquire_buffered_lock;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::module::_io::acquire_buffered_lock",
         "pyre_interpreter::acquire_buffered_lock",
-        acquire_buffered_lock as *const (),
+        acquire_buffered_lock,
     );
     let release_buffered_lock: fn(usize) = crate::module::_io::release_buffered_lock;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::module::_io::release_buffered_lock",
         "pyre_interpreter::release_buffered_lock",
-        release_buffered_lock as *const (),
+        release_buffered_lock,
     );
     let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::module::_warnings::state_ns",
         "pyre_interpreter::state_ns",
-        warnings_state_ns as *const (),
+        warnings_state_ns,
     );
     // The host-boundary seams beside them: the stdout fd writer and the
     // thread-identity read.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
-    push_alias_pair(
+    // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::host_seam::emit_stdout",
         "pyre_interpreter::emit_stdout",
         emit_stdout as *const (),
     );
     let current_ident: fn() -> i64 = crate::module::thread::current_ident;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::module::thread::current_ident",
         "pyre_interpreter::current_ident",
-        current_ident as *const (),
+        current_ident,
     );
     let finalize_failed_attr_receiver_now: fn(pyre_object::PyObjectRef) -> bool =
         crate::eval::finalize_failed_attr_receiver_now;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::eval::finalize_failed_attr_receiver_now",
         "pyre_interpreter::finalize_failed_attr_receiver_now",
-        finalize_failed_attr_receiver_now as *const (),
+        finalize_failed_attr_receiver_now,
     );
     let set_in_flight_exception: fn(pyre_object::PyObjectRef) =
         crate::eval::set_in_flight_exception;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::eval::set_in_flight_exception",
         "pyre_interpreter::set_in_flight_exception",
-        set_in_flight_exception as *const (),
+        set_in_flight_exception,
     );
     // `mmap_type` is `#[cfg(unix)]` inside `interp_mmap`, and the `mmap`
     // module itself is gated at `module/mod.rs`'s `pub mod mmap`; the row has to carry
@@ -1290,11 +1639,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     {
         let mmap_type: fn() -> pyre_object::PyObjectRef =
             crate::module::mmap::interp_mmap::mmap_type;
-        push_alias_pair(
+        pa0(
             &mut entries,
             "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
             "pyre_interpreter::mmap_type",
-            mmap_type as *const (),
+            mmap_type,
         );
     }
     // `cdata_bytes_object` carries the `_ctypes` module's own gate
@@ -1304,24 +1653,25 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     {
         let cdata_bytes_object: fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
             crate::module::_ctypes::cdata::cdata_bytes_object;
-        push_alias_pair(
+        // ABI-UNSOUND: `Option<PyObjectRef>` is two words: a raw pointer has no niche.
+        push_abi_unsound_alias_pair(
             &mut entries,
             "pyre_interpreter::module::_ctypes::cdata::cdata_bytes_object",
             "pyre_interpreter::cdata_bytes_object",
             cdata_bytes_object as *const (),
         );
     }
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::note_eval_activation_enter",
         "pyre_object::note_eval_activation_enter",
-        pyre_object::gc_interp::note_eval_activation_enter as *const (),
+        pyre_object::gc_interp::note_eval_activation_enter,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::note_eval_activation_exit",
         "pyre_object::note_eval_activation_exit",
-        pyre_object::gc_interp::note_eval_activation_exit as *const (),
+        pyre_object::gc_interp::note_eval_activation_exit,
     );
     // The dispatch-loop safepoint's five toucher residuals plus the frame-entry
     // odometer bump and the items-block strategy gate: each reads a
@@ -1330,155 +1680,155 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `PYRE_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
     // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
     // qualified path (siblings of `gc_interp::enabled`).
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::collect_enabled",
         "pyre_object::collect_enabled",
-        pyre_object::gc_interp::collect_enabled as *const (),
+        pyre_object::gc_interp::collect_enabled,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::poll_due",
         "pyre_object::poll_due",
-        pyre_object::gc_interp::poll_due as *const (),
+        pyre_object::gc_interp::poll_due,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::at_outermost_activation",
         "pyre_object::at_outermost_activation",
-        pyre_object::gc_interp::at_outermost_activation as *const (),
+        pyre_object::gc_interp::at_outermost_activation,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_hook::try_gc_major_threshold_reached",
         "pyre_object::try_gc_major_threshold_reached",
-        pyre_object::gc_hook::try_gc_major_threshold_reached as *const (),
+        pyre_object::gc_hook::try_gc_major_threshold_reached,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_hook::try_gc_collect_oldgen",
         "pyre_object::try_gc_collect_oldgen",
-        pyre_object::gc_hook::try_gc_collect_oldgen as *const (),
+        pyre_object::gc_hook::try_gc_collect_oldgen,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::object_array::itemsblock_gc_enabled",
         "pyre_object::itemsblock_gc_enabled",
-        pyre_object::object_array::itemsblock_gc_enabled as *const (),
+        pyre_object::object_array::itemsblock_gc_enabled,
     );
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::call::bump_frame_entry_count",
-        crate::call::bump_frame_entry_count as *const (),
+        crate::call::bump_frame_entry_count,
     );
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::call::py_recursion_depth",
-        crate::call::py_recursion_depth as *const (),
+        crate::call::py_recursion_depth,
     );
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::module::sys::state::recursion_limit",
-        crate::module::sys::state::recursion_limit as *const (),
+        crate::module::sys::state::recursion_limit,
     );
     // The dispatch-loop safepoint entry itself paces the poll inline and
     // dispatches to the threshold and collection hooks.
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::gc_interp::safepoint",
         "pyre_object::safepoint",
-        pyre_object::gc_interp::safepoint as *const (),
+        pyre_object::gc_interp::safepoint,
     );
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::jit_compiler_bigint_to_rbigint",
-        crate::jit_compiler_bigint_to_rbigint as *const (),
+        crate::jit_compiler_bigint_to_rbigint,
     );
     // PyPy's getconstant_w is a pre-wrapped list read. Pyre's compiler stores
     // ConstantData, so the first read realizes and atomically publishes that
     // wrapped object. Keep this temporary compiler-boundary machinery opaque
     // to source translation; all later reads return the same co_consts_w slot.
-    push_fnaddr(
+    up2(
         &mut entries,
         "pyre_interpreter::pycode::w_code_const",
-        crate::pycode::w_code_const as *const (),
+        crate::pycode::w_code_const,
     );
     // Truncated `_divrem` projections used by Rust operator shims.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_div",
-        crate::objspace::descroperation::jit_bigint_div as *const (),
+        crate::objspace::descroperation::jit_bigint_div,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_rem",
-        crate::objspace::descroperation::jit_bigint_rem as *const (),
+        crate::objspace::descroperation::jit_bigint_rem,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder",
-        crate::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder as *const (),
+        crate::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder,
     );
     // Floored `divmod` projections used by the zero-checked interpreter seams.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
-        crate::objspace::descroperation::jit_bigint_div_floor as *const (),
+        crate::objspace::descroperation::jit_bigint_div_floor,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
-        crate::objspace::descroperation::jit_bigint_mod_floor as *const (),
+        crate::objspace::descroperation::jit_bigint_mod_floor,
     );
     // Machine-int-divisor legs of the same seams (`_int_floordiv` / `_int_mod`).
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_int_div_floor",
-        crate::objspace::descroperation::jit_bigint_int_div_floor as *const (),
+        crate::objspace::descroperation::jit_bigint_int_div_floor,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_int_mod_int_result",
-        crate::objspace::descroperation::jit_bigint_int_mod_int_result as *const (),
+        crate::objspace::descroperation::jit_bigint_int_mod_int_result,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_int_divmod",
-        crate::objspace::descroperation::jit_bigint_int_divmod as *const (),
+        crate::objspace::descroperation::jit_bigint_int_divmod,
     );
     // `jit_bigint_{and,or,xor,sub,mul}` residualize the Rust RBigInt binary
     // operators (`<BigInt as BitAnd>::bitand`, …) the `front::mir` retarget
     // (`front::bigint_binop`) redirects when both operands are the opaque
     // `BigInt` ADT.  Each returns a fresh `*mut BigInt` (as i64), bound by path.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_and",
-        crate::objspace::descroperation::jit_bigint_and as *const (),
+        crate::objspace::descroperation::jit_bigint_and,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_or",
-        crate::objspace::descroperation::jit_bigint_or as *const (),
+        crate::objspace::descroperation::jit_bigint_or,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_xor",
-        crate::objspace::descroperation::jit_bigint_xor as *const (),
+        crate::objspace::descroperation::jit_bigint_xor,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_sub",
-        crate::objspace::descroperation::jit_bigint_sub as *const (),
+        crate::objspace::descroperation::jit_bigint_sub,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
-        crate::objspace::descroperation::jit_bigint_mul as *const (),
+        crate::objspace::descroperation::jit_bigint_mul,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_add",
-        crate::objspace::descroperation::jit_bigint_add as *const (),
+        crate::objspace::descroperation::jit_bigint_add,
     );
     // Mixed W_LongObject/W_IntObject descriptors call the dedicated
     // rbigint.int_* operations, preserving PyPy's no-temporary-bigint path.
@@ -1508,7 +1858,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
             crate::objspace::descroperation::jit_bigint_int_xor as *const (),
         ),
     ] {
-        push_fnaddr(&mut entries, path, addr);
+        push_raw_fnaddr(&mut entries, path, addr);
     }
     for (path, addr) in [
         (
@@ -1536,55 +1886,55 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
             crate::objspace::descroperation::jit_bigint_int_ge as *const (),
         ),
     ] {
-        push_fnaddr(&mut entries, path, addr);
+        push_raw_fnaddr(&mut entries, path, addr);
     }
     // `bigint_pow_nomod(...)?` is source-level `Result` syntax for
     // RPython's implicit MemoryError edge. The MIR front removes that shell
     // and binds the elidable pointer-ABI payload call here.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_pow_nomod",
-        crate::objspace::descroperation::jit_bigint_pow_nomod as *const (),
+        crate::objspace::descroperation::jit_bigint_pow_nomod,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_int_pow_nomod",
-        crate::objspace::descroperation::jit_bigint_int_pow_nomod as *const (),
+        crate::objspace::descroperation::jit_bigint_int_pow_nomod,
     );
     // `bigint_lshift_count(...)?` carries the same implicit MemoryError shape
     // for RPython's lshift allocation.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_count",
-        crate::objspace::descroperation::jit_bigint_lshift_count as *const (),
+        crate::objspace::descroperation::jit_bigint_lshift_count,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result",
-        crate::objspace::descroperation::jit_bigint_lshift_int_int_result as *const (),
+        crate::objspace::descroperation::jit_bigint_lshift_int_int_result,
     );
     // Unary rbigint operations each take one payload pointer.
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_neg",
-        crate::objspace::descroperation::jit_bigint_neg as *const (),
+        crate::objspace::descroperation::jit_bigint_neg,
     );
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_invert",
-        crate::objspace::descroperation::jit_bigint_invert as *const (),
+        crate::objspace::descroperation::jit_bigint_invert,
     );
     // `jit_bigint_{shl,shr}` residualize the BigInt shift-by-`usize` operators
     // (`<BigInt as Shl<usize>>::shl`, …); `b` is the machine shift count.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_shl",
-        crate::objspace::descroperation::jit_bigint_shl as *const (),
+        crate::objspace::descroperation::jit_bigint_shl,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_shr",
-        crate::objspace::descroperation::jit_bigint_shr as *const (),
+        crate::objspace::descroperation::jit_bigint_shr,
     );
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
@@ -1618,183 +1968,183 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         }
     }
 
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::intobject::jit_w_int_new",
         "pyre_object::jit_w_int_new",
-        pyre_object::jit_w_int_new as *const (),
+        pyre_object::jit_w_int_new,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::floatobject::jit_w_float_new",
         "pyre_object::jit_w_float_new",
-        pyre_object::jit_w_float_new as *const (),
+        pyre_object::jit_w_float_new,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::listobject::jit_list_append",
         "pyre_object::jit_list_append",
-        pyre_object::jit_list_append as *const (),
+        pyre_object::jit_list_append,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::listobject::jit_list_getitem",
         "pyre_object::jit_list_getitem",
-        pyre_object::jit_list_getitem as *const (),
+        pyre_object::jit_list_getitem,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_object::listobject::jit_list_setitem",
         "pyre_object::jit_list_setitem",
-        pyre_object::jit_list_setitem as *const (),
+        pyre_object::jit_list_setitem,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::listobject::jit_list_reverse",
         "pyre_object::jit_list_reverse",
-        pyre_object::jit_list_reverse as *const (),
+        pyre_object::jit_list_reverse,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_i64_fits",
         "pyre_object::jit_bigint_to_i64_fits",
-        pyre_object::jit_bigint_to_i64_fits as *const (),
+        pyre_object::jit_bigint_to_i64_fits,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_from_i64",
         "pyre_object::jit_bigint_from_i64",
-        pyre_object::jit_bigint_from_i64 as *const (),
+        pyre_object::jit_bigint_from_i64,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_from_u64",
         "pyre_object::jit_bigint_from_u64",
-        pyre_object::jit_bigint_from_u64 as *const (),
+        pyre_object::jit_bigint_from_u64,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_clone",
         "pyre_object::jit_bigint_clone",
-        pyre_object::jit_bigint_clone as *const (),
+        pyre_object::jit_bigint_clone,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_eq",
         "pyre_object::jit_bigint_eq",
-        pyre_object::jit_bigint_eq as *const (),
+        pyre_object::jit_bigint_eq,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_ne",
         "pyre_object::jit_bigint_ne",
-        pyre_object::jit_bigint_ne as *const (),
+        pyre_object::jit_bigint_ne,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_lt",
         "pyre_object::jit_bigint_lt",
-        pyre_object::jit_bigint_lt as *const (),
+        pyre_object::jit_bigint_lt,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_le",
         "pyre_object::jit_bigint_le",
-        pyre_object::jit_bigint_le as *const (),
+        pyre_object::jit_bigint_le,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_gt",
         "pyre_object::jit_bigint_gt",
-        pyre_object::jit_bigint_gt as *const (),
+        pyre_object::jit_bigint_gt,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::longobject::jit_bigint_ge",
         "pyre_object::jit_bigint_ge",
-        pyre_object::jit_bigint_ge as *const (),
+        pyre_object::jit_bigint_ge,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_bits",
         "pyre_object::jit_bigint_bits",
-        pyre_object::jit_bigint_bits as *const (),
+        pyre_object::jit_bigint_bits,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_is_zero",
         "pyre_object::jit_bigint_is_zero",
-        pyre_object::jit_bigint_is_zero as *const (),
+        pyre_object::jit_bigint_is_zero,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_is_one",
         "pyre_object::jit_bigint_is_one",
-        pyre_object::jit_bigint_is_one as *const (),
+        pyre_object::jit_bigint_is_one,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_tobool",
         "pyre_object::jit_bigint_tobool",
-        pyre_object::jit_bigint_tobool as *const (),
+        pyre_object::jit_bigint_tobool,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_hash",
         "pyre_object::jit_bigint_hash",
-        pyre_object::jit_bigint_hash as *const (),
+        pyre_object::jit_bigint_hash,
     );
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_bit_length",
-        crate::objspace::descroperation::jit_bigint_bit_length as *const (),
+        crate::objspace::descroperation::jit_bigint_bit_length,
     );
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_bit_count",
-        crate::objspace::descroperation::jit_bigint_bit_count as *const (),
+        crate::objspace::descroperation::jit_bigint_bit_count,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_i64_value",
         "pyre_object::jit_bigint_to_i64_value",
-        pyre_object::jit_bigint_to_i64_value as *const (),
+        pyre_object::jit_bigint_to_i64_value,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_i64_value_or_zero",
         "pyre_object::jit_bigint_to_i64_value_or_zero",
-        pyre_object::jit_bigint_to_i64_value_or_zero as *const (),
+        pyre_object::jit_bigint_to_i64_value_or_zero,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_u64_fits",
         "pyre_object::jit_bigint_to_u64_fits",
-        pyre_object::jit_bigint_to_u64_fits as *const (),
+        pyre_object::jit_bigint_to_u64_fits,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_u64_value",
         "pyre_object::jit_bigint_to_u64_value",
-        pyre_object::jit_bigint_to_u64_value as *const (),
+        pyre_object::jit_bigint_to_u64_value,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_sign_i64",
         "pyre_object::jit_bigint_sign_i64",
-        pyre_object::jit_bigint_sign_i64 as *const (),
+        pyre_object::jit_bigint_sign_i64,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_f64_or_inf",
         "pyre_object::jit_bigint_to_f64_or_inf",
-        pyre_object::jit_bigint_to_f64_or_inf as *const (),
+        pyre_object::jit_bigint_to_f64_or_inf,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_f64_or_nan",
         "pyre_object::jit_bigint_to_f64_or_nan",
-        pyre_object::jit_bigint_to_f64_or_nan as *const (),
+        pyre_object::jit_bigint_to_f64_or_nan,
     );
     // The #171 object-append fold descends `w_list_append` and folds the
     // store leaves to native ops, leaving `list_write_barrier(l)` as a
@@ -1804,11 +2154,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // enclosing `W_ListObject`, whose trace reaches every item slot, and is
     // the only thing keeping an appended `old -> young` element reachable
     // across a minor collection.
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::listobject::list_write_barrier",
         "pyre_object::list_write_barrier",
-        pyre_object::list_write_barrier as *const (),
+        pyre_object::list_write_barrier,
     );
     // The Object arm reaches the barrier through `prepare_list_ref_store`,
     // which brackets it in `push_roots` so the value survives the safepoint
@@ -1832,11 +2182,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // re-pairing are unaffected.
     let prepare_list_ref_store: extern "C" fn(i64, i64) -> i64 =
         pyre_object::listobject::__majit_call_target_prepare_list_ref_store;
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::listobject::prepare_list_ref_store",
         "pyre_object::prepare_list_ref_store",
-        prepare_list_ref_store as *const (),
+        prepare_list_ref_store,
     );
     // `prepare_list_ref_store` returns the relocated value. The following
     // owner reload is the other half of RPython's post-safepoint pop_roots;
@@ -1844,11 +2194,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // the descended body.
     let current_gc_ref: extern "C" fn(i64) -> i64 =
         pyre_object::listobject::__majit_call_target_current_gc_ref;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::listobject::current_gc_ref",
         "pyre_object::current_gc_ref",
-        current_gc_ref as *const (),
+        current_gc_ref,
     );
     // The #171 fold descends `w_list_append` as a sub-jitcode walk, so a guard
     // exit inside it is numbered against `w_list_append`'s own jitcode and is
@@ -1869,22 +2219,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `pyre_object::<Type>::<method>` spelling here.
     let object_push: unsafe fn(&mut pyre_object::W_ListObject, pyre_object::PyObjectRef) =
         pyre_object::W_ListObject::object_push;
-    push_fnaddr(
+    up2(
         &mut entries,
         "pyre_object::W_ListObject::object_push",
-        object_push as *const (),
+        object_push,
     );
     let int_array_push: fn(&mut pyre_object::IntArray, i64) = pyre_object::IntArray::push;
-    push_fnaddr(
-        &mut entries,
-        "pyre_object::IntArray::push",
-        int_array_push as *const (),
-    );
+    p2(&mut entries, "pyre_object::IntArray::push", int_array_push);
     let float_array_push: fn(&mut pyre_object::FloatArray, f64) = pyre_object::FloatArray::push;
-    push_fnaddr(
+    p2(
         &mut entries,
         "pyre_object::FloatArray::push",
-        float_array_push as *const (),
+        float_array_push,
     );
     // The same resume needs the jitcode *shells* it inline-calls to carry a
     // real address: `blackhole.py:1300-1317 bhimpl_inline_call_*` calls
@@ -1893,23 +2239,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // is the fold's descended body and `w_list_len` its length probe.
     let w_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
         pyre_object::listobject::w_list_append;
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::listobject::w_list_append",
         "pyre_object::w_list_append",
-        w_list_append as *const (),
+        w_list_append,
     );
     let w_list_pop_end_inner: unsafe fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_pop_end_inner;
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::listobject::w_list_pop_end_inner",
         "pyre_object::w_list_pop_end_inner",
-        w_list_pop_end_inner as *const (),
+        w_list_pop_end_inner,
     );
     let w_list_pop_end: unsafe fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
         pyre_object::listobject::w_list_pop_end;
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<PyObjectRef>` is two words: a raw pointer has no niche.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::listobject::w_list_pop_end",
         "pyre_object::w_list_pop_end",
@@ -1917,76 +2264,76 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     let w_list_len: unsafe fn(pyre_object::PyObjectRef) -> usize =
         pyre_object::listobject::w_list_len;
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::listobject::w_list_len",
         "pyre_object::w_list_len",
-        w_list_len as *const (),
+        w_list_len,
     );
     let w_set_len: unsafe fn(pyre_object::PyObjectRef) -> usize = pyre_object::setobject::w_set_len;
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::setobject::w_set_len",
         "pyre_object::w_set_len",
-        w_set_len as *const (),
+        w_set_len,
     );
     // The cold list strategy dehomogenization `switch_to_object_strategy` bulk
     // re-boxes typed int/float storage into an Object items block via
     // Vec/collect allocation the tracer cannot model. Register it so the hot
     // append/setitem paths that call it resolve the residual to a
     // runtime-patchable address instead of tracing into the transition.
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::listobject::switch_to_object_strategy",
         "pyre_object::switch_to_object_strategy",
-        pyre_object::switch_to_object_strategy as *const (),
+        pyre_object::switch_to_object_strategy,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::tupleobject::jit_tuple_getitem",
         "pyre_object::jit_tuple_getitem",
-        pyre_object::jit_tuple_getitem as *const (),
+        pyre_object::jit_tuple_getitem,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_concat",
         "pyre_object::jit_str_concat",
-        pyre_object::jit_str_concat as *const (),
+        pyre_object::jit_str_concat,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_repeat",
         "pyre_object::jit_str_repeat",
-        pyre_object::jit_str_repeat as *const (),
+        pyre_object::jit_str_repeat,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_compare",
         "pyre_object::jit_str_compare",
-        pyre_object::jit_str_compare as *const (),
+        pyre_object::jit_str_compare,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_is_true",
         "pyre_object::jit_str_is_true",
-        pyre_object::jit_str_is_true as *const (),
+        pyre_object::jit_str_is_true,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::unicodeobject::jit_int_str",
         "pyre_object::jit_int_str",
-        pyre_object::jit_int_str as *const (),
+        pyre_object::jit_int_str,
     );
     // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
     // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
     // The non-virtual shrink reallocs a raw low-level string down to its final
     // length; the virtual path is folded by `opt_call_shrink_array` and never
     // calls this.
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::lowlevel_string::jit_ll_shrink_array",
         "pyre_object::jit_ll_shrink_array",
-        pyre_object::lowlevel_string::jit_ll_shrink_array as *const (),
+        pyre_object::lowlevel_string::jit_ll_shrink_array,
     );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
@@ -1995,33 +2342,33 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // leaf — the crate-root alias leaf must stay un-prefixed (strips to
     // `["ll_append_res0"]`) to satisfy both the leaf-name gate and the
     // `function_fnaddrs.contains_key` lookup; the real symbols carry `jit_`.
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::rbuilder::ll_append_res0",
         "pyre_object::ll_append_res0",
-        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res0 as *const (),
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res0,
     );
-    push_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_object::rbuilder::ll_append_res_slice",
         "pyre_object::ll_append_res_slice",
-        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res_slice as *const (),
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res_slice,
     );
-    push_alias_pair(
+    cpa3(
         &mut entries,
         "pyre_object::functional::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
-        pyre_object::jit_range_iter_new as *const (),
+        pyre_object::jit_range_iter_new,
     );
     // The lowered raise path's exception materialisation, opaque so that its
     // body stays out of every JitCode that can raise.
     let pyerror_to_exc_object: extern "C" fn(i64) -> i64 =
         crate::error::__majit_call_target_pyerror_to_exc_object;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::error::pyerror_to_exc_object",
         "pyre_interpreter::pyerror_to_exc_object",
-        pyerror_to_exc_object as *const (),
+        pyerror_to_exc_object,
     );
     // The same materialisation with the `type_error` constructor folded in, so
     // the raise site carries neither body. The typed local is the only
@@ -2029,175 +2376,180 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // call — `push_alias_pair` performs none.
     let pyerror_type_error_to_exc_object: extern "C" fn(i64) -> i64 =
         crate::error::__majit_call_target_pyerror_type_error_to_exc_object;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::error::pyerror_type_error_to_exc_object",
         "pyre_interpreter::pyerror_type_error_to_exc_object",
-        pyerror_type_error_to_exc_object as *const (),
+        pyerror_type_error_to_exc_object,
     );
     // `elidable_cannot_raise` subclass-range check; the trampoline widens its
     // one-word bool return by zero-extension.
     let ll_issubclass: extern "C" fn(i64, i64) -> i64 =
         pyre_object::pyobject::__majit_call_target_ll_issubclass;
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::pyobject::ll_issubclass",
         "pyre_object::ll_issubclass",
-        ll_issubclass as *const (),
+        ll_issubclass,
     );
     // `elidable_cannot_raise` bool singleton lookup; the trampoline widens the
     // returned pointer to one word.
     let w_bool_from: extern "C" fn(i64) -> i64 =
         pyre_object::boolobject::__majit_call_target_w_bool_from;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::boolobject::w_bool_from",
         "pyre_object::w_bool_from",
-        w_bool_from as *const (),
+        w_bool_from,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
         "pyre_object::ensure_object_subclass_ranges_initialized",
-        pyre_object::pyobject::ensure_object_subclass_ranges_initialized as *const (),
+        pyre_object::pyobject::ensure_object_subclass_ranges_initialized,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_write_barrier",
         "pyre_object::try_gc_write_barrier",
-        pyre_object::gc_hook::try_gc_write_barrier as *const (),
+        pyre_object::gc_hook::try_gc_write_barrier,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::gc_hook::try_gc_owns_object",
         "pyre_object::try_gc_owns_object",
-        pyre_object::gc_hook::try_gc_owns_object as *const (),
+        pyre_object::gc_hook::try_gc_owns_object,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::gc_hook::maybe_register_finalizer",
         "pyre_object::maybe_register_finalizer",
-        pyre_object::gc_hook::maybe_register_finalizer as *const (),
+        pyre_object::gc_hook::maybe_register_finalizer,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::has_hash_w_hook",
         "pyre_object::has_hash_w_hook",
-        pyre_object::dict_eq_hook::has_hash_w_hook as *const (),
+        pyre_object::dict_eq_hook::has_hash_w_hook,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::dict_eq_hook::hash_w_hooked",
         "pyre_object::hash_w_hooked",
-        pyre_object::dict_eq_hook::hash_w_hooked as *const (),
+        pyre_object::dict_eq_hook::hash_w_hooked,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::has_eq_w_hook",
         "pyre_object::has_eq_w_hook",
-        pyre_object::dict_eq_hook::has_eq_w_hook as *const (),
+        pyre_object::dict_eq_hook::has_eq_w_hook,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::dict_eq_hook::eq_w_hooked",
         "pyre_object::eq_w_hooked",
-        pyre_object::dict_eq_hook::eq_w_hooked as *const (),
+        pyre_object::dict_eq_hook::eq_w_hooked,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::has_hash_str_hook",
         "pyre_object::has_hash_str_hook",
-        pyre_object::dict_eq_hook::has_hash_str_hook as *const (),
+        pyre_object::dict_eq_hook::has_hash_str_hook,
     );
-    push_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_object::dict_eq_hook::hash_str_hooked",
         "pyre_object::hash_str_hooked",
-        pyre_object::dict_eq_hook::hash_str_hooked as *const (),
+        pyre_object::dict_eq_hook::hash_str_hooked,
     );
     /*
      * Fat-pointer arguments (`&str`, `&[u8]`, `&Wtf8`) are two words, but the
      * residual-call ABI passes one register per argument slot; publishing these
      * addresses would pass one word where the callee reads two.
      */
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_probe_object",
         "pyre_object::dict_entries_probe_object",
         pyre_object::dictmultiobject::dict_entries_probe_object as *const (),
     );
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_remove_object",
         "pyre_object::dict_entries_remove_object",
-        pyre_object::dictmultiobject::dict_entries_remove_object as *const (),
+        pyre_object::dictmultiobject::dict_entries_remove_object,
     );
     // The checked probe / store pair, keyed on an already-hashed key.
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_probe_hashed",
         "pyre_object::dict_entries_probe_hashed",
         pyre_object::dictmultiobject::dict_entries_probe_hashed as *const (),
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_insert_hashed",
         "pyre_object::dict_entries_insert_hashed",
         pyre_object::dictmultiobject::dict_entries_insert_hashed as *const (),
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_pop_last",
         "pyre_object::dict_entries_pop_last",
-        pyre_object::dictmultiobject::dict_entries_pop_last as *const (),
+        pyre_object::dictmultiobject::dict_entries_pop_last,
     );
     // The positional slot reads the post-scan lookup arms and the reentrant
     // key scan perform: an index the caller already settled on, so no
     // comparison runs behind these boundaries.
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_value_at",
         "pyre_object::dict_entries_value_at",
-        pyre_object::dictmultiobject::dict_entries_value_at as *const (),
+        pyre_object::dictmultiobject::dict_entries_value_at,
     );
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<*mut PyObject>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_key_obj_at",
         "pyre_object::dict_entries_key_obj_at",
         pyre_object::dictmultiobject::dict_entries_key_obj_at as *const (),
     );
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_key_hash_at",
         "pyre_object::dict_entries_key_hash_at",
-        pyre_object::dictmultiobject::dict_entries_key_hash_at as *const (),
+        pyre_object::dictmultiobject::dict_entries_key_hash_at,
     );
-    push_alias_pair(
+    upa4(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_key_is_at",
         "pyre_object::dict_entries_key_is_at",
-        pyre_object::dictmultiobject::dict_entries_key_is_at as *const (),
+        pyre_object::dictmultiobject::dict_entries_key_is_at,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_capacity",
         "pyre_object::dict_entries_capacity",
-        pyre_object::dictmultiobject::dict_entries_capacity as *const (),
+        pyre_object::dictmultiobject::dict_entries_capacity,
     );
-    push_alias_pair(
+    upa3(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_value_set_at",
         "pyre_object::dict_entries_value_set_at",
-        pyre_object::dictmultiobject::dict_entries_value_set_at as *const (),
+        pyre_object::dictmultiobject::dict_entries_value_set_at,
     );
-    push_alias_pair(
+    upa3(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_insert_object",
         "pyre_object::dict_entries_insert_object",
-        pyre_object::dictmultiobject::dict_entries_insert_object as *const (),
+        pyre_object::dictmultiobject::dict_entries_insert_object,
     );
     // The index-returning twin of the object-key probe.
-    push_alias_pair(
+    // ABI-UNSOUND: `Option<usize>` does not fit one residual slot.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_index_of_object",
         "pyre_object::dict_entries_index_of_object",
@@ -2214,194 +2566,194 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `__majit_call_policy_*`'s null-target fallback.
     let w_dict_unicode_lookup_index: extern "C" fn(i64, i64, i64, i64) -> i64 =
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_lookup_index;
-    push_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_unicode_lookup_index",
         "pyre_object::w_dict_unicode_lookup_index",
-        w_dict_unicode_lookup_index as *const (),
+        w_dict_unicode_lookup_index,
     );
     let w_dict_unicode_key_hash: extern "C" fn(i64) -> i64 =
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash;
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
         "pyre_object::w_dict_unicode_key_hash",
-        w_dict_unicode_key_hash as *const (),
+        w_dict_unicode_key_hash,
     );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
     // serial the build process saw.
     let next_version_tag_serial: fn() -> u64 = pyre_object::celldict::next_version_tag_serial;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_object::celldict::next_version_tag_serial",
         "pyre_object::next_version_tag_serial",
-        next_version_tag_serial as *const (),
+        next_version_tag_serial,
     );
     // `quasiimmut.py _invalidate_now`, shared by both `?` fields.
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::quasiimmut::sweep_quasi_immut_field",
         "pyre_object::sweep_quasi_immut_field",
-        pyre_object::quasiimmut::sweep_quasi_immut_field as *const (),
+        pyre_object::quasiimmut::sweep_quasi_immut_field,
     );
     // The three typed-storage promotions: `IndexMap` construction and refill
     // end to end, so the residual boundary is the whole migration.
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_switch_int_to_object_strategy",
         "pyre_object::w_dict_switch_int_to_object_strategy",
-        pyre_object::dictmultiobject::w_dict_switch_int_to_object_strategy as *const (),
+        pyre_object::dictmultiobject::w_dict_switch_int_to_object_strategy,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::w_dict_switch_bytes_to_object_strategy",
         "pyre_object::w_dict_switch_bytes_to_object_strategy",
-        pyre_object::dictmultiobject::w_dict_switch_bytes_to_object_strategy as *const (),
+        pyre_object::dictmultiobject::w_dict_switch_bytes_to_object_strategy,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::dictmultiobject::w_module_dict_switch_to_object_strategy",
         "pyre_object::w_module_dict_switch_to_object_strategy",
-        pyre_object::dictmultiobject::w_module_dict_switch_to_object_strategy as *const (),
+        pyre_object::dictmultiobject::w_module_dict_switch_to_object_strategy,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::kwargsdict::w_dict_switch_kwargs_to_object_strategy",
         "pyre_object::w_dict_switch_kwargs_to_object_strategy",
-        pyre_object::kwargsdict::w_dict_switch_kwargs_to_object_strategy as *const (),
+        pyre_object::kwargsdict::w_dict_switch_kwargs_to_object_strategy,
     );
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_object::identitydict::w_dict_switch_identity_to_object_strategy",
         "pyre_object::w_dict_switch_identity_to_object_strategy",
-        pyre_object::identitydict::w_dict_switch_identity_to_object_strategy as *const (),
+        pyre_object::identitydict::w_dict_switch_identity_to_object_strategy,
     );
-    push_alias_pair(
+    upa2(
         &mut entries,
         "pyre_object::identitydict::w_dict_delete_identity_strategy",
         "pyre_object::w_dict_delete_identity_strategy",
-        pyre_object::identitydict::w_dict_delete_identity_strategy as *const (),
+        pyre_object::identitydict::w_dict_delete_identity_strategy,
     );
-    push_alias_pair(
+    upa3(
         &mut entries,
         "pyre_object::identitydict::w_dict_store_identity_strategy",
         "pyre_object::w_dict_store_identity_strategy",
-        pyre_object::identitydict::w_dict_store_identity_strategy as *const (),
+        pyre_object::identitydict::w_dict_store_identity_strategy,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_float_abs",
         "pyre_interpreter::jit_float_abs",
-        crate::objspace::descroperation::jit_float_abs as *const (),
+        crate::objspace::descroperation::jit_float_abs,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::call::pyre_debug_call_enabled",
         "pyre_interpreter::pyre_debug_call_enabled",
-        crate::call::pyre_debug_call_enabled as *const (),
+        crate::call::pyre_debug_call_enabled,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::executioncontext::arm_async_eval_breaker",
         "pyre_interpreter::arm_async_eval_breaker",
-        crate::executioncontext::arm_async_eval_breaker as *const (),
+        crate::executioncontext::arm_async_eval_breaker,
     );
-    push_alias_pair(
+    cpa7(
         &mut entries,
         "pyre_interpreter::module::_warnings::show_warning",
         "pyre_interpreter::show_warning",
-        crate::module::_warnings::show_warning_jit_abi as *const (),
+        crate::module::_warnings::show_warning_jit_abi,
     );
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::executioncontext::disarm_async_eval_breaker",
         "pyre_interpreter::disarm_async_eval_breaker",
-        crate::executioncontext::disarm_async_eval_breaker as *const (),
+        crate::executioncontext::disarm_async_eval_breaker,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
         "pyre_interpreter::execution_context_builtin_cache_get",
-        crate::executioncontext::execution_context_builtin_cache_get as *const (),
+        crate::executioncontext::execution_context_builtin_cache_get,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::has_compares_by_identity_hook",
         "pyre_object::has_compares_by_identity_hook",
-        pyre_object::dict_eq_hook::has_compares_by_identity_hook as *const (),
+        pyre_object::dict_eq_hook::has_compares_by_identity_hook,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::dict_eq_hook::compares_by_identity_hooked",
         "pyre_object::compares_by_identity_hooked",
-        pyre_object::dict_eq_hook::compares_by_identity_hooked as *const (),
+        pyre_object::dict_eq_hook::compares_by_identity_hooked,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::dict_eq_hook::signal_hash_error",
         "pyre_object::signal_hash_error",
-        pyre_object::dict_eq_hook::signal_hash_error as *const (),
+        pyre_object::dict_eq_hook::signal_hash_error,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::take_hash_error",
         "pyre_object::take_hash_error",
-        pyre_object::dict_eq_hook::take_hash_error as *const (),
+        pyre_object::dict_eq_hook::take_hash_error,
     );
-    push_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_object::dict_eq_hook::signal_eq_error",
         "pyre_object::signal_eq_error",
-        pyre_object::dict_eq_hook::signal_eq_error as *const (),
+        pyre_object::dict_eq_hook::signal_eq_error,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::take_eq_error",
         "pyre_object::take_eq_error",
-        pyre_object::dict_eq_hook::take_eq_error as *const (),
+        pyre_object::dict_eq_hook::take_eq_error,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::eq_error_pending",
         "pyre_object::eq_error_pending",
-        pyre_object::dict_eq_hook::eq_error_pending as *const (),
+        pyre_object::dict_eq_hook::eq_error_pending,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::begin_callback_free_probe",
         "pyre_object::begin_callback_free_probe",
-        pyre_object::dict_eq_hook::begin_callback_free_probe as *const (),
+        pyre_object::dict_eq_hook::begin_callback_free_probe,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::end_callback_free_probe",
         "pyre_object::end_callback_free_probe",
-        pyre_object::dict_eq_hook::end_callback_free_probe as *const (),
+        pyre_object::dict_eq_hook::end_callback_free_probe,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::callback_free_probe_active",
         "pyre_object::callback_free_probe_active",
-        pyre_object::dict_eq_hook::callback_free_probe_active as *const (),
+        pyre_object::dict_eq_hook::callback_free_probe_active,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::callback_free_probe_broken",
         "pyre_object::callback_free_probe_broken",
-        pyre_object::dict_eq_hook::callback_free_probe_broken as *const (),
+        pyre_object::dict_eq_hook::callback_free_probe_broken,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_object::dict_eq_hook::break_callback_free_probe",
         "pyre_object::break_callback_free_probe",
-        pyre_object::dict_eq_hook::break_callback_free_probe as *const (),
+        pyre_object::dict_eq_hook::break_callback_free_probe,
     );
-    push_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_interpreter::stack_check::stack_almost_full",
         "pyre_interpreter::stack_almost_full",
-        crate::stack_check::stack_almost_full as *const (),
+        crate::stack_check::stack_almost_full,
     );
 
     // `@jit.elidable`-decorated inherent methods that show up as
@@ -2427,11 +2779,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // while the module-qualified form is the 3-segment
     // `["pyframe", "PyFrame", "nlocals"]` — register both.
     let pyframe_nlocals: fn(&crate::pyframe::PyFrame) -> usize = crate::pyframe::PyFrame::nlocals;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::nlocals",
         "pyre_interpreter::PyFrame::nlocals",
-        pyframe_nlocals as *const (),
+        pyframe_nlocals,
     );
 
     // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
@@ -2455,11 +2807,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // trace-time call.
     let pyframe_pop: fn(&mut crate::pyframe::PyFrame) -> pyre_object::PyObjectRef =
         crate::pyframe::PyFrame::pop;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::pop",
         "pyre_interpreter::PyFrame::pop",
-        pyframe_pop as *const (),
+        pyframe_pop,
     );
 
     // `stack_underflow_error` deliberately remains unpublished: its `&str`
@@ -2476,28 +2828,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `get_current_exception_fn` / `set_current_exception_fn` cpu
     // helpers — same TLS slot, same flat read/write semantics.
     let get_current_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::eval::get_current_exception",
         "pyre_interpreter::get_current_exception",
-        get_current_exc as *const (),
+        get_current_exc,
     );
     // `get_sys_exception` is the PyPy `ExecutionContext.sys_exc_info` leaf:
     // it may walk the running-generator chain, but that execution-context
     // state is runtime data and must not be folded into a trace.
     let get_sys_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_sys_exception;
-    push_alias_pair(
+    pa0(
         &mut entries,
         "pyre_interpreter::eval::get_sys_exception",
         "pyre_interpreter::get_sys_exception",
-        get_sys_exc as *const (),
+        get_sys_exc,
     );
     let set_current_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::eval::set_current_exception",
         "pyre_interpreter::set_current_exception",
-        set_current_exc as *const (),
+        set_current_exc,
     );
 
     // `w_type` / `w_object` — the `type` / `object` typeobject accessors
@@ -2509,16 +2861,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // hashes.  Callers spell them `crate::typedef::w_type()`, the sole
     // path form, with no crate-root re-export.
     let w_type: fn() -> pyre_object::PyObjectRef = crate::typedef::w_type;
-    push_fnaddr(
-        &mut entries,
-        "pyre_interpreter::typedef::w_type",
-        w_type as *const (),
-    );
+    p0(&mut entries, "pyre_interpreter::typedef::w_type", w_type);
     let w_object: fn() -> pyre_object::PyObjectRef = crate::typedef::w_object;
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::typedef::w_object",
-        w_object as *const (),
+        w_object,
     );
 
     // Thread-local / `OnceLock` accessors that carry `#[dont_look_inside]`
@@ -2528,7 +2876,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `get_current_exception` / `set_current_exception`, plus the weakref
     // proxy type singletons (twins of `w_type` / `w_object`).
     let set_call_error: fn(crate::PyError) = crate::call::set_call_error;
-    push_fnaddr(
+    // ABI-UNSOUND: `PyError` is passed by value and is wider than a word.
+    push_abi_unsound_fnaddr(
         &mut entries,
         "pyre_interpreter::call::set_call_error",
         set_call_error as *const (),
@@ -2537,10 +2886,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // as a value, so routing it through `BH_LAST_EXC_VALUE` would convert the
     // returned value into a raise.
     let clear_call_error: fn() = crate::call::clear_call_error;
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::call::clear_call_error",
-        clear_call_error as *const (),
+        clear_call_error,
     );
     // `#[dont_look_inside]` execution-context thread-local read, a twin of
     // the call-error slot accessors above. front::mir const-folds the
@@ -2548,27 +2897,27 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // the call stays a residual read via the registered fnaddr.
     let take_last_exec_ctx: fn() -> *const crate::PyExecutionContext =
         crate::call::take_last_exec_ctx;
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::call::take_last_exec_ctx",
-        take_last_exec_ctx as *const (),
+        take_last_exec_ctx,
     );
     // `take_pending_hash_error` deliberately remains unpublished: it returns
     // an error as a value, so routing it through `BH_LAST_EXC_VALUE` would
     // convert the returned value into a raise.
     let proxy_type: fn() -> pyre_object::PyObjectRef =
         crate::module::_weakref::interp__weakref::proxy_type;
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::proxy_type",
-        proxy_type as *const (),
+        proxy_type,
     );
     let callable_proxy_type: fn() -> pyre_object::PyObjectRef =
         crate::module::_weakref::interp__weakref::callable_proxy_type;
-    push_fnaddr(
+    p0(
         &mut entries,
         "pyre_interpreter::module::_weakref::interp__weakref::callable_proxy_type",
-        callable_proxy_type as *const (),
+        callable_proxy_type,
     );
 
     // Stack-overflow / JIT-pending-exception bookkeeping accessors, all
@@ -2578,20 +2927,20 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // become residual Calls.
     let stack_slowpath: extern "C" fn(usize) -> u8 =
         crate::stack_check::pyre_stack_too_big_slowpath;
-    push_fnaddr(
+    cp1(
         &mut entries,
         "pyre_interpreter::stack_check::pyre_stack_too_big_slowpath",
-        stack_slowpath as *const (),
+        stack_slowpath,
     );
-    push_fnaddr(
+    cp0(
         &mut entries,
         "pyre_interpreter::stack_check::stack_check",
-        crate::stack_check::stack_check_jit_abi as *const (),
+        crate::stack_check::stack_check_jit_abi,
     );
-    push_fnaddr(
+    cp0(
         &mut entries,
         "pyre_interpreter::stack_check::drain_jit_pending_exception",
-        crate::stack_check::drain_jit_pending_exception_jit_abi as *const (),
+        crate::stack_check::drain_jit_pending_exception_jit_abi,
     );
 
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
@@ -2610,44 +2959,44 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `register_macro_helper_trace_fnaddr`.
     let pyframe_get_pycode_fn: unsafe fn(&crate::pyframe::PyFrame) -> *const crate::CodeObject =
         crate::pyframe::pyframe_get_pycode;
-    push_alias_pair(
+    upa1(
         &mut entries,
         "pyre_interpreter::pyframe::pyframe_get_pycode",
         "pyre_interpreter::pyframe_get_pycode",
-        pyframe_get_pycode_fn as *const (),
+        pyframe_get_pycode_fn,
     );
 
     let report_stack_underflow: fn(&crate::pyframe::PyFrame) =
         crate::pyframe::report_stack_underflow;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyframe::report_stack_underflow",
         "pyre_interpreter::report_stack_underflow",
-        report_stack_underflow as *const (),
+        report_stack_underflow,
     );
 
     let pyframe_ncells_free: fn(&crate::CodeObject) -> usize = crate::pyframe::ncells;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyframe::ncells",
         "pyre_interpreter::ncells",
-        pyframe_ncells_free as *const (),
+        pyframe_ncells_free,
     );
 
     let pyframe_npure_cellvars: fn(&crate::CodeObject) -> usize = crate::pyframe::npure_cellvars;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyframe::npure_cellvars",
         "pyre_interpreter::npure_cellvars",
-        pyframe_npure_cellvars as *const (),
+        pyframe_npure_cellvars,
     );
 
     let pyframe_ncells_method: fn(&crate::pyframe::PyFrame) -> usize =
         crate::pyframe::PyFrame::ncells;
-    push_fnaddr(
+    p1(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::ncells",
-        pyframe_ncells_method as *const (),
+        pyframe_ncells_method,
     );
 
     // LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
@@ -2659,7 +3008,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `residual_call` ops and the walker's `goto_if_not` bounds-check
     // aborts with `GotoIfNotValueNotConcrete`.
     //
-    // `push_alias_pair` (vs plain `push_fnaddr`) is required because the
+    // `push_alias_pair` (vs plain `push_raw_fnaddr`) is required because the
     // in-module call site `load_fast_var_num_to_index(var_num, op_arg)`
     // inside `pyopcode.rs` resolves to a bare-segment `CallPath`
     // (`["load_fast_var_num_to_index"]`) that the assertion-aware hint
@@ -2670,19 +3019,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::VarNum>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::load_fast_var_num_to_index;
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_interpreter::pyopcode::load_fast_var_num_to_index",
         "pyre_interpreter::load_fast_var_num_to_index",
-        load_fast_var_num_to_index as *const (),
+        load_fast_var_num_to_index,
     );
 
     let code_varnames_len: fn(&crate::CodeObject) -> usize = crate::pyopcode::code_varnames_len;
-    push_alias_pair(
+    pa1(
         &mut entries,
         "pyre_interpreter::pyopcode::code_varnames_len",
         "pyre_interpreter::code_varnames_len",
-        code_varnames_len as *const (),
+        code_varnames_len,
     );
 
     // Paired-local index decode helpers for the LoadFastLoadFast /
@@ -2693,22 +3042,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::var_nums_to_first_index;
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_interpreter::pyopcode::var_nums_to_first_index",
         "pyre_interpreter::var_nums_to_first_index",
-        var_nums_to_first_index as *const (),
+        var_nums_to_first_index,
     );
 
     let var_nums_to_second_index: fn(
         crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::var_nums_to_second_index;
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_interpreter::pyopcode::var_nums_to_second_index",
         "pyre_interpreter::var_nums_to_second_index",
-        var_nums_to_second_index as *const (),
+        var_nums_to_second_index,
     );
 
     // Opcode oparg decode helpers for two-phase lifting. These wrap
@@ -2719,11 +3068,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::Label>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::label_arg_to_usize;
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_interpreter::pyopcode::label_arg_to_usize",
         "pyre_interpreter::label_arg_to_usize",
-        label_arg_to_usize as *const (),
+        label_arg_to_usize,
     );
 
     let jump_target_forward_decoded: fn(
@@ -2732,11 +3081,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::Label>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::jump_target_forward_decoded;
-    push_alias_pair(
+    pa4(
         &mut entries,
         "pyre_interpreter::pyopcode::jump_target_forward_decoded",
         "pyre_interpreter::jump_target_forward_decoded",
-        jump_target_forward_decoded as *const (),
+        jump_target_forward_decoded,
     );
 
     let jump_target_forward_from_oparg: fn(
@@ -2744,11 +3093,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         usize,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::jump_target_forward_from_oparg;
-    push_alias_pair(
+    pa3(
         &mut entries,
         "pyre_interpreter::pyopcode::jump_target_forward_from_oparg",
         "pyre_interpreter::jump_target_forward_from_oparg",
-        jump_target_forward_from_oparg as *const (),
+        jump_target_forward_from_oparg,
     );
 
     let jump_target_backward_decoded: fn(
@@ -2757,18 +3106,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::Label>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::jump_target_backward_decoded;
-    push_alias_pair(
+    pa4(
         &mut entries,
         "pyre_interpreter::pyopcode::jump_target_backward_decoded",
         "pyre_interpreter::jump_target_backward_decoded",
-        jump_target_backward_decoded as *const (),
+        jump_target_backward_decoded,
     );
 
     let binary_op_arg: fn(
         crate::bytecode::Arg<crate::bytecode::oparg::BinaryOperator>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::BinaryOperator = crate::pyopcode::binary_op_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::binary_op_arg",
         "pyre_interpreter::binary_op_arg",
@@ -2779,7 +3131,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::ComparisonOperator>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::ComparisonOperator = crate::pyopcode::comparison_op_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::comparison_op_arg",
         "pyre_interpreter::comparison_op_arg",
@@ -2790,7 +3145,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::Invert>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::Invert = crate::pyopcode::invert_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::invert_arg",
         "pyre_interpreter::invert_arg",
@@ -2801,7 +3159,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::BuildSliceArgCount>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::BuildSliceArgCount = crate::pyopcode::build_slice_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::build_slice_arg",
         "pyre_interpreter::build_slice_arg",
@@ -2812,7 +3173,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::CommonConstant>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::CommonConstant = crate::pyopcode::common_constant_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::common_constant_arg",
         "pyre_interpreter::common_constant_arg",
@@ -2823,7 +3187,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::ConvertValueOparg>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::ConvertValueOparg = crate::pyopcode::convert_value_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::convert_value_arg",
         "pyre_interpreter::convert_value_arg",
@@ -2834,7 +3201,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::SpecialMethod>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::SpecialMethod = crate::pyopcode::special_method_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::special_method_arg",
         "pyre_interpreter::special_method_arg",
@@ -2845,7 +3215,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::MakeFunctionFlag>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::MakeFunctionFlag = crate::pyopcode::make_function_flag_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::make_function_flag_arg",
         "pyre_interpreter::make_function_flag_arg",
@@ -2856,7 +3229,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction1>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::IntrinsicFunction1 = crate::pyopcode::intrinsic_function_1_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::intrinsic_function_1_arg",
         "pyre_interpreter::intrinsic_function_1_arg",
@@ -2867,7 +3243,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::IntrinsicFunction2>,
         crate::bytecode::OpArg,
     ) -> crate::bytecode::IntrinsicFunction2 = crate::pyopcode::intrinsic_function_2_arg;
-    push_alias_pair(
+    // ABI-UNSOUND: the result is an ADT. `return_type_string_to_value_type`
+    // classifies every type name it does not know as `Type::Ref`, so this
+    // one-byte enum is read back as a reference.
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_interpreter::pyopcode::intrinsic_function_2_arg",
         "pyre_interpreter::intrinsic_function_2_arg",
@@ -2878,11 +3257,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::bytecode::Arg<crate::bytecode::oparg::RaiseKind>,
         crate::bytecode::OpArg,
     ) -> usize = crate::pyopcode::raise_kind_arg_as_usize;
-    push_alias_pair(
+    pa2(
         &mut entries,
         "pyre_interpreter::pyopcode::raise_kind_arg_as_usize",
         "pyre_interpreter::raise_kind_arg_as_usize",
-        raise_kind_arg_as_usize as *const (),
+        raise_kind_arg_as_usize,
     );
 
     // `PyError::type_error` deliberately remains unpublished: its by-value
@@ -2895,10 +3274,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `["PyError", "to_exc_object"]` after the crate segment is stripped.
     let pyerror_to_exc_object: fn(&mut crate::PyError) -> pyre_object::PyObjectRef =
         crate::PyError::to_exc_object;
-    push_fnaddr(
+    p1(
         &mut entries,
         "pyre_interpreter::PyError::to_exc_object",
-        pyerror_to_exc_object as *const (),
+        pyerror_to_exc_object,
     );
 
     // RPython convention (cross-reference `support.py:255-271` for
@@ -2959,15 +3338,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //     reachable would be a silent semantic regression.
     // See the TODO block at
     // `call.rs::find_all_graphs_bfs` for the convergence path.
-    push_fnaddr(
+    cp2(
         &mut entries,
         "_ll_2_int_floordiv",
-        majit_metainterp::blackhole::_ll_2_int_floordiv as *const (),
+        majit_metainterp::blackhole::_ll_2_int_floordiv,
     );
-    push_fnaddr(
+    cp2(
         &mut entries,
         "_ll_2_int_mod",
-        majit_metainterp::blackhole::_ll_2_int_mod as *const (),
+        majit_metainterp::blackhole::_ll_2_int_mod,
     );
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
@@ -2980,17 +3359,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // alias is what `CallTarget::function_path(["cast_uint_to_float"])`
     // resolves against after `register_macro_helper_trace_fnaddr`
     // strips the crate segment.
-    push_alias_pair(
+    pa1(
         &mut entries,
         "majit_metainterp::blackhole::cast_uint_to_float",
         "majit_metainterp::cast_uint_to_float",
-        majit_metainterp::blackhole::cast_uint_to_float as *const (),
+        majit_metainterp::blackhole::cast_uint_to_float,
     );
-    push_alias_pair(
+    pa1(
         &mut entries,
         "majit_metainterp::blackhole::cast_float_to_uint",
         "majit_metainterp::cast_float_to_uint",
-        majit_metainterp::blackhole::cast_float_to_uint as *const (),
+        majit_metainterp::blackhole::cast_float_to_uint,
     );
 
     // `_ll_2_str_eq_nonnull` (`rpython/jit/codewriter/support.py-
