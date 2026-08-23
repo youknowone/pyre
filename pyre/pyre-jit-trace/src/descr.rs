@@ -6575,6 +6575,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("unicodeobject::W_UnicodeObjectUser", || {
         LazyLock::force(&W_UNICODE_USER_DESCR_GROUP);
     }),
+    ("bytesobject::W_BytesObject", || {
+        LazyLock::force(&W_BYTES_DESCR_GROUP);
+    }),
+    ("bytearrayobject::W_BytearrayObject", || {
+        LazyLock::force(&W_BYTEARRAY_DESCR_GROUP);
+    }),
     ("functional::W_IntRangeIterator", || {
         LazyLock::force(&RANGE_ITER_DESCR_GROUP);
     }),
