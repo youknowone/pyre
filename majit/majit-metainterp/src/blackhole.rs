@@ -8219,7 +8219,11 @@ fn handler_residual_call_r_v(
 /// architectural item; not in scope here because the change cascades
 /// through the Backend trait's `Send + Sync` bound and every callsite
 /// that holds `&'static dyn Backend` today.
-#[cfg(any(feature = "dynasm", feature = "cranelift"))]
+// Exactly the condition under which `BackendImpl` resolves: cranelift or
+// dynasm off wasm32, and unconditionally on wasm32, where it is
+// `WasmBackend`. A narrower gate here leaves `bh.cpu` unset on wasm and
+// every vable handler trips `expect("cpu not set")`.
+#[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
 pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
     // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
     // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs`)
@@ -8278,7 +8282,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // `bh.cpu.expect("cpu not set")` once their setup_insns entries land.
     // The leaked instance services only stateless GC reads;
     // the residual_call (`bh_call_*`) prereq audit is pending.
-    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     {
         builder.cpu = Some(pyre_production_cpu());
     }

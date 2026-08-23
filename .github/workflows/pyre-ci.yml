@@ -409,8 +409,11 @@ jobs:
       # the format cannot silently turn every consumer into "not checked". It
       # is `#[ignore]`d because it spawns `python3`, which is why it is pinned
       # to Linux: `python3` is not a name that resolves on the windows runner.
+      # `prepass` is named because `--no-default-features` applies to the
+      # selected package: without it the build script writes placeholders and
+      # refuses outside an LLBC extraction.
       run: |
-        cargo test --no-default-features --features dynasm \
+        cargo test --no-default-features --features dynasm,prepass \
           -p pyre-jit-trace --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)

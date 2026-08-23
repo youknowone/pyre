@@ -150,14 +150,40 @@ WASM_TIMEOUT_SCALE = 4.0
 # 4x when 3x was collecting per-fixture `max-wasm-ratio` allowances one at a
 # time (fannkuch, fib_recursive, raise_catch_loop,
 # short_circuit_value_kept_stack) rather than measuring anything, and came back
-# to 4.0 once every one of those allowances had been removed and the fixtures
+# to 3.5 once every one of those allowances had been removed and the fixtures
 # that still exceeded it -- fib_recursive and loop_callee_shared_mutation, both
-# bound by CALL_ASSEMBLER returns -- were fixed rather than exempted. It went to
-# 3.8 for str_getitem_len_hot, which measured 4.1x on ubuntu and stayed red
-# under the wider ceiling anyway; that fixture reads 2.9x once its bridge stops
-# crossing modules once per iteration, so the ceiling comes back down with it.
-# No fixture carries an allowance today.
+# bound by CALL_ASSEMBLER returns -- were fixed rather than exempted. It then
+# went 3.5 -> 3.8 -> 4.0 chasing str_getitem_len_hot, which measured 4.1x on
+# ubuntu and stayed red under each wider ceiling anyway; that fixture reads
+# 2.9x now that its bridge has stopped crossing modules once per iteration, and
+# its allowance is gone, so it is not what holds the ceiling up any more.
+#
+# What does is the rest of the census, and it is worth stating because the
+# ceiling has now been widened twice by a fixture that was never going to be
+# caught by widening it. Two ubuntu runs of one base gate 299 fixtures between
+# them. Outside the two that still carry an allowance (builtin_folds_hot
+# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst is foriter_make_function_body at
+# 3.74x, then short_circuit_boxed_int_cross_fn 3.0x/3.5x and
+# pickle_terminal_raise_resume steady at 3.4x.
+#
+# Under the highest-observed-plus-15% rule the allowances are fitted with, that
+# 3.74x asks for 4.30x -- ABOVE this constant. 4.0 is therefore not slack: it
+# leaves its worst gated fixture 7% of headroom where the rule wants 15%, and
+# short_circuit_boxed_int_cross_fn's own 0.49x swing between those two runs is
+# the scale that headroom is being measured against. ⛔That is a reason to fix
+# or exempt foriter_make_function_body, NOT to raise the constant to 4.3: the
+# ceiling has been widened for a fixture twice already and stayed red both
+# times.
+#
+# Census the union of runs, not their intersection. A fixture whose jit-stats
+# gate fails prints SNAPDIFF where its time and ratio go, so it leaves the table
+# of whichever run it failed in -- which is exactly how foriter_make_function_body
+# stayed out of the first version of this paragraph, and 3.5 looked reachable.
 WASM_MAX_DYNASM_RATIO = 4.0
+# The headroom every `max-wasm-ratio` allowance is fitted with, and the same
+# margin the summary requires before it will call one outgrown -- a fixture
+# reading just under the ceiling is not one that can lose its allowance.
+WASM_RATIO_FIT_HEADROOM = 1.15
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x
@@ -206,14 +232,31 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # their gates at once.  The estimate has to come from the same load conditions
 # as the run it is subtracted from.
 #
-# That last condition is the one this measurement cannot enforce, so the median
-# is printed with the samples it was drawn from ([min..max]).  Startup is
-# measured once, upfront, and then subtracted from benches that run for the
-# rest of the job, so it can come from a load window the benches never saw:
-# one macos job read every interpreter's startup at about twice the
-# neighbouring job's (dynasm 0.151s against 0.066s) while its raw bench times
-# moved by a fifth of that, and a median printed alone shows none of it.
+# That last condition is what STARTUP_REFRESH_S exists to meet.  A single
+# upfront measurement is subtracted from benches that run for the rest of the
+# job, so it can come from a load window those benches never saw: one macos job
+# read every interpreter's startup at about twice the neighbouring job's
+# (dynasm 0.151s against 0.066s) while its raw bench times moved by a fifth of
+# that, which lands whole in `exec` and collapsed a 0.074s exec to 0.009s.
+# Re-measuring on a timer keeps the subtrahend within one interval of the run
+# it is taken from, and every pass prints the samples it was drawn from
+# ([min..max]) so the drift is readable in the log rather than inferred from a
+# neighbouring job.
 STARTUP_SAMPLES = 5
+# Re-measured no more often than this, and only at a fixture boundary: the
+# pairing argument above requires a fixture's numerator and denominator to be
+# reduced by the SAME estimate, which a refresh between one fixture's backends
+# would break.
+#
+# Sized against the phase it has to resolve, which is NOT the job's wall time:
+# of a ~50min ubuntu job, the part between the startup line and the last
+# comparison is 592s (macos 402s, windows 661s) -- the rest is cargo.  Over
+# that, 300s bought 1 refresh on ubuntu and macos; 120s buys 4/3/5, and each
+# pass costs one empty-program spawn per interpreter per sample, which the
+# pass's own line reports so this can be re-sized from a measurement rather
+# than an estimate.  Lengthening it trades that resolution back for an estimate
+# allowed to drift further from what it is subtracted from.
+STARTUP_REFRESH_S = 120
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # `exec` is `bench - startup`, and startup is a measured median rather than a
 # constant, so whatever the estimate is off by lands whole in `exec`.  That
@@ -1613,15 +1656,25 @@ def wasm_ratio_gate(path):
     a Rust heap the wasm path does not yet collect, so a loop dominated by that
     work runs several times dynasm's execution time for a reason that is
     structural rather than a regression. The allowances are set at the highest
-    ratio observed plus 15%, and each fixture records the ratios it was fitted
-    to. ubuntu-24.04 is the only runner that builds wasm, so it supplies most of
-    them; a fixture sitting on the gate locally is fitted here instead.
+    ratio observed plus 15% (`WASM_RATIO_FIT_HEADROOM`, which `print_summary`
+    also requires before it will call an allowance outgrown), and each fixture
+    records the ratios it was fitted to. ubuntu-24.04 is the only runner that
+    builds wasm, so it supplies most of them; a fixture sitting on the gate
+    locally is fitted here instead, which is why an allowance can name a host
+    no CI run measures.
 
-    15% rather than the ~3% ubuntu shows between runs because the ratio moves
-    with host load even though both sides are user-CPU and measured in the same
-    invocation: fannkuch reads 2.9x on an idle machine here and 3.1x on the same
-    machine under a load average of 41. An allowance fitted to an idle reading
-    would be a gate that fails on a busy runner.
+    15% because the ratio moves with host load even though both sides are
+    user-CPU and measured in the same invocation: fannkuch reads 2.9x on an
+    idle machine here and 3.1x on the same machine under a load average of 41.
+    An allowance fitted to an idle reading would be a gate that fails on a busy
+    runner.
+
+    It is a p90 and not a safety factor, which this paragraph got wrong while
+    it cited "~3% between runs": over the 273 fixtures two ubuntu runs of one
+    base both gate, |delta|/max has median 4.7%, p75 8.8%, p90 14.9% and a tail
+    to 67% (mapdict_frozen_unboxing_fold 1.79x then 0.59x). An allowance that
+    clears its fixture's highest reading by less than 15% is fitted to one
+    sample rather than to the instrument.
     """
     found = _header_directive(path, "# pyre-check: max-wasm-ratio=")
     if found is None:
@@ -2023,6 +2076,9 @@ class Check:
         # interpreter/backend key -> measured empty-program user-CPU startup (s).
         # Populated by measure_startups(); missing key => 0.0 (no subtraction).
         self.startup = {}
+        # time.monotonic() of the pass that produced self.startup; None until
+        # the first one. Read by maybe_refresh_startups() to age the estimate.
+        self.startup_sampled_at = None
         # (backend, bench name) -> raw user-CPU of that backend's run in THIS
         # invocation. Feeds the wasm-vs-dynasm gate, which needs a baseline
         # measured on the same host under the same load; a recorded one would
@@ -2033,12 +2089,18 @@ class Check:
         # applied. Reported in the summary: an unevaluated gate otherwise
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
-        # (bench name, ceiling) for fixtures whose header raised the ratio
-        # above WASM_MAX_DYNASM_RATIO, for the same reason as the line above: a
-        # gate widened for a fixture and a gate the fixture satisfied both print
-        # green. Reported from `print_summary` rather than beside that line,
-        # because three of the fixtures carrying an allowance are regular
-        # benches and a `--no-synthetic` run would otherwise not name them.
+        # (bench name, ceiling, measured ratio or None) for fixtures whose
+        # header raised the ratio above WASM_MAX_DYNASM_RATIO, for the same
+        # reason as the line above: a gate widened for a fixture and a gate the
+        # fixture satisfied both print green. The measured ratio rides along
+        # because an allowance the backend has since outgrown is invisible
+        # otherwise -- one sat at 4.8x over a fixture measuring 2.9x, and
+        # finding that took parsing 434 comparison rows out of a job log.
+        # `None` means the gate was declined this run, so there is no ratio to
+        # compare it against. Reported from `print_summary` rather than beside
+        # that line, because three of the fixtures carrying an allowance are
+        # regular benches and a `--no-synthetic` run would otherwise not name
+        # them.
         self.wasm_ratio_allowed = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
@@ -2094,18 +2156,18 @@ class Check:
             return WIN_NATIVE_TIMEOUT_SCALE * self.args.timeout_scale
         return self.args.timeout_scale
 
-    def measure_startups(self):
-        """Measure each timed interpreter/backend's empty-program user-CPU cost.
+    def _sample_startups(self):
+        """One sampling pass: ({key: [user-CPU seconds]}, wall seconds spent).
 
-        Runs an empty script STARTUP_SAMPLES times per interpreter, records
-        the median user-CPU in self.startup and prints it beside the range its
-        samples spanned. This is the fixed per-process cost (interpreter init;
-        for wasm, wasmtime recompiling the module) added to every bench
-        regardless of workload; subtracting it yields an execution-only
-        comparison. No-op under --no-startup-subtract.
+        A target whose empty program exits non-zero yields an empty list, which
+        `_adopt_startups` reads as "this pass has no estimate for it" rather
+        than as zero.
+
+        The wall cost is returned so every pass states its own price in the
+        log: it is what STARTUP_REFRESH_S is traded against, and it is paid per
+        interpreter, so it moves with the backend set and the host.
         """
-        if self.args.no_startup_subtract:
-            return
+        started = time.monotonic()
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False
         ) as handle:
@@ -2120,35 +2182,83 @@ class Check:
                     targets.append(
                         (backend, [self._pyre(backend), empty_path], pyre_env())
                     )
-            parts = []
+            samples = {}
             for key, cmd, env in targets:
-                samples = []
+                got = []
                 for _ in range(STARTUP_SAMPLES):
                     _out, elapsed, code, _err = run_timed(
                         cmd, timeout_s=60, env=env,
                     )
                     if code != 0:
-                        samples = []
+                        got = []
                         break
-                    samples.append(elapsed)
-                startup = statistics.median(samples) if samples else 0.0
-                self.startup[key] = startup
-                spread = (
-                    f"[{min(samples):.3f}..{max(samples):.3f}]"
-                    if samples else ""
-                )
-                parts.append(f"{key}={startup:.3f}s{spread}")
-            print(dim(
-                f"startup (empty-program user-CPU, median {STARTUP_SAMPLES}, "
-                f"shown as median[min..max]; ratios/gates are "
-                f"execution-only): "
-                + " ".join(parts)
-            ))
+                    got.append(elapsed)
+                samples[key] = got
+            return samples, time.monotonic() - started
         finally:
             try:
                 os.unlink(empty_path)
             except OSError:
                 pass
+
+    def _adopt_startups(self, samples):
+        """Take a pass as the current estimate; return its rendered parts.
+
+        A target this pass failed to sample keeps the estimate it already had:
+        on the first pass that is 0.0, which is the no-subtraction default, and
+        on a refresh it is the previous pass's, which beats dropping to zero
+        mid-job and inflating every later exec time for that interpreter. Such
+        a target is rendered `[unsampled]` so the value is not read as fresh.
+        """
+        parts = []
+        for key, got in samples.items():
+            if got:
+                self.startup[key] = statistics.median(got)
+                spread = f"[{min(got):.3f}..{max(got):.3f}]"
+            else:
+                spread = "[unsampled]"
+            parts.append(f"{key}={self.startup.get(key, 0.0):.3f}s{spread}")
+        self.startup_sampled_at = time.monotonic()
+        return " ".join(parts)
+
+    def measure_startups(self):
+        """Measure each timed interpreter/backend's empty-program user-CPU cost.
+
+        Runs an empty script STARTUP_SAMPLES times per interpreter, records
+        the median user-CPU in self.startup and prints it beside the range its
+        samples spanned. This is the fixed per-process cost (interpreter init;
+        for wasm, wasmtime recompiling the module) added to every bench
+        regardless of workload; subtracting it yields an execution-only
+        comparison. Re-measured during the run by `maybe_refresh_startups`.
+        No-op under --no-startup-subtract.
+        """
+        if self.args.no_startup_subtract:
+            return
+        samples, cost = self._sample_startups()
+        print(dim(
+            f"startup (empty-program user-CPU, median {STARTUP_SAMPLES} "
+            f"in {cost:.1f}s, shown as median[min..max]; ratios/gates are "
+            f"execution-only): "
+            + self._adopt_startups(samples)
+        ))
+
+    def maybe_refresh_startups(self):
+        """Re-measure startup once the estimate in hand is STARTUP_REFRESH_S old.
+
+        Call at a fixture boundary only -- see STARTUP_REFRESH_S. Prints the
+        pass in the same shape as the opening line, so the job's log carries
+        the whole series and a suspicious `exec` can be read against the
+        estimate that was actually subtracted from it.
+        """
+        if self.args.no_startup_subtract or self.startup_sampled_at is None:
+            return
+        if time.monotonic() - self.startup_sampled_at < STARTUP_REFRESH_S:
+            return
+        samples, cost = self._sample_startups()
+        print(dim(
+            f"startup re-measured in {cost:.1f}s (median[min..max]): "
+            + self._adopt_startups(samples)
+        ))
 
     def _exec_time(self, key, t):
         """Startup-subtracted user-CPU for interpreter *key*, floored.
@@ -3150,12 +3260,13 @@ class Check:
             # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
             # something the same size as its own error.
             ceiling = wasm_ratio_gate(script) or WASM_MAX_DYNASM_RATIO
-            if ceiling > WASM_MAX_DYNASM_RATIO:
-                self.wasm_ratio_allowed.append((name, ceiling))
+            allowed = ceiling > WASM_MAX_DYNASM_RATIO
             if dynasm_exec in (None, "-") or (
                 float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
             ):
                 self.wasm_ratio_ungated.append(name)
+                if allowed:
+                    self.wasm_ratio_allowed.append((name, ceiling, None))
             else:
                 # This ceiling is meant to come back down as the backend closes
                 # the gap, so it has to mean the number it states: a standing
@@ -3173,6 +3284,15 @@ class Check:
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
                     )
                 )
+                if allowed:
+                    # The values the gate judged, not the first sample: a
+                    # median retry is what an allowance fitted to a slow
+                    # reading would otherwise be reported against.
+                    self.wasm_ratio_allowed.append((
+                        name, ceiling,
+                        float(self._exec_time(backend, checked_elapsed))
+                        / float(self._exec_time("dynasm", checked_baseline)),
+                    ))
                 if not passed:
                     detail = self._gate_fail_detail(
                         backend, "dynasm", checked_elapsed, checked_baseline,
@@ -3248,6 +3368,7 @@ class Check:
         skip_backends=(), *, wasm_float_tol=False,
     ):
         """Run one benchmark on each enabled backend."""
+        self.maybe_refresh_startups()
         need_cpython = False
         if (
             self.enabled("dynasm")
@@ -3499,6 +3620,7 @@ class Check:
         return False
 
     def run_synthetic_bench(self, path, timeout):
+        self.maybe_refresh_startups()
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
         try:
@@ -3735,9 +3857,12 @@ class Check:
         print()
 
         if self.wasm_ratio_allowed:
+            rows = sorted(set(self.wasm_ratio_allowed))
             names = ", ".join(
-                f"{name} {ceiling:g}x"
-                for name, ceiling in sorted(set(self.wasm_ratio_allowed))
+                f"{name} {ceiling:g}x "
+                + (f"(measured {measured:.1f}x)" if measured is not None
+                   else "(gate declined this run)")
+                for name, ceiling, measured in rows
             )
             print(
                 dim(
@@ -3745,6 +3870,27 @@ class Check:
                     f"`# pyre-check: max-wasm-ratio` for: {names}"
                 )
             )
+            # `* WASM_RATIO_FIT_HEADROOM` and not a bare comparison: without
+            # it math_folds_hot, which reads 3.9x under a 4.0 ceiling, is named
+            # as outgrown on the strength of 0.07x. The caveat is there because
+            # a run only measures its own host and an allowance may be fitted
+            # to another -- math_folds_hot's 13x is a darwin-arm64 reading of
+            # 11.3x, which no ubuntu run can see.
+            outgrown = [
+                n for n, _, m in rows
+                if m is not None
+                and m * WASM_RATIO_FIT_HEADROOM <= WASM_MAX_DYNASM_RATIO
+            ]
+            if outgrown:
+                print(
+                    dim(
+                        f"  {len(outgrown)} of those measured far enough under "
+                        f"{WASM_MAX_DYNASM_RATIO:g}x on THIS host to fit "
+                        f"without an allowance; check what host the fixture's "
+                        f"note fitted it to before removing: "
+                        f"{', '.join(outgrown)}"
+                    )
+                )
 
         if self.results:
             print("─" * 53)
@@ -3986,9 +4132,16 @@ def main():
     print(bold("pyre pre-merge check"))
     chk.print_backend_config()
     print()
-    chk.measure_startups()
+    # After the warmup, not before it. The startup pass runs on whatever state
+    # the cargo build left behind -- cold page cache for each binary, and a
+    # machine that has just had every core busy -- while the benches it is
+    # subtracted from run one process at a time on paged-in binaries. The
+    # warmup is the one thing between the two, so it belongs on the build's
+    # side of the measurement.
     if not args.synthetic_only:
         chk.warmup(f"{BENCH_DIR}/int_loop.py")
+    chk.measure_startups()
+    if not args.synthetic_only:
         print()
 
         B = BENCH_DIR
