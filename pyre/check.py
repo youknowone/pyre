@@ -1165,6 +1165,30 @@ JITSTATS_BADNESS_FIELDS = (
     "field_pos_spec_misplaced",
     "field_pos_attached_misplaced",
     "fbw_store_journal_rollback_failed",
+    # Three of the four `fbw_diag` tripwires. Unlike the rest of that line's
+    # tallies these are not workload counts: each marks a leg the walker takes
+    # only when a cheaper one was unavailable, and `trace.rs` says of them that
+    # a nonzero value "is itself the news". Their healthy value is exactly
+    # zero, which is what makes them badness counters and bars them from being
+    # banded.
+    #
+    # Listing a counter that is zero on both sides costs no re-record:
+    # `_jit_stats_change` reads a field missing from either side as "0", so
+    # every existing baseline keeps matching without being touched. That is
+    # what makes arming these free, and it is also why each one's zero has to
+    # be established on the tree first — a counter that is nonzero anywhere
+    # fails every baseline that does not name it.
+    #
+    # Established by running the full corpus on all three backends with these
+    # listed: zero fixture diffs and no baseline written. `fbw_midbody_latch`
+    # is deliberately NOT here — the same run found it at 1 on five fixtures
+    # natively and six on wasm, so its leg is now reachable and gating it at
+    # zero would be asserting something false. Its hazardous subset,
+    # `fbw_midbody_latch_new_unjournaled`, is still zero everywhere, which is
+    # the half that matters and the half that is armed.
+    "fbw_midbody_latch_new_unjournaled",
+    "fbw_escape_plain_fallback",
+    "fbw_escape_plain_fallback_unclean",
 )
 
 # A zero-valued badness counter is meaningful only if its source census ran.
@@ -1253,22 +1277,32 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # removing it. It is printed on the `[jit-stats]` line either way, so a reader
 # diagnosing a `guard_failures` move can still see it.
 
-# The rest of the `fbw_diag` tallies — `fbw_walks`, the two `fbw_midbody_latch*`
-# and `fbw_escape_plain_fallback*` pairs, `fbw_escape_*`, `fbw_force_*` — are
-# deliberately absent too, and unlike `back_edge_polls` that is a decision to
-# revisit rather than a rule. They were emitted with BARE keys (`portal_only`,
+# The remaining `fbw_diag` tallies — `fbw_walks`, `fbw_escape_*`, `fbw_force_*`
+# — stay absent, and unlike `back_edge_polls` that is a decision to revisit
+# rather than a rule. They were emitted with BARE keys (`portal_only`,
 # `by_portal`, …) until they were namespaced, so no committed baseline carries
-# them under any spelling. Two reasons to leave them ungated for now:
+# them under any spelling. Two reasons to leave them ungated for now, and the
+# three tripwires above are listed precisely because NEITHER reason reaches
+# them:
 #
 # * They are workload counts, not badness counters: none has a healthy value,
 #   and neither direction is a defect on its own — the same reason
 #   `bridges_compiled` sits in neither regression list. Gating needs a polarity,
-#   and nothing here has measured one yet.
+#   and nothing here has measured one yet. The tripwires do have one: zero.
 # * A count that is nonzero on the fbw fixtures reads as 0 on the baseline side
 #   the moment it is listed here (`_jit_stats_change` treats an absent field as
 #   "0"), so adding one would fail every affected baseline until all of them are
 #   re-recorded. That re-record is the decision, and it should be made
 #   deliberately with a polarity in hand, not as a side effect of naming a key.
+#   A counter that is zero on BOTH sides costs no such re-record, which is why
+#   the tripwires could be armed without touching a baseline.
+#
+# `fbw_midbody_latch` is ungated for a third reason that is neither of those.
+# It IS a tripwire with a polarity, and its zero was true when it was added —
+# but the corpus now reaches its leg on five fixtures natively and six on wasm,
+# each exactly once. So arming it would assert a falsehood, and recording it
+# would pin a reachability nobody has adjudicated yet. Its hazardous subset is
+# armed above and still zero, which bounds what the open question can cost.
 #
 # They are on the `[jit-stats] fbw_diag` line on both the native and the wasm
 # reader, so a human can read them without a gate.
