@@ -100,10 +100,19 @@ pub mod frame_locals_proxy {
         /// - a `STORE_FAST` in the body lands in the shadow while a read
         ///   through the proxy answers from the array.
         ///
-        /// So every accessor that reaches `locals_cells_stack_w` calls this --
-        /// the write, the getitem scan and the snapshot.  [`Self::frame`] itself
-        /// does not: [`Self::fast_local_index`] goes through it only for `code`,
-        /// which is not a redirected field.
+        /// Only the write takes this.  **The read direction cannot, yet**, and
+        /// the reason is the missing injection rather than a preference:
+        /// `hook_access_field` runs in residual code, while inside a trace the
+        /// same accesses are *redirected* to the shadow, so upstream never
+        /// forces from a traced read -- `pyframe.py fast2locals` is
+        /// `@jit.unroll_safe` for exactly that reason.  Pyre cannot tell the two
+        /// apart at this call, so forcing on every read forces the traced ones
+        /// too; measured, that aborts the loop where a hot `len(fr.f_locals)` or
+        /// `fr.f_locals["x"]` sits in the traced body.  Telling them apart needs
+        /// the redirected-field injection itself.
+        ///
+        /// [`Self::frame`] does not take it either: [`Self::fast_local_index`]
+        /// goes through it only for `code`, which is not a redirected field.
         ///
         /// The `vable_token` test is `virtualizable.py`'s, and it is required
         /// rather than a shortcut:
@@ -136,10 +145,7 @@ pub mod frame_locals_proxy {
 
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
-            // The snapshot copies `locals_cells_stack_w`, so materialize it
-            // first.  Nothing unrooted is live across the force here: the proxy
-            // payload is born non-moving and the frame is anchored.
-            self.force_locals();
+            // No force here; see [`Self::force_locals`] on the read direction.
             self.frame().frame_locals_proxy_snapshot()
         }
 
@@ -288,9 +294,7 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
-            // The scan below reads `locals_cells_stack_w`, so materialize it
-            // first; `key` is rooted above because the force can collect.
-            self.force_locals();
+            // No force here; see [`Self::force_locals`] on the read direction.
             // Hashing runs before the scan, so an unhashable key is a
             // `TypeError` even for a frame with no locals to compare against.
             let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
