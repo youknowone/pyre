@@ -326,8 +326,7 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
     for fd in llbc.iter_local_fns() {
         let path = fd.item_meta.name_path();
         if path.contains("frame_locals_proxy_snapshot") {
-            let g = lower_fun_decl(&llbc, fd)
-                .unwrap_or_else(|e| panic!("lower {path}: {e:?}"));
+            let g = lower_fun_decl(&llbc, fd).unwrap_or_else(|e| panic!("lower {path}: {e:?}"));
             eprintln!("[vable-probe] lowered {path}");
             graphs.push(g);
         }

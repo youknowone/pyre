@@ -10280,7 +10280,9 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
-    ctx.trace_ctx.heap_cache_mut().nullity_now_known(read, false);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .nullity_now_known(read, false);
     Ok(())
 }
 

@@ -377,7 +377,9 @@ pub unsafe fn register_mutator_extra_area(
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_extra_area called before register_mutator");
-    entry.extra_areas.push(MutatorExtraArea { walk, data, name });
+    entry
+        .extra_areas
+        .push(MutatorExtraArea { walk, data, name });
 }
 
 /// Append an owner-keyed-table pruner to the current registered mutator.
@@ -1672,7 +1674,11 @@ mod tests {
         // SAFETY: `root` remains valid until unregistration, and `walk_cell`
         // derives its sole dereference from the supplied `data` pointer.
         unsafe {
-            register_mutator_extra_area(walk_cell, &mut root as *mut GcRef as *const (), "test_cell");
+            register_mutator_extra_area(
+                walk_cell,
+                &mut root as *mut GcRef as *const (),
+                "test_cell",
+            );
         }
         walk_my_extra_areas(|gcref| gcref.0 += 0x100);
         unregister_mutator();

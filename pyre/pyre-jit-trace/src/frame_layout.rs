@@ -128,9 +128,7 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
         if *token_ptr == 0 {
             return;
         }
-        pyre_interpreter::executioncontext::force_frame(
-            ptr as *mut pyre_interpreter::PyFrame,
-        );
+        pyre_interpreter::executioncontext::force_frame(ptr as *mut pyre_interpreter::PyFrame);
         if *token_ptr != 0 {
             if majit_metainterp::majit_log_enabled() {
                 let token = *token_ptr;

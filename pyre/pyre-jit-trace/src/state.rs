@@ -1455,8 +1455,7 @@ pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
 /// both halves' documented invariants actually assert.
 pub static PROBE14_CODE_SLOTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn probe14_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1501,12 +1500,7 @@ fn walk_jitcode_constants_refs_in(
             let mut gcref = majit_ir::GcRef(unsafe { *cell } as usize);
             let before = gcref.0;
             if probe {
-                probe14_note_nursery(
-                    "CONSTANT",
-                    before,
-                    jc.payload.jitcode.name(),
-                    jitcode_index,
-                );
+                probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
             }
             visitor(&mut gcref);
             if gcref.0 != before {

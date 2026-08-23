@@ -4832,8 +4832,16 @@ fn register_thread_root_areas() {
         register(rd_consts_root_walker_area, jit_driver, "rd_consts");
         register(partial_trace_root_walker_area, jit_driver, "partial_trace");
         register(active_trace_root_walker_area, jit_driver, "active_trace");
-        register(compile_snapshot_root_walker_area, jit_driver, "compile_snapshot");
-        register(forced_virtuals_root_walker_area, jit_driver, "forced_virtuals");
+        register(
+            compile_snapshot_root_walker_area,
+            jit_driver,
+            "compile_snapshot",
+        );
+        register(
+            forced_virtuals_root_walker_area,
+            jit_driver,
+            "forced_virtuals",
+        );
         // The ephemeron half of the walker above, on the same `data` so the
         // prune reaches exactly the drivers the root walk reaches.
         majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
