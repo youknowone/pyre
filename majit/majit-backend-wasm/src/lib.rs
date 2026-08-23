@@ -92,8 +92,10 @@ use std::sync::{Arc, Mutex};
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
 /// has been entered `INLINE_TRIP_THRESHOLD` times; 55 = that trip fired and the
-/// merge was attempted.
-pub static BRIDGE_DIAG: [AtomicU64; 56] = [const { AtomicU64::new(0) }; 56];
+/// merge was attempted; 56 = eligible but not deferrable, because the region
+/// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
+/// it reads.
+pub static BRIDGE_DIAG: [AtomicU64; 57] = [const { AtomicU64::new(0) }; 57];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -1789,10 +1791,6 @@ struct PendingInline {
     /// The loop this region merges into.
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
-    /// The constants pool as it stood for the bridge's own compile.
-    /// `set_constants_pool` clears and refills the backend's pool per trace, so
-    /// by the time the callback fires it describes some unrelated trace.
-    constants: indexmap::IndexMap<u32, i64>,
 }
 
 thread_local! {
@@ -1810,6 +1808,58 @@ thread_local! {
     /// trip only appends here, and [`take_tripped_inlines`]'s caller installs
     /// the merge once the trace has returned.
     static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops a registered [`PendingInline`] unless the bridge whose probe would
+/// fire its callback actually got published.
+///
+/// Registration has to precede the module build — the probe is one of the
+/// build's inputs — so a build or host rejection after it would otherwise leave
+/// an entry nothing can ever reach, holding the owner's `Arc<JitCellToken>`,
+/// the copied region and its pool for the life of the thread, once per
+/// rejected attempt. The counter stays leaked either way; it is eight bytes,
+/// and on this path no module was published to increment it.
+struct PendingInlineGuard(Option<i64>);
+
+impl PendingInlineGuard {
+    /// The bridge is published, so the entry is the callback's to remove.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PendingInlineGuard {
+    fn drop(&mut self) {
+        if let Some(pending_id) = self.0 {
+            PENDING_INLINES.with(|pending| pending.borrow_mut().remove(&pending_id));
+        }
+    }
+}
+
+/// The merged-stream exit ordinal of a guard belonging to a region already
+/// merged into this loop, or `None` when `trace_id` names no such region.
+///
+/// `InlinedBridge::source_fail_index` indexes the merged stream — the owner's
+/// own ops followed by every region's, in attach order — whose exits are
+/// numbered across the whole of it. A guard in the owner itself is already at
+/// its own ordinal; a region's guards start past the owner's and past every
+/// region attached before it. The answer stays valid however long a deferred
+/// merge waits, because merging only ever appends.
+fn merged_region_fail_index(
+    inputs: &codegen::ModuleBuildInputs,
+    trace_id: u64,
+    region_fail_index: u32,
+) -> Option<u32> {
+    let mut ordinal = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops);
+    for region in &inputs.inlined_bridges {
+        let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
+        if region.trace_id == trace_id {
+            return ((region_fail_index as usize) < count)
+                .then(|| (ordinal + region_fail_index as usize) as u32);
+        }
+        ordinal += count;
+    }
+    None
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
@@ -1834,7 +1884,6 @@ pub fn take_tripped_inlines() -> Vec<i64> {
 fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
-    constants: indexmap::IndexMap<u32, i64>,
     cells_base_ptr: u32,
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
@@ -1845,14 +1894,9 @@ fn register_pending_inline(
         id
     });
     PENDING_INLINES.with(|pending| {
-        pending.borrow_mut().insert(
-            pending_id,
-            PendingInline {
-                owner,
-                region,
-                constants,
-            },
-        )
+        pending
+            .borrow_mut()
+            .insert(pending_id, PendingInline { owner, region })
     });
     codegen::InlineTripProbe {
         counter_addr,
@@ -1886,6 +1930,37 @@ pub fn set_ca_deopt_helper_slot(slot: u32) {
 /// Current CA deopt-helper table slot (0 = unset).
 pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
+}
+
+/// Publish the residual-call targets whose call descr describes their real
+/// wasm ABI, so codegen may lower them to a typed in-module `call_indirect`
+/// instead of the `jit_call` host trampoline.
+///
+/// This is an exact-function allow-list, not a signature inference, for the
+/// same reason [`ca_deopt_helper_slot`]'s twin in `pyre-wasm`
+/// (`direct_uniform_i64_call`) is one: a descr `Float` does not prove the wasm
+/// parameter is `f64`, and an `Int` or `Ref` beside it may be a real `i32`
+/// pointer -- `jit_bigint_to_f64_or_inf(&BigInt) -> f64` is published raw and
+/// is genuinely `(i32) -> f64`. Emitting a guessed signature traps at the
+/// `call_indirect`. A caller vouches for each address by naming the function.
+///
+/// Addresses are `fn as usize`, which on wasm32 is the table index.
+pub fn set_faithful_residual_call_addrs(addrs: &[i64]) {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
+        let mut set = set.borrow_mut();
+        set.clear();
+        set.extend(addrs.iter().copied());
+    });
+}
+
+thread_local! {
+    static FAITHFUL_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`].
+pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
 }
 
 /// Configure the dormant terminal-decline regression hook.
@@ -2134,14 +2209,9 @@ impl WasmBackend {
             return;
         };
         diag_bump(55);
-        let PendingInline {
-            owner,
-            region,
-            constants,
-            ..
-        } = pending;
+        let PendingInline { owner, region } = pending;
         let source_fail_index = region.source_fail_index;
-        if !self.install_inline_region(&owner, region, constants) {
+        if !self.install_inline_region(&owner, region) {
             // The probe cleared the dispatch cell to get here. A merge that
             // does not install leaves the out-of-line bridge as the only route
             // to that guard, so put the cell back rather than leave the guard
@@ -2184,7 +2254,6 @@ impl WasmBackend {
         &mut self,
         owner: &JitCellToken,
         mut region: codegen::InlinedBridge,
-        constants: indexmap::IndexMap<u32, i64>,
     ) -> bool {
         if owner.is_invalidated() {
             diag_bump(50);
@@ -2223,7 +2292,15 @@ impl WasmBackend {
         for region in &candidate.inlined_bridges {
             merged_ops.extend(region.ops.iter().cloned());
         }
-        candidate.constants = constants;
+        // `candidate.constants` keeps the pool of the compile that recorded
+        // these ops -- the owner's. The pool is keyed by value position, and
+        // the merge rebases every region off the owner's ids, so a region's
+        // own entries reach the build through `InlinedBridge::constants` and
+        // are replayed at the rebase offset. Assigning the merging bridge's
+        // pool here instead would leave the owner's window described by
+        // another trace's keys: an owner-only folded value loses its entry,
+        // and one the bridge happens to number the same way is seeded with the
+        // wrong bits.
         candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
         candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
         candidate.nursery = nursery_alloc_params(&merged_ops);
@@ -3724,7 +3801,7 @@ impl majit_backend::Backend for WasmBackend {
 
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
-        let mut defer_inline: Option<Arc<JitCellToken>> = None;
+        let mut defer_inline: Option<(Arc<JitCellToken>, u32)> = None;
         if inline_bridge_enabled() {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
@@ -3737,6 +3814,28 @@ impl majit_backend::Backend for WasmBackend {
             // By value: the id this compile will take, which the eager arm
             // below consumes before the last `decline` call is out of scope.
             let bridge_trace_id = self.trace_counter;
+            // `source_fail_index` is the SOURCE TRACE's own exit ordinal, and
+            // stays that everywhere else in this function: the dispatch cell,
+            // `chained_bridge_slots` and `bridge_descr_ranges` are all keyed by
+            // it, and the metainterp re-derives that key off the FailDescr. The
+            // region handed to the owner is the one thing that indexes the
+            // merged stream instead.
+            let merged_source_fail_index = if is_direct {
+                // The owner's own guards come first in the merged stream, so a
+                // direct guard's two numberings coincide.
+                Some(source_fail_index)
+            } else {
+                original_token
+                    .compiled
+                    .get()
+                    .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                    .and_then(|loop_| {
+                        let inputs = loop_.reemit.borrow();
+                        inputs.as_ref().and_then(|inputs| {
+                            merged_region_fail_index(inputs, source_trace_id, source_fail_index)
+                        })
+                    })
+            };
             let decline = |reason: &str| {
                 record_inline_decline(format!(
                     "bridge={bridge_trace_id} src={source_trace_id} fi={source_fail_index} \
@@ -3746,7 +3845,12 @@ impl majit_backend::Backend for WasmBackend {
             if original_token.is_invalidated() {
                 diag_bump(50);
                 decline("owner_invalidated");
-            } else if !is_direct {
+            } else if merged_source_fail_index.is_none() {
+                // Still out of line: the guard belongs to a bridge module of
+                // its own, so the owner's stream holds no exit for it. A guard
+                // in a region already merged into the owner is a different
+                // case — its code was emitted from the merged stream, so it is
+                // physically in this module and reachable by `br`.
                 diag_bump(33);
                 decline("not_direct");
             } else if !bridge_is_loop_closing {
@@ -3778,7 +3882,7 @@ impl majit_backend::Backend for WasmBackend {
                 if candidate
                     .inlined_bridges
                     .iter()
-                    .any(|r| r.source_fail_index == source_fail_index)
+                    .any(|r| Some(r.source_fail_index) == merged_source_fail_index)
                 {
                     diag_bump(36);
                     decline("already_owned");
@@ -3816,13 +3920,36 @@ impl majit_backend::Backend for WasmBackend {
                     // merge.
                     let outside_loop = source_in_preamble
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+                    // The `is_none` arm above already declined, so this holds.
+                    let Some(merged_fail_index) = merged_source_fail_index else {
+                        return Err(BackendError::Unsupported(
+                            "wasm backend: inline candidate without a merged-stream exit \
+                             ordinal"
+                                .into(),
+                        ));
+                    };
                     self.collect_constants_from_ops(ops);
-                    if outside_loop {
+                    if outside_loop && codegen::has_invalidation_guard(ops) {
+                        // A quasi-immutable fold's dependencies are registered
+                        // once, against whatever flag the token names when this
+                        // compile returns — the bridge's own, because deferring
+                        // takes the out-of-line path below. The merge cannot
+                        // move a registration that has already happened, so
+                        // merged, the region would read the owner's root flag
+                        // while its dependencies still hold the bridge's: a
+                        // field mutated before the trip would be forgotten, and
+                        // one mutated after would leave the fold in place. The
+                        // eager arm below has no such window — it merges before
+                        // this compile returns, so the flag it records is the
+                        // one the dependencies then attach to.
+                        diag_bump(56);
+                        decline("defer_invalidation_guard");
+                    } else if outside_loop {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
                         // trips. Everything else about this compile is the
                         // ordinary out-of-line path below.
-                        defer_inline = Some(owner);
+                        defer_inline = Some((owner, merged_fail_index));
                         diag_bump(54);
                         decline("deferred");
                     } else {
@@ -3830,7 +3957,7 @@ impl majit_backend::Backend for WasmBackend {
                         // body's fall-through and was measured and shipped
                         // merged on the spot, so it stays that way.
                         let region = codegen::InlinedBridge {
-                            source_fail_index,
+                            source_fail_index: merged_fail_index,
                             outside_loop,
                             trace_id: self.trace_counter,
                             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
@@ -3838,7 +3965,7 @@ impl majit_backend::Backend for WasmBackend {
                             gc_table_base,
                             constants: self.constants.clone(),
                         };
-                        if self.install_inline_region(&owner, region, self.constants.clone()) {
+                        if self.install_inline_region(&owner, region) {
                             self.trace_counter += 1;
                             if let Some(table) = gc_table {
                                 Self::register_gc_table(original_token, table);
@@ -3914,9 +4041,9 @@ impl majit_backend::Backend for WasmBackend {
         // the sub-bridges chained onto this bridge's guards
         // (`chained_bridge_slots`, keyed by that id) are replayed into the
         // merged region's cells when the owner is finally rebuilt.
-        let inline_trip = defer_inline.map(|owner| {
+        let inline_trip = defer_inline.map(|(owner, merged_fail_index)| {
             let region = codegen::InlinedBridge {
-                source_fail_index,
+                source_fail_index: merged_fail_index,
                 // Decided against the candidate as it stands when the merge
                 // actually runs, which may have taken more regions by then.
                 outside_loop: false,
@@ -3936,8 +4063,9 @@ impl majit_backend::Backend for WasmBackend {
                 .map_or(0, |loop_| {
                     &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32
                 });
-            register_pending_inline(owner, region, self.constants.clone(), cells_base_ptr)
+            register_pending_inline(owner, region, cells_base_ptr)
         });
+        let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
@@ -4009,6 +4137,9 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+        // Past every path that can fail with no module published: from here the
+        // probe exists and its callback owns the pending entry.
+        pending_guard.disarm();
         // Only a bridge that survived the decline above gets its reference
         // constants rooted. The table is attached to the long-lived original
         // loop token, so rooting a rejected bridge's table would keep its

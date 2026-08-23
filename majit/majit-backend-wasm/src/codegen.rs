@@ -1772,6 +1772,9 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
+/// Wasm parameter types and result type of a residual call lowered directly.
+type TypedResidualSig = (Vec<ValType>, ValType);
+
 /// If `op` is a residual float CALL with only float arguments, return its wasm
 /// parameter types — eligible for a direct `call_indirect` returning `f64`.
 /// Float-result targets are not audited for a uniform word ABI: a `Ref` or
@@ -1783,29 +1786,58 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
 ///
 /// This includes `CallMayForceF`: the wasm virtualizable is always
 /// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
-fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
+fn residual_call_float_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
     use OpCode::*;
     if !matches!(
         op.opcode,
         CallF | CallPureF | CallLoopinvariantF | CallMayForceF
+    ) && !matches!(
+        op.opcode,
+        CallI | CallPureI | CallLoopinvariantI | CallMayForceI
+    ) && !matches!(
+        op.opcode,
+        CallR | CallPureR | CallLoopinvariantR | CallMayForceR
     ) {
-        return None;
-    }
-    if op.result_type() != Type::Float {
         return None;
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Float {
+    if op.result_type() != cd.result_type() {
         return None;
     }
+    let result = match cd.result_type() {
+        Type::Float => ValType::F64,
+        Type::Int | Type::Ref => ValType::I64,
+        Type::Void => return None,
+    };
     let arg_types = cd.arg_types();
-    let mut params = Vec::with_capacity(arg_types.len());
-    for ty in arg_types {
-        if *ty != Type::Float {
+    // Every argument `f64` and an `f64` result is the shipped shape and needs
+    // no vouching: a float-only descr has no word parameter to be an `i32`
+    // pointer in disguise. Anything else -- a word beside a float, or a word
+    // result over float arguments -- is only as good as the descr, so the
+    // callee has to be named by `set_faithful_residual_call_addrs`.
+    let all_float = result == ValType::F64 && arg_types.iter().all(|t| *t == Type::Float);
+    if !all_float {
+        // Only a compile-time callee can be checked against the allow-list; a
+        // register-form func pointer is a different target on every execution.
+        let func_ptr = op.arg(0).to_opref();
+        if !func_ptr.is_constant() {
             return None;
         }
-        params.push(ValType::F64);
+        if !crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr)) {
+            return None;
+        }
+    }
+    let mut params = Vec::with_capacity(arg_types.len());
+    for ty in arg_types {
+        params.push(match ty {
+            Type::Float => ValType::F64,
+            Type::Int | Type::Ref => ValType::I64,
+            Type::Void => return None,
+        });
     }
     // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
     // descr's `arg_types` describes those call args, so the counts must match.
@@ -1813,7 +1845,7 @@ fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
     if params.len() != nargs {
         return None;
     }
-    Some(params)
+    Some((params, result))
 }
 
 /// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
@@ -1936,7 +1968,12 @@ fn has_call_ops(ops: &[Op]) -> bool {
 /// are direct under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string
 /// allocation retain the trampoline. When the direct family is disabled, all
 /// of the existing call-area users return to the trampoline baseline.
-fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
+fn has_trampoline_calls(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    emit_ca: bool,
+) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     if !WASM_DIRECT_RESIDUAL_CALL {
         return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
@@ -1954,7 +1991,7 @@ fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bo
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
             direct_helper_i64_arity(op, &ref_values).is_none()
-                && residual_call_float_sig(op).is_none()
+                && residual_call_float_sig(op, constants).is_none()
                 && residual_call_void_true_arity(op).is_none()
         }
         // `New*` and ref-store write barriers are covered by
@@ -2341,6 +2378,13 @@ pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
         (Some(pos), Some(label_idx)) => pos < label_idx,
         _ => false,
     }
+}
+
+/// Whether these ops carry a `GUARD_NOT_INVALIDATED`, so their validity is
+/// watched through the invalidation flag of whichever module emits them.
+pub fn has_invalidation_guard(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| op.opcode == OpCode::GuardNotInvalidated)
 }
 
 /// Position in `ops` of the exit with ordinal `fail_index`.
@@ -2832,7 +2876,8 @@ pub fn build_wasm_module(
     // residual helpers, including the CA arm's inline fast path, use
     // `call_indirect` and need no import, although their frozen frame still
     // keeps the tail call area for future bridges.
-    let needs_call = has_trampoline_calls(&analysis_inputargs, &analysis_ops, ca.emit_ca);
+    let needs_call =
+        has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -2867,7 +2912,7 @@ pub fn build_wasm_module(
     let mut float_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
         for op in analysis_ops {
-            if let Some(sig) = residual_call_float_sig(op)
+            if let Some(sig) = residual_call_float_sig(op, constants)
                 && !float_residual_sigs.contains(&sig)
             {
                 float_residual_sigs.push(sig);
@@ -2968,19 +3013,19 @@ pub fn build_wasm_module(
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
         next_type_idx += 1;
     }
-    // Float residual types follow all pre-existing direct helper types. Their
-    // parameter sequence comes from the call descr (`i64` for Int/Ref, `f64`
-    // for Float) and their result is always `f64`; the emitter uses this map to
-    // select the exact `call_indirect` type for each callee.
+    // Typed residual types follow all pre-existing direct helper types. Both
+    // the parameter sequence and the result come from the call descr (`i64`
+    // for Int/Ref, `f64` for Float); the emitter uses this map to select the
+    // exact `call_indirect` type for each callee.
     let float_residual_type_base = next_type_idx;
     let float_residual_type_indices = float_residual_sigs
         .iter()
         .cloned()
         .enumerate()
         .map(|(offset, sig)| (sig, float_residual_type_base + offset as u32))
-        .collect::<indexmap::IndexMap<_, _>>();
-    for sig in float_residual_type_indices.keys() {
-        types.ty().function(sig.clone(), vec![ValType::F64]);
+        .collect::<indexmap::IndexMap<TypedResidualSig, u32>>();
+    for (params, result) in float_residual_type_indices.keys() {
+        types.ty().function(params.clone(), vec![*result]);
     }
     next_type_idx += float_residual_type_indices.len() as u32;
     let true_void_residual_type_base = next_type_idx;
@@ -3200,10 +3245,10 @@ fn build_function(
     // eligible residual call / `New*` / write barrier, so those arms always
     // use the `jit_call` path.
     residual_type_base: Option<u32>,
-    // Exact wasm type indices for direct float residual calls, keyed by their
-    // descr-derived parameter sequence. These types return `f64`; Float SSA
-    // values are converted to/from their i64 bit carrier around the call.
-    float_residual_type_indices: &indexmap::IndexMap<Vec<ValType>, u32>,
+    // Exact wasm type indices for direct typed residual calls, keyed by their
+    // descr-derived parameter sequence and result. Float SSA values are
+    // converted to/from their i64 bit carrier around the call.
+    float_residual_type_indices: &indexmap::IndexMap<TypedResidualSig, u32>,
     // Base wasm type index of the `(i64×n) -> ()` true-void residual-call
     // types (type `true_void_residual_type_base + n` for arity `n`), or
     // `None` when the trace has no eligible true-void residual call.
@@ -3266,6 +3311,31 @@ fn build_function(
         return Err(BackendError::Unsupported(
             "wasm backend: a preamble-sourced inline region is placed inside the loop".into(),
         ));
+    }
+    // A region's block closes where its own ops begin, so a guard branching
+    // into it must sit before them. That one inequality is what makes a
+    // region's ordinal usable as a branch depth (`emit_guard_exit` counts it
+    // from the family's still-open blocks), and it is also what refuses the two
+    // structurally impossible attachments: a region reached from a guard in a
+    // LATER region of the same family, and a body region reached from a guard
+    // in an outside one, whose header `loop` has already closed.
+    {
+        let mut start = bridge_start;
+        for bridge in inlined_bridges {
+            let guard_pos = exit_op_index(ops, bridge.source_fail_index).ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge source guard is outside the merged stream".into(),
+                )
+            })?;
+            if guard_pos >= start {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: an inline region is reached from a guard at or past its \
+                     own ops, so the block it branches to has already closed"
+                        .into(),
+                ));
+            }
+            start += bridge.ops.len();
+        }
     }
     let outside_start = bridge_start
         + inlined_bridges[..body_region_count]
@@ -3370,7 +3440,7 @@ fn build_function(
             // Blocks open in reverse attach order, making region 0 of each
             // family innermost. The guard `if` contributes the final +1 in
             // `emit_guard_if_exit`.
-            branch_depth: if region < body_region_count {
+            region_ordinal: if region < body_region_count {
                 region as u32
             } else {
                 (region - body_region_count) as u32
@@ -3386,6 +3456,8 @@ fn build_function(
         param_type_indices: bridge_param_type_indices,
         inline_guards: &inline_guards,
         outside_region_base: 0,
+        closed_body_regions: 0,
+        closed_outside_regions: 0,
         ref_homes,
         frame,
     };
@@ -3795,6 +3867,8 @@ fn build_function(
             block_exit_depth - open_outside_blocks - u32::from(resume_dispatch);
         let guard_dispatch = BridgeDispatch {
             outside_region_base,
+            closed_body_regions: started_body_regions as u32,
+            closed_outside_regions: started_outside_regions as u32,
             ..guard_dispatch
         };
         // The guard whose condition the previous op already pushed and tested.
@@ -5659,16 +5733,19 @@ fn build_function(
                             frame,
                         );
                     }
-                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op).and_then(|sig| {
-                    float_residual_type_indices
-                        .get(&sig)
-                        .map(|type_idx| (sig, type_idx))
-                }) {
-                    // Direct in-module float residual call with the
-                    // descr-derived mixed `(i64/f64...) -> f64` signature.
+                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op, constants)
+                    .and_then(|sig| {
+                        float_residual_type_indices
+                            .get(&sig)
+                            .map(|type_idx| (sig, type_idx))
+                    })
+                {
+                    // Direct in-module typed residual call with the
+                    // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
+                    let (params, _) = &sig;
                     let call_args = &op.getarglist()[1..];
-                    debug_assert_eq!(call_args.len(), sig.len());
-                    for (arg, ty) in call_args.iter().zip(&sig) {
+                    debug_assert_eq!(call_args.len(), params.len());
+                    for (arg, ty) in call_args.iter().zip(params) {
                         if *ty == ValType::F64 {
                             emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
                         } else {
@@ -7084,11 +7161,13 @@ fn emit_array_addr(
 struct InlineGuard<'a> {
     guard_idx: u32,
     inputargs: &'a [InputArg],
-    /// Ordinal within this region's family of blocks, region 0 innermost. For a
-    /// body region that is already the branch depth at loop-body statement
-    /// level; a preamble region adds `BridgeDispatch::outside_region_base`,
-    /// which depends on where the branching guard sits.
-    branch_depth: u32,
+    /// Ordinal within this region's family, region 0 attached first. NOT a
+    /// branch depth on its own: a family's blocks close one per region as the
+    /// walk reaches each region's ops, so the depth of region N's block is this
+    /// ordinal less however many of the family have already closed where the
+    /// branching guard sits. `BridgeDispatch` carries that running count, and
+    /// `emit_guard_exit` does the subtraction.
+    region_ordinal: u32,
     outside_loop: bool,
 }
 
@@ -7105,6 +7184,12 @@ struct BridgeDispatch<'a> {
     /// Depth of the innermost still-open preamble-region block, at the
     /// statement level of the operation being emitted.
     outside_region_base: u32,
+    /// Regions of each family whose block has already been closed at the
+    /// operation being emitted — one closes at each region's first op. A guard
+    /// in the owner's own stream sees zero of both; a guard nested inside
+    /// region P sees P+1 of P's family.
+    closed_body_regions: u32,
+    closed_outside_regions: u32,
     ref_homes: &'a RefHomes,
     frame: FrameGeometry,
 }
@@ -7291,10 +7376,21 @@ fn emit_guard_exit(
         );
         // The target depth is measured outside this failing `if`; include the
         // `if` itself before selecting the enclosing bridge block.
-        let depth = if inline.outside_loop {
-            dispatch.outside_region_base + inline.branch_depth
+        //
+        // A family's blocks close one per region as the walk reaches each
+        // region's ops, so the ordinal counts from whichever of them are still
+        // open here. `build_function` refuses any region whose source guard
+        // does not precede its own ops, which is what keeps this subtraction
+        // from going negative.
+        let ordinal = if inline.outside_loop {
+            inline.region_ordinal - dispatch.closed_outside_regions
         } else {
-            inline.branch_depth
+            inline.region_ordinal - dispatch.closed_body_regions
+        };
+        let depth = if inline.outside_loop {
+            dispatch.outside_region_base + ordinal
+        } else {
+            ordinal
         };
         sink.br(depth + 1);
         return;
