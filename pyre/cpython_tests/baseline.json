@@ -1252,7 +1252,8 @@
       "dynasm": "PASS"
     },
     "test.test_types": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "imports `_datetime`, an extension module PyPy does not provide"
     },
     "test.test_typing": {
       "dynasm": "PASS"
