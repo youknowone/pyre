@@ -52,6 +52,15 @@
 //! `_nonstandard_virtualizable`'s `PTR_EQ` is the one that takes the
 //! exemption.
 //!
+//! Most callers have no reader to thread, because the fold has two other
+//! preconditions and either one alone closes it. `SETFIELD_GC`,
+//! `SETARRAYITEM_GC`, `GETARRAYITEM_GC_*`, `ASSERT_NOT_NONE` and
+//! `RECORD_EXACT_CLASS` answer `is_pure_with_descr` false, and a caller with
+//! no `resvalue` is the `None` rule below. Those pass `cpu: None`, which
+//! states that no reader is needed rather than standing in for one; a
+//! `debug_assert` refuses `None` from a call that could otherwise have
+//! folded, so the pairing cannot go quietly wrong.
+//!
 //! The fold this opens is narrow: `is_pure_with_descr` admits a getfield only
 //! through `descr.is_always_pure()`, so a mutable virtualizable field records
 //! however constant its box is.
@@ -99,7 +108,7 @@ impl TraceCtx {
     /// were dropped in favour of an arguments-only test.
     pub fn execute_and_record(
         &mut self,
-        cpu: &dyn crate::cpu::Cpu,
+        cpu: Option<&dyn crate::cpu::Cpu>,
         opnum: OpCode,
         descr: Option<DescrRef>,
         args: &[OpRef],
@@ -117,6 +126,13 @@ impl TraceCtx {
             !opnum.can_raise() || opnum.is_ovf(),
             "execute_and_record: {opnum:?} can raise",
         );
+        // `None` is not "any cpu will do" — it is the caller stating that this
+        // opcode cannot reach the fold, so no reader is needed. An opcode that
+        // *can* fold would silently lose the fold instead, so say so loudly.
+        debug_assert!(
+            cpu.is_some() || resvalue.is_none() || !opnum.is_pure_with_descr(descr.as_ref()),
+            "execute_and_record: {opnum:?} can fold but no cpu was supplied",
+        );
         // `profiler.count_ops(opnum)` — counted on both paths.
         self.profiler().count_ops(opnum, crate::counters::OPS);
 
@@ -129,6 +145,7 @@ impl TraceCtx {
             // to receive a constant either.
             if resvalue.is_some()
                 && args.iter().all(|a| a.is_constant())
+                && let Some(cpu) = cpu
                 && let Some(folded) = Self::fold_value(cpu, opnum, args, descr.as_ref())
             {
                 // `executor.wrap_constant(resvalue)`. Upstream's structural
@@ -223,7 +240,7 @@ mod tests {
         let cpu = crate::cpu::default_cpu();
         let before = ctx.num_ops();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::ForceToken,
             None,
             &[],
@@ -240,7 +257,7 @@ mod tests {
         let cpu = crate::cpu::default_cpu();
         let before = ctx.num_ops();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAdd,
             None,
             &[OpRef::ConstInt(2), OpRef::ConstInt(3)],
@@ -262,7 +279,7 @@ mod tests {
         );
         let cpu = crate::cpu::default_cpu();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAdd,
             None,
             &[arg, OpRef::ConstInt(3)],
@@ -286,7 +303,7 @@ mod tests {
         let cpu = crate::cpu::default_cpu();
         let before = ctx.num_ops();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntFloorDiv,
             None,
             &[OpRef::ConstInt(5), OpRef::ConstInt(0)],
@@ -307,7 +324,7 @@ mod tests {
 
         let before = ctx.num_ops();
         let clear = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAddOvf,
             None,
             &args,
@@ -318,7 +335,7 @@ mod tests {
         assert_eq!(ctx.num_ops(), before);
 
         let pending = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAddOvf,
             None,
             &args,
@@ -340,7 +357,7 @@ mod tests {
         let cpu = crate::cpu::default_cpu();
         let before = ctx.num_ops();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAddOvf,
             None,
             &[OpRef::ConstInt(i64::MAX), OpRef::ConstInt(1)],
@@ -371,7 +388,7 @@ mod tests {
         let mut ctx = fresh_ctx();
         let cpu = crate::cpu::default_cpu();
         let op = ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAdd,
             None,
             &[OpRef::ConstInt(2), OpRef::ConstInt(3)],
@@ -402,7 +419,7 @@ mod tests {
         assert_eq!(counts(&ctx), (Some(0), Some(0)));
 
         ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::IntAdd,
             None,
             &[OpRef::ConstInt(2), OpRef::ConstInt(3)],
@@ -416,7 +433,7 @@ mod tests {
         );
 
         ctx.execute_and_record(
-            cpu.as_ref(),
+            Some(cpu.as_ref()),
             OpCode::ForceToken,
             None,
             &[],

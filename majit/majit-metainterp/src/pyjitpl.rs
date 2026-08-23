@@ -5758,10 +5758,11 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
+            .vable_arraylen_vable(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
     /// pyjitpl.py `opimpl_hint_force_virtualizable(box)`.
@@ -17121,7 +17122,7 @@ impl<M: Clone> MetaInterp<M> {
         let eqbox_opref = {
             let ctx = self.tracing.as_mut()?;
             ctx.execute_and_record(
-                cpu.as_ref(),
+                Some(cpu.as_ref()),
                 OpCode::PtrEq,
                 None,
                 &[vref_box, standard_box],

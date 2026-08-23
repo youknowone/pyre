@@ -2876,7 +2876,7 @@ where
         let same_box = !is_float && lhs.same_box(rhs);
         if !same_box {
             let cond = ctx.execute_and_record(
-                self.cpu.as_ref(),
+                Some(self.cpu.as_ref()),
                 opcode,
                 None,
                 &[lhs, rhs],
@@ -4137,7 +4137,7 @@ where
                 // the op counters and the concrete stamp every sibling read
                 // already carries.
                 let opref = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     OpCode::RawLoadI,
                     Some(descr),
                     &[base_opref, ea_opref],
@@ -4184,7 +4184,7 @@ where
                 };
                 // Never folds, for the reason given in the `BC_RAW_LOAD_I` arm.
                 let opref = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     OpCode::RawLoadF,
                     Some(descr),
                     &[base_opref, ea_opref],
@@ -4283,7 +4283,7 @@ where
                 // a null gcptr before any fold — the executor row would
                 // dereference it.
                 let op = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     kind,
                     Some(fielddescr),
                     &[struct_opref],
@@ -4320,7 +4320,7 @@ where
                 // See the `BC_GETFIELD_GC_I` arm on the descr gate and the
                 // null case.
                 let op = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     OpCode::GetfieldGcF,
                     Some(fielddescr),
                     &[struct_opref],
@@ -5153,6 +5153,7 @@ where
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
                 let result = ctx.vable_arraylen_vable(
+                    self.cpu.as_ref(),
                     opcode_pc,
                     vable_opref,
                     vable_struct_ptr,
@@ -5285,7 +5286,7 @@ where
                 let (src, src_value) = self.read_int_reg(src_idx);
                 let cond_value = (src_value != 0) as i64;
                 let cond = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     OpCode::IntIsTrue,
                     None,
                     &[src],
@@ -5313,7 +5314,7 @@ where
                 let (src, src_value) = self.read_int_reg(src_idx);
                 let cond_value = if src_value == 0 { 1 } else { 0 };
                 let cond = ctx.execute_and_record(
-                    self.cpu.as_ref(),
+                    Some(self.cpu.as_ref()),
                     OpCode::IntIsZero,
                     None,
                     &[src],
@@ -5484,7 +5485,7 @@ where
                             "BC_SWITCH miss chain: key {key} equals the switched value",
                         );
                         let cond = ctx.execute_and_record(
-                            self.cpu.as_ref(),
+                            Some(self.cpu.as_ref()),
                             OpCode::IntEq,
                             None,
                             &[value_box, key_ref],
@@ -9360,7 +9361,7 @@ where
         // declines — an out-of-range shift, a zero divisor — the funnel
         // records instead of folding and stamps the op with exactly this value.
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[lhs, rhs],
@@ -9433,7 +9434,7 @@ where
         // `checked_*`, so a constant pair that really overflows declines the
         // fold and is recorded with its guard instead.
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[lhs, rhs],
@@ -9473,7 +9474,7 @@ where
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[src],
@@ -9508,7 +9509,7 @@ where
             other => panic!("trace_binop_r_to_i: unsupported opcode {other:?}"),
         };
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[lhs, rhs],
@@ -9541,7 +9542,7 @@ where
             (src_value == 0) as i64
         };
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[src, null],
@@ -9566,7 +9567,7 @@ where
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_binop_f(opcode, lhs_value, rhs_value);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[lhs, rhs],
@@ -9591,7 +9592,7 @@ where
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_float_cmp(opcode, lhs_value, rhs_value);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[lhs, rhs],
@@ -9613,7 +9614,7 @@ where
         let (src, src_value) = self.read_float_reg(src_idx);
         let value = eval_unary_f(opcode, src_value);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             opcode,
             None,
             &[src],
@@ -9636,7 +9637,7 @@ where
         let (src, src_value) = self.read_int_reg(src_idx);
         let fvalue = src_value as f64;
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             OpCode::CastIntToFloat,
             None,
             &[src],
@@ -9664,7 +9665,7 @@ where
         let (src, bits) = self.read_float_reg(src_idx);
         let ivalue = f64::from_bits(bits as u64) as i64;
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             OpCode::CastFloatToInt,
             None,
             &[src],
@@ -9686,7 +9687,7 @@ where
         };
         let (src, bits) = self.read_float_reg(src_idx);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             OpCode::ConvertFloatBytesToLonglong,
             None,
             &[src],
@@ -9707,7 +9708,7 @@ where
         };
         let (src, bits) = self.read_int_reg(src_idx);
         let opref = ctx.execute_and_record(
-            self.cpu.as_ref(),
+            Some(self.cpu.as_ref()),
             OpCode::ConvertLonglongBytesToFloat,
             None,
             &[src],

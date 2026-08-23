@@ -672,7 +672,7 @@ pub fn materialize_bridge_virtual(
             // from the operands alone.
             let cpu = crate::cpu::default_cpu();
             let buffer = ctx.execute_and_record(
-                cpu.as_ref(),
+                Some(cpu.as_ref()),
                 OpCode::IntAdd,
                 None,
                 &[base_buffer, offset_ref],
@@ -831,7 +831,7 @@ pub fn materialize_bridge_virtual(
             // arguments an always-pure opcode does not reach.
             let cpu = crate::cpu::default_cpu();
             let stop = ctx.execute_and_record(
-                cpu.as_ref(),
+                Some(cpu.as_ref()),
                 OpCode::IntAdd,
                 None,
                 &[start, length],
