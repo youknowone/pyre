@@ -8807,9 +8807,17 @@ const FLOAT_CMP_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["float_ne"]),
 ];
 
-// effectinfo.py: EF_ELIDABLE_CAN_RAISE — may raise (e.g. ZeroDivisionError)
-// int_floordiv and int_mod have distinct oopspec indices (IntPyDiv vs IntPyMod)
-// because intbounds.rs optimizes them differently.
+// effectinfo.py: EF_ELIDABLE_CAN_RAISE — these name the source-level helpers,
+// which check for a zero divisor and raise.
+//
+// They carry no oopspec index. `OS_INT_PY_DIV` / `OS_INT_PY_MOD` identify
+// `rint.py ll_int_py_div` and `ll_int_py_mod`, the machine-word primitives
+// whose zero check `ll_int_py_div_zer` has already inlined away — that is why
+// `jtransform.py _handle_int_special` gives them `EF_ELIDABLE_CANNOT_RAISE` —
+// and `rewrite.py optimize_call_int_py_div` rewrites a call carrying either
+// index into `int_rshift` / `int_neg` on the strength of it. The `int.py_div`
+// / `int.py_mod` oopspec names are the only spelling that identifies those
+// primitives, and `_handle_int_special` is where the indices are minted.
 const INT_FLOORDIV_TARGETS: &[CallTargetPattern] =
     &[CallTargetPattern::FunctionPath(&["int_floordiv"])];
 
@@ -8906,12 +8914,12 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     CallDescriptorEntry {
         targets: INT_FLOORDIV_TARGETS,
         extraeffect: ExtraEffect::ElidableCanRaise,
-        oopspecindex: OopSpecIndex::IntPyDiv,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: INT_MOD_TARGETS,
         extraeffect: ExtraEffect::ElidableCanRaise,
-        oopspecindex: OopSpecIndex::IntPyMod,
+        oopspecindex: OopSpecIndex::None,
     },
     // RPython `jtransform.py` `_do_builtin_call` casts —
     // unsigned-domain conversion helpers.  Cannot raise; elidable.
