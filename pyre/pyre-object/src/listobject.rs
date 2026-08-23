@@ -222,9 +222,9 @@ impl W_ListObject {
         let current_cap = list.object_items_capacity();
         let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
         // The GC rewrite emits COND_CALL_GC_WB before SETFIELD_GC. Keep that
-        // ordering on the host path too: under free-threading a post-store
-        // barrier can park behind a collector after publishing the new
-        // pointer but before remembering this old object.
+        // ordering on the host path too: the grow below allocates in the moving
+        // nursery and may collect, so this old list has to be on the remembered
+        // set before that minor runs, not after it.
         list_write_barrier(obj);
         // Phase L2: a GC-managed grow allocates the new block in the moving
         // nursery and may collect; `grow_list_items_block_gc` roots the old
@@ -237,8 +237,9 @@ impl W_ListObject {
         let _ = crate::gc_roots::pin_root(new_items as PyObjectRef);
         // framework.py's GC transform places the owner write barrier directly
         // before SETFIELD_GC. Keep the old block installed while the barrier
-        // runs, then swap without another safepoint: a post-store barrier may
-        // park behind a foreign collection that would miss the fresh edge.
+        // runs, then swap: remembering an old object that does not hold the new
+        // young pointer yet is the harmless direction, and it is the one that
+        // survives a collection point ever appearing between the two.
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -452,8 +453,9 @@ impl W_ListObject {
         let _ = crate::gc_roots::pin_root(new_items as PyObjectRef);
         // `_ll_list_resize_really` installs the freshly allocated GcArray
         // through SETFIELD_GC.  Run the owner barrier before publishing the
-        // edge: a post-store barrier can itself park behind a foreign
-        // collection, which would otherwise miss the new nursery block.
+        // edge, the same direction the transform emits: an old object on the
+        // remembered set without the young pointer yet is harmless, an old
+        // object holding it without being remembered is not.
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(root_base);

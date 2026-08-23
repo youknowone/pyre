@@ -58,11 +58,11 @@ pub fn w_method_new(
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
     let w_module = PY_NULL;
     if !raw.is_null() {
-        // Remember the old-gen shell before publishing nursery members. The
-        // barrier may park behind a collection; running it after the stores
-        // would leave a movable `w_self` (notably a list) untraced during that
-        // window. This is the same pre-store shape as tupleobject's stable
-        // shell plus young items block.
+        // Remember the old-gen shell before publishing nursery members:
+        // running the barrier after the stores would leave a movable `w_self`
+        // (notably a list) named by a slot no collection traces until it does.
+        // This is the same pre-store shape as tupleobject's stable shell plus
+        // young items block.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         for slot in save_point..save_point + 3 {
             let root = crate::gc_roots::shadow_stack_get(slot);

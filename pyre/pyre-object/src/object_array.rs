@@ -793,12 +793,11 @@ pub unsafe fn grow_typed_items_block(
 ) -> *mut TypedItemsBlock {
     unsafe {
         let fresh = alloc_typed_items_block(new_cap, tid);
-        // `fresh` has no owner field yet, and `dealloc_typed_items_block` below
-        // enters a GC operation (`try_gc_owns_object`) that parks this mutator
-        // while another thread can run a cycle to `STATE_SWEEPING`. Old-gen is
-        // mark-sweep, so an unreachable, not-yet-`VISITED` block is swept —
-        // root it for the span, as `gct_fv_gc_malloc` roots every livevar it
-        // brackets a malloc with (`framework.py:853-856`).
+        // `fresh` has no owner field yet, so nothing on the heap names it for
+        // the span below. Old-gen is mark-sweep and a block born outside
+        // `GcState::Marking` carries no `VISITED`, so the next cycle sweeps an
+        // unreachable one — root it for the span, as `gct_fv_gc_malloc` roots
+        // every livevar it brackets a malloc with (`framework.py gct_fv_gc_malloc`).
         let _roots = crate::gc_roots::push_roots();
         let fresh_root = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(fresh as crate::PyObjectRef);

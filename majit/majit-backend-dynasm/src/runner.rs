@@ -723,8 +723,8 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     if gc_box::with_mut(|g| g.get_referents(obj, &mut visit)).is_some() {
         return;
     }
-    // See `MajitGc::get_referents`: the fallback can park, so the argument is
-    // published and reloaded rather than passed as the raw local.
+    // See `MajitGc::get_referents`: the fallback enters the collector, so the
+    // argument is published and reloaded rather than passed as the raw local.
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
 }
 

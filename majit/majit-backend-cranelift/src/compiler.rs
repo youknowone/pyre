@@ -1874,9 +1874,10 @@ fn get_objects_via_active_runtime(generation: i8, visitor: majit_gc::GetObjectsV
 }
 
 /// Split the same way [`gc_write_barrier_via_active_runtime`] is: the TLS path
-/// cannot park, so the raw address is still current there, while the `gc_op`
-/// fallback can — and a minor collection during that wait would forward `obj`,
-/// leaving the collector to answer about a forwarding stub.
+/// answers out of the box it already holds, so the raw address is still current
+/// there, while the `gc_op` fallback enters the collector — where a minor
+/// driven from inside the operation would forward `obj`, leaving the collector
+/// to answer about a forwarding stub.
 fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     if gc_box::present() {

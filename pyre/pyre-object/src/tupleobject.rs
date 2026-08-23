@@ -376,14 +376,15 @@ fn w_tuple_new_array_backed_impl(
         // This runs BEFORE the store, against the null-items image published
         // above: remembering an old object that holds no young pointer yet is
         // the harmless direction. Storing first would leave the young block
-        // named by a slot no collection traces for the whole parking window —
+        // named by a slot no collection traces until the barrier runs —
         // `remember_young_pointer` clears `GCFLAG_TRACK_YOUNG_PTRS` and queues
-        // the tuple only once it runs (incminimark.py:1519-1522), and a minor that
-        // lands inside that window reclaims the block and poisons the nursery
+        // the tuple only once it does (`remember_young_pointer`), and a minor
+        // landing in that window reclaims the block and poisons the nursery
         // under it, leaving `wrappeditems` dangling for good.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        // Re-read the block the barrier's park may have moved: the tuple is on
-        // the remembered set now, but its `wrappeditems` is still null, so no
+        // Take the block from its published slot rather than from the word
+        // held across the barrier: the slot is the one authority a promotion
+        // rewrites, and the tuple's own `wrappeditems` is still null, so no
         // collection could have forwarded that slot for us.
         if let Some(s) = block_root {
             items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
