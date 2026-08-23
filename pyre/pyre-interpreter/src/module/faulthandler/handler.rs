@@ -497,6 +497,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // registering, restore on unregister.  The handler writes a short
     // "user signal NN delivered" message to fd 2 (no traceback).
     // `handler.py register(signum, file=None, all_threads=True, chain=False)`.
+    //
+    // The pair exists only off Windows, which has no user signal to hand them
+    // (`moduledef.py` guards the two `extra_interpdef` calls on the platform).
+    // A name that is there but answers every call with an error is worse than
+    // no name: `hasattr(faulthandler, "register")` is how its callers ask.
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "register",
@@ -590,6 +596,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         ),
     );
+    #[cfg(unix)]
     crate::module_ns_store(
         ns,
         "unregister",
