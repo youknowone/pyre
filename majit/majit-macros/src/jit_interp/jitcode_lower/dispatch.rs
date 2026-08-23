@@ -936,7 +936,7 @@ fn lower_extended_arg_inner_while_body(
 }
 
 /// Match `Stmt::Local { pat: Pat::Ident(X), init: Some(program[<idx>]) }`.
-/// If `X` is in `inner_alias`, emit `BC_GETARRAYITEM_GC_I` writing into
+/// If `X` is in `inner_alias`, emit `BC_GETARRAYITEM_GC_I_PURE` writing into
 /// the aliased outer register and re-bind `X → outer_reg`. Otherwise
 /// fall through to the existing `try_lower_opcode_fetch_stmt` (which
 /// allocates a fresh register).
@@ -986,7 +986,9 @@ fn try_lower_inner_byte_fetch(
         ),
         quote! {
             let __descr_idx = #descr_tok;
-            __builder.getarrayitem_gc_i(
+            // Reads the same immutable env array as the outer fetch, so the
+            // same always-pure spelling.
+            __builder.getarrayitem_gc_i_pure(
                 #aliased_reg as u16,
                 #program_reg as u16,
                 #index_reg as u16,
@@ -1428,7 +1430,11 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                 ),
                 quote::quote! {
                     let __descr_idx = #descr_tok;
-                    __builder.getarrayitem_gc_i(
+                    // The bytecode array is fixed once the program is built,
+                    // so the read is spelled with the always-pure opcode and
+                    // the tracer folds it at a green index on the strength of
+                    // that spelling rather than on who the caller is.
+                    __builder.getarrayitem_gc_i_pure(
                         #result_reg as u16,
                         #program_reg as u16,
                         #index_reg as u16,

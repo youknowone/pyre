@@ -4345,24 +4345,24 @@ where
                         ),
                     }
                 };
-                let (opref, reg_concrete) =
-                    if array_opref.is_constant() && index_opref.is_constant() {
-                        // pyjitpl.py `execute_varargs(pure=True)` →
-                        // `record_result_of_call_pure`: a read of the immutable
-                        // bytecode array at a green index has all-constant args, so
-                        // it folds to a ConstInt and is not recorded — the same
-                        // record-time fold PyPy applies to `strgetitem(green_str,
-                        // green_pc)` (strings/immutable arrays lower to the pure
-                        // read variant). BC_GETARRAYITEM_GC_I is emitted only for
-                        // the green-pc dispatch's `program` fetch (the sole caller,
-                        // `add_gc_byte_array_descr`; comment above), whose array is
-                        // a green ref and index a green int, so folding here
-                        // collapses the per-pc opcode-dispatch guard ladder instead
-                        // of leaving a residual load. Done at record time, the read
-                        // hits the live array directly, so the optimizer's
-                        // `protect_speculative_array` typeid check (which a raw
-                        // `&[u8]` data pointer, having no GC type header, would fail)
-                        // never applies.
+                // `execute_varargs(pure=True)` → `record_result_of_call_pure`:
+                // an all-constant read of an array the opcode itself declares
+                // immutable folds to a ConstInt and is not recorded — the same
+                // record-time fold `strgetitem(green_str, green_pc)` gets, and
+                // for the same reason, that the pure spelling is what licenses
+                // it. `is_pure_with_descr` admits `GetarrayitemGcPureI` and no
+                // descr admits the plain read, so the plain read is recorded
+                // even with two constant arguments; whether an array qualifies
+                // is the emitter's call (`OpKind::ArrayRead { pure }`,
+                // `jitcode/assembler.rs`'s `getarrayitem_gc_i_pure`), not this
+                // site's. Done at record time the read hits the live array
+                // directly, so the optimizer's `protect_speculative_array`
+                // typeid check — which a raw `&[u8]` data pointer, having no GC
+                // type header, would fail — never applies.
+                let foldable = opcode == OpCode::GetarrayitemGcPureI
+                    && array_opref.is_constant()
+                    && index_opref.is_constant();
+                let (opref, reg_concrete) = if foldable {
                         (ctx.const_int(concrete), concrete)
                     } else if let Some(cached) = cached {
                         // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,

@@ -7,7 +7,7 @@
 //! loop close.
 
 use majit_metainterp::jitcode::insns::{
-    BC_ABORT, BC_GETARRAYITEM_GC_I, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
+    BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
     BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
 };
 use majit_metainterp::{Assembler, BC_GOTO, JitCode, JitDriver};
@@ -444,7 +444,7 @@ fn dispatch_jitcode_contains_loop_back_goto() {
 
 /// The dispatch JitCode body must contain the opcode-fetch IR ops
 /// lowered from `let opcode = program[pc]; pc += 1;`:
-///   1. BC_GETARRAYITEM_GC_I — loads program[pc] into an int register
+///   1. BC_GETARRAYITEM_GC_I_PURE — loads program[pc] into an int register
 ///   2. BC_INT_ADD           — increments pc_reg by 1 (via load_const + int_add)
 ///
 /// pyopcode.py:171 `opcode = ord(co_code[next_instr])` + `next_instr += 1`.
@@ -458,8 +458,8 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
         .expect("missing JIT_MERGE_POINT");
     let post_mp = &code[mp_idx..];
     assert!(
-        post_mp.contains(&BC_GETARRAYITEM_GC_I),
-        "dispatch JitCode body must emit BC_GETARRAYITEM_GC_I for program[pc]; \
+        post_mp.contains(&BC_GETARRAYITEM_GC_I_PURE),
+        "dispatch JitCode body must emit BC_GETARRAYITEM_GC_I_PURE for program[pc]; \
          got bytes {:?}",
         post_mp
     );
@@ -846,17 +846,17 @@ mod oparg_minimal {
     /// A.2.2: the dispatch JitCode body must lower BOTH byte fetches in
     /// `let opcode = program[pc]; let oparg = program[pc + 1]; pc += 2;`
     /// per RPython `pyopcode.py:179-181`:
-    ///     - opcode fetch → `BC_GETARRAYITEM_GC_I result, program, pc`
+    ///     - opcode fetch → `BC_GETARRAYITEM_GC_I_PURE result, program, pc`
     ///     - oparg  fetch → `BC_INT_ADD offset, pc, +1` then
-    ///       `BC_GETARRAYITEM_GC_I result, program, offset`
+    ///       `BC_GETARRAYITEM_GC_I_PURE result, program, offset`
     ///     - pc advance   → `BC_INT_ADD pc, pc, +2`
     ///
-    /// Net post-merge-point op shape: BC_GETARRAYITEM_GC_I × 2 and at
+    /// Net post-merge-point op shape: BC_GETARRAYITEM_GC_I_PURE × 2 and at
     /// least two BC_INT_ADDs (one for `pc + 1` offset, one for `pc += 2`).
     #[test]
     fn dispatch_oparg_minimal_lowers_oparg_fetch_and_pc_advance() {
         use majit_metainterp::jitcode::insns::{
-            BC_GETARRAYITEM_GC_I, BC_INT_ADD, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
+            BC_GETARRAYITEM_GC_I_PURE, BC_INT_ADD, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
         };
 
         let dispatch_jc = build_oparg_minimal();
@@ -869,11 +869,11 @@ mod oparg_minimal {
 
         let getarrayitem_count = post_mp
             .iter()
-            .filter(|&&b| b == BC_GETARRAYITEM_GC_I)
+            .filter(|&&b| b == BC_GETARRAYITEM_GC_I_PURE)
             .count();
         assert_eq!(
             getarrayitem_count, 2,
-            "A.2.2: dispatch JitCode body must emit exactly two BC_GETARRAYITEM_GC_I \
+            "A.2.2: dispatch JitCode body must emit exactly two BC_GETARRAYITEM_GC_I_PURE \
              ops (opcode + oparg per pyopcode.py:179-180); got {}",
             getarrayitem_count
         );
@@ -886,15 +886,15 @@ mod oparg_minimal {
             int_add_count
         );
 
-        // Order check: the FIRST BC_GETARRAYITEM_GC_I (opcode fetch) must
+        // Order check: the FIRST BC_GETARRAYITEM_GC_I_PURE (opcode fetch) must
         // precede the first BC_INT_ADD (which is the pc+1 offset compute
-        // for the oparg fetch). The SECOND BC_GETARRAYITEM_GC_I (oparg
+        // for the oparg fetch). The SECOND BC_GETARRAYITEM_GC_I_PURE (oparg
         // fetch) must come after the offset compute. RPython
         // `pyopcode.py:179-180` orders opcode → oparg.
         let first_getarr = post_mp
             .iter()
-            .position(|&b| b == BC_GETARRAYITEM_GC_I)
-            .expect("first BC_GETARRAYITEM_GC_I missing");
+            .position(|&b| b == BC_GETARRAYITEM_GC_I_PURE)
+            .expect("first BC_GETARRAYITEM_GC_I_PURE missing");
         let first_int_add = post_mp
             .iter()
             .position(|&b| b == BC_INT_ADD)
@@ -902,10 +902,10 @@ mod oparg_minimal {
         let second_getarr = post_mp
             .iter()
             .enumerate()
-            .filter(|&(_, &b)| b == BC_GETARRAYITEM_GC_I)
+            .filter(|&(_, &b)| b == BC_GETARRAYITEM_GC_I_PURE)
             .nth(1)
             .map(|(i, _)| i)
-            .expect("second BC_GETARRAYITEM_GC_I missing");
+            .expect("second BC_GETARRAYITEM_GC_I_PURE missing");
         assert!(
             first_getarr < first_int_add,
             "A.2.2: opcode fetch must precede pc+1 offset compute; \
@@ -936,7 +936,8 @@ mod oparg_minimal {
     #[test]
     fn dispatch_oparg_minimal_pins_last_instr_store_position() {
         use majit_metainterp::jitcode::insns::{
-            BC_GETARRAYITEM_GC_I, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_STORE_STATE_FIELD,
+            BC_GETARRAYITEM_GC_I_PURE, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
+            BC_STORE_STATE_FIELD,
         };
 
         let dispatch_jc = build_oparg_minimal();
@@ -965,8 +966,8 @@ mod oparg_minimal {
             .expect("BC_STORE_STATE_FIELD missing");
         let first_getarr = post_mp
             .iter()
-            .position(|&b| b == BC_GETARRAYITEM_GC_I)
-            .expect("BC_GETARRAYITEM_GC_I missing");
+            .position(|&b| b == BC_GETARRAYITEM_GC_I_PURE)
+            .expect("BC_GETARRAYITEM_GC_I_PURE missing");
         assert!(
             store_pos < first_getarr,
             "A.2.4: last_instr store must precede opcode fetch \
@@ -982,7 +983,7 @@ mod oparg_minimal {
     /// `emit_canonical_call_void`
     /// auto-selection (no float / no int args → R variant with
     /// `ref_count = 0`). Position: between the `BC_STORE_STATE_FIELD`
-    /// for `state.last_instr` (L172) and the first `BC_GETARRAYITEM_GC_I`
+    /// for `state.last_instr` (L172) and the first `BC_GETARRAYITEM_GC_I_PURE`
     /// for the opcode fetch (L179) — RPython source order is
     /// L172 store → L174 trace → L179 fetch.
     ///
@@ -1001,8 +1002,8 @@ mod oparg_minimal {
     #[test]
     fn dispatch_oparg_minimal_pins_bytecode_only_trace_residual_call() {
         use majit_metainterp::jitcode::insns::{
-            BC_GETARRAYITEM_GC_I, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_RESIDUAL_CALL_R_V,
-            BC_STORE_STATE_FIELD,
+            BC_GETARRAYITEM_GC_I_PURE, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
+            BC_RESIDUAL_CALL_R_V, BC_STORE_STATE_FIELD,
         };
 
         let dispatch_jc = build_oparg_minimal();
@@ -1046,11 +1047,11 @@ mod oparg_minimal {
             .iter()
             .enumerate()
             .skip(residual_pos + 1)
-            .find(|&(_, &b)| b == BC_GETARRAYITEM_GC_I)
+            .find(|&(_, &b)| b == BC_GETARRAYITEM_GC_I_PURE)
             .map(|(i, _)| i)
-            .expect("BC_GETARRAYITEM_GC_I after BC_RESIDUAL_CALL_R_V missing");
+            .expect("BC_GETARRAYITEM_GC_I_PURE after BC_RESIDUAL_CALL_R_V missing");
         // Successful chained `find_after` proves the ordering:
-        // BC_STORE_STATE_FIELD → BC_RESIDUAL_CALL_R_V → BC_GETARRAYITEM_GC_I,
+        // BC_STORE_STATE_FIELD → BC_RESIDUAL_CALL_R_V → BC_GETARRAYITEM_GC_I_PURE,
         // matching pyopcode.py:172 → L174 → L179 source order.
         let _ = (store_pos, residual_pos, first_getarr);
     }
@@ -1325,7 +1326,7 @@ mod oparg_minimal {
 mod oparg_extended {
 
     use majit_metainterp::jitcode::insns::{
-        BC_ABORT, BC_GETARRAYITEM_GC_I, BC_INT_MUL, BC_INT_OR, BC_JIT_MERGE_POINT,
+        BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_INT_MUL, BC_INT_OR, BC_JIT_MERGE_POINT,
         BC_JIT_MERGE_POINT_C,
     };
     use majit_metainterp::{Assembler, JitDriver};
@@ -1421,7 +1422,7 @@ mod oparg_extended {
     /// A.2.3b shape pin: lowered EXTENDED_ARG inner while emits the
     /// RPython L188-193 IR sequence:
     ///
-    /// - 4 × BC_GETARRAYITEM_GC_I — outer opcode + outer oparg
+    /// - 4 × BC_GETARRAYITEM_GC_I_PURE — outer opcode + outer oparg
     ///   (pyopcode.py:179-180) plus inner opcode2 + inner arg2
     ///   (pyopcode.py:188-189)
     /// - 1 × BC_INT_MUL — `oparg * 256` (Pre-A.2.3 codex BLOCKER (c):
@@ -1460,15 +1461,15 @@ mod oparg_extended {
         // a naive byte filter (.filter(|&&b| b == BC_X).count()) can
         // collide with operand values that happen to equal BC_X. The
         // existing `dispatch_oparg_minimal_lowers_oparg_fetch_and_pc_advance`
-        // test gets away with `== 2` for BC_GETARRAYITEM_GC_I (0xa9)
+        // test gets away with `== 2` for the fetch opcode
         // because the fixture uses a small register window; this richer
         // EXTENDED_ARG fixture has more registers and high-byte descr
         // indices, so we assert minimums + ordering instead.
         let count = |target: u8| post_mp.iter().filter(|&&b| b == target).count();
-        let getarr_count = count(BC_GETARRAYITEM_GC_I);
+        let getarr_count = count(BC_GETARRAYITEM_GC_I_PURE);
         assert!(
             getarr_count >= 4,
-            "A.2.3b: dispatch JitCode body must emit ≥ 4 BC_GETARRAYITEM_GC_I \
+            "A.2.3b: dispatch JitCode body must emit ≥ 4 BC_GETARRAYITEM_GC_I_PURE \
              ops (outer opcode + outer oparg + inner opcode2 + inner arg2 \
              per pyopcode.py:179-180/188-189); got {}",
             getarr_count
@@ -1511,10 +1512,10 @@ mod oparg_extended {
                 .map(|(i, _)| i)
                 .unwrap_or_else(|| panic!("BC_{:02x} after offset {} missing", target, after))
         };
-        let outer_opcode_pos = first_pos(BC_GETARRAYITEM_GC_I, 0);
-        let outer_oparg_pos = first_pos(BC_GETARRAYITEM_GC_I, outer_opcode_pos + 1);
-        let inner_opcode_pos = first_pos(BC_GETARRAYITEM_GC_I, outer_oparg_pos + 1);
-        let inner_arg_pos = first_pos(BC_GETARRAYITEM_GC_I, inner_opcode_pos + 1);
+        let outer_opcode_pos = first_pos(BC_GETARRAYITEM_GC_I_PURE, 0);
+        let outer_oparg_pos = first_pos(BC_GETARRAYITEM_GC_I_PURE, outer_opcode_pos + 1);
+        let inner_opcode_pos = first_pos(BC_GETARRAYITEM_GC_I_PURE, outer_oparg_pos + 1);
+        let inner_arg_pos = first_pos(BC_GETARRAYITEM_GC_I_PURE, inner_opcode_pos + 1);
         let abort_pos = first_pos(BC_ABORT, inner_arg_pos + 1);
         let int_mul_pos = first_pos(BC_INT_MUL, abort_pos + 1);
         let int_or_pos = first_pos(BC_INT_OR, int_mul_pos + 1);
