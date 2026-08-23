@@ -434,6 +434,15 @@ pub extern "C" fn PyGILState_Ensure() -> i32 {
     let held = majit_gc::rgil::am_i_holding_the_gil();
     let guard = enter_external_callback_from_foreign_thread();
     GIL_STATES.with(|states| states.borrow_mut().push(guard));
+    // The caller may be inside a `Py_BEGIN_ALLOW_THREADS` block, or on a thread
+    // that has never run pyre at all; either way its thread state is the
+    // current one from here until the matching release.
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    crate::cpyext::pystate::set_threadstate_is_current(true);
     // `PyGILState_LOCKED` when the GIL was already this thread's,
     // `PyGILState_UNLOCKED` when acquiring it is what the release undoes.
     if held { 0 } else { 1 }
@@ -453,6 +462,17 @@ pub extern "C" fn PyGILState_Release(_state: i32) {
         "PyGILState_Release without a matching PyGILState_Ensure"
     );
     drop(guard);
+    // Giving the GIL back leaves no state current.  A nested release gives
+    // nothing back, and the entry that still owns the GIL is one its own caller
+    // goes on reading the thread state under.
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    if !majit_gc::rgil::am_i_holding_the_gil() {
+        crate::cpyext::pystate::set_threadstate_is_current(false);
+    }
 }
 
 /// Whether this thread holds the GIL — `pystate.py PyGILState_Check`.

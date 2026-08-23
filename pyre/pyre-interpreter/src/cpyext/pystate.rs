@@ -86,6 +86,15 @@ fn thread_state() -> *mut CPyThreadState {
     THREAD_STATE.with(|state| state.get())
 }
 
+/// Record whether this thread's state is the current one.
+///
+/// The GIL entry points that make it so live in [`crate::module::thread`],
+/// because a build without this layer exports them too; the flag they set is
+/// this one.
+pub(crate) fn set_threadstate_is_current(current: bool) {
+    STATE_IS_CURRENT.with(|state| state.set(current));
+}
+
 /// `pystate.py PyEval_SaveThread` — drop the GIL, and answer the state the
 /// matching [`PyEval_RestoreThread`] is to be handed back.
 #[unsafe(no_mangle)]
