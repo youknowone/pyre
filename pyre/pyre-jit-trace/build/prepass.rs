@@ -2134,6 +2134,14 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
     }
 
     hash_file_content(&mut h, &std::path::Path::new(manifest_dir).join("build.rs"));
+    // The whole `build/` directory, not `build.rs` alone. This prepass now
+    // lives in `build/prepass.rs`, `#[path]`-included by that wrapper rather
+    // than sitting under `src/`, so neither the line above nor the `*/src`
+    // walk reaches its bytes. Editing it recompiles the build script and
+    // makes Cargo rerun it -- and then an unchanged key restores the previous
+    // generated tables over the ones the rerun just wrote. Hashing the
+    // directory covers a second module added beside it too.
+    hash_rs_dir_content(&mut h, &std::path::Path::new(manifest_dir).join("build"));
     hash_file_content(
         &mut h,
         &std::path::Path::new(manifest_dir).join("src/virtualizable_spec.rs"),
