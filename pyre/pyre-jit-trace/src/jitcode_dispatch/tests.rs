@@ -482,6 +482,28 @@ fn execution_context_recovery_records_a_non_elidable_call() {
     assert!(!call_descr.get_extra_info().check_can_raise(false));
 }
 
+/// The globals guard reads a frame's namespace override with a plain
+/// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
+/// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py
+/// set_w_globals` rebinds the field after the object exists, and an immutable
+/// descr would let the read fold back to the recording frame's namespace —
+/// which is the pin the guard exists to break.
+#[test]
+fn frame_debug_data_w_globals_descr_reads_the_mutable_override_field() {
+    let descr = crate::descr::frame_debug_data_w_globals_descr();
+    let field = descr
+        .as_field_descr()
+        .expect("w_globals resolves to a FieldDescr");
+    assert_eq!(
+        field.offset(),
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+    );
+    assert!(
+        !field.is_immutable(),
+        "an immutable descr would fold the read back to the recorded namespace",
+    );
+}
+
 #[test]
 fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");

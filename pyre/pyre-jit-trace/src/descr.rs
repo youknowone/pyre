@@ -777,6 +777,7 @@ fn build_object_descr_group_with_def_path(
         &[],
         &[],
         "",
+        false,
     )
 }
 
@@ -804,6 +805,32 @@ fn build_object_descr_group_keyed_only(
         &[],
         &[],
         cache_key_name,
+        false,
+    )
+}
+
+/// `build_object_descr_group_with_def_path` for a struct the JIT never
+/// allocates and whose pointer may not carry a `GcHeader`.  `headerless` is
+/// what keeps `StructPtrInfo::make_guards` from certifying a runtime type id
+/// off `ref - GcHeader::SIZE`; the `NEW` rewrite shape the flag also selects is
+/// out of reach with no `NEW` to rewrite.
+fn build_headerless_object_descr_group_with_def_path(
+    obj_size: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
+) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_extra_gc_edges(
+        obj_size,
+        0,
+        0,
+        fields,
+        simple_name,
+        def_path,
+        &[],
+        &[],
+        "",
+        true,
     )
 }
 
@@ -826,6 +853,7 @@ fn build_object_descr_group_with_field_indices(
         &[],
         field_indices,
         "",
+        false,
     )
 }
 
@@ -846,6 +874,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     extra_gc_edges: &[Arc<dyn FieldDescr>],
     field_indices: &[u32],
     cache_key_name: &str,
+    headerless: bool,
 ) -> PyreObjectDescrGroup {
     // `cache_key_name` names the `gc_cache._cache_size` STRUCT identity for a
     // group that publishes under neither name registry.  Zero is the
@@ -908,7 +937,7 @@ fn build_object_descr_group_with_extra_gc_edges(
         cache_key,
         vtable,
         true,
-        false,
+        headerless,
         &specs,
         &gc_edges,
     );
@@ -2668,18 +2697,24 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
-// `pyframe.py FrameDebugData.w_locals` — the frame's own locals mapping,
-// reached as `self.getorcreatedebug().w_locals` at the head of `fast2locals`
-// (pyframe.py:555-557).  Not a PyObject — no vtable and no allocation type id,
-// because the trace never NEWs one: it arrives as the `debugdata`
-// virtualizable field and is only read.  The field is MUTABLE (`setdictscope`
-// and `fast2locals`' lazy materialisation both rebind it), so the read must
-// not be treated as always-pure.
+// `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`,
+// holding the frame's own locals mapping (read at the head of `fast2locals`)
+// and the rare per-frame globals override (read by `get_w_globals`).  Not a PyObject — no vtable, and the trace never NEWs one:
+// it arrives as the `debugdata` virtualizable field and is only read.
+//
+// Headerless, because `getorcreate_debug_data` falls back to `malloc_raw`
+// whenever the owning frame is not collector-owned, so a loaded pointer may
+// have no `GcHeader` to read.  A headered declaration has
+// `StructPtrInfo::make_guards` certify the loaded pointer against a type id
+// the GcCache mints from the structural key, which names nothing in the
+// collector's type table and so fails on every check.
+//
+// Both fields are MUTABLE — `setdictscope` and `fast2locals`' lazy
+// materialisation rebind `w_locals`, `set_w_globals` rebinds `w_globals` — so
+// neither read may be treated as always-pure.
 static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
-        0,
-        0,
         &[
             (
                 "w_globals",
@@ -2928,6 +2963,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
         &[],
         "",
+        false,
     )
 });
 

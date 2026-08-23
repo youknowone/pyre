@@ -5007,7 +5007,103 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     }
     let expected = ctx.trace_ctx.const_ref(expected_globals as i64);
     if w_globals_op.is_constant() {
-        return Ok(ctx.trace_ctx.const_value(w_globals_op) == Some(expected_globals as i64));
+        if ctx.trace_ctx.const_value(w_globals_op) != Some(expected_globals as i64) {
+            return Ok(false);
+        }
+        // The constant is the RECORDING frame's namespace, published from
+        // `pycode.w_globals`, which is green because `pycode.py
+        // frame_stores_global` keeps the FIRST namespace a code object runs
+        // under.  It therefore cannot tell that frame apart from one running
+        // the same code object under a second `exec(code, ns)`: that frame
+        // carries its own namespace in `debugdata` and still enters this loop
+        // under the same `(code, pc)` warm key.  AGENTS.md "One red frame per
+        // frame" — read the live red frame instead of trusting the anchor.
+        //
+        // `pyframe.py get_w_globals` is `debugdata.w_globals` when the frame
+        // carries a payload and `promote(pycode).w_globals` when it does not,
+        // so emit that shape.  `debugdata` is a virtualizable field, so the
+        // read answers from `virtualizable_boxes` and records no op — the same
+        // route `fast2locals`' fold takes for the neighbouring `w_locals`.
+        let Some((debugdata_op, majit_ir::Value::Ref(recorded))) = ctx
+            .trace_ctx
+            .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+        else {
+            return Ok(false);
+        };
+        if recorded == majit_ir::GcRef::NO_CONCRETE {
+            // "no recorded word" is not "recorded a null word", and it is also
+            // not an address to read a payload out of.
+            return Ok(false);
+        }
+        // `createframe_obj` allocates the payload only when
+        // `frame_stores_global` reports the frame's namespace differs from the
+        // published one, so the recorded direction is what separates the two
+        // arms — and each is pinned so a frame on the other one side-exits.
+        let present = recorded.as_usize() != 0;
+        if present {
+            // Read the override through the SHADOW's payload, which is what the
+            // emitted `getfield_gc_r` reads, and decline before emitting
+            // anything if it is not the namespace this fold answers with.  A
+            // tracing shadow hands out a clone of the payload around the same
+            // fields, so the value is the invariant to check — never the
+            // holder's address.
+            let shadow = recorded.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+            if unsafe { (*shadow).w_globals } != expected_globals {
+                return Ok(false);
+            }
+        }
+        // `pyjitpl.py _establish_nullity`: a box's nullity is immutable, so a
+        // guard the trace already carries answers for every later fold site.
+        // Every LOAD_GLOBAL in the frame reaches here, and a trace that
+        // re-records the same guard per site spends its `trace_limit` on ops
+        // the optimizer then removes.
+        let known = ctx
+            .trace_ctx
+            .heap_cache()
+            .is_nullity_known(debugdata_op, |op| {
+                op.inline_const_to_value().and_then(|v| match v {
+                    majit_ir::Value::Int(n) => Some(n),
+                    majit_ir::Value::Ref(gc) => Some(gc.0 as i64),
+                    _ => None,
+                })
+            });
+        if known != Some(present) {
+            let opcode = if present {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata_op])?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .nullity_now_known(debugdata_op, present);
+        }
+        if !present {
+            // No payload, so the namespace IS `pycode.w_globals` — the constant
+            // already compared above.
+            return Ok(true);
+        }
+        // The payload's `w_globals` is the authority, and it is a mutable
+        // field, so the read stays a real load off the live frame's payload.
+        // The payload address itself is per-frame — every call allocates one —
+        // so only the value it holds can be guarded.
+        let live = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            debugdata_op,
+            crate::descr::frame_debug_data_w_globals_descr(),
+        );
+        if !live.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[live, expected],
+            )?;
+            // The guard proved the read; hand the heapcache the constant so the
+            // next fold site reads it back instead of guarding again.
+            ctx.trace_ctx.heap_cache_mut().replace_box(live, expected);
+        }
+        return Ok(true);
     }
     // pypy/objspace/std/celldict.py `elidable_promote('0,1,2')` promotes
     // `w_dict`; mirror that by pinning the runtime frame's w_globals identity.
