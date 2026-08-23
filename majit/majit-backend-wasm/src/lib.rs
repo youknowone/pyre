@@ -1932,6 +1932,37 @@ pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
 }
 
+/// Publish the residual-call targets whose call descr describes their real
+/// wasm ABI, so codegen may lower them to a typed in-module `call_indirect`
+/// instead of the `jit_call` host trampoline.
+///
+/// This is an exact-function allow-list, not a signature inference, for the
+/// same reason [`ca_deopt_helper_slot`]'s twin in `pyre-wasm`
+/// (`direct_uniform_i64_call`) is one: a descr `Float` does not prove the wasm
+/// parameter is `f64`, and an `Int` or `Ref` beside it may be a real `i32`
+/// pointer -- `jit_bigint_to_f64_or_inf(&BigInt) -> f64` is published raw and
+/// is genuinely `(i32) -> f64`. Emitting a guessed signature traps at the
+/// `call_indirect`. A caller vouches for each address by naming the function.
+///
+/// Addresses are `fn as usize`, which on wasm32 is the table index.
+pub fn set_faithful_residual_call_addrs(addrs: &[i64]) {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
+        let mut set = set.borrow_mut();
+        set.clear();
+        set.extend(addrs.iter().copied());
+    });
+}
+
+thread_local! {
+    static FAITHFUL_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`].
+pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
+}
+
 /// Configure the dormant terminal-decline regression hook.
 pub fn set_force_ca_terminal_decline(selector: u64) {
     FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);

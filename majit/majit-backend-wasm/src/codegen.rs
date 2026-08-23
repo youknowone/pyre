@@ -1772,6 +1772,9 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
+/// Wasm parameter types and result type of a residual call lowered directly.
+type TypedResidualSig = (Vec<ValType>, ValType);
+
 /// If `op` is a residual float CALL with only float arguments, return its wasm
 /// parameter types — eligible for a direct `call_indirect` returning `f64`.
 /// Float-result targets are not audited for a uniform word ABI: a `Ref` or
@@ -1783,29 +1786,58 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
 ///
 /// This includes `CallMayForceF`: the wasm virtualizable is always
 /// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
-fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
+fn residual_call_float_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
     use OpCode::*;
     if !matches!(
         op.opcode,
         CallF | CallPureF | CallLoopinvariantF | CallMayForceF
+    ) && !matches!(
+        op.opcode,
+        CallI | CallPureI | CallLoopinvariantI | CallMayForceI
+    ) && !matches!(
+        op.opcode,
+        CallR | CallPureR | CallLoopinvariantR | CallMayForceR
     ) {
-        return None;
-    }
-    if op.result_type() != Type::Float {
         return None;
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Float {
+    if op.result_type() != cd.result_type() {
         return None;
     }
+    let result = match cd.result_type() {
+        Type::Float => ValType::F64,
+        Type::Int | Type::Ref => ValType::I64,
+        Type::Void => return None,
+    };
     let arg_types = cd.arg_types();
-    let mut params = Vec::with_capacity(arg_types.len());
-    for ty in arg_types {
-        if *ty != Type::Float {
+    // Every argument `f64` and an `f64` result is the shipped shape and needs
+    // no vouching: a float-only descr has no word parameter to be an `i32`
+    // pointer in disguise. Anything else -- a word beside a float, or a word
+    // result over float arguments -- is only as good as the descr, so the
+    // callee has to be named by `set_faithful_residual_call_addrs`.
+    let all_float = result == ValType::F64 && arg_types.iter().all(|t| *t == Type::Float);
+    if !all_float {
+        // Only a compile-time callee can be checked against the allow-list; a
+        // register-form func pointer is a different target on every execution.
+        let func_ptr = op.arg(0).to_opref();
+        if !func_ptr.is_constant() {
             return None;
         }
-        params.push(ValType::F64);
+        if !crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr)) {
+            return None;
+        }
+    }
+    let mut params = Vec::with_capacity(arg_types.len());
+    for ty in arg_types {
+        params.push(match ty {
+            Type::Float => ValType::F64,
+            Type::Int | Type::Ref => ValType::I64,
+            Type::Void => return None,
+        });
     }
     // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
     // descr's `arg_types` describes those call args, so the counts must match.
@@ -1813,7 +1845,7 @@ fn residual_call_float_sig(op: &Op) -> Option<Vec<ValType>> {
     if params.len() != nargs {
         return None;
     }
-    Some(params)
+    Some((params, result))
 }
 
 /// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
@@ -1936,7 +1968,12 @@ fn has_call_ops(ops: &[Op]) -> bool {
 /// are direct under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string
 /// allocation retain the trampoline. When the direct family is disabled, all
 /// of the existing call-area users return to the trampoline baseline.
-fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bool {
+fn has_trampoline_calls(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    emit_ca: bool,
+) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
     if !WASM_DIRECT_RESIDUAL_CALL {
         return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
@@ -1954,7 +1991,7 @@ fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bo
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
             direct_helper_i64_arity(op, &ref_values).is_none()
-                && residual_call_float_sig(op).is_none()
+                && residual_call_float_sig(op, constants).is_none()
                 && residual_call_void_true_arity(op).is_none()
         }
         // `New*` and ref-store write barriers are covered by
@@ -2839,7 +2876,8 @@ pub fn build_wasm_module(
     // residual helpers, including the CA arm's inline fast path, use
     // `call_indirect` and need no import, although their frozen frame still
     // keeps the tail call area for future bridges.
-    let needs_call = has_trampoline_calls(&analysis_inputargs, &analysis_ops, ca.emit_ca);
+    let needs_call =
+        has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -2874,7 +2912,7 @@ pub fn build_wasm_module(
     let mut float_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
         for op in analysis_ops {
-            if let Some(sig) = residual_call_float_sig(op)
+            if let Some(sig) = residual_call_float_sig(op, constants)
                 && !float_residual_sigs.contains(&sig)
             {
                 float_residual_sigs.push(sig);
@@ -2975,19 +3013,19 @@ pub fn build_wasm_module(
             .function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
         next_type_idx += 1;
     }
-    // Float residual types follow all pre-existing direct helper types. Their
-    // parameter sequence comes from the call descr (`i64` for Int/Ref, `f64`
-    // for Float) and their result is always `f64`; the emitter uses this map to
-    // select the exact `call_indirect` type for each callee.
+    // Typed residual types follow all pre-existing direct helper types. Both
+    // the parameter sequence and the result come from the call descr (`i64`
+    // for Int/Ref, `f64` for Float); the emitter uses this map to select the
+    // exact `call_indirect` type for each callee.
     let float_residual_type_base = next_type_idx;
     let float_residual_type_indices = float_residual_sigs
         .iter()
         .cloned()
         .enumerate()
         .map(|(offset, sig)| (sig, float_residual_type_base + offset as u32))
-        .collect::<indexmap::IndexMap<_, _>>();
-    for sig in float_residual_type_indices.keys() {
-        types.ty().function(sig.clone(), vec![ValType::F64]);
+        .collect::<indexmap::IndexMap<TypedResidualSig, u32>>();
+    for (params, result) in float_residual_type_indices.keys() {
+        types.ty().function(params.clone(), vec![*result]);
     }
     next_type_idx += float_residual_type_indices.len() as u32;
     let true_void_residual_type_base = next_type_idx;
@@ -3207,10 +3245,10 @@ fn build_function(
     // eligible residual call / `New*` / write barrier, so those arms always
     // use the `jit_call` path.
     residual_type_base: Option<u32>,
-    // Exact wasm type indices for direct float residual calls, keyed by their
-    // descr-derived parameter sequence. These types return `f64`; Float SSA
-    // values are converted to/from their i64 bit carrier around the call.
-    float_residual_type_indices: &indexmap::IndexMap<Vec<ValType>, u32>,
+    // Exact wasm type indices for direct typed residual calls, keyed by their
+    // descr-derived parameter sequence and result. Float SSA values are
+    // converted to/from their i64 bit carrier around the call.
+    float_residual_type_indices: &indexmap::IndexMap<TypedResidualSig, u32>,
     // Base wasm type index of the `(i64×n) -> ()` true-void residual-call
     // types (type `true_void_residual_type_base + n` for arity `n`), or
     // `None` when the trace has no eligible true-void residual call.
@@ -5695,16 +5733,19 @@ fn build_function(
                             frame,
                         );
                     }
-                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op).and_then(|sig| {
-                    float_residual_type_indices
-                        .get(&sig)
-                        .map(|type_idx| (sig, type_idx))
-                }) {
-                    // Direct in-module float residual call with the
-                    // descr-derived mixed `(i64/f64...) -> f64` signature.
+                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op, constants)
+                    .and_then(|sig| {
+                        float_residual_type_indices
+                            .get(&sig)
+                            .map(|type_idx| (sig, type_idx))
+                    })
+                {
+                    // Direct in-module typed residual call with the
+                    // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
+                    let (params, _) = &sig;
                     let call_args = &op.getarglist()[1..];
-                    debug_assert_eq!(call_args.len(), sig.len());
-                    for (arg, ty) in call_args.iter().zip(&sig) {
+                    debug_assert_eq!(call_args.len(), params.len());
+                    for (arg, ty) in call_args.iter().zip(params) {
                         if *ty == ValType::F64 {
                             emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
                         } else {

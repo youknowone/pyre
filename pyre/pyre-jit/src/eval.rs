@@ -5165,6 +5165,27 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_backend_wasm::set_inline_trip_helper_slot(
         crate::call_jit::wasm_jit_inline_trip as *const () as usize as u32,
     );
+    // Residual targets whose call descr describes their real wasm ABI, so the
+    // backend may lower them to a typed `call_indirect` instead of the
+    // `jit_call` host trampoline. Each is a hand-written `extern "C"` whose
+    // recorded `arg_types`/`result_type` were written against that signature,
+    // and naming it here is the vouching the backend cannot do for itself --
+    // a raw callee taking `&T` is `(i32)` on wasm32 whatever its descr says.
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::set_faithful_residual_call_addrs(&[
+        // (f64) -> i64
+        pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const () as usize
+            as i64,
+        // (f64, i64) -> f64
+        pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as usize
+            as i64,
+        // (f64, f64) -> i64
+        pyre_interpreter::module::math::interp_math::jit_math_isclose_default as *const () as usize
+            as i64,
+        // (i64, i64) -> f64
+        pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
+            as i64,
+    ]);
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
     (d, info)
