@@ -3335,11 +3335,36 @@ impl TraceCtx {
         &self.metainterp_sd.profiler
     }
 
-    /// Root portal merge-point green key for this trace.
+    /// `pyjitpl.py MIFrame.implement_guard_value`, promoting `opref` into the
+    /// already-minted `promoted_box`.
     ///
-    /// Mirrors RPython's `current_merge_points[0]`: this stays anchored to the
-    /// original loop/portal merge point even if `green_key` is later retargeted
-    /// Record a promote: emit GuardValue to specialize on a runtime value.
+    /// Upstream mints the constant itself with `executor.constant_from_op(box)`,
+    /// which dispatches on the box's type; `TraceCtx` spells that through three
+    /// type-specific entry points, so the typed wrappers below mint and this
+    /// body takes the result.
+    ///
+    /// Upstream's `self.metainterp.replace_box(box, promoted_box)` is not here:
+    /// it walks the `MIFrame` register banks, which live a layer above the
+    /// recorder. Callers that need the rebind do it themselves.
+    fn implement_guard_value(
+        &mut self,
+        opref: OpRef,
+        promoted_box: OpRef,
+        num_live: usize,
+    ) -> OpRef {
+        // `if isinstance(box, Const): return box  # no promotion needed`.
+        // Structurally first: a `GuardValue` over an already-constant box can
+        // only ever succeed, and it would still hang a full resume snapshot
+        // off itself.
+        if opref.is_constant() {
+            return opref;
+        }
+        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, promoted_box], num_live);
+        promoted_box
+    }
+
+    /// Record an int-typed promote: emit GuardValue to specialize on a runtime
+    /// value.
     ///
     /// In RPython this is `jit.promote(x)` — it records a `GUARD_VALUE`
     /// that asserts the runtime value equals the constant captured during
@@ -3349,15 +3374,13 @@ impl TraceCtx {
     /// value seen at trace time.
     pub fn promote_int(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_int(runtime_value);
-        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
-        const_ref
+        self.implement_guard_value(opref, const_ref, num_live)
     }
 
     /// Record a ref-typed promote (GUARD_VALUE for GC references).
     pub fn promote_ref(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_ref(runtime_value);
-        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
-        const_ref
+        self.implement_guard_value(opref, const_ref, num_live)
     }
 
     /// Record a float-typed promote (GUARD_VALUE for floats).
@@ -3365,8 +3388,7 @@ impl TraceCtx {
     /// pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
     pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_float(runtime_value);
-        self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
-        const_ref
+        self.implement_guard_value(opref, const_ref, num_live)
     }
 
     /// `pyjitpl.py generate_guard` + `:2610 capture_resumedata`:
@@ -3426,8 +3448,8 @@ impl TraceCtx {
     /// That hoist narrows this path, it does not close it, and the
     /// difference is worth stating because the doc above was already once
     /// wrong in exactly this direction. `get_arrayitem_vable_index` still
-    /// carries its `promote_int` call; it is guarded by `index.is_constant()`
-    /// and so fires only for an index that did not arrive constant. What the
+    /// carries its `promote_int` call; `implement_guard_value`'s Const arm
+    /// makes it fire only for an index that did not arrive constant. What the
     /// hoist bought is that the `pyjitpl/dispatch.rs` family is const *by
     /// construction* at all of its index reads. The
     /// `jitcode_dispatch/vable_ops.rs` family is gated only on the index
@@ -5525,6 +5547,34 @@ mod history_record_tests {
         recorder.close_loop(jump_args);
         let mut trace = recorder.get_trace();
         (*trace.ops.remove(0)).clone()
+    }
+
+    /// `MIFrame.implement_guard_value`'s `isinstance(box, Const)` arm, for all
+    /// three typed entry points: an already-constant box is handed straight
+    /// back, with no `GUARD_VALUE` and so no resume snapshot behind one.
+    #[test]
+    fn promoting_an_already_constant_box_records_no_guard() {
+        let (mut ctx, _) = make_ctx_with_mixed_inputs();
+        let before = ctx.num_guards();
+
+        let i = OpRef::const_int(7);
+        assert_eq!(ctx.promote_int(i, 7, 0), i);
+        let f = OpRef::const_float(1.5);
+        assert_eq!(ctx.promote_float(f, 1.5f64.to_bits() as i64, 0), f);
+        let r = OpRef::const_ptr(majit_ir::GcRef(0));
+        assert_eq!(ctx.promote_ref(r, 0, 0), r);
+
+        assert_eq!(ctx.num_guards(), before, "a Const needs no promotion");
+    }
+
+    /// The other arm, unchanged: a real box still gets its `GUARD_VALUE` and
+    /// the promoted constant back.
+    #[test]
+    fn promoting_a_non_constant_box_records_the_guard() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let before = ctx.num_guards();
+        assert_eq!(ctx.promote_int(args[2], 7, 0), OpRef::const_int(7));
+        assert_eq!(ctx.num_guards(), before + 1);
     }
 
     #[test]

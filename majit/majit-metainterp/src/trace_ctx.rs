@@ -4795,12 +4795,7 @@ impl TraceCtx {
             eprintln!("[vable-idx-probe] {constness} pc={pc} value={index_runtime_value}");
         }
         // indexbox = self.implement_guard_value(indexbox, pc)
-        let promoted_index = if index.is_constant() {
-            index
-        } else {
-            self.promote_int(index, index_runtime_value, pc)
-        };
-        let _ = promoted_index;
+        self.promote_int(index, index_runtime_value, pc);
         let item_index = usize::try_from(index_runtime_value).ok()?;
         // arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
         // assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
