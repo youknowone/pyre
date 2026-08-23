@@ -1783,6 +1783,42 @@ impl PyError {
         !w_value.is_null() && crate::eval::check_exc_match_against(w_value, w_check_class)
     }
 
+    /// pypy/interpreter/error.py `OperationError.async`.
+    ///
+    /// ```python
+    /// def async(self, space):
+    ///     "Check if this is an exception that should better not be caught."
+    ///     return (self.match(space, space.w_SystemExit) or
+    ///             self.match(space, space.w_KeyboardInterrupt))
+    ///     # note: an extra case is added in OpErrFmtNoArgs
+    /// ```
+    ///
+    /// Named `r#async` because `async` is a Rust keyword, the same escape
+    /// `typedef::r#type` uses for `space.type`.
+    ///
+    /// The guard sites all read the same way: an error is about to be
+    /// swallowed and turned into a fallback answer, and this says which
+    /// errors must not be. The two named classes are the ones a program has
+    /// no business converting into `None` or `NotImplemented` — an exit
+    /// request and a Ctrl-C.
+    ///
+    /// `KeyboardInterrupt` has no `ExcKind`, so it reaches a `PyError`
+    /// only as an already-built instance and the class is named through the
+    /// registry rather than through a static. That is also why an error
+    /// that has not materialised can answer from its `kind` alone: nothing
+    /// unmaterialised is ever a `KeyboardInterrupt`, and building an
+    /// instance merely to ask would put an allocation on the swallow path
+    /// of every attribute lookup that misses.
+    pub fn r#async(&mut self, space: PyObjectRef) -> bool {
+        if self.exc_object.is_null() {
+            return self.kind == PyErrorKind::SystemExit;
+        }
+        ["SystemExit", "KeyboardInterrupt"].iter().any(|name| {
+            crate::builtins::lookup_exc_class(name)
+                .is_some_and(|w_class| self.match_(space, w_class))
+        })
+    }
+
     /// pypy/interpreter/error.py `chain_exceptions`.
     ///
     /// ```python
@@ -4554,5 +4590,26 @@ mod tests {
         assert!(!err.has_any_traceback());
         assert!(!err.got_any_traceback());
         assert!(err.exc_object.is_null(), "the reads must not materialise");
+    }
+
+    #[test]
+    fn an_unmaterialised_error_answers_async_from_its_kind() {
+        // The guard sites ask this on the swallow path of every miss, so it
+        // must not build an instance to answer.  `kind` settles both
+        // disjuncts before materialisation: nothing unmaterialised is a
+        // `KeyboardInterrupt`, which has no `ExcKind` at all.
+        let mut ordinary = super::PyError::type_error("bad operand");
+        assert!(!ordinary.r#async(pyre_object::PY_NULL));
+        assert!(
+            ordinary.exc_object.is_null(),
+            "the read must not materialise"
+        );
+
+        let mut exiting = super::PyError::new(super::PyErrorKind::SystemExit, "0");
+        assert!(exiting.r#async(pyre_object::PY_NULL));
+        assert!(
+            exiting.exc_object.is_null(),
+            "the read must not materialise"
+        );
     }
 }

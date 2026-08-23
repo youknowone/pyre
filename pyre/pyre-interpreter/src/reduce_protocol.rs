@@ -117,7 +117,7 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let w_objdict = crate::baseobjspace::findattr(current_obj(), "__dict__");
+    let w_objdict = crate::baseobjspace::findattr(current_obj(), "__dict__")?;
     let mut state_slot = None;
     if let Some(d) = w_objdict {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -338,7 +338,7 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     // Honour a user `__reduce__` override:
     // `type(obj).__reduce__ is not object.__reduce__`.
-    let w_reduce = crate::baseobjspace::findattr(current_obj(), "__reduce__");
+    let w_reduce = crate::baseobjspace::findattr(current_obj(), "__reduce__")?;
     if let Some(w_reduce) = w_reduce {
         let reduce_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_reduce);

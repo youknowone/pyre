@@ -523,25 +523,22 @@ pub fn combine_starstarargs_wrapped(
         if !isinst {
             false
         } else {
-            // argument.py:127-128 — `space.findattr(space.type(...),
-            // w_st_iter)`: PyPy issues `getattr` on the type object
+            // `argument.py` — `space.findattr(space.type(...),
+            // w_st_iter)`: the `getattr` is issued on the type object
             // itself, going through the metaclass / descriptor lookup
-            // chain.  `space.findattr` returns `None` for ordinary
-            // OperationError and re-raises async (baseobjspace.py:878).
-            // Pyre's `findattr` matches the same shape (Option<W>),
-            // modulo async-propagation (still a known gap covered by
-            // the `findattr` TODO).
+            // chain, so a raising `__getattribute__` on the metaclass
+            // surfaces here instead of reading as "no `__iter__`".
             let w_obj_type = crate::typedef::r#type(w_starstararg())
                 .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
             let lhs = if w_obj_type.is_null() {
                 None
             } else {
-                crate::baseobjspace::findattr(w_obj_type, "__iter__")
+                crate::baseobjspace::findattr(w_obj_type, "__iter__")?
             };
             let rhs = if w_dict_type.is_null() {
                 None
             } else {
-                crate::baseobjspace::findattr(w_dict_type, "__iter__")
+                crate::baseobjspace::findattr(w_dict_type, "__iter__")?
             };
             // `space.is_w` is pointer identity.
             match (lhs, rhs) {

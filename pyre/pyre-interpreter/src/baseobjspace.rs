@@ -4698,31 +4698,33 @@ pub fn not_(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(w_bool_from(!is_true(obj)?))
 }
 
-/// PyPy-compatible attribute lookup returning `None` when not found.  Runs
-/// suppressed (`_PyObject_LookupAttr`) since the AttributeError is swallowed.
-pub fn findattr(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    if unsafe { is_none(obj) } {
-        return None;
-    }
-    match getattr_str_impl(obj, name, true, true) {
-        Ok(value) if value.is_null() => None,
-        Ok(value) => Some(value),
-        Err(err) => {
-            if err.kind == crate::PyErrorKind::AttributeError
-                || err.kind == crate::PyErrorKind::NameError
-            {
-                None
-            } else {
-                panic!("space.findattr: unexpected {err:?}");
-            }
-        }
-    }
-}
-
-/// Like [`findattr`] but propagates a non-`AttributeError`/`NameError` error
-/// (e.g. a descriptor or `__getattr__` raising) instead of panicking. `Ok(None)`
-/// means the attribute is absent.
-pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+/// `baseobjspace.py findattr`.
+///
+/// ```python
+/// def findattr(self, w_object, w_name):
+///     try:
+///         return self.getattr(w_object, w_name)
+///     except OperationError as e:
+///         # a PyPy extension: let SystemExit and KeyboardInterrupt go through
+///         if e.async(self):
+///             raise
+///         return None
+/// ```
+///
+/// The `return None` arm is narrower here than upstream's, and deliberately:
+/// upstream swallows every error but the two `PyError::async` names,
+/// while `PyObject_GetOptionalAttr` reports only a missing attribute as
+/// "absent" and propagates anything else. `object.__reduce_ex__` — one of
+/// this function's callers — takes exactly that route
+/// (`object___reduce_ex___impl` returns on `< 0`), and a raising
+/// `__qualname__` descriptor likewise stops `_PyObject_FunctionStr` rather
+/// than reading as "no qualname". The 3.14 rule subsumes the async arm: an
+/// exit request or a Ctrl-C is never one of the two kinds swallowed here.
+///
+/// The lookup runs suppressed (`_PyObject_LookupAttr`), which is what makes
+/// the common absent case reach the `Ok(null)` arm without building an
+/// AttributeError to throw away.
+pub fn findattr(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
     if unsafe { is_none(obj) } {
         return Ok(None);
     }
@@ -4739,6 +4741,12 @@ pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRe
             }
         }
     }
+}
+
+/// [`findattr`] under the name most of its callers reach it by; the note on
+/// how the swallow set was chosen is on that one.
+pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    findattr(obj, name)
 }
 
 /// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
@@ -14687,14 +14695,18 @@ fn object_functionstr_str(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 ///         return None
 /// ```
 ///
-/// `Err(_)` carries the propagated async exception
-/// (`PyErrorKind::SystemExit`, mirroring `OperationError.async`'s
-/// SystemExit/KeyboardInterrupt arm — `error.py:62-65`).  Pyre's
-/// `PyError` does not yet carry a `KeyboardInterrupt` kind; SystemExit
-/// alone covers the propagation contract for the cases pyre raises
-/// today.  Ordinary `OperationError`s (AttributeError, NameError,
-/// TypeError from descriptors) collapse to `Ok(None)`, matching
-/// PyPy's `return None` arm.
+/// `Err(_)` carries the propagated async exception, asked through
+/// `PyError::async`.  Ordinary `OperationError`s
+/// (AttributeError, NameError, TypeError from descriptors) collapse to
+/// `Ok(None)`, matching the `return None` arm.
+///
+/// This one keeps upstream's swallow set rather than the narrower 3.14 rule
+/// [`findattr`] takes, because the surrounding `object_functionstr` is a
+/// port of upstream's try/except layout and the two have to agree on which
+/// faults reach the `str(w_function)` fallback.  The residual divergence is
+/// upstream's own: `_PyObject_FunctionStr` propagates any non-AttributeError
+/// from either lookup, so a raising `__qualname__` descriptor stops it where
+/// this falls through.
 fn object_functionstr_findattr(
     obj: PyObjectRef,
     name: &str,
@@ -14705,8 +14717,13 @@ fn object_functionstr_findattr(
     match getattr_str(obj, name) {
         Ok(value) if value.is_null() => Ok(None),
         Ok(value) => Ok(Some(value)),
-        Err(e) if e.kind == crate::PyErrorKind::SystemExit => Err(e),
-        Err(_) => Ok(None),
+        Err(mut e) => {
+            if e.r#async(w_none()) {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
