@@ -1,3 +1,51 @@
+# FILING (2026-08-23). Read this before attempting a fix -- four attempts have
+# already been made and refuted by measurement, and the diagnosis they produced
+# is not the one the first three assumed.
+#
+# THE INVARIANT IS A TRIPLE, not a pair:
+#     (last_instr, valuestackdepth, the stack cells [base .. base+depth))
+# Attempt 4 is the proof rather than merely a failure: pairing the depth at the
+# publishing writer makes `ForIter` read slot base+0, but nothing ever wrote the
+# iterator INTO that cell, so it still reads an int -- which is exactly the
+# TypeError below. Supplying two words without the cells cannot work.
+#
+# The four refuted attempts, with what discriminated each:
+#   1. `adopt_blackhole_crn` restores `last_instr` alone where its sibling
+#      `apply_blackhole_crn_handoff` restores both via `correct_resume_vsd`.
+#      Real and main-owned -- but an audit placed inside it NEVER FIRES here.
+#   2. `LiveLastInstrGuard` saves only `last_instr`. Saving/restoring the whole
+#      `FrameScalars` pair did not fix it: the guard is FAITHFUL, and the pair is
+#      already inconsistent when `enter_frame` captures it.
+#   3. The CALL_ASSEMBLER pin in `emit_walker_loop_callee_call_assembler`. Real
+#      and live on main (11 emits on `str_search_index_bounds`) -- ZERO events
+#      on this reproducer.
+#   4. Pairing both words at the publish site: RED, build provenance verified.
+#      `maybe_publish_inline_callee_last_instr_concrete` records this in its own
+#      doc.
+#
+# The plurality of coordinates is NOT the defect. A virtualizable's stored fields
+# are stale by design while the JIT executes -- upstream elides per-opcode
+# `last_instr` stores and reconstructs at exits -- so the walk-local coordinate
+# governs during a walk, the resume/blackhole image at exits, and the concrete
+# frame only outside the JIT domain.
+#
+# THE NEXT EXPERIMENT IS CONSUMER-SIDE, not another writer audit: instrument
+# every interpreter (re)entry on this frame, logging `last_instr`, `vsd`, AND THE
+# TYPES OF THE CELLS [base .. base+analysis_depth), to catch a re-entry that
+# never passed a reconstruction writing all three.
+#
+# Do NOT resurrect the "resumed inside a Cache slot" reading: `pc` in
+# `report_stack_underflow` is `next_instr()`, so `last_instr=66 pc=67` means
+# resume pc 66, an ordinary opcode boundary. That was an inference, never an
+# observation.
+#
+# Census: 128-case sweep = 32 fail / 96 pass, all 32 in the `rec_for` family.
+# Red on four dynasm binaries incl. one built at origin/main, and on cranelift --
+# so it is backend-independent and main-owned. Clean under PYRE_NO_JIT=1.
+# One-shot audit line:
+#   inline_callee_last_instr: next_instr=18 op=ForIter
+#     analysis_depth=Some(1) frame_depth=Some(0) (vsd=3 base=3)
+#
 # OPEN DEFECT reproducer, kept out of the runner glob until it passes.
 #
 # A loop-bearing callee resumed at its own `for` header with the operand-stack
