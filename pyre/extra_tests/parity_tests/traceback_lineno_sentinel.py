@@ -17,7 +17,10 @@
 # instruction sits.
 #
 # PyPy 7.3.20 fails every `rebuilt` case: its sentinel is `-sys.maxsize-1`, so
-# a `-1` handed to the constructor reads back as `-1`.
+# a `-1` handed to the constructor reads back as `-1`.  It also accepts writes
+# to `tb_lineno` and `tb_lasti`, which is the other half of the same choice --
+# it took the most negative value as its sentinel precisely because a written
+# line number could otherwise collide with it.
 
 
 def raiser():
@@ -84,6 +87,22 @@ def a_negative_offset_resolves_to_the_first_line():
         assert node.tb_lineno == firstlineno, (node.tb_lineno, firstlineno)
 
 
+def only_tb_next_is_writable():
+    # With `tb_lineno` resolving rather than storing, a writable slot would let
+    # a `-1` written back read as a computed line -- an answer neither
+    # reference gives.  Only `tb_next` takes an assignment.
+    node = NODES[0]
+    for name, value in (('tb_lineno', 5), ('tb_lasti', 5), ('tb_frame', None)):
+        try:
+            setattr(node, name, value)
+        except AttributeError as exc:
+            print(name, type(exc).__name__)
+        else:
+            print(name, 'writable')
+    node.tb_next = None
+    print('tb_next:', node.tb_next)
+
+
 def only_minus_one_is_the_sentinel():
     # `-2` and `0` are stored line numbers, however implausible; the
     # constructor is documented to take them and nothing resolves them.
@@ -98,4 +117,5 @@ the_sentinel_resolves_against_tb_lasti()
 an_offset_naming_no_instruction_resolves_to_none()
 a_negative_offset_resolves_to_the_first_line()
 only_minus_one_is_the_sentinel()
+only_tb_next_is_writable()
 print('OK')
