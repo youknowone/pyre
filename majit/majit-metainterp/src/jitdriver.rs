@@ -7830,9 +7830,14 @@ impl<S: JitState> JitDriver<S> {
         // can differ by the `ensure_default_driver_sd` placeholder shift, and
         // the merge point asserts the two agree, so arm a request instead and
         // let the merge point stamp its own `jdindex`.
-        ctx.bridge_resume_at_position = descr_arc
-            .as_fail_descr()
-            .is_some_and(|fd| fd.is_resume_at_position());
+        //
+        // The test is on `get_resumestorage()`, not on the failing descr:
+        // upstream's `key` is the resolved storage, so a guard that shares a
+        // short-preamble donor's resume data through `ResumeGuardCopiedDescr`
+        // arms the flag as well. `compile_trace`'s sibling read is the one
+        // that stays unresolved (compile.py:1040 tests `resumekey` itself).
+        ctx.bridge_resume_at_position =
+            crate::compile::get_resumestorage(&descr_arc).is_resume_at_position();
         if let Some(ptr) = live_vable_ptr {
             ctx.set_virtualizable_heap_ptr(ptr);
         }

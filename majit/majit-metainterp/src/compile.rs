@@ -5129,6 +5129,28 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
     })
 }
 
+/// `compile.py AbstractResumeGuardDescr.get_resumestorage`: the descr that
+/// actually holds this guard's resume data.
+///
+/// `ResumeGuardDescr.get_resumestorage` returns self (compile.py:883-884);
+/// `ResumeGuardCopiedDescr`'s returns `prev` (compile.py:848-851), the donor
+/// guard whose resume data it shares. The distinction is load-bearing wherever
+/// upstream tests the *storage* rather than the guard: `handle_guard_failure`
+/// takes `key = resumedescr.get_resumestorage()` and arms
+/// `seen_loop_header_for_jdindex` from `isinstance(key,
+/// ResumeAtPositionDescr)`, so a copied guard sharing a short-preamble donor
+/// counts as one. `compile_trace` deliberately does not resolve — it tests
+/// `resumekey` itself (compile.py:1040) — so callers must pick.
+pub fn get_resumestorage(descr: &DescrRef) -> DescrRef {
+    if descr.is_resume_guard_copied() {
+        descr
+            .prev_descr()
+            .expect("compile.py:849-850 ResumeGuardCopiedDescr.get_resumestorage requires prev")
+    } else {
+        descr.clone()
+    }
+}
+
 /// `compile.py ResumeGuardDescr.copy_all_attributes_from` +
 /// `compile.py ResumeGuardCopiedDescr.copy_all_attributes_from`
 /// dispatched on the receiver's variant.  Mutates `my_descr` in place;
@@ -5182,13 +5204,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         // compile.py `other = other.get_resumestorage()`: copied
         // donors route reads through `prev`. Resolve the chain so we
         // never deep-copy from a copied descr's empty payload.
-        let resolved_donor = if donor_descr.is_resume_guard_copied() {
-            donor_descr
-                .prev_descr()
-                .expect("compile.py:849 ResumeGuardCopiedDescr.get_resumestorage requires prev")
-        } else {
-            donor_descr.clone()
-        };
+        let resolved_donor = get_resumestorage(donor_descr);
         // compile.py `assert isinstance(other, ResumeGuardDescr)` —
         // post-resolution donor must be a ResumeGuardDescr (or subclass).
         assert!(
@@ -5547,13 +5563,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     // resume data from the canonical donor.  ResumeGuardDescr's
     // `get_resumestorage` returns self, so direct sources pass through
     // unchanged.
-    let resolved_descr = if src_descr.is_resume_guard_copied() {
-        src_descr
-            .prev_descr()
-            .expect("compile.py:849 ResumeGuardCopiedDescr.prev must be set")
-    } else {
-        src_descr.clone()
-    };
+    let resolved_descr = get_resumestorage(&src_descr);
     // compile.py `assert isinstance(other, ResumeGuardDescr)`:
     // reject non-resume FailDescr (e.g. `SimpleFailDescr`) that would
     // otherwise yield an empty rd_* payload on the loop-version descr.
@@ -6202,6 +6212,33 @@ mod fail_descr_tests {
             );
             assert!(descr.is_resume_guard(), "opcode {opcode:?}");
         }
+    }
+
+    /// `handle_guard_failure` arms `seen_loop_header_for_jdindex` from
+    /// `isinstance(key, ResumeAtPositionDescr)` where `key =
+    /// resumedescr.get_resumestorage()` (pyjitpl.py:2917 / :2941), so a copied
+    /// guard sharing a short-preamble donor answers yes even though the copied
+    /// descr is not itself a `ResumeAtPositionDescr`.
+    #[test]
+    fn get_resumestorage_reports_a_copied_guards_resume_at_position_donor() {
+        let donor = make_resume_at_position_descr_typed(vec![Type::Int]);
+        assert!(donor.is_resume_at_position());
+
+        let copied = make_resume_guard_copied_descr(donor.clone());
+        assert!(
+            !copied.is_resume_at_position(),
+            "compile.py:832 ResumeGuardCopiedDescr is a sibling of \
+             ResumeGuardDescr, not a ResumeAtPositionDescr"
+        );
+        assert!(
+            get_resumestorage(&copied).is_resume_at_position(),
+            "compile.py:848-851 get_resumestorage() resolves to prev"
+        );
+
+        // A plain resume guard is its own storage (compile.py:883-884).
+        let plain = make_resume_guard_descr_typed(vec![Type::Int]);
+        assert_eq!(Arc::as_ptr(&get_resumestorage(&plain)), Arc::as_ptr(&plain));
+        assert!(!get_resumestorage(&plain).is_resume_at_position());
     }
 
     /// `get_resumestorage()` chases to `prev`, `fail_arg_types`
