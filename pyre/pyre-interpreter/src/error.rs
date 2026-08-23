@@ -1064,20 +1064,24 @@ impl PyError {
             unsafe { crate::display::py_repr_wtf8(key) }
                 .unwrap_or_else(|_| Wtf8Buf::from_string("<unrepresentable>".to_string()))
         };
-        let exc = w_exception_new_wtf8(ExcKind::KeyError, &message);
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exception_new_wtf8(ExcKind::KeyError, &message));
+        // The exception is read back out of its slot at every use: the pin
+        // keeps it alive without keeping it in place, and the allocations
+        // below can relocate it.
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if !key.is_null() {
             // Reload the key after the repr / exception allocations: the pin
             // keeps it alive, but a minor collection may have relocated the
             // young key, leaving this raw local pointing at the old address.
             let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![key]);
-            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list) };
         }
         PyError {
             kind: PyErrorKind::KeyError,
             message,
-            exc_object: exc,
+            exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
@@ -1216,14 +1220,18 @@ impl PyError {
         };
         let filename_slot = pin(w_filename);
         let filename2_slot = pin(w_filename2);
-        let exc = w_exception_new(exc_kind, &message);
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        // The exception is read back out of its slot at every use below rather
+        // than out of a Rust local: each setter is preceded by an allocation,
+        // and the pin keeps the object alive without keeping it in place.
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exception_new(exc_kind, &message));
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         // Retag to the errno subclass through `w_class`, like
         // `os_error_family_new`: the subclasses share OSError's layout, so
         // the ExcKind stays OSError and only the class differs.
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
-                (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+                (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
             }
         }
         // `PyErr_SetExcFromWindowsErrWithFilenameObjects` builds the exception
@@ -1258,32 +1266,29 @@ impl PyError {
                 .collect(),
         );
         unsafe {
-            pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
-            pyre_object::interp_exceptions::w_exception_set_errno(
-                exc,
-                pyre_object::w_int_new(errno as i64),
-            );
-            pyre_object::interp_exceptions::w_exception_set_strerror(
-                exc,
-                pyre_object::w_str_new(&strerror),
-            );
+            pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list);
+            // Each value is built before the setter runs, so the exception the
+            // setter is handed is the one that exists after that allocation
+            // rather than the one that existed before it.
+            let w_errno = pyre_object::w_int_new(errno as i64);
+            pyre_object::interp_exceptions::w_exception_set_errno(exc(), w_errno);
+            let w_strerror = pyre_object::w_str_new(&strerror);
+            pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
             #[cfg(windows)]
             if let Some(code) = winerror {
-                pyre_object::interp_exceptions::w_exception_set_winerror(
-                    exc,
-                    pyre_object::w_int_new(code as i64),
-                );
+                let w_winerror = pyre_object::w_int_new(code as i64);
+                pyre_object::interp_exceptions::w_exception_set_winerror(exc(), w_winerror);
             }
             // Reload the paths after the args allocations: the pins keep them
             // alive, but a minor collection may have relocated the young
             // strings, leaving the raw locals pointing at the old addresses.
             if let Some(slot) = filename_slot {
                 let w_filename = pyre_object::gc_roots::shadow_stack_get(slot);
-                pyre_object::interp_exceptions::w_exception_set_filename(exc, w_filename);
+                pyre_object::interp_exceptions::w_exception_set_filename(exc(), w_filename);
             }
             if let Some(slot) = filename2_slot {
                 let w_filename2 = pyre_object::gc_roots::shadow_stack_get(slot);
-                pyre_object::interp_exceptions::w_exception_set_filename2(exc, w_filename2);
+                pyre_object::interp_exceptions::w_exception_set_filename2(exc(), w_filename2);
             }
         }
         PyError {
@@ -1293,7 +1298,7 @@ impl PyError {
             // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
             // it and the uncaught-traceback header would drop the filename.
             message: Wtf8Buf::new(),
-            exc_object: exc,
+            exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
@@ -1322,20 +1327,28 @@ impl PyError {
         // `w_list_new` run, so a collection there could sweep the unrooted
         // exception before `w_exception_set_args` writes through it.
         let _roots = pyre_object::gc_roots::push_roots();
-        let exc = w_exception_new(exc_kind, &strerror);
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exception_new(exc_kind, &strerror));
+        // Everything below is read back out of its slot: `w_list_new_object`
+        // takes elements its caller has already pinned, and each pin keeps its
+        // object alive without keeping it in place.
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        let errno_slot = exc_slot + 1;
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
+        let strerror_slot = errno_slot + 1;
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&strerror));
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            pyre_object::w_int_new(errno as i64),
-            pyre_object::w_str_new(&strerror),
+            pyre_object::gc_roots::shadow_stack_get(errno_slot),
+            pyre_object::gc_roots::shadow_stack_get(strerror_slot),
         ]);
-        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+        unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list) };
         PyError {
             kind,
             // Leave the display message empty so `message_text` derives it
             // from `exc_object`, whose `descr_str` renders the two-element
             // `args` as a tuple repr rather than as a bare string.
             message: Wtf8Buf::new(),
-            exc_object: exc,
+            exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
@@ -1372,32 +1385,36 @@ impl PyError {
         // `w_list_new` run, so a collection there could sweep the unrooted
         // exception before `w_exception_set_args` writes through it.
         let _roots = pyre_object::gc_roots::push_roots();
-        let exc = w_exception_new_wtf8(exc_kind, &message);
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exception_new_wtf8(exc_kind, &message));
+        // Everything below is read back out of its slot: `w_list_new_object`
+        // takes elements its caller has already pinned, and each pin keeps its
+        // object alive without keeping it in place.
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if let Some(w_target) = subclass.and_then(crate::builtins::lookup_exc_class) {
             unsafe {
-                (*(exc as *mut pyre_object::PyObject)).w_class = w_target;
+                (*(exc() as *mut pyre_object::PyObject)).w_class = w_target;
             }
         }
+        let errno_slot = exc_slot + 1;
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
+        let strerror_slot = errno_slot + 1;
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8(strerror.clone()));
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            pyre_object::w_int_new(errno as i64),
-            pyre_object::w_str_from_wtf8(strerror.clone()),
+            pyre_object::gc_roots::shadow_stack_get(errno_slot),
+            pyre_object::gc_roots::shadow_stack_get(strerror_slot),
         ]);
         unsafe {
-            pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
-            pyre_object::interp_exceptions::w_exception_set_errno(
-                exc,
-                pyre_object::w_int_new(errno as i64),
-            );
-            pyre_object::interp_exceptions::w_exception_set_strerror(
-                exc,
-                pyre_object::w_str_from_wtf8(strerror.clone()),
-            );
+            pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list);
+            let w_errno = pyre_object::w_int_new(errno as i64);
+            pyre_object::interp_exceptions::w_exception_set_errno(exc(), w_errno);
+            let w_strerror = pyre_object::w_str_from_wtf8(strerror.clone());
+            pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
         }
         PyError {
             kind,
             message,
-            exc_object: exc,
+            exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
@@ -1448,8 +1465,13 @@ impl PyError {
         if !w_name_from.is_null() {
             let _ = pyre_object::gc_roots::pin_root(w_name_from);
         }
-        let exc = w_exception_new_wtf8(ExcKind::ImportError, &message);
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(w_exception_new_wtf8(ExcKind::ImportError, &message));
+        // The exception is read back out of its slot at every use: the pin
+        // keeps it alive without keeping it in place, and the message
+        // allocation below can relocate it.
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         // `ImportError.__init__` mirrors args[0] into the dedicated `msg`
         // slot; the prebuilt-instance path bypasses it, so stamp it here.
         let w_msg = if message.is_empty() {
@@ -1477,15 +1499,15 @@ impl PyError {
             pyre_object::gc_roots::shadow_stack_get(name_from_slot)
         };
         unsafe {
-            pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
-            pyre_object::interp_exceptions::w_exception_set_name(exc, w_name);
-            pyre_object::interp_exceptions::w_exception_set_import_path(exc, w_path);
-            pyre_object::interp_exceptions::w_exception_set_import_name_from(exc, w_name_from);
+            pyre_object::interp_exceptions::w_exception_set_import_msg(exc(), w_msg);
+            pyre_object::interp_exceptions::w_exception_set_name(exc(), w_name);
+            pyre_object::interp_exceptions::w_exception_set_import_path(exc(), w_path);
+            pyre_object::interp_exceptions::w_exception_set_import_name_from(exc(), w_name_from);
         }
         PyError {
             kind: PyErrorKind::ImportError,
             message,
-            exc_object: exc,
+            exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
