@@ -314,6 +314,48 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_ELIDABLE_CANNOT_RAISE` for a callee that cannot trigger GC.
+///
+/// This is a representable analyzer output, not a special case:
+/// `EffectInfo.__new__` takes `can_collect` as its own parameter, defaulting
+/// to true, and `effectinfo_from_writeanalyze` forces it true only for
+/// `extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`;
+/// `EF_ELIDABLE_CANNOT_RAISE` is 0.  Elidable with `can_collect=false` is
+/// therefore the analyzer output for an `@jit.elidable` leaf whose collect
+/// analyzer clears it, which is the shape of every helper in
+/// `jit_builtin_folds`.
+///
+/// `EffectInfo.__new__` additionally empties `_write_descrs_*` for every
+/// `EF_ELIDABLE_*`.  Those sets are already empty here, so no other field
+/// differs from [`CANNOT_RAISE_NO_HEAP_EFFECT_INFO`].
+///
+/// This differs from [`ELIDABLE_CANNOT_RAISE_EFFECT_INFO`], which goes
+/// through `const_new` and leaves `can_collect=true`, costing every backend
+/// the gcmap bracket and reference-register spill these callees do not need.
+pub const ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::ElidableCannotRaise,
+    oopspecindex: OopSpecIndex::None,
+    pyre_helper: PyreHelperKind::None,
+    _readonly_descrs_fields: Some(Vec::new()),
+    _write_descrs_fields: Some(Vec::new()),
+    _readonly_descrs_arrays: Some(Vec::new()),
+    _write_descrs_arrays: Some(Vec::new()),
+    _readonly_descrs_interiorfields: Some(Vec::new()),
+    _write_descrs_interiorfields: Some(Vec::new()),
+    descr_set_keys: Some(majit_ir::effectinfo::DescrSetKeysImage::Empty),
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
 /// `EF_ELIDABLE_CANNOT_RAISE` with `OS_INT_PY_DIV` oopspec — Python `//`
 /// (floor division). RPython parity: jtransform.py:2046-2047
 /// `_handle_int_special` classifies `int.py_div` as

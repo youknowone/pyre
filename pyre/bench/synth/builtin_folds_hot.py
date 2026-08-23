@@ -13,6 +13,16 @@
 # arm on that host.  The gate clears the highest folded reading by 20% and still
 # sits an order of magnitude under the residual arm scaled to it.
 #
+# Those three-runner readings predate recording the `Int1` and `Float1`
+# channels as elidable calls.  A fold whose operand does not change is hoisted
+# out of the loop now instead of called once per iteration, and darwin-arm64
+# reads 3.1x / 2.9x where it read 4.6x / 4.7x.  The ceiling is unchanged: it
+# was fitted to a reading from all three runners, and only a reading from all
+# three can replace it.  `min` / `max` is the channel that did not move -- it
+# answers with a reference, and the loop re-proves that reference's `w_class`
+# before it can unbox it, so the call stays in the body.  That channel is what
+# the remaining ratio is mostly made of.
+#
 # pyre-check: spec-folds=builtin_fold1,builtin_fold2
 # This fixture carried a wasm allowance of 13 while every folded builtin still
 # left the trace module: a fold removes the frame force, the argument rooting,

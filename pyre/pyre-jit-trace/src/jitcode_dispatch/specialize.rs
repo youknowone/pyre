@@ -11403,11 +11403,18 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
                     continue;
                 }
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-                let raw = ctx.trace_ctx.call_int_typed_with_effect(
+                let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+                    OpCode::CallI,
                     raw_fn as *const (),
                     &[r_args[2]],
                     &[majit_ir::Type::Ref],
-                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                    majit_ir::Type::Int,
+                    majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                    &[
+                        majit_ir::Value::Int(raw_fn as *const () as i64),
+                        majit_ir::Value::Ref(majit_ir::GcRef(operands[0] as usize)),
+                    ],
+                    majit_ir::Value::Int(value),
                 );
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(value));
@@ -11429,11 +11436,18 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
                     continue;
                 }
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-                let raw = ctx.trace_ctx.call_float_typed_with_effect(
+                let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+                    OpCode::CallF,
                     raw_fn as *const (),
                     &[r_args[2]],
                     &[majit_ir::Type::Ref],
-                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                    majit_ir::Type::Float,
+                    majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                    &[
+                        majit_ir::Value::Int(raw_fn as *const () as i64),
+                        majit_ir::Value::Ref(majit_ir::GcRef(operands[0] as usize)),
+                    ],
+                    majit_ir::Value::Float(value),
                 );
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(value));
@@ -11509,6 +11523,21 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
             // their own arguments, so unlike the allocating ref helpers this
             // one really cannot collect -- which drops the gcmap bracket the
             // plain `CannotRaise` constructor would ask every backend for.
+            //
+            // The helper is a pure function of its pair, so this call could be
+            // recorded elidable the way the int and float channels are.  It is
+            // not, because it does not pay: what a caller does with the answer
+            // is unbox it, and the returned reference's `w_class` is not an
+            // immutable field, so the loop re-proves it every iteration before
+            // it can read `intval`.  The derived value therefore cannot cross
+            // the jump, and the optimizer re-materializes both calls at the
+            // end of the body to feed it -- leaving the loop paying the calls
+            // it already paid plus the re-check.  Measured on a
+            // `min(a, b) + max(a, b)` loop over 8M iterations, interleaved:
+            // 0.0515s as a plain call against 0.0541s as an elidable one, the
+            // plain call ahead in 8 of 9 rounds.  A `w_class` that can be
+            // proved away, or an int channel that answers with the winning
+            // value instead of the winning object, is what would change that.
             majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         );
         // Concrete before the guard: the guard captures a resume snapshot, and
