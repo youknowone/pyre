@@ -2045,6 +2045,22 @@ fn eval_source_in_main(
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
 
+    // `<string>` names no file, so `linecache._interactive_cache` is the only
+    // place a traceback frame or `inspect.getsource` can reach the command's
+    // text; publish the compiled tree there before it runs. A script keeps its
+    // own path and a stdin run keeps `<stdin>`, which is the same distinction
+    // `__file__` above already makes. Registration is cosmetic, so a failure
+    // must not stop the command.
+    if filename == "<string>" {
+        let _ = repl::register_interactive_code(
+            canonical,
+            ec_ptr,
+            frame.fget_f_code(),
+            source,
+            filename,
+        );
+    }
+
     match eval_with_jit(&mut frame, None) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
