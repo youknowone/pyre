@@ -331,6 +331,22 @@ assert p('power', 2, 8) == 256
 assert p('negative', 5) == -5
 assert p('index', 7) == 7
 assert p('float', 7) == 7.0
+# `PyNumber_Long` is `int(o)`: a float truncates toward zero, a string or a
+# bytes object is parsed, and what has neither answer is refused.
+assert p('long', 7) == 7
+assert p('long', 12.9) == 12
+assert p('long', -12.9) == -12
+assert p('long', True) == 1
+assert p('long', '  42  ') == 42
+assert p('long', b'42') == 42
+assert p('long', 10 ** 30) == 10 ** 30
+for bad, kind in [('zz', ValueError), ([], TypeError), (None, TypeError)]:
+    try:
+        p('long', bad)
+    except kind:
+        pass
+    else:
+        raise AssertionError('%r was accepted' % (bad,))
 assert p('number_check', 7) is True
 assert p('number_check', 'x') is False
 assert p('as_ssize', 12) == 12

@@ -960,6 +960,9 @@ static PyObject *m_protocol(PyObject *self, PyObject *args)
     if (strcmp(what, "float") == 0) {
         return PyNumber_Float(first);
     }
+    if (strcmp(what, "long") == 0) {
+        return PyNumber_Long(first);
+    }
     if (strcmp(what, "number_check") == 0) {
         return PyBool_FromLong(PyNumber_Check(first));
     }
