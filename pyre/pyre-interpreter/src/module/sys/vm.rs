@@ -1366,7 +1366,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // pypy/interpreter/app_main.py:785-786:
     //   sys._xoptions = dict(x.split('=', 1) if '=' in x else (x, True)
     //                        for x in options['_xoptions'])
-    let xoptions = w_dict_new();
+    // `fsdecode_os_str*` reaches `call_registered_decode_error_handler`, which
+    // calls app-level Python, so a decode is a collection point.  The dict is
+    // filled across every one of them and a dict moves, so it lives in a root
+    // slot and each store reads it back from there rather than from the word
+    // that was live before the decode.
+    let roots = pyre_object::gc_roots::push_roots();
+    let xoptions_slot = roots.base();
+    let _ = roots.pin_root(w_dict_new());
     for option in crate::importing::xoptions() {
         // `split('=', 1)` over a value that need not have a UTF-8 form. `=` is
         // ASCII, and `OsStr` documents its encoded form as splittable at an
@@ -1375,21 +1382,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let (name, value) = match bytes.iter().position(|&b| b == b'=') {
             Some(eq) => {
                 let (name, value) = bytes.split_at(eq);
-                let value = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&value[1..]) };
-                (name, crate::gateway::fsdecode_os_str(value))
+                (name, Some(&value[1..]))
             }
-            None => (bytes, w_bool_from(true)),
+            None => (bytes, None),
         };
-        let name = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(name) };
+        // The name decodes first: it answers a `Wtf8Buf`, which no collection
+        // touches, whereas the decoded value is a `str` that moves.  Decoding
+        // the value last leaves nothing movable live across a decode but the
+        // rooted dict.
+        let w_name = crate::gateway::fsdecode_os_str_wtf8(unsafe {
+            std::ffi::OsStr::from_encoded_bytes_unchecked(name)
+        });
+        let value = match value {
+            Some(value) => crate::gateway::fsdecode_os_str(unsafe {
+                std::ffi::OsStr::from_encoded_bytes_unchecked(value)
+            }),
+            None => w_bool_from(true),
+        };
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_wtf8_no_proxy(
-                xoptions,
-                &crate::gateway::fsdecode_os_str_wtf8(name),
+                roots.get(xoptions_slot),
+                &w_name,
                 value,
             );
         }
     }
-    module_ns_store(ns, "_xoptions", xoptions);
+    module_ns_store(ns, "_xoptions", roots.get(xoptions_slot));
     // Format matches `platform._sys_version`'s CPython parser:
     // `version (buildinfo) [compiler]`.
     //
