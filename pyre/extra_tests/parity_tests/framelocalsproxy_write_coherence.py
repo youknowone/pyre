@@ -36,13 +36,19 @@ def write_through_proxy(rounds):
 def read_after_store_proxy(rounds):
     # The read direction, through the getitem scan: the body's `STORE_FAST x`
     # goes to the shadow once compiled while `proxy["x"]` reads the array.
+    #
+    # This reports the LAST value rather than a running total, which scopes it
+    # to the standing divergence.  A total also counts the single update lost at
+    # the one iteration where the loop compiles -- a separate defect, present on
+    # the write side too and visible with this one removed, so it does not
+    # belong to the arm that guards this one.
     x = -1
     proxy = sys._getframe(0).f_locals
-    total = 0
+    last = None
     for i in range(rounds):
         x = i
-        total += proxy["x"]
-    return total
+        last = proxy["x"]
+    return last
 
 
 def snapshot_after_store_proxy(rounds):
