@@ -59,7 +59,14 @@ def the_object_reduce_helpers_are_not_frames():
 
 def the_defaultdict_factory_is_not_a_frame():
     d = collections.defaultdict(int)
-    assert traced(lambda: d['missing']) == ['<lambda>'], traced(lambda: d['missing'])
+    # A miss fills the key it was asked for, and `traced` runs its callable once
+    # outside the trace, so a fixed key would leave the traced call an ordinary
+    # hit that never reaches the factory -- and the arm would pass however
+    # visible that frame became.  Hand each call a key nothing has filled.
+    keys = iter(('warm', 'traced'))
+    seen = traced(lambda: d[next(keys)])
+    assert seen == ['<lambda>'], seen
+    assert d['traced'] == 0, d
 
 
 def the_operator_getters_are_not_frames():
