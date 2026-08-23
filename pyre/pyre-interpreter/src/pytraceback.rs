@@ -379,12 +379,17 @@ pub unsafe fn mark_traceback_escaped(w_traceback: PyObjectRef) {
 ///     operror.set_traceback(tb)
 /// ```
 ///
-/// Pyre stores the chain head on the materialised `W_BaseException`'s
-/// `w_traceback` slot (the same slot
-/// `interp_exceptions.rs`'s `w_exception_set_traceback` writes to).  The
-/// operror-side `_application_traceback: Option<PyObjectRef>` cache
-/// mirrors the slot for `to_exc_object` callers that haven't allocated
-/// the exception yet.
+/// Upstream keys the two reads off the operror, whose
+/// `_application_traceback` field holds the chain beside `_w_value`.  Pyre
+/// keys them off the materialised `W_BaseException`'s `w_traceback` slot
+/// instead, and takes that object rather than the `PyError`: a propagating
+/// Rust `PyError` is memcpy'd at every `?` and so cannot be registered as a
+/// GC root, while the instance can, which is what `set_in_flight_exception`
+/// below relies on.  [`PyError::get_traceback`](crate::PyError::get_traceback)
+/// and [`PyError::set_traceback`](crate::PyError::set_traceback) are the
+/// carrier-level spelling of the same two slot accesses, for callers that do
+/// hold the error; this entry point is also the one the JIT seam reaches
+/// across an ABI boundary carrying only the exception value.
 ///
 /// `last_instruction` is the byte-offset of the in-flight opcode
 /// (`pyframe.py:72 self.last_instr`).  In RPython this is the

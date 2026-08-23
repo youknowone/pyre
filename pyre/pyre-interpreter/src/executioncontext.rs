@@ -1338,13 +1338,11 @@ impl ExecutionContext {
                 let w_value = operr.normalize_exception(space)?;
                 let w_type = crate::typedef::r#type(w_value)
                     .map_or_else(pyre_object::w_none, |p| p.as_ptr());
-                let mut w_traceback =
-                    unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) };
-                if w_traceback.is_null() {
-                    w_traceback = pyre_object::w_none();
-                } else {
-                    unsafe { crate::pytraceback::mark_traceback_escaped(w_traceback) };
-                }
+                // `operr.get_w_traceback(space)` — the slot read, its escape
+                // mark, and the `w_None` for an empty chain.  The normalization
+                // above put the same instance on the carrier, so the carrier
+                // reads it back.
+                let w_traceback = operr.get_w_traceback(space);
                 pyre_object::tupleobject::w_tuple_new(vec![w_type, w_value, w_traceback])
             } else {
                 w_arg
