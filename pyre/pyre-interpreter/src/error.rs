@@ -425,6 +425,24 @@ pub struct PyError {
 /// traceback, or context state.
 pub type OperationError = PyError;
 
+/// Whether `co_filename` names one of the modules
+/// [`PyError::remove_traceback_module_frames`] was asked to drop.
+///
+/// A name matches outright, as upstream's `co_filename not in module_names`
+/// does, and also matches as a trailing path component: upstream's callers
+/// name frozen modules, whose `co_filename` is the fixed `<frozen ...>`
+/// pseudo-name, while the same module read from disk carries an
+/// installation-dependent absolute path that no fixed string can spell.
+fn traceback_frame_names_module(co_filename: &str, module_names: &[&str]) -> bool {
+    let normalized = co_filename.replace('\\', "/");
+    module_names.iter().any(|name| {
+        normalized == *name
+            || (normalized.len() > name.len()
+                && normalized.ends_with(name)
+                && normalized.as_bytes()[normalized.len() - name.len() - 1] == b'/')
+    })
+}
+
 /// [`PyError::to_exc_object`] behind the residual-call ABI:
 /// one pointer in, one pointer out, and a body the codewriter does not
 /// look inside.
@@ -1557,6 +1575,194 @@ impl PyError {
         }
         self.exc_object = w_value;
         Ok(w_value)
+    }
+
+    /// `error.py` — `OperationError.get_traceback`:
+    ///
+    /// ```python
+    /// def get_traceback(self):
+    ///     tb = self._application_traceback
+    ///     if tb is not None and isinstance(tb, PyTraceback):
+    ///         tb.frame.mark_as_escaped()
+    ///     return tb
+    /// ```
+    ///
+    /// Upstream keeps the chain head in an `_application_traceback` field
+    /// beside `_w_value`, so it can answer while `_w_value` is still `None`.
+    /// This carrier keeps it on the materialised instance's `w_traceback`
+    /// slot instead, for the reason [`to_exc_object`] exists at all: a
+    /// propagating Rust `PyError` is memcpy'd at every `?` and so cannot be
+    /// registered as a GC root, while the instance can — `set_in_flight_exception`
+    /// publishes it and the collector then reaches the whole chain through it.
+    /// An unmaterialised error therefore has no chain to report, which is the
+    /// same answer upstream's `None` gives: nothing has recorded a frame yet.
+    ///
+    /// Reading marks the head frame escaped, upstream's documented side
+    /// effect — see [`crate::pytraceback::mark_traceback_escaped`] for which
+    /// single-frame case that covers.
+    pub fn get_traceback(&self) -> PyObjectRef {
+        let tb = self.application_traceback();
+        unsafe { crate::pytraceback::mark_traceback_escaped(tb) };
+        tb
+    }
+
+    /// The `_application_traceback` field read itself, without
+    /// [`get_traceback`](Self::get_traceback)'s escape mark.  Upstream reads
+    /// the field directly wherever the chain must not escape, and goes through
+    /// `get_traceback` everywhere else.
+    fn application_traceback(&self) -> PyObjectRef {
+        if self.exc_object.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(self.exc_object) }
+    }
+
+    /// `error.py` — `OperationError.has_any_traceback`:
+    ///
+    /// ```python
+    /// def has_any_traceback(self):
+    ///     return self._application_traceback is not None
+    /// ```
+    ///
+    /// The plain field test, so it neither materialises nor marks anything
+    /// escaped; [`get_traceback`](Self::get_traceback) is the reading form.
+    pub fn has_any_traceback(&self) -> bool {
+        !self.application_traceback().is_null()
+    }
+
+    /// `error.py` — `OperationError.got_any_traceback`, upstream's second
+    /// spelling of the same test, kept so both call sites port across.
+    pub fn got_any_traceback(&self) -> bool {
+        self.has_any_traceback()
+    }
+
+    /// `error.py` — `OperationError.get_w_traceback`:
+    ///
+    /// ```python
+    /// def get_w_traceback(self, space):
+    ///     """Return a traceback or w_None. """
+    ///     tb = self.get_traceback()
+    ///     if tb is None:
+    ///         return space.w_None
+    ///     return tb
+    /// ```
+    pub fn get_w_traceback(&self, _space: PyObjectRef) -> PyObjectRef {
+        let tb = self.get_traceback();
+        if tb.is_null() {
+            return pyre_object::w_none();
+        }
+        tb
+    }
+
+    /// `error.py` — `OperationError.set_traceback`:
+    ///
+    /// ```python
+    /// def set_traceback(self, traceback):
+    ///     """Set the current traceback."""
+    ///     self._application_traceback = traceback
+    /// ```
+    ///
+    /// The store is the one operation that cannot be answered without the
+    /// instance, since that is where [`get_traceback`](Self::get_traceback)
+    /// reads it back from, so this is where an error still carrying only a
+    /// message materialises.  Callers that go on to allocate must sequence
+    /// their own allocation after this one: the instance is what roots the
+    /// chain, so a node built before it exists is unreachable.
+    pub fn set_traceback(&mut self, w_traceback: PyObjectRef) {
+        let exc = self.to_exc_object();
+        if exc.is_null() {
+            return;
+        }
+        unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(exc, w_traceback) };
+    }
+
+    /// `error.py` — `OperationError.remove_traceback_module_frames`:
+    ///
+    /// ```python
+    /// def remove_traceback_module_frames(self, *module_names):
+    ///     tb = self._application_traceback
+    ///     while tb is not None and isinstance(tb, PyTraceback):
+    ///         if tb.frame.pycode.co_filename not in module_names:
+    ///             break
+    ///         tb = tb.next
+    ///     self._application_traceback = tb
+    /// ```
+    ///
+    /// Drops the leading, outermost run of traceback entries raised from one
+    /// of `module_names`, so machinery a module implements in Python does not
+    /// surface in an error it re-raises; the first entry from anywhere else
+    /// stops the walk and the rest of the chain is kept intact.
+    ///
+    /// [`traceback_frame_names_module`] is the membership test, which widens
+    /// upstream's `not in module_names` by one case pyre needs.
+    pub fn remove_traceback_module_frames(&mut self, module_names: &[&str]) {
+        let exc = self.to_exc_object();
+        if exc.is_null() {
+            return;
+        }
+        unsafe {
+            use pyre_object::gc_roots::{
+                pin_root, push_roots, shadow_stack_get, shadow_stack_len, shadow_stack_set,
+            };
+
+            // `co_filename` is realised by `code_get_field`, which allocates
+            // and can therefore collect.  A traceback node emitted by compiled
+            // code is nursery-resident, so a collection moves it and a raw
+            // cursor carried across the call would name reclaimed memory —
+            // both when the walk steps to `w_next` and when the survivor is
+            // republished below.  Keep the cursor in a root slot and re-read it
+            // after every call that can allocate, the discipline
+            // `write_traceback_chain` already follows for its own walk.
+            let _roots = push_roots();
+            let exc_slot = shadow_stack_len();
+            let exc = pin_root(exc);
+            // Read the chain off the pinned address, not off
+            // `self.exc_object`: `pin_root` normalizes, so a collection during
+            // the publish leaves the field naming where the exception used to
+            // be.  Store the pinned address back for the same reason
+            // `to_exc_object` does with the deferred context refs.
+            self.exc_object = exc;
+            let tb_slot = shadow_stack_len();
+            let _ = pin_root(pyre_object::interp_exceptions::w_exception_get_traceback(
+                exc,
+            ));
+            let code_slot = shadow_stack_len();
+            let _ = pin_root(pyre_object::PY_NULL);
+            loop {
+                // `while tb is not None and isinstance(tb, PyTraceback)`.
+                let tb = shadow_stack_get(tb_slot);
+                if tb.is_null()
+                    || pyre_object::is_none(tb)
+                    || !crate::pytraceback::is_pytraceback(tb)
+                {
+                    break;
+                }
+                let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
+                if w_code.is_null() {
+                    break;
+                }
+                shadow_stack_set(code_slot, w_code);
+                let names_a_module =
+                    crate::pycode::code_get_field(shadow_stack_get(code_slot), "co_filename")
+                        .ok()
+                        .filter(|f| pyre_object::is_str(*f))
+                        // A module imported from a path with no UTF-8 spelling
+                        // carries a surrogate escape in `co_filename`; it is
+                        // not one of the named modules either way.
+                        .and_then(|f| pyre_object::w_str_get_value_opt(f))
+                        .is_some_and(|f| traceback_frame_names_module(f, module_names));
+                if !names_a_module {
+                    break;
+                }
+                let tb = shadow_stack_get(tb_slot);
+                shadow_stack_set(tb_slot, crate::pytraceback::w_pytraceback_get_w_next(tb));
+            }
+            // `self._application_traceback = tb`.  `exc_object` still names the
+            // pinned exception, so the store lands on the same instance the
+            // walk read from.
+            debug_assert_eq!(self.exc_object, shadow_stack_get(exc_slot));
+            self.set_traceback(shadow_stack_get(tb_slot));
+        }
     }
 
     /// pypy/interpreter/error.py `OperationError.match`.
@@ -4283,5 +4489,70 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("Traceback (most recent call last):"));
         assert!(text.contains("TypeError: bad operand"));
+    }
+
+    #[test]
+    fn traceback_frame_names_module_matches_a_frozen_pseudo_name_exactly() {
+        let names = ["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"];
+        assert!(super::traceback_frame_names_module(
+            "<frozen importlib._bootstrap>",
+            &names
+        ));
+        // Upstream's membership test is exact, so a longer pseudo-name that
+        // merely starts the same is a different module.
+        assert!(!super::traceback_frame_names_module(
+            "<frozen importlib._bootstrap_external>",
+            &names
+        ));
+    }
+
+    #[test]
+    fn traceback_frame_names_module_matches_an_installed_path_by_its_tail() {
+        let names = ["importlib/_bootstrap.py"];
+        assert!(super::traceback_frame_names_module(
+            "/usr/lib/python3.14/importlib/_bootstrap.py",
+            &names
+        ));
+        // A Windows spelling of the same file reaches the same verdict.
+        assert!(super::traceback_frame_names_module(
+            r"C:\Python314\Lib\importlib\_bootstrap.py",
+            &names
+        ));
+    }
+
+    #[test]
+    fn traceback_frame_names_module_needs_a_separator_before_the_tail() {
+        // `my_importlib/_bootstrap.py` ends with the name but is a different
+        // package, so the tail match only counts on a path boundary.
+        assert!(!super::traceback_frame_names_module(
+            "/app/my_importlib/_bootstrap.py",
+            &["importlib/_bootstrap.py"]
+        ));
+        assert!(!super::traceback_frame_names_module(
+            "/app/notimportlib/_bootstrap.py",
+            &["importlib/_bootstrap.py"]
+        ));
+    }
+
+    #[test]
+    fn traceback_frame_names_module_answers_no_for_an_application_frame() {
+        assert!(!super::traceback_frame_names_module(
+            "/app/main.py",
+            &["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"]
+        ));
+        assert!(!super::traceback_frame_names_module("/app/main.py", &[]));
+    }
+
+    #[test]
+    fn an_unmaterialised_error_reports_no_traceback() {
+        // `_application_traceback` starts as `None` upstream, and pyre reads
+        // the chain off the exception instance, which a message-only error has
+        // not built.  Neither read may allocate one to find that out.
+        let err = super::PyError::type_error("bad operand");
+        assert!(err.exc_object.is_null());
+        assert!(err.get_traceback().is_null());
+        assert!(!err.has_any_traceback());
+        assert!(!err.got_any_traceback());
+        assert!(err.exc_object.is_null(), "the reads must not materialise");
     }
 }

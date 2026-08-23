@@ -669,13 +669,33 @@ fn call_codec(
     w_coder: PyObjectRef,
     w_obj: PyObjectRef,
     action: &str,
+    encoding: &str,
     errors: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
-    let w_res = if let Some(errors) = errors {
-        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new(errors)])?
+    let call = if let Some(errors) = errors {
+        crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new(errors)])
     } else {
-        crate::call::call_function_impl_result(w_coder, &[w_obj])?
+        crate::call::call_function_impl_result(w_coder, &[w_obj])
+    };
+    // A codec that raises gets one line of context naming the operation and
+    // the encoding, and is re-raised otherwise unchanged:
+    //
+    //     _PyErr_FormatNote("%s with '%s' codec failed", "encoding", encoding);
+    //
+    // `interp_codecs.py _wrap_codec_error` instead rebuilds the error with the
+    // original as `__cause__`, which is the pre-3.12 spelling of the same
+    // context — `gh-102406` replaced the chaining with a PEP 678 note, and
+    // pyre targets 3.14.  The message text is the one both produce.
+    let w_res = match call {
+        Ok(w_res) => w_res,
+        Err(mut operr) => {
+            crate::baseobjspace::add_internal_exception_note(
+                &mut operr,
+                &format!("{action} with '{encoding}' codec failed"),
+            )?;
+            return Err(operr);
+        }
     };
     if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
         let msg = if action.starts_with("en") {
@@ -704,7 +724,7 @@ pub(crate) fn encode_text_codec(
         validate_error_handler(errors)?;
     }
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
-    let w_retval = call_codec(w_encfunc, w_obj, "encoding", Some(errors))?;
+    let w_retval = call_codec(w_encfunc, w_obj, "encoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_retval) } {
         let tname = unsafe { pyre_object::type_name_of(w_retval) };
         return Err(crate::PyError::type_error(format!(
@@ -733,7 +753,7 @@ pub(crate) fn decode_text_codec(
         validate_error_handler(errors)?;
     }
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
-    let w_retval = call_codec(w_decfunc, w_obj, "decoding", Some(errors))?;
+    let w_retval = call_codec(w_decfunc, w_obj, "decoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::is_str(w_retval) } {
         let tname = unsafe { pyre_object::type_name_of(w_retval) };
         return Err(crate::PyError::type_error(format!(

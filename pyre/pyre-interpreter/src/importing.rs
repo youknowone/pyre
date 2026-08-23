@@ -4653,77 +4653,29 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     Ok(Some(shadow_stack_get(mod_slot)))
 }
 
-/// `interp_import.py:98` — `e.remove_traceback_module_frames('<frozen
-/// importlib._bootstrap>', '<frozen importlib._bootstrap_external>', ...)`:
-/// drop the leading traceback entries that belong to the importlib bootstrap
+/// `interp_import.py interp___import__` — the `except OperationError` arm:
+///
+/// ```python
+/// e.remove_traceback_module_frames(
+///       '<frozen importlib._bootstrap>',
+///       '<frozen importlib._bootstrap_external>',
+///       '<builtin>/frozen importlib._bootstrap_external')
+/// raise
+/// ```
+///
+/// Drops the leading traceback entries that belong to the importlib bootstrap
 /// so an import error does not expose its internal `__import__` /
-/// `_find_and_load` machinery. pyre runs the bootstrap from the on-disk
-/// `importlib/_bootstrap{,_external}.py` sources, so match those filenames as
-/// well as the frozen pseudo-names. Only leading (outermost, contiguous)
-/// bootstrap frames are removed; a user frame stops the walk, keeping real
-/// application frames intact.
+/// `_find_and_load` machinery.  pyre runs the bootstrap from the on-disk
+/// `importlib/_bootstrap{,_external}.py` sources rather than frozen modules,
+/// so those two path spellings are named alongside upstream's three.
 fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
-    use pyre_object::interp_exceptions::{w_exception_get_traceback, w_exception_set_traceback};
-
-    fn is_bootstrap_filename(path: &str) -> bool {
-        let norm = path.replace('\\', "/");
-        norm.ends_with("importlib/_bootstrap.py")
-            || norm.ends_with("importlib/_bootstrap_external.py")
-            || norm == "<frozen importlib._bootstrap>"
-            || norm == "<frozen importlib._bootstrap_external>"
-    }
-
-    let exc = err.to_exc_object();
-    if exc.is_null() {
-        return err;
-    }
-    unsafe {
-        use pyre_object::gc_roots::{
-            pin_root, push_roots, shadow_stack_get, shadow_stack_len, shadow_stack_set,
-        };
-
-        // `code_get_field` realises `co_filename`, which allocates and can
-        // therefore collect.  A traceback node emitted by compiled code is
-        // nursery-resident, so a collection moves it and a raw cursor carried
-        // across the call would name reclaimed memory — both when the walk
-        // steps to `w_next` and when the survivor is republished below.  Keep
-        // the cursor in a root slot and re-read it after every call that can
-        // allocate, the discipline `write_traceback_chain` already follows for
-        // its own walk.
-        let _roots = push_roots();
-        let exc_slot = shadow_stack_len();
-        let exc = pin_root(exc);
-        let tb_slot = shadow_stack_len();
-        let _ = pin_root(w_exception_get_traceback(exc));
-        let code_slot = shadow_stack_len();
-        let _ = pin_root(pyre_object::PY_NULL);
-        loop {
-            let tb = shadow_stack_get(tb_slot);
-            if tb.is_null() || is_none(tb) {
-                break;
-            }
-            let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
-            if w_code.is_null() {
-                break;
-            }
-            shadow_stack_set(code_slot, w_code);
-            let is_bootstrap =
-                crate::pycode::code_get_field(shadow_stack_get(code_slot), "co_filename")
-                    .ok()
-                    .filter(|f| pyre_object::is_str(*f))
-                    // A module imported from a path with no UTF-8 spelling carries a
-                    // surrogate escape in `co_filename`; it is not one of the
-                    // bootstrap names either way.
-                    .and_then(|f| pyre_object::w_str_get_value_opt(f))
-                    .is_some_and(is_bootstrap_filename);
-            if !is_bootstrap {
-                break;
-            }
-            let tb = shadow_stack_get(tb_slot);
-            shadow_stack_set(tb_slot, crate::pytraceback::w_pytraceback_get_w_next(tb));
-        }
-        w_exception_set_traceback(shadow_stack_get(exc_slot), shadow_stack_get(tb_slot));
-    }
+    err.remove_traceback_module_frames(&[
+        "<frozen importlib._bootstrap>",
+        "<frozen importlib._bootstrap_external>",
+        "<builtin>/frozen importlib._bootstrap_external",
+        "importlib/_bootstrap.py",
+        "importlib/_bootstrap_external.py",
+    ]);
     err
 }
 
