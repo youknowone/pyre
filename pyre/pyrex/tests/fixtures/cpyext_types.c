@@ -169,9 +169,27 @@ static PyObject *point_receiver(PyObject *self, PyObject *unused)
                          PyType_Check(self) ? ((PyTypeObject *)self)->tp_name : "-");
 }
 
+/* METH_CLASS: the receiver is the class the attribute was read through. */
+static PyObject *point_origin(PyObject *cls, PyObject *unused)
+{
+    return PyObject_CallFunction(cls, "ll", 0L, 0L);
+}
+
+/* METH_STATIC: the receiver slot carries no argument of the call. */
+static PyObject *point_units(PyObject *self, PyObject *args)
+{
+    long count = 0;
+    if (!PyArg_ParseTuple(args, "l", &count)) {
+        return NULL;
+    }
+    return PyLong_FromLong(count * 2);
+}
+
 static PyMethodDef point_methods[] = {
     {"receiver", point_receiver, METH_NOARGS, "what this row was reached through"},
     {"translate", (PyCFunction)point_translate, METH_VARARGS, "shift in place"},
+    {"origin", (PyCFunction)point_origin, METH_NOARGS | METH_CLASS, "the zero point"},
+    {"units", (PyCFunction)point_units, METH_VARARGS | METH_STATIC, "twice a count"},
     {"norm", (PyCFunction)point_norm, METH_NOARGS, "squared length"},
     {"named", (PyCFunction)(void (*)(void))point_named, METH_VARARGS | METH_KEYWORDS,
      "prefixed name"},

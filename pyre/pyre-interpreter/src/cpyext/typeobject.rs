@@ -2409,16 +2409,6 @@ pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0
 }
 
-/// `true` when a mirror is itself a `PyTypeObject`, whose block therefore
-/// begins with a `PyVarObject` rather than a bare header.
-pub(super) fn is_type_mirror(raw: *mut CPyObject) -> bool {
-    if raw.is_null() {
-        return false;
-    }
-    let ob_type = unsafe { (*raw).ob_type };
-    !ob_type.is_null() && unsafe { (*ob_type).tp_flags } & PY_TPFLAGS_TYPE_SUBCLASS != 0
-}
-
 /// `true` when a mirror is a `PyModuleDef` rather than a linked object.
 pub(super) fn is_module_def(raw: *mut CPyObject) -> bool {
     !raw.is_null() && unsafe { std::ptr::eq((*raw).ob_type, &raw mut CPY_MODULE_DEF_TYPE) }
@@ -4599,13 +4589,47 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         let name = unsafe { std::ffi::CStr::from_ptr((*method).ml_name) }
             .to_string_lossy()
             .into_owned();
+        // `typeobject.c:type_add_method` — the flags decide the descriptor,
+        // each naming a different receiver.  A row carrying both is refused
+        // before the type is built.
+        let flags = unsafe { (*method).ml_flags };
+        let carrier_type = match flags & super::methodobject::METH_CLASS {
+            0 => method_descriptor_type(),
+            _ => classmethod_descriptor_type(),
+        };
         let descriptor = new_carrier(
-            method_descriptor_type(),
+            carrier_type,
             method as usize,
             unsafe { (*method).ml_name },
             unsafe { (*method).ml_doc },
             pyre_object::PY_NULL,
         );
+        let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(descriptor);
+        // A static row is a function bound to the type, wrapped so that
+        // reading it through the class or an instance yields the function
+        // itself rather than binding a receiver a second time.
+        let descriptor = match flags & super::methodobject::METH_STATIC {
+            0 => pyre_object::gc_roots::shadow_stack_get(descriptor_slot),
+            _ => {
+                let owner = reload();
+                match super::methodobject::new_pycfunction(method, owner, owner) {
+                    Ok(function) => {
+                        let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = roots.pin_root(function);
+                        pyre_object::function::w_staticmethod_new(
+                            pyre_object::gc_roots::shadow_stack_get(function_slot),
+                        )
+                    }
+                    // The name is left unbound rather than bound to something
+                    // that would take its first argument as a receiver.
+                    Err(error) => {
+                        super::pyerrors::set_pending_error(error);
+                        continue;
+                    }
+                }
+            }
+        };
         let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(descriptor);
         store(
@@ -5060,6 +5084,29 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // where `tp_name`'s prefix is meant to end up.
 
     let w_metatype = resolve_metatype(tp, w_metaclass, w_base)?;
+
+    // `typeobject.c:type_add_method` refuses a row declaring both, because
+    // each of the two names a different receiver.
+    let mut index = 0isize;
+    while unsafe {
+        !(*tp).tp_methods.is_null() && !(*(*tp).tp_methods.offset(index)).ml_name.is_null()
+    } {
+        let method = unsafe { (*tp).tp_methods.offset(index) };
+        index += 1;
+        let flags = unsafe { (*method).ml_flags };
+        if flags & super::methodobject::METH_CLASS == 0
+            || flags & super::methodobject::METH_STATIC == 0
+        {
+            continue;
+        }
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "method cannot be both class and static: {}",
+                unsafe { std::ffi::CStr::from_ptr((*method).ml_name) }.to_string_lossy()
+            ),
+        ));
+    }
 
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = pyre_object::gc_roots::shadow_stack_len();

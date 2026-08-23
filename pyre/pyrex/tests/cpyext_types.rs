@@ -106,6 +106,17 @@ else:
     raise AssertionError('METH_NOARGS took an argument')
 
 assert type(m.Point.__dict__['norm']).__name__ == 'method_descriptor'
+
+# METH_CLASS binds the class, METH_STATIC binds nothing, and each is a
+# different kind of attribute on the type.
+assert type(m.Point.__dict__['origin']).__name__ == 'classmethod_descriptor'
+assert type(m.Point.__dict__['units']).__name__ == 'staticmethod'
+origin = m.Point.origin()
+assert (origin.x, origin.y) == (0, 0), (origin.x, origin.y)
+assert (m.Point(1, 2).origin().x, m.Point(1, 2).origin().y) == (0, 0)
+assert m.Point.units(21) == 42
+assert m.Point(1, 2).units(3) == 6
+assert repr(m.Point.__dict__['origin']).startswith("<classmethod 'origin' of ")
 assert m.Point.__dict__['norm'].__doc__ == 'squared length'
 assert m.Point.__dict__['norm'].__objclass__ is m.Point
 # An unbound descriptor takes the receiver as its first argument.
