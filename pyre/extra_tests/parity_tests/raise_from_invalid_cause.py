@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14's "exception causes must derive from BaseException"; pypy3 appends ", not int"
 # CPython-suite gap: test_raise.TestCause.test_invalid_cause raises
 # `IndexError from 5`, whose class has no observable constructor, so no test
 # sees whether the raised class is instantiated before the cause is rejected,

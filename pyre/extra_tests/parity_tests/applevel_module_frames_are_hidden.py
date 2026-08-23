@@ -18,17 +18,12 @@
 # (`executioncontext.py _trace`), out of `record_application_traceback` and out
 # of `getnextframe_nohidden`.
 #
-# Where PyPy does NOT apply it, the visible frames are an artefact of PyPy
-# implementing in Python (in `lib_pypy`) what CPython implements in C, not a
-# decision that those frames belong to the program: `_contextvars.Context.run`
-# only became hidden in PyPy 7.3.14, reactively, after it broke Django.  So the
-# arms below follow CPython, and `contextvars` and `blake2b` in particular
-# report FEWER frames here than a PyPy 3.11 build does.
+# Every name below is one PyPy hides too, so this file is checked against PyPy
+# as well.  The two subjects where PyPy answers differently are split into
+# `contextvars_and_hash_bodies_are_not_frames.py`, which says so in its header.
 import sys
 import atexit
 import collections
-import contextvars
-import hashlib
 import operator
 import typing
 
@@ -84,32 +79,6 @@ def the_atexit_registry_is_not_a_frame():
     assert traced(register_and_drop) == ['register_and_drop'], traced(register_and_drop)
 
 
-def the_context_machinery_is_not_frames():
-    var = contextvars.ContextVar('probe', default=0)
-    ctx = contextvars.copy_context()
-
-    def run_in_context():
-        return ctx.run(lambda: var.get())
-
-    # `run`, the variable lookup and the persistent map that stores the
-    # bindings are one extension module on CPython, so the only frame this
-    # reports is the callable the context was asked to run.
-    assert traced(run_in_context) == ['run_in_context', '<lambda>'], traced(run_in_context)
-
-    def set_and_reset():
-        token = var.set(1)
-        var.reset(token)
-
-    assert traced(set_and_reset) == ['set_and_reset'], traced(set_and_reset)
-
-
-def the_hash_wrappers_are_not_frames():
-    assert traced(lambda: hashlib.blake2b(b'abc').hexdigest()) == ['<lambda>'], traced(
-        lambda: hashlib.blake2b(b'abc').hexdigest()
-    )
-    assert traced(lambda: hashlib.sha256(b'abc').hexdigest()) == ['<lambda>']
-
-
 def a_failure_inside_aiter_records_no_frame():
     class NotAnAsyncIterator:
         def __aiter__(self):
@@ -148,8 +117,6 @@ the_object_reduce_helpers_are_not_frames()
 the_defaultdict_factory_is_not_a_frame()
 the_operator_getters_are_not_frames()
 the_atexit_registry_is_not_a_frame()
-the_context_machinery_is_not_frames()
-the_hash_wrappers_are_not_frames()
 a_failure_inside_aiter_records_no_frame()
 the_caller_a_type_parameter_records_is_this_frame()
 print('OK')

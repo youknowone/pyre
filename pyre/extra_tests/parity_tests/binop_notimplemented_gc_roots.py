@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14's "can't multiply sequence by non-int"; pypy3 reports "unsupported operand type(s) for *"
 # CPython-suite gap: no test returns NotImplemented from a dunder that collects.
 # parity-tests reason: this is a pyre/PyPy moving-GC root-liveness regression.
 

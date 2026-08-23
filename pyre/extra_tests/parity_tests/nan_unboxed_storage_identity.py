@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins two float("nan") calls being two objects, which every CPython gives; pypy3 gives one
 # CPython-suite gap: the suite checks NaN value semantics, not identity through containers.
 # parity-tests reason: pyre's raw-f64 storage reboxes on read, which only `is` / `id()` sees.
 

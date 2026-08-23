@@ -18,6 +18,18 @@ A script whose subject is platform-specific names the platforms it
 applies to in its header (`# pyre-check: platforms=linux,darwin`) and is
 skipped elsewhere.
 
+PyPy runs too when one is on PATH, as a cross-check rather than a
+reference: it is a second implementation of the same language, so it
+catches a script that pins something pyre and CPython agree on only by
+accident. PyPy 7.3.x implements CPython 3.11, so a script pinning
+behaviour introduced later — or pinning something PyPy does its own way —
+cannot hold there and says so in its header:
+
+    # pyre-check: pypy-diverges: <what this pins, and what pypy3 reports>
+
+A script carrying that must fail under PyPy and a script without it must
+pass, so the directive cannot quietly outlive the divergence it names.
+
 A script whose defect is only reachable under a particular runtime
 configuration declares it with one or more
 
@@ -30,6 +42,9 @@ stops being reachable, i.e. cover nothing while still looking green.
 Usage:
     python3 pyre/extra_tests/parity_tests/run.py
         [--dynasm-only|--cranelift-only] [--gc-poison]
+
+`PYRE_CHECK_PYPY3` names the PyPy binary; setting it empty turns the
+cross-check off.
 
 `--gc-poison` fills reclaimed nursery bytes with a poison pattern for the
 pyre backends. A dangling reference into reclaimed nursery memory usually
@@ -68,6 +83,14 @@ PARITY_REASON_PREFIX = "# parity-tests reason:"
 # measures nothing, so a run that cannot find the right one stops rather than
 # reporting what it found.
 CPYTHON_TARGET = (3, 14)
+
+PYPY_DIVERGES_PREFIX = "# pyre-check: pypy-diverges:"
+
+# The CPython version PyPy implements, which is what makes it a cross-check and
+# not a second reference: it is three releases behind the one these scripts
+# pin. A PyPy on some other target has not been classified against this corpus,
+# so the lane skips rather than reporting what it found.
+PYPY_TARGET = (3, 11)
 
 
 def _runs_here(path: Path) -> bool:
@@ -110,8 +133,24 @@ def _scripts() -> tuple[list[Path], list[Path]]:
         if missing:
             names = ", ".join(missing)
             raise RuntimeError(f"{p.name}: missing parity header field(s): {names}")
+        for line in header:
+            if line.startswith(PYPY_DIVERGES_PREFIX):
+                if not line[len(PYPY_DIVERGES_PREFIX):].strip():
+                    raise RuntimeError(
+                        f"{p.name}: `{PYPY_DIVERGES_PREFIX}` with no reason — the "
+                        f"directive exists to say which divergence is expected"
+                    )
         (out if _runs_here(p) else skipped).append(p)
     return out, skipped
+
+
+def _pypy_divergence(script: Path) -> str | None:
+    """The divergence from PyPy this script declares, if it declares one."""
+    header = script.read_text(encoding="utf-8").splitlines()[:20]
+    for line in header:
+        if line.startswith(PYPY_DIVERGES_PREFIX):
+            return line[len(PYPY_DIVERGES_PREFIX):].strip()
+    return None
 
 
 _ENV_DIRECTIVE = re.compile(r"^#\s*parity-env:\s*(\w+)=(\S*)\s*$", re.MULTILINE)
@@ -246,6 +285,50 @@ def _cpython() -> str:
     )
 
 
+PYPY_PROBE = (
+    "import sys; print(sys.implementation.name); "
+    "print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
+)
+
+
+def _pypy() -> tuple[str | None, str]:
+    """The PyPy to cross-check against, and why there is none when there isn't.
+
+    Unlike [`_cpython`] this never stops the run: PyPy is a cross-check, and a
+    host without one still measures everything the references can decide.
+    Which is also why its absence is announced — a lane that silently does not
+    run reads exactly like a lane that ran and agreed.
+    """
+    named = os.environ.get("PYRE_CHECK_PYPY3")
+    if named is not None and not named.strip():
+        return None, "PYRE_CHECK_PYPY3 is set empty"
+    candidate = named or "pypy3"
+    if named is None and shutil.which(candidate) is None:
+        return None, "no pypy3 on PATH"
+    try:
+        proc = subprocess.run(
+            [candidate, "-c", PYPY_PROBE], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, f"{candidate} did not run"
+    lines = (proc.stdout or "").splitlines()
+    if proc.returncode != 0 or len(lines) < 3:
+        return None, f"{candidate} did not report its version"
+    if lines[0].strip() != "pypy":
+        return None, f"{candidate} is {lines[0].strip()}, not pypy"
+    try:
+        version = tuple(int(part) for part in lines[1].split())
+    except ValueError:
+        return None, f"{candidate} did not report its version"
+    if version != PYPY_TARGET:
+        wanted = "%d.%d" % PYPY_TARGET
+        return None, (
+            "%s implements CPython %d.%d, and the `pypy-diverges:` directives "
+            "were classified against %s" % (candidate, *version, wanted)
+        )
+    return lines[2].strip() or candidate, ""
+
+
 def _report(failures: list[Failure]) -> None:
     """The evidence for every failure, printed last and on stdout.
 
@@ -317,12 +400,17 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     runners = _runners(args.dynasm_only, args.cranelift_only, args.gc_poison)
+    pypy, pypy_off = _pypy()
     scripts, skipped = _scripts()
     if not scripts:
         print("no parity test scripts found", file=sys.stderr)
         return 1
 
     print(f"runners: {[name for name, _, _ in runners]}")
+    if pypy is None:
+        print(f"pypy cross-check: off — {pypy_off}")
+    else:
+        print(f"pypy cross-check: {pypy}")
     print(f"scripts: {len(scripts)}")
     for script in skipped:
         print(f"skipped ({sys.platform} not in its platforms): {script.name}")
@@ -341,6 +429,27 @@ def main() -> int:
             if not ok:
                 failures.append(Failure(name, backend, reason, err))
                 reasons.append(f"      {backend}: {reason}")
+        if pypy is not None:
+            declared = _pypy_divergence(script)
+            ok, reason, err = _run([pypy], script, pinned or None)
+            if declared is None:
+                row.append(f"pypy={'OK' if ok else 'FAIL'}")
+                if not ok:
+                    failures.append(Failure(name, "pypy", reason, err))
+                    reasons.append(f"      pypy: {reason}")
+            elif ok:
+                # The directive named a divergence that is no longer there, so
+                # what it now does is exempt this script from the lane for a
+                # reason that has stopped being true.
+                row.append("pypy=XPASS")
+                stale = (
+                    f"passed, but its header declares a divergence: {declared!r} "
+                    f"— drop the `{PYPY_DIVERGES_PREFIX}` line"
+                )
+                failures.append(Failure(name, "pypy", stale, ""))
+                reasons.append(f"      pypy: {stale}")
+            else:
+                row.append("pypy=xfail")
         print(" ".join(row))
         for line in reasons:
             print(line)

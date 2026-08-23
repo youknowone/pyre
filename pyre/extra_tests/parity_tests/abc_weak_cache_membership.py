@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14's "cannot use ... as a set element"; pypy3 reports only "unhashable type"
 # CPython-suite gap: `test_abc` asks membership only through classes whose
 # caches it never inspects, so it covers neither the empty-collection answer,
 # nor an item that cannot carry a weakref, nor a class whose hash raises, and

@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins PyFloat_AsDouble short-circuiting a float subclass; pypy3 runs its __float__ override instead
 # CPython-suite gap: numeric tests do not alternate subclasses at a hot binary site.
 # parity-tests reason: this guards pyre's JIT exact-class specialization guards.
 

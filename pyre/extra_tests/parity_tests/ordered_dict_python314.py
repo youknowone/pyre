@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins the OrderedDict({...}) repr (3.12); pypy3 spells it OrderedDict([(...)])
 # CPython-suite gap: these OrderedDict 3.14 contracts are not jointly asserted.
 # parity-tests reason: guard pyre's app-level OrderedDict compatibility surface.
 

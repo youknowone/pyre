@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins sys.monitoring tool ids (3.12), absent from the CPython 3.11 pypy3 implements
 # CPython-suite gap: test_cprofile and test_profile only ever pass real bools
 # to `enable`, so neither exercises the failing-conversion path, and the leak
 # they would expose is process-wide rather than per-test.

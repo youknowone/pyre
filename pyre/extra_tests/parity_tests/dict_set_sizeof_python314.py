@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins __sizeof__ in the type dict of dict and set, which pypy3 does not put there
 # CPython-suite gap: exact dict and set __sizeof__ values are not asserted.
 # parity-tests reason: guard pyre's CPython 3.14 container size surface.
 

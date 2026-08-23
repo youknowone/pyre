@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins a recursion depth decided by sys.setrecursionlimit alone; pypy3's moves between repeats
 # CPython-suite gap: recursion tests do not compare cold and JIT-hot call depth.
 # parity-tests reason: this guards pyre's native budget across JIT guard resume.
 
