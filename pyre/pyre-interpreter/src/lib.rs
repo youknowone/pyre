@@ -466,7 +466,7 @@ macro_rules! py_class {
         $name:literal
         $(, methods: {
             $(
-                $(#[doc = $mdoc:literal])?
+                $(#[doc = $mdoc:literal] $(#[doc = $mdoc_cont:literal])*)?
                 fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
             )*
         })?
@@ -499,7 +499,9 @@ macro_rules! py_class {
                                     stringify!($mname),
                                     $mname,
                                     ::core::option::Option::<&'static str>::None
-                                        $(.or(::core::option::Option::Some($mdoc)))?,
+                                        $(.or(::core::option::Option::Some(
+                                            ::core::concat!($mdoc $(, "\n", $mdoc_cont)*),
+                                        )))?,
                                 ),
                             ) };
                         }
