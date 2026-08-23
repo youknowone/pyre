@@ -2748,14 +2748,23 @@ where
                 | OpCode::FloatGe
         );
         let same_box = !is_float && lhs.same_box(rhs);
-        if !(same_box || lhs.is_constant() && rhs.is_constant()) {
-            let cond = ctx.record_op(opcode, &[lhs, rhs]);
-            ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
+        if !same_box {
+            let cond = ctx.execute_and_record(
+                self.cpu.as_ref(),
+                opcode,
+                None,
+                &[lhs, rhs],
+                Some(majit_ir::Value::Int(taken as i64)),
+                self.last_exception_value,
+            );
             let guard = if taken {
                 OpCode::GuardTrue
             } else {
                 OpCode::GuardFalse
             };
+            // `generate_guard`'s `if isinstance(box, Const): return` is
+            // `record_state_guard`'s own first gate, so a folded `cond`
+            // suppresses the guard without a second test here.
             self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
         }
         if !taken {
@@ -9110,18 +9119,18 @@ where
             return (ctx.const_int(fast), fast);
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
-        // `MetaInterp.execute_and_record`: a pure op whose args are all
-        // constants (`_all_constants`) folds to its constant result at trace
-        // time and records nothing.  Every opcode routed here is a pure int/uint arithmetic or
-        // comparison, so an all-constant pair yields a constant destination.
-        if lhs.is_constant() && rhs.is_constant() {
-            return (ctx.const_int(value), value);
-        }
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        // `Box(value)` parity: stamp the result OpRef with its
-        // runtime concrete so downstream `box_value(opref)` consumers
-        // see the value (matches PyPy `BoxInt(value)` carrier).
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        // The returned `value` stays `eval_binop_i`'s, not the funnel's: on
+        // the fold path the two agree, and where the constant evaluator
+        // declines — an out-of-range shift, a zero divisor — the funnel
+        // records instead of folding and stamps the op with exactly this value.
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         (opref, value)
     }
 
@@ -9181,27 +9190,30 @@ where
             OpCode::IntMulOvf => lhs_value.overflowing_mul(rhs_value),
             _ => unreachable!("trace_int_binop_jump_if_ovf: {opcode:?}"),
         };
-        // All-constant operands fold at trace time
-        // (`MetaInterp.execute_and_record`): no resop, no guard.  A constant pair that overflows unconditionally
-        // takes the overflow branch.
-        if lhs.is_constant() && rhs.is_constant() {
-            if overflowed {
-                self.frames.current_mut().code_cursor = target;
-            } else {
-                self.set_int_reg(dst, Some(ctx.const_int(wrapped)), Some(wrapped));
-            }
-            return;
-        }
         // `int_*_ovf` produces the wrapping result and sets the overflow flag;
-        // the following box-less guard checks that flag.
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(wrapped));
-        let guard = if overflowed {
-            OpCode::GuardOverflow
-        } else {
-            OpCode::GuardNoOverflow
-        };
-        self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+        // the box-less guard below checks that flag.  An all-constant pair
+        // folds and needs neither, but only while the arithmetic stays in
+        // range: `execute_binary_int_const` spells the OVF opcodes with
+        // `checked_*`, so a constant pair that really overflows declines the
+        // fold and is recorded with its guard instead.
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(wrapped)),
+            self.last_exception_value,
+        );
+        if !opref.is_constant() {
+            let guard = if overflowed {
+                OpCode::GuardOverflow
+            } else {
+                OpCode::GuardNoOverflow
+            };
+            // The guard is box-less, so `record_state_guard`'s Const gate —
+            // which reads `args[0]` — cannot see that the operation folded.
+            self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+        }
         if overflowed {
             // Overflow branch taken: the result register is not written; follow
             // the label (matches `bhimpl_int_*_jump_if_ovf` returning `None`).
@@ -9224,14 +9236,14 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
-        // `MetaInterp.execute_and_record`: a constant source folds to a
-        // constant result.
-        if src.is_constant() {
-            self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
-            return;
-        }
-        let opref = ctx.record_op(opcode, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 

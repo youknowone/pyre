@@ -106,6 +106,7 @@ pub mod counter;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
+pub mod execute_and_record;
 pub mod executor;
 pub mod gc;
 pub mod graphpage;
