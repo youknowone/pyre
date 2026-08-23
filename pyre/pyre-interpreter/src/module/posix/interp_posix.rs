@@ -5899,27 +5899,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// call.  The entry never moves (`allocate_stable`), so the raw receiver
     /// stays valid across the fetch's allocation.
     fn dir_entry_get_lstat(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        #[allow(unused_mut)]
-        let mut from_walk = None;
         {
             let de = W_DirEntry::from_obj(self_obj)
                 .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
             if !de.w_lstat.is_null() {
                 return Ok(de.w_lstat);
             }
-            // A walk that read the find record answers from it rather than
-            // returning to the name, which is what keeps a removed entry
-            // answering. The build is deferred to here so a listing nobody
-            // stats never pays for one.
-            #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-            {
-                from_walk = de.win32_lstat;
-            }
         }
-        if let Some(_found) = from_walk {
-            #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-            {
-                let result = stat_result_from_fields(&stat_fields_from_find_data(&_found), 0);
+        // A walk that read the find record answers from it rather than
+        // returning to the name, which is what keeps a removed entry
+        // answering. The build waits until here so a listing nobody stats
+        // never pays for one.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            let found = W_DirEntry::from_obj(self_obj)
+                .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?
+                .win32_lstat;
+            if let Some(found) = found {
+                let result = stat_result_from_fields(&stat_fields_from_find_data(&found), 0);
                 let de = W_DirEntry::from_obj(self_obj).ok_or_else(|| {
                     crate::PyError::type_error("expected a 'posix.DirEntry' object")
                 })?;
