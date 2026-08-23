@@ -3665,38 +3665,6 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
     )
 }
 
-fn stdio_stdin_readline(args: &[PyObjectRef]) -> crate::PyResult {
-    if args.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "readline() takes at most one argument ({} given)",
-            args.len()
-        )));
-    }
-    let sys = crate::importing::get_sys_module("sys")
-        .ok_or_else(|| crate::PyError::runtime_error("lost sys.stdin"))?;
-    let stdin = crate::baseobjspace::getattr_str(sys, "stdin")?;
-    let buffer = crate::baseobjspace::getattr_str(stdin, "buffer")?;
-    let bytes = crate::baseobjspace::call_method(buffer, "readline", args);
-    if bytes.is_null() {
-        return Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error("readline failed")));
-    }
-    if !unsafe { pyre_object::is_bytes(bytes) } {
-        return Err(crate::PyError::type_error(
-            "underlying readline() should have returned a bytes-like object",
-        ));
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(bytes);
-    let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let (encoding, errors) = live_stdio_encoding_errors("stdin", "strict");
-    crate::typedef::bytes_method_decode(&[
-        pyre_object::gc_roots::shadow_stack_get(bytes_slot),
-        w_str_new(&encoding),
-        w_str_new(&errors),
-    ])
-}
-
 /// `pylifecycle.c init_sys_streams` builds the standard streams after the
 /// import system, so a text codec is reachable by the time they need one.
 /// Pyre builds them from `sys` module creation instead, where the codec lookup
@@ -3901,13 +3869,6 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         })
     };
     crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
-    if fd == 0 {
-        crate::baseobjspace::setdictvalue_native(
-            stream,
-            "readline",
-            crate::make_builtin_function("readline", stdio_stdin_readline),
-        );
-    }
     crate::baseobjspace::setdictvalue_native(
         stream,
         "flush",
