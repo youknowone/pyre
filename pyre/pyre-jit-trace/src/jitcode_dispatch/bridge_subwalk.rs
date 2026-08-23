@@ -1465,6 +1465,24 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // would replay them.  Capture the frames while this `WalkContext` still
         // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
         // the image, and a decline there leaves the pre-existing rollback.
+        //
+        // This site does NOT apply the exclusions the walk-level latch applies
+        // (`jitcode_dispatch/mod.rs`), so a `VableEscapedDuringResidualCall`
+        // whose narrower resume-marker image was already latched at force time
+        // gets that image replaced by a broader one rooted here — measured,
+        // `already_latched=true complete_image=false accepted=true`. Adding
+        // those gates here was built and measured twice, and is inert both
+        // times. The witness is an `f_locals` proxy write in the resumed tail
+        // of a CALL_ASSEMBLER callee, read under `PYRE_BRIDGE_LATCH_AUDIT=1`,
+        // and the gate is provably live on it: `accepted` flips true → false,
+        // the adopted image's origin flips `bridge1361` → `escape-flush`, and
+        // the inner frame's resume pc moves 2037 → 2046. Neither observable
+        // moves with it — the returned value stays wrong by the same amount,
+        // and a variant that reads the written local straight back still
+        // answers NULL (`TypeError: comparison on null operand`) under both
+        // images. So the loss is upstream of which image wins; a wrong value
+        // and a NULL slot are two different symptoms of it, and gating here
+        // fixes neither. Left alone until a fixture separates them.
         let audit = bridge_latch_audit_enabled();
         if let Err(ref error) = outcome {
             // Sampled before the latch: afterwards `abort_blackhole_latched` is
