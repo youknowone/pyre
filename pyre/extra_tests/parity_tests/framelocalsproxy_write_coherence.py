@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins the PEP 667 write-through f_locals proxy, which pypy3 does not have -- its f_locals is a snapshot dict, so the proxy write never reaches the fast local and reading the key back raises KeyError
 # CPython-suite gap: the suite exercises FrameLocalsProxy access only against
 # cold frames, never against one whose surrounding loop the JIT has compiled.
 # parity-tests reason: this guards the coherence of the running frame's
