@@ -2932,6 +2932,42 @@ pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
         .map(|(start, _)| start.line.get())
 }
 
+/// Whether the instruction at `pc` may be reported to a trace function as the
+/// start of a source line.
+///
+/// `initialize_lines` (`Python/instrumentation.c`) refuses `INSTRUMENTED_LINE`
+/// on five opcodes — `END_ASYNC_FOR`, `END_FOR`, `END_SEND`, `RESUME` and
+/// `POP_ITER`.  `END_FOR` and `END_SEND` are skipped by the `FOR_ITER` / `SEND`
+/// ahead of them; the other three carry no line event of their own even though
+/// the line table gives them a line.
+///
+/// [`crate::PyFrame::get_lineno_for_pc_tracing`] needs this because `RESUME`
+/// opens every function body carrying the `def` line (`emit_resume_for_scope`
+/// in the compiler's `codegen`), so reporting it as a line start puts a line
+/// event on the `def` line at every call.  `pycode.py` cannot answer this: its
+/// 3.11 bytecode has none of these five opcodes, and where its own
+/// `_get_lineno_for_pc_tracing` has no line for a pc it answers `-1`, which is
+/// the sentinel `run_trace_func` already guards on.
+pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool {
+    use crate::bytecode::Instruction;
+
+    let Some(unit) = code.instructions.get(pc) else {
+        return true;
+    };
+    // Specialization rewrites the opcode byte in place (`RESUME` becomes
+    // `RESUME_CHECK`), so ask about the family, not the specialized form.
+    let op = unit.op;
+    let op = op.to_base().unwrap_or(op);
+    !matches!(
+        op,
+        Instruction::EndAsyncFor
+            | Instruction::EndFor
+            | Instruction::EndSend
+            | Instruction::PopIter
+            | Instruction::Resume { .. }
+    )
+}
+
 /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
 /// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
 /// the wrapper's `w_globals` — the only point both the raw pointer and the

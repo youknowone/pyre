@@ -4148,6 +4148,32 @@ impl PyFrame {
         }
     }
 
+    /// pycode.py `_get_lineno_for_pc_tracing(frame.last_instr)` — the line a
+    /// trace function attributes to the instruction the frame is executing, or
+    /// `-1` when that instruction cannot start a line.
+    ///
+    /// Upstream decodes the line table into one entry per code unit and leaves
+    /// `-1` in every entry the decode never reached, so `-1` is the "no line
+    /// here" answer `run_trace_func` guards on twice.  pyre's table covers
+    /// every instruction, so the sentinel comes from the opcode instead:
+    /// [`crate::pycode::instruction_can_start_a_line`].
+    ///
+    /// Separate from [`Self::get_last_lineno`], which answers the *frame's*
+    /// line for `f_lineno` and reports `co_firstlineno` for a frame that has
+    /// not started.  That is the right answer for the getset — a not-yet-run
+    /// generator's `f_lineno` is its `def` line — and the wrong one for a line
+    /// event, which is why this is a second entry point rather than an edit to
+    /// that one.
+    #[inline]
+    pub fn get_lineno_for_pc_tracing(&self) -> isize {
+        if self.last_instr < 0
+            || !crate::pycode::instruction_can_start_a_line(self.code(), self.last_instr as usize)
+        {
+            return -1;
+        }
+        self.get_last_lineno()
+    }
+
     /// pyframe.py fget_f_lineno — the line currently executing.
     ///
     /// `None` when an untraced frame's line table yields no entry; the

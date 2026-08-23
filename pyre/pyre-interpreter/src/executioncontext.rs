@@ -970,14 +970,17 @@ impl ExecutionContext {
     /// pypy/interpreter/executioncontext.py `run_trace_func`.
     ///
     /// ```python
+    /// @jit.unroll_safe
     /// def run_trace_func(self, frame):
-    ///     code = frame.pycode
-    ///     if frame.last_instr == -1:
-    ///         return     # don't trace the SETUP_ANNOTATIONS at the very start
+    ///     code = frame.getcode() # promote the frame!
     ///     d = frame.getorcreatedebug()
-    ///     if d.is_in_line_tracing or d.f_trace_lines:
-    ///         lastline = d.f_lineno
-    ///         lineno = code._get_lineno_for_pc_tracing(frame.last_instr)
+    ///     lastline = d.f_lineno
+    ///     lineno = frame.pycode._get_lineno_for_pc_tracing(frame.last_instr)
+    ///     if lineno != -1:
+    ///         d.f_lineno = lineno
+    ///     if d.f_trace_lines and lineno != -1:
+    ///         # when we are at a start of a line, or executing a backwards jump,
+    ///         # produce a line event
     ///         if lastline != lineno or frame.last_instr < d.instr_prev_plus_one:
     ///             self._trace(frame, 'line', self.space.w_None)
     ///     if d.f_trace_opcodes:
@@ -988,33 +991,32 @@ impl ExecutionContext {
         if frame.is_null() {
             return Ok(());
         }
-        // executioncontext.py:189-192:
-        //   d = frame.getorcreatedebug()
-        //   lastline = d.f_lineno
-        //   lineno = frame.pycode._get_lineno_for_pc_tracing(frame.last_instr)
-        //   d.f_lineno = lineno
         let last_instr = unsafe { (*frame).last_instr };
-        let lineno = unsafe { (*frame).get_last_lineno() };
-        let (lastline, want_line, want_opcode) = unsafe {
-            let d = (*frame).getorcreatedebug(lineno);
+        // `frame.pycode._get_lineno_for_pc_tracing(frame.last_instr)`, not
+        // `get_last_lineno`: the two differ on exactly the instructions that
+        // carry a line but may not start one, and `-1` is what both guards
+        // below are written against.
+        let lineno = unsafe { (*frame).get_lineno_for_pc_tracing() };
+        let (want_line, want_opcode) = unsafe {
+            // `getorcreatedebug()` with no argument: reached only through
+            // `bytecode_only_trace`, which returns early unless
+            // `get_w_f_trace()` is non-null, so the debug block already exists
+            // and the seed is dead.  Passing `lineno` here would seed
+            // `f_lineno` with the line whose novelty decides the event.
+            let d = (*frame).getorcreatedebug(-1);
             let lastline = d.f_lineno;
-            // executioncontext.py:192 d.f_lineno = lineno — PERSISTENT
-            // write so subsequent run_trace_func invocations see the
-            // current line (not the previous).
-            d.f_lineno = lineno;
-            // executioncontext.py:193-197:
-            //   if d.f_trace_lines and lineno != -1:
-            //       if lastline != lineno or frame.last_instr < d.instr_prev_plus_one:
-            //           self._trace(frame, 'line', self.space.w_None)
-            //   if d.f_trace_opcodes:
-            //       self._trace(frame, 'opcode', self.space.w_None)
+            // Persistent, so the next invocation compares against this line —
+            // but only for an instruction that names one, or a `RESUME` would
+            // overwrite the resumed line with the `def` line it carries.
+            if lineno != -1 {
+                d.f_lineno = lineno;
+            }
             let want_line = d.f_trace_lines
                 && lineno != -1
                 && (lastline != lineno || last_instr < d.instr_prev_plus_one);
             let want_opcode = d.f_trace_opcodes;
-            (lastline, want_line, want_opcode)
+            (want_line, want_opcode)
         };
-        let _ = lastline;
         // Reached only with a tracer installed, so the anchor is already on the
         // slow path; both events run Python and the sentinel write below is a
         // store into the frame's debug block.
@@ -1026,11 +1028,11 @@ impl ExecutionContext {
             self._trace(anchor.live(), "opcode", pyre_object::w_none(), None)?;
         }
         let frame = anchor.live();
-        // executioncontext.py:200 — record the next-PC sentinel so
-        // backward jumps re-fire the line event even when staying on
-        // the same source line.
+        // `d.instr_prev_plus_one = frame.last_instr + 1` — the next-PC sentinel
+        // that makes a backward jump re-fire the line event even when it stays
+        // on the same source line.
         unsafe {
-            (*frame).getorcreatedebug(lineno).instr_prev_plus_one = last_instr + 1;
+            (*frame).getorcreatedebug(-1).instr_prev_plus_one = last_instr + 1;
         }
         Ok(())
     }
