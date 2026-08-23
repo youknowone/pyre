@@ -946,18 +946,6 @@ impl ExecutionContext {
         }
     }
 
-    /// gh-142766 compatibility for `generator.close()`: once the close path
-    /// clears a generator frame, an otherwise-dead local with `__del__` must
-    /// finalize before `close()` returns. Pyre's user instances are non-moving
-    /// old-generation objects, so a non-moving major pass stands in for those
-    /// synchronous releases. Keep this on the `generator.py:243` close path;
-    /// normal generator exhaustion follows deferred finalizer scheduling and
-    /// must not collect on every return.
-    pub fn finalize_explicitly_cleared_frame_references(&mut self) {
-        pyre_object::gc_hook::try_gc_collect_oldgen();
-        self._run_finalizers_now();
-    }
-
     /// Request the CPython refcount boundary associated with exposing a
     /// coroutine's frame.  The action runs before the next opcode, after the
     /// attribute receiver has left the value stack.

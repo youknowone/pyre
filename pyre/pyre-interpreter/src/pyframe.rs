@@ -3978,11 +3978,6 @@ impl PyFrame {
                         &mut *frame_anchor.live(),
                     )
                 };
-                let ec = crate::call::getexecutioncontext()
-                    as *mut crate::executioncontext::ExecutionContext;
-                if !ec.is_null() {
-                    unsafe { (*ec).finalize_explicitly_cleared_frame_references() };
-                }
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
