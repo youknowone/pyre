@@ -983,8 +983,7 @@ fn probe14_note_nursery(kind: &str, addr: usize, name: &str, jitcode_index: usiz
         let header = unsafe { (addr as *const usize).offset(-1).read_unaligned() };
         eprintln!(
             "[probe14] NURSERY ROOT #{n}: {kind} 0x{addr:x} header={header:#x} in jitcode \
-             {jitcode_index} {name:?} -- this area skips minor collections, so nothing \
-             keeps it alive"
+             {jitcode_index} {name:?}"
         );
     }
 }
@@ -1475,8 +1474,31 @@ fn walk_jitcode_constants_refs_in(
     }
     for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
         let pool_len = jc.payload.jitcode.constants_r.len();
-        for (pool_slot, &slot) in jc.payload.jitcode.constants_r.iter().enumerate() {
-            let mut gcref = majit_ir::GcRef(slot as usize);
+        // The pool cell, not a copy of it.  Upstream reaches a run-time write
+        // into a prebuilt structure through the write barrier —
+        // `_remember_young_pointer_inlined` puts the written-to object on
+        // `old_objects_pointing_to_young`, and the remembered set is scanned at
+        // every minor, so the entry is kept and forwarded.  `constants_r` is a
+        // bare Rust `Vec<i64>` with no GC header to carry
+        // GCFLAG_TRACK_YOUNG_PTRS, so this walker IS pyre's remembered set for
+        // it, and owes both halves: drag the object out, and store back where
+        // it went.
+        //
+        // Sound for the same reason the `RefCell::as_ptr` read above is: the
+        // walk runs on the collecting thread with the owning mutator quiesced.
+        // `METAINTERP_SD` is thread-local while `Arc<RuntimeJitCode>` is not,
+        // so two threads' areas can present the same slot; the second visit
+        // reads an address that is no longer a nursery start and is a no-op.
+        //
+        // The pool also carries words that are not gcrefs at all — patched
+        // host-static addresses and pre-patch STR sentinels.  `drag_out_root`
+        // and `seed_major_root` reject them before any deref, which is what
+        // makes handing them the whole pool safe; a fast path that pre-filtered
+        // the slots would have to reproduce those gates.
+        let pool = jc.payload.jitcode.constants_r.as_ptr() as *mut i64;
+        for pool_slot in 0..pool_len {
+            let cell = unsafe { pool.add(pool_slot) };
+            let mut gcref = majit_ir::GcRef(unsafe { *cell } as usize);
             let before = gcref.0;
             if probe {
                 probe14_note_nursery(
@@ -1487,6 +1509,9 @@ fn walk_jitcode_constants_refs_in(
                 );
             }
             visitor(&mut gcref);
+            if gcref.0 != before {
+                unsafe { *cell = gcref.0 as i64 };
+            }
             if probe {
                 PROBE14_SLOTS.fetch_add(1, Relaxed);
                 if gcref.0 != before {
@@ -1503,7 +1528,7 @@ fn walk_jitcode_constants_refs_in(
                         // nothing here distinguishes a pool built by
                         // `add_const_r` from one built by `emit_const_r_bits`.
                         eprintln!(
-                            "[probe14] RELOCATION DISCARDED #{n}: constants_r slot \
+                            "[probe14] RELOCATION APPLIED #{n}: constants_r slot \
                              0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
                              jitcode {}/{}, pool_slot {}/{})",
                             gcref.0,

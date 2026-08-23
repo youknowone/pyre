@@ -2057,8 +2057,8 @@ fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
 /// pool.  A tagged small-int immediate would be baked verbatim as a
 /// `ConstPtr(GcRef(tagged))` that an in-trace `GuardClass` derefs as a heap
 /// `W_IntObject` (fannkuch `sign=-1`), and the pool is GC-root-walked
-/// (`walk_jitcode_constants_refs`) so a tagged slot is also forwarded as a
-/// moving-GC pointer.  Re-realize it as a distinct heap box so the pool holds
+/// (`walk_jitcode_constants_refs`, at every collection) so a tagged slot is
+/// also forwarded as a moving-GC pointer.  Re-realize it as a distinct heap box so the pool holds
 /// only real gcrefs — byte-identical to the flag-false bake (`w_int_new` of a
 /// fresh heap `W_IntObject`).  `w_int_new_unique` allocates regardless of
 /// `CAN_BE_TAGGED` (never re-tags).  Gated so flag-false emission is

@@ -5595,28 +5595,23 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    // incminimark.py:355 `prebuilt_root_objects` parity.  The two populations
-    // owned by this area cannot point into the nursery:
+    // Every collection, minor included.  `jitcode.py JitCode` is an ordinary
+    // GC object upstream and `constants_r` an ordinary traced field of it, so
+    // the collector keeps and forwards its entries whatever generation they
+    // are in.  pyre owns the array in `Arc` memory, out of the object graph,
+    // so this walker IS that tracing and owes the same guarantee.
     //
-    // * PyCode wrappers are allocated through `try_gc_alloc_stable_raw`;
-    // * with tagged ints disabled, JitCode `constants_r` entries are either
-    //   stable old-generation int/float objects or immortal build-time
-    //   constants.
-    //
-    // A minor collection cannot reclaim either population, and there is no
-    // old-to-young edge here for its remembered-set pass to discover.  Walking
-    // every JitCode on every recursive CALL_ASSEMBLER nursery refill therefore
-    // only repeated `drag_out_root`'s non-nursery fast return.  Major marking
-    // still has to keep both populations alive, exactly like RPython's
-    // unconditional `prebuilt_root_objects` major scan.
-    // If tagged ints are enabled, codewriter normalization can materialize a
-    // moving `W_IntObject`; retain the conservative minor scan in that mode.
-    if !pyre_object::tagged_int::CAN_BE_TAGGED
-        && majit_gc::shadow_stack::extra_root_walk_kind()
-            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
-    {
-        return;
-    }
+    // This used to skip minor collections when tagged ints were disabled, on
+    // the claim that the entries were then "stable old-generation int/float
+    // objects or immortal build-time constants".  That claim is false, and its
+    // consequence was the fault it was meant to make impossible: upstream
+    // builds every jitcode at translation time, while pyre builds one per
+    // CodeObject at RUN time, so a trace's `Operand::ConstRef` reaches the pool
+    // straight off the heap.  Measured with `PYRE_PROBE14=1` on
+    // `_pending/exec_foreign_globals_gc_root.py`, one slot holds a NURSERY
+    // object on every walk; skipped by the minor pass, it was neither kept
+    // alive nor forwarded, and the next major seeded a corpse
+    // (`GC BUG: invalid type_id ... site=jitcode_constants`).
     unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
 }
 
