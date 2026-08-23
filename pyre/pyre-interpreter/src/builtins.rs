@@ -7208,9 +7208,10 @@ pub(crate) fn crt_errno() -> i32 {
 /// matches the libc constants the subclass table keys on; translate the common
 /// kinds to their POSIX errno through `ErrorKind` (which the standard library
 /// normalises per platform), the way `winerror_to_errno` fills `OSError.errno`
-/// alongside `.winerror`.  Unrecognised kinds keep the raw code, and an error
-/// carrying no OS code at all falls back to `default` (the errno each call site
-/// used before the translation existed).
+/// alongside `.winerror`.  A C runtime call reports its errno as the error's
+/// payload instead, which `posix_errno` reads.  Unrecognised kinds keep the raw
+/// code, and an error carrying no code of either kind falls back to `default`
+/// (the errno each call site used before the translation existed).
 pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
     #[cfg(windows)]
     {
@@ -7230,6 +7231,19 @@ pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
         };
         if let Some(errno) = mapped {
             return errno;
+        }
+        // A C runtime call carries its exact errno as the error's payload and
+        // leaves `raw_os_error()` empty (`io_error_from_errno`), so the
+        // fallback below would answer `default` for every one of them --
+        // `_wopen` refusing at the descriptor limit read back as the `open`
+        // call site's EACCES rather than as EMFILE.  Only a payload-carrying
+        // error is asked, since `posix_errno` answers EINVAL for an error that
+        // holds neither a payload nor a code.
+        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+        if e.raw_os_error().is_none() && e.get_ref().is_some() {
+            use rustpython_host_env::os::ErrorExt;
+
+            return e.posix_errno();
         }
     }
     e.raw_os_error().unwrap_or(default)
