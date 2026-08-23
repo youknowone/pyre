@@ -71,9 +71,13 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // Its slot loop scans the same fixed-size locals-plus array `fast2locals`
     // does and takes the hint for the same reason — without it the function is
     // one residual call, and the `f_locals` read behind it forces the
-    // virtualizable for that call's whole length.  Same evidence as the two
-    // above: the body is unreachable from the portal BFS, so the abort
-    // population and every baseline are unchanged.
+    // virtualizable for that call's whole length.
+    //
+    // NOT the same evidence as the two above, and this line used to claim it
+    // was: the body is REACHED.  `frame_locals_proxy_snapshot` holds a jitcode
+    // in the metadata artefact, where `gettopframe_nohidden` and
+    // `getnextframe_nohidden` do not.  The abort population and the baselines
+    // were measured unchanged; unreachability is not why.
     (
         "frame_locals_proxy_snapshot",
         "fast2locals' scan of the same locals-plus array",

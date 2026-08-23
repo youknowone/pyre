@@ -423,6 +423,15 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
         "no `locals_cells_stack_w` read found in any \
          `frame_locals_proxy_snapshot` graph — probe is inert"
     );
+    // The escape list was collected and printed but never asserted on, so a
+    // read that rode a link out of its defining block would print and pass —
+    // and that is precisely what `_check_no_vable_array`'s `link argument`
+    // route refuses.
+    assert!(
+        escapes.is_empty(),
+        "`frame_locals_proxy_snapshot`'s virtualizable-array read escapes its \
+         defining block: {escapes:?}"
+    );
 
     // Pin the measured shape rather than only reporting it.  Both reads now
     // pair: the body is a plain loop, so each `locals_w!(self)` copies the
