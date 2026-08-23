@@ -2935,29 +2935,57 @@ pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
 /// Whether the instruction at `pc` may be reported to a trace function as the
 /// start of a source line.
 ///
-/// `initialize_lines` (`Python/instrumentation.c`) refuses `INSTRUMENTED_LINE`
-/// on five opcodes — `END_ASYNC_FOR`, `END_FOR`, `END_SEND`, `RESUME` and
-/// `POP_ITER`.  `END_FOR` and `END_SEND` are skipped by the `FOR_ITER` / `SEND`
-/// ahead of them; the other three carry no line event of their own even though
-/// the line table gives them a line.
+/// Both rules come from `initialize_lines` (`Python/instrumentation.c`), which
+/// decides once per code object which instructions carry `INSTRUMENTED_LINE`:
 ///
-/// [`crate::PyFrame::get_lineno_for_pc_tracing`] needs this because `RESUME`
-/// opens every function body carrying the `def` line (`emit_resume_for_scope`
-/// in the compiler's `codegen`), so reporting it as a line start puts a line
-/// event on the `def` line at every call.  `pycode.py` cannot answer this: its
-/// 3.11 bytecode has none of these five opcodes, and where its own
-/// `_get_lineno_for_pc_tracing` has no line for a pc it answers `-1`, which is
-/// the sentinel `run_trace_func` already guards on.
+/// * `if (i < code->_co_firsttraceable)` — the frame prologue starts no line.
+///   `_co_firsttraceable` is the index of the first `RESUME` (`init_code`,
+///   `Objects/codeobject.c`), so this covers everything the compiler inserts
+///   ahead of it: `COPY_FREE_VARS`, `MAKE_CELL`, and a generator's
+///   `RETURN_GENERATOR` / `POP_TOP` pair, which carries the `def` line.
+/// * a switch excluding `END_ASYNC_FOR`, `END_FOR`, `END_SEND`, `RESUME` and
+///   `POP_ITER`.  `END_FOR` and `END_SEND` are skipped by the `FOR_ITER` /
+///   `SEND` ahead of them; the other three carry no line event of their own
+///   even though the line table gives them a line.
+///
+/// [`crate::PyFrame::get_lineno_for_pc_tracing`] needs both because the
+/// prologue and the `RESUME` that ends it are all stamped with the `def` line,
+/// so tracing any of them as a line start puts a line event on the `def` line
+/// at every call.  `pycode.py` cannot answer this: its 3.11 bytecode has none
+/// of these opcodes, and where its own `_get_lineno_for_pc_tracing` has no line
+/// for a pc it answers `-1`, which is the sentinel `run_trace_func` already
+/// guards on.
 pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool {
     use crate::bytecode::Instruction;
 
-    let Some(unit) = code.instructions.get(pc) else {
-        return true;
-    };
     // Specialization rewrites the opcode byte in place (`RESUME` becomes
-    // `RESUME_CHECK`), so ask about the family, not the specialized form.
-    let op = unit.op;
-    let op = op.to_base().unwrap_or(op);
+    // `RESUME_CHECK`), so every read below asks about the family.
+    fn base_op(code: &crate::CodeObject, index: usize) -> Option<Instruction> {
+        let op = code.instructions.get(index)?.op;
+        Some(op.to_base().unwrap_or(op))
+    }
+
+    // `i < code->_co_firsttraceable`, resolved by walking to the first
+    // `RESUME`.  This costs the prologue's length rather than `pc`, because it
+    // stops at that `RESUME` — which sits within a handful of units of the
+    // start for every code object the compiler produces.  A code object with no
+    // `RESUME` at all leaves `_co_firsttraceable` past the end and so traces no
+    // lines, which is what `init_code`'s scan does with one too.
+    let mut index = 0;
+    while index <= pc {
+        match base_op(code, index) {
+            Some(Instruction::Resume { .. }) => break,
+            Some(_) => index += 1,
+            None => return false,
+        }
+    }
+    if index > pc {
+        return false;
+    }
+
+    let Some(op) = base_op(code, pc) else {
+        return false;
+    };
     !matches!(
         op,
         Instruction::EndAsyncFor
