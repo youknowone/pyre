@@ -18520,9 +18520,10 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
-    // int.__index__ / __int__ / __trunc__ — exact ints preserve identity;
+    // int.__index__ / __int__ / __trunc__ / __floor__ / __ceil__ —
+    // `_self_unaryop` → `self.int(space)`: exact ints preserve identity;
     // subclasses and bools are normalized by `int_as_plain_int`.
-    for method in ["__index__", "__int__", "__trunc__"] {
+    for method in ["__index__", "__int__", "__trunc__", "__floor__", "__ceil__"] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -18556,41 +18557,47 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
-    // int.real / int.imag / int.numerator — properties
-    // True.real → 1 (int, not bool), False.real → 0
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+    // intobject.py:1148-1158 — `numerator` / `real` / `imag` /
+    // `denominator` are `GetSetProperty`.  `fget` is called
+    // `(descriptor, receiver)`.  True.real → 1 (plain int, not bool).
+    type IntGetSet = fn(&[PyObjectRef]) -> crate::PyResult;
+    let int_getset_plain = |args: &[PyObjectRef]| {
+        Ok(int_as_plain_int(&[args
+            .get(1)
+            .copied()
+            .unwrap_or_else(|| pyre_object::w_int_new(0))]))
+    };
+    for (name, getter, doc) in [
+        (
             "real",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity("real", |args| Ok(int_as_plain_int(args)), 1),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "imag",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity("imag", |_| Ok(pyre_object::w_int_new(0)), 1),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+            int_getset_plain as IntGetSet,
+            "the real part of a complex number",
+        ),
+        (
             "numerator",
-            pyre_object::w_property_new(
-                make_builtin_function_with_arity("numerator", |args| Ok(int_as_plain_int(args)), 1),
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ),
-        )
-    };
+            int_getset_plain,
+            "the numerator of a rational number in lowest terms",
+        ),
+        (
+            "imag",
+            (|_| Ok(pyre_object::w_int_new(0))) as IntGetSet,
+            "the imaginary part of a complex number",
+        ),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                make_getset_property_named_doc(
+                    make_builtin_function_with_arity(name, getter, 2),
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                    doc,
+                    name,
+                ),
+            )
+        };
+    }
     // A getset `fget` is always called as `(descriptor, receiver)`.
     let denom_getter =
         make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 2);
@@ -18683,21 +18690,6 @@ fn init_int_type(ns: PyObjectRef) {
                 },
                 1,
             ),
-        )
-    };
-    // `int.__floor__` / `int.__ceil__` return the int itself.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__floor__",
-            make_builtin_function_with_arity("__floor__", |args| Ok(args[0]), 1),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__ceil__",
-            make_builtin_function_with_arity("__ceil__", |args| Ok(args[0]), 1),
         )
     };
     // Binary arithmetic / bitwise dunders (forward + reflected).

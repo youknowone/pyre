@@ -1763,7 +1763,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let pre_virtualref_boxes = ctx.snapshot_virtualref_boxes();
     let pre_pos = ctx.get_trace_position();
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession::default());
-    crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
     // A prior walk's blackhole image must not be adopted as this drain's
@@ -2163,7 +2162,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         );
     }
     discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
-    crate::jitcode_dispatch::bool_box_truth_reset();
     if adopted {
         // `try_adopt_blackhole` mirrors `convert_and_run_from_pyjitpl` and can
         // finish the root frame with `DoneWithThisFrame*`; it records that
@@ -5180,7 +5178,6 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     // stashed Finish payload an authoritative probe walk may have recorded so
     // they cannot leak into the next walk (the production tracer clears these
     // at entry, but the probe never runs through that path).
-    crate::jitcode_dispatch::bool_box_truth_reset();
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
 }
@@ -5911,7 +5908,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // every iteration (the observed spin).
     // Clear the walk-local bool-box-truth map left by a prior aborted walk so
     // it cannot leak into this one.
-    crate::jitcode_dispatch::bool_box_truth_reset();
     // Slice b: clear any Finish payload a prior
     // aborted walk's top-level `*_return` arm may have stashed, so a stale
     // value cannot leak into this walk's `Terminate` handling.

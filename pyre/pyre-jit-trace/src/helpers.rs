@@ -522,9 +522,12 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     };
     // `space.newbool` selects the `w_True` / `w_False` singleton: it cannot
     // raise, so the residual is EF_CANNOT_RAISE (no trailing GuardNoException).
-    // It is NOT elidable here — the boxed bool feeds consumers (COMPARE_OP
-    // boxing, the bool-bitwise lowering) that need a recorded OpRef, so a pure
-    // call folding to an inline Const would break their `OpRef` reads.
+    //
+    // This residual is the fallback, not the port.  `baseobjspace.py:895-900`
+    // is plain RPython, so a walk that can capture a resume image traces the
+    // `if b:` itself — `walker_newbool_guarded` emits the truth guard and hands
+    // back the prebuilt singleton as a constant, and no box op exists at all.
+    // Only a walk with no snapshot to resume into reaches this call.
     ctx.call_ref_typed_with_effect(
         jit_bool_value_from_truth as *const (),
         &[truth],

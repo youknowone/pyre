@@ -205,8 +205,8 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
 /// bool the following `TO_BOOL` / `POP_JUMP_IF_*` tests, so without this arm a
 /// comparison costs two `CALL_MAY_FORCE`s and two force/exception guard pairs
 /// instead of one call and a field read.  When the comparison itself already
-/// specialized, [`bool_box_truth_lookup`] folds the test first and this never
-/// runs; it covers the case where the comparison stayed a residual.
+/// specialized, its result is the `space.newbool` singleton and both the class
+/// guard and the field read below fold off that constant.
 pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -528,19 +528,13 @@ pub(crate) fn try_walker_specialize_unary_invert_int<Sym: WalkSym>(
 /// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
-/// The raw machine int of an int/bool operand, for the specialized IR.
+/// The raw machine int of an int/bool operand, for the specialized IR: guard
+/// the operand's exact class, then load `intval` out of the box.
 ///
-/// The ordinary path guards the operand's exact class and loads `intval` out
-/// of the box.  A bool this same walk boxed still carries the truth Int it was
-/// built from ([`bool_box_truth_lookup`]), so the arithmetic reads that
-/// directly and the box, its class guard and its `intval` load all go dead —
-/// the arithmetic twin of the `POP_JUMP_IF_*` fold, which is this walker's
-/// runtime reconstruction of `jtransform.py optimize_goto_if_not`.
-///
-/// The branch consumer may take the truth operand as it stands because it only
-/// asks whether it is nonzero.  Arithmetic may not: `jit_bool_value_from_truth`
-/// maps *every* nonzero truth to `intval` 1, so the value the box would have
-/// yielded is the normalized `int_is_true`, not the operand itself.
+/// A bool `space.newbool` produced this same walk arrives as the prebuilt
+/// `w_True` / `w_False` singleton behind its own truth guard, so both the class
+/// guard and the `intval` load read a constant and fold away — no side table
+/// has to reconnect the box to the truth it was built from.
 fn walker_int_operand_raw<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -548,14 +542,7 @@ fn walker_int_operand_raw<Sym: WalkSym>(
     operand_obj: pyre_object::PyObjectRef,
     type_addr: i64,
     intval_descr: majit_ir::DescrRef,
-    concrete: i64,
 ) -> Result<OpRef, DispatchError> {
-    if let Some(truth) = bool_box_truth_lookup(operand) {
-        let normalized = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[truth]);
-        ctx.trace_ctx
-            .set_opref_concrete(normalized, majit_ir::Value::Int(concrete));
-        return Ok(normalized);
-    }
     let raw = walker_unbox_int_typed(ctx, op_pc, operand, type_addr, intval_descr)?;
     walker_guard_exact_w_class(
         ctx,
@@ -741,8 +728,8 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr, la)?;
-    let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr, rb)?;
+    let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr)?;
+    let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr)?;
     if overflows {
         let concrete_value = match op_code {
             OpCode::IntAddOvf => la.wrapping_add(rb),
@@ -810,14 +797,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     // 74-76) so it keeps the bool type; `boxed_result_i64` is already the
     // authentic W_Bool the forced residual produced.
     let boxed = if result_is_bool {
-        match walker_newbool_guarded(
-            ctx,
-            op_pc,
-            raw_result,
-            concrete_value != 0,
-            dst as u8,
-            dst_bank,
-        )? {
+        match walker_newbool_guarded(ctx, op_pc, raw_result, concrete_value != 0, dst_bank)? {
             Some(boxed) => boxed,
             None => {
                 let boxed = crate::helpers::emit_trace_bool_value_from_truth(
@@ -4896,33 +4876,12 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(folded));
-    // #62: elide the dead `box_bool` when a forward JitCode lookahead
-    // PROVES the compare's boxed Ref dst is consumed solely by the
-    // immediately-following `is_true` (POP_JUMP_IF_*), which folds to the
-    // raw truth.  In that shape the W_Bool is never read as a Ref, so the
-    // box is dead the moment it is recorded — yet it is a non-pure `CallR`
-    // the optimizer cannot DCE (pure.py demotes CALL_PURE→CALL and
-    // emits it; the retired MIFrame path never created the box because it
-    // fused COMPARE_OP+POP_JUMP at the bytecode level). Mirroring that
-    // fusion walker-side: write the raw truth into the Ref dst as a marker
-    // and record `bool_box_truth(truth, truth)` so the `is_true` fold
-    // (dispatch_residual_call_iRd_kind:5137) resolves it to `truth`; emit
-    // no box.  Gated on the lookahead proof so the marker provably never
-    // escapes (no Ref consumer, not live at the branch resume) — any other
-    // shape (escape to a local, arithmetic, multi-use, branch keeping the
-    // value) falls back to emitting the real box.
-    if dst_bank == 'r' && compare_box_provably_dead(ctx, op_pc, dst as u8) {
-        bool_box_truth_record(truth, truth);
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
-        return Ok(Some(()));
-    }
-    // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
-    // residual_call lands a boxed bool in the dst Ref register; the
-    // separate goto_if_not op reads it).
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst as u8, dst_bank)? {
-        // The guarded arm already pinned the truth to a constant and filed
-        // `bool_box_truth_record` against it, so the following `is_true`
-        // folds without re-reading the runtime truth.
+    // `space.newbool` on the truth: its guard plus the prebuilt singleton
+    // (`baseobjspace.py:895-900`).  The box the generic `compare_fn` residual
+    // would have landed in the dst Ref register never exists, and the
+    // `goto_if_not` that reads it sees a constant.  The residual box below is
+    // the no-snapshot fallback only.
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst_bank)? {
         Some(boxed) => boxed,
         None => {
             let boxed =
@@ -4931,9 +4890,6 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
             );
-            // #62: remember boxed→truth so an immediately-following `is_true` residual
-            // (POP_JUMP_IF_*) folds back to the raw Int instead of may-force-unboxing.
-            bool_box_truth_record(boxed, truth);
             boxed
         }
     };
@@ -4945,8 +4901,8 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
 /// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
 /// `call_jit.rs`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
-/// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and,
-/// via [`bool_box_truth_record`], the immediately-following `is_true`
+/// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and, since
+/// that singleton is a constant, the immediately-following `is_true`
 /// truth-extract residual).  With the exception's constructor + raise
 /// already virtualized by their own folds, folding the match to a constant
 /// lets the whole exception de-escape and DCE.
@@ -5190,18 +5146,16 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
             .replace_box(w_class_op, expected);
     }
 
-    // The match is a constant at trace time: emit the immortal bool
-    // singleton as a `const_ref`, and a raw truth `const_int` so the
-    // following `is_true` (the `except` clause's `POP_JUMP_IF_FALSE`)
-    // folds to the constant via `bool_box_truth_record`.
+    // The match is a constant at trace time: emit the immortal bool singleton
+    // as a `const_ref`.  The following `is_true` (the `except` clause's
+    // `POP_JUMP_IF_FALSE`) reads a constant W_Bool, which
+    // `try_walker_specialize_truth_bool` folds off its concrete.
     let result_obj = pyre_object::w_bool_from(matched);
     let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
     ctx.trace_ctx.set_opref_concrete(
         const_bool,
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
-    let truth = ctx.trace_ctx.const_int(matched as i64);
-    bool_box_truth_record(const_bool, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)?;
     Ok(Some(()))
 }
@@ -5212,34 +5166,33 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 /// matching `GUARD_TRUE` / `GUARD_FALSE`, and `pyjitpl.py:525-526` replaces
 /// the truth box with the promoted constant.
 ///
-/// Restricted to the shape [`classify_compare_box_use`] recognizes — the box
-/// decides one branch and nothing else.  There the guard is the branch's own
-/// `goto_if_not` guard, so it adds no guard the trace would not already carry.
-/// A bool that escapes (kept on the stack for a short-circuit, stored to a
-/// local) keeps the residual box: guarding it would pin a value the trace
-/// otherwise carries unconstrained, and every later re-entry with the other
-/// truth bails.
+/// The guard is unconditional, because `newbool`'s `if b:` is: it is plain
+/// RPython carrying no `@jit` hint (`baseobjspace.py:895` is only
+/// `@signature`, and `boolobject.py` has none), so the tracer resolves it the
+/// one way it observed and pins that with a guard no matter who consumes the
+/// result.  This used to be restricted to a box that "decides one branch and
+/// nothing else", on the reasoning that guarding an escaping bool pins a value
+/// the trace would otherwise carry unconstrained.  Upstream grants no such
+/// exemption, and the transform that does read like one —
+/// `jtransform.py:196 optimize_goto_if_not` — is a different thing: it fuses a
+/// compare into a block's exitswitch, and `:205-211` makes it *refuse* when the
+/// boolean has any other consumer.  It never decides whether `newbool` guards.
 ///
-/// The shape survives the `push_and_bump!` publish
-/// ([`VablePublish::Tolerated`]).  That store mirrors the box into the
-/// operand-stack slot the guard's own resume image describes; swapping a
-/// prebuilt singleton in for the recorded call result leaves it storing the
-/// same value, so it is not a second use that makes the bool escape.
+/// The store that publishes the result survives the guard: it mirrors the box
+/// into the operand-stack slot the guard's own resume image describes, and
+/// swapping the prebuilt singleton in for a recorded call result leaves it
+/// storing the same value.
 fn walker_newbool_guarded<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     truth: OpRef,
     observed: bool,
-    dst_reg: u8,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
+    // No resume image, no guard: emitting one without a snapshot to resume
+    // into would leave the bail with nowhere to land.  That is the only thing
+    // that keeps a caller on the residual box.
     if ctx.fbw_mode.snapshot_sym.is_null() || dst_bank != 'r' {
-        return Ok(None);
-    }
-    if !matches!(
-        classify_compare_box_use(ctx, op_pc, dst_reg, VablePublish::Tolerated),
-        CompareBoxUse::FeedsBranchOnly { .. }
-    ) {
         return Ok(None);
     }
     let guard = if observed {
@@ -5249,14 +5202,12 @@ fn walker_newbool_guarded<Sym: WalkSym>(
     };
     ctx.trace_ctx.record_guard(guard, &[truth], 0);
     walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    let promoted = ctx.trace_ctx.const_int(observed as i64);
     let result_obj = pyre_object::w_bool_from(observed);
     let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
     ctx.trace_ctx.set_opref_concrete(
         const_bool,
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
-    bool_box_truth_record(const_bool, promoted);
     Ok(Some(const_bool))
 }
 
@@ -5381,18 +5332,9 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
     let result = same != invert;
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(result as i64));
-    // Same boxed-bool elision as the int compare specialization: when the
-    // Ref dst is provably consumed only by the following `is_true`, write
-    // the raw truth and let `bool_box_truth_record` resolve it.
-    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
-        bool_box_truth_record(truth, truth);
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
-        return Ok(Some(()));
-    }
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, result, dst as u8, dst_bank)? {
-        // The guarded arm already pinned the truth to a constant and filed
-        // `bool_box_truth_record` against it, so the following `is_true`
-        // folds without re-reading the runtime truth.
+    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
+    // residual box is the no-snapshot fallback only.
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, result, dst_bank)? {
         Some(boxed) => boxed,
         None => {
             let boxed =
@@ -5401,7 +5343,6 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(result) as usize)),
             );
-            bool_box_truth_record(boxed, truth);
             boxed
         }
     };
@@ -5409,10 +5350,10 @@ pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Write an immortal `bool` singleton into a residual call's Ref dst, along
-/// with the raw truth `bool_box_truth_record` needs so an immediately
-/// following `is_true` (`POP_JUMP_IF_*`) folds to the constant instead of
-/// unboxing through a residual.
+/// Write an immortal `bool` singleton into a residual call's Ref dst.  An
+/// immediately following `is_true` (`POP_JUMP_IF_*`) reads a constant W_Bool,
+/// which [`try_walker_specialize_truth_bool`] folds off its concrete rather
+/// than unboxing through a residual.
 fn walker_write_const_bool_result<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5426,8 +5367,6 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
         const_bool,
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
-    let truth = ctx.trace_ctx.const_int(value as i64);
-    bool_box_truth_record(const_bool, truth);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, const_bool)
 }
 
@@ -5701,22 +5640,9 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(concrete_truth));
-    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
-        bool_box_truth_record(truth, truth);
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
-        return Ok(Some(()));
-    }
-    let boxed = match walker_newbool_guarded(
-        ctx,
-        op_pc,
-        truth,
-        concrete_truth != 0,
-        dst as u8,
-        dst_bank,
-    )? {
-        // The guarded arm already pinned the truth to a constant and filed
-        // `bool_box_truth_record` against it, so the following `is_true`
-        // folds without re-reading the runtime truth.
+    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
+    // residual box is the no-snapshot fallback only.
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, concrete_truth != 0, dst_bank)? {
         Some(boxed) => boxed,
         None => {
             let boxed =
@@ -5725,7 +5651,6 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
             );
-            bool_box_truth_record(boxed, truth);
             boxed
         }
     };
@@ -5834,17 +5759,9 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     let folded = majit_metainterp::eval_binop_i(cmp, sign_concrete, 0);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(folded));
-    // #62: elide the dead box when the boxed Ref is consumed solely by the
-    // following `is_true` (POP_JUMP_IF_*); else box the raw truth into a W_Bool.
-    if compare_box_provably_dead(ctx, op_pc, dst as u8) {
-        bool_box_truth_record(truth, truth);
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
-        return Ok(Some(()));
-    }
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst as u8, dst_bank)? {
-        // The guarded arm already pinned the truth to a constant and filed
-        // `bool_box_truth_record` against it, so the following `is_true`
-        // folds without re-reading the runtime truth.
+    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
+    // residual box is the no-snapshot fallback only.
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst_bank)? {
         Some(boxed) => boxed,
         None => {
             let boxed =
@@ -5853,7 +5770,6 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
             );
-            bool_box_truth_record(boxed, truth);
             boxed
         }
     };
@@ -10910,20 +10826,19 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `math.isclose(a, b)` with both tolerances defaulted, in the shape
-/// [`walker_newbool_guarded`] recognizes: the result decides one branch and
-/// nothing else.
+/// `math.isclose(a, b)` with both tolerances defaulted.
 ///
 /// The residual costs a builtin dispatch, a keyword split and two
 /// `try_get_double` conversions to produce one of two prebuilt singletons.
 /// Emit instead the two unboxed operands and a pure elidable `CALL_I` into
-/// `jit_math_isclose_default`, whose truth the branch's own guard already
-/// pins.  That helper is total, so unlike the float folds this one needs no
-/// result guard of its own.
+/// `jit_math_isclose_default`, then let [`walker_newbool_guarded`] pin its
+/// truth and hand back the singleton.  That helper is total, so unlike the
+/// float folds this one needs no result guard of its own.
 ///
 /// A keyword argument (which would reach `bh_call_fn_kw`, not this shape), a
-/// third positional, a numeric subclass, a rebound callable, or a result that
-/// escapes the branch all retain the generic residual path (SAFE).
+/// third positional, a numeric subclass or a rebound callable all retain the
+/// generic residual path (SAFE).  Where the result goes afterwards is not a
+/// condition: `space.newbool` guards its `if b:` for every consumer.
 pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -10941,15 +10856,10 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
         return Ok(None);
     }
     // Settle the result's shape before emitting anything: everything below
-    // this point commits ops to the trace, and `walker_newbool_guarded` is
-    // what decides whether the branch's guard can stand in for the box.
-    if ctx.fbw_mode.snapshot_sym.is_null()
-        || dst_bank != 'r'
-        || !matches!(
-            classify_compare_box_use(ctx, op.pc, dst as u8, VablePublish::Tolerated),
-            CompareBoxUse::FeedsBranchOnly { .. }
-        )
-    {
+    // this point commits ops to the trace, so ask up front for the one
+    // condition `walker_newbool_guarded` needs — a resume image to land the
+    // truth guard's bail in, and a Ref destination for the singleton.
+    if ctx.fbw_mode.snapshot_sym.is_null() || dst_bank != 'r' {
         return Ok(None);
     }
     let (Some((a_is_int, a_value)), Some((b_is_int, b_value))) = (
@@ -11006,8 +10916,7 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
         .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(observed)));
     // The shape check above already established what this re-tests, so the
     // `None` arm is unreachable; keep it as the decline rather than assert.
-    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst as u8, dst_bank)?
-    else {
+    let Some(boxed) = walker_newbool_guarded(ctx, op.pc, truth, observed, dst_bank)? else {
         return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
@@ -11843,7 +11752,6 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
-            bool_box_truth_reset();
             if promoted_empty {
                 fbw_append_promote_journal_rollback_last(inner_self);
             }
@@ -12397,7 +12305,6 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
-            bool_box_truth_reset();
             Ok(None)
         }
         Err(error) => Err(error),
@@ -12709,7 +12616,6 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
-            bool_box_truth_reset();
             if promoted_empty {
                 fbw_append_promote_journal_rollback_last(list);
             }
@@ -15582,20 +15488,9 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
         majit_metainterp::eval_float_cmp(cmp, lhs_f64.to_bits() as i64, rhs_f64.to_bits() as i64);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(folded));
-    // #62: elide the dead box when the compare's boxed dst is consumed
-    // solely by the immediately-following `is_true` (see
-    // [`compare_box_provably_dead`] / the int-compare twin for rationale).
-    if dst_bank == 'r' && compare_box_provably_dead(ctx, op_pc, dst as u8) {
-        bool_box_truth_record(truth, truth);
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, truth)?;
-        return Ok(Some(()));
-    }
-    // NON-fused: box the raw truth into a W_Bool (the generic compare_fn
-    // residual_call lands a boxed bool; the separate goto_if_not reads it).
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst as u8, dst_bank)? {
-        // The guarded arm already pinned the truth to a constant and filed
-        // `bool_box_truth_record` against it, so the following `is_true`
-        // folds without re-reading the runtime truth.
+    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
+    // residual box is the no-snapshot fallback only.
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst_bank)? {
         Some(boxed) => boxed,
         None => {
             let boxed =
@@ -15604,9 +15499,6 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
                 boxed,
                 majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
             );
-            // #62: remember boxed→truth so an immediately-following `is_true` residual
-            // (POP_JUMP_IF_*) folds back to the raw Int instead of may-force-unboxing.
-            bool_box_truth_record(boxed, truth);
             boxed
         }
     };

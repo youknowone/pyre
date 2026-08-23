@@ -265,9 +265,9 @@ pub fn fbw_debug_abort_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
 }
 
-/// Clear any stashed Finish payload before a walk begins (mirrors
-/// [`bool_box_truth_reset`]).  Also clears the concrete-return cell so a
-/// stale value from a prior aborted walk cannot leak into this one.
+/// Clear any stashed Finish payload before a walk begins.  Also clears the
+/// concrete-return cell so a stale value from a prior aborted walk cannot leak
+/// into this one.
 pub(crate) fn fbw_finish_payload_reset() {
     FBW_FINISH_PAYLOAD.with(|c| c.set(None));
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(false));
@@ -364,8 +364,7 @@ pub(crate) fn fbw_context_chained_contains(op: OpRef) -> bool {
     FBW_CONTEXT_CHAINED.with(|s| s.borrow().contains(&op))
 }
 
-/// Clear the store journal and residual-call census before a walk
-/// begins (mirrors [`bool_box_truth_reset`]).
+/// Clear the store journal and residual-call census before a walk begins.
 pub(crate) fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow_mut().clear());
