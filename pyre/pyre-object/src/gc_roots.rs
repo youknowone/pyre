@@ -431,8 +431,8 @@ impl RootScope {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
         // Publish the raw value before the query, for the reason [`pin_root`]
-        // gives: the query is itself a GC operation that may park behind
-        // another thread's collection.
+        // gives: the slot is what a walker reads, so it must name the value
+        // before anything consults the collector about it.
         // SAFETY: same cell; `slot` bounds-checks `index`.
         unsafe { *(*self.stack_slot).slot(index) = root };
         // Same guard as `shadow_stack_set`, after the raw publish: RPython has

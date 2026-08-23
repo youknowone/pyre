@@ -31,9 +31,9 @@ fn key_wrapper_new(cmp: PyObjectRef, object: PyObjectRef) -> PyObjectRef {
     // so force the TypeDef/typed-layout binding before allocating its payload.
     let _ = type_object();
     let _roots = pyre_object::gc_roots::push_roots();
-    // Publish both livevars before the first forwarding query: `pin_root` can
-    // park behind another thread's collection, which would leave the operand
-    // still held in a Rust local naming a pre-move address.
+    // Publish both livevars in one pass and read each back from its slot: a
+    // slot is what a promotion rewrites, the Rust local naming the same object
+    // is not.
     let slot = pyre_object::gc_roots::pin_roots(&[cmp, object]);
     W_KeyWrapper::allocate_stable(W_KeyWrapper {
         ob: PyObject {
@@ -145,9 +145,9 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     }
 
     let _roots = pyre_object::gc_roots::push_roots();
-    // Publish every operand before the first forwarding query: a `pin_root`
-    // per argument can park behind another thread's collection, leaving the
-    // ones still in `effective` naming pre-move addresses.
+    // Publish every operand in one pass and read each back from its slot: a
+    // slot is what a promotion rewrites, the copies left in `effective` are
+    // not.
     let base = pyre_object::gc_roots::pin_roots(&effective);
     let function_slot = base;
     let sequence_slot = base + 1;

@@ -993,8 +993,9 @@ impl FrameBox {
     pub fn new(mut frame: PyFrame) -> Self {
         // `frame` is an RPython aggregate local whose GCREF fields are all
         // translated livevars across the frame allocation. Publish every field
-        // before the first GC operation; a contended stable allocation parks
-        // this mutator and lets another collector run.
+        // before it, the way `gct_fv_gc_malloc` brackets a malloc with the
+        // livevars it holds: old-gen buys immobility, not survival, so a field
+        // no heap edge names yet is what the next cycle sweeps.
         //
         // One `push_roots(hop)` bracket over the whole set, not ten
         // independently-owned slots: their lifetime is exactly this function
@@ -1125,8 +1126,8 @@ impl FrameBox {
     /// and must not have been freed.
     pub unsafe fn from_raw(ptr: *mut PyFrame) -> Self {
         // Publish before asking the collector whether the address is managed:
-        // the ownership query is a GC operation and may park behind another
-        // thread's collection.
+        // the slot is what a walker reads, so it has to name the frame before
+        // anything consults the collector about it.
         let owner_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
         if pyre_object::gc_hook::try_gc_owns_object(ptr as *mut u8) {
             FrameBox {
@@ -1154,8 +1155,7 @@ impl FrameBox {
     /// frame at scope end — a caller that publishes `as_mut_ptr` past its own
     /// scope must ask this first.  Answered from the ownership decision
     /// [`FrameBox::new`] already made, so it neither re-enters the collector
-    /// (an ownership query can park behind another thread's collection) nor
-    /// relies on an address range test.
+    /// for a question already answered nor relies on an address range test.
     pub fn is_gc_owned(&self) -> bool {
         self.owner_root.is_some()
     }
@@ -4778,10 +4778,11 @@ impl PyFrame {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
         };
         // The allocation result is a translated livevar before it is stored in
-        // the eventual PyFrame. Publish it before `w_cell_new`, the barrier,
-        // or any other GC operation can park this free-threaded mutator. It
-        // joins the bracket the call inputs already opened: its lifetime is
-        // the rest of this function body, so it needs no owner of its own.
+        // the eventual PyFrame. Publish it before `w_cell_new`, the barrier or
+        // anything else below: until a heap edge names it, the shadow-stack
+        // slot is the only thing that keeps it off the next sweep. It joins the
+        // bracket the call inputs already opened: its lifetime is the rest of
+        // this function body, so it needs no owner of its own.
         let _ = pyre_object::gc_roots::pin_root(locals_cells_stack_w as PyObjectRef);
 
         {

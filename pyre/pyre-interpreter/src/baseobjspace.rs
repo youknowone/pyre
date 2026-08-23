@@ -18815,7 +18815,8 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
     // `self.async_gen.send_ex()` / `.throw()`.  RPython's GC transform roots
     // that live variable around the nested frame execution.  Preserve the
     // same lifetime explicitly: the awaitable owns the `async_gen` edge, and
-    // the nested execution may park while another thread performs a major GC.
+    // the nested execution runs Python, so it reaches collection points of its
+    // own.
     let _roots = pyre_object::gc_roots::push_roots();
     let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(awaitable);

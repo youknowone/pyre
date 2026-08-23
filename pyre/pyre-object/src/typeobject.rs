@@ -1847,16 +1847,16 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
 /// heap parents, whose list is forwarded by the `W_TYPE_GC_TYPE_ID` custom
 /// trace.
 ///
-/// Order matters, and it is the safepoint that fixes it, not the allocation:
-/// host-side allocation cannot collect (`dynasm_alloc_nursery_typed` routes to
-/// `try_alloc_nursery_no_collect_typed` and spills to old-gen on nursery full),
-/// but `try_gc_write_barrier` reaches `gc_sync::gc_op`, which leaves RUNNING and
-/// parks on `gc_mutex` — an entry-style safepoint where another thread's
-/// stop-the-world collection runs.  The dirty bit is consumable
-/// (`gc_roots::clear_prebuilt_roots_dirty` after each walk), so marking on the
-/// far side of that safepoint would let a collection walk the prebuilt family
-/// with the slot already updated and the bit still clear, and nothing else roots
-/// the young weakref.  Mark first, then take the barrier.
+/// Order matters for the dirty bit, and neither operation here is a collection
+/// point: host-side allocation cannot collect (`dynasm_alloc_nursery_typed`
+/// routes to `try_alloc_nursery_no_collect_typed` and spills to old-gen on
+/// nursery full), and `try_gc_write_barrier` reaches `gc_sync::gc_op`, which
+/// under the GIL is a bare borrow of the singleton.  The bit is consumable
+/// (`gc_roots::clear_prebuilt_roots_dirty` after each walk) and nothing else
+/// roots the young weakref, so any collection that walks the prebuilt family
+/// with the slot already updated and the bit still clear loses it.  Mark first,
+/// then take the barrier: that puts the mark ahead of every collection point the
+/// caller can reach afterwards, wherever the next one falls.
 #[inline]
 unsafe fn note_weak_subclass_store(w_parent: PyObjectRef) {
     crate::gc_roots::mark_prebuilt_roots_dirty();

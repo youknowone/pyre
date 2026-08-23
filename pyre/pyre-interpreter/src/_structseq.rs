@@ -507,10 +507,9 @@ pub fn new_instance_with_extra(
     // shape explicitly across the tuple/dict allocations instead of relying
     // on raw Rust Vec entries surviving a moving collection.
     let _roots = pyre_object::gc_roots::push_roots();
-    // Publish the class, every item and every extra as one batch: the
-    // forwarding query inside a first `pin_root` can park behind another
-    // thread's collection, which would leave the values still held only in
-    // these Rust vectors naming pre-move addresses.
+    // Publish the class, every item and every extra as one batch and read each
+    // back from its slot: a slot is what a promotion rewrites, the copies left
+    // in these Rust vectors are not.
     let mut roots = Vec::with_capacity(1 + items.len() + extras.len());
     roots.push(cls);
     roots.extend_from_slice(&items);

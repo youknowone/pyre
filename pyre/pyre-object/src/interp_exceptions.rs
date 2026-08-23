@@ -1952,9 +1952,9 @@ pub unsafe fn w_exception_kind_byte(obj: PyObjectRef) -> u8 {
 /// a live type. `is_exception` reads the subclass range through it, so an
 /// aligned non-null word that is not a type header still faults. Proving it
 /// would need a heap-membership test, and the only one available (`is_tracked`)
-/// runs as a `gc_op` — it leaves RUNNING and can park the mutator, which is not
-/// something a classification on the blackhole resume path may do. The caller's
-/// contract carries that obligation instead.
+/// runs as a `gc_op`, which asserts GIL ownership and takes the reentry guard —
+/// neither is something a classification on the blackhole resume path may take
+/// on. The caller's contract carries that obligation instead.
 ///
 /// # Safety
 /// `obj` must be null or point to at least `size_of::<PyObject>()` readable

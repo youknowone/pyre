@@ -3,12 +3,15 @@ import gc
 import sys
 
 
-# The generation argument is integer-unwrapped but otherwise ignored: every
-# value is accepted and none of them selects anything.  What `collect` answers
-# is not asserted here -- it is a spec axis, so pyre answers an int where this
-# fixture's oracle answers None, and `extra_tests/snippets/stdlib_gc.py` is
-# where the return value is pinned.
-for generation in (-999, -1, 0, 1, 2, 3, 999):
+# The generation argument is integer-unwrapped and then ignored: none of these
+# selects anything, because every collection here is a full one.  Which values
+# are *accepted* is a spec axis -- this oracle takes any int, `gc_collect_impl`
+# takes only a generation it reports, and pyre follows the latter -- so only
+# the three both accept are probed here, and
+# `extra_tests/snippets/gc_generation_argument_is_bounded.py` pins the rest.
+# What `collect` answers is a spec axis too: pyre answers an int where this
+# oracle answers None, and `extra_tests/snippets/stdlib_gc.py` pins that.
+for generation in (0, 1, 2):
     gc.collect(generation)
 
 for value in (1.0, "1"):
@@ -45,8 +48,13 @@ else:
     raise AssertionError("finalizer lock must be balanced")
 
 
-# `referents.py:get_objects` is deliberately not CPython-generational.  It
-# emits the audit event before checking the argument, and accepts only None.
+# `referents.py:get_objects` audits -1 whatever it was handed, because its own
+# walk takes no generation, and it emits that event before it looks at the
+# argument at all.  pyre keeps both of those: nothing pins the payload to the
+# argument, so the walk it does have -- one that selects a generation -- widens
+# only which arguments are accepted, and
+# `extra_tests/snippets/gc_generation_argument_is_bounded.py` is where the
+# accepted set is pinned.  What both agree on is the payload, asserted here.
 get_objects_events = []
 referent_events = []
 
@@ -61,15 +69,8 @@ def audit_hook(event, args):
 sys.addaudithook(audit_hook)
 assert isinstance(gc.get_objects(), list)
 assert isinstance(gc.get_objects(None), list)
-for generation in (0, -1, "x"):
-    try:
-        gc.get_objects(generation)
-    except NotImplementedError as error:
-        assert str(error) == "get_objects(generation=None) accepts only None on PyPy"
-    else:
-        raise AssertionError("PyPy gc.get_objects accepts only None")
 
-assert get_objects_events == [(-1,), (-1,), (-1,), (-1,), (-1,)]
+assert get_objects_events == [(-1,), (-1,)]
 
 
 referent = []

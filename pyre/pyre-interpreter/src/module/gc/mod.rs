@@ -35,6 +35,14 @@ static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 static GC_THRESHOLD: [AtomicI64; 3] =
     [AtomicI64::new(2000), AtomicI64::new(10), AtomicI64::new(10)];
 
+/// How many generations this module reports.  `get_threshold` answers a
+/// three-tuple and `set_threshold` writes three slots, so three is the count
+/// every generation argument is checked against — the same `NUM_GENERATIONS`
+/// `gc_collect_impl` and `gc_get_objects_impl` bound theirs by.  The collector
+/// underneath has two physical generations; the middle one is simply always
+/// empty, which is what `do_get_objects` already answers for it.
+const NUM_GENERATIONS: i64 = 3;
+
 const STATE_SCANNING: u8 = 0;
 const STATE_MARKING: u8 = 1;
 const STATE_SWEEPING: u8 = 2;
@@ -779,7 +787,46 @@ fn pin_referents(w_obj: PyObjectRef) {
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     majit_gc::get_referents(majit_ir::GcRef(source as usize), pin_object);
     pin_unboxed_container_referents(source_slot);
+    pin_heaptype_referent(source_slot);
     remove_root_slot_preserving_tail(source_slot);
+}
+
+/// `subtype_traverse` visits an object's own type when that type is a heap
+/// type — "for a heaptype, the instances count as references to the type" — and
+/// so does `type_traverse` for a class whose metaclass is one.  The collector
+/// has no edge to report for it: `PyObject.ob_type` addresses a
+/// `try_gc_alloc_stable_raw` header that never moves and that nothing traces.
+/// Materialise it here, the same way `pin_unboxed_container_referents`
+/// materialises the logical half of an unboxed container entry.
+///
+/// Some layouts already arrive with it — a tuple subclass carries its type
+/// among the collector's own edges — so the referents pinned so far are scanned
+/// and the type is appended only when it is not already among them.  The append
+/// is at the end, which is where `subtype_traverse` puts it for an instance
+/// with managed-dict values; a class or a tuple subclass reports it first
+/// instead, and this module does not reproduce that order.
+///
+/// Gated on `cpython_object_is_gc` because that is the flag that decides
+/// whether `tp_traverse` runs at all: a non-GC object has no referents, which
+/// is why `gc.get_referents(1)` is empty.
+fn pin_heaptype_referent(source_slot: usize) {
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(source_slot);
+    if w_obj.is_null() || !crate::typedef::cpython_object_is_gc(w_obj) {
+        return;
+    }
+    let Some(w_type) = crate::typedef::r#type(w_obj) else {
+        return;
+    };
+    let w_type = w_type.as_ptr();
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
+        return;
+    }
+    for slot in source_slot + 1..pyre_object::gc_roots::shadow_stack_len() {
+        if pyre_object::gc_roots::shadow_stack_get(slot) == w_type {
+            return;
+        }
+    }
+    let _ = pyre_object::gc_roots::pin_root(w_type);
 }
 
 /// Wrap every raw collector node rooted in `[first, last)` as
@@ -795,7 +842,8 @@ fn wrap_raw_nodes(first: usize, last: usize) -> usize {
     for slot in first..last {
         let raw = majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(slot) as usize);
         let wrapped = if majit_gc::is_app_level_object(raw) {
-            // The query can park behind a moving collection; reload the slot.
+            // The query enters the collector; the address comes back out of
+            // the slot rather than out of the word held across it.
             pyre_object::gc_roots::shadow_stack_get(slot)
         } else {
             gcref::wrap_rooted(slot)
@@ -1298,7 +1346,13 @@ fn dump_rpy_heap_public(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 crate::py_module! {
     "gc",
     interpleveldefs: {
-        "callbacks"           => w_list_new(vec![]),
+        // No `callbacks`.  `moduledef.py` defines none, and the collector-side
+        // hook contract keeps its calls allocation-free, so nothing here can
+        // run an app-level callback around a collection the way
+        // `invoke_gc_callback` does.  Binding an empty list would satisfy
+        // `hasattr` and then never call it, which is a silent failure where the
+        // missing attribute is a loud one; `gc.hooks` is the notification
+        // surface that does fire.
         "garbage"             => w_list_new(vec![]),
         "DEBUG_STATS"         => w_int_new(1),
         "DEBUG_COLLECTABLE"   => w_int_new(2),
@@ -1313,13 +1367,18 @@ crate::py_module! {
         fn collect(
             #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `interp_gc.py collect` unwraps the optional generation
-            // as an int, but deliberately ignores its value.  In particular,
-            // unlike a three-generation frontend, every integer is accepted
-            // and the default is 0.
-            let _generation = crate::baseobjspace::int_w(
+            // `interp_gc.py collect` unwraps the optional generation as an
+            // int and ignores its value, because PyPy's frontend has no
+            // generations to select between.  This one reports three, so the
+            // argument is bounded the way `gc_collect_impl` bounds it; the
+            // value is still ignored below, since every collection here is a
+            // full one.
+            let generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
+            if !(0..NUM_GENERATIONS).contains(&generation) {
+                return Err(crate::PyError::value_error("invalid generation"));
+            }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
@@ -1352,24 +1411,38 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `referents.py:116-126 get_objects`: "Return a list of all
-            // app-level objects." The audit event always reports -1 and fires
-            // before the argument is examined, so a non-None value is still
-            // audited; only None is then accepted, because the collector has
-            // no generations to select between.
+            // `referents.py get_objects` returns "a list of all
+            // app-level objects" and takes no generation, but `do_get_objects`
+            // already filters by one: -1 is every object, 0 is the nursery, 2
+            // is what is not in it, and 1 is the generation this collector
+            // keeps empty.  So the argument is passed through rather than
+            // refused, bounded the way `gc_get_objects_impl` bounds it.  The
+            // audit event always reports -1 and fires before the argument is
+            // examined, so an out-of-range value is still audited.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(generation);
             crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
             let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
-            if !unsafe { is_none(generation) } {
-                return Err(crate::PyError::not_implemented(
-                    "get_objects(generation=None) accepts only None on PyPy",
+            let generation = if unsafe { is_none(generation) } {
+                -1
+            } else {
+                crate::baseobjspace::int_w(crate::baseobjspace::space_index(generation)?)?
+            };
+            if generation >= NUM_GENERATIONS {
+                return Err(crate::PyError::value_error(format!(
+                    "generation parameter must be less than the number of \
+                     available generations ({NUM_GENERATIONS})"
+                )));
+            }
+            if generation < -1 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter cannot be negative",
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_cpython_tracked_object);
+            majit_gc::get_objects(generation as i8, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
