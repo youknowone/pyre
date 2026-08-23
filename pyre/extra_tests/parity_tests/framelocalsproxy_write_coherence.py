@@ -60,6 +60,19 @@ def write_through_caller_proxy(rounds):
     return x
 
 
-print("write_through_proxy", write_through_proxy(ROUNDS))
-print("store_then_read_proxy", store_then_read_proxy(ROUNDS))
-print("write_through_caller_proxy", write_through_caller_proxy(ROUNDS))
+def check(name, got):
+    # Every arm drives the same local to ``ROUNDS - 1``; a stale answer reports
+    # the value it held when the loop compiled, which is well short of that.
+    if got != ROUNDS - 1:
+        print(f"{name}: got {got!r}, want {ROUNDS - 1!r}")
+        return False
+    return True
+
+
+results = [
+    check("write_through_proxy", write_through_proxy(ROUNDS)),
+    check("store_then_read_proxy", store_then_read_proxy(ROUNDS)),
+    check("write_through_caller_proxy", write_through_caller_proxy(ROUNDS)),
+]
+if all(results):
+    print("OK")
