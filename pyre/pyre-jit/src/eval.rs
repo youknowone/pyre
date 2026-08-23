@@ -7559,6 +7559,31 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // records the shape's answer while the frame stays interpreted;
             // `bench/synth/exception_with_exit_self_null_slot` is the `while`
             // form, which never depended on this gate.
+            //
+            // 2026-08-24: the witness above no longer fires.  Admitting both
+            // opcodes on this tree and rebuilding, `test.test_pow` is OK 3/3
+            // with no `GeneratorExit` anywhere in the output, and 14 further
+            // `with`/generator-heavy modules — `test_long`, `test_contextlib`,
+            // `test_contextlib_async`, `test_with`, `test_unittest`,
+            // `test_exceptions`, `test_exception_variations`, `test_except_star`,
+            // `test_raise`, `test_decimal`, `test_generator_stop`,
+            // `test_coroutines`, `test_yield_from` — are clean too.  The
+            // admission is not inert: it takes `foriter_load_special_with` from
+            // `loops_compiled=2` to `3` and the fixture still prints its
+            // recorded answer.  Two `with` root causes landed in between, either
+            // of which could account for it: the `bh_with_except_start_fn`
+            // null-receiver tag that was aborting every bridge out of a `with`
+            // handler at op 1, and the blackhole `guard_class` no-op stub that
+            // lost a second suppressing `__exit__`.
+            //
+            // The gate stays shut anyway, because admitting it is not a
+            // one-file change: `loops_aborted` goes 0 -> 9 on that fixture, so
+            // all three backends' jitstats need re-recording, and the method
+            // note on the original defect is that two green synthetic gate runs
+            // on three backends missed it while the cpython suite caught it —
+            // so the full 209-module suite is the evidence to produce, not a
+            // subset.  Neither is measurable on a host that cannot build
+            // release.
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
