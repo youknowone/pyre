@@ -144,10 +144,19 @@ fn build_jitcode(arm: Arm) -> (Arc<JitCode>, usize) {
     (jitcode, pc)
 }
 
+/// Whether the vable register holds a recorded box or a prebuilt constant.
+/// Step 4's `PTR_EQ` runs through `execute_and_record`, so the two shapes
+/// differ in whether the comparison survives into the trace.
+#[derive(Clone, Copy)]
+enum VableBox {
+    Recorded,
+    Constant,
+}
+
 /// Run one dispatch step of `arm` against a NON-standard virtualizable whose
 /// index box is non-constant, and report `(guards minted, whether any guard
-/// names the index box)`.
-fn run_arm(arm: Arm) -> (usize, bool) {
+/// names the index box, whether Step 4's PTR_EQ was recorded)`.
+fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let info = one_int_array_vinfo();
     let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
 
@@ -171,7 +180,21 @@ fn run_arm(arm: Arm) -> (usize, bool) {
     // reaches its Step 4 `PTR_EQ`, reads unequal, and takes the non-standard
     // branch. This is the whole point of the fixture — the standard branch
     // promotes on purpose.
-    let other_vable = ctx.const_ref(2);
+    //
+    // `VableBox::Recorded` must NOT be a `ConstPtr`. Step 4 runs its `PTR_EQ`
+    // through `execute_and_record`, so a constant on both sides folds the
+    // comparison and no guard is minted — which would leave the `guards > 0`
+    // line measuring nothing. A virtualizable in a register is a recorded box
+    // in production anyway; the concrete pointer arrives from the frame's
+    // `ref_values`, not from the box being constant.
+    let other_vable = match vable {
+        VableBox::Recorded => {
+            let b = OpRef::input_arg_ref(0);
+            ctx.set_opref_concrete(b, Value::Ref(majit_ir::GcRef(2)));
+            b
+        }
+        VableBox::Constant => ctx.const_ref(2),
+    };
 
     // A non-constant index carrying a recording-time concrete. Any other shape
     // makes the promote a no-op, so the test would pass without measuring it.
@@ -211,7 +234,15 @@ fn run_arm(arm: Arm) -> (usize, bool) {
                 .first()
                 .is_some_and(|arg| arg.to_opref() == index)
     });
-    (ctx.num_guards() - guards_before, promoted_index)
+    let recorded_ptr_eq = ctx
+        .ops()
+        .iter()
+        .any(|recorded| recorded.opcode == majit_ir::OpCode::PtrEq);
+    (
+        ctx.num_guards() - guards_before,
+        promoted_index,
+        recorded_ptr_eq,
+    )
 }
 
 /// ## The negative control, and how it was taken
@@ -245,7 +276,8 @@ fn run_arm(arm: Arm) -> (usize, bool) {
 #[test]
 fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
     for arm in [Arm::Get, Arm::Set] {
-        let (guards, promoted_index) = run_arm(arm);
+        let (guards, promoted_index, recorded_ptr_eq) = run_arm(arm, VableBox::Recorded);
+        assert!(recorded_ptr_eq, "{}: Step 4's PTR_EQ", arm.name());
         assert!(
             guards > 0,
             "{}: the arm must still mint the Step 4 PTR_EQ promote of \
@@ -263,5 +295,32 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
              only the standard leg enters.",
             arm.name()
         );
+    }
+}
+
+/// The same walk with a prebuilt `ConstPtr` in the vable register. Step 3
+/// already returned for `standard_box is box`, so two constants reaching Step 4
+/// are *different* constants and cannot be equal at runtime either — the
+/// `PTR_EQ` folds to `ConstInt(0)` and `implement_guard_value`'s Const arm then
+/// declines the promote, leaving neither the comparison nor a `GUARD_VALUE` in
+/// the trace. `capture_vable_promote_guard` derives its stamp count from
+/// `ctx.num_guards()` rather than assuming one, so minting none is a case it
+/// already handles.
+#[test]
+fn a_constant_vable_folds_the_step_four_ptr_eq_away() {
+    for arm in [Arm::Get, Arm::Set] {
+        let (guards, promoted_index, recorded_ptr_eq) = run_arm(arm, VableBox::Constant);
+        assert!(
+            !recorded_ptr_eq,
+            "{}: two different ConstPtrs must fold, not record",
+            arm.name()
+        );
+        assert_eq!(
+            guards,
+            0,
+            "{}: a folded PTR_EQ has nothing to promote",
+            arm.name()
+        );
+        assert!(!promoted_index, "{}", arm.name());
     }
 }

@@ -3986,18 +3986,29 @@ impl TraceCtx {
             // guard descr via `num_live` (live-var count), not pc, so the
             // parameter is documented here but not consumed at this layer.
             let _ = pc;
-            // pyjitpl.py `_nonstandard_virtualizable` execute leg.
-            self.profiler()
-                .count_ops(OpCode::PtrEq, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::PtrEq, crate::counters::RECORDED_OPS);
-            let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
             let isstandard: i64 = if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref())
             {
                 1
             } else {
                 0
             };
+            // pyjitpl.py `_nonstandard_virtualizable` execute leg. Step 3
+            // already returned for `standard_box is box`, so two constants
+            // arriving here are *different* constants and cannot be equal at
+            // runtime either — the fold to `ConstInt(0)` is sound, and
+            // `promote_int` then short-circuits it into no GUARD_VALUE.
+            // `PTR_EQ` reads no memory, so the fold does not depend on which
+            // backend answers; `TraceCtx` holds no `Cpu`, so the default one
+            // stands in.
+            let cpu = crate::cpu::default_cpu();
+            let eqbox = self.execute_and_record(
+                cpu.as_ref(),
+                OpCode::PtrEq,
+                None,
+                &[vable_opref, standard_box],
+                Some(Value::Int(isstandard)),
+                0,
+            );
             self.promote_int(eqbox, isstandard, 0);
             if isstandard != 0 {
                 // pyjitpl.py:1140-1142 `if box.type == 'r':

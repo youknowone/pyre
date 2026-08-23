@@ -17108,10 +17108,23 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             0
         };
+        // Two distinct `ConstPtr`s cannot be equal at runtime either, so the
+        // funnel's fold is sound here and collapses the pair to `ConstInt(0)`;
+        // `promote_int` then short-circuits on it and no GUARD_VALUE is
+        // recorded. `PTR_EQ` reads no memory, so the fold does not depend on
+        // which backend `self.cpu` is.
+        let cpu = self.cpu.clone();
+        let last_exc_value = self.last_exc_value;
         let eqbox_opref = {
             let ctx = self.tracing.as_mut()?;
-            ctx.recorder
-                .record_op(OpCode::PtrEq, &[vref_box, standard_box])
+            ctx.execute_and_record(
+                cpu.as_ref(),
+                OpCode::PtrEq,
+                None,
+                &[vref_box, standard_box],
+                Some(majit_ir::Value::Int(isstandard_int)),
+                last_exc_value,
+            )
         };
         // pyjitpl.py: eqbox = self.implement_guard_value(eqbox, pc)
         // — pyre's `promote_int` records GUARD_VALUE on the result and
