@@ -156,7 +156,6 @@ fn interface_io_error(error: std::io::Error) -> crate::PyError {
 /// between.
 #[cfg(any(unix, windows))]
 struct SocketWritableBuffer {
-    _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
     address: *mut u8,
@@ -165,8 +164,12 @@ struct SocketWritableBuffer {
 
 #[cfg(any(unix, windows))]
 impl SocketWritableBuffer {
+    /// The root scope the pins land in belongs to the caller.  A scope per
+    /// buffer would be released in the order the buffers are dropped, and a
+    /// `Vec` of them drops front to back, so the first release would truncate
+    /// the stack that the slots the later ones still name live in —
+    /// `recvmsg_into` with two buffers is the case that reaches it.
     unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, crate::PyError> {
-        let roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let (data, owner) =
@@ -176,7 +179,6 @@ impl SocketWritableBuffer {
         let owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
         let held = crate::builtins::buffer_export_incref(owner);
         Ok(Self {
-            _roots: roots,
             owner_slot,
             held,
             address: data.as_mut_ptr(),
@@ -4232,6 +4234,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
+            let _roots = pyre_object::gc_roots::push_roots();
             let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
             let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
@@ -4301,6 +4304,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let buf_obj = args[1];
+            let _roots = pyre_object::gc_roots::push_roots();
             let mut buffer = unsafe { SocketWritableBuffer::acquire(buf_obj) }?;
             let slot = unsafe { buffer.as_mut_slice() };
             let buf_len = slot.len();
@@ -4535,6 +4539,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_tuple_len(seq)
                 }
             };
+            // One scope for the whole set: `SocketWritableBuffer` records slot
+            // indices into it, and the vector's elements are dropped front to
+            // back.
+            let _roots = pyre_object::gc_roots::push_roots();
             let mut buffers: Vec<SocketWritableBuffer> = Vec::with_capacity(nbufs);
             for i in 0..nbufs {
                 let item = unsafe {
