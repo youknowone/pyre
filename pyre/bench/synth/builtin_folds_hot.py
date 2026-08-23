@@ -13,31 +13,20 @@
 # arm on that host.  The gate clears the highest folded reading by 20% and still
 # sits an order of magnitude under the residual arm scaled to it.
 #
-# pyre-check: max-wasm-ratio=13
 # pyre-check: spec-folds=builtin_fold1,builtin_fold2
-# The wasm ceiling is fitted to the highest reading observed plus 15%.  Two
-# ubuntu-24.04 runs of the same code read 8.2x and 11.3x, because the
-# denominator is small enough for startup subtraction to move it: dynasm's
-# execution-only time came out 0.69s and then 0.44s, and the second run's own
-# failure line said a dynasm startup estimate 0.68x larger would have erased
-# the gap.  The loop counts below are twice what they were for that reason --
-# the subtraction error is a fixed number of milliseconds, so doubling the work
-# halves its share.  Every recorded jit-stats counter is unchanged by the
-# doubling.
+# This fixture carried a wasm allowance of 13 while every folded builtin still
+# left the trace module: a fold removes the frame force, the argument rooting,
+# the execution-context resolution and the gateway binding, but each one still
+# lowered to a call into a raw helper, and `abs(x)`'s helper is `(i64) -> f64`,
+# a mixed signature the backend would not lower without a caller vouching for
+# it.  31,998,958 crossings, 100% of them that one helper, 3.3s of a 5.0s run.
+# Vouching it (`float_fold_helper_addrs`) takes the crossings to zero and the
+# fixture to 1.2x, so the allowance is gone rather than lowered.
 #
-# The structure is the host crossing.  A JIT-emitted trace is its own wasm
-# module, so a call leaving it reaches the interpreter through the
-# `env.jit_call` trampoline, which marshals func_ptr and arguments through the
-# frame call area in shared linear memory and dispatches through the main
-# module's indirect function table.  What the fold removes is the frame force,
-# the argument rooting, the execution-context resolution and the gateway
-# binding; the crossing itself stays, because every fold here still lowers to
-# a call into a raw helper.  The tree carries its own contrast: on the same
-# ubuntu run `math_folds_hot`, whose folds lower to inline arithmetic instead,
-# reads 3.3x.  Every loop below is nothing but folded builtin calls, so the
-# crossing is the whole measurement.  The alternative to this allowance is to
-# give the trace module direct imports for the raw helpers rather than one
-# generic trampoline.
+# The loop counts are twice what they once were, and stay that way: the
+# denominator is small enough for startup subtraction to move it, and the
+# subtraction error is a fixed number of milliseconds, so doubling the work
+# halves its share.  Every recorded jit-stats counter is unchanged by it.
 #
 # `spec-folds` is the exact instrument neither ratio is.  Six loops sum into
 # one number, so retiring one channel moves it by less than the span this

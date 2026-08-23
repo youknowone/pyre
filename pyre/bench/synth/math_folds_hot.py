@@ -1,9 +1,12 @@
 # pyre-check: max-pypy-ratio=5
 # pyre-check: skip-cpython
-# pyre-check: max-wasm-ratio=13
-# Fitted to the highest reading observed plus 15%: darwin-arm64 reads
-# 8.1-9.0x across five runs at load 11 and 11.3x during a load spike.  The wasm
-# side is slower for a structural reason rather than a regression: `pymath`
+# This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
+# reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`
+# and `ldexp` lower to helpers with mixed `f64`/word signatures, which the
+# backend would not lower in-module without a caller vouching for them, so
+# 3,998,958 calls left the trace module.  Vouched, the fixture reads 1.5x on
+# the same host and carries no allowance.
+# What remains of the gap is structural rather than a regression: `pymath`
 # reaches the platform libm on native and its pure-Rust `libm` fallback in the
 # guest, and the guest also pays an errno-classifying wrapper the native build
 # folds away.  Measured on the same fold machinery and the same loop, wasm

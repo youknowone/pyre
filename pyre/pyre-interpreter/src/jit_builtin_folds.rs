@@ -53,6 +53,27 @@ pub enum BuiltinFoldRaw {
     Ref2(extern "C" fn(i64, i64) -> i64),
 }
 
+/// Addresses of the fold helpers whose recorded call descr describes their
+/// real wasm ABI, for `majit_backend_wasm::set_faithful_residual_call_addrs`.
+///
+/// [`BuiltinFoldRaw::Float1`] is the only shape that needs vouching. Its descr
+/// is `[Ref] -> Float` (`call_float_typed_with_effect` in the walker's fold
+/// arm), which on wasm32 is `(i64) -> f64` -- a mixed signature the backend
+/// will not lower on a descr's word alone. `Int1` and `Ref2` are uniformly
+/// word-sized and already lower through the arity-keyed family.
+///
+/// Derived from the table rather than hand-listed, so a fold added later is
+/// covered by construction.
+pub fn float_fold_helper_addrs() -> Vec<i64> {
+    BUILTIN_FOLDS
+        .iter()
+        .filter_map(|fold| match fold.raw {
+            BuiltinFoldRaw::Float1(f) => Some(f as *const () as usize as i64),
+            BuiltinFoldRaw::Int1(_) | BuiltinFoldRaw::Ref2(_) => None,
+        })
+        .collect()
+}
+
 impl BuiltinFoldRaw {
     /// Positional argument count this helper answers for.  A call with any
     /// other count is not this row's shape and keeps the residual.

@@ -5172,20 +5172,25 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // and naming it here is the vouching the backend cannot do for itself --
     // a raw callee taking `&T` is `(i32)` on wasm32 whatever its descr says.
     #[cfg(target_arch = "wasm32")]
-    majit_backend_wasm::set_faithful_residual_call_addrs(&[
-        // (f64) -> i64
-        pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const () as usize
-            as i64,
-        // (f64, i64) -> f64
-        pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as usize
-            as i64,
-        // (f64, f64) -> i64
-        pyre_interpreter::module::math::interp_math::jit_math_isclose_default as *const () as usize
-            as i64,
-        // (i64, i64) -> f64
-        pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
-            as i64,
-    ]);
+    {
+        let mut faithful = vec![
+            // (f64) -> i64
+            pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
+                as usize as i64,
+            // (f64, i64) -> f64
+            pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as usize
+                as i64,
+            // (f64, f64) -> i64
+            pyre_interpreter::module::math::interp_math::jit_math_isclose_default as *const ()
+                as usize as i64,
+            // (i64, i64) -> f64
+            pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
+                as i64,
+        ];
+        // (i64) -> f64, one per float-result builtin fold.
+        faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
+        majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
+    }
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
     (d, info)
