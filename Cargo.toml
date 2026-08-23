@@ -85,6 +85,9 @@ sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/Rust
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
+# Defaults off although that manifest declares none: backend selection there is
+# mandatory, so a `default` added to it later would otherwise arrive through
+# every inheriting edge at once instead of being named per consumer.
 majit-metainterp = { version = "0.0.2", path = "majit/majit-metainterp", default-features = false }
 majit-ir = { version = "0.0.2", path = "majit/majit-ir" }
 majit-trace = { version = "0.0.2", path = "majit/majit-trace" }
