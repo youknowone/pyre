@@ -1432,7 +1432,7 @@ crate::py_module! {
             };
         let unsupported = crate::builtins::make_exc_type_multi(
             "io.UnsupportedOperation",
-            crate::builtins::exc_exception_new,
+            crate::builtins::exc_os_error_new,
             bases,
         );
         let _ = UNSUPPORTED_OPERATION_TYPE.set(unsupported as usize);

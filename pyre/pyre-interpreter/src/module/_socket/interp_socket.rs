@@ -111,8 +111,13 @@ fn socket_converted_error(
     }
     args.push(pyre_object::w_str_new(message));
 
-    let exc = crate::builtins::exc_exception_new(&args)
-        .expect("exc_exception_new is infallible for str/int args");
+    // Every class this resolves to is an OSError subclass, and
+    // `converted_error` reaches them through `space.call_function`, so the
+    // instance is built by the family `__new__` that parses `(errno,
+    // strerror)` into the slots — not by the bare `BaseException.__new__`
+    // that only stores `args`.
+    let exc = crate::builtins::exc_os_error_new(&args)
+        .expect("exc_os_error_new is infallible for str/int args");
 
     let mut err = crate::PyError::os_error(message);
     err.exc_object = exc;
@@ -1375,6 +1380,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `socketmodule.c` names them `socket.herror` / `socket.gaierror`
     // instead, and `type.__module__` reads the qualified prefix back, so
     // `socket.gaierror.__module__` is `"socket"` rather than `"_socket"`.
+    // `new_exception_class` leaves the base's `__new__` in place, so both
+    // inherit the OSError family constructor and its errno/strerror parse.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before _socket init");
     crate::module_ns_store(ns, "error", w_os_error);
@@ -1383,7 +1390,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "herror",
         crate::builtins::make_exc_type(
             "socket.herror",
-            crate::builtins::exc_exception_new,
+            crate::builtins::exc_os_error_new,
             w_os_error,
         ),
     );
@@ -1392,7 +1399,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "gaierror",
         crate::builtins::make_exc_type(
             "socket.gaierror",
-            crate::builtins::exc_exception_new,
+            crate::builtins::exc_os_error_new,
             w_os_error,
         ),
     );

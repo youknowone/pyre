@@ -2755,7 +2755,7 @@ crate::py_module! {
             .expect("ValueError installed");
         let cert_error = crate::builtins::make_exc_type_multi(
             "_ssl.SSLCertVerificationError",
-            crate::builtins::exc_exception_new,
+            crate::builtins::exc_os_error_new,
             &[ssl_error, value_error],
         );
         crate::module_ns_store(ns, "SSLCertVerificationError", cert_error);
