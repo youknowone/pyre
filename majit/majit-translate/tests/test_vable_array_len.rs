@@ -391,8 +391,10 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
                             .iter()
                             .any(|a| matches!(a, LinkArg::Value(v) if v == result))
                         {
-                            escapes
-                                .push(format!("{:?}: link argument, block {bi} exit {ei}", graph.name));
+                            escapes.push(format!(
+                                "{:?}: link argument, block {bi} exit {ei}",
+                                graph.name
+                            ));
                         }
                     }
                     for o in &b.operations {
