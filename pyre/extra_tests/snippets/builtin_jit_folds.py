@@ -172,6 +172,22 @@ class _Cmp:
 assert _stable(min, (_Cmp(1), _Cmp(2))).v == 1
 assert _stable(max, (_Cmp(1), _Cmp(2))).v == 2
 
+# Every pair above is a loop invariant, so the trace only ever sees the shape
+# it recorded.  A loop whose operands change has to leave through the guards
+# and answer from the builtin again.  Each stretch is long enough to compile
+# before the next one flips it, and the tie is driven after the `a > b`
+# stretch rather than after `a < b`: a trace recorded on `a > b` guards the
+# ordering it saw, and a later tie still satisfies that guard.
+_varying = ([(9, 3)] * ROUNDS + [(3, 3)] * ROUNDS + [(3, 9)] * ROUNDS
+            + [(1.5, 2.5)] * ROUNDS + [(9, 3)] * ROUNDS)
+_wrong = 0
+for _a, _b in _varying:
+    if min(_a, _b) != (_a if _a <= _b else _b):
+        _wrong += 1
+    if max(_a, _b) != (_a if _a >= _b else _b):
+        _wrong += 1
+assert _wrong == 0
+
 # --- rebound names ----------------------------------------------------------
 # The fold keys on the wrapped builtin code, not the name it is reachable
 # under, so a shadowing definition must win.

@@ -11514,6 +11514,81 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
         if value.is_null() || value != boxed_result {
             continue;
         }
+        // Two distinct exact machine ints need no builtin-specific branch:
+        // the ordering guard determines which object `min_max_multiple_args`
+        // would keep for either comparison direction.  The answer written to
+        // the destination is the winning operand's own `OpRef`, so nothing is
+        // allocated and no new box is made.  If a later iteration reverses
+        // the ordering the guard fails and resumes in the builtin, the same
+        // side exit the decline sentinel below uses.
+        //
+        // Recording starts only from a pair that already differs, because on
+        // a tie the winner is scan order rather than an ordering this arm
+        // could guard.  The guard is then recorded in whichever direction
+        // held, so the `a < b` trace excludes a later tie while the `a >= b`
+        // one admits it.  On such a tie `min_max_multiple_args` keeps its
+        // first argument and this arm may hand back the second, but the two
+        // are exact ints of equal value and `is_w` compares those by value
+        // rather than by pointer, so which one the loop gets back is not
+        // observable.
+        let has_tagged_int = pyre_object::tagged_int::CAN_BE_TAGGED
+            && (pyre_object::tagged_int::is_tagged_int(operands[0])
+                || pyre_object::tagged_int::is_tagged_int(operands[1]));
+        let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+        let is_exact_int = |o: pyre_object::PyObjectRef| unsafe {
+            std::ptr::eq((*o).ob_type, &pyre_object::pyobject::INT_TYPE)
+                && std::ptr::eq((*o).w_class, int_typeobj)
+        };
+        if !has_tagged_int && is_exact_int(operands[0]) && is_exact_int(operands[1]) {
+            let (a_value, b_value) = unsafe {
+                (
+                    pyre_object::w_int_get_value(operands[0]),
+                    pyre_object::w_int_get_value(operands[1]),
+                )
+            };
+            if a_value != b_value {
+                let winner = if value == operands[0] {
+                    r_args[2]
+                } else if value == operands[1] {
+                    r_args[3]
+                } else {
+                    continue;
+                };
+
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+                let (a_op, b_op) = (r_args[2], r_args[3]);
+                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+                walker_guard_class(ctx, op.pc, a_op, int_type_addr)?;
+                walker_guard_class(ctx, op.pc, b_op, int_type_addr)?;
+                walker_guard_exact_w_class(ctx, op.pc, a_op, int_typeobj)?;
+                walker_guard_exact_w_class(ctx, op.pc, b_op, int_typeobj)?;
+                let a_raw = walker_unbox_int_typed(
+                    ctx,
+                    op.pc,
+                    a_op,
+                    int_type_addr,
+                    crate::descr::int_intval_descr(),
+                )?;
+                let b_raw = walker_unbox_int_typed(
+                    ctx,
+                    op.pc,
+                    b_op,
+                    int_type_addr,
+                    crate::descr::int_intval_descr(),
+                )?;
+                let lt = ctx.trace_ctx.record_op(OpCode::IntLt, &[a_raw, b_raw]);
+                ctx.trace_ctx
+                    .set_opref_concrete(lt, Value::Int(i64::from(a_value < b_value)));
+                let guard_opcode = if a_value < b_value {
+                    OpCode::GuardTrue
+                } else {
+                    OpCode::GuardFalse
+                };
+                walker_emit_fold_guard_with_snapshot(ctx, op.pc, guard_opcode, &[lt])?;
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', winner)?;
+                return Ok(Some(()));
+            }
+        }
         walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
         let raw = ctx.trace_ctx.call_ref_typed_with_effect(
             raw_fn as *const (),
@@ -11538,6 +11613,9 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
             // plain call ahead in 8 of 9 rounds.  A `w_class` that can be
             // proved away, or an int channel that answers with the winning
             // value instead of the winning object, is what would change that.
+            // It is also the arm for every shape the inline comparison
+            // declines: floats, equal values, tagged immediates, and any
+            // operand that is not an exact machine int.
             majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         );
         // Concrete before the guard: the guard captures a resume snapshot, and

@@ -33,7 +33,9 @@
 //! channels are recorded that way; the reference channel satisfies the same
 //! requirement but is still emitted as a plain call, for a reason that belongs
 //! with the emission and is recorded at
-//! `try_walker_specialize_builtin_fold2`.
+//! `try_walker_specialize_builtin_fold2`.  That site also answers a pair of
+//! exact machine ints without reaching this module at all, by guarding the
+//! ordering of the two operands instead of calling anything.
 
 use pyre_object::{PY_NULL, PyObjectRef};
 
