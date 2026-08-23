@@ -566,6 +566,15 @@ assert after > before, f'the last Owner was not deallocated: {before} -> {after}
 gc.collect()
 assert ref() is None, 'releasing the C reference did not let the object go'
 
+# ── and gc.collect() runs the deallocators before it returns ───────────
+# Read from C, so no bytecode runs between the collection and the count: a
+# drain left to the async action would not have happened yet.
+before = m.owner_deallocs()
+for _ in range(16):
+    m.Owner()
+during = m.collect_then_owner_deallocs()
+assert during > before, f'gc.collect() returned before tp_dealloc ran: {before} -> {during}'
+
 print('cpyext-lifetime-ok')
 "#;
 
