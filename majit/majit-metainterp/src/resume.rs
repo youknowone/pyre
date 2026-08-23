@@ -3274,7 +3274,12 @@ impl ResumeDataLoopMemo {
     /// resume.py getconst(const) — tag a constant value.
     /// Unified entry point matching RPython's getconst(const) which
     /// dispatches on const.type (INT, REF, FLOAT).
-    pub fn getconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
+    ///
+    /// `Err(TagOverflow)` when the constant pool has outgrown the tag's 14-bit
+    /// signed field; RPython lets `tag`'s exception out of `getconst` the same
+    /// way, up to `optimizer.py`'s `except resume.TagOverflow: raise
+    /// compile.giveup()`.
+    pub fn getconst(&mut self, val: i64, tp: majit_ir::Type) -> Result<i16, TagOverflow> {
         match tp {
             majit_ir::Type::Int => self.getconst_int(val),
             majit_ir::Type::Ref => self.getconst_ref(val),
@@ -3284,46 +3289,61 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py getconst for INT type.
-    pub fn getconst_int(&mut self, val: i64) -> i16 {
+    pub fn getconst_int(&mut self, val: i64) -> Result<i16, TagOverflow> {
         // Try inline TAGINT (-8191..8190 in RPython's i16 range).
         let shifted = val >> 13;
         if shifted == 0 || shifted == -1 {
-            return ((val << 2) | TAGINT as i64) as i16;
+            return Ok(((val << 2) | TAGINT as i64) as i16);
         }
         // Large int: check cache.
         if let Some(&tagged) = self.large_ints.get(&val) {
-            return tagged;
+            return Ok(tagged);
         }
-        let tagged = self.newconst(val, majit_ir::Type::Int);
+        let tagged = self.newconst(val, majit_ir::Type::Int)?;
         self.large_ints.insert(val, tagged);
-        tagged
+        Ok(tagged)
     }
 
     /// resume.py getconst for REF type.
-    pub fn getconst_ref(&mut self, val: i64) -> i16 {
+    pub fn getconst_ref(&mut self, val: i64) -> Result<i16, TagOverflow> {
         if val == 0 {
-            return NULLREF;
+            return Ok(NULLREF);
         }
         if let Some(&tagged) = self.refs.get(&val) {
-            return tagged;
+            return Ok(tagged);
         }
-        let tagged = self.newconst(val, majit_ir::Type::Ref);
+        let tagged = self.newconst(val, majit_ir::Type::Ref)?;
         self.refs.insert(val, tagged);
-        tagged
+        Ok(tagged)
     }
 
     /// resume.py getconst fallback for FLOAT type.
-    pub fn getconst_float(&mut self, val: i64) -> i16 {
+    pub fn getconst_float(&mut self, val: i64) -> Result<i16, TagOverflow> {
         // FLOAT constants always go to the pool (no inline encoding).
         // RPython: return self._newconst(const)
         self.newconst(val, majit_ir::Type::Float)
     }
 
-    /// resume.py _newconst — add to consts pool, return TAGCONST-tagged.
-    fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
-        let index = self.consts.len() as i32 + TAG_CONST_OFFSET;
+    /// resume.py `_newconst` — add to consts pool, return TAGCONST-tagged.
+    ///
+    /// ```python
+    /// result = tag(len(self.consts) + TAG_CONST_OFFSET, TAGCONST)
+    /// self.consts.append(const)
+    /// return result
+    /// ```
+    ///
+    /// The tag is minted through [`tag`] rather than by an inline shift-and-
+    /// cast, so a pool larger than the 14-bit signed field answers
+    /// `Err(TagOverflow)` instead of wrapping. A wrapped tag names a different
+    /// pool slot, and the deopt then restores a different constant than the
+    /// one the guard captured — with no diagnostic anywhere.
+    ///
+    /// The pool entry is pushed only after the tag is minted, so a rejected
+    /// tag leaves the pool exactly as it was.
+    fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> Result<i16, TagOverflow> {
+        let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
         self.consts.push(majit_ir::Const::from_raw_i64(val, tp));
-        ((index << 2) | TAGCONST as i32) as i16
+        Ok(tagged)
     }
 
     /// resume.py getconst — i64-sized variant used by the rd_numb
@@ -3344,10 +3364,16 @@ impl ResumeDataLoopMemo {
                 self.consts.push(majit_ir::Const::Int(*value));
                 // Also publish through the i16 cache so that a later
                 // `getconst_int(value)` returns the same pool slot
-                // (resume.py:171 self.large_ints[val] = tagged).
-                let tagged_i16 =
-                    ((((index as i32) + TAG_CONST_OFFSET) << 2) | TAGCONST as i32) as i16;
-                self.large_ints.insert(*value, tagged_i16);
+                // (resume.py:171 self.large_ints[val] = tagged). The cache
+                // records only slots an i16 tag can name: this encoder's own
+                // result is i64 and never truncates, so a slot past the tag's
+                // range is still encodable here, and skipping the entry leaves
+                // a later `getconst_int` to mint a fresh one and answer
+                // `Err(TagOverflow)` itself rather than be handed a wrapped
+                // tag naming somebody else's constant.
+                if let Ok(tagged_i16) = tag((index as i32) + TAG_CONST_OFFSET, TAGCONST) {
+                    self.large_ints.insert(*value, tagged_i16);
+                }
                 tag_i64(encode_len(index), TAGCONST)
             }
             majit_ir::Const::Ref(gcref) => {
@@ -3366,9 +3392,10 @@ impl ResumeDataLoopMemo {
                 }
                 let index = self.consts.len();
                 self.consts.push(majit_ir::Const::Ref(*gcref));
-                let tagged_i16 =
-                    ((((index as i32) + TAG_CONST_OFFSET) << 2) | TAGCONST as i32) as i16;
-                self.refs.insert(raw, tagged_i16);
+                // See the Int arm on why an unrepresentable tag skips the cache.
+                if let Ok(tagged_i16) = tag((index as i32) + TAG_CONST_OFFSET, TAGCONST) {
+                    self.refs.insert(raw, tagged_i16);
+                }
                 tag_i64(encode_len(index), TAGCONST)
             }
             majit_ir::Const::Float(v) => {
@@ -3558,7 +3585,7 @@ impl ResumeDataLoopMemo {
         num_env_virtuals: usize,
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
-    ) -> (Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize) {
+    ) -> Result<(Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize), TagOverflow> {
         // resume.py: new_liveboxes = [None] * memo.num_cached_boxes()
         let mut new_boxes_list: Vec<Option<majit_ir::OpRef>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
@@ -3640,41 +3667,15 @@ impl ResumeDataLoopMemo {
                 };
                 if num_idx < rd_virtuals.len() {
                     // resume.py: fieldnums = [self._gettagged(box) for box in fieldboxes]
-                    let fieldnums: Vec<i16> = vf
-                        .field_oprefs
-                        .iter()
-                        .map(|&opref| {
-                            // resume.py _gettagged with pyre-specific fallback
-                            // to cached_boxes/cached_virtuals when the local
-                            // liveboxes entries are still UNASSIGNED/UNASSIGNEDVIRTUAL.
-                            if opref.is_none() {
-                                return UNINITIALIZED_TAG;
-                            }
-                            if env.is_const(opref) {
-                                let (val, tp) = env.get_const(opref);
-                                return self.getconst(val, tp);
-                            }
-                            // #160/S11: livebox / cached maps are box-keyed.
-                            let b = env.get_box_replacement_operand(opref);
-                            if let Some(t) = numb_state.liveboxes.get(&b) {
-                                return t;
-                            }
-                            if let Some(t) = new_liveboxes.get(&b) {
-                                if tagged_eq(t, UNASSIGNED)
-                                    && let Some(&num) = self.cached_boxes.get(&b)
-                                {
-                                    return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
-                                }
-                                if tagged_eq(t, UNASSIGNEDVIRTUAL)
-                                    && let Some(&num) = self.cached_virtuals.get(&b)
-                                {
-                                    return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
-                                }
-                                return t;
-                            }
-                            UNASSIGNED
-                        })
-                        .collect();
+                    let mut fieldnums: Vec<i16> = Vec::with_capacity(vf.field_oprefs.len());
+                    for &opref in &vf.field_oprefs {
+                        fieldnums.push(self._gettagged(
+                            opref,
+                            env,
+                            &numb_state.liveboxes,
+                            new_liveboxes,
+                        )?);
+                    }
                     let reused = env.virtual_info_would_be_reused(opref_id, &fieldnums);
                     // resume.py: vinfo = self.make_virtual_info(info, fieldnums)
                     if let Some(rd_virt) = env.make_virtual_info(opref_id, fieldnums) {
@@ -3687,7 +3688,7 @@ impl ResumeDataLoopMemo {
                 }
             }
         }
-        (rd_virtuals, nholes)
+        Ok((rd_virtuals, nholes))
     }
 
     /// resume.py `_add_pending_fields(pending_setfields)`.
@@ -3704,14 +3705,15 @@ impl ResumeDataLoopMemo {
         env: &dyn majit_ir::BoxEnv,
         liveboxes_from_env: &LiveboxMap,
         new_liveboxes: &LiveboxMap,
-    ) {
+    ) -> Result<(), TagOverflow> {
         for pf in pending_setfields.iter_mut() {
             let target = env.get_box_replacement(pf.target);
             let value = env.get_box_replacement(pf.value);
             // resume.py num = self._gettagged(box); fieldnum = self._gettagged(fieldbox)
-            pf.target_tagged = self._gettagged(target, env, liveboxes_from_env, new_liveboxes);
-            pf.value_tagged = self._gettagged(value, env, liveboxes_from_env, new_liveboxes);
+            pf.target_tagged = self._gettagged(target, env, liveboxes_from_env, new_liveboxes)?;
+            pf.value_tagged = self._gettagged(value, env, liveboxes_from_env, new_liveboxes)?;
         }
+        Ok(())
     }
 
     /// resume.py `_add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)`.
@@ -3738,7 +3740,7 @@ impl ResumeDataLoopMemo {
         new_liveboxes: &LiveboxMap,
         env: &dyn majit_ir::BoxEnv,
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
-    ) {
+    ) -> Result<(), TagOverflow> {
         // resume.py:572-574: serialize_optimizer_knowledge(
         //     self.optimizer, numb_state, liveboxes, liveboxes_from_env, self.memo)
         crate::optimizeopt::bridgeopt::serialize_optimizer_knowledge(
@@ -3748,7 +3750,7 @@ impl ResumeDataLoopMemo {
             new_liveboxes,
             env,
             optimizer_knowledge,
-        );
+        )
     }
 
     /// resume.py `_invalidation_needed(nliveboxes, nholes)`.
@@ -3779,15 +3781,17 @@ impl ResumeDataLoopMemo {
 
     /// resume.py _gettagged — resolve an OpRef to its tagged number.
     /// Looks up in liveboxes_from_env first, then new_liveboxes, then constant.
+    ///
+    /// Only the constant arm can fail, and it fails the way `getconst` does.
     pub(crate) fn _gettagged(
         &mut self,
         opref: majit_ir::OpRef,
         env: &dyn majit_ir::BoxEnv,
         liveboxes_from_env: &LiveboxMap,
         new_liveboxes: &LiveboxMap,
-    ) -> i16 {
+    ) -> Result<i16, TagOverflow> {
         if opref.is_none() {
-            return UNINITIALIZED_TAG;
+            return Ok(UNINITIALIZED_TAG);
         }
         // resume.py: isinstance(box, Const) → getconst
         if env.is_const(opref) {
@@ -3799,23 +3803,23 @@ impl ResumeDataLoopMemo {
         let b = env.get_box_replacement_operand(opref);
         // resume.py: liveboxes_from_env → existing tag
         if let Some(tagged) = liveboxes_from_env.get(&b) {
-            return tagged;
+            return Ok(tagged);
         }
         if let Some(tagged) = new_liveboxes.get(&b) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED)
                 && let Some(&num) = self.cached_boxes.get(&b)
             {
-                return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
+                return Ok(tag(num, TAGBOX).unwrap_or(UNASSIGNED));
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL)
                 && let Some(&num) = self.cached_virtuals.get(&b)
             {
-                return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
+                return Ok(tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL));
             }
-            return tagged;
+            return Ok(tagged);
         }
-        UNASSIGNED
+        Ok(UNASSIGNED)
     }
 
     /// `ResumeDataLoopMemo._number_boxes` tags each box in a snapshot section.
@@ -3843,7 +3847,7 @@ impl ResumeDataLoopMemo {
             // resume.py: isinstance(box, Const) → getconst
             if env.is_const(opref) {
                 let (val, tp) = env.get_const(opref);
-                let tagged = self.getconst(val, tp);
+                let tagged = self.getconst(val, tp)?;
                 numb_state.append_short(tagged);
                 continue;
             }
@@ -4037,13 +4041,16 @@ impl ResumeDataLoopMemo {
         env: &dyn majit_ir::BoxEnv,
         pending_setfields: &mut [majit_ir::GuardPendingFieldEntry],
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
-    ) -> (
-        Vec<u8>,
-        Vec<majit_ir::Const>,
-        Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
-        Vec<majit_ir::OpRef>,
-        LiveboxTypeMap,
-    ) {
+    ) -> Result<
+        (
+            Vec<u8>,
+            Vec<majit_ir::Const>,
+            Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+            Vec<majit_ir::OpRef>,
+            LiveboxTypeMap,
+        ),
+        TagOverflow,
+    > {
         let num_env_virtuals = numb_state.num_virtuals;
 
         // resume.py: split liveboxes_from_env into TAGBOX/TAGVIRTUAL
@@ -4218,7 +4225,7 @@ impl ResumeDataLoopMemo {
             num_env_virtuals as usize,
             &numb_state,
             env,
-        );
+        )?;
 
         // resume.py: if self._invalidation_needed(...): memo.clear_box_virtual_numbers()
         if self._invalidation_needed(liveboxes.len(), nholes) {
@@ -4231,7 +4238,7 @@ impl ResumeDataLoopMemo {
             env,
             &numb_state.liveboxes,
             &new_liveboxes,
-        );
+        )?;
 
         // resume.py:447: numb_state.patch(1, len(liveboxes))
         numb_state.writer.patch(1, liveboxes.len() as i32);
@@ -4243,7 +4250,7 @@ impl ResumeDataLoopMemo {
             &new_liveboxes,
             env,
             optimizer_knowledge,
-        );
+        )?;
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         let rd_numb = numb_state.create_numbering();
@@ -4305,13 +4312,13 @@ impl ResumeDataLoopMemo {
                 all_livebox_types.insert(opref, env.get_type(opref));
             }
         }
-        (
+        Ok((
             rd_numb,
             rd_consts,
             rd_virtuals,
             ordered_liveboxes,
             all_livebox_types,
-        )
+        ))
     }
 
     /// resume.py finish (on ResumeDataVirtualAdder) — encode with shared pool.
@@ -5106,7 +5113,7 @@ mod tests {
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
-            memo.finish(numb_state, &env, &mut [], None);
+            memo.finish(numb_state, &env, &mut [], None).unwrap();
 
         // liveboxes should contain only TAGBOX entries: OpRef::int_op(1) and OpRef::int_op(3)
         assert_eq!(liveboxes.len(), 2);
@@ -5596,6 +5603,41 @@ mod tests {
             rd_virtual_field_source(UNASSIGNEDVIRTUAL),
             ResumeValueSource::Unavailable
         );
+    }
+
+    /// The TAGCONST field is 14 signed bits, so pool index 8192 is the first
+    /// one it cannot name. Minting through `tag` makes that index an error;
+    /// the shift-and-cast it replaced produced `-8192`, a tag that reads back
+    /// as a *different* pool slot with no diagnostic anywhere.
+    #[test]
+    fn a_const_pool_past_the_tag_field_gives_up_instead_of_wrapping() {
+        let mut memo = ResumeDataLoopMemo::new();
+        // Floats never take the inline encoding, so each one is a pool entry.
+        for i in 0..8192 {
+            let tagged = memo
+                .getconst_float(i as i64)
+                .expect("index 0..8191 fits the 14-bit field");
+            assert_eq!(untag(tagged), (i, TAGCONST));
+        }
+        assert_eq!(memo.consts().len(), 8192);
+
+        // The whole getconst family gives up once the pool is full, and none
+        // of them leaves a half-written entry behind: `newconst` mints the
+        // tag before it pushes.
+        assert!(memo.getconst_float(0).is_err());
+        assert!(memo.getconst_ref(0x1234).is_err());
+        assert!(memo.getconst_int(1 << 40).is_err());
+        assert!(
+            memo.getconst(2.5f64.to_bits() as i64, majit_ir::Type::Float)
+                .is_err()
+        );
+        assert_eq!(memo.consts().len(), 8192);
+
+        // A wrapped tag would have been silently accepted: it stays in i16
+        // range and untags to a live pool slot that holds someone else's
+        // constant.
+        let wrapped = ((8192i32 << 2) | TAGCONST as i32) as i16;
+        assert_eq!(untag(wrapped), (-8192, TAGCONST));
     }
 }
 

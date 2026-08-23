@@ -32,7 +32,7 @@ pub fn tag_box(
     memo: &mut crate::resume::ResumeDataLoopMemo,
     env: &dyn majit_ir::BoxEnv,
     new_liveboxes: &crate::resume::LiveboxMap,
-) -> i16 {
+) -> Result<i16, crate::resume::TagOverflow> {
     memo._gettagged(opref, env, liveboxes_from_env, new_liveboxes)
 }
 
@@ -68,7 +68,7 @@ pub fn serialize_optimizer_knowledge(
     new_liveboxes: &crate::resume::LiveboxMap,
     env: &dyn majit_ir::BoxEnv,
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
-) {
+) -> Result<(), crate::resume::TagOverflow> {
     // bridgeopt.py `available_boxes = {}` followed by
     // `available_boxes[box] = None` — RPython uses a dict as a
     // membership set (values are always None). Pyre uses a Vec scanned
@@ -151,7 +151,7 @@ pub fn serialize_optimizer_knowledge(
         numb_state.append_int(0); // struct fields count
         numb_state.append_int(0); // array items count
         numb_state.append_int(0); // loopinvariant count
-        return;
+        return Ok(());
     };
     // bridgeopt.py:93: triples_struct = optimizer.optheap.serialize_optheap(available_boxes)
     let filtered_fields: Vec<(OpRef, i32, OpRef)> = knowledge
@@ -166,10 +166,10 @@ pub fn serialize_optimizer_knowledge(
         .collect();
     numb_state.append_int(filtered_fields.len() as i64);
     for (obj, descr_idx, val) in &filtered_fields {
-        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes);
+        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         numb_state.append_int(*descr_idx as i64);
-        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes);
+        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
     // bridgeopt.py:102-108: array items
@@ -185,7 +185,7 @@ pub fn serialize_optimizer_knowledge(
         .collect();
     numb_state.append_int(filtered_arrayitems.len() as i64);
     for (obj, index, descr_idx, val) in &filtered_arrayitems {
-        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes);
+        let obj_tag = tag_box(*obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
         // index unchanged; resumecode.py:90-93 enforces SHORT range on the
@@ -193,7 +193,7 @@ pub fn serialize_optimizer_knowledge(
         // index into an i32.
         numb_state.append_int(*index);
         numb_state.append_int(*descr_idx as i64);
-        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes);
+        let val_tag = tag_box(*val, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(val_tag as i32);
     }
 
@@ -206,11 +206,12 @@ pub fn serialize_optimizer_knowledge(
         .collect();
     numb_state.append_int(filtered_loopinvariant.len() as i64);
     for (const_ptr, result) in &filtered_loopinvariant {
-        let const_tag = memo.getconst_int(*const_ptr);
+        let const_tag = memo.getconst_int(*const_ptr)?;
         numb_state.writer.append_short(const_tag as i32);
-        let result_tag = tag_box(*result, &numb_state.liveboxes, memo, env, new_liveboxes);
+        let result_tag = tag_box(*result, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(result_tag as i32);
     }
+    Ok(())
 }
 
 /// `frontend_boxes`: runtime values from guard failure (RPython Box objects
