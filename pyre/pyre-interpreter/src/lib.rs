@@ -291,7 +291,6 @@ macro_rules! py_module {
         $(, int_constants: { $($int_key:literal => $int_value:expr),* $(,)? })?
         $(, exceptions: { $($exc_key:literal => $exc_base:expr),* $(,)? })?
         $(, appleveldefs: { $($appfile:literal => [ $($appname:literal),* $(,)? ]),* $(,)? })?
-        $(, lib_appleveldefs: { $($libfile:literal => [ $($libname:literal),* $(,)? ]),* $(,)? })?
         $(, inline_app: { $($inline_src:literal => [ $($inline_name:literal),* $(,)? ]),* $(,)? })?
         $(, inline_functions: {
             $(
@@ -349,21 +348,6 @@ macro_rules! py_module {
                     include_str!($appfile),
                     $appfile,
                     &[ $( $appname ),* ],
-                );
-            )*)?
-            // lib_appleveldefs: installed the same way, for a source PyPy
-            // ships as a `lib_pypy` module reached by import rather than as a
-            // mixed module's app-level half.  Those frames are part of the
-            // program upstream, so they stay visible — see
-            // `importing::AppleveldefFrames`.
-            $($(
-                $crate::importing::appleveldef_install_with_frames(
-                    ns,
-                    include_str!($libfile),
-                    $libfile,
-                    &[ $( $libname ),* ],
-                    &[],
-                    $crate::importing::AppleveldefFrames::Visible,
                 );
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —

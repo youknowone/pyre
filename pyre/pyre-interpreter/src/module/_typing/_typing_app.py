@@ -19,10 +19,13 @@ from types import GenericAlias, UnionType as Union
 
 
 def _caller_module():
-    # Equivalent to sys._getframe(2).f_globals['__name__']: frame 0 is this
-    # helper, frame 1 the constructor, frame 2 the user that called it.
+    # `typevarobject.c caller()` reads `__name__` out of the globals of the
+    # frame that is running, and the constructor calling it is native, so the
+    # frame it finds is the user's.  The frames of this module are not the
+    # program's either -- `sys._getframe` counts along a walk that steps over
+    # them -- so depth 0 names that same frame however deep the helper sits.
     try:
-        return sys._getframe(2).f_globals.get('__name__')
+        return sys._getframe(0).f_globals.get('__name__')
     except (AttributeError, ValueError):
         return None
 

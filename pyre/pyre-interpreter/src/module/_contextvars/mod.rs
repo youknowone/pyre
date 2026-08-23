@@ -489,16 +489,12 @@ crate::py_module! {
     extra_init: |ns| {
         let context_var = crate::module_ns_get(ns, "ContextVar")
             .expect("_contextvars.ContextVar must be installed first");
-        // `lib_pypy/_contextvars.py` is an ordinary module upstream, so its
-        // frames are the program's.  Only `Context.run` is hidden there, by
-        // its own `@hidden_applevel` decorator, which the source below keeps.
-        crate::importing::appleveldef_install_with_frames(
+        crate::importing::appleveldef_install_seeded(
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
             &["Context"],
             &[("ContextVar", context_var)],
-            crate::importing::AppleveldefFrames::Visible,
         );
         let context = crate::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
