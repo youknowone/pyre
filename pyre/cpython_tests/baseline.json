@@ -1205,7 +1205,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_traceback": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_tracemalloc": {
       "dynasm": "IMPORTERROR"
@@ -1346,7 +1346,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_warnings": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_wave": {
       "dynasm": "PASS"
