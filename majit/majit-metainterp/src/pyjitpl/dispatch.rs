@@ -5091,8 +5091,14 @@ where
                 };
                 let (src, src_value) = self.read_int_reg(src_idx);
                 let cond_value = if src_value == 0 { 1 } else { 0 };
-                let cond = ctx.record_op(OpCode::IntIsZero, &[src]);
-                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
+                let cond = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    OpCode::IntIsZero,
+                    None,
+                    &[src],
+                    Some(majit_ir::Value::Int(cond_value)),
+                    self.last_exception_value,
+                );
                 let guard = if cond_value == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -5244,8 +5250,26 @@ where
                 } else {
                     for &key in descr.switch_const_keys_in_order() {
                         let key_ref = ctx.const_int(key);
-                        let cond = ctx.record_op(OpCode::IntEq, &[value_box, key_ref]);
-                        ctx.set_opref_concrete(cond, majit_ir::Value::Int(0));
+                        // `SwitchDictDescr.attach` builds `const_keys_in_order`
+                        // as `sorted(dict.keys())`, so a `switch_lookup` miss
+                        // means no key equals the switched value. Evaluate the
+                        // comparison rather than assume that: the funnel folds
+                        // this value into the trace when `value_box` is
+                        // constant, and a constant that disagrees with the
+                        // guard beside it is a miscompile with no diagnostic.
+                        let cond_value = (concrete_value == key) as i64;
+                        debug_assert_eq!(
+                            cond_value, 0,
+                            "BC_SWITCH miss chain: key {key} equals the switched value",
+                        );
+                        let cond = ctx.execute_and_record(
+                            self.cpu.as_ref(),
+                            OpCode::IntEq,
+                            None,
+                            &[value_box, key_ref],
+                            Some(majit_ir::Value::Int(cond_value)),
+                            self.last_exception_value,
+                        );
                         self.record_state_guard(
                             ctx,
                             sym,
@@ -13189,6 +13213,72 @@ mod tests {
         );
         assert!(recorded.contains(&OpCode::ConvertFloatBytesToLonglong));
         assert!(recorded.contains(&OpCode::ConvertLonglongBytesToFloat));
+    }
+
+    #[test]
+    fn goto_if_not_int_is_zero_folds_a_constant_source() {
+        // The fused compare folds and `record_state_guard`'s Const gate then
+        // drops the guard too, so both ops disappear.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 5);
+        builder.goto_if_not_int_is_zero(0, target);
+        builder.mark_label(target);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::IntIsZero));
+        assert!(!folded.contains(&OpCode::GuardFalse));
+
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_zero(0, target);
+        builder.mark_label(target);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 5)],
+        );
+        assert!(recorded.contains(&OpCode::IntIsZero));
+        assert!(recorded.contains(&OpCode::GuardFalse));
+    }
+
+    #[test]
+    fn switch_miss_chain_folds_a_constant_switched_value() {
+        // One IntEq + one GuardFalse per key on the miss path; a constant
+        // switched value collapses the whole chain to nothing.
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        builder.load_const_i_value(0, 99);
+        builder.switch(0, &[(-3, case_a), (7, case_b)]);
+        builder.mark_label(case_a);
+        builder.mark_label(case_b);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::IntEq));
+        assert!(!folded.contains(&OpCode::GuardFalse));
+
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        builder.switch(0, &[(-3, case_a), (7, case_b)]);
+        builder.mark_label(case_a);
+        builder.mark_label(case_b);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 99)],
+        );
+        assert_eq!(
+            recorded.iter().filter(|&&o| o == OpCode::IntEq).count(),
+            2,
+            "one comparison per switch key",
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|&&o| o == OpCode::GuardFalse)
+                .count(),
+            2,
+        );
     }
 
     fn switch_return_jitcode() -> JitCode {
