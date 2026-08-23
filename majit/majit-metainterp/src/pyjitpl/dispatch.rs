@@ -9271,8 +9271,14 @@ where
             OpCode::PtrNe | OpCode::InstancePtrNe => (lhs_value != rhs_value) as i64,
             other => panic!("trace_binop_r_to_i: unsupported opcode {other:?}"),
         };
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9298,8 +9304,14 @@ where
         } else {
             (src_value == 0) as i64
         };
-        let opref = ctx.record_op(opcode, &[src, null]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[src, null],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9317,8 +9329,14 @@ where
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_binop_f(opcode, lhs_value, rhs_value);
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(value));
     }
 
@@ -9336,8 +9354,14 @@ where
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_float_cmp(opcode, lhs_value, rhs_value);
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9352,8 +9376,14 @@ where
         };
         let (src, src_value) = self.read_float_reg(src_idx);
         let value = eval_unary_f(opcode, src_value);
-        let opref = ctx.record_op(opcode, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            opcode,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(value));
     }
 
@@ -9369,8 +9399,14 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let fvalue = src_value as f64;
-        let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            OpCode::CastIntToFloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(fvalue)),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
     }
 
@@ -9391,8 +9427,14 @@ where
         };
         let (src, bits) = self.read_float_reg(src_idx);
         let ivalue = f64::from_bits(bits as u64) as i64;
-        let opref = ctx.record_op(OpCode::CastFloatToInt, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(ivalue));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            OpCode::CastFloatToInt,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(ivalue)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(ivalue));
     }
 
@@ -9407,8 +9449,14 @@ where
             (src_idx, dst)
         };
         let (src, bits) = self.read_float_reg(src_idx);
-        let opref = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(bits));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            OpCode::ConvertFloatBytesToLonglong,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(bits)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(bits));
     }
 
@@ -9422,8 +9470,14 @@ where
             (src_idx, dst)
         };
         let (src, bits) = self.read_int_reg(src_idx);
-        let opref = ctx.record_op(OpCode::ConvertLonglongBytesToFloat, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+        let opref = ctx.execute_and_record(
+            self.cpu.as_ref(),
+            OpCode::ConvertLonglongBytesToFloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(f64::from_bits(bits as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(bits));
     }
 }
@@ -12900,6 +12954,241 @@ mod tests {
                 .any(|op| op.opcode == OpCode::GuardFalse),
             "non-constant false branch must guard on the comparison",
         );
+    }
+
+    /// Opcodes the tracer recorded for `jitcode`, run from pc 0 with
+    /// `argboxes` bound as the frame's arguments.
+    ///
+    /// The always-pure arms below each need the same two runs — every operand
+    /// a `load_const_*` (the funnel's `_all_constants` holds, so the op folds
+    /// and nothing is recorded) and every operand an input arg (it does not,
+    /// so the op is recorded) — and differ only in the jitcode.
+    fn traced_opcodes(
+        types: &[majit_ir::Type],
+        jitcode: &JitCode,
+        argboxes: &[(JitArgKind, OpRef, i64)],
+    ) -> Vec<OpCode> {
+        let mut ctx = TraceCtx::for_test_types(types);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, jitcode, 0, |_pc| 0, argboxes);
+        assert!(matches!(action, TraceAction::Continue));
+        ctx.into_recorder()
+            .ops()
+            .iter()
+            .map(|op| op.opcode)
+            .collect()
+    }
+
+    #[test]
+    fn ptr_compare_folds_two_constant_refs() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0x30);
+        builder.load_const_r_value(1, 0x40);
+        builder.record_binop_r(2, OpCode::PtrEq, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::PtrEq));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_binop_r(2, OpCode::PtrEq, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            &builder.finish(),
+            &[
+                (JitArgKind::Ref, OpRef::input_arg_ref(0), 0x30),
+                (JitArgKind::Ref, OpRef::input_arg_ref(1), 0x40),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::PtrEq));
+    }
+
+    #[test]
+    fn ptr_nullity_folds_a_constant_ref() {
+        // The `CONST_NULL` operand is constant by construction, so the fold
+        // turns on the source alone.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0x30);
+        builder.ptr_nonzero(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::PtrNe));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.ptr_nonzero(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x30)],
+        );
+        assert!(recorded.contains(&OpCode::PtrNe));
+    }
+
+    #[test]
+    fn float_binop_folds_two_constant_floats() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.load_const_f_value(1, 2.5f64.to_bits() as i64);
+        builder.record_binop_f(2, OpCode::FloatAdd, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatAdd));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_binop_f(2, OpCode::FloatAdd, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float, majit_ir::Type::Float],
+            &builder.finish(),
+            &[
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(0),
+                    1.5f64.to_bits() as i64,
+                ),
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(1),
+                    2.5f64.to_bits() as i64,
+                ),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::FloatAdd));
+    }
+
+    #[test]
+    fn float_truediv_by_zero_records_instead_of_folding() {
+        // `execute_binary_float_const_row` declines this operand pair, and a
+        // decline records — the tracer and the optimizer then agree about
+        // what is constant.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.0f64.to_bits() as i64);
+        builder.load_const_f_value(1, 0.0f64.to_bits() as i64);
+        builder.record_binop_f(2, OpCode::FloatTrueDiv, 0, 1);
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::FloatTrueDiv));
+    }
+
+    #[test]
+    fn float_compare_folds_two_constant_floats() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.load_const_f_value(1, 2.5f64.to_bits() as i64);
+        builder.record_compare_f(2, OpCode::FloatLt, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatLt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_compare_f(2, OpCode::FloatLt, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float, majit_ir::Type::Float],
+            &builder.finish(),
+            &[
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(0),
+                    1.5f64.to_bits() as i64,
+                ),
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(1),
+                    2.5f64.to_bits() as i64,
+                ),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::FloatLt));
+    }
+
+    #[test]
+    fn float_unary_folds_a_constant_float() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, (-1.5f64).to_bits() as i64);
+        builder.record_unary_f(1, OpCode::FloatAbs, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatAbs));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_unary_f(1, OpCode::FloatAbs, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                (-1.5f64).to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::FloatAbs));
+    }
+
+    #[test]
+    fn cast_int_to_float_folds_a_constant_int() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 7);
+        builder.record_cast_int_to_float(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastIntToFloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_int_to_float(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+        );
+        assert!(recorded.contains(&OpCode::CastIntToFloat));
+    }
+
+    #[test]
+    fn cast_float_to_int_folds_in_range_and_records_out_of_range() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 7.5f64.to_bits() as i64);
+        builder.record_cast_float_to_int(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastFloatToInt));
+
+        // `execute_cast_const_row` declines a non-finite source rather than
+        // freeze the runtime's saturation as a constant.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, f64::INFINITY.to_bits() as i64);
+        builder.record_cast_float_to_int(1, 0);
+        let declined = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(declined.contains(&OpCode::CastFloatToInt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_float_to_int(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                7.5f64.to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::CastFloatToInt));
+    }
+
+    #[test]
+    fn float_bits_conversions_fold_a_constant_operand() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.record_convert_float_bytes_to_longlong(1, 0);
+        builder.load_const_i_value(2, 1.5f64.to_bits() as i64);
+        builder.record_convert_longlong_bytes_to_float(3, 2);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::ConvertFloatBytesToLonglong));
+        assert!(!folded.contains(&OpCode::ConvertLonglongBytesToFloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_convert_float_bytes_to_longlong(1, 0);
+        builder.record_convert_longlong_bytes_to_float(2, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                1.5f64.to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::ConvertFloatBytesToLonglong));
+        assert!(recorded.contains(&OpCode::ConvertLonglongBytesToFloat));
     }
 
     fn switch_return_jitcode() -> JitCode {
