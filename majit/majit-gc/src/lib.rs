@@ -3125,6 +3125,12 @@ pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_set_c_edge_census(census));
 }
 
+/// Register the [`rawrefcount::FinalizerClaimFn`] the collector claims a dying
+/// block's finalizer through.  Upstream has no counterpart; see the type.
+pub fn gc_rawrefcount_set_finalizer_claim(claim: rawrefcount::FinalizerClaimFn) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_set_finalizer_claim(claim));
+}
+
 /// `rawrefcount.py:create_link_pypy` — `pyobject` is a mirror of `obj`, and
 /// `obj` owns it: the mirror lives as long as the interpreter object does, plus
 /// as long afterwards as the C side still holds a reference.
@@ -3177,6 +3183,11 @@ pub fn gc_rawrefcount_to_obj(pyobject: usize) -> GcRef {
 /// 0 when the queue is empty.
 pub fn gc_rawrefcount_next_dead() -> usize {
     gc_sync::gc_op(|gc| gc.rawrefcount_next_dead())
+}
+
+/// The next mirror whose finalizer the drain owes a call, or zero.
+pub fn gc_rawrefcount_next_finalize() -> usize {
+    gc_sync::gc_op(|gc| gc.rawrefcount_next_finalize())
 }
 
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress

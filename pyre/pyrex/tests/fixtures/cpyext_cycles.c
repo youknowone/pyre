@@ -76,6 +76,86 @@ static PyTypeObject NodeType = {
     .tp_new = node_new,
 };
 
+/* A block whose finalizer hands its own fields back to the interpreter, which
+   is the shape `ffi.gc` has: the destructor is a callable the block holds, and
+   it is called with the object the block was built around.  Both are reachable
+   from nothing else, so the finalizer can only run while what the block
+   references is still there. */
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *destructor;
+    PyObject *payload;
+} Doomed;
+
+static PyObject *doomed_new(PyTypeObject *tp, PyObject *args, PyObject *kwds)
+{
+    PyObject *destructor;
+    PyObject *payload;
+    (void)kwds;
+    if (!PyArg_ParseTuple(args, "OO", &destructor, &payload)) {
+        return NULL;
+    }
+    Doomed *self = (Doomed *)tp->tp_alloc(tp, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->destructor = Py_NewRef(destructor);
+    self->payload = Py_NewRef(payload);
+    return (PyObject *)self;
+}
+
+static int doomed_traverse(PyObject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(((Doomed *)self)->destructor);
+    Py_VISIT(((Doomed *)self)->payload);
+    return 0;
+}
+
+static void doomed_finalize(PyObject *self)
+{
+    Doomed *doomed = (Doomed *)self;
+    PyObject *destructor = doomed->destructor;
+    PyObject *payload = doomed->payload;
+    doomed->destructor = NULL;
+    doomed->payload = NULL;
+    if (destructor != NULL) {
+        PyObject *result = PyObject_CallFunctionObjArgs(destructor, payload, NULL);
+        if (result == NULL) {
+            PyErr_WriteUnraisable(destructor);
+        }
+        else {
+            Py_DECREF(result);
+        }
+        Py_DECREF(destructor);
+    }
+    Py_XDECREF(payload);
+}
+
+static void doomed_dealloc(PyObject *self)
+{
+    PyObject_GC_UnTrack(self);
+    /* Answers non-zero when the finalizer handed `self` out, and zero once it
+       has run -- including when it already ran before the block reached here. */
+    if (PyObject_CallFinalizerFromDealloc(self) < 0) {
+        return;
+    }
+    Py_XDECREF(((Doomed *)self)->destructor);
+    Py_XDECREF(((Doomed *)self)->payload);
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyTypeObject DoomedType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "cpyext_cycles.Doomed",
+    .tp_basicsize = sizeof(Doomed),
+    .tp_dealloc = doomed_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_traverse = doomed_traverse,
+    .tp_new = doomed_new,
+    .tp_finalize = doomed_finalize,
+};
+
 /* An external root no traversal can discover, so whatever it names has to
    survive however the rest of the graph looks. */
 static PyObject *pinned = NULL;
@@ -175,6 +255,9 @@ PyMODINIT_FUNC PyInit_cpyext_cycles(void)
     if (PyType_Ready(&NodeType) < 0) {
         return NULL;
     }
+    if (PyType_Ready(&DoomedType) < 0) {
+        return NULL;
+    }
     PyObject *m = PyModule_Create(&module);
     if (m == NULL) {
         return NULL;
@@ -182,6 +265,12 @@ PyMODINIT_FUNC PyInit_cpyext_cycles(void)
     Py_INCREF(&NodeType);
     if (PyModule_AddObject(m, "Node", (PyObject *)&NodeType) < 0) {
         Py_DECREF(&NodeType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    Py_INCREF(&DoomedType);
+    if (PyModule_AddObject(m, "Doomed", (PyObject *)&DoomedType) < 0) {
+        Py_DECREF(&DoomedType);
         Py_DECREF(m);
         return NULL;
     }

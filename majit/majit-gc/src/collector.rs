@@ -2794,6 +2794,11 @@ impl MiniMarkGC {
             if self.rrc_trace_c_edges_young() {
                 continue;
             }
+            // A mirror whose object died may have a finalizer to run first,
+            // and it runs after this collection: its object comes out too.
+            if self.rrc_claim_finalizers_young() {
+                continue;
+            }
             break;
         }
 
@@ -3052,6 +3057,11 @@ impl MiniMarkGC {
         self.rrc.c_edge_census = Some(census);
     }
 
+    /// Register the [`rawrefcount::FinalizerClaimFn`].
+    pub fn rawrefcount_set_finalizer_claim(&mut self, claim: rawrefcount::FinalizerClaimFn) {
+        self.rrc.finalizer_claim = Some(claim);
+    }
+
     /// Take this collection's edges from the embedder and count, per mirror,
     /// how many of its references the reporting blocks supply.
     ///
@@ -3145,6 +3155,82 @@ impl MiniMarkGC {
         marked
     }
 
+    /// Whether this mirror's object has to outlive the collection: its
+    /// finalizer is claimed here, or was claimed by an earlier collection whose
+    /// drain has not run yet.
+    ///
+    /// The second case is what keeps the retention for as long as it is owed.
+    /// The drain is an action the embedder runs between bytecodes, and a second
+    /// collection can reach here before it has: freeing the block there would
+    /// leave the queue naming one whose references are already gone.
+    fn rrc_owes_finalizer(&mut self, pyobject: usize) -> bool {
+        if self.rrc.finalize_pending.contains(&pyobject) {
+            return true;
+        }
+        let Some(claim) = self.rrc.finalizer_claim else {
+            return false;
+        };
+        if !claim(pyobject) {
+            return false;
+        }
+        self.rrc.finalize_pending.push_back(pyobject);
+        true
+    }
+
+    /// Claim the finalizer of every mirror this collection has found dead, and
+    /// keep its object alive until the drain has run it.
+    ///
+    /// `gcmodule.c:finalize_garbage` runs before `delete_garbage` for the same
+    /// reason this runs before the free pass: a finalizer reads the object it
+    /// is handed, and the fields of the block it belongs to still reference
+    /// what they referenced.  Marking the object here is what keeps both --
+    /// [`Self::mark_c_edges`] re-grants the block's own references once its
+    /// object is known to live, so the caller re-enters the fixed point and the
+    /// whole of what the finalizer will reach comes with it.
+    ///
+    /// The free pass below then reads the mirror as surviving, which defers it
+    /// by one collection rather than freeing it under the finalizer's feet.
+    /// Every mirror whose object is dying is asked, not only the ones whose
+    /// block the free pass would bring to zero: a block the C side still holds
+    /// a reference to is deallocated later, and its finalizer reads the same
+    /// fields whenever that is.
+    /// [`rawrefcount::FinalizerClaimFn`] answers only once per block, so the
+    /// next collection to find the object dead frees it.
+    ///
+    /// Returns how many objects this marked, which is what makes the caller
+    /// re-enter the fixed point.
+    fn rrc_claim_finalizers(&mut self) -> usize {
+        if self.rrc.finalizer_claim.is_none() {
+            return 0;
+        }
+        let mut marked = 0usize;
+        for which in [RrcList::P, RrcList::O] {
+            let list = match which {
+                RrcList::P => std::mem::take(&mut self.rrc.p_list_old),
+                RrcList::O => std::mem::take(&mut self.rrc.o_list_old),
+            };
+            for &pyobject in &list {
+                let obj = Self::rrc_linked_object(pyobject);
+                if obj == 0
+                    || self.rrc_object_marked(obj)
+                    || !self.rrc_owes_finalizer(pyobject)
+                {
+                    continue;
+                }
+                self.seed_major_root(GcRef(obj), "rrc_finalizer");
+                while let Some(addr) = self.incr_state.gray_stack.pop() {
+                    self.mark_object(addr);
+                    marked += 1;
+                }
+            }
+            match which {
+                RrcList::P => self.rrc.p_list_old = list,
+                RrcList::O => self.rrc.o_list_old = list,
+            }
+        }
+        marked
+    }
+
     /// Whether a minor has decided `obj` lives.
     ///
     /// Only a nursery object can die here, and it is exactly
@@ -3203,6 +3289,42 @@ impl MiniMarkGC {
             }
         }
         self.rrc.c_edges = edges;
+        dragged
+    }
+
+    /// [`Self::rrc_claim_finalizers`] for a minor: keep the nursery object of a
+    /// mirror whose finalizer has yet to run out of this collection's reach.
+    ///
+    /// Returns whether anything was dragged out, which the caller turns into
+    /// the fixed point by re-entering the walk that traces what this reached.
+    fn rrc_claim_finalizers_young(&mut self) -> bool {
+        if self.rrc.finalizer_claim.is_none() {
+            return false;
+        }
+        let mut dragged = false;
+        for which in [RrcList::P, RrcList::O] {
+            let list = match which {
+                RrcList::P => std::mem::take(&mut self.rrc.p_list_young),
+                RrcList::O => std::mem::take(&mut self.rrc.o_list_young),
+            };
+            for &pyobject in &list {
+                let obj = Self::rrc_linked_object(pyobject);
+                if obj == 0
+                    || self.rrc_young_object_alive(obj)
+                    || !self.is_nursery_object_start(obj)
+                    || !self.rrc_owes_finalizer(pyobject)
+                {
+                    continue;
+                }
+                let mut root = GcRef(obj);
+                self.drag_out_root(&mut root);
+                dragged = true;
+            }
+            match which {
+                RrcList::P => self.rrc.p_list_young = list,
+                RrcList::O => self.rrc.o_list_young = list,
+            }
+        }
         dragged
     }
 
@@ -3272,6 +3394,18 @@ impl MiniMarkGC {
         unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
     }
 
+    /// The next mirror whose finalizer the drain owes a call, or zero.
+    ///
+    /// [`Self::rrc_claim_finalizers`] filled the queue and kept each object
+    /// alive for it; the block itself is freed by a later collection.
+    pub fn rawrefcount_next_finalize(&mut self) -> usize {
+        if self.rrc.enabled {
+            self.rrc.finalize_pending.pop_front().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
     /// incminimark.py `rawrefcount_next_dead`.  Zero when the queue
     /// is empty.
     pub fn rawrefcount_next_dead(&mut self) -> usize {
@@ -3289,7 +3423,9 @@ impl MiniMarkGC {
     /// the callback may only schedule the drain, not perform it.
     fn rrc_invoke_callback(&mut self) {
         if self.rrc.enabled
-            && (!self.rrc.dealloc_pending.is_empty() || self.rrc.c_garbage)
+            && (!self.rrc.dealloc_pending.is_empty()
+                || !self.rrc.finalize_pending.is_empty()
+                || self.rrc.c_garbage)
             && let Some(trigger) = self.rrc.dealloc_trigger
         {
             self.rrc.c_garbage = false;
@@ -5794,6 +5930,11 @@ impl MiniMarkGC {
             }
         }
         self.mark_conditional_edges_to_fixed_point();
+        // Before anything reads VISITED to decide what dies, and after the
+        // fixed point has settled which mirrors those are.
+        if self.rrc.enabled && self.rrc_claim_finalizers() > 0 {
+            self.mark_conditional_edges_to_fixed_point();
+        }
         // incminimark.py:2492: this counter belongs to one finalization-order
         // pass.  `_bump_finalization_state_from_0_to_1` below repopulates it
         // with every otherwise-dead object retained for a finalizer.

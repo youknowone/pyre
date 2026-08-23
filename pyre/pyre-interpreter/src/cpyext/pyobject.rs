@@ -672,9 +672,21 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
 /// mirror can decref others, which is why the queue is re-read every iteration
 /// rather than drained into a list.
 pub fn drain_dead() {
-    // First, because a block the collector could not bring to zero is one the
-    // queue never names: its remaining references are a cycle's, and breaking
-    // them is what lets the deallocators below run at all.
+    // `gcmodule.c:delete_garbage` is preceded by `finalize_garbage`, and for
+    // the same reason: a finalizer is handed the object it belongs to, and
+    // reads the fields of its block.  The collection that queued these kept
+    // both alive for exactly this call.
+    loop {
+        let raw = majit_gc::gc_rawrefcount_next_finalize() as *mut CPyObject;
+        if raw.is_null() {
+            break;
+        }
+        super::gc::run_claimed_finalizer(raw);
+    }
+    // Before the deallocators, because a block the collector could not bring to
+    // zero is one the queue never names: its remaining references are a
+    // cycle's, and breaking them is what lets the deallocators below run at
+    // all.
     super::gc::clear_garbage();
     loop {
         let raw = majit_gc::gc_rawrefcount_next_dead() as *mut CPyObject;
@@ -934,6 +946,7 @@ pub(super) unsafe fn resize_cached_bytes(
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
     majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
+    majit_gc::gc_rawrefcount_set_finalizer_claim(super::gc::claim_finalizer);
 }
 
 /// Fired from inside a collection, so it may only schedule.

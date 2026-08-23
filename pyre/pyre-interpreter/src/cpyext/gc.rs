@@ -65,6 +65,48 @@ pub(super) fn forget_finalized(raw: usize) {
     FINALIZED.lock().remove(&raw);
 }
 
+/// Claim the finalizer of a block whose linked object the collector has just
+/// found dead — [`majit_gc::rawrefcount::FinalizerClaimFn`].
+///
+/// `gcmodule.c finalize_garbage` sets the finalized flag and then calls, and
+/// this is the first half of that: the call itself happens in the drain, once
+/// the collection that kept the object alive for it has finished. Answering
+/// `true` is therefore a promise the drain has to keep, which is why the flag
+/// goes on here rather than there — a second collection finding the same object
+/// dead must not claim it again.
+///
+/// Runs with the collector borrowed. Only the block's type and the set above
+/// are read; neither is an interpreter object.
+pub(super) fn claim_finalizer(raw: usize) -> bool {
+    let block = raw as *mut CPyObject;
+    let tp = unsafe { (*block).ob_type };
+    if !has_gc(tp) || unsafe { (*tp).tp_finalize }.is_null() {
+        return false;
+    }
+    FINALIZED.lock().insert(raw)
+}
+
+/// Run the finalizer [`claim_finalizer`] promised.
+///
+/// The flag it set is what `PyObject_CallFinalizer` would read to refuse a
+/// second call, so the slot is called directly. The reference held over the
+/// call is `finalize_garbage`'s: a finalizer may hand `self` out, and what it
+/// hands out has to outlive the call.
+pub(super) fn run_claimed_finalizer(raw: *mut CPyObject) {
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    let slot = unsafe { (*tp).tp_finalize };
+    if slot.is_null() {
+        return;
+    }
+    let finalize: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(slot) };
+    unsafe { super::pyobject::incref(raw) };
+    unsafe { finalize(raw) };
+    unsafe { super::pyobject::decref(raw) };
+}
+
 /// `true` when `tp` declares the cyclic-collection protocol.
 pub(super) fn has_gc(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HAVE_GC != 0
