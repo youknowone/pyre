@@ -72,6 +72,9 @@ def store_then_read_proxy(rounds):
 
 
 def write_through_caller_proxy(rounds):
+    # Second control: this one agrees either way because `setter` builds a
+    # fresh proxy per iteration, so the getter's own force fires every time.
+    # What the arms above need is a proxy that OUTLIVES that force.
     def setter(value):
         sys._getframe(1).f_locals["x"] = value
 
