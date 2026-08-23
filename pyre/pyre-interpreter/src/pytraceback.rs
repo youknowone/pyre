@@ -57,12 +57,14 @@ use pyre_object::pyobject::*;
 /// app-level visible through the fourth constructor argument and `-1` is the
 /// one 3.14 measures it against: `tb_lineno_get` resolves on
 /// `if (lineno == -1)`, and `_PyTraceBack_FromFrame` records a node with
-/// `tb_create_raw(..., -1)`.  Upstream's comment explains its own choice —
-/// negative line numbers are settable there, so it took the most negative
-/// value to keep a written line number from colliding with the sentinel — and
-/// 3.14 answered the same worry by making `tb_lineno` read-only instead.  Pyre
-/// keeps the setter, so a written `-1` re-resolves here where 3.14 would raise
-/// `AttributeError`; every value 3.14 can actually produce reads the same.
+/// `tb_create_raw(..., -1)`.
+///
+/// Upstream's comment explains its own choice — negative line numbers are
+/// settable there, so it took the most negative value to keep a written line
+/// number from colliding with the sentinel.  3.14 answered the same worry by
+/// making `tb_lineno` read-only, and `init_pytraceback_type` follows it, so a
+/// line number can only arrive through the constructor and the collision
+/// upstream guarded against has no path here either.
 pub const LINENO_NOT_COMPUTED: i64 = -1;
 
 pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
@@ -244,13 +246,6 @@ pub unsafe fn w_pytraceback_get_lasti(obj: PyObjectRef) -> i64 {
 /// # Safety
 /// `obj` must point to a valid `PyTraceback`.
 #[inline]
-pub unsafe fn w_pytraceback_set_lasti(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut PyTraceback)).lasti = value }
-}
-
-/// # Safety
-/// `obj` must point to a valid `PyTraceback`.
-#[inline]
 pub unsafe fn w_pytraceback_get_w_next(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_next }
 }
@@ -293,13 +288,6 @@ pub unsafe fn w_pytraceback_get_lineno_raw(obj: PyObjectRef) -> i64 {
 /// # Safety
 /// `obj` must point to a valid `PyTraceback`.
 #[inline]
-pub unsafe fn w_pytraceback_set_lineno(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut PyTraceback)).lineno = value }
-}
-
-/// # Safety
-/// `obj` must point to a valid `PyTraceback`.
-#[inline]
 pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_code }
 }
@@ -335,9 +323,9 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// `record_application_traceback` still stamps the line eagerly, so a recorded
 /// node reaches the first branch and never resolves here.  That timing is not
-/// observable against 3.14: `tb_lasti` and `tb_lineno` are both read-only
-/// there, so the only way to hand a live node a sentinel is the constructor,
-/// which lands in the second branch either way.
+/// observable: `tb_lasti` and `tb_lineno` are read-only, so the only way to
+/// hand a live node a sentinel is the constructor, which lands in the second
+/// branch either way.
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
@@ -534,7 +522,7 @@ mod tests {
 
     /// A node carrying no code object cannot resolve, which is the
     /// `Py_RETURN_NONE` arm; a stamped line is handed back as it is, including
-    /// the negative values `descr_set_tb_lineno` accepts.
+    /// the negative values the constructor accepts.
     #[test]
     fn an_unresolvable_node_answers_none_and_a_stamped_line_answers_itself() {
         unsafe {

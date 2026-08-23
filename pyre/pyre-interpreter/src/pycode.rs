@@ -2899,6 +2899,12 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// return _PyCode_CheckLineNumber(addrq, &bounds);
 /// ```
 ///
+/// `location.py offset2lineno(c, stopat)` is the same resolver upstream, down
+/// to the byte-offset convention: it answers `c.co_firstlineno` for `-1` and
+/// halves `stopat` before walking the line table.  `pyframe::offset2lineno`
+/// carries the name but takes an instruction index, so this is the one a
+/// `tb_lasti` reaches.
+///
 /// `addrq` counts bytes, two per instruction, so the row index is `addrq / 2`
 /// — the same conversion `traceback._get_code_position` makes app-level.  A
 /// negative offset names the code object's first line, which is the answer for

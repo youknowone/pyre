@@ -2441,8 +2441,8 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         // this fold would have to pin — so the slot value is the getter's value
         // only once it is pinned against the sentinel.  A node that already
         // carries the sentinel — built from a frame with no `pycode`, or handed
-        // it through `TracebackType(..., -1)` or the `tb_lineno` setter — has
-        // nothing to pin, so decline before recording anything.
+        // it through `TracebackType(..., -1)` — has nothing to pin, so decline
+        // before recording anything.
         if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
             return Ok(None);
         }
