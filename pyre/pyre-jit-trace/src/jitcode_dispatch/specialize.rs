@@ -8847,6 +8847,22 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     if !std::ptr::eq(w_locals, frame_ref.get_w_locals()) {
         return Ok(None);
     }
+    // `f_extra_locals` is the OTHER half of what the residual reports.  A
+    // proxy write whose key names no writable fast local lands there
+    // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, and
+    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals — so
+    // the mapping this fold rebuilds from slots alone would silently drop the
+    // key.  Decline while the frame carries any, read through the same shadow
+    // payload for the same reason `w_locals` is, and pin the null direction
+    // with a guard below so a write mid-loop side-exits instead.
+    let w_extra_locals = if shadow_debugdata.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { (*shadow_debugdata).w_extra_locals }
+    };
+    if !w_extra_locals.is_null() || !frame_ref.get_extra_locals().is_null() {
+        return Ok(None);
+    }
     // Two shapes, each pinned by a guard so the compiled loop side-exits when
     // the frame moves to the other one:
     //
@@ -9048,6 +9064,17 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[op_ref])?;
         }
         field_op = Some(op_ref);
+        // `d.w_extra_locals` — the gate above required it absent, so the loop
+        // side-exits the moment an `f_locals` write puts a non-fast key there
+        // rather than going on publishing a mapping without it.
+        let extra_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            debugdata_op,
+            crate::descr::frame_debug_data_w_extra_locals_descr(),
+        );
+        if !extra_op.is_constant() {
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[extra_op])?;
+        }
     }
     let mut dict_op = match field_op.filter(|_| frame_owned) {
         Some(op_ref) => op_ref,
@@ -9230,8 +9257,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// inactive strict fold or unseeded frame register, a top frame that is not
 /// this level's own, a shadow describing another code object, a non-OPTIMIZED
 /// frame, cellvars / freevars / `CO_FAST_HIDDEN` slots, a frame wider than
-/// [`MAX_MODELLED_FASTLOCALS`], a frame that already carries a locals mapping,
-/// and a written slot the shadow cannot resolve back to a Ref.
+/// [`MAX_MODELLED_FASTLOCALS`], a frame that already carries a locals mapping
+/// or an `f_extra_locals` dict, and a written slot the shadow cannot resolve
+/// back to a Ref.
 fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9295,6 +9323,17 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // this level's frame is rebuilt from scratch by the compiled trace when it
     // is built at all, so that shape has no counterpart here and declines.
     if !frame_ref.get_w_locals().is_null() {
+        return Ok(None);
+    }
+    // A null `w_locals` is NOT on its own a fresh mapping.  A proxy write
+    // whose key names no writable fast local goes to `f_extra_locals`
+    // (`framelocalsproxy_setitem`) and leaves `w_locals` null, and
+    // `frame_locals_proxy_snapshot` copies that dict into every mapping it
+    // hands back — so rebuilding from the shadow's slots alone would drop the
+    // key.  Read the LIVE callee frame, which is the only holder: this level's
+    // frame is built by the compiled trace, so its payload starts empty every
+    // iteration and only a residual on the recorded path can have filled it.
+    if !frame_ref.get_extra_locals().is_null() {
         return Ok(None);
     }
     // Collect each slot's shadow entry first, so a slot the shadow cannot

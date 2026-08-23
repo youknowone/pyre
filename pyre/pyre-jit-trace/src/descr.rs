@@ -2447,15 +2447,26 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
         pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
         0,
         0,
-        &[(
-            "w_locals",
-            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
-            std::mem::size_of::<usize>(),
-            Type::Ref,
-            false,
-            false,
-            false,
-        )],
+        &[
+            (
+                "w_locals",
+                pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_extra_locals",
+                pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "FrameDebugData",
         "pyframe::FrameDebugData",
     )
@@ -4149,6 +4160,15 @@ pub fn rbigint_pair_item1_descr() -> DescrRef {
 /// reads at the head of `fast2locals` (pyframe.py).
 pub fn frame_debug_data_w_locals_descr() -> DescrRef {
     field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
+}
+
+/// `FrameDebugData.w_extra_locals` — the dict `framelocalsproxy_setitem`
+/// allocates for a key that names no writable fast local.  `fast2locals` never
+/// touches it, but `frame_locals_proxy_snapshot` copies it into every mapping
+/// `locals()` / `vars()` / `dir()` hand back, so a fold that rebuilds that
+/// mapping from fastlocals alone has to see it.
+pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
+    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 1)
 }
 
 /// `len(bytes)` returns the byte count.  `bytesobject.py` reads it as

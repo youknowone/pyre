@@ -1774,6 +1774,10 @@ impl Default for FrameDebugData {
 /// Byte offset of `w_locals` in `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_W_LOCALS_OFFSET: usize = std::mem::offset_of!(FrameDebugData, w_locals);
 
+/// Byte offset of `w_extra_locals` in `FrameDebugData`.
+pub const FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET: usize =
+    std::mem::offset_of!(FrameDebugData, w_extra_locals);
+
 /// Allocated size of a `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_SIZE: usize = std::mem::size_of::<FrameDebugData>();
 
@@ -2863,7 +2867,7 @@ impl PyFrame {
     }
 
     #[inline]
-    fn get_extra_locals(&self) -> PyObjectRef {
+    pub fn get_extra_locals(&self) -> PyObjectRef {
         self.getdebug_data()
             .map_or(pyre_object::PY_NULL, |data| data.w_extra_locals)
     }
