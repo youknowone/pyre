@@ -29,6 +29,28 @@ fn main() {
             _ => {}
         }
     }
+    embed_windows_manifest(&target);
+}
+
+/// Embed `python.manifest` in the Windows executables, the way
+/// `rpython/translator/platform/windows.py` links `pypy/goal/python.manifest`
+/// with `/MANIFEST:EMBED /MANIFESTINPUT:`.
+///
+/// Its `longPathAware` setting is the one that carries weight here: without a
+/// manifest the Win32 layer applies the MAX_PATH limit before the wide call
+/// behind it runs, so `open()` on a 270-character name reports ENOENT while the
+/// same name spelled `\\?\...` opens.
+fn embed_windows_manifest(target: &str) {
+    if target != "windows" || std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("python.manifest");
+    println!("cargo::rerun-if-changed={}", manifest.display());
+    println!("cargo::rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!(
+        "cargo::rustc-link-arg-bins=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
 }
 
 /// Every `#[unsafe(no_mangle)]` item the cpyext layer defines.
