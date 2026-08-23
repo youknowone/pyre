@@ -526,11 +526,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("EAI_SERVICE", libc::EAI_SERVICE);
         cst!("EAI_SOCKTYPE", libc::EAI_SOCKTYPE);
         cst!("EAI_SYSTEM", libc::EAI_SYSTEM);
-        // EAI_ADDRFAMILY / EAI_BADHINTS / EAI_PROTOCOL / EAI_MAX exist
-        // on macOS at the system-header level but the libc crate does
-        // not export them; PyPy filters them out via
-        // `platform.DefinedConstantInteger` on platforms where they are
-        // absent, so we mirror that and skip.
+        // `_rsocket_rffi.py` names these four alongside the rest and
+        // `platform.DefinedConstantInteger` keeps whichever the platform's
+        // `<netdb.h>` defines.  Darwin defines all four; the libc crate does
+        // not re-export them, so they are spelled out here the way
+        // `NI_MAXSERV` above is.
+        #[cfg(target_vendor = "apple")]
+        {
+            cst!("EAI_ADDRFAMILY", 1);
+            cst!("EAI_BADHINTS", 12);
+            cst!("EAI_PROTOCOL", 13);
+            cst!("EAI_MAX", 15);
+        }
         // ── SCM_* (ancillary data types) ──
         cst!("SCM_RIGHTS", libc::SCM_RIGHTS);
         #[cfg(any(target_os = "linux", target_os = "android"))]
