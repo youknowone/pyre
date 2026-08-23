@@ -86,6 +86,44 @@ pub mod frame_locals_proxy {
             unsafe { &mut *(self.w_frame as *mut PyFrame) }
         }
 
+        /// Materialize the viewed frame's `locals_cells_stack_w`.
+        ///
+        /// `rvirtualizable.py hook_access_field` puts the force at the field
+        /// access.  The `f_locals` getter forces once, when it builds the
+        /// proxy, and a proxy is a live view that outlives that force: bind
+        /// one before a loop the JIT afterwards compiles and a write through
+        /// it lands in the frame array while the compiled loop still answers
+        /// the same local from its shadow.
+        ///
+        /// The `vable_token` test is `virtualizable.py`'s, and it is required
+        /// rather than a shortcut:
+        ///
+        /// ```text
+        /// def force_virtualizable_if_necessary(virtualizable):
+        ///     if virtualizable.vable_token:
+        ///         force_now(virtualizable)
+        /// ```
+        ///
+        /// The backend hook behind `force_frame` signals a frame escape before
+        /// it tests any token, and a proxy write reached while this frame is
+        /// being traced holds no token.  Calling it there raises an escape with
+        /// no committed resume pc, so the walk replays from entry and
+        /// double-applies the residual's body effects; measured, that aborts
+        /// the loop and leaves a name string where the operand stack expects
+        /// its iterator.  The token is set only once compiled code owns the
+        /// frame, which is exactly when the write has a shadow to reach.
+        fn force_locals(&self) {
+            let frame = self.w_frame as *mut PyFrame;
+            if unsafe { (*frame).vable_token } == 0 {
+                return;
+            }
+            // The force materializes through a backend hook this crate cannot
+            // follow and is judged as able to collect, so the frame is
+            // anchored across it.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+            crate::executioncontext::force_frame_before_locals_read(anchor.live());
+        }
+
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
             self.frame().frame_locals_proxy_snapshot()
@@ -182,6 +220,9 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             value: PyObjectRef,
         ) -> Result<(), crate::PyError> {
+            // The write below targets `locals_cells_stack_w`, so materialize it
+            // first — outside the roots region, per `force_locals`.
+            self.force_locals();
             // `fast_local_index` compares against a freshly allocated string
             // per local and `get_or_create_extra_locals` allocates the dict, so
             // both stores below would otherwise write pre-allocation copies.
