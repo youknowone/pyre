@@ -2561,7 +2561,15 @@ fn socket_apply_timeout(fd: rffi::Socket, timeout: f64) -> Result<(), crate::PyE
 fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, crate::PyError> {
     let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
     if rffi::is_invalid(fd) {
-        return Err(crate::PyError::os_error("Bad file descriptor"));
+        // `close` leaves `self.fd = INVALID_SOCKET` (`rsocket.py RSocket.close`)
+        // and the operations run the syscall on it anyway, so what a closed
+        // socket reports is the kernel's `EBADF` in its `(errno, strerror)`
+        // form.  This check stands in for that call and owes the same error —
+        // callers read `.errno` to tell a closed socket from a failed one.
+        return Err(crate::PyError::os_error_syscall(
+            libc::EBADF,
+            pyre_object::PY_NULL,
+        ));
     }
     Ok(fd)
 }
