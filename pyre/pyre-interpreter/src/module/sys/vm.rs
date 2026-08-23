@@ -2757,12 +2757,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // sys.exc_clear — no-op
-    module_ns_store(
-        ns,
-        "exc_clear",
-        make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
-    );
     module_ns_store(
         ns,
         "call_tracing",
