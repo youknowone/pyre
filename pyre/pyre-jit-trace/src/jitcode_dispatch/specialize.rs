@@ -181,7 +181,19 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
         return Ok(None);
     };
     let val = unsafe {
-        if !pyre_object::is_int(obj) || pyre_object::is_bool(obj) {
+        // `is_int` reads `ob_type`, which an `int` subclass shares, so it alone
+        // admits one here.  Two things then go wrong at once: the walk folds the
+        // truth straight off the payload instead of running the subclass's
+        // `__bool__`, and `walker_numeric_builtin_class` answers with the
+        // canonical `int` — a `w_class` the recorded operand does not carry, so
+        // the pin below becomes a guard that fails on the very value that
+        // recorded it.  Decline before unboxing, as `walker_unary_int_operand`
+        // does; `walker_numeric_builtin_class` documents this gate as its
+        // precondition.
+        if !pyre_object::is_int(obj)
+            || pyre_object::is_bool(obj)
+            || !pyre_object::is_exact_builtin_instance(obj)
+        {
             return Ok(None);
         }
         pyre_object::w_int_get_value(obj)
@@ -3898,11 +3910,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     } {
         match unbox_type {
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-                // `type(w_value) is space.IntObjectCls` (mapdict.py): reject bool
-                // and every type-changing value before emitting any guards.
-                if unsafe {
-                    pyre_object::pyobject::is_bool(concrete_value)
-                        || !pyre_object::pyobject::is_int(concrete_value)
+                // Match mapdict.py `_direct_write` exactly, through the same
+                // predicate the interpreter's own store uses: `is_int` reads
+                // `ob_type`, which an `int` subclass shares, so unboxing on it
+                // would take the raw payload and lose `w_class`.
+                if !unsafe {
+                    pyre_interpreter::objspace::std::mapdict::is_unboxable_int(concrete_value)
                 } {
                     return Ok(None);
                 }
@@ -14234,8 +14247,16 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         if index as usize >= concrete_len {
             return Ok(None);
         }
+        // Object storage keeps the value boxed, so a subclass survives it; the
+        // unboxed strategies write the raw payload and would drop the subclass
+        // identity the read-back must return.  `is_int`/`is_float` read
+        // `ob_type`, which a subclass shares, so they alone do not establish
+        // that -- and `walker_numeric_builtin_class` below answers with the
+        // canonical class, which such a value does not carry.
         let sid = if pyre_object::w_list_uses_object_storage(list_obj) {
             0i64
+        } else if !pyre_object::is_exact_builtin_instance(value_obj) {
+            return Ok(None);
         } else if pyre_object::w_list_uses_int_storage(list_obj)
             && pyre_object::is_int(value_obj)
             && !pyre_object::is_bool(value_obj)

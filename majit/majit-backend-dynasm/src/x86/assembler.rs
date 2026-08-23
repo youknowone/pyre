@@ -1427,6 +1427,19 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// Emit: load a regalloc Loc into the dedicated scratch (R11), which is
+    /// outside `ALL_CORE_REGS`, so the load cannot clobber a value the
+    /// regalloc still has live in an allocatable register.  Counterpart of
+    /// the AArch64 `emit_load_loc_to_ip0`.
+    fn emit_load_loc_to_scratch(&mut self, loc: Loc) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        match loc {
+            // already there
+            Loc::Reg(r) if !r.is_xmm && r.value == scratch.value => {}
+            _ => self.regalloc_mov(&loc, &Loc::Reg(scratch)),
+        }
+    }
+
     /// Emit: load the value of `opref` into RCX (x64) / X1 (aarch64).
     fn load_arg_to_rcx(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
@@ -4234,7 +4247,7 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.genop_cond_call_value(op);
+                self.genop_cond_call_value(op, arglocs);
             }
             // ── Allocation (raw, when GC rewriter is not active) ──
             OpCode::New => self.genop_new(op),
@@ -7969,8 +7982,18 @@ impl<'a> Assembler386<'a> {
         if let Some(cc) = self.guard_success_cc.take() {
             self.emit_jcc_to_label(invert_cc(cc), skip_label);
         } else {
-            self.load_arg_to_rax(op.arg(0).to_opref());
-            dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
+            // Read the predicate from its regalloc location, not via
+            // `resolve_opref`: `consider_discard_nargs_j2` emits no
+            // `before_call`, so a predicate the regalloc left register-resident
+            // has no slot mapping and would panic there.  Test it in the
+            // scratch (R11) rather than rax, which IS allocatable here and may
+            // still hold one of the call's own arglocs.
+            self.emit_load_loc_to_scratch(arglocs[0]);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64
+                ; test Rq(scratch), Rq(scratch)
+                ; jz =>skip_label
+            );
         }
 
         // `consider_discard_nargs` emits no `before_call`, so the regalloc
@@ -7996,8 +8019,15 @@ impl<'a> Assembler386<'a> {
     }
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
-    fn genop_cond_call_value(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
+    ///
+    /// The predicate comes from its regalloc location for the same reason as
+    /// `genop_discard_cond_call`.  It is loaded into rax rather than the
+    /// scratch because on the not-taken path the predicate IS the result, and
+    /// `store_rax_to_result` reads it from there.  `consider_raw_call_like_j2`
+    /// runs `before_call` before computing arglocs, so no argloc is a
+    /// caller-saved register and this load cannot clobber one.
+    fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
+        self.emit_load_to_rax(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
 

@@ -3122,7 +3122,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.genop_cond_call_value(op);
+                self.genop_cond_call_value(op, arglocs);
             }
             // ── Allocation (raw, when GC rewriter is not active) ──
             OpCode::New => self.genop_new(op),
@@ -6651,8 +6651,14 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// COND_CALL_VALUE_I/R: if arg(0) == 0, call function; else result = arg(0).
-    fn genop_cond_call_value(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
+    ///
+    /// The predicate comes from its regalloc location, not `resolve_opref`,
+    /// which only recognises constants and frame slots — a predicate left
+    /// register-resident has no slot mapping.  It is loaded into x0 rather
+    /// than the ip0 scratch because on the not-taken path the predicate IS the
+    /// result, and `store_rax_to_result` reads it from there.
+    fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc]) {
+        self.emit_load_to_rax(arglocs[0]);
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
