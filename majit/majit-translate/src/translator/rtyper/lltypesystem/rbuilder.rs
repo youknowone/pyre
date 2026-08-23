@@ -6676,6 +6676,20 @@ impl Repr for UnicodeBuilderRepr {
                     )
                 }
             }
+            "append_slice" => {
+                let string_repr = crate::translator::rtyper::rstr::unicode_repr();
+                rtype_builder_append_slice(
+                    self,
+                    string_repr.as_ref(),
+                    hop,
+                    UNICODEBUILDERPTR.clone(),
+                    UNICODEPIECEPTR.clone(),
+                    UNICODEPIECE.clone(),
+                    UNICODEPTR.clone(),
+                    "mallocunicode",
+                    "copyunicodecontent",
+                )
+            }
             "build" => rtype_builder_build(
                 self,
                 hop,
@@ -8329,6 +8343,97 @@ mod tests {
             .unwrap_or_else(|err| panic!("rtype_method getlength: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         assert_single_direct_call_to(&llops, "ll_getlength");
+    }
+
+    /// UnicodeBuilder mirror of the StringBuilder `append_slice` surface: the
+    /// same shared `rtype_builder_append_slice` body, threaded with the UNICODE
+    /// pointer / piece lltypes and the `mallocunicode` malloc helper.
+    #[test]
+    fn unicodebuilder_rtype_method_append_slice_emits_direct_call() {
+        use super::{ConstValue, constant_with_lltype};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let v_builder = Variable::new();
+        v_builder.set_concretetype(Some(super::UNICODEBUILDERPTR.clone()));
+        let v_piece = Variable::new();
+        v_piece.set_concretetype(Some(super::UNICODEPTR.clone()));
+        let c_start = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+        let c_end = constant_with_lltype(ConstValue::Int(5), LowLevelType::Signed);
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "append_slice".to_string(),
+                vec![
+                    Hlvalue::Variable(v_builder.clone()),
+                    Hlvalue::Variable(v_piece.clone()),
+                    c_start,
+                    c_end,
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        {
+            let LowLevelType::Ptr(inner) = super::UNICODEBUILDERPTR.clone() else {
+                panic!("builder lltype must be a Ptr");
+            };
+            let mut s = hop.args_s.borrow_mut();
+            s.push(crate::annotator::model::SomeValue::Ptr(
+                crate::translator::rtyper::lltypesystem::lltype::SomePtr::new(*inner),
+            ));
+            s.push(crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+        }
+        {
+            let mut r = hop.args_r.borrow_mut();
+            r.push(Some(super::unicodebuilder_repr() as std::sync::Arc<dyn Repr>));
+            r.push(Some(
+                crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>
+            ));
+            r.push(None);
+            r.push(None);
+        }
+        let result = super::unicodebuilder_repr()
+            .rtype_method("append_slice", &hop)
+            .unwrap_or_else(|err| panic!("rtype_method append_slice: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_)) | None));
+        assert_single_direct_call_to(&llops, "ll_append_slice");
+
+        let graph_names: std::collections::HashSet<String> = _ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in [
+            "ll_append_slice",
+            "ll_append_res_slice",
+            "_ll_append",
+            "ll_grow_and_append",
+            "ll_grow_by",
+            "ll_copy_string_contents",
+            "mallocunicode",
+        ] {
+            assert!(
+                graph_names.contains(expected),
+                "append_slice helper tree missing `{expected}`; minted graphs = {graph_names:?}"
+            );
+        }
     }
 
     /// rbuilder.py mirror for UnicodeBuilderRepr.
