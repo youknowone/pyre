@@ -11473,10 +11473,10 @@ pub fn compile_err_to_syntax_error(
 ///
 /// CPython's tokenizer keeps byte offsets internally too, but
 /// ``_PyPegen_byte_offset_to_character_offset`` converts them before the
-/// exception is materialised.  RustPython's `SourceLocation` is deliberately
-/// built with `PositionEncoding::Utf8`, so its `character_offset` is still a
-/// byte column despite the field name.  Preserve the parser's selected line
-/// and span and port only that final conversion here.
+/// exception is materialised.  This is that conversion, for the spans this
+/// module locates itself by scanning `source`; a location the compiler reports
+/// for a parser diagnostic already counts characters and must not be passed
+/// through here.  The line and the span are the caller's to choose.
 fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize) -> usize {
     if lineno == 0 || byte_offset == 0 {
         return byte_offset;
@@ -11507,6 +11507,24 @@ fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
         .count()
         + 1;
     (lineno, byte_index - line_start + 1)
+}
+
+/// Byte index of the one-based character column a parser diagnostic reports,
+/// which is what indexes back into the source it was parsed from.  A column
+/// past the end of its line lands on the line's end.
+fn source_character_index(source: &str, lineno: usize, char_offset: usize) -> Option<usize> {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(lineno.checked_sub(1)?)
+        .map(str::len)
+        .sum::<usize>();
+    let line = source.get(line_start..)?.split('\n').next()?;
+    let column = char_offset.checked_sub(1)?;
+    let index = line
+        .char_indices()
+        .nth(column)
+        .map_or(line.len(), |(index, _)| index);
+    Some(line_start + index)
 }
 
 fn source_byte_index(source: &str, lineno: usize, byte_offset: usize) -> Option<usize> {
@@ -11570,8 +11588,8 @@ fn fstring_missing_comma_span(source: &str, raw_index: usize) -> Option<(usize, 
     }
     let (start_line, start_offset) = inner_error.python_location();
     let (end_line, end_offset) = inner_error.python_end_location()?;
-    let start = source_byte_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
-    let end = source_byte_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
+    let start = source_character_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
+    let end = source_character_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
     Some((open + 1 + start, open + 1 + end))
 }
 
@@ -12420,11 +12438,13 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         (e.python_location(), None)
     };
-    // Parser diagnostics are converted by pegen before exposure, while
-    // compiler/symtable diagnostics retain the UTF-8 byte columns used by AST
-    // locations (for example `return "ä"` ends at offset 12, not 11).
+    // A parser diagnostic arrives already counted in characters, and a
+    // compiler/symtable one retains the UTF-8 byte columns used by AST
+    // locations (for example `return "ä"` ends at offset 12, not 11).  Neither
+    // is converted here.  A span located above is a byte index into `source`
+    // whichever kind produced it, so only that one is.
     let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
-    let offset = if parser_error {
+    let offset = if parser_error && diagnostic_span.is_some() {
         syntax_error_character_offset(source, lineno, byte_offset)
     } else {
         byte_offset
@@ -12436,7 +12456,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
-        let end_offset = if parser_error && parser_end.is_some() {
+        let end_offset = if parser_error && diagnostic_end.is_some() {
             syntax_error_character_offset(source, end_lineno, end_byte_offset)
         } else {
             end_byte_offset
