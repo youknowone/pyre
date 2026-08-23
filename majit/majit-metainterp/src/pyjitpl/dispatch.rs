@@ -3969,9 +3969,9 @@ where
                 };
                 let (base_opref, base_addr) = self.read_int_reg(base_reg);
                 let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                let opref =
-                    ctx.record_op_with_descr(OpCode::RawLoadI, &[base_opref, ea_opref], descr);
-                // Concrete eval: descriptor-sized read at `base + ea`.
+                // Concrete eval: descriptor-sized read at `base + ea`. It runs
+                // before the record because `execute_and_record` takes the
+                // value rather than computing it.
                 //
                 // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
                 // (0 when the access would trap), so `base_addr + ea_value`
@@ -3994,6 +3994,21 @@ where
                         }
                     }
                 };
+                // `RawLoadI` is outside `is_pure_with_descr` at every descr —
+                // `test_raw_load_i_stays_non_pure_for_eval_breaker_poll` pins
+                // it there, because a pure raw load lets `optimize_guard_false`
+                // delete the back-edge eval-breaker poll — so the funnel always
+                // records. What it adds over a bare `record_op_with_descr` is
+                // the op counters and the concrete stamp every sibling read
+                // already carries.
+                let opref = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    OpCode::RawLoadI,
+                    Some(descr),
+                    &[base_opref, ea_opref],
+                    Some(Value::Int(concrete)),
+                    self.last_exception_value,
+                );
                 self.set_int_reg(dst, Some(opref), Some(concrete));
             }
             jitcode::insns::BC_RAW_LOAD_F => {
@@ -4022,8 +4037,6 @@ where
                 };
                 let (base_opref, base_addr) = self.read_int_reg(base_reg);
                 let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                let opref =
-                    ctx.record_op_with_descr(OpCode::RawLoadF, &[base_opref, ea_opref], descr);
                 // Concrete eval: an 8-byte f64 read at `base + ea`, carried as
                 // raw bits in the float bank (set_float_reg takes i64 bits).
                 //
@@ -4034,6 +4047,15 @@ where
                     8 => unsafe { core::ptr::read_unaligned(item_addr as *const i64) },
                     other => panic!("BC_RAW_LOAD_F: unsupported itemsize = {other}"),
                 };
+                // Never folds, for the reason given in the `BC_RAW_LOAD_I` arm.
+                let opref = ctx.execute_and_record(
+                    self.cpu.as_ref(),
+                    OpCode::RawLoadF,
+                    Some(descr),
+                    &[base_opref, ea_opref],
+                    Some(Value::Float(f64::from_bits(concrete_bits as u64))),
+                    self.last_exception_value,
+                );
                 self.set_float_reg(dst, Some(opref), Some(concrete_bits));
             }
             jitcode::insns::BC_GETFIELD_GC_I
@@ -13034,6 +13056,64 @@ mod tests {
             .iter()
             .map(|op| op.opcode)
             .collect()
+    }
+
+    /// `BC_RAW_LOAD_I` / `_F` advanced their register bank with the traced
+    /// concrete but left the recorded op unstamped — the one read family that
+    /// did. `RawLoad*` is outside `is_pure_with_descr` at every descr, so the
+    /// op is still recorded; only the stamp and the counters are new.
+    #[test]
+    fn a_raw_load_records_and_stamps_its_concrete() {
+        let ipayload: i64 = 0x0123_4567_89ab_cdef;
+        let fpayload: f64 = 1.5;
+
+        for (want_op, want_value, base, jitcode) in [
+            (
+                OpCode::RawLoadI,
+                Value::Int(ipayload),
+                &ipayload as *const i64 as i64,
+                {
+                    let mut b = JitCodeBuilder::new();
+                    let descr = b.add_raw_int_array_descr(8);
+                    b.raw_load_i(2, 0, 1, descr);
+                    b.finish()
+                },
+            ),
+            (
+                OpCode::RawLoadF,
+                Value::Float(fpayload),
+                &fpayload as *const f64 as i64,
+                {
+                    let mut b = JitCodeBuilder::new();
+                    let descr = b.add_raw_float_array_descr();
+                    b.raw_load_f(0, 0, 1, descr);
+                    b.finish()
+                },
+            ),
+        ] {
+            let mut ctx = TraceCtx::for_test_types(&[majit_ir::Type::Int, majit_ir::Type::Int]);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[
+                    (JitArgKind::Int, OpRef::input_arg_int(0), base),
+                    (JitArgKind::Int, OpRef::input_arg_int(1), 0),
+                ],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+
+            let recorder = ctx.into_recorder();
+            let op = recorder
+                .ops()
+                .iter()
+                .find(|op| op.opcode == want_op)
+                .unwrap_or_else(|| panic!("{want_op:?} must be recorded, never folded"));
+            assert_eq!(op.get_value(), Some(want_value), "{want_op:?}");
+        }
     }
 
     #[test]
