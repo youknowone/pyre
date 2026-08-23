@@ -10587,7 +10587,14 @@ impl CodeWriter {
                             let result = residual_call!(
                                 with_except_start_fn_idx,
                                 CallFlavor::MayForce,
-                                majit_ir::PyreHelperKind::None,
+                                // `exit_self` is NULL whenever `LOAD_SPECIAL`
+                                // resolved an already-bound `__exit__`, and
+                                // `with_except_start_values` reads that NULL as
+                                // "no receiver" instead of dereferencing it.
+                                // The tag is what tells the walker's may-force
+                                // NULL-ref gate so; without it every bridge out
+                                // of a `with` handler is refused.
+                                majit_ir::PyreHelperKind::WithExceptStart,
                                 vec![],
                                 vec![exit_func, exit_self, exc],
                                 vec![],

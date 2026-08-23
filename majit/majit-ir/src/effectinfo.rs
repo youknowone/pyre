@@ -1051,6 +1051,15 @@ pub enum PyreHelperKind {
     /// rejects.  `kwnames` (arg index 2) is the constant kwnames tuple and
     /// is always a live Ref.
     CallKw,
+    /// `bh_with_except_start_fn(exit_func, exit_self, val)` — the
+    /// WITH_EXCEPT_START residual.  `exit_self` (arg index 1) is a `PY_NULL`
+    /// sentinel the helper checks before use: `with_except_start_values`
+    /// prepends it as arg0 only when non-null, exactly as `LOAD_SPECIAL`
+    /// pushes an already-bound `__exit__` beside a NULL receiver slot.  A
+    /// concrete-NULL there is therefore the normal `with` shape — not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref gate
+    /// rejects.
+    WithExceptStart,
     /// `load_attr_fn(obj, code, name_idx)` — the plain (non-method) LOAD_ATTR
     /// residual (`lower_getattr_hlop_to_insn` → `space.getattr`).  The Ref
     /// operands are the receiver and the jitcode's own PyCode; the Int operand

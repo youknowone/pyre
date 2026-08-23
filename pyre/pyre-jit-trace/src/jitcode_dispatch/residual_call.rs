@@ -2254,6 +2254,13 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // `try_execute_residual_call_via_executor`.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // `bh_with_except_start_fn(exit_func, exit_self, val)` — `exit_self`
+    // (arg index 1) is a checked `PY_NULL` sentinel: `with_except_start_values`
+    // prepends it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL
+    // for every already-bound `__exit__`, which is the common `with` shape.
+    // Aborting on it refuses every bridge out of a `with` handler.
+    let is_with_except_start =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::WithExceptStart;
     // `bh_load_global_fn(namespace_ptr, w_code, frame, namei)` — `namespace_ptr`
     // (arg index 0) is never dereferenced.  The helper discards it and resolves
     // the namespace from the executing frame or the callee's own promoted
@@ -2284,6 +2291,9 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
             continue;
         }
         if is_store_deref && i == 1 {
+            continue;
+        }
+        if is_with_except_start && i == 1 {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -2810,6 +2820,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the region on top of the residuals the walk already ran concretely.
     let is_store_deref =
         call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
+    // Same `bh_with_except_start_fn` `exit_self` exemption as
+    // `walker_abort_if_mayforce_null_ref_arg`: arg index 1 is the checked
+    // `PY_NULL` receiver slot `LOAD_SPECIAL` pushes beside a bound `__exit__`.
+    let is_with_except_start =
+        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::WithExceptStart;
     // Same `bh_load_global_fn` `namespace_ptr` exemption as
     // `walker_abort_if_mayforce_null_ref_arg`: arg index 0 is discarded by the
     // helper, so a concrete NULL there is the normal nested-function shape.
@@ -2832,6 +2847,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if is_store_deref && i == 1 {
+            continue;
+        }
+        if is_with_except_start && i == 1 {
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
