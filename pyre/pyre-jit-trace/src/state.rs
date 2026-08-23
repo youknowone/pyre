@@ -15084,6 +15084,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
         }
         ctx.try_set_opref_concrete(opref, captured);
     }
+    // `recover_inline_callee_globals` reads the code object's published
+    // namespace, which is the one this frame shape answers with, so the
+    // disagreement arm is unreachable from here — it belongs to a future caller
+    // that resolves the namespace some other way.
     let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx,
         &locals_boxes,
@@ -15093,7 +15097,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         stack_base,
         pycode_const,
         w_globals_const,
-    );
+    )?;
     // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
     // `setup_call` + `raise ChangeFrame` — and `newframe` (`:2455-2476`)
     // builds an `MIFrame` and nothing else: upstream has no recording-time

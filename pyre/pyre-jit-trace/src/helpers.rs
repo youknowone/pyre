@@ -1548,6 +1548,14 @@ pub fn emit_box_float_inline(
 /// would have written; the class-level GC-pointer defaults listed at the end
 /// of the body are cleared by the GC rewriter, exactly as they are initialized
 /// in a frame the interpreter builds.
+///
+/// `None` when `w_globals` is not the namespace this frame would answer with:
+/// the emitted frame carries no `debugdata`, so `get_w_globals` on it reads the
+/// code object's published namespace (`pyframe.py get_w_globals`), and a callee
+/// running under a different dictionary needs the override
+/// `createframe_obj` allocates. Callers already decline a global-storing callee
+/// (`pycode.py frame_stores_global`) before they get here; this is the frame
+/// shape's own statement of what it can represent.
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
@@ -1556,8 +1564,11 @@ pub fn emit_new_pyframe_inline_with_params(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    _w_globals: OpRef,
-) -> OpRef {
+    w_globals: OpRef,
+) -> Option<OpRef> {
+    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
+        return None;
+    }
     use crate::descr::{
         pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
         pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
@@ -1661,17 +1672,46 @@ pub fn emit_new_pyframe_inline_with_params(
     // nothing and every reader goes through `get_builtin`, which answers
     // `space.builtin` for an unset slot.
 
-    new_frame
+    Some(new_frame)
 }
 
+/// Whether a `debugdata`-less frame for `pycode` answers `w_globals` from
+/// `get_w_globals`, i.e. whether the code object has published that very
+/// dictionary as its first namespace (`pycode.py frame_stores_global`).
+///
+/// Both operands are trace-time constants at every emission site. A namespace
+/// that is not constant, or a code object whose slot is still unpublished,
+/// leaves the question unanswered rather than answered `false`: the emission
+/// sites establish the invariant themselves, and this check is here to stop a
+/// later one that does not, not to close a shape that already works.
+fn inline_frame_answers_this_namespace(ctx: &TraceCtx, pycode: OpRef, w_globals: OpRef) -> bool {
+    let (Some(majit_ir::Value::Ref(code)), Some(majit_ir::Value::Ref(globals))) =
+        (ctx.box_value(pycode), ctx.box_value(w_globals))
+    else {
+        return true;
+    };
+    if code.as_usize() == 0 || globals.as_usize() == 0 {
+        return true;
+    }
+    let published = unsafe {
+        pyre_interpreter::w_code_get_w_globals(code.as_usize() as pyre_object::PyObjectRef)
+    };
+    published.is_null() || published as usize == globals.as_usize()
+}
+
+/// `None` on the same namespace disagreement as
+/// [`emit_new_pyframe_inline_with_params`], whose doc states the rule.
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
     arg_box: OpRef,
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    _w_globals: OpRef,
-) -> OpRef {
+    w_globals: OpRef,
+) -> Option<OpRef> {
+    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
+        return None;
+    }
     use crate::descr::{
         pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
         pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
@@ -1766,7 +1806,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // nothing and every reader goes through `get_builtin`, which answers
     // `space.builtin` for an unset slot.
 
-    new_frame
+    Some(new_frame)
 }
 
 // ── Elidable canary helper ──────────────────────────────────────────

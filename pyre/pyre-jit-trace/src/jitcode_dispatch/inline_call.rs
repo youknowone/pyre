@@ -1960,7 +1960,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // local, no cells, constant code / globals.
     let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
-    let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
+    // The `frame_stores_global` decline above is what makes this frame shape
+    // able to answer for `callee_globals_obj`; emission has already started, so
+    // a disagreement here is an aborted walk rather than a residual.
+    let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx.trace_ctx,
         &param_boxes,
         &[],
@@ -1969,7 +1972,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         nlocals,
         pycode_const,
         w_globals_obj_const,
-    );
+    ) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
 
     // `pyframe.py execute_frame`'s `ec.enter(self)`, which upstream records
     // ahead of the callee's `jit_merge_point` and this fold otherwise jumps
@@ -6085,7 +6090,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
             let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
-            let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
+            // Same pairing as the Branch A site: the `frame_stores_global`
+            // decline earlier in this walk is what lets a `debugdata`-less
+            // frame answer for `inline_consts.w_globals`.
+            let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
                 ctx.trace_ctx,
                 &param_boxes,
                 &freevar_cell_ops,
@@ -6094,7 +6102,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 nlocals + ncells,
                 pycode_const,
                 w_globals_obj_const,
-            );
+            ) else {
+                if try_multiframe {
+                    return resolved_inline_decline(op.pc, line!());
+                }
+                seed_break_reason = "Collapse::CalleeGlobalsNotPublished";
+                break 'seed;
+            };
 
             callee_regs_r[frame_reg as usize] = callee_frame;
             // `perform_call` creates one concrete frame per MIFrame before
