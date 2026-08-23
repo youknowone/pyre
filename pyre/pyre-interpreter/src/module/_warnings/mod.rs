@@ -615,14 +615,19 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
         return Ok(PY_NULL);
     }
     let source_slot = pin_root_slot(source);
+    // `interp_warnings.py:386` splits through the `str` type itself, so a `str`
+    // subclass that overrides `splitlines` does not get to decide what the line
+    // list is, and the descriptor's own receiver check rejects a `get_source`
+    // result that is not a `str` — the same type error `PyUnicode_Splitlines`
+    // reports for that input.
     let splitlines = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(source_slot),
+        crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
         "splitlines",
     )?;
     let splitlines_slot = pin_root_slot(splitlines);
     let lines = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(splitlines_slot),
-        &[],
+        &[pyre_object::gc_roots::shadow_stack_get(source_slot)],
     )?;
     let lines_slot = pin_root_slot(lines);
     match crate::baseobjspace::getitem(
