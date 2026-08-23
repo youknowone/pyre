@@ -9177,7 +9177,7 @@ impl SimpleBufferBytes {
         if let Err(mut error) = crate::builtins::memoryview_release(&[view]) {
             error.write_unraisable(
                 pyre_object::w_none(),
-                Wtf8::new("Exception ignored in __release_buffer__:"),
+                Wtf8::new("Exception ignored in __release_buffer__"),
                 view,
             );
         }
@@ -19175,11 +19175,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         if let Some(slot) = exc_slot {
             err.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
         }
-        err.write_unraisable(
-            w_none(),
-            &where_desc,
-            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-        );
+        err.write_unraisable(w_none(), &where_desc, w_none());
     }
 }
 

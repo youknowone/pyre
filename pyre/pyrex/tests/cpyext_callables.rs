@@ -131,6 +131,25 @@ eq('refused format states nothing', reports[3].err_msg, None)
 # Reporting clears the indicator, so nothing is pending afterwards.
 eq('nothing pending', m.probe('still working'), 'still working')
 
+# ── what the default report prints ─────────────────────────────────────
+
+import io
+
+printed = io.StringIO()
+stderr, sys.stderr = sys.stderr, printed
+try:
+    m.report_unraisable_msg()
+    m.report_unraisable(subject)
+finally:
+    sys.stderr = stderr
+
+lines = [line for line in printed.getvalue().splitlines()
+         if line.startswith('Exception ignored')]
+# A stated message ends the line it is on; an object named follows it there.
+eq('reported lines', lines,
+   ['Exception ignored while doing the thing:',
+    'Exception ignored in: %r' % (subject,)])
+
 # ── the runtime it is running against ──────────────────────────────────
 
 # A module-level function was declared with no class, so it carries none.

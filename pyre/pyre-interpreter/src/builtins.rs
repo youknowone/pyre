@@ -1907,7 +1907,7 @@ unsafe fn memoryview_call_python_release_unraisable(
                 w_none(),
                 rustpython_wtf8::Wtf8::new(
                     format!(
-                        "Exception ignored in __release_buffer__ of {}:",
+                        "Exception ignored in __release_buffer__ of {}",
                         crate::baseobjspace::object_functionstr_type_name(r_exporter)
                     )
                     .as_str(),

@@ -502,7 +502,16 @@ impl W_Profiler {
         {
             Ok(value) => value,
             Err(mut err) => {
-                err.write_unraisable(w_none(), Wtf8::new("timer function "), self.w_callable);
+                let repr = unsafe { crate::display::py_repr_wtf8(self.w_callable) }
+                    .unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
+                err.write_unraisable(
+                    w_none(),
+                    &crate::display::wtf8_format!(
+                        "Exception ignored while calling _lsprof timer ",
+                        repr
+                    ),
+                    w_none(),
+                );
                 0
             }
         }

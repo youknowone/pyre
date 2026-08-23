@@ -529,7 +529,7 @@ fn release_acquired(w_view: PyObjectRef) {
     if let Err(mut error) = crate::builtins::memoryview_release(&[w_view]) {
         error.write_unraisable(
             pyre_object::w_none(),
-            rustpython_wtf8::Wtf8::new("Exception ignored in __release_buffer__:"),
+            rustpython_wtf8::Wtf8::new("Exception ignored in __release_buffer__"),
             w_view,
         );
     }
