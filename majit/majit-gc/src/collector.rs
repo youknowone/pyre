@@ -3211,10 +3211,7 @@ impl MiniMarkGC {
             };
             for &pyobject in &list {
                 let obj = Self::rrc_linked_object(pyobject);
-                if obj == 0
-                    || self.rrc_object_marked(obj)
-                    || !self.rrc_owes_finalizer(pyobject)
-                {
+                if obj == 0 || self.rrc_object_marked(obj) || !self.rrc_owes_finalizer(pyobject) {
                     continue;
                 }
                 self.seed_major_root(GcRef(obj), "rrc_finalizer");

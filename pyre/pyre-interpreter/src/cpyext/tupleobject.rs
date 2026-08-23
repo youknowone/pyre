@@ -108,9 +108,8 @@ pub unsafe extern "C" fn _PyTuple_ITEMS(object: *mut CPyObject) -> *mut *mut CPy
                 // tuple is reached through the mirror's link, which the
                 // collector keeps current.
                 let w_tuple = unsafe { pyobject::from_ref(object) };
-                let item = unsafe {
-                    pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64)
-                };
+                let item =
+                    unsafe { pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64) };
                 match item {
                     Some(item) => pyobject::make_ref(item) as usize,
                     None => 0,

@@ -16235,7 +16235,11 @@ unsafe fn fileio_writebuf(
 
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj, false));
+            return Ok((
+                pyre_object::bytearrayobject::w_bytearray_data_mut(obj),
+                obj,
+                false,
+            ));
         }
         if pyre_object::interp_array::is_array(obj) {
             return Ok((

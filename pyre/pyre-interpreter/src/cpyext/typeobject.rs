@@ -295,8 +295,14 @@ const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, std::ffi::c_ulong);
         &pyre_object::bytesobject::BYTES_TYPE,
         PY_TPFLAGS_BYTES_SUBCLASS,
     ),
-    (&pyre_object::pyobject::STR_TYPE, PY_TPFLAGS_UNICODE_SUBCLASS),
-    (&pyre_object::pyobject::TUPLE_TYPE, PY_TPFLAGS_TUPLE_SUBCLASS),
+    (
+        &pyre_object::pyobject::STR_TYPE,
+        PY_TPFLAGS_UNICODE_SUBCLASS,
+    ),
+    (
+        &pyre_object::pyobject::TUPLE_TYPE,
+        PY_TPFLAGS_TUPLE_SUBCLASS,
+    ),
     (&pyre_object::pyobject::LIST_TYPE, PY_TPFLAGS_LIST_SUBCLASS),
     (&pyre_object::pyobject::DICT_TYPE, PY_TPFLAGS_DICT_SUBCLASS),
 ];

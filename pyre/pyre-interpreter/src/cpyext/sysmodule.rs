@@ -16,7 +16,9 @@ pub unsafe extern "C" fn PySys_GetObject(name: *const c_char) -> *mut CPyObject 
     if name.is_null() {
         return std::ptr::null_mut();
     }
-    let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    let name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
     let Some(module) = crate::importing::get_interpreter_sys_module() else {
         return std::ptr::null_mut();
     };
