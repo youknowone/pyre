@@ -12226,6 +12226,14 @@ impl<M: Clone> MetaInterp<M> {
             .filter(|token| token.has_compiled_code())
     }
 
+    /// [`Self::has_compiled_loop`] with both flag reads removed, for pricing
+    /// the refcount pair alone. See `WarmState::probe_cell_token_upgrades` --
+    /// a cost probe, never a decision.
+    #[cfg(feature = "yield-stage-probe")]
+    pub fn probe_cell_token_upgrades(&self, green_key: u64) -> bool {
+        self.warm_state.probe_cell_token_upgrades(green_key)
+    }
+
     /// `warmstate.py:458-464` — the same code-presence gate as
     /// [`Self::has_compiled_loop`], resolved on the full green key instead of
     /// on the bucket head.

@@ -25,6 +25,15 @@ back-edge-stage-probe = []
 # that repeats the frame build. See `pyjitpl::ExecuteStageRepeats`, which
 # says which numbers are amplified and which is single-shot.
 execute-stage-probe = ["majit-backend-cranelift?/execute-stage-probe"]
+# The third of the same family, for the sibling-door yield scan an embedder
+# runs ahead of a warm entry. That scan's predicate is a conjunction over three
+# state sources, and the public API fuses two of them: `has_compiled_loop` is
+# `entry_procedure_token(..).is_some()`, and `get_procedure_token` performs the
+# `Weak::upgrade` AND reads `is_invalidated` inside one function. This feature
+# adds the one reader that separates them -- the cell lookup and the upgrade
+# with NO flag read after it -- so an amplified arm can price the refcount pair
+# on its own. See `WarmState::probe_cell_token_upgrades`.
+yield-stage-probe = []
 
 [dependencies]
 majit-ir = { workspace = true }

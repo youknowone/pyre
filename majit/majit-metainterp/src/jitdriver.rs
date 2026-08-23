@@ -7347,6 +7347,17 @@ impl<S: JitState> JitDriver<S> {
         self.meta.has_compiled_loop(green_key)
     }
 
+    /// [`Self::has_compiled_loop`] with both flag reads removed, so an
+    /// amplified arm can price the cell lookup and the `Weak::upgrade`/drop
+    /// pair without them. A cost probe with a deliberately weaker answer than
+    /// the door's -- see `WarmState::probe_cell_token_upgrades`. Nothing may
+    /// route on it.
+    #[cfg(feature = "yield-stage-probe")]
+    #[inline]
+    pub fn probe_cell_token_upgrades(&self, green_key: u64) -> bool {
+        self.meta.probe_cell_token_upgrades(green_key)
+    }
+
     /// Whether the warm-entry runner can actually execute the code at this
     /// green key. Stronger than `has_compiled_loop`: it also requires a
     /// frontend `compiled_loops` meta (`get_compiled_meta`).

@@ -1483,6 +1483,28 @@ impl WarmEnterState {
             .and_then(|cell| cell.get_procedure_token())
     }
 
+    /// [`Self::get_procedure_token`] with the two flag reads taken OUT: the
+    /// cell lookup, the `Weak::upgrade`, and the drop of the `Arc` it
+    /// produced, and nothing else.
+    ///
+    /// A measurement reader with no production caller and no upstream
+    /// counterpart. It exists because the shipping predicate fuses two
+    /// separable costs into one function -- `get_procedure_token` performs the
+    /// refcount pair AND reads `invalidated` -- so no arm built from the public
+    /// API can say which of them a sibling-door scan is paying for. Differenced
+    /// against `has_compiled_loop`, this one leaves the flag reads.
+    ///
+    /// The answer is deliberately WEAKER than the shipping predicate's: an
+    /// invalidated token still upgrades, so this returns `true` where the door
+    /// would decide `false`. That is why it is a cost probe and never a
+    /// decision -- nothing may route on it.
+    #[cfg(feature = "yield-stage-probe")]
+    pub fn probe_cell_token_upgrades(&self, cell_key: u64) -> bool {
+        self.cell_by_key(cell_key)
+            .and_then(|cell| cell.loop_token.as_ref())
+            .is_some_and(|weak| weak.upgrade().is_some())
+    }
+
     /// `warmstate.py` — resolve the cell by `comparekey`, then read its
     /// procedure token.
     ///
