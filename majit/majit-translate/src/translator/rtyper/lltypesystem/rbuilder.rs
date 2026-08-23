@@ -8098,8 +8098,8 @@ mod tests {
     /// whole nested callee tree (res_slice + the shared `_ll_append` chain).
     #[test]
     fn stringbuilder_rtype_method_append_slice_emits_direct_call() {
-        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
         use super::{ConstValue, constant_with_lltype};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
         let (_ann, rtyper) = setup_rtyper();
         let llops = std::rc::Rc::new(std::cell::RefCell::new(
             crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
