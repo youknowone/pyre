@@ -8391,8 +8391,19 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
             }
-            if let Some(result) = unsafe { get(method, obj, w_type.as_ptr())? } {
-                return Ok(result);
+            match unsafe { get(method, obj, w_type.as_ptr()) } {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                // `_handle_getattribute` runs the hook for an AttributeError
+                // raised anywhere in `__getattribute__`, and a receiver with no
+                // instance dict is no exception -- an unset `__slots__` member
+                // raises exactly here.  A class shadowing an inherited method
+                // with a slot of the same name, so that `__getattr__` can
+                // install one on first read, is a receiver of that shape.
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                    return unsafe { instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e) };
+                }
+                Err(e) => return Err(e),
             }
             return Ok(method);
         }
