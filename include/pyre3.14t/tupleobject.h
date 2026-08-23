@@ -30,7 +30,7 @@ typedef struct {
 
 #define PyTuple_GET_SIZE(ob) Py_SIZE(ob)
 #define PyTuple_GET_ITEM(ob, i) (_PyTuple_ITEMS((PyObject *)(ob))[i])
-#define PyTuple_SET_ITEM(ob, i, v) ((void)PyTuple_SetItem((PyObject *)(ob), (i), (v)))
+#define PyTuple_SET_ITEM(ob, i, v) _PyTuple_SET_ITEM((PyObject *)(ob), (i), (v))
 
 /* Variadic, so it is built here out of the non-variadic exports. */
 static inline PyObject *PyTuple_Pack(Py_ssize_t n, ...)

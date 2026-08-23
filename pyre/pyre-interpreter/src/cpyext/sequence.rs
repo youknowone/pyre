@@ -339,16 +339,28 @@ pub unsafe extern "C" fn PySequence_Fast_GET_ITEM(
 /// Upstream answers with a pointer into the tuple mirror's `ob_item` or into
 /// the list's storage; a mirror here has neither, so the array is filled and
 /// kept beside the container, which is what makes the address good after this
-/// returns.  The entries are borrowed exactly as `PySequence_Fast_GET_ITEM`
-/// borrows one.
+/// returns.  Each entry is a reference the array owns, which is what keeps a
+/// slot readable for as long as the array is; a caller borrows from the array
+/// exactly as it borrows from `ob_item` upstream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Fast_ITEMS(object: *mut CPyObject) -> *mut *mut CPyObject {
+    let value = unsafe { pyobject::from_ref(object) };
+    if unsafe { !value.is_null() && pyre_object::is_tuple(value) } {
+        // A tuple's `ob_item` is where it is for as long as the tuple lives,
+        // so the array is the one `PyTuple_GET_ITEM` hands out rather than a
+        // second one that would leave the first pointing at nothing.
+        return unsafe { super::tupleobject::_PyTuple_ITEMS(object) };
+    }
     let length = unsafe { PySequence_Fast_GET_SIZE(object) };
     if length < 0 {
         return std::ptr::null_mut();
     }
     let items = (0..length)
-        .map(|index| unsafe { PySequence_Fast_GET_ITEM(object, index) } as usize)
+        .map(|index| {
+            let item = unsafe { PySequence_Fast_GET_ITEM(object, index) };
+            unsafe { pyobject::incref(item) };
+            item as usize
+        })
         .collect();
     pyobject::refill_items(object, items)
 }

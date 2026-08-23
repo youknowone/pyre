@@ -606,6 +606,7 @@ PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t);
 PyAPI_FUNC(int) PyTuple_SetItem(PyObject *, Py_ssize_t, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyTuple_Size(PyObject *);
 PyAPI_FUNC(PyObject **) _PyTuple_ITEMS(PyObject *);
+PyAPI_FUNC(void) _PyTuple_SET_ITEM(PyObject *, Py_ssize_t, PyObject *);
 
 /* cpyext/typeobject.rs */
 PyAPI_FUNC(PyObject *) PyErr_NewException(const char *, PyObject *, PyObject *);

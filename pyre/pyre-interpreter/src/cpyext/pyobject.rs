@@ -744,9 +744,9 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
 /// takes its address — which is what the box gives: it owns its slots, so a
 /// rehash of the map does not move them.
 ///
-/// Each entry is a reference the container owns through [`borrow_from`], so the
-/// array roots nothing the container does not and [`release_borrowed`] is what
-/// gives them back.
+/// Each entry is a reference the array owns, as `ob_item`'s are: a slot read
+/// through `PyTuple_GET_ITEM` is borrowed from the container, and it stays
+/// good for as long as the container does because the array holds it.
 /// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
 type ItemCache = HashMap<usize, Box<[usize]>, BuildHasherDefault<std::hash::DefaultHasher>>;
 static ITEM_ARRAYS: ForkMutex<ItemCache> =
@@ -758,9 +758,24 @@ static ITEM_ARRAYS: ForkMutex<ItemCache> =
 /// reallocation upstream documents, and a caller may only read the array while
 /// the sequence does not change.
 pub(super) fn refill_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut CPyObject {
-    let mut cache = ITEM_ARRAYS.lock();
-    cache.insert(raw as usize, items.into_boxed_slice());
-    cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject
+    let (address, previous) = {
+        let mut cache = ITEM_ARRAYS.lock();
+        let previous = cache.insert(raw as usize, items.into_boxed_slice());
+        (
+            cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject,
+            previous,
+        )
+    };
+    // Outside the lock: a deallocator this runs takes it again.
+    release_item_array(previous);
+    address
+}
+
+/// Give back the references an array owned.
+fn release_item_array(array: Option<Box<[usize]>>) {
+    for entry in array.into_iter().flatten() {
+        unsafe { decref(entry as *mut CPyObject) };
+    }
 }
 
 /// `raw`'s array, built by `items` the first time it is asked for.
@@ -778,28 +793,37 @@ pub(super) fn items_or_build(
     if let Some(array) = existing {
         return array;
     }
-    // Built with the lock released: an entry is taken through `borrow_from`,
+    // Built with the lock released: an entry is taken through `make_ref`,
     // which allocates and takes locks of its own.
     let built = items();
     refill_items(raw, built)
 }
 
-/// Write one slot of an array already handed out, leaving its address alone.
+/// Put `item` in one slot of an array already handed out, leaving its address
+/// alone, and answer with what it displaced.
 ///
-/// The one thing that changes a tuple after C has seen it is
-/// `PyTuple_SetItem`, and a caller holding the address `PyTuple_GET_ITEM` gave
-/// it has to read the new value through it.
-pub(super) fn set_cached_item(raw: *mut CPyObject, index: usize, item: *mut CPyObject) {
-    if let Some(array) = ITEM_ARRAYS.lock().get_mut(&(raw as usize))
-        && let Some(slot) = array.get_mut(index)
-    {
-        *slot = item as usize;
-    }
+/// What changes a tuple after C has seen it is `PyTuple_SetItem` and
+/// `PyTuple_SET_ITEM`, and a caller holding the address `PyTuple_GET_ITEM`
+/// gave it has to read the new value through it.
+///
+/// The array takes over `item`'s reference and gives up the one it answers
+/// with; a caller that gets nothing back -- no array, or an index past its end
+/// -- still holds `item`'s.
+pub(super) fn replace_cached_item(
+    raw: *mut CPyObject,
+    index: usize,
+    item: *mut CPyObject,
+) -> Option<*mut CPyObject> {
+    let mut cache = ITEM_ARRAYS.lock();
+    let slot = cache.get_mut(&(raw as usize))?.get_mut(index)?;
+    Some(std::mem::replace(slot, item as usize) as *mut CPyObject)
 }
 
-/// Drop the array a dying container mirror handed out.
+/// Drop the array a dying container mirror handed out, and the references it
+/// owned with it.
 fn forget_items(raw: usize) {
-    ITEM_ARRAYS.lock().remove(&raw);
+    let array = ITEM_ARRAYS.lock().remove(&raw);
+    release_item_array(array);
 }
 
 /// The NUL-terminated byte view of a mirror, filled on first use.
