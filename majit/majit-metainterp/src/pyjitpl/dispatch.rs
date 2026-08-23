@@ -1904,6 +1904,68 @@ where
         promoted_box
     }
 
+    /// `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — returns
+    /// `box.nonnull()`, guarding it into the trace on the way.
+    ///
+    /// ```python
+    /// value = box.nonnull()
+    /// if heapcache.is_nullity_known(box):
+    ///     profiler.count_ops(rop.GUARD_NONNULL, Counters.HEAPCACHED_OPS)
+    ///     return value
+    /// if value:
+    ///     if not self.metainterp.heapcache.is_class_known(box):
+    ///         self.metainterp.generate_guard(rop.GUARD_NONNULL, box, resumepc=orgpc)
+    /// else:
+    ///     if not isinstance(box, Const):
+    ///         self.metainterp.generate_guard(rop.GUARD_ISNULL, box, resumepc=orgpc)
+    ///         promoted_box = executor.constant_from_op(box)
+    ///         self.metainterp.replace_box(box, promoted_box)
+    /// heapcache.nullity_now_known(box)
+    /// return value
+    /// ```
+    ///
+    /// The nullity question is asked of the box directly — there is no
+    /// comparison operation, and none of `GUARD_NONNULL` / `GUARD_ISNULL` /
+    /// the two heapcache updates has an analogue in a `PTR_EQ` against null
+    /// under a `GUARD_TRUE`.
+    fn establish_nullity(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        src_reg: usize,
+        src: OpRef,
+        src_value: i64,
+        opcode_pc: usize,
+    ) -> bool {
+        let value = src_value != 0;
+        if ctx.heapcache_nullity_known(src) == Some(true) {
+            ctx.profiler().count_ops(
+                OpCode::GuardNonnull,
+                crate::pyjitpl::counters::HEAPCACHED_OPS,
+            );
+            return value;
+        }
+        if value {
+            // A known class already implies non-null, so the guard would be
+            // redundant.
+            if !ctx.heap_cache().is_class_known(src) {
+                self.record_state_guard(ctx, sym, OpCode::GuardNonnull, &[src], opcode_pc, false);
+            }
+        } else if !src.is_constant() {
+            self.record_state_guard(ctx, sym, OpCode::GuardIsnull, &[src], opcode_pc, false);
+            // `replace_box(box, constant_from_op(box))` — the register
+            // write-back stand-in, as in [`Self::implement_guard_value`].
+            let null = ctx.const_null();
+            self.set_ref_reg(src_reg, Some(null), Some(0));
+        }
+        // majit's `nullity_now_known` also records WHICH nullity, where
+        // upstream only sets the flag; `is_nullity_known` then answers
+        // `Some(false)` for a known-null box rather than conflating it with
+        // unknown.
+        ctx.heap_cache_mut().nullity_now_known(src, value);
+        value
+    }
+
     /// `pyjitpl.py MIFrame.opimpl_goto_if_not(box, target, orgpc, replace)`.
     ///
     /// ```python
@@ -5438,25 +5500,16 @@ where
                     )
                 };
                 let (src, src_value) = self.read_ref_reg(src_idx);
-                let null = ctx.const_null();
-                let (opcode, cond_value) = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO => {
-                        (OpCode::PtrEq, (src_value == 0) as i64)
-                    }
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => {
-                        (OpCode::PtrNe, (src_value != 0) as i64)
-                    }
+                let nonnull = self.establish_nullity(ctx, sym, src_idx, src, src_value, opcode_pc);
+                // pyjitpl.py:
+                //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
+                //   opimpl_goto_if_not_ptr_iszero:  if     nonnull: self.pc = target
+                let branch_taken = match bytecode {
+                    jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO => nonnull,
+                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => !nonnull,
                     _ => unreachable!(),
                 };
-                let cond = ctx.record_op(opcode, &[src, null]);
-                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
-                let guard = if cond_value == 0 {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
-                };
-                self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
-                if cond_value == 0 {
+                if branch_taken {
                     self.frames.current_mut().code_cursor = target;
                 }
             }
@@ -13145,6 +13198,91 @@ mod tests {
             .iter()
             .map(|op| op.opcode)
             .collect()
+    }
+
+    /// `_establish_nullity` asks the nullity question of the box itself:
+    /// `GUARD_NONNULL` / `GUARD_ISNULL`, never a comparison against null under
+    /// a `GUARD_TRUE`. Both bytecodes share it and differ only in which answer
+    /// takes the branch.
+    #[test]
+    fn a_ptr_nullity_branch_guards_the_box_itself() {
+        // (bytecode-emitting closure, traced pointer, expected guard)
+        let cases: [(fn(&mut JitCodeBuilder, u16), i64, OpCode); 4] = [
+            (
+                |b, t| b.goto_if_not_ptr_nonzero(0, t),
+                0x40,
+                OpCode::GuardNonnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_nonzero(0, t),
+                0,
+                OpCode::GuardIsnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_iszero(0, t),
+                0x40,
+                OpCode::GuardNonnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_iszero(0, t),
+                0,
+                OpCode::GuardIsnull,
+            ),
+        ];
+        for (emit, ptr, want) in cases {
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            emit(&mut builder, target);
+            builder.mark_label(target);
+            let recorded = traced_opcodes(
+                &[majit_ir::Type::Ref],
+                &builder.finish(),
+                &[(JitArgKind::Ref, OpRef::input_arg_ref(0), ptr)],
+            );
+            assert_eq!(recorded, vec![want], "ptr={ptr:#x}");
+        }
+    }
+
+    /// `heapcache.nullity_now_known(box)` closes the question, so a second
+    /// nullity branch on the same box takes the `is_nullity_known`
+    /// short-circuit and guards nothing.
+    #[test]
+    fn a_second_nullity_branch_on_one_box_is_answered_by_the_heapcache() {
+        let mut builder = JitCodeBuilder::new();
+        let first = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(0, first);
+        builder.mark_label(first);
+        let second = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(0, second);
+        builder.mark_label(second);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x40)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardNonnull], "{recorded:?}");
+    }
+
+    /// The null arm's `replace_box(box, constant_from_op(box))`: the source
+    /// register comes out of the branch holding `CONST_NULL`, so a following
+    /// nullity read of it folds instead of recording a `PTR_NE`.
+    ///
+    /// The probe is `ptr_nonzero` rather than a `PTR_EQ` against the register
+    /// itself, because `trace_binop_r_to_i` short-circuits identical operands
+    /// through `FASTPATHS_SAME_BOXES` and would answer the same either way.
+    #[test]
+    fn a_null_ptr_nullity_branch_rebinds_its_source_register() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_ptr_iszero(0, target);
+        builder.ptr_nonzero(1, 0);
+        builder.mark_label(target);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
     }
 
     /// `opimpl_goto_if_not`'s tail — `if replace: replace_box(box,

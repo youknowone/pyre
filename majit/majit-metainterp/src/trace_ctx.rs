@@ -4294,6 +4294,21 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
     }
 
+    /// `heapcache.py is_nullity_known(box)`, supplying the `getref_base()`
+    /// reader its `Const` arm needs. `Some(true)` / `Some(false)` / `None` are
+    /// known-nonnull / known-null / unknown; only `Some(true)` is upstream's
+    /// truthy answer, for the reason spelled out at
+    /// [`Self::trace_assert_not_none`].
+    pub fn heapcache_nullity_known(&self, opref: OpRef) -> Option<bool> {
+        self.heap_cache.is_nullity_known(opref, |op| {
+            op.inline_const_to_value().and_then(|v| match v {
+                Value::Int(n) => Some(n),
+                Value::Ref(gc) => Some(gc.0 as i64),
+                _ => None,
+            })
+        })
+    }
+
     /// pyjitpl.py `opimpl_assert_not_none`:
     ///
     /// ```text
@@ -4326,14 +4341,7 @@ impl TraceCtx {
         // `Some(true)` for known non-null, `Some(false)` for known
         // null, `None` for unknown — match PyPy's semantics by
         // short-circuiting only on `Some(true)`.
-        let known = self.heap_cache.is_nullity_known(opref, |op| {
-            op.inline_const_to_value().and_then(|v| match v {
-                Value::Int(n) => Some(n),
-                Value::Ref(gc) => Some(gc.0 as i64),
-                _ => None,
-            })
-        });
-        if known == Some(true) {
+        if self.heapcache_nullity_known(opref) == Some(true) {
             self.profiler().count_ops(
                 OpCode::AssertNotNone,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
