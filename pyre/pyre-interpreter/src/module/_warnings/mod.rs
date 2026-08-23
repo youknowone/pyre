@@ -146,7 +146,7 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
     } else {
         category
     };
-    // `interp_warnings.py:62-72` raises "category is not a subclass of Warning"
+    // `interp_warnings.py` `get_category` raises "category is not a subclass of Warning"
     // from inside its own `try`, so the enclosing `except OperationError` catches
     // that raise and re-reports it in the `'%T'` form.  A plain False and a
     // subclass check that itself fails therefore reach the caller identically.
@@ -565,10 +565,11 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let globals_slot = pin_root_slot(module_globals);
-    // `importlib/_bootstrap_external.py:630 _bless_my_loader` reconciles
+    // `importlib/_bootstrap_external.py` `_bless_my_loader` reconciles
     // `__loader__` against `__spec__.loader` before either is used: it raises
     // when the globals name no loader at all, and warns `DeprecationWarning`
-    // when only the deprecated `__loader__` names one.  `interp_warnings.py:365`
+    // when only the deprecated `__loader__` names one.  `interp_warnings.py`
+    // `get_source_line`
     // reads `__loader__` straight out of the globals; that module predates the
     // reconciliation and carries no counterpart for it, so this answers to the
     // 3.14 stdlib shipped here.
@@ -615,7 +616,8 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
         return Ok(PY_NULL);
     }
     let source_slot = pin_root_slot(source);
-    // `interp_warnings.py:386` splits through the `str` type itself, so a `str`
+    // `interp_warnings.py` `get_source_line` splits through the `str` type
+    // itself, so a `str`
     // subclass that overrides `splitlines` does not get to decide what the line
     // list is, and the descriptor's own receiver check rejects a `get_source`
     // result that is not a `str` — the same type error `PyUnicode_Splitlines`

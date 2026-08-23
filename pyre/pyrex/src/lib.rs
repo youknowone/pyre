@@ -1252,13 +1252,15 @@ pub(crate) fn seed_main_loader(
     }
 }
 
-/// `app_main.py:908-917` — `launch_env` has already assembled the dev-mode,
+/// `app_main.py` `run_command_line` — `launch_env` has already assembled the
+/// dev-mode,
 /// `PYTHONWARNINGS`, `-W` and BytesWarning entries onto `sys.warnoptions`; what
 /// remains is driving the warnings machinery through them before user code runs.
 /// A module already in `sys.modules` (a `sitecustomize` may have pulled it in)
 /// has run its body once, so it is re-driven through `_processoptions`;
 /// otherwise the plain import runs `_processoptions(sys.warnoptions)` from the
-/// module body (`warnings.py:94`).  This is the step that emits
+/// module body (`warnings.py`, its module-level `_processoptions` call).  This
+/// is the step that emits
 /// "Invalid -W option ignored: ..." and that leaves `sys.modules['warnings']`
 /// populated on a `-W` run.  Every failure is swallowed, matching the bare
 /// `except ImportError: pass`.

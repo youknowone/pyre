@@ -1392,7 +1392,8 @@ impl PyError {
     }
 
     /// `_PyErr_SetImportErrorWithNameFrom` — the same error carrying the name
-    /// the `from` list asked for.  `traceback.py:1096-1101` gates its spelling
+    /// the `from` list asked for.  `traceback.py`
+    /// `TracebackException.__init__` gates its spelling
     /// suggestion on `.name_from` being other than `None`, so only a raise that
     /// stamps it can offer one.
     pub fn import_error_name_path_from(

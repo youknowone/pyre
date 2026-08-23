@@ -13352,10 +13352,10 @@ impl CodeWriter {
                         // `i` is the unified localsplus index read like
                         // LOAD_FAST. The `make_cell_value(current, code, slot)`
                         // HLOp → `residual_call_ir_r(make_cell_fn,
-                        // ListR[current, code], ListI[slot])` returns the cell
-                        // to install: a fresh cell of the family
-                        // (`pycode.py` `PyCode._initialize`) cell
-                        // family `code` + `slot` names, wrapping the raw
+                        // ListI[slot], ListR[current, code])` returns the cell
+                        // to install: a fresh cell belonging to the
+                        // `CellFamily` that `(code, slot)` names
+                        // (`pycode.py` `PyCode._initialize`), wrapping the raw
                         // argument value, or the existing cell unchanged
                         // (`bh_make_cell_fn`, Plain — allocates, runs no user
                         // code). The result is stored into the slot via

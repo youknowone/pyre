@@ -173,7 +173,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         };
         put(dict_slot, "__module__", pyre_object::w_str_new("ast"))
             .expect("set __module__ on _ast type namespace");
-        // `ast.py:152-156` publishes one tuple under both names.  `MATCH_CLASS`
+        // `astcompiler/ast.py` `State.make_new_type` publishes one tuple
+        // under both names.  `MATCH_CLASS`
         // resolves positional sub-patterns through `__match_args__`, so a
         // `case ast.Expr(expr)` only reaches a field when the node type carries
         // the same field order `_fields` reports.

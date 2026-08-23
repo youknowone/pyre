@@ -3549,12 +3549,13 @@ pub struct LoweringContext {
     /// (`PlainCannotRaise` — writes heap, runs no user code, never raises).
     pub store_deref_value_fn_idx: u16,
     /// `make_cell_fn` descrs-pool index.  MAKE_CELL records the
-    /// `make_cell_value(current)` HLOp lowered to `residual_call_r_r(ConstInt(
-    /// fn_idx), ListR([current]), Descr) → reg` via
-    /// [`lower_make_cell_hlop_to_insn`] (the single-Ref shape); the result is
-    /// the cell the codewriter stores via `setarrayitem_vable_r`.
-    /// `bh_make_cell_fn` allocates a fresh cell (`Plain` — runs no user code,
-    /// never raises).
+    /// `make_cell_value(current, code, slot)` HLOp lowered to
+    /// `residual_call_ir_r(ConstInt(fn_idx), ListI([slot]),
+    /// ListR([current, code]), Descr) → reg` via
+    /// [`lower_make_cell_hlop_to_insn`]; the result is the cell the codewriter
+    /// stores via `setarrayitem_vable_r`.  `bh_make_cell_fn` allocates a fresh
+    /// cell belonging to the `CellFamily` that `(code, slot)` names (`Plain` —
+    /// runs no user code, never raises).
     pub make_cell_fn_idx: u16,
     /// `make_function_fn` descrs-pool index.  MAKE_FUNCTION records the
     /// `make_function_value(globals, code)` HLOp lowered to
