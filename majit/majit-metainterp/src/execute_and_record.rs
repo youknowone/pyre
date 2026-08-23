@@ -377,4 +377,52 @@ mod tests {
         assert!(!op.is_constant());
         assert_eq!(ctx.box_value(op), None);
     }
+
+    /// `OPS` counts every operation the funnel is asked for and
+    /// `RECORDED_OPS` only those it records, so the two differ by exactly the
+    /// folds. Each is bumped from one place, and this is what says so: a
+    /// second bump on either — or a fold that reached `record_helper` anyway —
+    /// changes a number no committed baseline can hold, because neither count
+    /// has a healthy value and a successful fold lowers `RECORDED_OPS` by
+    /// design.
+    #[test]
+    fn the_funnel_counts_ops_once_and_recorded_ops_only_when_it_records() {
+        let mut ctx = fresh_ctx();
+        let cpu = crate::cpu::default_cpu();
+        let counts = |ctx: &TraceCtx| {
+            (
+                ctx.profiler().get_counter(crate::counters::OPS),
+                ctx.profiler().get_counter(crate::counters::RECORDED_OPS),
+            )
+        };
+        assert_eq!(counts(&ctx), (Some(0), Some(0)));
+
+        ctx.execute_and_record(
+            cpu.as_ref(),
+            OpCode::IntAdd,
+            None,
+            &[OpRef::ConstInt(2), OpRef::ConstInt(3)],
+            Some(Value::Int(5)),
+            0,
+        );
+        assert_eq!(
+            counts(&ctx),
+            (Some(1), Some(0)),
+            "a fold is counted, not recorded"
+        );
+
+        ctx.execute_and_record(
+            cpu.as_ref(),
+            OpCode::ForceToken,
+            None,
+            &[],
+            Some(Value::Int(7)),
+            0,
+        );
+        assert_eq!(
+            counts(&ctx),
+            (Some(2), Some(1)),
+            "a record is counted on both"
+        );
+    }
 }
