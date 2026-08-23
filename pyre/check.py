@@ -2017,12 +2017,18 @@ class Check:
         # applied. Reported in the summary: an unevaluated gate otherwise
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
-        # (bench name, ceiling) for fixtures whose header raised the ratio
-        # above WASM_MAX_DYNASM_RATIO, for the same reason as the line above: a
-        # gate widened for a fixture and a gate the fixture satisfied both print
-        # green. Reported from `print_summary` rather than beside that line,
-        # because three of the fixtures carrying an allowance are regular
-        # benches and a `--no-synthetic` run would otherwise not name them.
+        # (bench name, ceiling, measured ratio or None) for fixtures whose
+        # header raised the ratio above WASM_MAX_DYNASM_RATIO, for the same
+        # reason as the line above: a gate widened for a fixture and a gate the
+        # fixture satisfied both print green. The measured ratio rides along
+        # because an allowance the backend has since outgrown is invisible
+        # otherwise -- one sat at 4.8x over a fixture measuring 2.9x, and
+        # finding that took parsing 434 comparison rows out of a job log.
+        # `None` means the gate was declined this run, so there is no ratio to
+        # compare it against. Reported from `print_summary` rather than beside
+        # that line, because three of the fixtures carrying an allowance are
+        # regular benches and a `--no-synthetic` run would otherwise not name
+        # them.
         self.wasm_ratio_allowed = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
@@ -3182,12 +3188,13 @@ class Check:
             # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
             # something the same size as its own error.
             ceiling = wasm_ratio_gate(script) or WASM_MAX_DYNASM_RATIO
-            if ceiling > WASM_MAX_DYNASM_RATIO:
-                self.wasm_ratio_allowed.append((name, ceiling))
+            allowed = ceiling > WASM_MAX_DYNASM_RATIO
             if dynasm_exec in (None, "-") or (
                 float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
             ):
                 self.wasm_ratio_ungated.append(name)
+                if allowed:
+                    self.wasm_ratio_allowed.append((name, ceiling, None))
             else:
                 # This ceiling is meant to come back down as the backend closes
                 # the gap, so it has to mean the number it states: a standing
@@ -3205,6 +3212,15 @@ class Check:
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
                     )
                 )
+                if allowed:
+                    # The values the gate judged, not the first sample: a
+                    # median retry is what an allowance fitted to a slow
+                    # reading would otherwise be reported against.
+                    self.wasm_ratio_allowed.append((
+                        name, ceiling,
+                        float(self._exec_time(backend, checked_elapsed))
+                        / float(self._exec_time("dynasm", checked_baseline)),
+                    ))
                 if not passed:
                     detail = self._gate_fail_detail(
                         backend, "dynasm", checked_elapsed, checked_baseline,
@@ -3769,9 +3785,12 @@ class Check:
         print()
 
         if self.wasm_ratio_allowed:
+            rows = sorted(set(self.wasm_ratio_allowed))
             names = ", ".join(
-                f"{name} {ceiling:g}x"
-                for name, ceiling in sorted(set(self.wasm_ratio_allowed))
+                f"{name} {ceiling:g}x "
+                + (f"(measured {measured:.1f}x)" if measured is not None
+                   else "(gate declined this run)")
+                for name, ceiling, measured in rows
             )
             print(
                 dim(
@@ -3779,6 +3798,18 @@ class Check:
                     f"`# pyre-check: max-wasm-ratio` for: {names}"
                 )
             )
+            spare = [
+                n for n, _, m in rows
+                if m is not None and m <= WASM_MAX_DYNASM_RATIO
+            ]
+            if spare:
+                print(
+                    dim(
+                        f"  {len(spare)} of those measured at or under "
+                        f"{WASM_MAX_DYNASM_RATIO:g}x, so the allowance is not "
+                        f"what keeps them green: {', '.join(spare)}"
+                    )
+                )
 
         if self.results:
             print("─" * 53)
