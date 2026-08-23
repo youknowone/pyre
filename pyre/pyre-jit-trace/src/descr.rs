@@ -2631,22 +2631,25 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
 
 /// The `[capacity][items…]` header shared by every list/tuple backing block.
 ///
-/// The `0` type id is load-bearing, not a slot waiting to be filled:
+/// Headerless, and both halves of that are load-bearing.
 /// `items_block_capacity_descr()` is the capacity read for all three list
-/// strategies, and their blocks carry three different runtime tids
-/// (`GC_INT_ARRAY_GC_TYPE_ID`, `GC_FLOAT_ARRAY_GC_TYPE_ID`,
-/// `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three arms of
-/// `helpers::emit_promote_empty_list_inline`). One descr fronting three tids
-/// can name none of them, so `StructPtrInfo::make_guards` (`optimizeopt/info.rs`)
-/// declines the short-preamble entry rather than pin a layout that holds for
-/// one strategy and not the other two; `unroll_free_retry_rescued` counts the
-/// unrolled attempt that costs. Stamping any single tid here makes the guard
-/// false for the other two block kinds.
+/// strategies, whose blocks carry three different runtime tids
+/// (`GC_INT_ARRAY_GC_TYPE_ID`,
+/// `GC_FLOAT_ARRAY_GC_TYPE_ID`, `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three
+/// arms of `helpers::emit_promote_empty_list_inline`), so one descr fronting
+/// them can name none; and `alloc_items_block`, the `PYRE_GC_ITEMSBLOCK=0` and
+/// no-hook fallback, hands back a `std::alloc` block with no `GcHeader` at all.
+/// Either way the loaded pointer must never reach `GUARD_GC_TYPE`, which reads
+/// at `ref - GcHeader::SIZE`.
+///
+/// Leaving the type id at 0 does not express that on its own: the flag
+/// `StructPtrInfo::make_guards` (`optimizeopt/info.rs`) consults is
+/// `headerless`, and an unstamped gc-managed descr is one a second producer for
+/// this key can have a collector identity stamped onto
+/// (`GcCache::register_unresolved_struct_tids`).
 static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        0,
-        0,
         &[(
             "capacity",
             pyre_object::object_array::ITEMS_BLOCK_LEN_OFFSET,
@@ -2662,16 +2665,20 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
 });
 
 // The RPython `tuple2` returned by `rbigint.divmod` / `int_divmod`
-// (rbigint.py:1002/1050). Not a PyObject — no vtable and no allocation type id,
-// because the trace never NEWs one: it arrives as an elidable's result and is
-// only read. Both fields are `Type::Ref`, which is what puts them in
-// `gc_fielddescrs`, and both are immutable, so the two reads CSE the way
-// upstream's pair of `getfield_gc_r` off one `call_pure_r` does.
+// (`rbigint.py` `divmod` / `int_divmod`). Not a PyObject — no vtable, and the
+// trace never NEWs one: it arrives as an elidable's result and is only read.
+//
+// Headerless, because `alloc_rbigint_pair_nursery_collecting` and
+// `alloc_rbigint_pair_no_collect` both end in `malloc_raw` when the collector
+// has no tid for the pair or the nursery cannot satisfy the request, so a
+// loaded pointer may have no `GcHeader` for `GUARD_GC_TYPE` to read.
+//
+// Both fields are `Type::Ref`, which is what puts them in `gc_fielddescrs`, and
+// both are immutable, so the two reads CSE the way upstream's pair of
+// `getfield_gc_r` off one `call_pure_r` does.
 static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_object::longobject::BIGINT_PAIR_SIZE,
-        0,
-        0,
         &[
             (
                 "item0",
@@ -2699,8 +2706,9 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 
 // `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`,
 // holding the frame's own locals mapping (read at the head of `fast2locals`)
-// and the rare per-frame globals override (read by `get_w_globals`).  Not a PyObject — no vtable, and the trace never NEWs one:
-// it arrives as the `debugdata` virtualizable field and is only read.
+// and the rare per-frame globals override (read by `get_w_globals`).  Not a
+// PyObject — no vtable, and the trace never NEWs one: it arrives as the
+// `debugdata` virtualizable field and is only read.
 //
 // Headerless, because `getorcreate_debug_data` falls back to `malloc_raw`
 // whenever the owning frame is not collector-owned, so a loaded pointer may
@@ -5680,6 +5688,36 @@ mod tests {
         assert_ne!(
             sentinel,
             Some(pyre_interpreter::pytraceback::PYTRACEBACK_GC_TYPE_ID)
+        );
+    }
+
+    /// A gc-managed declaration that leaves `type_id` at 0 does not thereby opt
+    /// out of `GUARD_GC_TYPE`. `StructPtrInfo::make_guards`
+    /// (`optimizeopt/info.rs`) emits one for any gc-managed, non-headerless
+    /// descr, and it takes the id from whatever the `GcCache` slot for the key
+    /// holds by then — a second producer's collector identity, which the
+    /// runtime header can never match. `headerless` is the flag that declines
+    /// the guard, so a struct that cannot name its runtime tid has to say so.
+    #[test]
+    fn a_gc_managed_group_that_names_no_type_id_declares_itself_headerless() {
+        for (_, force) in DECLARED_GROUPS {
+            force();
+        }
+        let gc = majit_ir::descr::gc_cache().lock().unwrap();
+        let unstamped: Vec<&str> = DECLARED_GROUPS
+            .iter()
+            .filter(|(def_path, _)| {
+                let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+                gc._cache_size
+                    .get(&key)
+                    .and_then(|descr| descr.as_size_descr())
+                    .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
+            })
+            .map(|(def_path, _)| *def_path)
+            .collect();
+        assert!(
+            unstamped.is_empty(),
+            "gc-managed groups with no type id and no headerless declaration: {unstamped:?}",
         );
     }
 
