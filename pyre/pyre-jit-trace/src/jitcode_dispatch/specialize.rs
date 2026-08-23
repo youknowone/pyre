@@ -10111,13 +10111,20 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatEq, &[diff, zero], true)?;
     // The pure elidable libm sqrt: EF_ELIDABLE_CANNOT_RAISE → CALL_F, no
     // trailing guard, foldable/hoistable.
-    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         crate::trace_opcode::sqrt_nonneg_jit as *const (),
         &[x],
         &[majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(crate::trace_opcode::sqrt_nonneg_jit as *const () as i64),
+            majit_ir::Value::Float(val),
+        ],
+        majit_ir::Value::Float(result_val),
     );
-    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
     let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
@@ -10229,13 +10236,20 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(diff, majit_ir::Value::Float(0.0));
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatEq, &[diff, zero], true)?;
-    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         raw_fn,
         &[x],
         &[majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(raw_fn as i64),
+            majit_ir::Value::Float(val),
+        ],
+        majit_ir::Value::Float(result_val),
     );
-    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
     let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
@@ -10330,19 +10344,39 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
         // and ignores an override there too.
         walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(arg_obj))?;
     }
-    let mantissa = ctx.trace_ctx.call_float_typed_with_effect(
+    let mantissa = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         pyre_interpreter::module::math::interp_math::jit_math_frexp_mantissa as *const (),
         &[x],
         &[majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(
+                pyre_interpreter::module::math::interp_math::jit_math_frexp_mantissa as *const ()
+                    as i64,
+            ),
+            majit_ir::Value::Float(x_value),
+        ],
+        majit_ir::Value::Float(mantissa_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(mantissa, majit_ir::Value::Float(mantissa_value));
-    let exponent = ctx.trace_ctx.call_int_typed_with_effect(
+    let exponent = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
         pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const (),
         &[x],
         &[majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(
+                pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
+                    as i64,
+            ),
+            majit_ir::Value::Float(x_value),
+        ],
+        majit_ir::Value::Int(exponent_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(exponent, majit_ir::Value::Int(exponent_value));
@@ -10466,11 +10500,21 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
     let exp = walker_unbox_int_typed(ctx, op.pc, r_args[3], exp_type_addr, exp_descr)?;
     ctx.trace_ctx
         .set_opref_concrete(exp, majit_ir::Value::Int(exp_value));
-    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const (),
         &[x, exp],
         &[majit_ir::Type::Float, majit_ir::Type::Int],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(
+                pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as i64,
+            ),
+            majit_ir::Value::Float(x_value),
+            majit_ir::Value::Int(exp_value),
+        ],
+        majit_ir::Value::Float(result_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
@@ -10582,11 +10626,20 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
         .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
     walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonnegative])?;
 
-    let raw_result = ctx.trace_ctx.call_int_typed_with_effect(
+    let raw_result = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
         pyre_interpreter::module::math::interp_math::jit_math_isqrt_i64 as *const (),
         &[raw_int],
         &[majit_ir::Type::Int],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(
+                pyre_interpreter::module::math::interp_math::jit_math_isqrt_i64 as *const () as i64,
+            ),
+            majit_ir::Value::Int(value),
+        ],
+        majit_ir::Value::Int(result_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
@@ -10916,11 +10969,18 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
                     value.ceil(),
                 ),
             };
-            let rounded = ctx.trace_ctx.call_float_typed_with_effect(
+            let rounded = ctx.trace_ctx.call_typed_with_effect_pure(
+                OpCode::CallF,
                 helper,
                 &[raw_float],
                 &[majit_ir::Type::Float],
-                majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                majit_ir::Type::Float,
+                majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(helper as i64),
+                    majit_ir::Value::Float(value),
+                ],
+                majit_ir::Value::Float(rounded_value),
             );
             ctx.trace_ctx
                 .set_opref_concrete(rounded, majit_ir::Value::Float(rounded_value));
@@ -11090,11 +11150,18 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let x =
         walker_coerce_operand_to_float(ctx, op.pc, r_args[2], operands[0], is_int, value, false)?;
-    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         raw_fn as *const (),
         &[x],
         &[majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(raw_fn as *const () as i64),
+            majit_ir::Value::Float(value),
+        ],
+        majit_ir::Value::Float(result_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
@@ -11172,11 +11239,19 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
         y_value,
         false,
     )?;
-    let raw = ctx.trace_ctx.call_float_typed_with_effect(
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallF,
         raw_fn as *const (),
         &[x, y],
         &[majit_ir::Type::Float, majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Float,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(raw_fn as *const () as i64),
+            majit_ir::Value::Float(x_value),
+            majit_ir::Value::Float(y_value),
+        ],
+        majit_ir::Value::Float(result_value),
     );
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
@@ -11270,11 +11345,19 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
         b_value,
         false,
     )?;
-    let truth = ctx.trace_ctx.call_int_typed_with_effect(
+    let truth = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
         helper as *const (),
         &[a, b],
         &[majit_ir::Type::Float, majit_ir::Type::Float],
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as *const () as i64),
+            majit_ir::Value::Float(a_value),
+            majit_ir::Value::Float(b_value),
+        ],
+        majit_ir::Value::Int(i64::from(observed)),
     );
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(observed)));
