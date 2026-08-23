@@ -2627,9 +2627,8 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
     if binary_op_tag_for_opname(opname).is_some() || compare_op_tag_for_opname(opname).is_some() {
         return true;
     }
-    // `load_method_self`, `store_deref_value`, `unbound_local_error`,
-    // `load_import_locals` lower with `PlainCannotRaise` and are intentionally
-    // absent.
+    // `load_method_self`, `store_deref_value`, `unbound_local_error`
+    // lower with `PlainCannotRaise` and are intentionally absent.
     matches!(
         opname,
         "bool"
@@ -2642,6 +2641,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "delete_global"
             | "load_build_class"
             | "load_import"
+            | "load_import_locals"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -4521,6 +4521,28 @@ where
 }
 
 /// Lower IMPORT_NAME's locals argument to a one-Ref residual call.
+///
+/// `bh_load_import_locals_fn` dereferences `PyFrame.debugdata` and then
+/// `FrameDebugData.w_locals`, and the optimizer caches both: `debugdata` is
+/// virtualizable field 3, and the `f_locals` fold reads `w_locals` through
+/// `frame_debug_data_w_locals_descr`, which is mutable because
+/// `setdictscope` and `fast2locals` rebind it.  Neither read is analyzed
+/// here, so this takes the same `Plain` lowering as `load_locals`, the
+/// sibling helper that reads the same two fields: no write set was computed,
+/// which is `EF_RANDOM_EFFECTS`, and `OptHeap` routes that to `clean_caches`
+/// instead of `force_from_effectinfo`.  It also dispatches as
+/// `CALL_MAY_FORCE` -- `RandomEffects` clears
+/// `check_forces_virtual_or_virtualizable()` -- which is what syncs the
+/// virtualizable the `debugdata` read goes through.
+///
+/// A `PlainCannotRaise` lowering would instead advertise concrete-empty
+/// readonly and write sets, so a lazy set pending on either field would not
+/// be flushed before the helper reads it and `__import__` would receive a
+/// stale mapping.  Declaring the two descrs readonly does not recover that:
+/// `compute_bitstrings` never runs on the `JitDriver` path, so every
+/// `check_readonly_descr_field` lookup misses on the `u32::MAX` sentinel,
+/// and the raw-set fallback in `force_from_effectinfo` covers only the write
+/// side.  The `EF_RANDOM_EFFECTS` boundary is what carries the reads.
 pub fn lower_load_import_locals_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -4531,30 +4553,14 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "load_import_locals" || op.args.len() != 1 {
-        return None;
-    }
-    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    // Reads the frame's debug slot and returns what is already there, so it
-    // cannot raise and cannot collect -- `do_residual_call` then drops the
-    // trailing `GUARD_NO_EXCEPTION` the sibling `load_import` lookup needs.
-    // It does read GC heap state (`PyFrame.debugdata`, then `w_locals`), so
-    // this is `PlainCannotRaise` and not the no-heap flavor, the same
-    // distinction `for_iter_exception_match_fn` is bound under. The generic
-    // frame-only helper would instead take the Plain "no graph was analyzed"
-    // path and become RANDOM_EFFECTS / CALL_MAY_FORCE, forcing the frame that
-    // this opcode should not force at all.
-    Some(build_residual_call_r_r_insn_from_operands(
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_import_locals",
         ctx.load_import_locals_fn_idx,
-        vec![frame_operand],
-        CallFlavor::PlainCannotRaise,
         majit_ir::PyreHelperKind::LoadImportLocals,
-        dst_reg,
-    ))
+        get_register,
+        lower_constant,
+    )
 }
 
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
@@ -13574,11 +13580,16 @@ mod tests {
     }
 
     #[test]
-    fn lower_load_import_locals_hlop_emits_infallible_frame_residual() {
+    fn lower_load_import_locals_hlop_keeps_the_unanalyzed_boundary() {
         // `pyopcode.py:1119-1125` reads the frame's debug locals before the
-        // call.  Peeking that slot creates nothing and cannot raise, so this
-        // is the plain one-Ref frame-receiver shape, not the CanRaise shape
-        // the sibling `load_import` lookup carries.
+        // call, and the helper that answers it dereferences
+        // `PyFrame.debugdata` -- virtualizable field 3 -- and then
+        // `FrameDebugData.w_locals`, which the `f_locals` fold caches and
+        // which `setdictscope` rebinds.  Neither read is analyzed here, so
+        // the residual keeps the one-Ref frame-receiver shape its sibling
+        // `load_locals` carries: `EF_RANDOM_EFFECTS`, dispatched as
+        // `CALL_MAY_FORCE` so the virtualizable is synced and `OptHeap`
+        // flushes the cached field before the helper reads either.
         let frame = Variable::new(VariableId(8), Kind::Ref);
         let result = Variable::new(VariableId(9), Kind::Ref);
         let op = SpaceOperation::new(
@@ -13630,15 +13641,21 @@ mod tests {
                                 stub.effect_info.pyre_helper,
                                 majit_ir::PyreHelperKind::LoadImportLocals
                             );
+                            // A `CannotRaise` shape here would advertise
+                            // concrete-empty readonly and write sets the
+                            // helper never earned, and `force_from_effectinfo`
+                            // would then skip both fields: there is no
+                            // raw-set fallback on the readonly side, and
+                            // `compute_bitstrings` never runs on this path.
                             assert_eq!(
                                 stub.effect_info.extraeffect,
-                                majit_ir::ExtraEffect::CannotRaise
+                                majit_ir::ExtraEffect::RandomEffects
                             );
                             assert_eq!(
                                 dispatch_kind_for_effect_info(&stub.effect_info),
-                                CallFlavor::PlainCannotRaise
+                                CallFlavor::MayForce
                             );
-                            assert!(!stub.effect_info.has_random_effects());
+                            assert!(stub.effect_info.has_random_effects());
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
                     },

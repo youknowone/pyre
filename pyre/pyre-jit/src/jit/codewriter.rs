@@ -4300,9 +4300,13 @@ fn register_helper_fn_pointers(
         cpu.load_import_fn as *const (),
         CallFlavor::Plain,
     );
-    // The locals half only reads the frame's debug slot: it cannot raise and
-    // cannot collect, but it does read GC heap state, so it takes
-    // `PlainCannotRaise` rather than the no-heap flavor.
+    // The locals half returns the frame's debug slot without an error path,
+    // so it binds `PlainCannotRaise`, the same pairing `load_locals_fn` above
+    // carries: the flavor bound here classifies the helper, while the residual
+    // this opcode emits is lowered `Plain` because the two fields it reads
+    // were never analyzed (see `lower_load_import_locals_hlop_to_insn`). It is
+    // not the no-heap flavor, which additionally asserts `can_collect=false`
+    // and an untouched heap.
     let load_import_locals_fn = bind(
         assembler,
         cpu.load_import_locals_fn as *const (),

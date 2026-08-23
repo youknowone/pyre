@@ -6507,12 +6507,13 @@ pub extern "C" fn bh_load_import_fn(frame_ptr: i64) -> i64 {
 ///
 /// The asymmetry with [`bh_load_import_fn`] is deliberate rather than an
 /// oversight. That one resolves `__import__` and genuinely raises ImportError
-/// when the name is absent, so it carries the publish-and-return-0 machinery
-/// and is bound `CanRaise`. This one is bound `PlainCannotRaise`, which makes
-/// `do_residual_call` drop the trailing `GUARD_NO_EXCEPTION` -- so a published
-/// exception here would have nothing to observe it. A null frame is a wiring
+/// when the name is absent, so it carries the publish-and-return-0 machinery.
+/// This one reads a slot that is either populated or absent, and answers
+/// `None` for absent, so it has no failure to report. A null frame is a wiring
 /// bug in an emit site, not a runtime condition, and takes the same assert
-/// `bh_load_locals_fn` uses for the same reason.
+/// `bh_load_locals_fn` uses for the same reason -- publishing an exception for
+/// it would convert a miswired emit site into a `SystemError` raised at some
+/// unrelated Python line.
 pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
     assert!(
         frame_ptr != 0,
