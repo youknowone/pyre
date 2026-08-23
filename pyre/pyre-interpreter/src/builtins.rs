@@ -11936,18 +11936,32 @@ fn incompatible_string_prefix_error(
     ))
 }
 
-/// CPython 3.14 `Parser/string_parser.c:decode_unicode_with_escapes` sends
-/// non-raw Unicode literals through the `unicode_escape` decoder before the
-/// f-string parser interprets replacement fields.  Ruff instead diagnoses an
-/// incomplete `\N{...` as either its own escape error or an unclosed f-string
-/// field.  Recover the decoder-first error, including the byte range relative
-/// to the literal contents used by the codec error message.
-/// The message a malformed `\N` escape produces, with the byte offset of the
-/// literal that carries it.
+/// A string literal's escape-decode failure.
+struct EscapeError {
+    /// What the decoder would have said.
+    message: String,
+    /// Byte offset of the literal, its prefix included.  The caller needs it
+    /// because [`string_escape_error`] walks the whole source: the escape is
+    /// only what gets reported when nothing earlier in the file already
+    /// failed.
+    literal_start: usize,
+    /// Byte range the diagnostic points at.
+    span: (usize, usize),
+}
+
+/// The escape-decode failure a string literal in `source` carries, if any.
 ///
-/// The caller needs the offset because this walks the whole source: the escape
-/// is only what gets reported when nothing earlier in the file already failed.
-fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
+/// `decode_unicode_with_escapes` runs a non-raw literal through the
+/// `unicode_escape` decoder, and `decode_bytes_with_escapes` runs a bytes
+/// literal through its own, both before the parser interprets anything inside
+/// the literal.  The parser pyre delegates to reports every one of those
+/// failures as a single `Got unexpected unicode`, so the literal is re-scanned
+/// here to recover which escape failed and what the decoder would have said.
+///
+/// The positions the message carries are byte offsets into the literal's
+/// contents, spanning the backslash through the last character the decoder
+/// consumed.
+fn string_escape_error(source: &str) -> Option<EscapeError> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -11979,13 +11993,22 @@ fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
         if !prefix
             .iter()
             .all(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f' | b'r' | b't' | b'u'))
-            || prefix
-                .iter()
-                .any(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'r'))
         {
             cursor += 1;
             continue;
         }
+        let has = |wanted: u8| {
+            prefix
+                .iter()
+                .any(|byte| byte.to_ascii_lowercase() == wanted)
+        };
+        // A raw literal keeps its backslashes, so no decoder runs over it.
+        if has(b'r') {
+            cursor += 1;
+            continue;
+        }
+        let bytes_literal = has(b'b');
+        let replacement_fields = has(b'f') || has(b't');
 
         let quote = bytes[quote_start];
         let triple = bytes[quote_start..].starts_with(&[quote, quote, quote]);
@@ -12006,39 +12029,154 @@ fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
             }
         }
 
-        let mut escape = content_start;
-        while escape < content_end {
-            if bytes[escape] != b'\\' {
-                escape += 1;
-                continue;
-            }
-            if bytes.get(escape + 1) != Some(&b'N') {
-                escape = (escape + 2).min(content_end);
-                continue;
-            }
-            let malformed_end = if bytes.get(escape + 2) != Some(&b'{') {
-                Some(escape + 1)
-            } else if bytes[escape + 3..content_end]
-                .iter()
-                .all(|byte| *byte != b'}')
-            {
-                Some(content_end.saturating_sub(1))
+        let token_end = (content_end + quote_len).min(bytes.len());
+        if let Some(message) = escape_decode_error(
+            &bytes[content_start..content_end],
+            bytes_literal,
+            replacement_fields,
+        ) {
+            // A literal that holds replacement fields is several tokens, and
+            // the one the report points at is the closing quote; a literal
+            // that is one token is pointed at whole.
+            let span = if replacement_fields {
+                (token_end.saturating_sub(quote_len), token_end)
             } else {
-                None
+                (token_start, token_end)
             };
-            if let Some(malformed_end) = malformed_end {
-                return Some((
-                    format!(
-                        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
-                        escape - content_start,
-                        malformed_end - content_start,
-                    ),
-                    token_start,
+            return Some(EscapeError {
+                message,
+                literal_start: token_start,
+                span,
+            });
+        }
+        cursor = token_end;
+    }
+    None
+}
+
+/// The decoder's complaint about a literal's `contents`.
+///
+/// A literal holding replacement fields reaches the decoder one piece at a
+/// time -- the run of text between two fields -- and the positions the message
+/// carries are relative to the piece the escape sits in.
+fn escape_decode_error(
+    contents: &[u8],
+    bytes_literal: bool,
+    replacement_fields: bool,
+) -> Option<String> {
+    /// `'unicodeescape' codec can't decode bytes in position ...`, whose range
+    /// runs from the backslash through the last character consumed.
+    fn unicode_error(start: usize, end: usize, reason: &str) -> String {
+        format!(
+            "(unicode error) 'unicodeescape' codec can't decode bytes in position {start}-{end}: {reason}"
+        )
+    }
+
+    let mut piece_start = 0;
+    let mut cursor = 0;
+    while cursor < contents.len() {
+        // A replacement field is not text the decoder ever sees, and the piece
+        // after it starts over at position 0.  A doubled brace is not one: it
+        // stays in the piece it is written in.
+        if replacement_fields && contents[cursor] == b'{' && contents.get(cursor + 1) != Some(&b'{')
+        {
+            let mut depth = 1usize;
+            cursor += 1;
+            while cursor < contents.len() && depth > 0 {
+                match contents[cursor] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            piece_start = cursor;
+            continue;
+        }
+        if contents[cursor] != b'\\' {
+            cursor += 1;
+            continue;
+        }
+        let Some(&kind) = contents.get(cursor + 1) else {
+            return None;
+        };
+        // `\N{...}` names a character; a bytes literal has no such escape.  The
+        // brace here belongs to the escape, which is why the field skip above
+        // runs only where no backslash precedes it.
+        if kind == b'N' && !bytes_literal {
+            if contents.get(cursor + 2) != Some(&b'{') {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    cursor + 1 - piece_start,
+                    r"malformed \N character escape",
                 ));
             }
-            escape += 2;
+            let Some(close) = contents[cursor + 3..].iter().position(|byte| *byte == b'}') else {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    contents.len().saturating_sub(1) - piece_start,
+                    r"malformed \N character escape",
+                ));
+            };
+            let close = cursor + 3 + close;
+            let name = std::str::from_utf8(&contents[cursor + 3..close]).ok();
+            if name
+                .and_then(rustpython_unicode::lookup_character)
+                .is_none()
+            {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    close - piece_start,
+                    "unknown Unicode character name",
+                ));
+            }
+            cursor = close + 1;
+            continue;
         }
-        cursor = content_end.saturating_add(quote_len);
+        // `\u` and `\U` are ordinary characters in a bytes literal too.
+        let (width, form) = match kind {
+            b'x' => (2, r"\xXX"),
+            b'u' if !bytes_literal => (4, r"\uXXXX"),
+            b'U' if !bytes_literal => (8, r"\UXXXXXXXX"),
+            _ => {
+                cursor += 2;
+                continue;
+            }
+        };
+        let digits_start = cursor + 2;
+        let digits = contents[digits_start.min(contents.len())..]
+            .iter()
+            .take(width)
+            .take_while(|byte| byte.is_ascii_hexdigit())
+            .count();
+        if digits < width {
+            // `decode_bytes_with_escapes` reports its own failure, and names
+            // only where the escape began.
+            return Some(if bytes_literal {
+                let position = cursor - piece_start;
+                format!(r"(value error) invalid \x escape at position {position}")
+            } else {
+                unicode_error(
+                    cursor - piece_start,
+                    digits_start + digits - 1 - piece_start,
+                    &format!("truncated {form} escape"),
+                )
+            });
+        }
+        let end = digits_start + width;
+        if kind == b'U'
+            && std::str::from_utf8(&contents[digits_start..end])
+                .ok()
+                .and_then(|text| u32::from_str_radix(text, 16).ok())
+                .is_none_or(|value| value > 0x10_FFFF)
+        {
+            return Some(unicode_error(
+                cursor - piece_start,
+                end - 1 - piece_start,
+                "illegal Unicode character",
+            ));
+        }
+        cursor = end;
     }
     None
 }
@@ -12327,20 +12465,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             );
         }
     }
-    if let Some((unicode_error, literal_start)) = malformed_unicode_name_escape(source) {
+    let escape_error = string_escape_error(source).filter(|escape| {
         // Both the decode and the parse are failures of the same compile, and
         // the one reported is whichever comes first in the source. A literal
         // that sits after the parser's own error keeps that error, so
         // `1 +\nx = "\N"\n` still reports the incomplete expression on line 1.
-        let parser_start = match &e {
+        match &e {
             crate::compile::CompileError::Parse(parse_error) => {
-                Some(parse_error.raw_location.start().to_usize())
+                parse_error.raw_location.start().to_usize() >= escape.literal_start
             }
-            _ => None,
-        };
-        if parser_start.is_none_or(|start| start >= literal_start) {
-            msg = unicode_error;
+            _ => true,
         }
+    });
+    if let Some(escape) = &escape_error {
+        msg = escape.message.clone();
     }
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
@@ -12419,7 +12557,14 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     }
     let prefix_span = prefix_error.map(|(_, start, end)| (start, end));
     let delimiter_span = delimiter_error.map(|(_, index)| (index, index));
-    let diagnostic_span = literal_span
+    // Only where the decoder's complaint is still the one being reported: a
+    // literal can carry both a bad escape and one of the errors above, and
+    // that one names its own span.
+    let escape_span = escape_error
+        .filter(|escape| escape.message == msg)
+        .map(|escape| escape.span);
+    let diagnostic_span = escape_span
+        .or(literal_span)
         .or(fstring_span)
         .or(scope_span)
         .or(generator_span)
@@ -19502,23 +19647,60 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unicode_name_escape_precedes_fstring_parsing() {
-        for (source, range) in [
-            (r"f'\N'", "0-1"),
-            (r"f'\N{'", "0-2"),
-            (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
+    fn string_escape_errors_precede_parsing() {
+        for (source, range, reason) in [
+            (r"f'\N'", "0-1", r"malformed \N character escape"),
+            (r"f'\N{'", "0-2", r"malformed \N character escape"),
+            (
+                r"'\N{GREEK CAPITAL LETTER DELTA'",
+                "0-28",
+                r"malformed \N character escape",
+            ),
+            (r"'\N{DELTA}'", "0-8", "unknown Unicode character name"),
+            (r"'\x'", "0-1", r"truncated \xXX escape"),
+            (r"'ab\x1'", "2-4", r"truncated \xXX escape"),
+            (r"'\u12'", "0-3", r"truncated \uXXXX escape"),
+            (r"'\U0001'", "0-5", r"truncated \UXXXXXXXX escape"),
+            (r"'\U00110000'", "0-9", "illegal Unicode character"),
         ] {
-            let (message, literal_start) = malformed_unicode_name_escape(source).unwrap();
-            assert!(message.contains(&format!("position {range}:")), "{message}");
-            assert!(message.ends_with(r"malformed \N character escape"));
-            assert_eq!(literal_start, 0);
+            let escape = string_escape_error(source).unwrap();
+            assert!(
+                escape
+                    .message
+                    .contains(&format!("position {range}: {reason}")),
+                "{}",
+                escape.message
+            );
+            assert_eq!(escape.literal_start, 0);
         }
-        assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
-        assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
-        assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+        // A bytes literal has its own decoder, and no `\N`/`\u`/`\U` escape.
+        let escape = string_escape_error(r"b'ab\x1'").unwrap();
+        assert_eq!(
+            escape.message,
+            r"(value error) invalid \x escape at position 2"
+        );
+        assert!(string_escape_error(r"b'\N'").is_none());
+        assert!(string_escape_error(r"b'\u12'").is_none());
+
+        assert!(string_escape_error(r"r'\N'").is_none());
+        assert!(string_escape_error(r"'\N{GREEK CAPITAL LETTER DELTA}'").is_none());
+        assert!(string_escape_error(r"'\x41'").is_none());
+        assert!(string_escape_error(r"'\\N'").is_none());
+        // The whole literal is what a report without replacement fields points
+        // at; one with them points at the escape.
+        assert_eq!(string_escape_error(r"'\x'").unwrap().span, (0, 4));
+        assert_eq!(string_escape_error(r"f'\x'").unwrap().span, (4, 5));
+        // Each piece between two replacement fields is decoded on its own, so
+        // the position starts over after every one.
+        assert!(
+            string_escape_error(r"f'{1}\x'")
+                .unwrap()
+                .message
+                .contains("position 0-1:")
+        );
         // The offset is what lets an earlier parse error keep the report.
         assert_eq!(
-            malformed_unicode_name_escape("1 +\nx = \"\\N\"\n").map(|(_, start)| start),
+            string_escape_error("1 +\nx = \"\\N\"\n").map(|escape| escape.literal_start),
             Some(8)
         );
     }
