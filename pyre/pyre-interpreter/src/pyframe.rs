@@ -90,10 +90,20 @@ pub mod frame_locals_proxy {
         ///
         /// `rvirtualizable.py hook_access_field` puts the force at the field
         /// access.  The `f_locals` getter forces once, when it builds the
-        /// proxy, and a proxy is a live view that outlives that force: bind
-        /// one before a loop the JIT afterwards compiles and a write through
-        /// it lands in the frame array while the compiled loop still answers
-        /// the same local from its shadow.
+        /// proxy, and a proxy is a live view that outlives that force: bind one
+        /// before a loop the JIT afterwards compiles and the two sides stop
+        /// agreeing.  Both directions diverge, and each needs a store in the
+        /// loop *body* to show, because a store outside it precedes the compile:
+        ///
+        /// - a write through the proxy lands in the frame array while the
+        ///   compiled loop answers that local from its shadow;
+        /// - a `STORE_FAST` in the body lands in the shadow while a read
+        ///   through the proxy answers from the array.
+        ///
+        /// So every accessor that reaches `locals_cells_stack_w` calls this --
+        /// the write, the getitem scan and the snapshot.  [`Self::frame`] itself
+        /// does not: [`Self::fast_local_index`] goes through it only for `code`,
+        /// which is not a redirected field.
         ///
         /// The `vable_token` test is `virtualizable.py`'s, and it is required
         /// rather than a shortcut:
@@ -126,6 +136,10 @@ pub mod frame_locals_proxy {
 
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
+            // The snapshot copies `locals_cells_stack_w`, so materialize it
+            // first.  Nothing unrooted is live across the force here: the proxy
+            // payload is born non-moving and the frame is anchored.
+            self.force_locals();
             self.frame().frame_locals_proxy_snapshot()
         }
 
@@ -220,15 +234,17 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             value: PyObjectRef,
         ) -> Result<(), crate::PyError> {
-            // The write below targets `locals_cells_stack_w`, so materialize it
-            // first — outside the roots region, per `force_locals`.
-            self.force_locals();
             // `fast_local_index` compares against a freshly allocated string
             // per local and `get_or_create_extra_locals` allocates the dict, so
             // both stores below would otherwise write pre-allocation copies.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.publish(&[key, value]);
             roots.normalize(key_slot, 2);
+            // The stores below target `locals_cells_stack_w`, so materialize it
+            // first.  The force follows the publish rather than preceding the
+            // region: it can collect, and `key` and `value` are pre-allocation
+            // copies until they are rooted.
+            self.force_locals();
             let value_slot = key_slot + 1;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
                 let frame = self.frame();
@@ -272,6 +288,9 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
+            // The scan below reads `locals_cells_stack_w`, so materialize it
+            // first; `key` is rooted above because the force can collect.
+            self.force_locals();
             // Hashing runs before the scan, so an unhashable key is a
             // `TypeError` even for a frame with no locals to compare against.
             let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
