@@ -3983,6 +3983,46 @@ pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
     }
 }
 
+/// `error.py oefmt` — build an exception whose message is `valuefmt` with each
+/// format code filled from its own argument.
+///
+/// ```python
+/// @specialize.arg(1)
+/// def oefmt(w_type, valuefmt, *args):
+///     """Equivalent to OperationError(w_type, space.newtext(valuefmt % args)).
+///     More efficient in the (common) case where the value is not actually
+///     needed."""
+/// ```
+///
+/// The conversions run here rather than behind the message accessor, and that
+/// is a decision rather than an omission.  Upstream returns an `OpErrFmt`
+/// storing the operands and formats only when `get_w_value` asks
+/// `_compute_value`, which is the RPython saving its docstring advertises: an
+/// error caught by an interpreter-level guard and discarded never pays for its
+/// `%R`.  3.14 does not defer.  `_PyErr_FormatV` renders the whole string
+/// before it ever names the exception —
+///
+/// ```c
+/// /* Issue #23571: PyUnicode_FromFormatV() must not be called with an
+///    exception set, it calls arbitrary Python code like PyObject_Repr() */
+/// _PyErr_Clear(tstate);
+/// string = PyUnicode_FromFormatV(format, vargs);
+/// ```
+///
+/// — so `%R`'s `PyObject_Repr` runs at the raise, not at the read.  Measured on
+/// 3.14.2 with a `__repr__` that logs, against `types.GenericAlias(obj, ...)[int]`
+/// (`genericaliasobject.c` `"%R is not a generic class"`): one call at
+/// construction, none at `str(e)`.  Deferring would move that side effect and
+/// its unraisable to a different moment than 3.14 picks.
+///
+/// The upstream saving is also narrower than it looks on 3.x: `except` pushes
+/// the instance whether or not the handler binds it, so the first
+/// application-level handler forces `_compute_value` anyway.  What is left is
+/// the interpreter-internal swallow — `findattr`, the `async` guards — and
+/// taking it would need the operands rooted for a `PyError` in flight, which
+/// nothing can do: Rust memcpies the carrier at every `?`, the same
+/// constraint that keeps the traceback chain on the instance
+/// ([`PyError::get_traceback`]).
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.  Nothing on the way to the
