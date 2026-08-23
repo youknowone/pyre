@@ -92,6 +92,3 @@ class Context(metaclass=Unsubclassable):
         if not isinstance(other, Context):
             return NotImplemented
         return dict(self.items()) == dict(other.items())
-
-
-Context.__module__ = '_contextvars'

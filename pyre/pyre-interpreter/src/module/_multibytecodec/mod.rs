@@ -478,6 +478,7 @@ crate::py_module! {
             ns,
             include_str!("app_multibytecodec.py"),
             "app_multibytecodec.py",
+            "_multibytecodec",
             &[
                 "MultibyteCodec",
                 "MultibyteIncrementalDecoder",

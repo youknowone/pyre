@@ -391,11 +391,13 @@ pub struct PyCode {
     /// with the rest of this code object's managed children.
     pub w_weakreflifeline: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py, 147`). Set by
-    /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
-    /// app_main bridge code.  Pyre has no such call site yet, so this
-    /// is always `false` on currently constructed instances; the
-    /// field exists so that `frame.hide()` can read the canonical
-    /// `pyframe.py return self.pycode.hidden_applevel`.
+    /// `pycompiler.compile(hidden_applevel=True)` for the app-level half of a
+    /// mixed module (`gateway.py ApplevelClass`), and by
+    /// `interp_magic.py hidden_applevel(func)` for one function at a time.
+    /// `pyframe.py hide` reads it, which is what keeps such a frame out of the
+    /// trace hook (`executioncontext.py _trace`), out of a recorded traceback
+    /// (`pytraceback.py record_application_traceback`) and out of the
+    /// `getnextframe_nohidden` walk `sys._getframe` counts along.
     pub hidden_applevel: bool,
     /// pycode.py `_compute_flatcall`. Cached arity descriptor:
     /// - 0-4: impossible (builtins only)
@@ -1033,22 +1035,28 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 ///
 /// # Safety
 /// `code` must point to a `CodeObject` that is never freed and never moved.
-unsafe fn box_code_constant_in_place(code: *const crate::CodeObject) -> PyObjectRef {
-    w_code_new(code as *const ())
+unsafe fn box_code_constant_in_place(
+    code: *const crate::CodeObject,
+    hidden_applevel: bool,
+) -> PyObjectRef {
+    w_code_new_with_hidden_applevel(code as *const (), hidden_applevel)
 }
 
-/// Wrap a nested compiler constant and inherit the enclosing `PyCode`'s raw
-/// filename when it belongs to the set selected by
-/// `importing.py update_code_filenames`' `oldname` guard.
+/// Wrap a nested compiler constant and inherit the two things the enclosing
+/// `PyCode` holds for a whole compilation unit rather than for one object: the
+/// raw filename, when it belongs to the set selected by
+/// `importing.py update_code_filenames`' `oldname` guard, and
+/// `hidden_applevel`, which `assemble.py make_code` reads off `compile_info`
+/// for every code object one compilation produces.
 ///
 /// # Safety
 /// `code` must satisfy [`box_code_constant_in_place`], and `parent` must be
 /// the `PyCode` whose constants table holds it.
-unsafe fn box_code_constant_inheriting_filename(
+unsafe fn box_code_constant_inheriting_unit(
     code: *const crate::CodeObject,
     parent: &PyCode,
 ) -> PyObjectRef {
-    let obj = unsafe { box_code_constant_in_place(code) };
+    let obj = unsafe { box_code_constant_in_place(code, parent.hidden_applevel) };
     if parent.filename_inherits_to_nested
         && unsafe { &*code }.source_path
             == unsafe { &*(parent.code_ptr as *const crate::CodeObject) }.source_path
@@ -2470,7 +2478,7 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
 
     let mut realized = match &constants[idx] {
         crate::bytecode::ConstantData::Code { code } => unsafe {
-            box_code_constant_inheriting_filename(&**code as *const crate::CodeObject, w_code)
+            box_code_constant_inheriting_unit(&**code as *const crate::CodeObject, w_code)
         },
         constant => crate::pyframe::pyobject_from_constant(constant),
     };

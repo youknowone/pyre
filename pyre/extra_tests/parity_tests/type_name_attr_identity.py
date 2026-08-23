@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins type.__name__ handing back the assigned str object; pypy3 hands back a copy
 # CPython-suite gap: mutable-type-name tests omit str-subclass identity under hot reads.
 # parity-tests reason: this guards pyre's JIT fold of the metatype name slot.
 

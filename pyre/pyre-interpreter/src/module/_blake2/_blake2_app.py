@@ -189,9 +189,12 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                 type(self).__module__, type(self).__name__, id(self)
             )
 
+    # The class statement above names both types `_Blake`; the factory's two
+    # results have to answer with the name each was asked for.  `__module__`
+    # needs no such repair -- the class body already read it off this file's
+    # own `__name__`.
     type.__setattr__(_Blake, "__name__", class_name)
     type.__setattr__(_Blake, "__qualname__", class_name)
-    type.__setattr__(_Blake, "__module__", "_blake2")
     return _Blake
 
 

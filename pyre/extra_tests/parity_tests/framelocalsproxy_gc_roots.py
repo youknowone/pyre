@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins PEP 667 write-through f_locals (3.13); a write through pypy3's proxy does not reach the fast local
 # CPython-suite gap: no suite test collects inside the key comparison a
 # FrameLocalsProxy operation performs.
 # parity-tests reason: this is a pyre/PyPy moving-GC root-liveness regression.

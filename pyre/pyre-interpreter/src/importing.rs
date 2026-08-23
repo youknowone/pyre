@@ -3749,7 +3749,9 @@ fn exec_code_module(
 /// each binding in `names` into the caller's module dict `ns`.
 ///
 /// `filename` is used as the source path for tracebacks / co_filename
-/// only.  Every function defined in `source` retains the intermediate
+/// only; `modname` is the name the namespace answers `__name__` with, and so
+/// the `__module__` of everything `source` defines.  Every function defined
+/// in `source` retains the intermediate
 /// namespace as its `__globals__`; once copied into the caller's module,
 /// those functions keep the namespace transitively reachable.
 #[doc(hidden)]
@@ -3767,9 +3769,10 @@ pub fn appleveldef_install(
     ns: impl AppleveldefNamespace,
     source: &str,
     filename: &str,
+    modname: &str,
     names: &[&str],
 ) {
-    appleveldef_install_seeded(ns, source, filename, names, &[]);
+    appleveldef_install_seeded(ns, source, filename, modname, names, &[]);
 }
 
 /// [`appleveldef_install`] with `seed` bound into the app namespace before the
@@ -3785,6 +3788,7 @@ pub fn appleveldef_install_seeded(
     mut ns: impl AppleveldefNamespace,
     source: &str,
     filename: &str,
+    modname: &str,
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
 ) {
@@ -3797,11 +3801,31 @@ pub fn appleveldef_install_seeded(
     let w_app_globals = unsafe { (*ctx).fresh_module_globals() };
     let _root = pyre_object::gc_roots::push_roots();
     let w_app_globals = pyre_object::gc_roots::pin_root(w_app_globals);
+    // `gateway.py build_applevel_dict` binds the owning module's name into the
+    // namespace before the source runs, so a `def` or a `class` in it answers
+    // `__module__` with the module it belongs to rather than `None` for a
+    // function or `builtins` for a class.  `modname` is what
+    // `mixedmodule.py MixedModule.get_applevel_name` names: the module's own
+    // name, or `"<parent>.<child>"` for a submodule.  A source that must be
+    // seen under a different name -- the public spelling of an accelerator it
+    // backs -- rebinds `__name__` itself, and that assignment runs later.
+    unsafe {
+        pyre_object::w_dict_setitem_str(w_app_globals, "__name__", pyre_object::w_str_new(modname))
+    };
     for &(name, value) in seed {
         unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
     }
     let code_ptr = Box::into_raw(Box::new(code));
-    let w_code = crate::w_code_new(code_ptr as *const ());
+    // `gateway.py ApplevelClass.hidden_applevel = True`, which
+    // `build_applevel_dict` passes to `space.exec_` and the compiler carries as
+    // `CompileInfo`; every code object of the unit is then built with it
+    // (`assemble.py make_code`), so the flag set here reaches the nested
+    // functions this source defines.
+    //
+    // Every source installed here is a native module's body — the module is
+    // built in, and what it holds is an extension module on CPython — so none
+    // of these frames are the running program's.
+    let w_code = crate::pycode::w_code_new_with_hidden_applevel(code_ptr as *const (), true);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
     if let Err(e) = frame.run_with_jit() {

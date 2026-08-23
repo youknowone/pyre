@@ -1498,6 +1498,7 @@ crate::py_module! {
             ns,
             include_str!("_io_app.py"),
             "_io_app.py",
+            "_io",
             &["IncrementalNewlineDecoder"],
             &[("_TextIOBase", text_base)],
         );

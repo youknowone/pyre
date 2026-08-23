@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14's SyntaxError column offsets, which pypy3 reports differently
 # CPython-suite gap: multibyte SyntaxError offsets are not exhaustively asserted.
 # parity-tests reason: guard pyre's CPython 3.14 character-column semantics.
 

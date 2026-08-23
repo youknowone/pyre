@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins math.sumprod (3.12), absent from the CPython 3.11 pypy3 implements
 # CPython-suite gap: math tests do not collect while retaining numeric operands.
 # parity-tests reason: this is a pyre/PyPy moving-GC root-liveness regression.
 # parity-env: PYPY_GC_NURSERY=4096

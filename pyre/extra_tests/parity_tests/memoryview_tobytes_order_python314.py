@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14 taking memoryview.tobytes' order positionally; pypy3 accepts it only by keyword
 # CPython-suite gap: memoryview.tobytes order conversions are not all asserted.
 # parity-tests reason: guard pyre's CPython 3.14 memoryview conversion surface.
 

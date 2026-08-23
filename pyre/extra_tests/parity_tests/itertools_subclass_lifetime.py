@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins itertools.batched (3.12), absent from the CPython 3.11 pypy3 implements
 # CPython-suite gap: itertools subclass tests omit user-finalizer lifetime.
 # parity-tests reason: this guards PyPy-style allocation and moving-GC ownership.
 

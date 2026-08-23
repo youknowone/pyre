@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins _pylong (3.12), absent from the CPython 3.11 pypy3 implements
 # CPython-suite gap: closure tests cannot cover pyre JIT residual-call liveness.
 # parity-tests reason: guard a closure-owned set across an inlined recursive call.
 

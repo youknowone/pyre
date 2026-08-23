@@ -96,6 +96,9 @@ fn handle(which: usize) -> PyObjectRef {
         pyre_object::gc_roots::shadow_stack_get(save_point),
         ASYNC_OP_SRC,
         "app_operation.py",
+        // `pypy/module/__builtin__/moduledef.py Module.applevel_name`, which
+        // `get_applevel_name` hands to every appleveldef of that module.
+        "builtins",
         &["aiter", "anext"],
     );
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);

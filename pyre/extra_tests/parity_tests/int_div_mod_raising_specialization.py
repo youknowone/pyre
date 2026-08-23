@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins 3.14's "division by zero"; pypy3 reports "integer division or modulo by zero"
 # CPython-suite gap: int div/mod tests do not compare cold/hot raising traces.
 # parity-tests reason: this guards pyre's JIT exact-int raising specialization.
 

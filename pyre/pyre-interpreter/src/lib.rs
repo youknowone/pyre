@@ -347,6 +347,7 @@ macro_rules! py_module {
                     ns,
                     include_str!($appfile),
                     $appfile,
+                    $name,
                     &[ $( $appname ),* ],
                 );
             )*)?
@@ -361,6 +362,7 @@ macro_rules! py_module {
                     ns,
                     $inline_src,
                     "<inline>",
+                    $name,
                     &[ $( $inline_name ),* ],
                 );
             )*)?
