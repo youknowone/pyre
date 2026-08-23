@@ -2920,31 +2920,3 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
     let _ = w_root;
     WRootFinalizerQueue
 }
-
-/// A stand-in for `interp_jit.py`'s `is_being_profiled` portal green at the
-/// green-key sites that hold no frame.
-///
-/// The markers do not use this: `jit_merge_point` and `can_enter_jit` both
-/// take `frame.get_is_being_profiled()`, as their declarations do. What has no
-/// frame to read is the `u64` key form — a function entry keys on
-/// `(pycode, 0)` and `fbw_decline` keys on `(pycode, start_pc)` from inside a
-/// walk — so `make_green_key` names the green here instead of taking it.
-///
-/// That makes this an approximation of the green at those sites, and the two
-/// forms can disagree while a profile function is installed. Threading the
-/// caller's own green through `make_green_key` is what removes the
-/// approximation; until then the disagreement is confined to the profiled
-/// regime, where the portal is already effectively out of service.
-///
-/// It reads `profilefunc` rather than a frame's flag because the flag is a
-/// cache of this slot: `setllprofile` calls
-/// `force_all_frames(is_being_profiled=True)` only when installing, so
-/// clearing the profile function leaves every live frame's flag set until
-/// `_c_call_return_trace` or `c_exception_trace` next observes `profilefunc`
-/// gone and repairs it. Every hook fire is gated on `profilefunc` — `leave`,
-/// `call_trace` and `_c_call_return_trace` all test it — so between the clear
-/// and the repair the flag names a regime that is no longer in force.
-pub fn current_is_being_profiled() -> bool {
-    let ec = crate::call::getexecutioncontext();
-    !ec.is_null() && unsafe { (*ec).profilefunc.is_some() }
-}

@@ -1639,7 +1639,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let w_code = caller.pycode;
-    let green_key = crate::eval::make_green_key(w_code, 0);
+    let green_key = crate::eval::make_green_key(w_code, 0, caller.get_is_being_profiled());
     let _token_num = self_recursive_dispatch(green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -2078,8 +2078,8 @@ fn jit_blackhole_resume_from_guard(
         None if num_fail_values >= 1 => {
             let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
             if !frame_ptr.is_null() {
-                let code = unsafe { (*frame_ptr).pycode };
-                crate::eval::make_green_key(code, 0)
+                let frame = unsafe { &*frame_ptr };
+                crate::eval::make_green_key(frame.pycode, 0, frame.get_is_being_profiled())
             } else {
                 0
             }

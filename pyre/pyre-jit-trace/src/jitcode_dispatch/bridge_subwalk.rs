@@ -909,6 +909,7 @@ pub(crate) fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Opt
 
 pub(crate) fn recipe_parent_frame_from_recipe(
     ctx: &mut TraceCtx,
+    is_being_profiled: bool,
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
@@ -940,6 +941,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     // snapshot.
     let (pending, _argboxes_r) = crate::state::setup_reconstructed_callee_frame(
         ctx,
+        is_being_profiled,
         recipe,
         root_ec,
         root_ec_box,
@@ -1092,6 +1094,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let is_being_profiled = session.borrow().is_being_profiled;
 
     // Terminal descrs must be wired on MetaInterpStaticData before the walk can
     // produce a compilable FINISH (mirror `dispatch_perfn_frame`).  The walk
@@ -1286,6 +1290,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         ));
         parent_for_current = recipe_parent_frame_from_recipe(
             ctx,
+            is_being_profiled,
             parent_recipe,
             root_sym.concrete_execution_context(),
             root_sym.execution_context(),

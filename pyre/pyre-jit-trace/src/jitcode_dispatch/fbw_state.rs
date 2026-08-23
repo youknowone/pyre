@@ -1953,6 +1953,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
         if let Some((callee_code_key, _)) = hazardous_callee {
             fbw_deny_hazardous_inline(callee_code_key);
+            let is_being_profiled = ctx.session.borrow().is_being_profiled;
             // `fbw_deny_hazardous_inline` writes a thread-local set that only
             // this walker reads, so the deny stayed invisible to the warm
             // state: `dont_trace_here` counted zero on every fixture that
@@ -1969,6 +1970,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                     .disable_noninlinable_function(crate::driver::make_green_key(
                         callee_code_key as *const (),
                         0,
+                        is_being_profiled,
                     ));
             }
         }

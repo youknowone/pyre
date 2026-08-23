@@ -952,6 +952,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if !ctx.is_authoritative_executor {
         return Ok(None);
     }
+    let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // Only a genuine `call_fn` residual is a candidate — every
     // container/builtin helper carries a distinct tag.
     if pyre_helper != majit_ir::PyreHelperKind::CallFn {
@@ -1142,18 +1143,18 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Ok(None);
     }
     // Resolve the callee's own loop or trace-in-progress marker with
-    // `make_green_key(w_callee_code, 0)` (`pc = 0` = function entry). A
+    // `make_green_key` at `(w_callee_code, 0)` (`pc = 0` = function entry). A
     // pending token only proves the callee is
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
-    let callee_key = crate::driver::make_green_key(w_code, 0);
+    let callee_key = crate::driver::make_green_key(w_code, 0, is_being_profiled);
     // warmstate.py / compile.py: resolve an installed
     // procedure token, or synthesize a tmp callback token while the real loop
     // is still tracing.
     let greenboxes = [
         majit_ir::Value::Int(0),
-        majit_ir::Value::Int(0),
+        majit_ir::Value::Int(is_being_profiled as i64),
         majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
     ];
     let red_types = [Type::Ref, Type::Ref];
@@ -3374,6 +3375,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     require_exact_int_result: bool,
     instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a
@@ -3579,7 +3581,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // later sibling calls in the same trace go straight to CALL_ASSEMBLER
     // instead of starting a fresh unroll from their now-shallower framestack.
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
-    let callee_green_key = crate::driver::make_green_key(w_code, 0);
+    let callee_green_key = crate::driver::make_green_key(w_code, 0, is_being_profiled);
     if let Some((driver, _)) = crate::driver::try_driver_pair()
         && !driver
             .meta_interp_mut()
@@ -5335,13 +5337,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `disable_noninlinable_function` is applied to.
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
-                crate::driver::make_green_key(raw_callee_code as *const (), 0),
+                crate::driver::make_green_key(raw_callee_code as *const (), 0, is_being_profiled),
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
                 Some(crate::driver::make_green_key_typed(
                     raw_callee_code as *const (),
                     0,
+                    is_being_profiled,
                 )),
             ),
             sub_wc.trace_ctx.get_trace_position(),

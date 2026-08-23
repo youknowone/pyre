@@ -7,20 +7,13 @@ use crate::callbacks;
 use crate::state::PyreJitState;
 
 /// RPython green_key = pypyjit greens `[next_instr, is_being_profiled,
-/// pycode]` (interp_jit.py). `is_being_profiled` is read from the running
-/// execution context (`current_is_being_profiled`) rather than folded to 0,
-/// so installing a profiler selects a different cell instead of sharing the
-/// unprofiled one. The returned u64 is the full
+/// pycode]` (interp_jit.py). The returned u64 is the full
 /// `JitCell.get_uhash` over the typed green tuple (warmstate.py),
 /// so this legacy hash flow and the typed marker-path lookup
 /// (`lookup_chain_with_key`) agree on the same cell.
 #[inline(always)]
-pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
-    majit_ir::pypyjit_greenkey_uhash(
-        pc,
-        pyre_interpreter::executioncontext::current_is_being_profiled(),
-        code_ptr as u64,
-    )
+pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
+    majit_ir::pypyjit_greenkey_uhash(pc, is_being_profiled, code_ptr as u64)
 }
 
 /// The typed form of [`make_green_key`]: the greens themselves, not a fold of
@@ -31,12 +24,19 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// cell out of a bucket, and a cell created from the fold alone is filed
 /// without a comparekey, where no later typed lookup can find it. The u64 form
 /// stays correct for calls that only move a counter.
-pub fn make_green_key_typed(code_ptr: *const (), pc: usize) -> majit_ir::GreenKey {
-    majit_ir::pypyjit_greenkey(
-        pc,
-        pyre_interpreter::executioncontext::current_is_being_profiled(),
-        code_ptr as u64,
-    )
+pub fn make_green_key_typed(
+    code_ptr: *const (),
+    pc: usize,
+    is_being_profiled: bool,
+) -> majit_ir::GreenKey {
+    majit_ir::pypyjit_greenkey(pc, is_being_profiled, code_ptr as u64)
+}
+
+/// Read the pypyjit profiling green from the concrete frame for a walk.
+#[inline]
+pub fn frame_is_being_profiled(frame_addr: usize) -> bool {
+    let frame = frame_addr as *const pyre_interpreter::pyframe::PyFrame;
+    !frame.is_null() && unsafe { (*frame).get_is_being_profiled() }
 }
 
 /// Type alias for the JIT driver pair. Must match pyre-jit/eval.rs JitDriverPair.

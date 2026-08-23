@@ -11433,8 +11433,12 @@ impl JitState for PyreJitState {
         if frame_ptr.is_null() {
             return None;
         }
-        let code = unsafe { (*frame_ptr).pycode };
-        Some(crate::driver::make_green_key(code, pc))
+        let frame = unsafe { &*frame_ptr };
+        Some(crate::driver::make_green_key(
+            frame.pycode,
+            pc,
+            frame.get_is_being_profiled(),
+        ))
     }
 
     fn code_ptr(&self) -> usize {
@@ -14677,6 +14681,7 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// stamps `parent_frames.first().pending_result_*`, which stays `None`.
 pub(crate) fn assemble_bridge_inline_pending(
     ctx: &mut TraceCtx,
+    is_being_profiled: bool,
     recipe: &ReconstructRecipe,
     execution_context: *const pyre_interpreter::PyExecutionContext,
     parent_frames: Vec<ResumeFrameState>,
@@ -14758,7 +14763,7 @@ pub(crate) fn assemble_bridge_inline_pending(
         // The reconstructed frame represents the same inlined call the
         // forward trace pushed at function entry; match its (code, 0)
         // greenkey identity for recursion-depth + inline-position tracking.
-        green_key: crate::driver::make_green_key(w_code, 0),
+        green_key: crate::driver::make_green_key(w_code, 0, is_being_profiled),
         green_key_raw: (w_code as usize, 0),
         parent_frames,
         nargs: recipe.nargs,
@@ -14792,6 +14797,7 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// caller must invoke this at the point the callee frame is reconstructed.
 pub(crate) fn setup_reconstructed_callee_frame(
     ctx: &mut TraceCtx,
+    is_being_profiled: bool,
     recipe: &ReconstructRecipe,
     execution_context: *const pyre_interpreter::PyExecutionContext,
     ec_box: OpRef,
@@ -15030,7 +15036,13 @@ pub(crate) fn setup_reconstructed_callee_frame(
     drop(concrete_frame);
     drop(concrete_roots);
 
-    let mut pending = assemble_bridge_inline_pending(ctx, recipe, execution_context, parent_frames);
+    let mut pending = assemble_bridge_inline_pending(
+        ctx,
+        is_being_profiled,
+        recipe,
+        execution_context,
+        parent_frames,
+    );
     pending.sym.frame = frame_vable;
     pending.sym.concrete_vable_ptr = concrete_frame_ptr as *mut u8;
     // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot

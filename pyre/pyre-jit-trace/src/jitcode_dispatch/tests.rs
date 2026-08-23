@@ -11894,11 +11894,11 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     ];
     // Model the trace as having STARTED at this loop header, so the second
     // arrival closes on the merge point the first arrival registered.  The
-    // arriving key is `make_green_key(pycode, next_instr)` from the green
+    // arriving key is `make_green_key` at `(pycode, next_instr)` from the green
     // concretes below.
     let mut tc = TraceCtx::for_test_types_with_green_key(
         &[Type::Ref],
-        crate::driver::make_green_key(0x1_0000 as *const (), 42),
+        crate::driver::make_green_key(0x1_0000 as *const (), 42, false),
     );
     let next_instr = tc.const_int(42); // gi[0] = Python pc
     let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
@@ -12057,7 +12057,7 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let pycode_ptr = 0x1_0000usize;
     let mut tc = TraceCtx::for_test_types_with_green_key(
         &[Type::Ref],
-        crate::driver::make_green_key(pycode_ptr as *const (), 42),
+        crate::driver::make_green_key(pycode_ptr as *const (), 42, false),
     );
     let next_instr = tc.const_int(42);
     let unused = tc.const_int(99);

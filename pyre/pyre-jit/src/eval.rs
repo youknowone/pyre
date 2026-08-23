@@ -6020,11 +6020,7 @@ fn green_key_from_pycode(
     if code_ptr.is_null() {
         return None;
     }
-    Some(majit_ir::pypyjit_greenkey_uhash(
-        next_instr,
-        is_being_profiled,
-        code_ptr as u64,
-    ))
+    Some(make_green_key(code_ptr, next_instr, is_being_profiled))
 }
 
 /// The typed `GreenKey` behind [`green_key_from_pycode`]'s `u64`.
@@ -6514,17 +6510,13 @@ pub(crate) fn call_depth() -> u32 {
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
 // dont_look_inside: green-key construction (pypyjit_greenkey_uhash); JIT-driver machinery.
 #[majit_macros::dont_look_inside]
-pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
+pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
     // Full `JitCell.get_uhash` over the pypyjit green tuple
     // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
-    // computed allocation-free. `is_being_profiled` folds to 0 (the JIT
-    // path is never profiled), so this matches the typed marker-path key
-    // and both lookups resolve to the same cell.
-    majit_ir::pypyjit_greenkey_uhash(
-        pc,
-        pyre_interpreter::executioncontext::current_is_being_profiled(),
-        code_ptr as u64,
-    )
+    // computed allocation-free. The caller supplies the same frame green used
+    // by the portal markers, so this and the typed marker-path key resolve to
+    // the same cell.
+    majit_ir::pypyjit_greenkey_uhash(pc, is_being_profiled, code_ptr as u64)
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::PY_RECURSION_DEPTH is the
@@ -6731,8 +6723,9 @@ fn unpack_merge_point_jit(
     }
     // baseobjspace.py iterator_greenkey → space.type(w_iterable): a per-type
     // singleton, so its address hashes to one stable green key per iterator type
-    // (`pc = 0`, novable — no bytecode offset).
-    let green_key = make_green_key(greenkey as *const (), 0);
+    // (`pc = 0`, novable — no bytecode offset). The jd1 driver has no
+    // `is_being_profiled` green, so its pypyjit-shaped key uses false.
+    let green_key = make_green_key(greenkey as *const (), 0, false);
     if !jd1_counter_tick(green_key) {
         return;
     }
@@ -6875,7 +6868,7 @@ fn drive_unpack_iterable_trace(
     // (`JitCell.comparekey` is what selects a cell within its bucket,
     // warmstate.py `def comparekey(self, *greenargs2)`), so the same
     // green key can go on to own a second cell in the same bucket, with its own
-    // token and flags. `green_key` is `make_green_key(greenkey_raw, 0)` (above),
+    // token and flags. `green_key` is `make_green_key` at `(greenkey_raw, 0)` (above),
     // so the pair reconstructs the identical hash.
     let action = meta.force_start_tracing(
         green_key,
@@ -9098,7 +9091,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // can_enter_jit is a lowered no-op / merge point; re-seed
                 // conservatively before the next frame reads.
                 let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
-                let green_key = make_green_key(unsafe { &*f }.pycode, loop_header_pc);
+                let green_key = make_green_key(
+                    unsafe { &*f }.pycode,
+                    loop_header_pc,
+                    unsafe { &*f }.get_is_being_profiled(),
+                );
                 if let Some(loop_result) = maybe_compile_and_run(
                     unsafe { &mut *f },
                     green_key,
@@ -9631,7 +9628,7 @@ fn handle_fail(
     //
     // The demotion registry is keyed on the FOR_ITER SITE, which is what the
     // marker carries and what `walker_foriter_green_key` reads back before
-    // specializing again — `make_green_key(w_code, foriter_start_pc)` for the
+    // specializing again — `make_green_key` at `(w_code, foriter_start_pc)` for the
     // FOR_ITER the guard protects, not for the loop this trace was entered at.
     // Those differ whenever the specialized FOR_ITER is not the entry header
     // itself (an inner loop inside a trace entered at an outer one), and
@@ -10769,7 +10766,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key(frame_root.frame().pycode, frame_root.frame().next_instr());
+    let green_key = make_green_key(
+        frame_root.frame().pycode,
+        frame_root.frame().next_instr(),
+        frame_root.frame().get_is_being_profiled(),
+    );
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
