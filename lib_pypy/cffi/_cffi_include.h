@@ -55,20 +55,6 @@
 #endif
 
 #include <Python.h>
-
-/* Whether the interpreter implements `_cffi_backend` itself.  It decides how a
-   generated module is reached: PyPy's built-in backend calls
-   `_cffi_pypyinit_*` and reads the type context back out of an array, while
-   the backend built from `_cffi_backend.c` is reached from `PyInit_*` through
-   the capsule of function pointers below.
-
-   pyre defines `PYPY_VERSION` -- it is the name "these are not CPython's
-   object layouts" is already spelled under -- and loads the C backend, so the
-   question is asked here rather than by naming an interpreter. */
-#if defined(PYPY_VERSION) && !defined(PYRE_VERSION)
-#  define _CFFI_BUILTIN_BACKEND
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -139,7 +125,7 @@ extern "C" {
 #endif
 
 /**********  CPython-specific section  **********/
-#ifndef _CFFI_BUILTIN_BACKEND
+#ifndef PYPY_VERSION
 
 
 #if PY_MAJOR_VERSION >= 3
