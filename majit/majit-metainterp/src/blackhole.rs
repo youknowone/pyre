@@ -9821,11 +9821,22 @@ bhhandler_r_v!(
     handler_hint_force_virtualizable,
     bhimpl_hint_force_virtualizable
 );
+/// RPython `blackhole.py bhimpl_guard_class`:
+/// ```python
+/// @arguments("cpu", "r", returns="i")
+/// def bhimpl_guard_class(cpu, struct):
+///     return cpu.bh_classof(struct)
+/// ```
+/// The guard has already failed by the time the blackhole reaches this op,
+/// so it produces the receiver's class pointer and does not branch.
 fn handler_guard_class(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let cpu = bh.cpu.expect("cpu not set");
+    let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
+    bh.registers_i[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
 /// `vtable_method_ptr` reaches the blackhole only when a `dyn Trait`

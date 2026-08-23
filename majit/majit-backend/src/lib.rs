@@ -3625,8 +3625,16 @@ pub trait Backend: Send {
     }
 
     /// model.py: bh_classof(obj_ptr)
-    fn bh_classof(&self, _obj_ptr: i64) -> i64 {
-        0
+    ///
+    /// `llmodel.py bh_classof` reads the object's class word:
+    ///   struct = lltype.cast_opaque_ptr(rclass.OBJECTPTR, struct)
+    ///   return ptr2int(struct.typeptr)
+    ///
+    /// That is the same `struct.typeptr` read `cls_of_box` performs, so both
+    /// go through one place and a backend with a different object model
+    /// overrides `cls_of_box` alone.
+    fn bh_classof(&self, obj_ptr: i64) -> i64 {
+        self.cls_of_box(obj_ptr)
     }
     /// RPython rclass.ll_issubclass(typeptr, bounding_class).
     /// Returns true if `typeptr` is a subclass of `bounding_class`.
