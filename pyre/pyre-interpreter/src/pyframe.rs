@@ -5723,17 +5723,32 @@ pub fn createframe_obj(
     let num_locals = code_ref.varnames.len();
     let num_cells = ncells(code_ref);
     let max_stack = code_ref.max_stackdepth as usize;
-    let frame_stores_global =
-        unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-
     let size = num_locals + num_cells + max_stack;
-    let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
+    // `frame_builtin_obj` and `FrameBox::new` are both collection points.
+    // `FrameBox::new` republishes the `PyFrame`'s own GCREF fields, but the
+    // globals override is not one of them any more and the code object retains
+    // only the FIRST globals dictionary, so nothing else names this one: a
+    // collection between here and `set_w_globals` would leave `f_globals`
+    // reading a relocated pointer. Carry the whole set on the root stack and
+    // read each back after the last allocation before its use, as
+    // `PyFrame::new` does for its own constructor.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.base();
+    let _ = _roots.pin_root(code as PyObjectRef);
+    let _ = _roots.pin_root(w_globals);
+    let frame_stores_global = unsafe {
+        crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
+    };
+    let _ = _roots.pin_root(crate::baseobjspace::frame_builtin_obj(
+        _roots.get(root_base + 1),
+        execution_context,
+    ));
+    let locals_cells_stack_w =
+        unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc) };
     let mut frame = FrameBox::new(PyFrame {
         ob_header: frame_ob_header(),
-        pycode: code,
-        locals_cells_stack_w: unsafe {
-            alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc)
-        },
+        pycode: _roots.get(root_base) as *const (),
+        locals_cells_stack_w,
         valuestackdepth: num_locals + num_cells,
         last_instr: -1,
         flags: 0,
@@ -5744,10 +5759,10 @@ pub fn createframe_obj(
         f_generator_nowref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        w_builtin,
+        w_builtin: _roots.get(root_base + 2),
     });
     if frame_stores_global {
-        frame.set_w_globals(w_globals);
+        frame.set_w_globals(_roots.get(root_base + 1));
     }
     // pyframe.py `PyFrame.__init__` — final step. PY_NULL plays the role of
     // Python `None` per the existing `initialize_frame_scopes` convention.
