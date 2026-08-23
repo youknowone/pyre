@@ -267,18 +267,37 @@ pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
 pub const PY_TPFLAGS_IMMUTABLETYPE: std::ffi::c_ulong = 1 << 8;
 pub const PY_TPFLAGS_ITEMS_AT_END: std::ffi::c_ulong = 1 << 23;
 
+/// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass flags".
+///
+/// A `Py*_Check` written for C is a flag test rather than a call, so a type
+/// whose bit is clear reads as not being one.
+pub const PY_TPFLAGS_LONG_SUBCLASS: std::ffi::c_ulong = 1 << 24;
+pub const PY_TPFLAGS_LIST_SUBCLASS: std::ffi::c_ulong = 1 << 25;
+pub const PY_TPFLAGS_TUPLE_SUBCLASS: std::ffi::c_ulong = 1 << 26;
+pub const PY_TPFLAGS_BYTES_SUBCLASS: std::ffi::c_ulong = 1 << 27;
+pub const PY_TPFLAGS_UNICODE_SUBCLASS: std::ffi::c_ulong = 1 << 28;
+pub const PY_TPFLAGS_DICT_SUBCLASS: std::ffi::c_ulong = 1 << 29;
+pub const PY_TPFLAGS_BASE_EXC_SUBCLASS: std::ffi::c_ulong = 1 << 30;
+pub const PY_TPFLAGS_TYPE_SUBCLASS: std::ffi::c_ulong = 1 << 31;
+
 /// The fast-subclass flags, in the order `inherit_special` tests them
 /// (`typeobject.py:492-509`): the first base that matches wins, so a type is
 /// only ever marked as one of these.
 const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, std::ffi::c_ulong); 8] = [
-    (&pyre_object::interp_exceptions::EXCEPTION_TYPE, 1 << 30),
-    (&pyre_object::pyobject::TYPE_TYPE, 1 << 31),
-    (&pyre_object::pyobject::INT_TYPE, 1 << 24),
-    (&pyre_object::bytesobject::BYTES_TYPE, 1 << 27),
-    (&pyre_object::pyobject::STR_TYPE, 1 << 28),
-    (&pyre_object::pyobject::TUPLE_TYPE, 1 << 26),
-    (&pyre_object::pyobject::LIST_TYPE, 1 << 25),
-    (&pyre_object::pyobject::DICT_TYPE, 1 << 29),
+    (
+        &pyre_object::interp_exceptions::EXCEPTION_TYPE,
+        PY_TPFLAGS_BASE_EXC_SUBCLASS,
+    ),
+    (&pyre_object::pyobject::TYPE_TYPE, PY_TPFLAGS_TYPE_SUBCLASS),
+    (&pyre_object::pyobject::INT_TYPE, PY_TPFLAGS_LONG_SUBCLASS),
+    (
+        &pyre_object::bytesobject::BYTES_TYPE,
+        PY_TPFLAGS_BYTES_SUBCLASS,
+    ),
+    (&pyre_object::pyobject::STR_TYPE, PY_TPFLAGS_UNICODE_SUBCLASS),
+    (&pyre_object::pyobject::TUPLE_TYPE, PY_TPFLAGS_TUPLE_SUBCLASS),
+    (&pyre_object::pyobject::LIST_TYPE, PY_TPFLAGS_LIST_SUBCLASS),
+    (&pyre_object::pyobject::DICT_TYPE, PY_TPFLAGS_DICT_SUBCLASS),
 ];
 
 /// Mark `tp` with the one fast-subclass flag its base chain earns it.
@@ -716,6 +735,7 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     let size = [
         heap_type_basicsize(w_type),
         super::frameobject::basicsize(w_type),
+        super::sliceobject::basicsize(w_type),
         super::pyerrors::basicsize(w_type),
         super::cdatetime::basicsize(w_type),
         super::complexobject::basicsize(w_type),
@@ -783,6 +803,12 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(w_type);
+    // `inherit_special`'s "Setup fast subclass flags", which runs for every
+    // type it builds and not only for one an extension declared: a `Py*_Check`
+    // written for C is a flag test, so a mirror whose bit is clear answers no
+    // for a type that is one.  It resolves the builtins, which allocates, so
+    // it reads the type back off the shadow stack.
+    set_fast_subclass_flags(mirror, pyre_object::gc_roots::shadow_stack_get(type_slot));
     // `object` names no base, and the empty tuple is what says so: a null is
     // a length read off nothing.
     let bases_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5842,6 +5868,18 @@ pub unsafe extern "C" fn PyObject_Del(object: *mut std::ffi::c_void) {
     unsafe { PyObject_Free(object) };
 }
 
+/// `PyObject_GC_Del` -- what a collected type's `tp_free` is, and the same
+/// deallocator: every block this layer hands out comes from
+/// [`PyType_GenericAlloc`] whether or not the collector tracks it.
+///
+/// An entry point rather than a spelling of [`PyObject_Del`], because an
+/// extension puts it in a `tp_free` slot -- cffi's `CData` types do -- and a
+/// slot holds an address.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_GC_Del(object: *mut std::ffi::c_void) {
+    unsafe { PyObject_Free(object) };
+}
+
 /// `object.c _Py_object_dealloc` — the `tp_dealloc` a mirror carries, and the
 /// end of the chain a deallocator written in C walks up.
 ///
@@ -6388,6 +6426,7 @@ pub(super) fn ensure_linked() {
     ensure_type_mirrors_linked();
     std::hint::black_box(PyObject_Free as *const ());
     std::hint::black_box(PyObject_Del as *const ());
+    std::hint::black_box(PyObject_GC_Del as *const ());
     std::hint::black_box(PyType_Ready as *const ());
     std::hint::black_box(PyType_Check as *const ());
     std::hint::black_box(PyType_IsSubtype as *const ());

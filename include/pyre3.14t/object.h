@@ -84,7 +84,12 @@ typedef PyObject *(*vectorcallfunc)(PyObject *, PyObject *const *, size_t, PyObj
 
 typedef Py_ssize_t (*lenfunc)(PyObject *);
 typedef PyObject *(*ssizeargfunc)(PyObject *, Py_ssize_t);
+/* The two-index slot no type carries any more.  It is named because an
+   extension written against the older layout still spells the type, and
+   because a `PyType_Slot` array may hold one. */
+typedef PyObject *(*ssizessizeargfunc)(PyObject *, Py_ssize_t, Py_ssize_t);
 typedef int (*ssizeobjargproc)(PyObject *, Py_ssize_t, PyObject *);
+typedef int (*ssizessizeobjargproc)(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *);
 typedef int (*objobjproc)(PyObject *, PyObject *);
 typedef int (*objobjargproc)(PyObject *, PyObject *, PyObject *);
 

@@ -1335,7 +1335,35 @@ pub unsafe extern "C" fn Py_HashBuffer(pointer: *const std::ffi::c_void, length:
     crate::builtins::hash_buffer(bytes) as isize
 }
 
+/// `pyobject.py _Py_HashPointer` — the hash an object's address gives.
+///
+/// Upstream answers with the address itself.  The rotation here is what the
+/// same call does for CPython, and it is what an extension keying a table by
+/// address wants: an allocator hands out addresses that agree in their low
+/// bits, and a table indexed by the low bits of the hash would put all of them
+/// in one chain.
+///
+/// -1 is what an error is reported by, so the one value that would be mistaken
+/// for one is moved.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_HashPointer(pointer: *const std::ffi::c_void) -> isize {
+    let bits = pointer as usize;
+    let hash = ((bits >> 4) | (bits << (usize::BITS - 4))) as isize;
+    match hash {
+        -1 => -2,
+        hash => hash,
+    }
+}
+
+/// The name [`Py_HashPointer`] was published under before 3.13.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_HashPointer(pointer: *const std::ffi::c_void) -> isize {
+    unsafe { Py_HashPointer(pointer) }
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(Py_HashPointer as *const ());
+    std::hint::black_box(_Py_HashPointer as *const ());
     std::hint::black_box(Py_ReprEnter as *const ());
     std::hint::black_box(Py_ReprLeave as *const ());
     std::hint::black_box(Py_HashBuffer as *const ());

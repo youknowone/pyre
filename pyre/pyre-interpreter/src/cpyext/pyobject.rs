@@ -122,6 +122,7 @@ pub(super) unsafe fn after_fork_child() {
         BLOCK_SIZES.reinit_after_fork();
         BORROWED.reinit_after_fork();
         BYTE_CACHE.reinit_after_fork();
+        ITEM_ARRAYS.reinit_after_fork();
     }
 }
 
@@ -187,6 +188,7 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     // The types whose blocks carry fields past the header; every other block
     // this runtime hands out is exactly its header.
     super::frameobject::attach(raw, w_obj);
+    super::sliceobject::attach(raw, w_obj);
     super::pyerrors::attach(raw, w_obj);
     super::cdatetime::attach(raw, w_obj);
     super::complexobject::attach(raw, w_obj);
@@ -354,6 +356,16 @@ fn deallocating_marker() -> usize {
     &raw const MARKER as usize
 }
 
+/// Whether `raw`'s deallocator is running -- its link slot holds the marker
+/// [`dealloc`] parks there for the duration.
+///
+/// An entry point a deallocator is written to call is handed a mirror in
+/// exactly this state, and has to tell it apart from a NULL: reading the
+/// object out of it through [`from_ref`] answers null for both.
+pub(super) fn is_deallocating(raw: *mut CPyObject) -> bool {
+    !raw.is_null() && unsafe { (*raw).ob_pyre_link } as usize == deallocating_marker()
+}
+
 /// `pyobject.py:330-337` — build the interpreter object of a mirror that has
 /// none yet.
 ///
@@ -477,11 +489,13 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // be the last reference to its own container, so that recursion runs here.
     release_borrowed(raw);
     BYTE_CACHE.lock().remove(&address);
+    forget_items(address);
     super::dictobject::forget_iteration(address);
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
     super::frameobject::forget_block(raw);
+    super::sliceobject::forget_block(raw);
     super::pyerrors::forget_block(raw);
     super::cdatetime::forget_block(raw);
     super::typeobject::forget_descriptor_block(raw);
@@ -719,6 +733,73 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
         }
         edges.push((container, items.iter().copied().collect()));
     }
+}
+
+/// The item array a container mirror hands out — the `ob_item` field upstream's
+/// `PyTupleObject` mirror carries, and the storage a list's mirror points into.
+///
+/// A mirror block here is exactly what its type declares, so the array is kept
+/// beside the container instead, keyed by its mirror.  The address has to stay
+/// good after the call returns — `PyTuple_GET_ITEM` is an lvalue and a caller
+/// takes its address — which is what the box gives: it owns its slots, so a
+/// rehash of the map does not move them.
+///
+/// Each entry is a reference the container owns through [`borrow_from`], so the
+/// array roots nothing the container does not and [`release_borrowed`] is what
+/// gives them back.
+/// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
+type ItemCache = HashMap<usize, Box<[usize]>, BuildHasherDefault<std::hash::DefaultHasher>>;
+static ITEM_ARRAYS: ForkMutex<ItemCache> =
+    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+
+/// Give `raw`'s array `items` and answer where they sit.
+///
+/// For a container that may have changed since the last ask: refilling is the
+/// reallocation upstream documents, and a caller may only read the array while
+/// the sequence does not change.
+pub(super) fn refill_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut CPyObject {
+    let mut cache = ITEM_ARRAYS.lock();
+    cache.insert(raw as usize, items.into_boxed_slice());
+    cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject
+}
+
+/// `raw`'s array, built by `items` the first time it is asked for.
+///
+/// For a container whose contents cannot change behind the array — a tuple —
+/// so that reading it slot by slot costs what reading a field costs.
+pub(super) fn items_or_build(
+    raw: *mut CPyObject,
+    items: impl FnOnce() -> Vec<usize>,
+) -> *mut *mut CPyObject {
+    let existing = ITEM_ARRAYS
+        .lock()
+        .get(&(raw as usize))
+        .map(|array| array.as_ptr() as *mut *mut CPyObject);
+    if let Some(array) = existing {
+        return array;
+    }
+    // Built with the lock released: an entry is taken through `borrow_from`,
+    // which allocates and takes locks of its own.
+    let built = items();
+    refill_items(raw, built)
+}
+
+/// Write one slot of an array already handed out, leaving its address alone.
+///
+/// The one thing that changes a tuple after C has seen it is
+/// `PyTuple_SetItem`, and a caller holding the address `PyTuple_GET_ITEM` gave
+/// it has to read the new value through it.
+pub(super) fn set_cached_item(raw: *mut CPyObject, index: usize, item: *mut CPyObject) {
+    if let Some(array) = ITEM_ARRAYS.lock().get_mut(&(raw as usize))
+        && let Some(slot) = array.get_mut(index)
+    {
+        *slot = item as usize;
+    }
+}
+
+/// Drop the array a dying container mirror handed out.
+fn forget_items(raw: usize) {
+    ITEM_ARRAYS.lock().remove(&raw);
 }
 
 /// The NUL-terminated byte view of a mirror, filled on first use.

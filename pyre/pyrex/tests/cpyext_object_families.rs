@@ -186,6 +186,22 @@ eq('get_ref once the referent is gone', m.wr_get_ref(reference), (0, None))
 eq('get_object once the referent is gone', m.wr_get_object(reference), None)
 eq('the callback ran', fired, ['called'])
 
+# A C deallocator that breaks its own object's weak references, which is what
+# every extension holding a weakref list does.  The assertion after it is the
+# point: an entry point reached from a deallocator must leave nothing pending,
+# or the next call inherits it and fails with a SystemError of its own.
+before = m.wr_cleared_count()
+victim = m.Cleared()
+watch = m.wr_new_ref(victim)
+del victim
+for _ in range(4):
+    if m.wr_cleared_count() > before:
+        break
+    gc.collect()
+eq('the deallocator ran', m.wr_cleared_count(), before + 1)
+eq('the weak reference is dead', m.wr_get_object(watch), None)
+eq('and the call after it is clean', m.wr_check([]), False)
+
 print('cpyext-weakref-ok')
 "#;
 

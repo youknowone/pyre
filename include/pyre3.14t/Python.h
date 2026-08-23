@@ -12,6 +12,8 @@
 #define Py_PYTHON_H
 
 #include <assert.h>
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
@@ -19,10 +21,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#ifndef _WIN32
+#include <alloca.h>
+#include <unistd.h>
+#endif
 
-/* `pyport.h` first: `patchlevel.h` declares one object, and `PyAPI_DATA` is
+/* `pyconfig.h` first, as the reference header includes it: what it answers
+ * about the platform is what the headers below are written against. */
+#include "pyconfig.h"
+/* `pyport.h` next: `patchlevel.h` declares one object, and `PyAPI_DATA` is
  * what declares it. */
 #include "pyport.h"
 #include "patchlevel.h"
@@ -65,6 +75,8 @@
 #include "listobject.h"
 #include "dictobject.h"
 #include "setobject.h"
+#include "bytearrayobject.h"
+#include "boolobject.h"
 #include "sliceobject.h"
 #include "memoryobject.h"
 #include "pycapsule.h"

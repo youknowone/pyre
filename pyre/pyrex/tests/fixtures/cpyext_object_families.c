@@ -230,6 +230,38 @@ static PyObject *wr_is_dead(PyObject *s, PyObject *o)
     return PyBool_FromLong(dead);
 }
 
+/* `_cffi_backend.c ctypedescr_dealloc` breaks the weak references to a dying
+   object from the object's own deallocator, which `weakrefobject.c
+   PyObject_ClearWeakRefs` states is the only place it may be called from: it
+   rejects a receiver whose count has not fallen to zero.  What matters here is
+   what the call leaves behind, because the next entry point inherits it. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *weaklist;
+} ClearedObject;
+
+static long wr_cleared;
+
+static void cleared_dealloc(PyObject *self)
+{
+    PyObject_ClearWeakRefs(self);
+    wr_cleared += 1;
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyTypeObject ClearedType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "cpyext_object_families.Cleared",
+    .tp_basicsize = sizeof(ClearedObject),
+    .tp_weaklistoffset = offsetof(ClearedObject, weaklist),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_new = PyType_GenericNew,
+    .tp_dealloc = cleared_dealloc,
+};
+
+static PyObject *wr_cleared_count(PyObject *s, PyObject *unused)
+{ (void)s; (void)unused; return PyLong_FromLong(wr_cleared); }
+
 #define M(name, fn) {name, fn, METH_O, NULL}
 static PyMethodDef methods[] = {
     M("ba_check", ba_check), M("ba_check_exact", ba_check_exact),
@@ -253,6 +285,7 @@ static PyMethodDef methods[] = {
     M("wr_new_proxy", wr_new_proxy), M("wr_get_object", wr_get_object),
     M("wr_get_ref", wr_get_ref), M("wr_is_dead", wr_is_dead),
     {"wr_new_ref_with_callback", wr_new_ref_with_callback, METH_VARARGS, NULL},
+    {"wr_cleared_count", wr_cleared_count, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {
@@ -260,5 +293,14 @@ static struct PyModuleDef def = {
 
 PyMODINIT_FUNC PyInit_cpyext_object_families(void)
 {
-    return PyModule_Create(&def);
+    PyObject *module = PyModule_Create(&def);
+    if (module == NULL) {
+        return NULL;
+    }
+    if (PyType_Ready(&ClearedType) < 0
+        || PyModule_AddObjectRef(module, "Cleared", (PyObject *)&ClearedType) < 0) {
+        Py_DECREF(module);
+        return NULL;
+    }
+    return module;
 }

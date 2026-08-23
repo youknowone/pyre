@@ -314,7 +314,7 @@ class Recompiler:
             prnt('static const char _CFFI_PYTHON_STARTUP_CODE[] = {')
             self._print_string_literal_in_array(self.ffi._embedding)
             prnt('0 };')
-            prnt('#ifdef PYPY_VERSION')
+            prnt('#ifdef _CFFI_BUILTIN_BACKEND')
             prnt('# define _CFFI_PYTHON_STARTUP_FUNC  _cffi_pypyinit_%s' % (
                 base_module_name,))
             prnt('#elif PY_MAJOR_VERSION >= 3')
@@ -418,7 +418,7 @@ class Recompiler:
         prnt('#  pragma GCC visibility push(default)  /* for -fvisibility= */')
         prnt('#endif')
         prnt()
-        prnt('#ifdef PYPY_VERSION')
+        prnt('#ifdef _CFFI_BUILTIN_BACKEND')
         prnt('PyMODINIT_FUNC')
         prnt('_cffi_pypyinit_%s(const void *p[])' % (base_module_name,))
         prnt('{')
@@ -704,7 +704,7 @@ class Recompiler:
         prnt('  %s%s(%s);' % (result_code, name, call_arguments))
         prnt('}')
         #
-        prnt('#ifndef PYPY_VERSION')        # ------------------------------
+        prnt('#ifndef _CFFI_BUILTIN_BACKEND')  # ----------------------------
         #
         prnt('static PyObject *')
         prnt('_cffi_f_%s(PyObject *self, PyObject *%s)' % (name, argname))

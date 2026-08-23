@@ -113,7 +113,7 @@ static void _cffi_release_reentrant_mutex(void)
 
 
 /**********  CPython-specific section  **********/
-#ifndef PYPY_VERSION
+#ifndef _CFFI_BUILTIN_BACKEND
 
 #include "_cffi_errors.h"
 

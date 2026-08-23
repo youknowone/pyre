@@ -136,6 +136,13 @@ pub unsafe extern "C" fn PyLong_AsSsize_t(object: *mut CPyObject) -> isize {
     as_i64(object).unwrap_or(-1) as isize
 }
 
+/// `longobject.py _PyLong_Sign` — -1, 0 or 1, and no error to report:
+/// the caller has already established that the object is an `int`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyLong_Sign(object: *mut CPyObject) -> c_int {
+    as_bigint(object, |value| value.get_sign()).unwrap_or(0) as c_int
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyLong_AsUnsignedLong(object: *mut CPyObject) -> c_ulong {
     as_unsigned(object).unwrap_or(u64::MAX) as c_ulong
@@ -716,6 +723,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyLong_AsLong as *const ());
     std::hint::black_box(PyLong_AsLongLong as *const ());
     std::hint::black_box(PyLong_AsSsize_t as *const ());
+    std::hint::black_box(_PyLong_Sign as *const ());
     std::hint::black_box(PyLong_AsUnsignedLong as *const ());
     std::hint::black_box(PyLong_AsUnsignedLongLong as *const ());
     std::hint::black_box(PyLong_AsSize_t as *const ());

@@ -738,6 +738,85 @@ fn wide_argument(object: *mut CPyObject) -> Option<PyObjectRef> {
     Some(value)
 }
 
+/// `Py_FileSystemDefaultEncoding` — the name `PyArg_ParseTuple`'s `"es"` and
+/// `"et"` codes take when an extension passes it, and what
+/// `PyUnicode_DecodeFSDefault` decodes with.
+///
+/// `unicodeobject.py` phrases the same answer as `space.fsdecode`; the string
+/// is here because C names it by address, and it is `static mut` because
+/// upstream lets an embedder replace it.
+static FILE_SYSTEM_ENCODING: [u8; 6] = *b"utf-8\0";
+
+#[unsafe(no_mangle)]
+pub static mut Py_FileSystemDefaultEncoding: *const c_char =
+    FILE_SYSTEM_ENCODING.as_ptr() as *const c_char;
+
+/// The code points of `value`, one `Py_UCS4` each.
+///
+/// `unicodeobject.py PyUnicode_AsUCS4` walks the interpreter's own UTF-8 with
+/// a code point iterator, so an unpaired surrogate goes across as itself
+/// rather than as a pair.
+fn code_points(value: PyObjectRef) -> Vec<u32> {
+    unsafe { pyre_object::w_str_get_wtf8(value) }
+        .code_points()
+        .map(|point| point.to_u32())
+        .collect()
+}
+
+/// `unicodeobject.py PyUnicode_AsUCS4` — the code points into a caller's
+/// buffer, answering with it, or NULL when the buffer is too short.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsUCS4(
+    object: *mut CPyObject,
+    buffer: *mut u32,
+    buflen: isize,
+    copy_null: c_int,
+) -> *mut u32 {
+    let Some(value) = wide_argument(object) else {
+        return std::ptr::null_mut();
+    };
+    if buffer.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let points = code_points(value);
+    let needed = points.len() + (copy_null != 0) as usize;
+    if buflen < needed as isize {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyUnicode_AsUCS4: buflen too short".to_string(),
+        ));
+        return std::ptr::null_mut();
+    }
+    for (index, &point) in points.iter().enumerate() {
+        unsafe { *buffer.add(index) = point };
+    }
+    if copy_null != 0 {
+        unsafe { *buffer.add(points.len()) = 0 };
+    }
+    buffer
+}
+
+/// `unicodeobject.py PyUnicode_AsUCS4Copy` — the same, into a block the
+/// caller frees with `PyMem_Free`, always NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsUCS4Copy(object: *mut CPyObject) -> *mut u32 {
+    let Some(value) = wide_argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let points = code_points(value);
+    let block =
+        unsafe { super::pymem::PyMem_Malloc(size_of::<u32>() * (points.len() + 1)) } as *mut u32;
+    if block.is_null() {
+        unsafe { super::pyerrors::PyErr_NoMemory() };
+        return std::ptr::null_mut();
+    }
+    for (index, &point) in points.iter().chain(&[0]).enumerate() {
+        unsafe { *block.add(index) = point };
+    }
+    block
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_AsWideChar(
     object: *mut CPyObject,
@@ -1490,6 +1569,8 @@ pub unsafe extern "C" fn PyUnicode_Equal(left: *mut CPyObject, right: *mut CPyOb
 
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_FromString as *const ());
+    std::hint::black_box(PyUnicode_AsUCS4 as *const ());
+    std::hint::black_box(PyUnicode_AsUCS4Copy as *const ());
     std::hint::black_box(PyUnicode_FromStringAndSize as *const ());
     std::hint::black_box(PyUnicode_AsUTF8 as *const ());
     std::hint::black_box(PyUnicode_AsUTF8AndSize as *const ());

@@ -1,9 +1,116 @@
 //! `slice` -- PyPy `cpyext/sliceobject.py`.
+//!
+//! A slice mirror carries its three bounds as fields, which the comment above
+//! `slice_attach` calls out: "Slice objects directly expose their members as
+//! PyObject.  Don't change them!".  cffi reads them that way, and no entry
+//! point stands in for the read.
 
 use super::object::argument;
 use super::pyobject::{self, CPyObject};
+use super::typeobject::CPyTypeObject;
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
+
+/// C-visible `PySliceObject`, the twin of the struct in
+/// `include/pyre3.14t/sliceobject.h`.
+///
+/// Field order is `sliceobject.py PySliceObjectFields`, which names them
+/// `start`, `step`, `stop`; the header spells the order CPython's does, and
+/// the two agree because every reader names a field rather than an offset.
+#[repr(C)]
+pub struct CPySliceObject {
+    pub ob_base: CPyObject,
+    pub start: *mut CPyObject,
+    pub stop: *mut CPyObject,
+    pub step: *mut CPyObject,
+}
+
+/// The layout is written out twice -- here and in the header -- so a field
+/// added to one without the other stops compiling rather than writing
+/// somewhere unclaimed.
+const _: () = {
+    assert!(std::mem::offset_of!(CPySliceObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPySliceObject, start) == 24);
+    assert!(std::mem::offset_of!(CPySliceObject, stop) == 32);
+    assert!(std::mem::offset_of!(CPySliceObject, step) == 40);
+    assert!(size_of::<CPySliceObject>() == 48);
+};
+
+/// The interpreter's slice type, or null before it is built.
+fn slice_type() -> PyObjectRef {
+    crate::typedef::gettypeobject(&pyre_object::sliceobject::SLICE_TYPE)
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries --
+/// `sliceobject.py basestruct=PySliceObject.TO` for the slice type, and 0 for
+/// every other type, which asks for the plain header.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    let slice_type = slice_type();
+    match !slice_type.is_null() && std::ptr::eq(w_type, slice_type) {
+        true => size_of::<CPySliceObject>() as isize,
+        false => 0,
+    }
+}
+
+/// A mirror's slice fields, or `None` when it is not a slice mirror.
+///
+/// The type decides it, as it does for a frame mirror and for the same reason:
+/// a size test would answer yes for any C-defined type whose own storage
+/// reaches this far.
+fn fields(raw: *mut CPyObject) -> Option<*mut CPySliceObject> {
+    if raw.is_null() {
+        return None;
+    }
+    let tp = unsafe { (*raw).ob_type };
+    // `as_pyobj` rather than a realizing read: this runs while a mirror is
+    // being deallocated, where nothing may build an interpreter object.
+    let slice_tp = pyobject::as_pyobj(slice_type()) as *mut CPyTypeObject;
+    if tp.is_null() || slice_tp.is_null() || !std::ptr::eq(tp, slice_tp) {
+        return None;
+    }
+    assert!(
+        unsafe { (*tp).tp_basicsize } >= size_of::<CPySliceObject>() as isize,
+        "a slice mirror was allocated at the plain PyObject size"
+    );
+    Some(raw as *mut CPySliceObject)
+}
+
+/// Fill a freshly allocated mirror of `w_obj` when `w_obj` is a slice --
+/// `sliceobject.py slice_attach`.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    if w_obj.is_null() || !unsafe { pyre_object::sliceobject::is_slice(w_obj) } {
+        return;
+    }
+    let Some(py_slice) = fields(raw) else {
+        return;
+    };
+    // Each bound is read immediately before it is handed to `make_ref`, which
+    // allocates: nothing read here is carried across one.
+    let start = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_start(w_obj) });
+    let stop = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_stop(w_obj) });
+    let step = pyobject::make_ref(unsafe { pyre_object::sliceobject::w_slice_get_step(w_obj) });
+    unsafe {
+        (*py_slice).start = start;
+        (*py_slice).stop = stop;
+        (*py_slice).step = step;
+    }
+}
+
+/// Release the references a slice mirror owns -- `sliceobject.py
+/// slice_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    let Some(py_slice) = fields(raw) else {
+        return;
+    };
+    unsafe {
+        for reference in [(*py_slice).start, (*py_slice).stop, (*py_slice).step] {
+            pyobject::decref(reference);
+        }
+        (*py_slice).start = std::ptr::null_mut();
+        (*py_slice).stop = std::ptr::null_mut();
+        (*py_slice).step = std::ptr::null_mut();
+    }
+}
 
 /// `slice(low, high)` — the object the sequence-slice entry points hand to
 /// `getitem`, as `space.getslice` does (`baseobjspace.py`).

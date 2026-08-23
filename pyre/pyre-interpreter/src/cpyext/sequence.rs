@@ -334,6 +334,25 @@ pub unsafe extern "C" fn PySequence_Fast_GET_ITEM(
     unsafe { super::listobject::PyList_GetItem(object, index) }
 }
 
+/// `PySequence_Fast_ITEMS(o)` — the items as a C array (`sequence.py`).
+///
+/// Upstream answers with a pointer into the tuple mirror's `ob_item` or into
+/// the list's storage; a mirror here has neither, so the array is filled and
+/// kept beside the container, which is what makes the address good after this
+/// returns.  The entries are borrowed exactly as `PySequence_Fast_GET_ITEM`
+/// borrows one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PySequence_Fast_ITEMS(object: *mut CPyObject) -> *mut *mut CPyObject {
+    let length = unsafe { PySequence_Fast_GET_SIZE(object) };
+    if length < 0 {
+        return std::ptr::null_mut();
+    }
+    let items = (0..length)
+        .map(|index| unsafe { PySequence_Fast_GET_ITEM(object, index) } as usize)
+        .collect();
+    pyobject::refill_items(object, items)
+}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PySequence_Check as *const ());
     std::hint::black_box(PySequence_Size as *const ());
@@ -357,4 +376,5 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PySequence_Fast as *const ());
     std::hint::black_box(PySequence_Fast_GET_SIZE as *const ());
     std::hint::black_box(PySequence_Fast_GET_ITEM as *const ());
+    std::hint::black_box(PySequence_Fast_ITEMS as *const ());
 }

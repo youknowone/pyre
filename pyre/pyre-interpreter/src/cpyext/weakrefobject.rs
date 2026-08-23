@@ -182,6 +182,15 @@ pub(super) fn ensure_linked() {
 /// nothing to break.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_ClearWeakRefs(object: *mut CPyObject) {
+    // A deallocator is the only place this may be called from --
+    // `weakrefobject.c PyObject_ClearWeakRefs` rejects anything whose count
+    // has not fallen to zero -- and a mirror whose deallocator is running
+    // carries the deallocating marker rather than its object.  The two halves
+    // die together, so the weak references were broken when the interpreter
+    // object was collected, which is what brought the mirror here.
+    if pyobject::is_deallocating(object) {
+        return;
+    }
     let Some(object) = super::object::argument(object) else {
         return;
     };

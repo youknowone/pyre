@@ -61,6 +61,37 @@ pub unsafe extern "C" fn PyTuple_GetItem(object: *mut CPyObject, index: isize) -
     pyobject::borrow_from(object, item)
 }
 
+/// The item array a tuple mirror hands out — `tupleobject.py` gives its mirror
+/// an `ob_item` of `ob_size` `PyObject *`, and `PyTuple_GET_ITEM` reads it.
+///
+/// Built on first ask and kept: what a tuple holds does not change, save
+/// through [`PyTuple_SetItem`], which writes the slot it changed.  The entries
+/// are references the mirror owns, released when it dies.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyTuple_ITEMS(object: *mut CPyObject) -> *mut *mut CPyObject {
+    let Some(value) = tuple_argument(object, "PyTuple_GET_ITEM") else {
+        return std::ptr::null_mut();
+    };
+    pyobject::items_or_build(object, || {
+        let length = unsafe { pyre_object::tupleobject::w_tuple_len(value) };
+        (0..length)
+            .map(|index| {
+                // Read immediately before `borrow_from`, which allocates: the
+                // tuple is reached through the mirror's link, which the
+                // collector keeps current.
+                let w_tuple = unsafe { pyobject::from_ref(object) };
+                let item = unsafe {
+                    pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64)
+                };
+                match item {
+                    Some(item) => pyobject::borrow_from(object, item) as usize,
+                    None => 0,
+                }
+            })
+            .collect()
+    })
+}
+
 /// Steals a reference to `item`, and is only defined on a tuple no other code
 /// has seen yet — the contract `PyTuple_SetItem` documents.
 #[unsafe(no_mangle)]
@@ -87,6 +118,13 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     let stored = unsafe {
         pyre_object::tupleobject::w_tuple_setitem_initializing(value, index as usize, w_item)
     };
+    if stored {
+        // A caller holding the address `PyTuple_GET_ITEM` gave it reads the
+        // new value through it, so the slot is written rather than the array
+        // rebuilt.  It goes before the decref below, which runs a deallocator:
+        // nothing read here is carried across one.
+        pyobject::set_cached_item(object, index as usize, pyobject::borrow_from(object, w_item));
+    }
     unsafe { pyobject::decref(item) };
     if !stored {
         super::pyerrors::set_pending_error(crate::PyError::new(
@@ -129,6 +167,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyTuple_New as *const ());
     std::hint::black_box(PyTuple_Size as *const ());
     std::hint::black_box(PyTuple_GetItem as *const ());
+    std::hint::black_box(_PyTuple_ITEMS as *const ());
     std::hint::black_box(PyTuple_SetItem as *const ());
     std::hint::black_box(PyTuple_GetSlice as *const ());
     std::hint::black_box(PyTuple_Check as *const ());
