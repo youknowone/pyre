@@ -1298,11 +1298,22 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 #   the tripwires could be armed without touching a baseline.
 #
 # `fbw_midbody_latch` is ungated for a third reason that is neither of those.
-# It IS a tripwire with a polarity, and its zero was true when it was added —
-# but the corpus now reaches its leg on five fixtures natively and six on wasm,
-# each exactly once. So arming it would assert a falsehood, and recording it
-# would pin a reachability nobody has adjudicated yet. Its hazardous subset is
-# armed above and still zero, which bounds what the open question can cost.
+# It reads as a tripwire but has no healthy value: the corpus reaches its leg
+# on five fixtures natively and those five plus `str_search_index_bounds` on
+# wasm, each exactly once. Arming it at zero would assert a falsehood.
+#
+# That is not something this branch caused, and not a recent drift either. A
+# control build of the base commit, full LLBC extraction and both native
+# binaries, reads 1 on the same five fixtures with the same
+# `fbw_midbody_latch_new_unjournaled=0` — the six fixture files are
+# byte-identical across the two trees, and the increment guard
+# (`is_top_inline && !unjournaled_before_subwalk`) is byte-identical too. The
+# leg was already reached when the counter was added; `trace.rs` used to say
+# the opposite and now records the measurement.
+#
+# Its hazardous subset is armed above and zero on every fixture of the corpus
+# on all three backends, which is what bounds the cost of leaving the
+# population count ungated.
 #
 # They are on the `[jit-stats] fbw_diag` line on both the native and the wasm
 # reader, so a human can read them without a gate.
