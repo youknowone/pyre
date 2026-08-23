@@ -261,6 +261,18 @@ impl Drop for FrameLocalsRoot {
 /// Restores `ExecutionContext.topframeref` after compiled execution, including
 /// panic unwinds.  The saved pointer lives on the shadow stack so a moving
 /// collection can forward it in place, matching `CurrentFrameGuard`.
+///
+/// Every door that runs a frame-bearing compiled trace has to take it, not just
+/// the one a given trace happened to be entered through: the reason it exists
+/// (`executioncontext.py leave` runs from a `finally`, so upstream's
+/// `topframeref` is balanced however a frame is left, while pyre carries
+/// `enter`/`leave` as walker-recorded field ops that a failing guard skips) is a
+/// property of the trace, and the same trace is reachable from the back-edge and
+/// function-entry doors as well as from `execute_assembler`.  A door without it
+/// leaks one `JitVirtualRef` per unbalanced run into the live `topframeref`
+/// slot, and every later `enter` chains its `f_backref` onto that abandoned
+/// frame — a chain that grows without bound and that the root walker traverses
+/// on every minor collection.
 struct TopFrameRefGuard {
     ec: *mut PyExecutionContext,
     saved_root: Option<usize>,
@@ -10030,9 +10042,13 @@ fn execute_assembler(
     // `CurrentFrameGuard` bracket a frame: a balanced run restores the same
     // value it saved, an unbalanced exit restores the caller.
     let ec_for_topframeref = frame_root.frame().execution_context as *mut PyExecutionContext;
+    // Held for the rest of the activation, not just the run: a guard failure is
+    // resumed below, and the resume re-enters the same walker-recorded frames
+    // it abandoned.  The chain this portal activation hands back has to be the
+    // one it was given either way.
+    let _topframeref_guard = TopFrameRefGuard::new(ec_for_topframeref);
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
     let outcome = {
-        let _topframeref_guard = TopFrameRefGuard::new(ec_for_topframeref);
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -10539,6 +10555,12 @@ fn bound_reached(
         );
     }
     // warmstate.py: procedure_token → EnterJitAssembler.
+    // Same bracket, same reason, as the `execute_assembler` door: a guard that
+    // fails between a walker-recorded `enter` and its `leave` leaves the
+    // callee's `JitVirtualRef` published in `topframeref`, and this door
+    // reaches the same traces.
+    let _topframeref_guard =
+        TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
     let outcome = if driver.has_runnable_compiled_loop(green_key) {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
@@ -10792,6 +10814,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // local; without this the compiled `GuardClass(n)` derefs the tag.
         untag_tagged_frame_locals(&mut frame_root);
         let mut jit_state = build_jit_state(frame_root.frame(), info);
+        // The `execute_assembler` door's `topframeref` bracket, at the
+        // function-entry door: the trace a function entry runs inlines the same
+        // callees and exits through the same guards.
+        let _topframeref_guard =
+            TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
         let outcome = {
             let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
             driver.run_compiled_detailed_with_bridge_keyed(
