@@ -1552,6 +1552,77 @@ static PyTypeObject TickerType = {
     ticker_new,                                 /* tp_new */
 };
 
+/* ── Sealed: a static type that declares no tp_new ──────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long token;
+} SealedObject;
+
+static PyObject *sealed_token(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return PyLong_FromLong(((SealedObject *)self)->token);
+}
+
+static PyMethodDef sealed_methods[] = {
+    {"token", sealed_token, METH_NOARGS, "the token the factory stamped"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyTypeObject SealedType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Sealed",                      /* tp_name */
+    sizeof(SealedObject),                       /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a type only its factory builds",           /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    sealed_methods,                             /* tp_methods */
+};
+
+/* The factory standing in for the constructor the type does not declare. */
+static PyObject *m_seal(PyObject *self, PyObject *args)
+{
+    long token = 0;
+    if (!PyArg_ParseTuple(args, "l", &token)) {
+        return NULL;
+    }
+    SealedObject *made = (SealedObject *)PyType_GenericAlloc(&SealedType, 0);
+    if (made == NULL) {
+        return NULL;
+    }
+    made->token = token;
+    return (PyObject *)made;
+}
+
+static PyObject *m_sealed_flags(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    unsigned long flags = PyType_GetFlags(&SealedType);
+    return Py_BuildValue("(kk)",
+                         flags & Py_TPFLAGS_DISALLOW_INSTANTIATION,
+                         (unsigned long)(SealedType.tp_new != NULL));
+}
+
 /* ── Spec: a heap type built with PyType_FromSpec ───────────────────── */
 
 typedef struct {
@@ -1991,6 +2062,8 @@ static PyMethodDef methods[] = {
     {"owner_deallocs", m_owner_deallocs, METH_NOARGS, "how often Owner.tp_dealloc ran"},
     {"collect_then_owner_deallocs", m_collect_then_owner_deallocs, METH_NOARGS,
      "gc.collect(), then the count as it stands on return"},
+    {"seal", m_seal, METH_VARARGS, "build a Sealed from C"},
+    {"sealed_flags", m_sealed_flags, METH_NOARGS, "Sealed's instantiation flag and tp_new"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -2027,6 +2100,9 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &OwnerType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &SealedType) < 0) {
         return -1;
     }
     if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {

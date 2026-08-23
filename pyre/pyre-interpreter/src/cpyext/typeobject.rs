@@ -259,6 +259,7 @@ pub struct CPyHeapTypeObject {
 
 pub const PY_TPFLAGS_DEFAULT: std::ffi::c_ulong = 0;
 pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
+pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: std::ffi::c_ulong = 1 << 7;
 pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
 pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
 pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
@@ -4935,10 +4936,28 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     if unsafe { (*tp).tp_free.is_null() } {
         unsafe { (*tp).tp_free = PyObject_Free as *const c_void };
     }
-    // `PyType_GenericNew` builds an ordinary instance, which is not the
-    // storage a base that has a constructor of its own would have built: left
-    // unset, the slot routes to the base's `__new__` instead.
-    if unsafe { (*tp).tp_new.is_null() } && !base_supplies_new(base) {
+    // `type_ready_set_new`.  A static type that declared no constructor and
+    // derives straight from `object` does not take `object`'s: the plain
+    // instance it builds is not the storage the type's own methods are written
+    // against, so the type refuses instantiation instead.  A heap type is the
+    // runtime's own and does inherit, as does one derived from any other base.
+    if !declares_tp_new(tp)
+        && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0
+        && base_is_object(base)
+    {
+        unsafe { (*tp).tp_flags |= PY_TPFLAGS_DISALLOW_INSTANTIATION };
+    }
+    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
+        // `inherit_slots` copies a base's `tp_new` for every slot alike, and
+        // this is the one slot a type carrying the flag must not have.
+        unsafe { (*tp).tp_new = std::ptr::null() };
+    } else if unsafe { (*tp).tp_new.is_null() }
+        && !base_supplies_new(base)
+        && !base_refuses_new(base)
+    {
+        // `PyType_GenericNew` builds an ordinary instance, which is not the
+        // storage a base that has a constructor of its own would have built:
+        // left unset, the slot routes to the base's `__new__` instead.
         unsafe { (*tp).tp_new = PyType_GenericNew as *const c_void };
     }
 
@@ -5023,6 +5042,17 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             true,
         );
+        // `type_call`'s own test, which is the slot rather than the flag: a
+        // subtype of a type that carries the flag inherits the empty slot
+        // without the flag, and it is just as unable to build an instance.
+        // With no constructor to route to, `Type()` is refused with `cannot
+        // create ... instances` rather than answered with storage the type's
+        // methods cannot read.
+        if (*tp).tp_new.is_null() {
+            pyre_object::w_type_set_disallow_instantiation(
+                pyre_object::gc_roots::shadow_stack_get(type_slot),
+            );
+        }
     };
     // `finish_type_2`'s `pto.c_tp_mro`, once there is a type to read one off.
     {
@@ -5086,6 +5116,28 @@ fn record_declared_tp_new(tp: *mut CPyTypeObject) {
 
 fn declares_tp_new(tp: *mut CPyTypeObject) -> bool {
     !tp.is_null() && DECLARED_TP_NEW.lock().contains(&(tp as usize))
+}
+
+/// Whether `base` is `object` -- `type_ready_set_new`'s
+/// `base == &PyBaseObject_Type`.  A type readied without a `tp_base` derives
+/// from `object` too, that being the base `type_ready_set_base` fills in.
+fn base_is_object(base: *mut CPyTypeObject) -> bool {
+    if base.is_null() {
+        return true;
+    }
+    let w_base = interpreter_type(base);
+    !w_base.is_null() && std::ptr::eq(w_base, crate::typedef::w_object())
+}
+
+/// Whether the base has no constructor at all.
+///
+/// `inherit_slots` has already handed the subtype the empty slot, which is
+/// what a base refusing instantiation owes it: an instance of the subtype is
+/// one of the base too, and neither is buildable.  The stand-in below would
+/// build one anyway.
+fn base_refuses_new(base: *mut CPyTypeObject) -> bool {
+    let w_base = interpreter_type(base);
+    !w_base.is_null() && unsafe { pyre_object::w_type_disallows_instantiation(w_base) }
 }
 
 /// Whether the base has a constructor of its own, which `PyType_GenericNew`

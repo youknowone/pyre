@@ -38,6 +38,9 @@ static PyTypeObject StaticType = {
     .tp_basicsize = sizeof(PyObject),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_methods = subject_methods,
+    /* A static type that declares no constructor cannot be instantiated
+       (`type_ready_set_new`), and the script below builds one. */
+    .tp_new = PyType_GenericNew,
 };
 
 /* ── what the field answers with ────────────────────────────────────── */

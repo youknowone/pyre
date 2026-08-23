@@ -751,6 +751,21 @@ eq('a class method binds the class', Holder.classy(1), (Holder, 1))
 eq('a static method binds nothing', Holder.staticy(1), (1,))
 eq('reached through an instance too', Holder().classy(2), (Holder, 2))
 
+# ── a type that declares no tp_new ─────────────────────────────────────
+# `type_ready_set_new`: a static type deriving straight from `object` without a
+# constructor of its own does not take `object`'s, and refuses instantiation.
+eq('the flag is set and the slot is empty', m.sealed_flags(), (1 << 7, 0))
+sealed = m.seal(41)
+eq('the factory still builds one', sealed.token(), 41)
+eq('and its methods reach the storage', type(sealed).__name__, 'Sealed')
+try:
+    type(sealed)()
+except TypeError as error:
+    eq('the report names the type', str(error),
+       "cannot create 'cpyext_types.Sealed' instances")
+else:
+    raise AssertionError('a type with no tp_new was instantiated')
+
 print('cpyext-types-ok')
 "#;
 
