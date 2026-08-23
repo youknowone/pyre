@@ -160,13 +160,20 @@ WASM_TIMEOUT_SCALE = 4.0
 #
 # What does is the rest of the census, and it is worth stating because the
 # ceiling has now been widened twice by a fixture that was never going to be
-# caught by widening it: of the 283 fixtures an ubuntu run gates, the highest
-# outside the two that still carry an allowance (builtin_folds_hot 8.6x,
-# math_folds_hot 3.9x, both written at 13x) is pickle_terminal_raise_resume at
-# 3.4x. A 3.5 ceiling would stand 0.07x above that against a ratio whose spread
-# between runs is ~0.5x, so the step down is owed to that fixture rather than
-# to this constant.
+# caught by widening it. Two ubuntu runs on one base gate 273 fixtures in
+# common; outside the two that still carry an allowance (builtin_folds_hot
+# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst any of them reaches is
+# short_circuit_boxed_int_cross_fn at 3.0x then 3.5x, with
+# pickle_terminal_raise_resume steady at 3.4x. Under the same
+# highest-observed-plus-15% rule the allowances are fitted with, that puts the
+# floor at 4.03x: 4.0 is the fitted value today, not slack, and it comes down
+# when short_circuit_boxed_int_cross_fn does. Its 0.49x swing between two runs
+# of one base is also the scale to read any single reading against.
 WASM_MAX_DYNASM_RATIO = 4.0
+# The headroom every `max-wasm-ratio` allowance is fitted with, and the same
+# margin the summary requires before it will call one outgrown -- a fixture
+# reading just under the ceiling is not one that can lose its allowance.
+WASM_RATIO_FIT_HEADROOM = 1.15
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x
@@ -1594,15 +1601,25 @@ def wasm_ratio_gate(path):
     a Rust heap the wasm path does not yet collect, so a loop dominated by that
     work runs several times dynasm's execution time for a reason that is
     structural rather than a regression. The allowances are set at the highest
-    ratio observed plus 15%, and each fixture records the ratios it was fitted
-    to. ubuntu-24.04 is the only runner that builds wasm, so it supplies most of
-    them; a fixture sitting on the gate locally is fitted here instead.
+    ratio observed plus 15% (`WASM_RATIO_FIT_HEADROOM`, which `print_summary`
+    also requires before it will call an allowance outgrown), and each fixture
+    records the ratios it was fitted to. ubuntu-24.04 is the only runner that
+    builds wasm, so it supplies most of them; a fixture sitting on the gate
+    locally is fitted here instead, which is why an allowance can name a host
+    no CI run measures.
 
-    15% rather than the ~3% ubuntu shows between runs because the ratio moves
-    with host load even though both sides are user-CPU and measured in the same
-    invocation: fannkuch reads 2.9x on an idle machine here and 3.1x on the same
-    machine under a load average of 41. An allowance fitted to an idle reading
-    would be a gate that fails on a busy runner.
+    15% because the ratio moves with host load even though both sides are
+    user-CPU and measured in the same invocation: fannkuch reads 2.9x on an
+    idle machine here and 3.1x on the same machine under a load average of 41.
+    An allowance fitted to an idle reading would be a gate that fails on a busy
+    runner.
+
+    It is a p90 and not a safety factor, which this paragraph got wrong while
+    it cited "~3% between runs": over the 273 fixtures two ubuntu runs of one
+    base both gate, |delta|/max has median 4.7%, p75 8.8%, p90 14.9% and a tail
+    to 67% (mapdict_frozen_unboxing_fold 1.79x then 0.59x). An allowance that
+    clears its fixture's highest reading by less than 15% is fitted to one
+    sample rather than to the instrument.
     """
     found = _header_directive(path, "# pyre-check: max-wasm-ratio=")
     if found is None:
@@ -3798,16 +3815,25 @@ class Check:
                     f"`# pyre-check: max-wasm-ratio` for: {names}"
                 )
             )
-            spare = [
+            # `* WASM_RATIO_FIT_HEADROOM` and not a bare comparison: without
+            # it math_folds_hot, which reads 3.9x under a 4.0 ceiling, is named
+            # as outgrown on the strength of 0.07x. The caveat is there because
+            # a run only measures its own host and an allowance may be fitted
+            # to another -- math_folds_hot's 13x is a darwin-arm64 reading of
+            # 11.3x, which no ubuntu run can see.
+            outgrown = [
                 n for n, _, m in rows
-                if m is not None and m <= WASM_MAX_DYNASM_RATIO
+                if m is not None
+                and m * WASM_RATIO_FIT_HEADROOM <= WASM_MAX_DYNASM_RATIO
             ]
-            if spare:
+            if outgrown:
                 print(
                     dim(
-                        f"  {len(spare)} of those measured at or under "
-                        f"{WASM_MAX_DYNASM_RATIO:g}x, so the allowance is not "
-                        f"what keeps them green: {', '.join(spare)}"
+                        f"  {len(outgrown)} of those measured far enough under "
+                        f"{WASM_MAX_DYNASM_RATIO:g}x on THIS host to fit "
+                        f"without an allowance; check what host the fixture's "
+                        f"note fitted it to before removing: "
+                        f"{', '.join(outgrown)}"
                     )
                 )
 
