@@ -3725,7 +3725,7 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // RPython `rtyper` lowers a heap-carried `Result` variant to
+        // RPython `rtyper` lowers a heap-carried sum-type variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
         // `jtransform`; `rewrite_op_malloc` then emits `new(descr)`.
         // Charon exposes the pre-rtyper shape instead: a niladic synthetic
@@ -3733,18 +3733,21 @@ impl<'a> Transformer<'a> {
         // enum tag as a separate MIR operand. Restore the exact low-level
         // shape here. The existing payload write follows this replacement in
         // program order; the tag write is emitted beside the allocation.
-        // Recognize the ctor through the front-side rule rather than a second
-        // spelling test: it anchors the owner path head at `core::result` and
-        // compares the instantiation-stripped leaf for equality, where a
-        // `starts_with("Result")` leaf test also accepts an unrelated enum whose
-        // name merely begins with it and carries `Ok`/`Err` variants. Both gates
-        // decide the same question, so they must not be able to drift.
+        // Recognize the ctor through the front-side rules rather than a second
+        // spelling test: each anchors the owner path head (`core::result`,
+        // `core::option`) and compares the instantiation-stripped leaf for
+        // equality, where a `starts_with("Result")` leaf test also accepts an
+        // unrelated enum whose name merely begins with it and carries
+        // `Ok`/`Err` variants. Both gates decide the same question, so they
+        // must not be able to drift.
+        //
+        // `Result` and `Option` are the two enums whose variant order the
+        // language fixes, so their tags can be spelled here. A user enum's
+        // cannot, and its variant ctor keeps the residual shape.
         if args.is_empty()
-            && let Some(is_err) = crate::front::result_exc::result_ctor_kind(target)
+            && let Some((name, tag)) = sum_variant_ctor_tag(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
-            let name = if is_err { "Err" } else { "Ok" };
-            let tag = i64::from(is_err);
             let result_base = owner
                 .strip_suffix(format!("::{name}").as_str())
                 .unwrap_or(owner)
@@ -3777,6 +3780,23 @@ impl<'a> Transformer<'a> {
                     },
                 },
             ]);
+        }
+        // The struct-shaped spelling of the same aggregate: Charon writes
+        // `Aggregate::Adt(ty, variant_idx = null)` for an `Option<T>` built
+        // through a separate `SetDiscriminant`, which names the type in the
+        // ctor leaf instead of a variant and leaves `front::mir` to emit the
+        // tag as its own `__discriminant` `FieldWrite`. Only the allocation is
+        // owed here; adding a tag would write it twice.
+        if args.is_empty()
+            && crate::front::option_ctor::is_option_base_ctor(target)
+            && let ValueType::Ref(Some(owner)) = result_ty
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::New {
+                    owner: owner.clone(),
+                },
+            }]);
         }
         // `rbuiltin.py rtype_const_result` /
         // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
@@ -6298,6 +6318,20 @@ impl<'a> Transformer<'a> {
         let result_ir = value_type_to_ir_type(result_ty);
         arg_ir == result_ir
     }
+}
+
+/// The niladic sum-type variant ctors lowered to an allocation plus a tag
+/// write: `(variant leaf, discriminant)`.
+///
+/// Both halves come from the front-side spelling rules
+/// ([`crate::front::result_exc::result_ctor_kind`],
+/// [`crate::front::option_ctor::option_variant_ctor_tag`]) so the recogniser
+/// here cannot drift from the one the frontend applies.
+fn sum_variant_ctor_tag(target: &CallTarget) -> Option<(&'static str, i64)> {
+    if let Some(is_err) = crate::front::result_exc::result_ctor_kind(target) {
+        return Some(if is_err { ("Err", 1) } else { ("Ok", 0) });
+    }
+    crate::front::option_ctor::option_variant_ctor_tag(target)
 }
 
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a
