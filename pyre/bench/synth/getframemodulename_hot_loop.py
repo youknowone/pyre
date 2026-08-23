@@ -17,15 +17,44 @@
 # oscillated and happened to be right on the last iteration.
 #
 # Depth 1 is read from a callee the tracer can inline, so the answer has to
-# name the CALLER's module rather than the frame the walk is standing in.
+# name the CALLER's module rather than the frame the walk is standing in.  The
+# callee therefore runs under a module of its OWN: with caller and callee both
+# in `__main__` the two answers coincide, and an implementation that ignored
+# the requested depth entirely -- always reporting the frame it is standing in
+# -- produced the expected `{"__main__"}` and passed.  Measured on the shipped
+# shape: depth 1 and depth 0 both answered `__main__`.  With the callee moved
+# out, depth 0 answers `OTHER_MODULE` and depth 1 still answers `__main__`, so
+# the two are finally distinguishable -- and BOTH are asserted, because pinning
+# only depth 1 leaves a route that has stopped distinguishing them unremarked.
+#
+# The callee is built by rebinding a code object against the other module's
+# namespace rather than by `exec`-ing source into it: `exec` into a namespace
+# that is not a module's own dict is a separate open defect here, and this
+# fixture has no reason to depend on it.
 import sys
 
 N = 200000
 EXPECTED = "__main__"
+OTHER_MODULE = "pyre_getframemodulename_callee"
+
+_other = type(sys)(OTHER_MODULE)
+_other.sys = sys
 
 
-def inner_depth1(seen):
-    seen.add(sys._getframemodulename(1))
+def _callee_template(seen_depth1):
+    seen_depth1.add(sys._getframemodulename(1))
+
+
+def _callee_depth0_template():
+    return sys._getframemodulename(0)
+
+
+inner_depth1 = type(_callee_template)(
+    _callee_template.__code__, _other.__dict__, "inner_depth1"
+)
+callee_depth0 = type(_callee_depth0_template)(
+    _callee_depth0_template.__code__, _other.__dict__, "callee_depth0"
+)
 
 
 def hot(n):
@@ -39,12 +68,27 @@ def hot(n):
 
 def main():
     at0, at1 = hot(N)
+    # Read once, OUTSIDE the hot loop.  Every `_getframemodulename` forces the
+    # frame -- it reads `w_globals`, a redirected field -- so a third call in
+    # the loop body costs a third escape per iteration and the loop stops
+    # compiling altogether (measured: `loops_compiled` 1 -> 0, `abrt_escape`
+    # 5 -> 10).  The depth-0 answer is invariant, so one read establishes it
+    # and the hot loop keeps guarding what it exists to guard: the depth-1
+    # answer from a callee the tracer inlines, in COMPILED code.
+    callee_at0 = {callee_depth0()}
     if at0 != {EXPECTED}:
         print("FAIL _getframemodulename(0) not invariant:", sorted(at0, key=str))
         return 1
     if at1 != {EXPECTED}:
         print("FAIL _getframemodulename(1) from an inlinable callee:",
               sorted(at1, key=str))
+        return 1
+    # The callee's own depth 0.  Distinct from `at1` by construction, so a
+    # route that collapsed the two -- ignoring the requested depth -- fails
+    # here even while `at1` still reads `__main__`.
+    if callee_at0 != {OTHER_MODULE}:
+        print("FAIL _getframemodulename(0) inside the foreign-module callee:",
+              sorted(callee_at0, key=str))
         return 1
     print("PASS _getframemodulename hot loop")
     return 0
