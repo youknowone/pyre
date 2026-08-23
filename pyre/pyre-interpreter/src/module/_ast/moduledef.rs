@@ -173,8 +173,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         };
         put(dict_slot, "__module__", pyre_object::w_str_new("ast"))
             .expect("set __module__ on _ast type namespace");
-        put(dict_slot, "_fields", tuple_of_names(node_fields(name)))
+        // `ast.py:152-156` publishes one tuple under both names.  `MATCH_CLASS`
+        // resolves positional sub-patterns through `__match_args__`, so a
+        // `case ast.Expr(expr)` only reaches a field when the node type carries
+        // the same field order `_fields` reports.
+        let fields_slot = dict_slot + 2;
+        let _ = roots.pin_root(tuple_of_names(node_fields(name)));
+        put(dict_slot, "_fields", roots.get(fields_slot))
             .expect("set _fields on _ast type namespace");
+        put(dict_slot, "__match_args__", roots.get(fields_slot))
+            .expect("set __match_args__ on _ast type namespace");
         put(
             dict_slot,
             "_attributes",
