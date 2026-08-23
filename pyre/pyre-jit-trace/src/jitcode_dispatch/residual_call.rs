@@ -5905,6 +5905,28 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `s.add(x)`: fold the bound method away, keeping the store residual.
+    // Gated exactly as the append arm above — the guards it records resume
+    // through the full-body path at `op.pc`, which a sub-walk has no frame for.
+    if ctx.is_authoritative_executor
+        && !ctx.fbw_mode.inline_subwalk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_orthodox_set_add(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // `s.discard(x)`: same bound-method fold as `s.add(x)`.
+    if ctx.is_authoritative_executor
+        && !ctx.fbw_mode.inline_subwalk
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && try_walker_orthodox_set_discard(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #171 ORTHODOX descent for the LIST_APPEND opcode (comprehension append,
     // e.g. `[f(x) for x in xs]`).  The codewriter lowers LIST_APPEND to a void
     // `jit_list_append(list, value)` residual tagged `ListAppendValue` (the
