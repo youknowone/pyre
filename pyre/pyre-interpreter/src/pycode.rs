@@ -2968,15 +2968,26 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// ```
 ///
 /// `location.py offset2lineno(c, stopat)` is the same resolver upstream, down
-/// to the byte-offset convention: it answers `c.co_firstlineno` for `-1` and
-/// halves `stopat` before walking the line table.  `pyframe::offset2lineno`
-/// carries the name but takes an instruction index, so this is the one a
-/// `tb_lasti` reaches.
+/// to the byte-offset convention: it halves `stopat` before walking the line
+/// table.  `pyframe::offset2lineno` carries the name but takes an instruction
+/// index, so this is the one a `tb_lasti` reaches.
 ///
 /// `addrq` counts bytes, two per instruction, so the row index is `addrq / 2`
-/// — the same conversion `traceback._get_code_position` makes app-level.  A
-/// negative offset names the code object's first line, which is the answer for
-/// a frame that has not run an instruction yet.
+/// — the same conversion `traceback._get_code_position` makes app-level.
+///
+/// EVERY negative offset names the code object's first line, which is the
+/// answer for a frame that has not run an instruction yet.  Upstream tests
+/// `stopat == -1` alone, so `-2` reaches `_offset2lineno(..., -1)`, walks a
+/// zero-length range and answers `-1`.  Measured with a traceback rebuilt at
+/// each offset:
+///
+/// | `tb_lasti` | 3.14.2 | PyPy 7.3.20 |
+/// |---|---|---|
+/// | `-1` | `co_firstlineno` | `co_firstlineno` |
+/// | `-2`, `-3` | `co_firstlineno` | `-1` |
+///
+/// The `addrq < 0` arm above is 3.14's, and `traceback_lineno_sentinel.py`
+/// pins it.
 ///
 /// An offset past the last row answers `None`, and `tb_lineno` hands that back
 /// as `None`.  `_PyCode_CheckLineNumber` also answers `-1` for an in-range
