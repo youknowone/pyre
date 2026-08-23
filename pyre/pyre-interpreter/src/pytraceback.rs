@@ -51,9 +51,21 @@ use pyre_object::pyobject::*;
 
 /// `pytraceback.py` `LINENO_NOT_COMPUTED = -sys.maxint-1` —
 /// sentinel meaning "please take the lineno from the frame and
-/// `lasti`".  Pyre uses `i64::MIN` to match RPython's `-sys.maxint-1`
-/// idiom (`pytraceback.py:9-12`).
-pub const LINENO_NOT_COMPUTED: i64 = i64::MIN;
+/// `lasti`".
+///
+/// The value is `-1`, not upstream's `-sys.maxint-1`, because the sentinel is
+/// app-level visible through the fourth constructor argument and `-1` is the
+/// one 3.14 measures it against: `tb_lineno_get` resolves on
+/// `if (lineno == -1)`, and `_PyTraceBack_FromFrame` records a node with
+/// `tb_create_raw(..., -1)`.
+///
+/// Upstream's comment explains its own choice — negative line numbers are
+/// settable there, so it took the most negative value to keep a written line
+/// number from colliding with the sentinel.  3.14 answered the same worry by
+/// making `tb_lineno` read-only, and `init_pytraceback_type` follows it, so a
+/// line number can only arrive through the constructor and the collision
+/// upstream guarded against has no path here either.
+pub const LINENO_NOT_COMPUTED: i64 = -1;
 
 pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 
@@ -91,8 +103,7 @@ pub struct PyTraceback {
     pub w_next: PyObjectRef,
     /// `pytraceback.py self.lineno = lineno` — either a real
     /// source line number or `LINENO_NOT_COMPUTED`, in which case
-    /// `get_lineno` calls `offset2lineno` to resolve it lazily
-    /// (`pytraceback.py:34-37`).
+    /// `w_pytraceback_get_lineno` resolves it from `w_code` and `lasti`.
     pub lineno: i64,
     /// Snapshot of the raising frame's `pycode`, with no upstream
     /// counterpart — `pytraceback.py` reads `self.frame.pycode`
@@ -235,13 +246,6 @@ pub unsafe fn w_pytraceback_get_lasti(obj: PyObjectRef) -> i64 {
 /// # Safety
 /// `obj` must point to a valid `PyTraceback`.
 #[inline]
-pub unsafe fn w_pytraceback_set_lasti(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut PyTraceback)).lasti = value }
-}
-
-/// # Safety
-/// `obj` must point to a valid `PyTraceback`.
-#[inline]
 pub unsafe fn w_pytraceback_get_w_next(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_next }
 }
@@ -284,13 +288,6 @@ pub unsafe fn w_pytraceback_get_lineno_raw(obj: PyObjectRef) -> i64 {
 /// # Safety
 /// `obj` must point to a valid `PyTraceback`.
 #[inline]
-pub unsafe fn w_pytraceback_set_lineno(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut PyTraceback)).lineno = value }
-}
-
-/// # Safety
-/// `obj` must point to a valid `PyTraceback`.
-#[inline]
 pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_code }
 }
@@ -308,35 +305,45 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 ///     return space.newint(self.get_lineno())
 /// ```
 ///
-/// Pyre stamps the real line number at `record_application_traceback`
-/// time instead of resolving it here.  The upstream walk goes through
-/// `self.frame.pycode`, which this reader cannot do: `frame` is only
-/// forwarded for a frame the GC owns, so it may already have been
-/// freed by the time `tb_lineno` is read.  The `w_code` snapshot is
-/// forwarded unconditionally and IS that `pycode`, so `offset2lineno`
-/// off `w_code` and `lasti` would be safe to run lazily.  What still
-/// depends on the eager stamp is the JIT fold
-/// `walker_specialize_traceback_walk_field` (pyre-jit-trace): it reads
-/// this slot directly and declines on the sentinel, so under a lazy
-/// `get_lineno` every fresh node would decline on its first read.
+/// The resolution walks the `w_code` snapshot rather than upstream's
+/// `self.frame.pycode`: `frame` is only forwarded for a frame the GC owns, so
+/// it may already have been freed by the time `tb_lineno` is read, while
+/// `w_code` is forwarded unconditionally and IS that `pycode`.
 ///
-/// Two `tb_lineno` answers diverge from `get_lineno` because of it.
-/// Upstream re-resolves from the CURRENT `lasti` whenever the slot
-/// still holds the sentinel, so `tb.tb_lasti = N; tb.tb_lineno` reads
-/// the new offset there and the originally-stamped line here; and a
-/// sentinel written back through `TracebackType(..., -sys.maxsize-1)`
-/// or the `tb_lineno` setter is re-resolved there and answered `-1`
-/// here.  Porting back to lazy needs the fold to call a resolver
-/// rather than decline.  The sentinel also still surfaces as `-1` for
-/// a traceback constructed without a frame (e.g. unit tests).
+/// `None` is the `Py_RETURN_NONE` arm of `tb_lineno_get`, taken when
+/// `PyCode_Addr2Line` reports no line for `tb_lasti` — here also when the node
+/// carries no code object at all, which upstream cannot reach because its
+/// frame edge is unconditional.
+///
+/// The resolved line is NOT written back to the slot.  Upstream memoizes
+/// (`self.lineno = offset2lineno(...)`); `tb_lineno_get` re-reads instead, and
+/// re-reading is what keeps the slot single-writer for the JIT fold
+/// `walker_specialize_traceback_walk_field`, which folds the raw slot against
+/// a guard that it is not the sentinel.
+///
+/// `record_application_traceback` still stamps the line eagerly, so a recorded
+/// node reaches the first branch and never resolves here.  That timing is not
+/// observable: `tb_lasti` and `tb_lineno` are read-only, so the only way to
+/// hand a live node a sentinel is the constructor, which lands in the second
+/// branch either way.
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
-#[inline]
-pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
+pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
     unsafe {
         let raw = w_pytraceback_get_lineno_raw(tb);
-        if raw == LINENO_NOT_COMPUTED { -1 } else { raw }
+        if raw != LINENO_NOT_COMPUTED {
+            return Some(raw);
+        }
+        let w_code = w_pytraceback_get_w_code(tb);
+        if w_code.is_null() {
+            return None;
+        }
+        let code = crate::w_code_get_ptr(w_code) as *const crate::CodeObject;
+        if code.is_null() {
+            return None;
+        }
+        crate::pycode::w_code_addr2line(&*code, w_pytraceback_get_lasti(tb)).map(|line| line as i64)
     }
 }
 
@@ -425,24 +432,23 @@ pub unsafe fn record_application_traceback(
         // safepoint's non-moving major would otherwise sweep its old-gen
         // traceback chain (`tstate->current_exception` parity).
         crate::eval::set_in_flight_exception(w_exc_object);
-        // `pytraceback.py:36 self.lineno = offset2lineno(self.frame
-        // .pycode, self.lasti)` — pyre resolves the line number
-        // eagerly here rather than lazily in `get_lineno`, so the slot
-        // never holds `LINENO_NOT_COMPUTED` for a node built here.
+        // `pytraceback.py self.lineno = offset2lineno(self.frame
+        // .pycode, self.lasti)` — pyre resolves the line number eagerly
+        // here rather than leaving the sentinel for the getter, so the
+        // slot never holds `LINENO_NOT_COMPUTED` for a node built here.
+        // `_PyTraceBack_FromFrame` records the sentinel instead and
+        // `tb_lineno_get` resolves it, but a node's `tb_lasti` and
+        // `tb_lineno` are both read-only there, so which of the two
+        // moments does the walk is not app-level observable.
         //
-        // Frame lifetime is NOT what blocks the lazy form: the `w_code`
+        // What the eager stamp buys is the JIT fold
+        // `walker_specialize_traceback_walk_field` (pyre-jit-trace): it
+        // reads this slot directly and declines on the sentinel, so a
+        // node that carried the sentinel would decline on every read of
+        // its line.  Frame lifetime is not part of it — the `w_code`
         // slot below is forwarded unconditionally and is the same
-        // `pycode` upstream reads, so resolving off `w_code` + `lasti`
-        // would be safe at any later point.  What blocks it is the JIT
-        // fold `walker_specialize_traceback_walk_field`
-        // (pyre-jit-trace), which reads this slot directly and declines
-        // on the sentinel; under a lazy `get_lineno` every freshly
-        // recorded node carries the sentinel on its first read, so the
-        // fold would have to emit a resolver call plus the memoizing
-        // write-back in place of today's plain `getfield`.  That trades
-        // a folded field read for a call on the `tb_lineno` walk.
-        // See `w_pytraceback_get_lineno` for the two `tb_lineno`
-        // answers the eager stamp diverges on.
+        // `pycode` upstream reads, which is what makes the getter's
+        // resolution safe at any later point.
         //
         // `frame.pycode` is the `PyCode` wrapper; the inner
         // `CodeObject` is extracted via `pyframe_get_pycode`.
@@ -504,6 +510,40 @@ mod tests {
             assert_eq!(w_pytraceback_get_lineno_raw(tb), LINENO_NOT_COMPUTED);
             assert!(w_pytraceback_get_frame(tb).is_null());
             assert!(w_pytraceback_get_w_code(tb).is_null());
+        }
+    }
+
+    /// The sentinel is the value the fourth constructor argument is measured
+    /// against, so it has to be the one `tb_lineno_get` tests for.
+    #[test]
+    fn the_sentinel_is_the_one_the_constructor_can_hand_in() {
+        assert_eq!(LINENO_NOT_COMPUTED, -1);
+    }
+
+    /// A node carrying no code object cannot resolve, which is the
+    /// `Py_RETURN_NONE` arm; a stamped line is handed back as it is, including
+    /// the negative values the constructor accepts.
+    #[test]
+    fn an_unresolvable_node_answers_none_and_a_stamped_line_answers_itself() {
+        unsafe {
+            let unresolvable = w_pytraceback_new(
+                std::ptr::null_mut(),
+                42,
+                PY_NULL,
+                LINENO_NOT_COMPUTED,
+                PY_NULL,
+            );
+            assert_eq!(w_pytraceback_get_lineno(unresolvable), None);
+
+            let stamped = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 7, PY_NULL);
+            assert_eq!(w_pytraceback_get_lineno(stamped), Some(7));
+
+            // `-2` is not the sentinel, so it reads back rather than resolving.
+            let negative = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, -2, PY_NULL);
+            assert_eq!(w_pytraceback_get_lineno(negative), Some(-2));
+
+            let zero = w_pytraceback_new(std::ptr::null_mut(), 42, PY_NULL, 0, PY_NULL);
+            assert_eq!(w_pytraceback_get_lineno(zero), Some(0));
         }
     }
 

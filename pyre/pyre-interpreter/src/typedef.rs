@@ -7782,11 +7782,20 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             make_new_descr(traceback_descr_new),
         )
     };
-    // pytraceback.py descr_get_tb_lasti / descr_set_tb_lasti — the slot
-    // is handed out and taken back as it is.  It already holds the byte offset
-    // `tb_lasti` means, so `traceback._get_code_position` recovers the
-    // instruction with its `// 2`, and a value written here reads back
-    // unchanged.
+    // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is.
+    // It already holds the byte offset `tb_lasti` means, so
+    // `traceback._get_code_position` recovers the instruction with its `// 2`.
+    //
+    // `descr_set_tb_lasti` and `descr_set_tb_lineno` are deliberately NOT
+    // wired, for the reason `__reduce__` / `__setstate__` are not: 3.14 is the
+    // behaviour authority and it makes both fields read-only -- `tb_lasti` is
+    // `Py_READONLY` in `tb_memberlist` and `tb_lineno` is a getset with a NULL
+    // setter, leaving `tb_next` as the type's only writable field.  Keeping
+    // upstream's setters would matter more now than it used to: `tb_lineno`
+    // resolves `LINENO_NOT_COMPUTED` rather than storing it, so a written `-1`
+    // would read back as a resolved line, which is an answer neither reference
+    // gives.  The constructor still takes both values, which is how a
+    // traceback with a chosen offset is built here as it is there.
     let lasti_getter = make_builtin_function_with_arity(
         "tb_lasti",
         |args| {
@@ -7799,34 +7808,20 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         },
         2,
     );
-    let lasti_setter = make_builtin_function_with_arity(
-        "tb_lasti",
-        |args| {
-            let tb = args[1];
-            let w_value = args[2];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let v = crate::baseobjspace::int_w(w_value)?;
-            unsafe { crate::pytraceback::w_pytraceback_set_lasti(tb, v) };
-            Ok(pyre_object::w_none())
-        },
-        3,
-    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "tb_lasti",
             make_getset_property_named(
                 lasti_getter,
-                lasti_setter,
+                pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 "tb_lasti",
             ),
         )
     };
 
-    // pytraceback.py descr_get_tb_lineno / descr_set_tb_lineno.
+    // pytraceback.py descr_get_tb_lineno.
     let lineno_getter = make_builtin_function_with_arity(
         "tb_lineno",
         |args| {
@@ -7834,24 +7829,13 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             if tb.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let n = unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) };
-            Ok(pyre_object::w_int_new(n))
+            // `tb_lineno_get` answers `None` when the offset names no line.
+            match unsafe { crate::pytraceback::w_pytraceback_get_lineno(tb) } {
+                Some(n) => Ok(pyre_object::w_int_new(n)),
+                None => Ok(pyre_object::w_none()),
+            }
         },
         2,
-    );
-    let lineno_setter = make_builtin_function_with_arity(
-        "tb_lineno",
-        |args| {
-            let tb = args[1];
-            let w_value = args[2];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let v = crate::baseobjspace::int_w(w_value)?;
-            unsafe { crate::pytraceback::w_pytraceback_set_lineno(tb, v) };
-            Ok(pyre_object::w_none())
-        },
-        3,
     );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -7859,7 +7843,7 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             "tb_lineno",
             make_getset_property_named(
                 lineno_getter,
-                lineno_setter,
+                pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
                 "tb_lineno",
             ),

@@ -1597,6 +1597,11 @@ impl PyError {
     /// An unmaterialised error therefore has no chain to report, which is the
     /// same answer upstream's `None` gives: nothing has recorded a frame yet.
     ///
+    /// 3.14 does not defer the instance either — `_PyErr_SetObject` comments
+    /// "We must normalize the value right now" and calls
+    /// `_PyErr_CreateException` before storing anything — so building it at
+    /// the first unwind, rather than never, is the closer of the two.
+    ///
     /// Reading marks the head frame escaped, upstream's documented side
     /// effect — see [`crate::pytraceback::mark_traceback_escaped`] for which
     /// single-frame case that covers.
@@ -1781,6 +1786,42 @@ impl PyError {
     pub fn match_(&mut self, _space: PyObjectRef, w_check_class: PyObjectRef) -> bool {
         let w_value = self.to_exc_object();
         !w_value.is_null() && crate::eval::check_exc_match_against(w_value, w_check_class)
+    }
+
+    /// pypy/interpreter/error.py `OperationError.async`.
+    ///
+    /// ```python
+    /// def async(self, space):
+    ///     "Check if this is an exception that should better not be caught."
+    ///     return (self.match(space, space.w_SystemExit) or
+    ///             self.match(space, space.w_KeyboardInterrupt))
+    ///     # note: an extra case is added in OpErrFmtNoArgs
+    /// ```
+    ///
+    /// Named `r#async` because `async` is a Rust keyword, the same escape
+    /// `typedef::r#type` uses for `space.type`.
+    ///
+    /// The guard sites all read the same way: an error is about to be
+    /// swallowed and turned into a fallback answer, and this says which
+    /// errors must not be. The two named classes are the ones a program has
+    /// no business converting into `None` or `NotImplemented` — an exit
+    /// request and a Ctrl-C.
+    ///
+    /// `KeyboardInterrupt` has no `ExcKind`, so it reaches a `PyError`
+    /// only as an already-built instance and the class is named through the
+    /// registry rather than through a static. That is also why an error
+    /// that has not materialised can answer from its `kind` alone: nothing
+    /// unmaterialised is ever a `KeyboardInterrupt`, and building an
+    /// instance merely to ask would put an allocation on the swallow path
+    /// of every attribute lookup that misses.
+    pub fn r#async(&mut self, space: PyObjectRef) -> bool {
+        if self.exc_object.is_null() {
+            return self.kind == PyErrorKind::SystemExit;
+        }
+        ["SystemExit", "KeyboardInterrupt"].iter().any(|name| {
+            crate::builtins::lookup_exc_class(name)
+                .is_some_and(|w_class| self.match_(space, w_class))
+        })
     }
 
     /// pypy/interpreter/error.py `chain_exceptions`.
@@ -3270,7 +3311,10 @@ fn write_traceback_chain_from_tb<W: Write>(
             break;
         }
         let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(current_tb) };
-        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
+        // `Py_DisplayTraceback` prints whatever `tb_get_lineno` gave it,
+        // negative included, rather than skipping a node it cannot place.
+        let lineno =
+            unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) }.unwrap_or(-1);
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
             (b"<unknown>".to_vec(), String::from("<unknown>"), None)
@@ -3947,6 +3991,46 @@ pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
     }
 }
 
+/// `error.py oefmt` — build an exception whose message is `valuefmt` with each
+/// format code filled from its own argument.
+///
+/// ```python
+/// @specialize.arg(1)
+/// def oefmt(w_type, valuefmt, *args):
+///     """Equivalent to OperationError(w_type, space.newtext(valuefmt % args)).
+///     More efficient in the (common) case where the value is not actually
+///     needed."""
+/// ```
+///
+/// The conversions run here rather than behind the message accessor, and that
+/// is a decision rather than an omission.  Upstream returns an `OpErrFmt`
+/// storing the operands and formats only when `get_w_value` asks
+/// `_compute_value`, which is the RPython saving its docstring advertises: an
+/// error caught by an interpreter-level guard and discarded never pays for its
+/// `%R`.  3.14 does not defer.  `_PyErr_FormatV` renders the whole string
+/// before it ever names the exception —
+///
+/// ```c
+/// /* Issue #23571: PyUnicode_FromFormatV() must not be called with an
+///    exception set, it calls arbitrary Python code like PyObject_Repr() */
+/// _PyErr_Clear(tstate);
+/// string = PyUnicode_FromFormatV(format, vargs);
+/// ```
+///
+/// — so `%R`'s `PyObject_Repr` runs at the raise, not at the read.  Measured on
+/// 3.14.2 with a `__repr__` that logs, against `types.GenericAlias(obj, ...)[int]`
+/// (`genericaliasobject.c` `"%R is not a generic class"`): one call at
+/// construction, none at `str(e)`.  Deferring would move that side effect and
+/// its unraisable to a different moment than 3.14 picks.
+///
+/// The upstream saving is also narrower than it looks on 3.x: `except` pushes
+/// the instance whether or not the handler binds it, so the first
+/// application-level handler forces `_compute_value` anyway.  What is left is
+/// the interpreter-internal swallow — `findattr`, the `async` guards — and
+/// taking it would need the operands rooted for a `PyError` in flight, which
+/// nothing can do: Rust memcpies the carrier at every `?`, the same
+/// constraint that keeps the traceback chain on the instance
+/// ([`PyError::get_traceback`]).
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.  Nothing on the way to the
@@ -4554,5 +4638,26 @@ mod tests {
         assert!(!err.has_any_traceback());
         assert!(!err.got_any_traceback());
         assert!(err.exc_object.is_null(), "the reads must not materialise");
+    }
+
+    #[test]
+    fn an_unmaterialised_error_answers_async_from_its_kind() {
+        // The guard sites ask this on the swallow path of every miss, so it
+        // must not build an instance to answer.  `kind` settles both
+        // disjuncts before materialisation: nothing unmaterialised is a
+        // `KeyboardInterrupt`, which has no `ExcKind` at all.
+        let mut ordinary = super::PyError::type_error("bad operand");
+        assert!(!ordinary.r#async(pyre_object::PY_NULL));
+        assert!(
+            ordinary.exc_object.is_null(),
+            "the read must not materialise"
+        );
+
+        let mut exiting = super::PyError::new(super::PyErrorKind::SystemExit, "0");
+        assert!(exiting.r#async(pyre_object::PY_NULL));
+        assert!(
+            exiting.exc_object.is_null(),
+            "the read must not materialise"
+        );
     }
 }
