@@ -621,34 +621,15 @@ pub(crate) fn read_int_le(data: &[u8]) -> i64 {
 pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
     // BINUNICODE is encoded with Python's UTF-8 `surrogatepass`: lone
     // surrogates are valid pickle payloads and are represented internally as
-    // WTF-8, while malformed byte sequences must still be rejected.
-    let s = rustpython_wtf8::Wtf8Buf::from_bytes(data.to_vec()).map_err(utf8_decode_error)?;
-    Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(s))
-}
-
-/// Construct Python's UTF-8 decode error details from Rust's `Utf8Error`.
-/// `error_len == None` is a truncated multibyte sequence; otherwise a valid
-/// leading byte at `valid_up_to` means the following byte was an invalid
-/// continuation, and every other offending byte is an invalid start.
-pub(crate) fn utf8_decode_error(bytes: Vec<u8>) -> PyError {
-    let error = std::str::from_utf8(&bytes).unwrap_err();
-    let start = error.valid_up_to();
-    let reason = match error.error_len() {
-        None => "unexpected end of data",
-        Some(_)
-            if bytes
-                .get(start)
-                .is_some_and(|byte| matches!(byte, 0xC2..=0xF4)) =>
-        {
-            "invalid continuation byte"
-        }
-        Some(_) => "invalid start byte",
-    };
-    let end = start
-        + error
-            .error_len()
-            .unwrap_or(bytes.len().saturating_sub(start));
-    crate::typedef::unicode_decode_error("utf-8", &bytes, start, end.min(bytes.len()), reason)
+    // WTF-8, while malformed byte sequences must still be rejected.  The
+    // rejection is `rutf8::wtf8_from_bytes`'s and not `Wtf8Buf::from_bytes`'s,
+    // which admits sequences that hold no code point at all, and it is
+    // reported at the position that validator stopped at.
+    let s = pyre_object::rutf8::wtf8_from_bytes(data, true)
+        .map_err(|error| crate::typedef::utf8_decode_error_from(data, error.pos))?;
+    Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(
+        s.to_owned(),
+    ))
 }
 
 crate::py_module! {

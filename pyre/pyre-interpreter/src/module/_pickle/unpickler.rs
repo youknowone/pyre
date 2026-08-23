@@ -6,7 +6,7 @@ use crate::PyError;
 
 use super::{
     HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
-    read_int_le, str_from_utf8, unpickling_error, utf8_decode_error,
+    read_int_le, str_from_utf8, unpickling_error,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1620,7 +1620,7 @@ fn read_line_bytes(slot: usize) -> Result<Vec<u8>, PyError> {
 
 fn read_line(slot: usize) -> Result<String, PyError> {
     let bytes = read_line_bytes(slot)?;
-    String::from_utf8(bytes).map_err(|err| utf8_decode_error(err.into_bytes()))
+    String::from_utf8(bytes).map_err(|err| crate::typedef::utf8_decode_error(err.as_bytes()))
 }
 
 /// Read a newline-terminated decimal integer argument (GET / PUT in the

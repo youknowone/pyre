@@ -5620,6 +5620,22 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     let vstack_mirror: Option<&[OpRef]> = vstack.filter(|_| guard_present);
     for &idx in &banks.ref_ {
         let color = idx as usize;
+        // The semantic slot this color owns AT THE GUARD PC.  Where it equals
+        // the slot being sourced, `regs_r[color]` is upstream's
+        // `registers_r[index]` (`get_list_of_active_boxes`, `pyjitpl.py`) for
+        // that slot rather than a merge color the regalloc may have reused;
+        // both the mirror-hole report and the operand-stack value choice below
+        // turn on that identity.
+        let guard_owned_slot = guard_present
+            .then(|| {
+                crate::state::semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    guard_stack_only,
+                    &guard_pcdep_entries,
+                    color,
+                )
+            })
+            .flatten();
         if let Some(mirror) = vstack_mirror {
             // Resume operand-stack slot for this live Ref color; the mirror
             // box for that slot is the kept value (bottom-anchored: resume
@@ -5665,13 +5681,32 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                     // (`synth/list_append_write_barrier_gc`), and declining them
                     // regressed it (loops 12→11, bridges 5→3, aborts 1→4) with
                     // no demonstration that the value encoded today is wrong.
-                    // Whether that NULL is the slot's real value (a `PUSH_NULL`
-                    // sentinel) cannot be settled here: the mirror has several
-                    // writers and only `reseed_vstack_from_shadow` gates a NULL
-                    // behind the live-NULL marker, while the per-op reconcile
-                    // and the vable write-through store one directly.  Settling
-                    // that is what closes the remaining case.
-                    if m == OpRef::NONE && !kept_recovered.contains_key(&idx) {
+                    //
+                    // A hole the guard pc's OWN color→slot map resolves is not
+                    // reported at all.  `get_list_of_active_boxes`
+                    // (`pyjitpl.py`) snapshots `self.registers_r[index]` and
+                    // never fails, because the register file IS the source; the
+                    // stale-read hazard this report exists for is the case
+                    // where that identity does not hold — the resume merge
+                    // color is unwritten at the guard point, or the regalloc
+                    // reused it for an unrelated SSA temp.  When
+                    // `pcdep_color_slots` AT THE GUARD PC maps this color to
+                    // this very semantic slot, the two coincide: the walk
+                    // register read below means exactly `registers_r[index]`,
+                    // and the stack-slot arm consumes it through the same
+                    // `guard_pc_proves_slot` test.  That also settles what the
+                    // mirror cannot: a slot whose live value is a NULL — an
+                    // already-cleared operand, a `self_or_null` — is a hole in
+                    // the mirror by construction, because
+                    // `reseed_vstack_from_shadow` reads a dense array where an
+                    // absent slot and a written NULL are the same word and so
+                    // refuses to source either.  The register file draws that
+                    // distinction, and upstream keeps the NULL: PyPy's MIFrame
+                    // registers preserve CONST_NULL in snapshots.
+                    if m == OpRef::NONE
+                        && !kept_recovered.contains_key(&idx)
+                        && guard_owned_slot != Some(sem)
+                    {
                         if let Some(first) = unrecovered_kept.as_deref_mut() {
                             first.get_or_insert(idx);
                         }
@@ -5803,13 +5838,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
                         let walk_real =
                             walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-                        let guard_pc_proves_slot = guard_present
-                            && crate::state::semantic_ref_slot_for_reg_color(
-                                nlocals,
-                                guard_stack_only,
-                                &guard_pcdep_entries,
-                                color,
-                            ) == Some(s_idx);
+                        let guard_pc_proves_slot = guard_owned_slot == Some(s_idx);
                         if guard_pc_proves_slot {
                             walk_real.or(vbox).unwrap_or_else(fallback)
                         } else if shadow_is_real {

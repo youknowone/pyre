@@ -16,6 +16,9 @@ use std::sync::OnceLock;
 
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::pyobject::*;
+use pyre_object::rutf8::{
+    invalid_byte_2_of_3, invalid_byte_2_of_4, invalid_cont_byte, surrogate_bytes,
+};
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -23086,7 +23089,12 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let a = args[0];
     if unsafe { pyre_object::is_str(a) } {
-        return parse_hex_bytes(unsafe { pyre_object::w_str_get_value(a) }.as_bytes());
+        // Every character before the first rejected one is a hex digit or
+        // ASCII whitespace, so the byte offset the scan reports is also the
+        // code point offset `_PyBytes_FromHex` names.  Reading the WTF-8
+        // payload rather than demanding a `str` keeps a lone surrogate a
+        // rejected character instead of an abort.
+        return parse_hex_bytes(unsafe { pyre_object::w_str_get_wtf8(a) }.as_bytes());
     }
     let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(a)? else {
         return Err(crate::PyError::type_error(format!(
@@ -23389,21 +23397,20 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if crate::baseobjspace::len_w(sep_obj)? != 1 {
             return Err(sep_length_error());
         }
-        let sep_char: char = if unsafe { pyre_object::is_str(sep_obj) } {
-            let s = unsafe { pyre_object::w_str_get_value(sep_obj) };
-            if !s.is_ascii() {
-                return Err(sep_ascii_error());
-            }
-            s.chars().next().unwrap_or('\0')
+        let sep_bytes: &[u8] = if unsafe { pyre_object::is_str(sep_obj) } {
+            // A lone surrogate is a length-1 separator with no UTF-8
+            // spelling, so the ASCII test reads the WTF-8 payload; demanding
+            // a `str` of it raises nothing, it aborts.
+            unsafe { pyre_object::w_str_get_wtf8(sep_obj) }.as_bytes()
         } else if unsafe { pyre_object::is_bytes(sep_obj) } {
-            let sep_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) };
-            if !sep_bytes.is_ascii() {
-                return Err(sep_ascii_error());
-            }
-            sep_bytes.first().copied().unwrap_or(0) as char
+            unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) }
         } else {
             return Err(crate::PyError::type_error("sep must be str or bytes."));
         };
+        if !sep_bytes.is_ascii() {
+            return Err(sep_ascii_error());
+        }
+        let sep_char = sep_bytes.first().copied().unwrap_or(0) as char;
         let sep_str = sep_char.to_string();
         // `bytearrayobject.py:680-692` — positive `bytes_per_sep` groups
         // from the right (default), negative groups from the left; zero
@@ -23463,6 +23470,52 @@ fn unicode_decode_error_msg(
 /// `W_UnicodeDecodeError.descr_init` (interp_exceptions.py) so
 /// the caught exception carries the full attribute set, not just a message.
 /// `.object` holds the whole bytes buffer; `start`/`end` index into it.
+/// Construct Python's UTF-8 decode error details from Rust's `Utf8Error`.
+/// `error_len == None` is a truncated multibyte sequence; otherwise a valid
+/// leading byte at `valid_up_to` means the following byte was an invalid
+/// continuation, and every other offending byte is an invalid start.
+///
+/// # Panics
+///
+/// `bytes` must not be valid UTF-8: the error details are read off the
+/// `Utf8Error` a strict decode of it raises, so a valid buffer has none.
+pub(crate) fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
+    utf8_decode_error_from(bytes, 0)
+}
+
+/// The same, resumed at the position a `surrogatepass` validator stopped at.
+///
+/// A strict scan cannot find that position itself: an encoded surrogate is
+/// what stops it, and `surrogatepass` accepts one, so scanning `bytes` from
+/// the front names the surrogate instead of the byte that was actually
+/// rejected.  `pos` comes from `rutf8::wtf8_from_bytes`, and the strict scan
+/// resumed there stops immediately, because everything WTF-8 rejects at a
+/// position UTF-8 rejects there too.
+///
+/// # Panics
+///
+/// `bytes[pos..]` must not be valid UTF-8, for the reason above.
+pub(crate) fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError {
+    let error = std::str::from_utf8(&bytes[pos..]).unwrap_err();
+    let start = pos + error.valid_up_to();
+    let reason = match error.error_len() {
+        None => "unexpected end of data",
+        Some(_)
+            if bytes
+                .get(start)
+                .is_some_and(|byte| matches!(byte, 0xC2..=0xF4)) =>
+        {
+            "invalid continuation byte"
+        }
+        Some(_) => "invalid start byte",
+    };
+    let end = start
+        + error
+            .error_len()
+            .unwrap_or(bytes.len().saturating_sub(start));
+    unicode_decode_error("utf-8", bytes, start, end.min(bytes.len()), reason)
+}
+
 pub(crate) fn unicode_decode_error(
     encoding: &str,
     data: &[u8],
@@ -23713,24 +23766,6 @@ const UTF8_CODE_LENGTH: [u8; 128] = [
     4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F0-F4 + F5-FF
 ];
 
-/// rutf8.py:326-328
-fn invalid_cont_byte(b: u8) -> bool {
-    (b as i8) >= -0x40 // equivalent: b < 0x80 || b > 0xBF
-}
-
-/// rutf8.py `_invalid_byte_2_of_3`: reject surrogate encodings unless the
-/// caller selected the `surrogatepass` path.
-fn invalid_byte_2_of_3(ch1: u8, ch2: u8, allow_surrogates: bool) -> bool {
-    invalid_cont_byte(ch2)
-        || (ch1 == 0xE0 && ch2 < 0xA0)
-        || (ch1 == 0xED && ch2 > 0x9F && !allow_surrogates)
-}
-
-/// rutf8.py:345-348
-fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
-    invalid_cont_byte(ch2) || (ch1 == 0xF0 && ch2 < 0x90) || (ch1 == 0xF4 && ch2 > 0x8F)
-}
-
 /// interp_locale.py `charp2uni` — decode a C string the way
 /// `str(bytes, 'utf-8', 'surrogateescape')` does: valid UTF-8 passes
 /// through and any other byte becomes a lone `0xDC00 + byte` surrogate.
@@ -23829,17 +23864,44 @@ pub(crate) fn fsdecode_wtf8_total(data: &[u8]) -> Wtf8Buf {
 /// Unicode scalar values via `char::from_u32`, or a WTF-8 `CodePoint` for
 /// the `surrogatepass` path.
 fn decode_utf8_with_errors(data: &[u8], err_mode: &str) -> Result<Wtf8Buf, crate::PyError> {
-    decode_utf8_with_errors_incremental(data, err_mode, true).map(|(decoded, _)| decoded)
+    decode_utf8_with_errors_incremental(data, err_mode, true, false).map(|(decoded, _)| decoded)
 }
 
 /// PyPy `unicodehelper.str_decode_utf8`: the incremental form additionally
 /// returns the byte position consumed and leaves a valid but incomplete
 /// trailing sequence untouched when `final_` is false.
+///
+/// `allow_surrogates` is the caller's, as it is upstream: `str_decode_utf8`
+/// defaults it to false and only `interp_codecs.utf_8_decode` turns it on.
+/// Deriving it from `err_mode` here instead made both entry points take the
+/// `_codecs` answer, and the two do not agree — with it off, `ED A0` stops as
+/// an invalid continuation byte at 0..1 and `surrogatepass_errors` decodes a
+/// complete surrogate itself.
+///
+/// `[3.14-spec]` The allowance covers a **complete** `ED A0..BF 80..BF` and
+/// nothing less.  `_str_decode_utf8_slowpath` reports the whole admitted lead
+/// pair when the sequence then fails, so `_codecs.utf_8_decode(b'\xed\xa0A',
+/// 'surrogatepass', True)` spans 0..2 there; `unicode_decode_utf8` has no
+/// `allow_surrogates` at all and spans 0..1, which is what a caller reads off
+/// `UnicodeDecodeError.start`/`.end`.  Measured on 3.14.0 and pypy3 over the
+/// 42 rows of `utf8_surrogatepass_error_span.py`: they differ on the six
+/// where the lead pair is a surrogate and the sequence does not complete,
+/// and agree everywhere else.  A truncated pair at the end of a non-final
+/// chunk is still retained, as both do.
 pub(crate) fn decode_utf8_with_errors_incremental(
     data: &[u8],
     err_mode: &str,
     final_: bool,
+    allow_surrogates: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
+    // `str_decode_utf8` tries the "fast version first": a buffer that is
+    // already well formed is its own decode, so nothing below runs and no
+    // error handler is reachable.  This is the whole of the common case, and
+    // it scans a word at a time where the state machine reads a byte at a
+    // time -- 39 ASCII bytes cost 232 ns through the machine and 34 here.
+    if let Ok(valid) = pyre_object::rutf8::wtf8_from_bytes(data, allow_surrogates) {
+        return Ok((valid.to_owned(), data.len()));
+    }
     // A custom error handler may replace exc.object; decoding then resumes
     // from the new bytes (`s`), re-evaluating `size` each iteration.  The
     // common path keeps the borrowed slice (no allocation).
@@ -23847,11 +23909,6 @@ pub(crate) fn decode_utf8_with_errors_incremental(
     let mut size = s.len();
     let mut result = Wtf8Buf::new();
     let mut pos = 0;
-    // PyPy `interp_codecs.utf_8_decode` passes
-    // `allow_surrogates=True` specifically for `surrogatepass`, so a valid
-    // ED A0..BF 80..BF sequence is decoded directly and an incomplete one is
-    // retained for the next incremental chunk.
-    let allow_surrogates = err_mode == "surrogatepass";
     // Run a utf-8 error handler and rebind `s`/`size` when it returns
     // replacement bytes; then advance `pos` to the resume position.
     macro_rules! run_err {
@@ -23898,7 +23955,15 @@ pub(crate) fn decode_utf8_with_errors_incremental(
                 if !final_ {
                     break;
                 }
-                run_err!(pos, pos + 2, "unexpected end of data");
+                // [3.14-spec] A pair only the surrogate allowance admits has
+                // to complete as a whole surrogate; with the third byte
+                // missing the answer is the one the allowance suspended.
+                let (end, reason) = if surrogate_bytes(ordch1, ordch2) {
+                    (pos + 1, "invalid continuation byte")
+                } else {
+                    (pos + 2, "unexpected end of data")
+                };
+                run_err!(pos, end, reason);
                 continue;
             } else if n == 4 {
                 // unicodehelper.py:435-459
@@ -23947,7 +24012,15 @@ pub(crate) fn decode_utf8_with_errors_incremental(
                 continue;
             }
             if invalid_cont_byte(ordch3) {
-                run_err!(pos, pos + 2, "invalid continuation byte");
+                // [3.14-spec] as above: the allowance covers a whole encoded
+                // surrogate, so a bad third byte falls back to the strict
+                // span rather than reporting two bytes as one bad sequence.
+                let end = if surrogate_bytes(ordch1, ordch2) {
+                    pos + 1
+                } else {
+                    pos + 2
+                };
+                run_err!(pos, end, "invalid continuation byte");
                 continue;
             }
             // 1110xxxx 10yyyyyy 10zzzzzz
@@ -24041,19 +24114,17 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             "decode() argument 'errors' must be str, not {tn}",
         )));
     }
+    // `str_utf8_w` hands back the string object's own buffer, and both
+    // objects stay rooted for the call, so neither name needs a copy.
     let encoding = match w_encoding {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            crate::baseobjspace::str_utf8_w(e)?.to_string()
-        }
-        _ => "utf-8".to_string(),
+        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
+        _ => "utf-8",
     };
     let errors = match w_errors {
-        Some(e) if unsafe { pyre_object::is_str(e) } => {
-            crate::baseobjspace::str_utf8_w(e)?.to_string()
-        }
-        _ => "strict".to_string(),
+        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
+        _ => "strict",
     };
-    let s = decode_bytes_to_wtf8(data, &encoding, errors.as_str())?;
+    let s = decode_bytes_to_wtf8(data, encoding, errors)?;
     Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
@@ -24065,10 +24136,21 @@ pub(crate) fn decode_bytes_to_wtf8(
     errors: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
-    let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    // The codec name is matched with case folded and `_` read as `-`.  Every
+    // caller inside the runtime, and `bytes.decode`'s own default, already
+    // spells it that way, so the rewrite is the exception and only it pays
+    // for a buffer.
+    let enc_lower: std::borrow::Cow<'_, str> = if encoding
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        std::borrow::Cow::Owned(encoding.to_ascii_lowercase().replace('_', "-"))
+    } else {
+        std::borrow::Cow::Borrowed(encoding)
+    };
     if crate::importing::dev_mode_flag()
         && matches!(
-            enc_lower.as_str(),
+            enc_lower.as_ref(),
             "utf-8"
                 | "utf8"
                 | "u8"
@@ -24090,7 +24172,7 @@ pub(crate) fn decode_bytes_to_wtf8(
     {
         crate::module::_codecs::validate_error_handler(errors)?;
     }
-    let s = match enc_lower.as_str() {
+    let s = match enc_lower.as_ref() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
             let mut out = Wtf8Buf::new();

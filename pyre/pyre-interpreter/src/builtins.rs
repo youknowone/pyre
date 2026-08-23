@@ -4462,7 +4462,7 @@ pub fn is_builtin_dir_function(callable: PyObjectRef) -> bool {
 /// Shared identity test behind the `is_builtin_*_function` predicates: the
 /// callable is a function whose code is the builtin-code wrapper around
 /// `expected`.
-fn is_builtin_code_function(
+pub(crate) fn is_builtin_code_function(
     callable: PyObjectRef,
     expected: crate::gateway::BuiltinCodeFn,
 ) -> bool {
@@ -5910,9 +5910,24 @@ fn type_descr_new_with_metaclass(
         // three-argument type() calls do not pass through __build_class__, so
         // fill __module__ from the live caller frame when the namespace did
         // not supply it.
+        //
+        // `ensure_module_attr` reaches the caller through
+        // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
+        // rather than through the `CURRENT_FRAME` thread-local.  No force is
+        // owed here: the walk only dereferences the vref and follows
+        // `f_backref`, and `force_frame` belongs to the consumers that hand a
+        // frame to application code.  `w_globals` is a declared virtualizable
+        // field, but no walk writes it on the live frame —
+        // `restore_resume_state_from` leaves it and `pycode` out of the resume
+        // restore as frame-invariant — so its heap slot is already current.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
-            let frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+            let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+            let frame = if ec.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { (*ec).gettopframe_nohidden() }
+            };
             if !frame.is_null() {
                 let globals = unsafe { (*frame).get_w_globals() };
                 if !globals.is_null()

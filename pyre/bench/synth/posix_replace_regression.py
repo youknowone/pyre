@@ -1,4 +1,6 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-interpreted
+# The invariant is interpreter-level, so the run compiles no loop.
 # pyre-check: skip-backends=wasm
 # The wasm guest has no filesystem support used by this fixture.
 # os.replace(src, dst) renames over an existing destination in one step and

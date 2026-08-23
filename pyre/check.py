@@ -6,6 +6,7 @@ Cross-platform Python translation of pyre/check.sh.
 
 import argparse
 import difflib
+import hashlib
 import math
 import os
 import re
@@ -908,6 +909,39 @@ def pyre_env():
     return env
 
 
+def effective_wasm_module():
+    """The module path the wasm runner will actually load.
+
+    `pyre_env` defaults `PYRE_WASM_MODULE` to the built module but leaves an
+    inherited one alone, so the default is not what runs whenever the caller
+    set it. A gate that asks about `WASM_MODULE_PATH` under an override checks
+    a file the run never opens, and clears the way for the stale module the
+    override names.
+
+    Both `pyre_env` and the runner read the key by presence, so an empty value
+    survives into the child and is opened as the empty path; resolving it here
+    by falsiness would vouch for the built module while every invocation failed.
+    """
+    override = os.environ.get("PYRE_WASM_MODULE")
+    return WASM_MODULE_PATH if override is None else override
+
+
+def same_file(one, other):
+    """Whether two paths name one file, tolerating a missing one.
+
+    The override is compared against the built module to decide whether the
+    build settled the question, and it is written by a caller who may spell it
+    absolutely, through a symlink, or relative to a different directory.
+    `os.path.samefile` answers that but raises when either side is absent,
+    which here is not an error: a missing file is simply not the built one, and
+    the existence check above has already spoken for the module itself.
+    """
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
+
 def _dump_failed_run(output, stderr, limit=40):
     """Print the tail of a failed run's captured streams.
 
@@ -1052,6 +1086,27 @@ def _jit_stats_merged(stderr):
                 key, value = token.split("=", 1)
                 fields[key] = value
     return fields if seen else None
+
+
+def _jit_stats_field(stderr, field):
+    """One integer counter off the merged map, or `None`.
+
+    `None` covers a run that printed no `[jit-stats]` line, one that printed
+    no such key, and one whose value does not read as an integer. None of
+    those is the same answer as a printed zero, which is why the caller
+    distinguishes them.
+
+    The unfiltered map and not the snapshot, for the reason
+    [`_jit_stats_merged`] gives: a non-vacuity check reads a counter precisely
+    because it is not part of the recorded surface.
+    """
+    fields = _jit_stats_merged(stderr or "")
+    if not fields or field not in fields:
+        return None
+    try:
+        return int(fields[field])
+    except ValueError:
+        return None
 
 
 def _jit_stats_snapshot(stderr, ungated=()):
@@ -1869,6 +1924,29 @@ def synth_selfcheck(path):
     )
 
 
+def synth_selfcheck_interpreted(path):
+    """Read an optional per-fixture JIT-floor opt-out from its header:
+        # pyre-check: selfcheck-interpreted
+
+    A selfcheck fixture asserts its own invariant, so it passes whenever the
+    invariant holds — including on a run where the JIT compiled nothing at all,
+    which for a guard against a *compiled* mis-admission is a pass that
+    establishes nothing. `run_selfcheck` therefore requires the run to have
+    compiled a loop, and this is how a fixture says its invariant is not about
+    compiled code: the two that carry it (`oserror_errno_fields_regression`,
+    `posix_replace_regression`) guard interpreter-level behaviour and measure
+    `loops_compiled=0` on every backend.
+
+    An opt-out rather than an opt-in, so a fixture that quietly stops being
+    compiled is reported rather than passing on in silence.
+    """
+    return _synth_header_flag(
+        path,
+        "# pyre-check: selfcheck-interpreted",
+        "synthetic selfcheck-interpreted marker takes no value",
+    )
+
+
 def synth_ungated_jitstats(path):
     """Read an optional per-fixture jit-stats exemption from its header:
         # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
@@ -1963,6 +2041,480 @@ def spec_fold_census(binary, path, timeout_s):
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
+
+
+# Repository-root files every crate is built against.
+ROOT_BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml")
+
+
+def workspace_member_dirs():
+    """Directories listed in the root `Cargo.toml` `members` array.
+
+    A `.rs` file only reaches a compiler if it belongs to a member crate, so
+    this is what separates a build input from a bench fixture or a baseline
+    sitting elsewhere in the tree. It does not settle the whole input set: one
+    of those sources can embed a file from anywhere in the tree, which is what
+    [`embedded_inputs_outside_members`] recovers. `pyre/pyrex/tests/gate_triage_complete.rs`
+    derives its own search roots the same way, for the same reason — including
+    the line anchor, which is what keeps `default-members = [` above from
+    being read as this array.
+    """
+    try:
+        manifest = Path("Cargo.toml").read_text(encoding="utf-8")
+    except OSError:
+        # No readable manifest is no member list, which the caller already
+        # treats as an unenumerable tree and fails open on. Letting the read
+        # raise instead would abort the whole run on a traceback.
+        return []
+    listing = re.search(r"^\s*members\s*=\s*\[(.*?)\]", manifest, re.S | re.M)
+    if not listing:
+        return []
+    members = []
+    for member in re.findall(r'"([^"]+)"', listing.group(1)):
+        # Cargo accepts a glob member. There is none today; expanding here
+        # keeps a future one from being read as a literal directory name that
+        # matches nothing and silently narrows the input set.
+        if any(char in member for char in "*?["):
+            members.extend(sorted(str(path) for path in Path().glob(member)))
+        else:
+            members.append(member)
+    return members
+
+
+# The package whose build script reads `PYRE_MIR_FRONTEND_LLBC`. `cargo` runs a
+# build script with its own package directory as the working directory, so that
+# is what a relative entry in the override is relative to — not this script's.
+LLBC_OVERRIDE_BASE = "pyre/pyre-jit-trace"
+
+
+def llbc_input_paths():
+    """The LLBC artefacts the JIT front end will actually read.
+
+    `majit_translate::build_semantic_program_via_active_frontend` reads them from
+    `PYRE_MIR_FRONTEND_LLBC` (an OS path-list) before falling back to the
+    workspace `build/llbc`, so a run under that override is built against
+    different bytes than the default glob names.
+
+    A relative entry is resolved against `LLBC_OVERRIDE_BASE` rather than taken
+    as written. The reader is `pyre-jit-trace/build.rs`, and a build script's
+    working directory is its own package, so `../../build/llbc/pyre-jit.ullbc`
+    is the workspace artefact to the build and two levels above the repository
+    to a caller resolving from the root. Taken as written it names a file that
+    is not there, which the digest records as an unreadable input — the same
+    value however often the real artefact is rewritten, so `--no-build` would
+    approve a generated JIT front end built from an LLBC that has since moved.
+    """
+    override = os.environ.get("PYRE_MIR_FRONTEND_LLBC")
+    if override:
+        return [
+            entry if os.path.isabs(entry)
+            else os.path.normpath(os.path.join(LLBC_OVERRIDE_BASE, entry)).replace(os.sep, "/")
+            for entry in override.split(os.pathsep) if entry
+        ]
+    return [str(path) for path in Path("build/llbc").glob("*.ullbc")]
+
+
+# `include_str!("x")`, `include_bytes!("x")` and `include!("x")` with a plain
+# literal. A path built with `concat!`/`env!` is deliberately unmatched: those
+# name `OUT_DIR`, which is under `target/` and so outside the tree this set is
+# derived from.
+EMBED_MACRO = re.compile(r'include(?:_str|_bytes)?!\s*\(\s*"([^"\\]*)"')
+
+
+def embedded_inputs_outside_members(member_sources, members, listed):
+    """Files a member crate embeds from outside every member directory.
+
+    `include_str!` and its siblings read their file at compile time, so it is a
+    build input exactly as the `.rs` around it is, and `rustc` records it in the
+    depinfo that makes `cargo` rebuild when it changes. The path is written
+    relative to the source file, so it can climb out of the crate and out of the
+    workspace entirely: `majit-metainterp/src/ruleopt/mod.rs` embeds
+    `rpython/jit/metainterp/ruleopt/real.rules`, which the member-directory
+    filter alone drops. Left out, editing that file rebuilds the artefact
+    without moving the fingerprint, and a later `--no-build` run approves a
+    binary built from the previous text.
+
+    Scanned rather than listed by hand, so a second one cannot be added to the
+    tree without the gate seeing it.
+
+    Conservative in one direction on purpose: an embed under `#[cfg(test)]`
+    reaches the unit tests and not the measured artefact, and this counts it
+    anyway rather than track cfgs. The cost is a rebuild nobody needed; the
+    alternative fails the other way, which is the one that reports a
+    measurement the binary does not support.
+    """
+    outside = set()
+    for source in member_sources:
+        if not source.endswith(".rs"):
+            continue
+        try:
+            text = Path(source).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            # Raced with a delete, or unreadable. The file was in the listing a
+            # moment ago, so dropping its embeds is no worse than the enclosing
+            # enumeration already is about a tree changing under it.
+            continue
+        if "include" not in text:
+            continue
+        for embedded in EMBED_MACRO.findall(text):
+            resolved = os.path.normpath(os.path.join(os.path.dirname(source), embedded))
+            if resolved.startswith("..") or os.path.isabs(resolved):
+                # Outside the repository, so no digest over the tree can cover
+                # it; the enumeration says what it saw and nothing more.
+                continue
+            resolved = resolved.replace(os.sep, "/")
+            if resolved.startswith(members) or resolved not in listed:
+                continue
+            outside.add(resolved)
+    return sorted(outside)
+
+
+def build_input_paths():
+    """Every file a release artefact is built from, or `None` when the tree
+    cannot be enumerated — which makes the freshness gate below fail open
+    rather than block a checkout that has no git.
+
+    Deliberately derived from the tree alone, never from `target/`. Reading the
+    build scripts' own `cargo:rerun-if-changed=` declarations back out of
+    `target/*/build/*/output` was tried and removed: the paths there are
+    written relative to each crate's own directory, so all but one of the 57
+    failed to resolve from the repository root and the whole mechanism
+    contributed nothing but a dependence on which profiles and targets happened
+    to have been built.
+
+    Untracked files count, which is why the enumeration is not just
+    `git ls-files`: a new `.rs` under a member crate compiles into the artefact
+    before it is ever staged. Left out, it would contribute nothing to the
+    digest, so editing it would not move the fingerprint and a later
+    `--no-build` run would accept an artefact built from code the digest never
+    saw. Worse, deleting it again would return the digest to its earlier value
+    while the artefact still held its code. `--others --exclude-standard` adds
+    exactly the untracked-and-not-ignored files, so `target/` and the rest of
+    `.gitignore` stay out.
+
+    One class is knowingly outside the set: an input a build script reads from
+    outside its crate. The only one in the tree is the `lib-python/3` closure
+    `pyre-interpreter/build.rs` embeds, and it is guarded by `wasm_vfs`, a
+    feature no artefact this script measures is built with. Enabling it for the
+    wasm-host build would mean adding that closure here. A file embedded by the
+    ordinary sources rather than by a build script is a different matter and is
+    covered — see [`embedded_inputs_outside_members`].
+    """
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+    if listing.returncode != 0:
+        return None
+    members = tuple(member + "/" for member in workspace_member_dirs())
+    if not members:
+        return None
+    listed = listing.stdout.split("\0")
+    # Every file under a member crate, whatever its suffix: the CJK codec
+    # `.c`/`.h` sources and the app-level `.py` bodies reach the binary exactly
+    # as the `.rs` files do.
+    paths = [p for p in listed if p.startswith(members) or p in ROOT_BUILD_INPUTS]
+    # A member crate can embed a file from outside every member directory, and
+    # the filter above is by path alone, so it cannot see one.
+    paths += embedded_inputs_outside_members(paths, members, frozenset(listed))
+    # The LLBC is a build input the fingerprint gate already tracks by content,
+    # but it is generated rather than tracked by git.
+    paths += llbc_input_paths()
+    return sorted(set(paths))
+
+
+def build_recipe_digest():
+    """A digest of the options an artefact is built *with*.
+
+    The input set above is the files a build reads; this is the command run
+    over them. `--no-default-features --features dynasm`, the wasm link args,
+    the toolchain and the build-std flags each select what lands in the
+    artefact, and none of them is a file under a member directory — this
+    script is a build input by no path rule, so editing `--growable-table` out
+    of `WASM_RUSTFLAGS` moved nothing in the fingerprint and a later
+    `--no-build` run approved a module built with it still in.
+
+    The whole table at once rather than the row for one backend: a stamp
+    naming only its own row could not be compared without also recording which
+    row it was, the table drives every artefact, and an edit to it is rare
+    enough that rebuilding all of them is the cheaper mistake.
+
+    What it does not cover is an option spelled inline in the build functions
+    rather than held here — `--target wasm32-unknown-unknown` is the one such
+    literal today. Hashing this script whole would cover those and would also
+    make every comment edit invalidate every artefact, which in a tree where
+    the script is edited far more often than the recipe is the worse trade.
+    """
+    recipe = "\0".join((
+        repr(CARGO_CONFIG),
+        WASM_RUSTFLAGS,
+        repr(WASM_CARGO_TOOLCHAIN),
+        repr(WASM_BUILD_STD_FLAGS),
+        WASM_BUILD_OUTPUT,
+        WASM_MODULE_PATH,
+    ))
+    return hashlib.sha256(recipe.encode("utf-8")).hexdigest()
+
+
+# Sentinel distinguishing "not computed yet" from "computed, and there is no
+# answer": a `None` result must be cached too, or one unenumerable call would
+# leave a later call free to answer differently within the same run.
+_FINGERPRINT_UNSET = object()
+_BUILD_INPUTS_FINGERPRINT = _FINGERPRINT_UNSET
+
+
+def build_inputs_fingerprint():
+    """A digest of every build input's *content*, computed once per run.
+
+    Content and not mtime: a concurrent `git checkout <ref> -- .`, a branch
+    switch, or an editor rewriting a file it did not change re-stamps whole
+    subtrees, and a gate reading mtimes then blocks a build that is in fact
+    current. Hashing the roughly one thousand inputs (about 1GB, most of it
+    the LLBC) costs under a second, against the multi-minute build
+    `--no-build` exists to skip.
+
+    Computed after a build rather than before it: `cargo` may rewrite
+    `Cargo.lock`, which is itself an input, so the state that produced the
+    artefact is the state that exists once the build has finished. Nothing
+    else a build writes is in the set — that is what keeps the two orders
+    equivalent for every other input.
+
+    "Once per run" therefore holds only between builds, and
+    [`invalidate_build_inputs_fingerprint`] is what ends a memoised value's
+    life. Without that call the rule above would bind the FIRST stamped
+    artefact alone: a run that builds several backends stamps after each one,
+    and every stamp past the first would carry a digest read before the build
+    that produced it. A later `--no-build` run then reads the tree as it
+    actually is and rejects artefacts that are in fact current.
+    """
+    global _BUILD_INPUTS_FINGERPRINT
+    if _BUILD_INPUTS_FINGERPRINT is not _FINGERPRINT_UNSET:
+        return _BUILD_INPUTS_FINGERPRINT
+    paths = build_input_paths()
+    if paths is None:
+        _BUILD_INPUTS_FINGERPRINT = None
+        return None
+    _BUILD_INPUTS_FINGERPRINT = digest_input_paths(paths)
+    return _BUILD_INPUTS_FINGERPRINT
+
+
+def digest_input_paths(paths):
+    """A digest over the named paths' contents, and over the build recipe."""
+    digest = hashlib.sha256()
+    # The recipe first: an artefact is what its inputs and its build options
+    # together produce, and neither alone identifies it.
+    digest.update(build_recipe_digest().encode("ascii"))
+    digest.update(b"\0")
+    for path in paths:
+        # The name goes in before the bytes are read, so a file that is
+        # tracked but unreadable is distinguishable both from one that is
+        # absent from the list and from one that is empty.
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            handle = open(path, "rb")
+        except OSError:
+            digest.update(b"\0")
+            continue
+        # Each file contributes a fixed-width value behind a one-byte tag,
+        # rather than its bytes inline: feeding the content straight in leaves
+        # the boundary between one file's tail and the next file's name
+        # unmarked, so a file holding `b"b\0x"` at path `a` hashes to the same
+        # bytes as an empty `a` beside a `b` holding `x`. Two input sets that
+        # collide read as one unchanged tree, which is the answer this gate
+        # exists to refuse.
+        content = hashlib.sha256()
+        with handle:
+            while chunk := handle.read(1 << 20):
+                content.update(chunk)
+        digest.update(b"\1")
+        digest.update(content.digest())
+    return digest.hexdigest()
+
+
+# The one input `cargo` itself rewrites during a build. A build window is
+# judged with it left out, because a lock file the build resolved is the build
+# doing its job rather than the tree moving underneath it.
+CARGO_WRITTEN_INPUTS = ("Cargo.lock",)
+
+# What `inputs` says in a stamp whose artefact was built over a tree that
+# changed while it was building. It is not a digest and can equal none, so the
+# comparison refuses it; `require_fresh_artefacts` names it to say why.
+STAMP_TREE_MOVED = "tree-moved-during-build"
+
+_BUILD_WINDOW_WITNESS = None
+
+
+def build_window_witness():
+    """A digest of the inputs a build is about to read, cargo's own aside.
+
+    Uncached, unlike [`build_inputs_fingerprint`]: the whole point is to be
+    read twice and compared, so a memoised second read would answer with the
+    first.
+    """
+    paths = build_input_paths()
+    if paths is None:
+        return None
+    return digest_input_paths([p for p in paths if p not in CARGO_WRITTEN_INPUTS])
+
+
+def open_build_window():
+    """Note the tree state a build is starting from.
+
+    `build_inputs_fingerprint` is read *after* a build, so that it describes
+    the `Cargo.lock` the build may have resolved. That ordering is what lets an
+    edit landing mid-build be recorded against an artefact compiled before it:
+    the stamp would then name a tree the binary does not contain, and a later
+    `--no-build` run would find them in agreement and measure it. Reading the
+    tree here as well makes that window observable, which is the only way to
+    tell the two orders apart.
+    """
+    global _BUILD_WINDOW_WITNESS
+    _BUILD_WINDOW_WITNESS = build_window_witness()
+
+
+def invalidate_build_inputs_fingerprint():
+    """Drop the memoised digest so the next read enumerates the tree again.
+
+    Called once per completed build, before its artefacts are stamped. The
+    memoisation that survives is the one it exists for: the read-only
+    `--no-build` path, where nothing writes to the tree between reads.
+    """
+    global _BUILD_INPUTS_FINGERPRINT
+    _BUILD_INPUTS_FINGERPRINT = _FINGERPRINT_UNSET
+
+
+def artefact_fingerprint_path(artefact):
+    return Path(str(artefact) + ".inputs")
+
+
+def artefact_content_digest(artefact):
+    """The artefact's own bytes, or `None` if it cannot be read.
+
+    35MB of binary hashes in about a tenth of a second, against the
+    multi-minute build the stamp exists to skip.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(artefact, "rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def stamp_artefact_inputs(artefact):
+    """Record the inputs an artefact was just built from, beside it.
+
+    The artefact's own digest goes in beside the input digest, because the
+    sidecar cannot otherwise tell which binary it is vouching for. A `cargo
+    build` outside this script overwrites the executable and leaves the
+    sidecar alone; restoring the tree to the state the sidecar names would
+    then make the input digests agree while the executable holds different
+    code, and `--no-build` would record baselines against it.
+
+    A failure here is not worth losing a finished build over, but it is worth
+    saying: the next `--no-build` run would otherwise report the artefact as
+    unstamped with no trace of why.
+    """
+    fingerprint = build_inputs_fingerprint()
+    if fingerprint is None:
+        return
+    if _BUILD_WINDOW_WITNESS is not None and _BUILD_WINDOW_WITNESS != build_window_witness():
+        # Some input changed while cargo was reading them, so the artefact
+        # holds neither the tree the build started from nor the one that is
+        # here now. Stamping the current tree against it would make a later
+        # `--no-build` run agree with a binary that does not contain it.
+        print(
+            f"  warning: the tree changed while {artefact} was building, so "
+            "its inputs are not\n           the tree that is here now; it is "
+            "stamped as unusable for --no-build."
+        )
+        fingerprint = STAMP_TREE_MOVED
+    content = artefact_content_digest(artefact)
+    if content is None:
+        print(f"  warning: could not read {artefact} to stamp it")
+        return
+    stamp = artefact_fingerprint_path(artefact)
+    try:
+        stamp.write_text(
+            f"inputs {fingerprint}\nartefact {content}\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"  warning: could not write the build-input stamp {stamp}: {exc}")
+
+
+def read_artefact_stamp(stamp):
+    """The `(inputs, artefact)` digests a stamp records, or `None`.
+
+    `None` covers both an unreadable stamp and one written in an older format
+    — either way this script did not write it in a shape it can check, which
+    is the "built outside this script" case the caller already reports.
+    """
+    try:
+        text = stamp.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if value:
+            fields[key] = value.strip()
+    if "inputs" not in fields or "artefact" not in fields:
+        return None
+    return fields["inputs"], fields["artefact"]
+
+
+def require_fresh_artefacts(artefacts, reason, remedy):
+    """Refuse to measure an artefact that was built from different sources.
+
+    `--no-build` skips every artefact of a backend, and wasm has two: the
+    native runner and the wasm module the runner loads. A module left behind by
+    an earlier build produces a fully green run — and a set of recorded
+    baselines — for code that is not in it, with nothing in the output saying
+    so.
+
+    `reason` names the circumstance that put the artefact under question and
+    `remedy` says what closes it, because skipping the build is not the only
+    way to arrive here: `PYRE_WASM_MODULE` names the module the runner loads
+    whether or not a build ran, so a normal run can measure a module this
+    invocation did not produce.
+
+    Each build stamps its artefact with `build_inputs_fingerprint` and with the
+    artefact's own content digest; an artefact carrying no stamp was built
+    outside this script, so its inputs are unknown and the run continues with a
+    note rather than a refusal. An artefact whose bytes no longer match the
+    stamp was rebuilt outside this script since, which puts it in the same
+    unknown-inputs class however well the input digest agrees.
+    """
+    fingerprint = build_inputs_fingerprint()
+    if fingerprint is None:
+        return
+    for artefact in artefacts:
+        recorded = read_artefact_stamp(artefact_fingerprint_path(artefact))
+        if recorded is None:
+            print(
+                f"  note: {artefact} carries no build-input stamp; "
+                "its freshness is unchecked"
+            )
+            continue
+        recorded_inputs, recorded_content = recorded
+        if recorded_content != artefact_content_digest(artefact):
+            fault = "has been rebuilt since it was stamped, so what it contains is unknown."
+        elif recorded_inputs == STAMP_TREE_MOVED:
+            fault = ("was built while the tree was changing, so which sources "
+                     "it contains was never established.")
+        elif recorded_inputs != fingerprint:
+            fault = ("was built from different sources, so it does not contain "
+                     "the current tree.")
+        else:
+            continue
+        print(f"ERROR: {reason}, but {artefact}\n       {fault}\n       {remedy}")
+        sys.exit(1)
 
 
 # Relative tolerance for wasm float outputs ONLY (see `wasm_outputs_match`).
@@ -2579,6 +3131,7 @@ class Check:
         if cfg.get("wasm"):
             return self.build_wasm_backend()
         print(f"Building {cfg['bin']} (release, backend={backend})...")
+        open_build_window()
         cmd = [
             "cargo", "build", "--release", "-p", "pyrex",
             "--bin", cfg["bin"], *cfg["extra"],
@@ -2640,6 +3193,10 @@ class Check:
         # The wall clock beside cargo's own figure is what makes a build that
         # recompiled the world distinguishable from a cache hit.
         print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
+        # The digest has to be read back after this build, not carried over
+        # from an earlier one in the same run.
+        invalidate_build_inputs_fingerprint()
+        stamp_artefact_inputs(default_binary(backend))
 
     def build_wasm_backend(self):
         """Build the wasm32 `pyre-wasm` module and the native `pyre-wasm-runner`.
@@ -2649,6 +3206,7 @@ class Check:
         produced: the wasm module (needs the export-table / custom-getrandom
         flags) and the host runner binary.
         """
+        open_build_window()
         steps = [
             (
                 "pyre-wasm (wasm32, --features wasm-host)",
@@ -2704,6 +3262,12 @@ class Check:
         dst = Path(WASM_MODULE_PATH)
         if not dst.exists() or dst.read_bytes() != src_bytes:
             dst.write_bytes(src_bytes)
+        # As in `build_backend`: this build resolves target-specific
+        # dependencies, so `Cargo.lock` may differ from the state the native
+        # backends were stamped against.
+        invalidate_build_inputs_fingerprint()
+        stamp_artefact_inputs(WASM_MODULE_PATH)
+        stamp_artefact_inputs(default_binary("wasm"))
 
         if WASM_ENGINE == "wasmtime":
             self._warm_wasm_cache()
@@ -3440,7 +4004,8 @@ class Check:
 
     # ── self-checking regression guard ──
 
-    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=()):
+    def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
+                      require_jit=True):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -3451,6 +4016,14 @@ class Check:
         *skip_backends* names backends the guard does not apply to (e.g. a
         `time`-module timing guard cannot run on the wasm guest, which has no
         `time` module).
+
+        With *require_jit* the run must also have compiled at least one loop.
+        A self-asserted invariant is satisfied by an interpreted run, so
+        without this a fixture guarding a compiled mis-admission passes while
+        establishing nothing — and it would go on passing if the shape it
+        guards stopped reaching the JIT, which is the change most likely to
+        make the guard vacuous. `synth_selfcheck_interpreted` turns it off for
+        a fixture whose invariant is not about compiled code.
         """
         print(f"  {name}")
         for backend in ALL_BACKENDS:
@@ -3491,6 +4064,19 @@ class Check:
                 _dump_failed_run(output, stderr)
                 self._append_comparison(backend, name, "-", "-", "FAIL")
                 continue
+            if require_jit:
+                compiled = _jit_stats_field(stderr, "loops_compiled")
+                if compiled is None or compiled < 1:
+                    seen = "no [jit-stats] line" if compiled is None else "loops_compiled=0"
+                    detail = (
+                        f"the guard ran interpreted ({seen}), so its assertion "
+                        "says nothing about compiled code"
+                    )
+                    self._record(backend, False, name, detail)
+                    print(f"{red('FAIL')}  {detail}")
+                    _dump_failed_run(output, stderr)
+                    self._append_comparison(backend, name, "-", "-", "FAIL")
+                    continue
             self._record(backend, True, name, "")
             print(f"{green('PASS')}  {elapsed:.2f}s")
             self._append_comparison(backend, name, "-", "-", f"{elapsed:.2f}s")
@@ -3755,6 +4341,7 @@ class Check:
                     str(path),
                     self.args.synthetic_timeout,
                     skip_backends=skip_backends,
+                    require_jit=not synth_selfcheck_interpreted(path),
                 )
             else:
                 self.run_synthetic_bench(
@@ -4120,12 +4707,41 @@ def main():
                     f"(missing executable: {pyre_bin})"
                 )
             sys.exit(1)
-        if backend == "wasm" and args.no_build and not Path(WASM_MODULE_PATH).is_file():
+        wasm_module = effective_wasm_module() if backend == "wasm" else None
+        # Asked whether or not a build ran: `PYRE_WASM_MODULE` names the module
+        # the runner loads, and a build cannot supply one that is not there.
+        if backend == "wasm" and not Path(wasm_module).is_file():
+            skipped = "--no-build requested" if args.no_build else "PYRE_WASM_MODULE set"
             print(
-                "ERROR: --no-build requested for backend 'wasm', but the "
-                f"wasm-host module is missing: {WASM_MODULE_PATH}"
+                f"ERROR: {skipped} for backend 'wasm', but the "
+                f"wasm-host module is missing: {wasm_module}"
             )
             sys.exit(1)
+        if args.no_build:
+            # `--pyre-path` names a binary from outside this tree, so its age
+            # says nothing about these sources. The module is a separate
+            # artefact and is this tree's own unless overridden, so it is asked
+            # about either way; one from elsewhere carries no stamp and draws
+            # the unchecked-freshness note rather than a refusal.
+            artefacts = [] if args.pyre_path else [pyre_bin]
+            if backend == "wasm":
+                artefacts.append(wasm_module)
+            if artefacts:
+                require_fresh_artefacts(
+                    artefacts,
+                    f"--no-build requested for backend '{backend}'",
+                    "Re-run without --no-build to rebuild it.",
+                )
+        elif backend == "wasm" and not same_file(wasm_module, WASM_MODULE_PATH):
+            # The build above produced `WASM_MODULE_PATH` and stamped it, but
+            # the override names something else, so that is what the benchmarks
+            # will load and what any baseline they record describes. Building a
+            # module nothing runs is not a freshness check on the one that does.
+            require_fresh_artefacts(
+                [wasm_module],
+                f"PYRE_WASM_MODULE names the module backend '{backend}' will load",
+                "Unset PYRE_WASM_MODULE to run the module this build produced.",
+            )
         chk._set_pyre(backend, pyre_bin)
 
     print()

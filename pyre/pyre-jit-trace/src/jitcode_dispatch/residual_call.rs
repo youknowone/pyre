@@ -3160,6 +3160,30 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 as usize
         && args[2] != 0
         && unsafe { pyre_object::is_exact_list(args[2] as usize as pyre_object::PyObjectRef) };
+    // `operator.index(x)` reaches `space_index`, whose first test is
+    // `is_int_or_long`: an int (or long) is returned as-is, before any
+    // `__index__` lookup, so no user code runs and nothing is written.  Every
+    // other argument type dispatches through `__index__` and stays opaque.
+    // Pin the callable the way the `ord` / `isinstance` / `tuple` arms above
+    // do — it shares the `CallFn` helper with them and is separated by the
+    // identity each one pins, so at most one can hold, and a rebound
+    // `operator.index` is a different object that keeps the conservative
+    // treatment.  Observe the argument too: the callable alone does not bound
+    // what `space_index` will do.  `randrange`'s `_index(start)` is the
+    // shape that reaches here: it is the ONLY residual the aborted walk of a
+    // `[randrange(k) for _ in ...]` body executes, and classifying it as a live
+    // heap write refused the in-flight FOR_ITER delivery and dropped the
+    // element.
+    let observed_exact_int_index = helper == majit_ir::PyreHelperKind::CallFn
+        && args.len() == 3
+        && args[1] == 0
+        && pyre_interpreter::module::operator::is_operator_index_function(
+            args[0] as pyre_object::PyObjectRef,
+        )
+        && {
+            let operand = args[2] as pyre_object::PyObjectRef;
+            !operand.is_null() && unsafe { pyre_object::pyobject::is_int_or_long(operand) }
+        };
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
@@ -3184,7 +3208,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_exact_str_ord
         || observed_replay_safe_isinstance
         || replay_safe_fresh_allocation
-        || replay_safe_tuple_from_list;
+        || replay_safe_tuple_from_list
+        || observed_exact_int_index;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || (helper == majit_ir::PyreHelperKind::CallFn && !replay_safe_tuple_from_list)
         || matches!(

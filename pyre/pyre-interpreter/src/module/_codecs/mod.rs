@@ -919,10 +919,14 @@ fn utf8_decode_impl(
         return Err(crate::PyError::type_error("errors must be str or None"));
     };
     let data = decode_input_bytes(w_obj)?;
+    // `interp_codecs.utf_8_decode`: `surrogatepass` is the one handler that
+    // decodes a complete ED A0..BF 80..BF sequence in the state machine and
+    // retains an incomplete one for the next chunk.
     let (decoded, consumed) = crate::typedef::decode_utf8_with_errors_incremental(
         &data,
         errors,
         crate::baseobjspace::is_true(w_final)?,
+        errors == "surrogatepass",
     )?;
     Ok(w_tuple_new(vec![
         w_str_from_wtf8_managed(decoded),

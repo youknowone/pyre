@@ -81,10 +81,10 @@ Kept as-is; listed for completeness.
   when it is unset. It is a measurement probe with no ON behaviour to graduate,
   so it has no epic — delete it with the demand counter itself once the pool's
   working set is settled.
-- **Default-OFF experiments (1)** — every gate this bucket once held has had
-  its reader and its ON path deleted, except `PYRE_FORITER_CALL_BODY`, which is
-  waiting to graduate (§6a2). The other live default-OFF arms are the two wasm
-  re-emission A/Bs there, kept as the switched-off side of a one-binary
+- **Default-OFF experiments (0)** — every gate this bucket once held has had
+  its reader and its ON path deleted, the last of them when the `LIST_APPEND`
+  admission it gated became unconditional. The live default-OFF arms left in
+  §6a2 are wasm A/Bs, kept as the switched-off side of a one-binary
   comparison rather than as experiments.
 - **Config / value / master switches (~16)** — tuning, paths, modes; keep:
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -179,7 +179,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_INLINE_BRIDGE | merging a loop-closing bridge's ops into the module of the loop it guards into, so `guard → bridge → loop` becomes a `br` (`lib.rs inline_bridge_enabled`); `=0`/`false`/`off` restores the separate bridge module | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6a2 — Default-OFF experiments (3)
+### §6a2 — Default-OFF experiments (2)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.  Bridge inlining reaches module replacement on its own, so
@@ -188,7 +188,6 @@ exercises the replacement machinery by itself.
 
 | gate | what turning it ON does | retire when |
 |---|---|---|
-| PYRE_FORITER_CALL_BODY | admits a `LIST_APPEND` FOR_ITER body that also carries a CALL (`eval.rs for_iter_call_body_admitted`), so a call-bearing comprehension can trace.  The body's item now survives the mid-body abort (the forward resume delivers it), but the loop it compiles residualizes the call it could not inline and is measured SLOWER: `[C(i) for i in range(2000)]` x200 runs 0.478s off / 0.569s on, dynasm | the traced body inlines that call (gh#73/gh#34); until then the ON arm loses and this is the one-binary A/B for it |
 | PYRE_WASM_REEMIT | re-emits a compiled loop's wasm module into its own table slot once, on the first bridge installed against it | when the replacement path no longer needs an isolated arm |
 | PYRE_WASM_INLINE_NONHEADER | admits an inlined region whose closing JUMP names a resumable LABEL other than the loop header AND whose source guard is in the LOOP BODY (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it.  The preamble-sourced half of that class takes a different placement — blocks outside the header `loop`, body past its `end` — and is admitted unconditionally, so this flag now covers only the body-sourced half.  Arming it removes 49.4M of the 257.3M cross-module crossings on the 81 fixtures that reach the decline and buys 0.74x/0.67x on two of them, but costs 1.23x on `spectral_norm` | the +18 ops per non-failing iteration it levies on the owner's fall-through is paid back on the fixtures it admits, or an admission rule separates them from `spectral_norm`, which sheds 99.7% of its crossings and still loses 23% |
 

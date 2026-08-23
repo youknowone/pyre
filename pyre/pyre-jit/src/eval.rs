@@ -7665,15 +7665,6 @@ fn for_iter_gate_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
 }
 
-/// Admit a `LIST_APPEND` FOR_ITER body that also carries a CALL (gh#73/gh#34).
-/// Off by default while the mid-body abort's forward resume is being measured:
-/// a call commits body effects, and the abort's recovery decides whether the
-/// consumed item survives.
-fn for_iter_call_body_admitted() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FORITER_CALL_BODY").is_some())
-}
-
 fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -7683,99 +7674,62 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     };
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
-    // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-    // admitted only when the body performs no CALL. A compiled loop's
-    // live-at-exit values stay reachable from the exit state until the
-    // next JIT activity overwrites it, so the loop variable keeps its
-    // final binding past the `STORE_FAST` that restores the isolated
-    // comprehension slot to unbound. A call-free body binds values the
-    // enclosing frame holds anyway; a per-element call binds a freshly
-    // constructed object, and `extra_tests/parity_tests/
-    // weakref_gc_lifeline.py` then sees the last element survive the
-    // collection that should have run its weakref callback. Decline
-    // call-bearing bodies to interpretation until the exit state stops
-    // rooting what it no longer resumes.
+    // The `LIST_APPEND` opcode (the inlined-comprehension accumulator) is
+    // admitted wherever it appears, like `SET_ADD` and `MAP_ADD` beside it.
+    // That is a statement about the one opcode, not about the body around it:
+    // the scan below still walks every body instruction and refuses the whole
+    // FOR_ITER on the first one outside the permitted set.
     //
-    // The scan narrows how often the in-flight delivery gap is reached;
-    // it is not a boundary the gap stays behind. Before #1174 this body,
-    // which is call-free and which the scan admits, lost a whole OUTER
-    // iteration — 59 of 60 appends, twice in 400 runs, on dynasm and on
-    // cranelift, 60 with the JIT off:
+    // It used to be admitted only for a call-free body, over two hazards.
+    // Both were re-measured on 2026-08-20 and neither reproduces:
     //
-    //     for index in items:
-    //         out.append([index for _ in range(1)])
+    // * GC liveness — a per-element call binds a freshly constructed object,
+    //   and `extra_tests/parity_tests/weakref_gc_lifeline.py` was said to see
+    //   the last element survive the collection that should have run its
+    //   weakref callback. That fixture is OK 10/10 per backend with the scan
+    //   gone, and the whole parity suite passes under the runner's
+    //   `--gc-poison` (`MAJIT_GC_NURSERY_POISON=1`) as well.
+    // * The in-flight delivery gap (single-executor tracing, gh#73/#34) —
+    //   the scan only narrowed how often it was reached, never bounded it.
+    //   Its cause here was a misclassification, not an unrecoverable effect:
+    //   `writes_live_heap` holds for EVERY `CallFn`, so `_operator.index` —
+    //   which `space.index` answers by returning an int argument unchanged,
+    //   ahead of any `__index__` lookup — was booked as a body effect, which
+    //   refused the consumed item's delivery AND broke the gh#467
+    //   CALL-forward odometer. `randrange`'s `_index(start)` is how
+    //   `for_iter_call_bearing_comprehension.py` reached it. That call is now
+    //   a replay-safe observed class (`residual_call.rs`), the walk's
+    //   `effects` at the abort reads 0 rather than 1, and the abort commits a
+    //   forward resume instead of falling back to the legacy replay.
     //
-    // The route was TWO in-flight entries and a take that selected on
-    // recency, not the R1 body-effect refusal and not a mislabelled
-    // coordinate: `inflight_foriter_body_pc` resolves the outer loop's
-    // `for_iter_next` (JitCode pc 153) to Python pc 5 and the inner one
-    // (631) to 34, both correct. The outer `list` loop captured through
-    // the residual leg and the inner `range` body through the specialised
-    // leg, so `fbw_foriter_inflight_take` popped the inner entry — whose
-    // body pc a frame parked at the outer header can never accept — and
-    // cleared the outer entry it could have delivered. Selecting the
-    // entry that matches the parked frame fixes that, and is what the
-    // take now does.
+    // The stake, same binary, `[uf(x) for x in it]` against the semantically
+    // identical `for x in it: l.append(uf(x))`: the statement loop runs 45x
+    // faster than `PYRE_JIT=0` either way, while the comprehension went from
+    // 0.69x — the JIT costing more than it saved, because a declined caller
+    // frame makes every callee pay full entry cost while nothing compiles —
+    // to 9.60x.
     //
-    // The shape no longer reaches it here: #1174 made that walk raise
-    // `callee_inline_abort` with `blackhole_required` set where it raised
-    // `callee_inline_unsupported`, so it stops aborting — 0 in-flight
-    // takes and 0 divergences across the whole probe family — which also
-    // means this base cannot re-witness the fix end to end; the selection
-    // is pinned by `take_selects_the_entry_the_parked_frame_can_accept_…`
-    // instead. `SET_ADD` and `MAP_ADD` spell the same shape and carry no
-    // scan at all. Closing the rest is the in-flight delivery gap
-    // (single-executor tracing, gh#73/#34).
+    // Upstream has no counterpart to any of this: `interp_jit.py`'s
+    // `jit_merge_point` is unconditional, and `pyopcode.py` spells
+    // `LIST_APPEND` as `space.call_method(v, 'append', w)`, an operation this
+    // body scan already admits. The scan existed only to protect pyre's
+    // tracer-level `LIST_APPEND` fold.
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
-    // `[{i: i} …]`, `[f"{i}" …]`) — is admitted. The only residual an
+    // `[{i: i} …]`, `[f"{i}" …]`) — was already admitted. The only residual an
     // Object-strategy append leaves in the folded body is the idempotent
-    // `list_write_barrier`, now exempt from the FBW body-effect
-    // accounting (it is not a body effect, mirroring RPython's
-    // `COND_CALL_GC_WB`, which pyjitpl never executes and the optimizer
-    // never treats as a side effect). That exemption keeps the append
-    // itself out of the body-effect accounting; it does not make the
-    // enclosing loop exact-resume safe, per the shape above.
+    // `list_write_barrier`, exempt from the FBW body-effect accounting (it is
+    // not a body effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl
+    // never executes and the optimizer never treats as a side effect).
     //
-    // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
-    // too: the fold virtualizes the inner list, whose separately
-    // allocated backing block (`NewArray` / `NewArrayClear`) carries no
-    // jitcode-liveness slot, and with the trace-time single-executor
-    // forks retired the append body no longer runs under a
-    // speculative-replay sub-walk, so the block is bound at every
-    // guard-exit deopt and the shape compiles bit-exact on all backends
-    // (`bench/synth/nested_list_comprehension_hot.py`).
-    let body_has_call = {
-        let mut scan_state = pyre_interpreter::OpArgState::default();
-        let mut scan_pc = pc + 1;
-        let mut has_call = false;
-        while scan_pc < exit && scan_pc < instructions.len() {
-            let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
-            if let I::ForIter { delta } = scan_instr {
-                // A nested loop owns its body.  It is validated when
-                // the outer instruction walk reaches that FOR_ITER;
-                // calls inside it must not taint a LIST_APPEND owned by
-                // this lexical loop (and vice versa).
-                scan_pc = pyre_interpreter::jump_target_forward(
-                    instructions,
-                    scan_pc + 1,
-                    delta.get(scan_arg).as_usize(),
-                );
-                scan_state = pyre_interpreter::OpArgState::default();
-                continue;
-            }
-            if matches!(
-                scan_instr,
-                I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
-            ) {
-                has_call = true;
-                break;
-            }
-            scan_pc += 1;
-        }
-        has_call
-    };
+    // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted too: the
+    // fold virtualizes the inner list, whose separately allocated backing
+    // block (`NewArray` / `NewArrayClear`) carries no jitcode-liveness slot,
+    // and with the trace-time single-executor forks retired the append body no
+    // longer runs under a speculative-replay sub-walk, so the block is bound
+    // at every guard-exit deopt and the shape compiles bit-exact on all
+    // backends (`bench/synth/nested_list_comprehension_hot.py`).
     let mut body_state = pyre_interpreter::OpArgState::default();
     let mut body_pc = pc + 1;
     while body_pc < exit && body_pc < instructions.len() {
@@ -7796,10 +7750,9 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
         // CALL_INTRINSIC_1 names several unrelated operations. UnaryPositive
         // and ListToTuple are the two variants codewriter.rs actually lowers:
         // the first follows the same implicit-dunder exact-resume path as
-        // UnaryNegative, while the second returns a fresh tuple. Keep counting
-        // the opcode in body_has_call so a unary-positive user frame still
-        // taints LIST_APPEND, but do not admit the def-time/import/error-path
-        // variants whose lowering deliberately aborts permanently.
+        // UnaryNegative, while the second returns a fresh tuple. Admit those
+        // two, but not the def-time/import/error-path variants whose lowering
+        // deliberately aborts permanently.
         let supported_call_intrinsic_1 = matches!(
             body_instr,
             I::CallIntrinsic1 { func }
@@ -7860,8 +7813,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                     // aborts all 5 on the force, compiling nothing.
                     | I::LoadBuildClass
             )
-            || ((!body_has_call || for_iter_call_body_admitted())
-                && matches!(body_instr, I::ListAppend { .. }));
+            || matches!(body_instr, I::ListAppend { .. });
         if !permitted {
             if for_iter_gate_diag_enabled() {
                 eprintln!(
@@ -14408,11 +14360,12 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
-        // A per-element CALL binds a freshly constructed object to the
-        // comprehension's isolated slot, and the compiled loop's exit state
-        // keeps that last binding reachable, so a call-bearing LIST_APPEND
-        // body stays interpreter-only.
+    fn for_iter_call_bearing_list_append_comprehension_body_is_jit_safe() {
+        // A per-element CALL no longer withholds LIST_APPEND. The element the
+        // call produces is reachable from the compiled loop's exit state like
+        // any other body-built value, and a mid-body abort recovers through the
+        // same Layer 2 defence that already admits `Call` on its own; the two
+        // opcodes together carry no hazard neither carries alone.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",
@@ -14420,7 +14373,7 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(!function_entry_trace_is_jit_safe(&code));
+            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -14546,10 +14499,13 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_later_comprehension_does_not_blacklist_an_earlier_loop() {
+    fn unsafe_later_loop_does_not_blacklist_an_earlier_loop() {
+        // The trailing loop holds a `with`, whose LOAD_SPECIAL is deliberately
+        // withheld from the body allow-list, so it is the whole-code scan's
+        // sole refusal.
         use pyre_interpreter::{Instruction as I, compile_exec};
         let module = compile_exec(
-            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    return [len(item) for item in escaped]\n",
+            "def run(n, cm):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    out = []\n    for item in escaped:\n        with cm:\n            out.append(len(item))\n    return out\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
@@ -14588,9 +14544,13 @@ mod tests {
 
     #[test]
     fn loop_region_includes_out_of_line_handler_rejoining_mid_body() {
+        // The handler holds a loop of its own whose body opens a `with`, and
+        // LOAD_SPECIAL is deliberately withheld from the body allow-list. The
+        // region scan reaches that inner FOR_ITER only if it follows the
+        // out-of-line handler past the back edge.
         use pyre_interpreter::{Instruction as I, compile_exec};
         let module = compile_exec(
-            "def run(items, k):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            out.extend([str(y) for y in range(k)])\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
+            "def run(items, k, cm):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            for y in range(k):\n                with cm:\n                    out.append(y)\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");

@@ -4,10 +4,10 @@
 import random
 
 # A comprehension whose body calls a user Python function accumulates through
-# LIST_APPEND. The call commits body effects, so a mid-body walk abort reaches
-# `fbw_foriter_inflight_take` with a non-empty effect journal; that refuses the
-# consumed item's delivery and the legacy replay resumes at the next iteration,
-# losing the element. Only lengths are asserted, so the check holds whatever
+# LIST_APPEND. `randrange` executes `_operator.index` on its bound, and while
+# that was booked as a body effect the mid-body walk abort refused the consumed
+# item's delivery, the legacy replay resumed at the next iteration, and the
+# element was lost. Only lengths are asserted, so the check holds whatever
 # values the generator produces.
 random.seed(1234)
 for trial in range(400):
