@@ -1597,6 +1597,11 @@ impl PyError {
     /// An unmaterialised error therefore has no chain to report, which is the
     /// same answer upstream's `None` gives: nothing has recorded a frame yet.
     ///
+    /// 3.14 does not defer the instance either — `_PyErr_SetObject` comments
+    /// "We must normalize the value right now" and calls
+    /// `_PyErr_CreateException` before storing anything — so building it at
+    /// the first unwind, rather than never, is the closer of the two.
+    ///
     /// Reading marks the head frame escaped, upstream's documented side
     /// effect — see [`crate::pytraceback::mark_traceback_escaped`] for which
     /// single-frame case that covers.
