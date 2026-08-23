@@ -2598,8 +2598,9 @@ impl UserDelAction {
         action
     }
 
-    /// `pypy/interpreter/executioncontext.py:636-643`:
+    /// `UserDelAction._run_finalizers`:
     /// ```python
+    /// @jit.dont_look_inside
     /// def _run_finalizers(self):
     ///     # called by perform() when we have to "perform" this action,
     ///     # and also directly at the end of gc.collect).
@@ -2613,6 +2614,14 @@ impl UserDelAction {
     /// `self.space.finalizer_queue` is read via the local
     /// `self.finalizer_queue` field (see struct doc for
     /// TODO).
+    ///
+    /// The hint is what keeps the body opaque.  `look_inside_graph` already
+    /// rejects this graph for its loop, so carrying it changes no jitcode
+    /// today — it only drops the name from the `unsafe_loopy_graphs`
+    /// diagnostic — but that rejection is a property of the loop rather than
+    /// a decision about the body, and the body is one to keep out of a trace:
+    /// it drains a collector queue and runs app-level finalizers.
+    #[majit_macros::dont_look_inside]
     pub fn _run_finalizers(&mut self) {
         loop {
             let w_obj = self.finalizer_queue.next_dead();
