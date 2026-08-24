@@ -33,6 +33,13 @@
 # The polymorphic slice loop is required: dropping `lst` and `tup` is clean.
 #
 # `PYRE_JIT=0` is clean, which is the control that makes this the JIT's fixture.
+#
+# The globals dict deliberately carries only `__name__`, and the compile takes a
+# literal filename: the wasm guest defines no `__file__`, and naming it here
+# raised `NameError` there while both native backends passed.  Neither is part
+# of what this reproduces -- the discriminator is that the mapping is not a
+# module's own `__dict__` -- and a mapping holding `__name__` alone is one of
+# the spellings that was measured to abort.
 
 WORKLOAD = '''N = 50000
 
@@ -67,5 +74,5 @@ def main():
 main()
 '''
 
-exec(compile(WORKLOAD, __file__, "exec"), {"__name__": "__main__", "__file__": __file__})
+exec(compile(WORKLOAD, "<workload>", "exec"), {"__name__": "__main__"})
 print("PASS")
