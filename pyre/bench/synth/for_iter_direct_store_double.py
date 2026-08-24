@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=0.5
+# pyre-check: spec-folds=store_attr_direct
 try:
     import pypyjit
 except ImportError:
