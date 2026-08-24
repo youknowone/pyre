@@ -7689,7 +7689,11 @@ mod tests {
                     !exc_target.borrow().operations.is_empty(),
                     "overflow falls to the slow path, not a bare raise block"
                 );
-                assert_eq!(exc.args.len(), 4, "overflow carries the four slow-path inputs");
+                assert_eq!(
+                    exc.args.len(),
+                    4,
+                    "overflow carries the four slow-path inputs"
+                );
             }
             for link in &bb.exits {
                 if let Some(t) = link.borrow().target.clone() {
@@ -7787,7 +7791,11 @@ mod tests {
             if !seen_d.insert(std::rc::Rc::as_ptr(&b) as usize) {
                 continue;
             }
-            if b.borrow().operations.iter().any(|o| o.opname == "direct_call") {
+            if b.borrow()
+                .operations
+                .iter()
+                .any(|o| o.opname == "direct_call")
+            {
                 block_d = Some(b.clone());
             }
             let exits: Vec<_> = b.borrow().exits.clone();
@@ -8544,6 +8552,52 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_new");
     }
 
+    /// rtyper/rbuilder.py — `rtyper_new` on a `with_capacity(n)` constructor
+    /// (`len(hop.args_v) != 0`) threads the size operand into `ll_new`
+    /// instead of the `INIT_SIZE` default, so the emitted `direct_call`
+    /// carries the requested size (200), not the default.
+    #[test]
+    fn stringbuilder_rtyper_new_with_size_threads_size_into_direct_call() {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(super::STRINGBUILDERPTR.clone()));
+        // A `Constant` size arg lets `HighLevelOp.inputarg` short-circuit to
+        // `inputconst` without an `args_r` binding — the single operand is all
+        // `rtype_builder_new`'s `nb_args() != 0` branch needs.
+        let size = super::constant_with_lltype(super::ConstValue::Int(200), LowLevelType::Signed);
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "newstringbuilder".to_string(),
+                vec![size],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let result = super::stringbuilder_repr()
+            .rtyper_new(&hop)
+            .unwrap_or_else(|err| panic!("rtyper_new: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_new");
+        // `direct_call(ll_new_funcptr, size)` — the size operand (args[1]) is
+        // the threaded 200, not the `INIT_SIZE` default.
+        let ops = llops.borrow();
+        let Hlvalue::Constant(size_arg) = &ops.ops[0].args[1] else {
+            panic!(
+                "ll_new size arg must be a Constant, got {:?}",
+                ops.ops[0].args[1]
+            );
+        };
+        let dbg = format!("{:?}", size_arg.value);
+        assert!(dbg.contains("200"), "expected threaded size 200 in {dbg}");
+    }
+
     /// The `newstringbuilder` ctor op flows through the rtyper's real
     /// `translate_operation` dispatch: the result builder repr's
     /// `rtyper_new` lowers it to a single `direct_call` against `ll_new`.
@@ -8674,7 +8728,9 @@ mod tests {
         }
         {
             let mut r = hop.args_r.borrow_mut();
-            r.push(Some(super::unicodebuilder_repr() as std::sync::Arc<dyn Repr>));
+            r.push(Some(
+                super::unicodebuilder_repr() as std::sync::Arc<dyn Repr>
+            ));
             r.push(Some(
                 crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>
             ));

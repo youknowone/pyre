@@ -201,10 +201,8 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                 // make_exception_link (it asserts they are Some and, for an
                 // empty-target handler, unwraps them). Dropping them turns a
                 // faithful OverflowError edge into a flatten-time panic.
-                model_link.last_exception =
-                    link.last_exception.as_ref().map(linkarg_from_hlvalue);
-                model_link.last_exc_value =
-                    link.last_exc_value.as_ref().map(linkarg_from_hlvalue);
+                model_link.last_exception = link.last_exception.as_ref().map(linkarg_from_hlvalue);
+                model_link.last_exc_value = link.last_exc_value.as_ref().map(linkarg_from_hlvalue);
                 model_link
             })
             .collect();
@@ -1023,7 +1021,10 @@ mod tests {
 
         let a = variable_with_lltype("a", LowLevelType::Signed);
         let b = variable_with_lltype("b", LowLevelType::Signed);
-        let start = Block::shared(vec![Hlvalue::Variable(a.clone()), Hlvalue::Variable(b.clone())]);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
         let ret = variable_with_lltype("result", LowLevelType::Signed);
         let graph =
             FlowGraph::with_return_var("ll_ovf_probe", start.clone(), Hlvalue::Variable(ret));
@@ -1043,8 +1044,12 @@ mod tests {
         ]);
 
         start.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
-        let normal =
-            Link::new(vec![Hlvalue::Variable(sum)], Some(graph.returnblock.clone()), None).into_ref();
+        let normal = Link::new(
+            vec![Hlvalue::Variable(sum)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
         let mut exc = Link::new(vec![], Some(handler), Some(overflow[0].clone()));
         exc.extravars(Some(overflow[0].clone()), Some(overflow[1].clone()));
         start.closeblock(vec![normal, exc.into_ref()]);

@@ -7834,6 +7834,14 @@ impl<'a> Lowering<'a> {
                 // so it preempts any generic ctor lowering. Inert unless
                 // [`enable_builder_mode`] selected this canonical form; the
                 // accumulator test resolves on demand from `body`.
+                //
+                // The ctor operands ride the marker verbatim: `new()` carries
+                // none and `with_capacity(n)` carries the size `n`
+                // ([`builder_ctor_dest_locals`] admits only those two), so the
+                // marker's arg count mirrors `len(hop.args_v)` in
+                // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py) —
+                // no arg selects `ll_new(INIT_SIZE)`, the size arg threads
+                // `ll_new(n)`.
                 if self.builder_mode
                     && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
                 {
@@ -7846,7 +7854,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__pyre_stringbuilder_new".to_string()],
                             },
-                            args: vec![],
+                            args,
                             result_ty: ValueType::Ref(None),
                         },
                     });

@@ -121,9 +121,8 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(StringBuilderBox, current_end) == STRINGBUILDER_CURRENT_END_OFFSET
 );
-const _: () = assert!(
-    std::mem::offset_of!(StringBuilderBox, total_size) == STRINGBUILDER_TOTAL_SIZE_OFFSET
-);
+const _: () =
+    assert!(std::mem::offset_of!(StringBuilderBox, total_size) == STRINGBUILDER_TOTAL_SIZE_OFFSET);
 const _: () = assert!(
     std::mem::offset_of!(StringBuilderBox, extra_pieces) == STRINGBUILDER_EXTRA_PIECES_OFFSET
 );
@@ -150,9 +149,8 @@ const _: () = assert!(
     "StringPieceBox body must match the stringpiece size descriptor",
 );
 const _: () = assert!(std::mem::offset_of!(StringPieceBox, buf) == STRINGPIECE_BUF_OFFSET);
-const _: () = assert!(
-    std::mem::offset_of!(StringPieceBox, prev_piece) == STRINGPIECE_PREV_PIECE_OFFSET
-);
+const _: () =
+    assert!(std::mem::offset_of!(StringPieceBox, prev_piece) == STRINGPIECE_PREV_PIECE_OFFSET);
 
 /// Native runtime realization of the RPython `StringBuilder` helper graphs
 /// (`rpython/rtyper/lltypesystem/rbuilder.py`) — rbuilder epic task #48b.

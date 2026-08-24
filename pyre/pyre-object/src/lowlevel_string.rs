@@ -245,7 +245,10 @@ mod tests {
         assert_ne!(new_buf, 0);
         assert_eq!(bh_lowlevel_string_len(new_buf), 5);
         assert_eq!(unsafe { *(new_buf as *const usize) }, 0xdead_beef);
-        assert_eq!(bh_read_lowlevel_string(new_buf, 1), vec![97, 98, 99, 100, 101]);
+        assert_eq!(
+            bh_read_lowlevel_string(new_buf, 1),
+            vec![97, 98, 99, 100, 101]
+        );
         bh_free_lowlevel_string(new_buf, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
@@ -259,7 +262,10 @@ mod tests {
         let new_buf = shrink_lowlevel_array(buf, 2, LOWLEVEL_UNICODE_BASE_SIZE, 4);
         assert_ne!(new_buf, 0);
         assert_eq!(bh_lowlevel_string_len(new_buf), 2);
-        assert_eq!(bh_read_lowlevel_string(new_buf, 4), vec![0x1_0000, 0x1_0001]);
+        assert_eq!(
+            bh_read_lowlevel_string(new_buf, 4),
+            vec![0x1_0000, 0x1_0001]
+        );
         bh_free_lowlevel_string(new_buf, LOWLEVEL_UNICODE_BASE_SIZE, 4);
     }
 
