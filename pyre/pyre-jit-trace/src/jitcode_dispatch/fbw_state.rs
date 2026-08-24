@@ -2896,11 +2896,20 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // here, and an ImportError when the name is absent, which replays
             // as the same error the same way `load_global`'s NameError does.
             // It writes nothing, so re-running it commits nothing.
+            // `load_import_locals` is the other residual the same opcode emits,
+            // and the weaker claim of the two: `import_locals` reads
+            // `PyFrame.debugdata` and then `FrameDebugData.w_locals` and
+            // returns one or `None`, with no lookup, no user code and no
+            // failure to report.  Its `Plain` lowering is a statement about the
+            // optimizer's heap cache -- the two fields were never analyzed, so
+            // no empty write set may be claimed for them -- and not about
+            // replay: reading a field twice commits nothing either way.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
                     | majit_ir::PyreHelperKind::LoadGlobal
                     | majit_ir::PyreHelperKind::LoadImport
+                    | majit_ir::PyreHelperKind::LoadImportLocals
                     | majit_ir::PyreHelperKind::BoxInt
                     | majit_ir::PyreHelperKind::NewtupleFromArray
                     | majit_ir::PyreHelperKind::NewlistFromArray
