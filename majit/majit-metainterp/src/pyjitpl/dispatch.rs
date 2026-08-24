@@ -1938,7 +1938,7 @@ where
         opcode_pc: usize,
     ) -> bool {
         let value = src_value != 0;
-        if ctx.heapcache_nullity_known(src) == Some(true) {
+        if ctx.heapcache_nullity_answered(src) {
             ctx.profiler().count_ops(
                 OpCode::GuardNonnull,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
@@ -4561,6 +4561,18 @@ where
                     && array_opref.is_constant()
                     && index_opref.is_constant();
                 let (opref, reg_concrete) = if foldable {
+                    // `execute_and_record` counts the operation *before* it
+                    // decides to fold, so a hand-built constant that skips the
+                    // funnel under-reports OPS on green pure-array reads.
+                    //
+                    // The fold itself stays here rather than routing: the
+                    // funnel would re-read the item through
+                    // `Cpu::bh_getarrayitem_gc_i`, a second reader of an array
+                    // this site has already read directly with the descr's own
+                    // geometry — and of a raw data pointer carrying no GC type
+                    // header, which is why the record-time fold is licensed at
+                    // all (see above).
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
                     (ctx.const_int(concrete), concrete)
                 } else if let Some(cached) = cached {
                     // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
@@ -13268,6 +13280,35 @@ mod tests {
             &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x40)],
         );
         assert_eq!(recorded, vec![OpCode::GuardNonnull], "{recorded:?}");
+    }
+
+    /// `nullity_now_known` records a known-**null** box too, and upstream's
+    /// `is_nullity_known` answers true for it, so a second nullity branch on
+    /// that box short-circuits instead of re-guarding. Reading only
+    /// `Some(true)` out of pyre's three-valued answer emits a second
+    /// `GUARD_ISNULL`.
+    ///
+    /// The two branches must read the box through **different registers**.
+    /// The null arm rebinds only the register it was handed, so branching on
+    /// the same one twice reaches the heapcache holding `CONST_NULL` — a
+    /// constant, which upstream answers false for — and the test would pass
+    /// without ever exercising the known-null answer.
+    #[test]
+    fn a_second_nullity_branch_on_a_known_null_box_is_answered_by_the_heapcache() {
+        let mut builder = JitCodeBuilder::new();
+        let first = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(0, first);
+        builder.mark_label(first);
+        let second = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(1, second);
+        builder.mark_label(second);
+        let aliased = OpRef::input_arg_ref(0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
     }
 
     /// The null arm's `replace_box(box, constant_from_op(box))`: the source

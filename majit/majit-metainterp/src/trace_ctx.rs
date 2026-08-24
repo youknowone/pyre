@@ -4325,6 +4325,25 @@ impl TraceCtx {
     /// known-nonnull / known-null / unknown; only `Some(true)` is upstream's
     /// truthy answer, for the reason spelled out at
     /// [`Self::trace_assert_not_none`].
+    /// `if self.metainterp.heapcache.is_nullity_known(box):` — upstream's
+    /// *truthiness* test, which is not the same question as
+    /// [`Self::heapcache_nullity_known`] answering `Some`.
+    ///
+    /// `heapcache.py` returns `bool(box.getref_base())` for a `Const` and
+    /// `_check_flag(box, HF_KNOWN_NULLITY)` otherwise, and
+    /// `nullity_now_known` sets that flag for *either* nullity. So a
+    /// non-`Const` box already known to be **null** answers true here and
+    /// short-circuits, while a **null `Const`** answers false and falls
+    /// through. Reading `Some(true)` alone gets the second of those right and
+    /// the first wrong, and re-guards a box whose nullity is already settled.
+    pub fn heapcache_nullity_answered(&self, opref: OpRef) -> bool {
+        match self.heapcache_nullity_known(opref) {
+            Some(true) => true,
+            Some(false) => !opref.is_constant(),
+            None => false,
+        }
+    }
+
     pub fn heapcache_nullity_known(&self, opref: OpRef) -> Option<bool> {
         self.heap_cache.is_nullity_known(opref, |op| {
             op.inline_const_to_value().and_then(|v| match v {
