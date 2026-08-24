@@ -1501,7 +1501,7 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
-                                #func as *const ()
+                                #word_result_addr
                             } else {
                                 __trace_target
                             };
@@ -1599,7 +1599,7 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
-                                #func as *const ()
+                                #word_result_addr
                             } else {
                                 __trace_target
                             };
