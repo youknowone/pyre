@@ -4996,11 +4996,19 @@ impl<M: Clone> MetaInterp<M> {
     /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
     /// reusing a thread-local `GreenKey` so the warmup-hot decision path
     /// does not allocate the key's value/type vectors per back-edge.
-    /// `is_being_profiled` folds to 0 (the JIT path is not profiled;
-    /// trace-side keys have no frame). Returns `None` for synthetic call
-    /// sites with no raw `(code, pc)` (e.g. [`Self::on_back_edge`]), which
-    /// keep the legacy u64 hash path. On install, `ensure_cell_for_key`
-    /// clones the key into the cell's `comparekey`, so reuse is safe.
+    /// `is_being_profiled` is written as 0 rather than read from anywhere:
+    /// trace-side keys have no frame to read it off, and a profiled frame does
+    /// not reach the JIT because `eval_with_jit_inner` declines every frame
+    /// whose execution context carries a profile hook (`frame_tracing_active`).
+    /// The `debug_assert_eq!` below is what holds the two spellings together —
+    /// a caller whose `green_key` was built with a true `is_being_profiled`
+    /// would bucket somewhere this key does not, so lifting that gate means
+    /// threading the value through here, not just relaxing the assert.
+    ///
+    /// Returns `None` for synthetic call sites with no raw `(code, pc)` (e.g.
+    /// [`Self::on_back_edge`]), which keep the legacy u64 hash path. On
+    /// install, `ensure_cell_for_key` clones the key into the cell's
+    /// `comparekey`, so reuse is safe.
     fn with_typed_decision_key<R>(
         green_key: u64,
         green_key_raw: (usize, usize),

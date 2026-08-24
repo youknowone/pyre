@@ -1232,9 +1232,10 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// swapped slot still hashes to something, just not to the same cell.
 ///
 /// `is_being_profiled` is a real green, and pyre's callers pass a live value:
-/// both green-key construction sites read
-/// `executioncontext::current_is_being_profiled()`, so a profiled portal does
-/// not share cells with the unprofiled one.
+/// every green-key construction site reads it off the frame
+/// (`call_jit.rs` and `eval.rs` hand `frame.get_is_being_profiled()`, which is
+/// `debugdata.is_being_profiled`), so a profiled portal does not share cells
+/// with the unprofiled one.
 ///
 /// What that separation buys a `setprofile` armed on an ALREADY-COMPILED loop
 /// is a re-warmup, and only that: the green flips, the cell the back edge
