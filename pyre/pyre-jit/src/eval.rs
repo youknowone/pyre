@@ -8409,13 +8409,22 @@ fn eval_with_jit_inner(
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame_plain(resume);
     }
-    // A profiled frame runs interpreted.  The `call` half of what a profile
-    // hook is owed is answered now — the walker declines to enter a callee
-    // while a hook is installed, and the arms below carry `execute_frame`'s
-    // `call_trace` / `return_trace` bracket — but `c_call` / `c_return` are
-    // not: a compiled trace folds away the builtin calls that owe them, with
-    // nothing left to report them (measured, `c_call` 2085 against CPython's
-    // 6001).  That is what still keeps the profile half out.
+    // A profiled frame runs interpreted, and `c_call` / `c_return` are the
+    // whole of why.  The frame-level events would survive the JIT: measured
+    // with this test narrowed to `f_trace` alone and the arms below carrying
+    // `execute_frame`'s `call_trace` / `return_trace` bracket plus `leave`'s
+    // `_trace('leaveframe')`, a 2000-iteration tail entered with a hook
+    // installed reported `call` and `return` exactly, for the loop frame and
+    // for its callee alike, matching cpython 3.14.6.  Every builtin's `c_call`
+    // stopped at 1041, the entry threshold — `len`, `ord`, `divmod`, `hex`,
+    // `sorted`, `max` and `round` alike — and nothing about that is a missing
+    // check on a call path: probed at `call::c_profile_frame`, compiled code
+    // does not reach the interpreter's builtin call doors at all, folded or
+    // residual.  `is_being_profiled` is a green, so upstream's compiled loop
+    // carries the reporting it traced through `call_args`; this walker decides
+    // rather than traces, so a profiled trace would have to be RECORDED with
+    // the reporting in it.  Until it is, a profiled frame is served correctly
+    // and slowly rather than quickly and silently.
     //
     // A frame that arrives with its own `f_trace` already armed runs
     // interpreted too.  One that gets it armed by the bracket below is past

@@ -1760,9 +1760,10 @@ pub fn report_stack_underflow(frame: &PyFrame) {
 ///
 /// A profile hook is the whole of the first half: `c_call` / `c_return` are
 /// owed for every builtin the frame calls, and a compiled trace folds those
-/// calls away with nothing left to report them (measured: `c_call` 2085
-/// against CPython's 6001).  A frame that arrives with its own `f_trace`
-/// already armed is the second half.
+/// calls away with nothing left to report them — measured with this test
+/// narrowed to `f_trace` alone, every builtin's `c_call` saturated at the
+/// entry threshold (see `eval::eval_with_jit_inner`).  A frame that arrives
+/// with its own `f_trace` already armed is the second half.
 ///
 /// A global trace function is deliberately absent.  `executioncontext.py
 /// settrace` keeps the JIT on and widens `trace_limit` rather than turning it
