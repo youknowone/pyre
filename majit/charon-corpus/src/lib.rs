@@ -296,7 +296,6 @@ pub fn w_number_add(a: *mut ObjectHeader, b: *mut ObjectHeader) -> i64 {
 #[allow(non_upper_case_globals)]
 pub const _immutable_fields_W_IntObject: &str = "intval";
 
-
 // A host-registered callback table.
 
 /// The callback a host installs at run time. A bare `fn` pointer, so the set
