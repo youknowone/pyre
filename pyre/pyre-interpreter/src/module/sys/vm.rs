@@ -2059,6 +2059,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             w_int_new(implementation_hexversion),
         );
         crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre314"));
+        // PEP 734. pyre runs one interpreter per process, so the answer is
+        // false; `sys.implementation` carries the name either way from 3.14 on.
+        crate::baseobjspace::setdictvalue_native(
+            impl_obj,
+            "supports_isolated_interpreters",
+            w_bool_from(false),
+        );
         crate::baseobjspace::setdictvalue_native(
             impl_obj,
             "_multiarch",
