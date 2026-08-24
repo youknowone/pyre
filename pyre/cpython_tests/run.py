@@ -121,6 +121,12 @@ KNOWN_SKIPS = {
     # opts out everywhere, which is a fact about the build rather than about
     # one host.
     "test.test_interpreters": "package skips itself on a free-threaded build (Py_GIL_DISABLED)",
+    # `test/test_types.py:13` imports `_datetime` at module scope. PyPy reaches
+    # `datetime` through its pure-Python implementation and ships no `_datetime`
+    # extension module, so that import cannot succeed here without the stub
+    # `AGENTS.md` rules out; the module stays blocked on a decision about the
+    # module inventory rather than on an interpreter gap.
+    "test.test_types": "imports `_datetime`, an extension module PyPy does not provide",
 }
 
 # Whole modules that CPython skips at import on some platforms. Off-platform

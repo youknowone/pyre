@@ -1205,7 +1205,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_traceback": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_tracemalloc": {
       "dynasm": "IMPORTERROR"
@@ -1252,7 +1252,8 @@
       "dynasm": "PASS"
     },
     "test.test_types": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "imports `_datetime`, an extension module PyPy does not provide"
     },
     "test.test_typing": {
       "dynasm": "PASS"
@@ -1345,7 +1346,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_warnings": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_wave": {
       "dynasm": "PASS"

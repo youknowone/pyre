@@ -1572,6 +1572,17 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// reads that alias the caller's frame. `None` when this is not an
     /// inlined-callee sub-walk.
     pub inline_callee_consts: Option<InlineCalleeConsts>,
+    /// Ascending jitcode offsets in THIS sub-walk's body that
+    /// [`fbw_state::fbw_callee_body_replay_scan`] could not prove replay-safe.
+    /// [`walk`] refuses the inline on reaching one.
+    ///
+    /// The admission that hands this over is what turns a whole-body verdict
+    /// into a path-sensitive one, so the set is per-sub-walk and never
+    /// inherited: it names offsets into one callee's jitcode and means nothing
+    /// in another's.  `None` for a top-level walk and for an admission that
+    /// found nothing to poison, which is the common case and the reason the
+    /// per-op test is one `Option` check.
+    pub inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
     /// FBW walk modes inherited by nested sub-walk contexts.
     pub fbw_mode: FbwWalkMode<Sym>,
     /// Caller-owned state shared by every frame in this walk attempt.
@@ -3241,6 +3252,29 @@ pub fn walk<Sym: WalkSym>(
     let mut pc = start_pc;
     loop {
         let opcode_position = pc;
+        // The path-sensitive half of the inline admission.  The scan that
+        // admitted this callee left behind the pcs it could not prove
+        // replay-safe instead of declining the whole body for them, so the
+        // refusal happens HERE, where the walk has arrived at one, rather than
+        // at the CALL for an arm the walk may never take.
+        //
+        // Before `step`, so nothing of the offending op is recorded or
+        // executed: the op is the effect, and the decline promises the
+        // enclosing CALL can be re-entered from scratch.  Everything walked up
+        // to this point passed the scan, so it committed no live-heap effect
+        // for the rewind to have to undo.
+        if ctx
+            .inline_poison_pcs
+            .as_ref()
+            .is_some_and(|pcs| pcs.binary_search(&pc).is_ok())
+        {
+            if fbw_inline_diag_enabled() {
+                eprintln!("[inline-poison-refuse] pc={pc}");
+            }
+            census_record("InlineCallee::PoisonedPcReached");
+            let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
+            return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
+        }
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             Err(error) => {
@@ -7695,6 +7729,53 @@ pub(crate) unsafe fn resolve_inlinable_callee(
         let closure = pyre_interpreter::function_get_closure(callable);
         Some((w_code, (*raw).arg_count as usize, !closure.is_null()))
     }
+}
+
+/// `space.lookup(w_obj, '__call__')` for a callable that is neither a
+/// `Function` nor a `Method` — `descroperation.py
+/// DescrOperation.call_args`'s third arm.
+///
+/// Returns the resolved `__call__` alongside the class it was found through and
+/// that class's version tag, which is what pins the lookup: the walker's
+/// counterpart of `space.lookup` promoting the type.  A `__call__` that is not
+/// a plain inlinable function — a builtin slot, a `classmethod`, another
+/// callable object — has no body to walk and declines here, exactly as
+/// `resolve_inlinable_callee` declines a non-`Function` callee.
+///
+/// # Safety
+/// `callable` must be a valid object.
+unsafe fn resolve_instance_dunder_call(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+    *const (),
+    usize,
+    bool,
+)> {
+    if callable.is_null() {
+        return None;
+    }
+    // A class reaches `type.__call__`, which instantiates rather than calls a
+    // `__call__` found on the metaclass; `try_walker_inline_type_call` owns
+    // that shape and resolves `__new__` / `__init__` for it.
+    if unsafe { pyre_object::is_type(callable) } {
+        return None;
+    }
+    let w_class = unsafe { (*callable).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return None;
+    }
+    // A version tag of 0 is a type whose dict changes are not tracked, so the
+    // `__call__` answer below cannot be pinned.
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return None;
+    }
+    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
+    Some((method, w_class, version_tag, w_code, nparams, has_closure))
 }
 
 type ExceptionInlineReceiverGuard = (

@@ -248,6 +248,7 @@ macro_rules! latchdbg {
 ///   immediately after `MIFrame.run_one_step()` and
 ///   `convert_and_run_from_pyjitpl` copies every live MIFrame at its
 ///   already-advanced `pc` (`pyjitpl.py:2863-2866`, `blackhole.py:1799-1821`).
+///   `convert_and_run_from_pyjitpl`).
 ///   `resume_pc` is `walk()`'s post-step `next_pc`.
 /// - A bridge carrier sub-walk that stopped on a walker capability gap.  That
 ///   sub-walk IS the reconstructed callee's one real execution (see
@@ -3252,7 +3253,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
     // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
     // it has no nested-callee abort for these allocation helpers.  Keep this
-    // executor predicate aligned with `fbw_callee_body_replay_safety`, which
+    // executor predicate aligned with `fbw_callee_body_replay_scan`, which
     // already admits both helpers as replay-safe reads/fresh allocations.
     //
     // Disjoint from the three observed-value classes above: those name `CallFn`
@@ -5053,6 +5054,116 @@ fn mapdict_qmut_force_enabled() -> bool {
     std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
 }
 
+/// `nestedscope.py Cell.get` for the LOAD_DEREF residual.
+///
+/// ```python
+/// def get(self):
+///     if jit.isconstant(self):
+///         if not self.family.ever_mutated:
+///             w_res = self._elidable_get()
+///             if w_res is not None:
+///                 return w_res
+///     ...
+///     return self.w_value
+/// ```
+///
+/// A cell the trace already holds as a constant — the ordinary freevar read,
+/// whose cell reaches the callee through the pinned callable's quasi-immutable
+/// `closure` — folds to its contents under a
+/// `QUASIIMMUT_FIELD(family, ever_mutated)`, so the read leaves no residual at
+/// all.  Every other shape declines and keeps the residual.
+///
+/// The `w_res is not None` re-check is load-bearing, not defensive: with
+/// `ever_mutated` false, the elidable read may hand back a stale unbound `None`
+/// for a cell that has since been bound for the first time (that first binding
+/// is deliberately not a mutation).  Dropping the check would fold a wrong
+/// answer, so a null falls through to the live residual read.
+///
+/// !! THIS FOLD CURRENTLY FIRES NOWHERE.  Measured 2026-08-24 on release
+/// dynasm over every `bench/synth` fixture that contains a nested function (71
+/// of them, selected by AST rather than by name): the `load_deref` census row
+/// is reported by all 71, `consulted` totals 46, and `fired` totals 0.  Its
+/// ideal shape — a write-once freevar read from a hot `while` — reads
+/// `consulted=1 fired=0` too, so this is not a coverage gap in the corpus.
+///
+/// `ever_mutated` is not what declines: `CellFamily::new` is born `false` and
+/// a write-once binding never sets it.  The first guard, `jit.isconstant` /
+/// [`OpRef::is_constant`], is the suspect — a cell read out of the frame's own
+/// cells region is red — but which guard actually declines has NOT been
+/// isolated, so do not repeat that as established.  The `can_move` gate on the
+/// contents postdates that measurement, so it is not what declined then.  A
+/// `spec-folds=load_deref` directive would therefore fail today; the row
+/// exists, unguarded, and is documented here rather than gated.
+///
+/// The one admission that made closure callees inline, and with them their
+/// cells reach a sub-walk as constants, was `PyreHelperKind::LoadDeref` in
+/// `fbw_state.rs` `replay_safe_read`.  That listing is out — see the note
+/// there and `bench/synth/_pending/caller_f_lasti_across_residual_call.py`.
+fn try_walker_specialize_load_deref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<OpRef>, DispatchError> {
+    // nestedscope.py `if jit.isconstant(self)`.
+    let Some(&cell_op) = r_args.first() else {
+        return Ok(None);
+    };
+    if !cell_op.is_constant() {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Ref(cell_ref)) = ctx.trace_ctx.box_value(cell_op) else {
+        return Ok(None);
+    };
+    // `NO_CONCRETE` is `usize::MAX - 1`, not zero, so `is_null` does not cover
+    // it and `is_cell` would dereference it.  It means "this box carries no
+    // concrete half", which declines here for the same reason a null does: the
+    // fold answers from the cell it can read, and there is none.  Spelled
+    // alongside the null the way `state.rs` reads a `Value::Ref`
+    // (`frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE`).
+    let cell = cell_ref.0 as pyre_object::PyObjectRef;
+    if cell.is_null()
+        || cell_ref == majit_ir::GcRef::NO_CONCRETE
+        || !unsafe { pyre_object::is_cell(cell) }
+    {
+        return Ok(None);
+    }
+    let family = unsafe { pyre_object::w_cell_family(cell) };
+    if family.is_null() {
+        return Ok(None);
+    }
+    // nestedscope.py `if not self.family.ever_mutated`.
+    if unsafe { (*family).ever_mutated.get() } {
+        return Ok(None);
+    }
+    // nestedscope.py `w_res = self._elidable_get(); if w_res is not None`.
+    let contents = unsafe { pyre_object::w_cell_get(cell) };
+    if contents.is_null() {
+        return Ok(None);
+    }
+    // A cell holds an arbitrary object, so baking its address needs the gate
+    // the other walker folds carry.  A RECORDED `ConstPtr` is forwarded at
+    // every later stage — the active-trace walk, the retrace and resume-data
+    // pools, and `remove_constptrs_in`, which turns each one into a
+    // `LoadFromGcTable` whose slot is a root.  The window this gate covers is
+    // the one before that: a freshly minted `ConstPtr` sits in the walker's
+    // own `registers_r` bank, which no registered root area walks, so a minor
+    // collection between the mint and the record leaves it pointing at the old
+    // address.  The only other address this fold bakes is the family's, and a
+    // family is a `Box::into_raw` leak outside the collector entirely, so the
+    // contents are the one edge that needs gating.
+    if majit_gc::can_move(majit_ir::GcRef(contents as usize)) {
+        return Ok(None);
+    }
+    let owner = ctx.trace_ctx.const_ref(family as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::cell_family_ever_mutated_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
+}
+
 fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6812,6 +6923,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // LOAD_DEREF on a constant cell whose binding was only ever filled once:
+    // fold to the contents under a `QUASIIMMUT_FIELD(family, ever_mutated)`
+    // instead of the opaque read residual, the shape upstream gets for free
+    // from `nestedscope.py Cell.get`.  Read-only, and every unrecognised
+    // shape falls through to the residual (SAFE).
+    //
+    // This is the shape that decides whether a closure callee inlines at all:
+    // the sub-walk's `DeferredCall` admission promises it commits nothing, and
+    // a `load_deref_value` that stays residual is a nested residual the lever
+    // could not inline, so the admission is revoked and the callee denied.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && pyre_helper_kind == majit_ir::PyreHelperKind::LoadDeref
+    {
+        if let Some(value) = spec_gate("load_deref", || {
+            try_walker_specialize_load_deref(ctx, op.pc, &r_args)
+        })? {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, value)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
 
     // STORE_ATTR fold (mapdict.py): recognize an existing unboxed

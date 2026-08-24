@@ -146,10 +146,13 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
     } else {
         category
     };
+    // `interp_warnings.py` `get_category` raises "category is not a subclass of Warning"
+    // from inside its own `try`, so the enclosing `except OperationError` catches
+    // that raise and re-reports it in the `'%T'` form.  A plain False and a
+    // subclass check that itself fails therefore reach the caller identically.
     match crate::baseobjspace::issubclass(category, warning) {
         Ok(true) => Ok(category),
-        Ok(false) => Err(PyError::type_error("category is not a subclass of Warning")),
-        Err(_) => Err(PyError::type_error(format!(
+        Ok(false) | Err(_) => Err(PyError::type_error(format!(
             "category must be a Warning subclass, not '{}'",
             crate::baseobjspace::object_functionstr_type_name(category)
         ))),
@@ -562,13 +565,31 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let globals_slot = pin_root_slot(module_globals);
-    let Some(loader) = crate::baseobjspace::finditem_str(
-        pyre_object::gc_roots::shadow_stack_get(globals_slot),
-        "__loader__",
-    )?
-    else {
+    // `importlib/_bootstrap_external.py` `_bless_my_loader` reconciles
+    // `__loader__` against `__spec__.loader` before either is used: it raises
+    // when the globals name no loader at all, and warns `DeprecationWarning`
+    // when only the deprecated `__loader__` names one.  `interp_warnings.py`
+    // `get_source_line`
+    // reads `__loader__` straight out of the globals; that module predates the
+    // reconciliation and carries no counterpart for it, so this answers to the
+    // 3.14 stdlib shipped here.
+    let Some(external) = crate::importing::get_sys_module("importlib._bootstrap_external") else {
+        // A warning raised before the external bootstrap is wired has no loader
+        // to ask for a source line.
         return Ok(PY_NULL);
     };
+    let external_slot = pin_root_slot(external);
+    let bless = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(external_slot),
+        "_bless_my_loader",
+    )?;
+    let bless_slot = pin_root_slot(bless);
+    // `None` when the globals name no loader; the `get_source` lookup below then
+    // takes the `AttributeError` arm and yields no source line.
+    let loader = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(bless_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(globals_slot)],
+    )?;
     let loader_slot = pin_root_slot(loader);
     let Some(module_name) = crate::baseobjspace::finditem_str(
         pyre_object::gc_roots::shadow_stack_get(globals_slot),
@@ -595,14 +616,20 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
         return Ok(PY_NULL);
     }
     let source_slot = pin_root_slot(source);
+    // `interp_warnings.py` `get_source_line` splits through the `str` type
+    // itself, so a `str`
+    // subclass that overrides `splitlines` does not get to decide what the line
+    // list is, and the descriptor's own receiver check rejects a `get_source`
+    // result that is not a `str` — the same type error `PyUnicode_Splitlines`
+    // reports for that input.
     let splitlines = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(source_slot),
+        crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
         "splitlines",
     )?;
     let splitlines_slot = pin_root_slot(splitlines);
     let lines = crate::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(splitlines_slot),
-        &[],
+        &[pyre_object::gc_roots::shadow_stack_get(source_slot)],
     )?;
     let lines_slot = pin_root_slot(lines);
     match crate::baseobjspace::getitem(

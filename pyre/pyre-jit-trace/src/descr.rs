@@ -100,6 +100,18 @@ const WRAPPER_DESCR_TAG: u32 = 0x5200_0000;
 const STATICMETHOD_W_FUNCTION_INDEX: u32 = WRAPPER_DESCR_TAG;
 const CLASSMETHOD_W_FUNCTION_INDEX: u32 = WRAPPER_DESCR_TAG | 1;
 
+// `CellFamily.ever_mutated` is a `Cell<bool>` on an owner that is not a
+// `PyObject` — the same shape as the map-node block, so `stable_field_index`
+// could collide with `Terminator.allow_unboxing` or
+// `PlainAttribute.ever_mutated` and the index is what selects the pointer cast
+// in `install_quasiimmut_field` / `register_quasi_immutable_deps`.  Reserved in
+// a tag of its own because the owner belongs to a code object rather than to
+// mapdict.  Disjoint from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT,
+// PROPERTY, WRAPPER, `object.typeptr` (0x6000_0000), the native mapdict block,
+// and the GC tid.
+const CELL_FAMILY_DESCR_TAG: u32 = 0x5300_0000;
+const CELL_FAMILY_EVER_MUTATED_INDEX: u32 = CELL_FAMILY_DESCR_TAG;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -3625,6 +3637,28 @@ pub fn plain_attribute_ever_mutated_descr() -> DescrRef {
     PLAIN_ATTRIBUTE_EVER_MUTATED_FIELD_DESCR.clone()
 }
 
+/// `nestedscope.py `CellFamily` _immutable_fields_ = ['ever_mutated?']` — the field
+/// `Cell.get`'s fold reads before returning a constant cell's contents.
+static CELL_FAMILY_EVER_MUTATED_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            CELL_FAMILY_EVER_MUTATED_INDEX,
+            core::mem::offset_of!(pyre_object::nestedscope::CellFamily, ever_mutated),
+            1,
+            Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "CellFamily.ever_mutated".to_string(),
+            "ever_mutated".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn cell_family_ever_mutated_descr() -> DescrRef {
+    CELL_FAMILY_EVER_MUTATED_FIELD_DESCR.clone()
+}
+
 static HOLDER_ATTR_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     Arc::new(
         majit_ir::descr::SimpleFieldDescr::new_with_name(
@@ -6540,6 +6574,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("unicodeobject::W_UnicodeObjectUser", || {
         LazyLock::force(&W_UNICODE_USER_DESCR_GROUP);
+    }),
+    ("bytesobject::W_BytesObject", || {
+        LazyLock::force(&W_BYTES_DESCR_GROUP);
+    }),
+    ("bytearrayobject::W_BytearrayObject", || {
+        LazyLock::force(&W_BYTEARRAY_DESCR_GROUP);
     }),
     ("functional::W_IntRangeIterator", || {
         LazyLock::force(&RANGE_ITER_DESCR_GROUP);

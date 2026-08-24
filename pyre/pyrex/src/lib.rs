@@ -1252,6 +1252,63 @@ pub(crate) fn seed_main_loader(
     }
 }
 
+/// `app_main.py` `run_command_line` — `launch_env` has already assembled the
+/// dev-mode,
+/// `PYTHONWARNINGS`, `-W` and BytesWarning entries onto `sys.warnoptions`; what
+/// remains is driving the warnings machinery through them before user code runs.
+/// A module already in `sys.modules` (a `sitecustomize` may have pulled it in)
+/// has run its body once, so it is re-driven through `_processoptions`;
+/// otherwise the plain import runs `_processoptions(sys.warnoptions)` from the
+/// module body (`warnings.py`, its module-level `_processoptions` call).  This
+/// is the step that emits
+/// "Invalid -W option ignored: ..." and that leaves `sys.modules['warnings']`
+/// populated on a `-W` run.
+///
+/// `run_command_line` writes the two branches under one `try` and catches
+/// `ImportError` alone, so a `-W ignore::mod.W` whose `mod` raises anything
+/// else leaves the block and ends the process before user code runs.  The
+/// spec runs that program: the filters apply as far as they got and the
+/// failure is reported on stderr.  So the structure below is that block's,
+/// and the non-`ImportError` arm reports rather than either dropping the
+/// failure or carrying it out of here.
+fn init_warnoptions(
+    w_main_globals: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    if importing::warnoptions().is_empty() {
+        return;
+    }
+    let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
+        let Some(w_warnings) = importing::get_sys_module("warnings") else {
+            importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr)?;
+            return Ok(());
+        };
+        let Some(w_sys) = importing::get_sys_module("sys") else {
+            return Ok(());
+        };
+        // `from warnings import _processoptions` raises `ImportError` when the
+        // name is absent, which the `except` covers; the attribute read that
+        // spells it here raises `AttributeError`, which it would not, so that
+        // lookup keeps its own swallowing arm.
+        let Ok(process) =
+            pyre_interpreter::baseobjspace::getattr_str(w_warnings, "_processoptions")
+        else {
+            return Ok(());
+        };
+        let options = pyre_interpreter::baseobjspace::getattr_str(w_sys, "warnoptions")?;
+        pyre_interpreter::call::call_function_impl_result(process, &[options])?;
+        Ok(())
+    })();
+    if let Err(e) = attempt
+        && !is_import_error(&e)
+    {
+        // Through the same seam the traceback takes, so the two stay ordered
+        // on a mediated stderr.
+        pyre_interpreter::host_seam::emit_stderr(b"'import warnings' failed; traceback:\n");
+        pyre_interpreter::eprint_exception(&e, true);
+    }
+}
+
 pub(crate) fn import_site(
     no_site: bool,
     w_main_globals: pyre_object::PyObjectRef,
@@ -1263,6 +1320,9 @@ pub(crate) fn import_site(
         eprintln!("'import site' failed");
     }
     importing::add_sys_path_0();
+    // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
+    // so `-S -Wxxx` still reports a bad filter.
+    init_warnoptions(w_main_globals, ec_ptr);
 }
 
 /// Run the `init_importlib` / `init_importlib_external` sequence
@@ -2009,6 +2069,22 @@ fn eval_source_in_main(
     };
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
+
+    // `<string>` names no file, so `linecache._interactive_cache` is the only
+    // place a traceback frame or `inspect.getsource` can reach the command's
+    // text; publish the compiled tree there before it runs. A script keeps its
+    // own path and a stdin run keeps `<stdin>`, which is the same distinction
+    // `__file__` above already makes. Registration is cosmetic, so a failure
+    // must not stop the command.
+    if filename == "<string>" {
+        let _ = repl::register_interactive_code(
+            canonical,
+            ec_ptr,
+            frame.fget_f_code(),
+            source,
+            filename,
+        );
+    }
 
     match eval_with_jit(&mut frame, None) {
         Ok(result) => {

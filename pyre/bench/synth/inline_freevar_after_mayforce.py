@@ -90,6 +90,20 @@ from fractions import Fraction
 # -- while its guard failures stayed at 1004, so on that backend the arm costs a
 # loop and no guard failure.
 #
+# The earlier reading of this counter -- that the seventh loop was a
+# `catch_exception/L` blackhole arm -- does not survive measurement:
+# `MAJIT_BH_DEBUG=1` shows all 1002 blackhole entries at `frame=0` across three
+# qualnames (`<module>`, `Fraction._add`, `Fraction._div`), never `forward`,
+# and both `fbw_blackhole_adopted_*` counters are zero.
+#
+# The discriminator is the admission, not the fold: `PYRE_FBW_NO_SPECIALIZE=`
+# `load_deref` suppresses the trace-time fold and moves no counter, because the
+# reclassification happens in the pre-scan that runs before `scan.verdict()`.
+# Blocking the inline through any other term of the same admission brings the
+# loop back -- wrapping `forward`'s body in `try: ... finally: pass` fails the
+# `!has_exception_table` term and reads seven loops again, naming
+# `make_forwarder.<locals>.forward` as the extra trace.
+#
 # DO NOT RE-RECORD `loops_compiled` here on a six. Seven is base-dependent,
 # not merely a value some tree happens to produce. Measured across three CI
 # runs: main alone at base `5bf59e1f008` reads seven and passes (32565716769);

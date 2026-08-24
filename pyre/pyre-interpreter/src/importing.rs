@@ -5665,10 +5665,19 @@ pub fn import_from(
     } else {
         format!("cannot import name '{name}' from '{pkgname}' ({pkgpath})").into()
     };
+    // The name the `from` list asked for rides along as `.name_from`; it is
+    // built before the three reads below because the allocation can move the
+    // pinned package name and path.
+    let name_from_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     let w_pkgpath = pyre_object::gc_roots::shadow_stack_get(pkgpath_slot);
-    Err(crate::PyError::import_error_name_path(
-        msg, w_pkgname, w_pkgpath,
+    let w_name_from = pyre_object::gc_roots::shadow_stack_get(name_from_slot);
+    Err(crate::PyError::import_error_name_path_from(
+        msg,
+        w_pkgname,
+        w_pkgpath,
+        w_name_from,
     ))
 }
 

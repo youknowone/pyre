@@ -250,27 +250,27 @@ fn read_prompt(sys_module: pyre_object::PyObjectRef, name: &str) -> Option<Strin
     unsafe { pyre_interpreter::display::py_str_display_result(prompt) }.ok()
 }
 
-/// Register a compiled interactive tree with `linecache._interactive_cache`.
+/// Register a compiled tree with `linecache._interactive_cache` under
+/// `filename`.
 ///
 /// `inspect.findsource()` keys on the code object's
 /// `(filename, qualname, firstlineno)` for synthetic filenames such as
-/// `<stdin>`, which is how the 3.14 interactive runner keeps REPL sources
-/// retrievable.  Callers treat a failure as non-fatal.
-fn register_interactive_code(
-    runtime: &ReplRuntime,
+/// `<stdin>` and `<string>`, which is how the 3.14 interactive runner and the
+/// `-c` command path keep their sources retrievable.  `_register_code` walks
+/// `co_consts`, so a function defined in the registered tree is published under
+/// the same entry.  Callers treat a failure as non-fatal.
+pub(crate) fn register_interactive_code(
+    w_globals: pyre_object::PyObjectRef,
+    ctx_ptr: *const PyExecutionContext,
     w_code: pyre_object::PyObjectRef,
     source: &str,
+    filename: &str,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_code);
     let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let linecache = importing::importhook(
-        "linecache",
-        runtime.w_globals,
-        pyre_object::PY_NULL,
-        0,
-        runtime.ctx_ptr,
-    )?;
+    let linecache =
+        importing::importhook("linecache", w_globals, pyre_object::PY_NULL, 0, ctx_ptr)?;
     let _ = pyre_object::gc_roots::pin_root(linecache);
     let linecache_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let register = pyre_interpreter::baseobjspace::getattr_str(
@@ -283,7 +283,7 @@ fn register_interactive_code(
     // the next one is built rather than left in a temporary.
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
     let source_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("<stdin>"));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(register_slot),
@@ -312,7 +312,13 @@ fn shell_exec(
             // Source registration is cosmetic — it only feeds later traceback
             // and `inspect` lookups — so a failure must not discard the
             // statement the user just typed.
-            let _ = register_interactive_code(runtime, w_code, source);
+            let _ = register_interactive_code(
+                runtime.w_globals,
+                runtime.ctx_ptr,
+                w_code,
+                source,
+                "<stdin>",
+            );
             let mut frame = match pyre_interpreter::pyframe::createframe_obj(
                 pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
                 runtime.w_globals,

@@ -13350,16 +13350,26 @@ impl CodeWriter {
                         // MAKE_CELL: wraps the slot value in a cell. Touches
                         // only the localsplus slot (no operand-stack effect);
                         // `i` is the unified localsplus index read like
-                        // LOAD_FAST. The `make_cell_value(current)` HLOp →
-                        // `residual_call_r_r(make_cell_fn, ListR[current])`
-                        // returns the cell to install: a fresh cell wrapping
-                        // the raw argument value, or the existing cell
-                        // unchanged (`bh_make_cell_fn`, Plain — allocates,
-                        // runs no user code). The result is stored into the
-                        // slot via `setarrayitem_vable_r`, mirroring the
-                        // STORE_FAST shadow write.
+                        // LOAD_FAST. The `make_cell_value(current, code, slot)`
+                        // HLOp → `residual_call_ir_r(make_cell_fn,
+                        // ListI[slot], ListR[current, code])` returns the cell
+                        // to install: a fresh cell belonging to the
+                        // `CellFamily` that `(code, slot)` names
+                        // (`pycode.py` `PyCode._initialize`), wrapping the raw
+                        // argument value, or the existing cell unchanged
+                        // (`bh_make_cell_fn`, Plain — allocates, runs no user
+                        // code). The result is stored into the slot via
+                        // `setarrayitem_vable_r`, mirroring the STORE_FAST
+                        // shadow write.
                         Instruction::MakeCell { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
+                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
+                            let slot_const: super::flow::FlowValue =
+                                super::flow::Constant::signed(idx as i64).into();
                             emit_load_fast_ref!(current_depth, idx, py_pc);
                             let _current_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let current_value = pop_ref_or_fresh(&mut current_state, &mut graph);
@@ -13367,7 +13377,7 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 "make_cell_value",
-                                vec![current_value.into()],
+                                vec![current_value.into(), code_const.into(), slot_const.into()],
                                 Kind::Ref,
                                 py_pc as i64,
                             );

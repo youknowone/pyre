@@ -1388,6 +1388,20 @@ impl PyError {
         w_name: PyObjectRef,
         w_path: PyObjectRef,
     ) -> Self {
+        Self::import_error_name_path_from(msg, w_name, w_path, pyre_object::PY_NULL)
+    }
+
+    /// `_PyErr_SetImportErrorWithNameFrom` — the same error carrying the name
+    /// the `from` list asked for.  `traceback.py`
+    /// `TracebackException.__init__` gates its spelling
+    /// suggestion on `.name_from` being other than `None`, so only a raise that
+    /// stamps it can offer one.
+    pub fn import_error_name_path_from(
+        msg: impl Into<Wtf8Buf>,
+        w_name: PyObjectRef,
+        w_path: PyObjectRef,
+        w_name_from: PyObjectRef,
+    ) -> Self {
         let message = msg.into();
         // Root the caller's name/path and the fresh exception across the
         // exception and message allocations below: they live only in Rust
@@ -1402,6 +1416,10 @@ impl PyError {
         let path_slot = pyre_object::gc_roots::shadow_stack_len();
         if !w_path.is_null() {
             let _ = pyre_object::gc_roots::pin_root(w_path);
+        }
+        let name_from_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_name_from.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(w_name_from);
         }
         let exc = w_exception_new_wtf8(ExcKind::ImportError, &message);
         let exc = pyre_object::gc_roots::pin_root(exc);
@@ -1426,10 +1444,16 @@ impl PyError {
         } else {
             pyre_object::gc_roots::shadow_stack_get(path_slot)
         };
+        let w_name_from = if w_name_from.is_null() {
+            w_name_from
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(name_from_slot)
+        };
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_import_msg(exc, w_msg);
             pyre_object::interp_exceptions::w_exception_set_name(exc, w_name);
             pyre_object::interp_exceptions::w_exception_set_import_path(exc, w_path);
+            pyre_object::interp_exceptions::w_exception_set_import_name_from(exc, w_name_from);
         }
         PyError {
             kind: PyErrorKind::ImportError,
@@ -3391,7 +3415,7 @@ fn write_traceback_chain_from_tb<W: Write>(
         {
             let span: Vec<String> = (start_line..=end_line)
                 .map(|n| {
-                    read_source_line(&filename, n as i64)
+                    frame_source_line(tb_slot, &filename, n as i64)
                         .map_or(String::new(), |l| l.trim_end().to_string())
                 })
                 .collect();
@@ -3400,7 +3424,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                     writeln!(writer, "    {line}")?;
                 }
             }
-        } else if let Some(line) = read_source_line(&filename, lineno) {
+        } else if let Some(line) = frame_source_line(tb_slot, &filename, lineno) {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;
@@ -3577,6 +3601,71 @@ fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option
         ),
         _ => None,
     }
+}
+
+/// `FrameSummary._set_lines` — the filename-keyed `linecache.getline` first
+/// and, for a synthetic `<…>` name, the code-keyed `_getline_from_code`
+/// fallback that reaches a source published by `linecache._register_code`
+/// (the `-c` command and the interactive prompt, neither of which has a file).
+///
+/// The code object is read back off the traceback rooted at `tb_slot` rather
+/// than passed in: the filesystem lookup runs first and can collect, so a
+/// pointer captured ahead of it would not survive.
+fn frame_source_line(tb_slot: usize, filename: &[u8], lineno: i64) -> Option<String> {
+    if let Some(line) = read_source_line(filename, lineno) {
+        return Some(line);
+    }
+    if filename.first() != Some(&b'<') {
+        return None;
+    }
+    let w_code = unsafe {
+        crate::pytraceback::w_pytraceback_get_w_code(pyre_object::gc_roots::shadow_stack_get(
+            tb_slot,
+        ))
+    };
+    if w_code.is_null() {
+        return None;
+    }
+    read_registered_source_line(w_code, lineno)
+}
+
+/// `linecache._getline_from_code` — the `_interactive_cache` entry a
+/// `_register_code` call published for this code object, or `None` when there
+/// is none.  The entry carries its lines with the trailing newline, which both
+/// callers already trim.
+///
+/// `sys.modules` is only consulted, never imported into: the cache is empty
+/// unless something already imported `linecache` to register a source, so an
+/// absent module is an empty cache — and rendering a traceback must not run an
+/// import.
+fn read_registered_source_line(w_code: PyObjectRef, lineno: i64) -> Option<String> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_code);
+    let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let linecache = crate::importing::get_sys_module("linecache")?;
+    let _ = pyre_object::gc_roots::pin_root(linecache);
+    let linecache_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Each allocation can collect, so every operand is rooted before the next
+    // one is built rather than left in a temporary.
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(lineno));
+    let lineno_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let getline = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(linecache_slot),
+        "_getline_from_code",
+    )
+    .ok()?;
+    let _ = pyre_object::gc_roots::pin_root(getline);
+    let getline_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let line = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(getline_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(code_slot),
+            pyre_object::gc_roots::shadow_stack_get(lineno_slot),
+        ],
+    )
+    .ok()?;
+    let line = crate::baseobjspace::text_w(line).ok()?;
+    (!line.is_empty()).then(|| line.to_string())
 }
 
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
