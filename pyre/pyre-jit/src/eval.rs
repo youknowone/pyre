@@ -6226,7 +6226,11 @@ fn green_key_from_pycode(
     if w_pycode.is_null() {
         return None;
     }
-    Some(make_green_key(w_pycode.cast(), next_instr, is_being_profiled))
+    Some(make_green_key(
+        w_pycode.cast(),
+        next_instr,
+        is_being_profiled,
+    ))
 }
 
 /// The typed `GreenKey` behind [`green_key_from_pycode`]'s `u64`.
