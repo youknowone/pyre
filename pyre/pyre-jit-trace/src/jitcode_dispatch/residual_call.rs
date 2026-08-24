@@ -132,6 +132,11 @@ pub(crate) struct EscapeFlushUndo {
     last_instr: isize,
     valuestackdepth: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+    /// The region as the flush left it.  The restore compares against this to
+    /// tell a slot the flush wrote from one the residual's user Python wrote
+    /// after the capture; empty means no flush image was recorded, and the
+    /// restore then puts every captured slot back as it always did.
+    pub(crate) flush_image: Vec<pyre_object::PyObjectRef>,
 }
 
 /// The operand stack an abort image publishes, resolved from the walker's
@@ -1601,6 +1606,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 }
             }
             if flushed {
+                record_escape_flush_image(expected);
                 let kind = if latched {
                     EscapeResumeKind::Exact
                 } else {
@@ -1609,7 +1615,9 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 if let Some(py_pc) = portal_py_pc {
                     COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
                 }
-            } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
+            } else if crate::state::flush_locals_region_to_frame(ctx, expected) {
+                record_escape_flush_image(expected);
+            } else {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }
@@ -1673,7 +1681,27 @@ fn capture_escape_flush_undo(frame: usize) {
             last_instr,
             valuestackdepth: pf.valuestackdepth,
             slots: locals_w!(pf).as_slice().to_vec(),
+            flush_image: Vec::new(),
         });
+    });
+}
+
+/// Record the locals region as the flush just left it, for the frame the
+/// pending capture holds.  Runs after the flush and before the residual's
+/// user Python can touch the region, so any later difference from this image
+/// is that user code's own write.  A second flush for the same frame supersedes
+/// the image: the restore must undo the flush that is actually standing.
+fn record_escape_flush_image(frame: usize) {
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(undo) = slot.as_mut() else {
+            return;
+        };
+        if undo.frame != frame {
+            return;
+        }
+        let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        undo.flush_image = locals_w!(pf).as_slice().to_vec();
     });
 }
 
@@ -1698,19 +1726,46 @@ pub(crate) fn restore_escape_flush_undo() {
             let arr_ptr = pf.locals_cells_stack_w;
             let dst = locals_w_mut!(pf);
             let n = undo.slots.len().min(dst.as_slice().len());
-            // Report-only: count the slots this restore is about to put back
-            // to a value the live frame no longer holds.  The capture is taken
-            // before the flush, but the residual runs user Python after it, so
-            // a non-zero count is that user code's write being discarded.
-            // Gated, so a production build pays nothing.
+            // Three-way merge: pre-flush capture, the image the flush left,
+            // and what the frame holds now.  A slot the residual did not touch
+            // still reads as the flush left it, and only those go back to their
+            // pre-flush value.  A slot that moved since carries a write made
+            // after the capture -- `f_locals` write-through from the callee is
+            // the reachable case -- and putting the capture back over it would
+            // discard that write.  The force-#2 arm above already refuses to
+            // re-flush for this reason; this is the same refusal on the way out.
+            //
+            // With no image (the flush declined, or an arm that never records
+            // one) `merge` is false and every captured slot goes back, as before.
+            let merge = undo.flush_image.len() >= n;
+            // Report-only: `differs` counts the slots that moved since the
+            // capture, `kept` those the merge leaves alone.  Gated, so a
+            // production build pays nothing.
             if fbw_debug_abort_enabled() {
                 let live = dst.as_slice();
-                let clobbered = (0..n).filter(|&i| live[i] != undo.slots[i]).count();
-                if clobbered != 0 {
-                    eprintln!("[fbw-undo-clobber] frame={frame:#x} slots={clobbered}/{n}");
+                let differs = (0..n).filter(|&i| live[i] != undo.slots[i]).count();
+                let kept = if merge {
+                    (0..n).filter(|&i| live[i] != undo.flush_image[i]).count()
+                } else {
+                    0
+                };
+                if differs != 0 {
+                    let moved: Vec<usize> =
+                        (0..n).filter(|&i| live[i] != undo.slots[i]).collect();
+                    let held: Vec<usize> = if merge {
+                        (0..n).filter(|&i| live[i] != undo.flush_image[i]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    eprintln!(
+                        "[fbw-undo-clobber] frame={frame:#x} n={n} differs={differs} moved={moved:?} kept={kept} held={held:?}"
+                    );
                 }
             }
             for (i, &v) in undo.slots.iter().take(n).enumerate() {
+                if merge && dst.as_slice()[i] != undo.flush_image[i] {
+                    continue;
+                }
                 dst[i] = v;
             }
             pf.last_instr = undo.last_instr;

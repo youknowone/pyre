@@ -7153,6 +7153,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         for slot in undo.slots.iter_mut() {
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
+        // The post-flush image is compared against the live slots, so it has to
+        // be forwarded on the same window: a stale address would read as "the
+        // residual wrote this" for every moved value and suppress the undo.
+        for slot in undo.flush_image.iter_mut() {
+            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+        }
     }
     // The `f_locals` fold's pre-mirror images are armed the same way and live
     // just as long — until the walk's commit or rollback leg consumes them —
