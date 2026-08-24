@@ -301,6 +301,19 @@ pub struct GcRewriterImpl {
     /// Consumed by `rewrite.py gen_malloc_fixedsize` framework-GC arm
     /// when a fixed-size NEW exceeds the nursery threshold.
     pub malloc_big_fixedsize_fn: i64,
+    /// Old-generation twin of [`Self::malloc_big_fixedsize_fn`], selected by
+    /// `gen_malloc_fixedsize` when the size descr is
+    /// [`majit_ir::descr::SizeDescr::non_moving`].  Same call signature, so it
+    /// shares `malloc_big_fixedsize_descr`; only the allocator differs.
+    ///
+    /// Upstream has no such twin: `gen_malloc_fixedsize` is reached only by an
+    /// oversized NEW there, and an oversized object is non-moving whichever arm
+    /// it takes.  pyre reuses the same generator for a descr that demands a
+    /// non-moving address at *any* size — `PYFRAME_DESCR_GROUP.size_descr` is
+    /// the live one — and that demand is not something
+    /// `malloc_big_fixedsize`'s own allocator can answer any more, now that it
+    /// dispatches on size and its small arm is the nursery.
+    pub malloc_big_fixedsize_oldgen_fn: i64,
     /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
     pub malloc_array_descr: DescrRef,
     /// gc.py:45 `self.malloc_array_nonstandard_descr = get_call_descr(...)`.
@@ -1135,7 +1148,13 @@ impl GcRewriterImpl {
                 // the headered branch below.  That helper takes the headered
                 // total size and stamps the type id itself.
                 let total_size = round_up(descr.size() + crate::header::GcHeader::SIZE);
-                self.gen_malloc_fixedsize(total_size, descr.type_id(), result_pos, st)
+                self.gen_malloc_fixedsize(
+                    total_size,
+                    descr.type_id(),
+                    descr.non_moving(),
+                    result_pos,
+                    st,
+                )
             };
             st.record_result_mapping(result_pos, obj_ref.clone());
             return;
@@ -1162,8 +1181,9 @@ impl GcRewriterImpl {
         // helper so `gen_malloc_fixedsize` does NOT call
         // `gen_initialize_tid` after the fact.
         // A descr marked `non_moving` declines the nursery the same way an
-        // oversized one does, and lands on the same helper: `gen_malloc_fixedsize`
-        // allocates in the old generation, which never moves an object.
+        // oversized one does, and lands on the same generator; there it picks
+        // `malloc_big_fixedsize_oldgen_fn`, because the upstream helper answers
+        // by size and would put a small non-moving struct in the nursery.
         let nursery_ref = if descr.non_moving() {
             None
         } else {
@@ -1174,7 +1194,7 @@ impl GcRewriterImpl {
                 self.gen_initialize_tid(r.clone(), type_id, st);
                 r
             }
-            None => self.gen_malloc_fixedsize(size, type_id, op.pos.get(), st),
+            None => self.gen_malloc_fixedsize(size, type_id, descr.non_moving(), op.pos.get(), st),
         };
         st.record_result_mapping(op.pos.get(), obj_ref.clone());
 
@@ -1661,34 +1681,32 @@ impl GcRewriterImpl {
     /// by `CHECK_MEMORY_ERROR` (via `gen_call_malloc_gc`).
     ///
     /// rewrite.py stamps `remember_write_barrier` on the result
-    /// there, sound because upstream's `malloc_big_fixedsize` hands back a
-    /// *young* raw-malloced object: a young object needs no barrier for a
-    /// young pointer stored into it.  pyre's helper allocates in the old
-    /// generation on both backends (`dynasm_malloc_big_fixedsize` /
-    /// `gc_malloc_big_fixedsize_helper` → `alloc_oldgen_typed`), so the
-    /// same stamp would silently drop the barrier on the first `SETFIELD_GC`
-    /// of a young value into an old object and leave that value unforwarded
-    /// after the next minor collection.  The stamp is therefore not applied.
+    /// there, sound because `malloc_big_fixedsize` hands back a *young*
+    /// raw-malloced object: it calls `do_malloc_fixedsize_clear`, i.e. the
+    /// ordinary `malloc_fixedsize`, whose large arm is
+    /// `external_malloc(typeid, 0, alloc_young=True)`.  A young object needs no
+    /// barrier for a young pointer stored into it.  Both backend helpers now
+    /// call that entry point (`dynasm_malloc_big_fixedsize` /
+    /// `gc_malloc_big_fixedsize_helper` → `alloc_nursery_typed`, which is
+    /// `MiniMarkGC::alloc_with_type`), so the stamp is applied.
     ///
-    /// The young non-moving birth upstream relies on now exists —
-    /// `MiniMarkGC::try_alloc_young_nonmoving_clear`, which the collecting
-    /// `alloc_with_type` entry points take for an oversized object — but these
-    /// helpers still route through `alloc_oldgen_typed`, so the reasoning above
-    /// is unchanged.
+    /// It is applied *conditionally*, because upstream's large arm has one
+    /// outcome and pyre's has a rollback gate: under
+    /// `MAJIT_GC_YOUNG_RAWMALLOC=0` the same helper births the object in the old
+    /// generation, and an old result under an elided barrier loses the first
+    /// young pointer stored into it.  The gate is process-wide and read once, so
+    /// asking it here answers for every trace this process compiles.
     ///
-    /// Moving them onto it is necessary but *not* sufficient, because the stamp
-    /// is a compile-time claim and pyre's birth is a runtime decision.  Upstream
-    /// may stamp unconditionally: its large arm is
-    /// `external_malloc(typeid, 0, alloc_young=True)` with no other outcome.
-    /// pyre's would fall back to the born-old birth on three of them — a type
-    /// carrying a destructor or the weakref flag, `MAJIT_GC_YOUNG_RAWMALLOC=0`,
-    /// and a failed young allocation — and an old result under an elided
-    /// barrier loses the first young pointer stored into it.  So the stamp
-    /// needs the birth to be decidable where it is emitted: a descr-level
-    /// predicate for the plain-type half, in the shape `SizeDescr::non_moving`
-    /// already uses, and the rollback gate read at rewrite time rather than
-    /// only in the collector.  Until both hold, moving the helpers alone would
-    /// make the stamp wrong rather than earn it.
+    /// Two outcomes stay young-or-nothing and so do not need a condition.  A
+    /// failed allocation returns NULL, which the `CHECK_MEMORY_ERROR` emitted by
+    /// [`gen_call_malloc_gc`](Self::gen_call_malloc_gc) turns into a
+    /// MemoryError before any store can reach the object.  A weakref type is
+    /// the one kind `MiniMarkGC::type_alloc_may_be_young` still sends to the
+    /// born-old birth, and it is excluded by the same contract upstream relies
+    /// on — `malloc_fixedsize`'s large arm opens with
+    /// `ll_assert(not contains_weakptr, "'contains_weakptr' specified for a
+    /// large object")` — a weakref payload being one `weakptr` slot, never
+    /// anything near the large-object threshold.
     ///
     /// pyre is framework-GC only; the Boehm `else` arm
     /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
@@ -1700,6 +1718,7 @@ impl GcRewriterImpl {
         &self,
         size: usize,
         type_id: u32,
+        non_moving: bool,
         result_pos: OpRef,
         st: &mut RewriteState,
     ) -> Operand {
@@ -1708,15 +1727,29 @@ impl GcRewriterImpl {
             0,
             "rewrite.py:785 `assert (size & (WORD-1)) == 0` — size must be word-aligned"
         );
-        let fn_ref = st.const_int(self.malloc_big_fixedsize_fn);
+        // The old-generation twin takes the same arguments, so only the callee
+        // address changes — the shape `gen_malloc_array` already uses for
+        // `non_moving`.
+        let fn_ref = st.const_int(if non_moving {
+            self.malloc_big_fixedsize_oldgen_fn
+        } else {
+            self.malloc_big_fixedsize_fn
+        });
         let size_ref = st.const_int(size as i64);
         let typeid_ref = st.const_int(type_id as i64);
-        self.gen_call_malloc_gc(
+        let result = self.gen_call_malloc_gc(
             &[fn_ref, size_ref, typeid_ref],
             result_pos,
             self.malloc_big_fixedsize_descr.clone(),
             st,
-        )
+        );
+        // rewrite.py: "mark 'v_result' as freshly malloced, so not needing a
+        // write barrier (this is always true because it's a fixed-size
+        // object)".
+        if !non_moving && crate::collector::young_rawmalloc_enabled() {
+            st.remember_wb(&result);
+        }
+        result
     }
 
     /// rewrite.py `gen_malloc_str`.
@@ -3438,6 +3471,7 @@ mod tests {
     const TEST_MALLOC_STR_FN: i64 = 0x3333;
     const TEST_MALLOC_UNICODE_FN: i64 = 0x4444;
     const TEST_MALLOC_BIG_FIXEDSIZE_FN: i64 = 0x5555;
+    const TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN: i64 = 0x5556;
 
     // ── Minimal concrete descriptor implementations for testing ──
 
@@ -3639,6 +3673,7 @@ mod tests {
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
             malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
+            malloc_big_fixedsize_oldgen_fn: TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
@@ -3890,7 +3925,9 @@ mod tests {
                 .to_opref()
                 .inline_const_bits()
                 .expect("malloc_big_fixedsize fn const"),
-            TEST_MALLOC_BIG_FIXEDSIZE_FN
+            TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN,
+            "a non_moving descr takes the old-generation twin: the plain helper \
+             dispatches on size and would nursery-allocate this one"
         );
         assert_eq!(
             result[0]
@@ -5439,6 +5476,7 @@ mod tests {
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
             malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
+            malloc_big_fixedsize_oldgen_fn: TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
@@ -5447,6 +5485,82 @@ mod tests {
             standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
             standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
         }
+    }
+
+    /// The `malloc_big_fixedsize` arm of rewrite.py `gen_malloc_fixedsize`
+    /// ends with `remember_write_barrier(v_result)`, sound because the helper
+    /// hands back a young object: it is `do_malloc_fixedsize_clear`, whose
+    /// large arm is `external_malloc(typeid, 0, alloc_young=True)`.
+    #[test]
+    fn test_setfield_gc_after_big_fixedsize_alloc_no_wb() {
+        let rw = make_rewriter();
+        let new_op = Op::with_descr(OpCode::New, &[], size_descr(8192, 71));
+        new_op.pos.set(OpRef::ref_op(0));
+        let ops = vec![
+            new_op,
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(1))],
+                ref_field_descr(),
+            ),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CallR)
+                .filter_map(|o| o.arg(0).to_opref().inline_const_bits())
+                .collect::<Vec<_>>(),
+            vec![TEST_MALLOC_BIG_FIXEDSIZE_FN],
+            "an oversized NEW takes the size-dispatching helper"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CondCallGcWb)
+                .count(),
+            0,
+            "the fresh young object is wb_applied, so the store needs no barrier"
+        );
+    }
+
+    /// The `non_moving` twin gets no stamp: it births in the old generation,
+    /// where a young pointer stored under an elided barrier would be lost at
+    /// the next minor.
+    #[test]
+    fn test_setfield_gc_after_non_moving_alloc_keeps_wb() {
+        let rw = make_rewriter();
+        let new_op = Op::with_descr(OpCode::New, &[], non_moving_size_descr(32, 72));
+        new_op.pos.set(OpRef::ref_op(0));
+        let ops = vec![
+            new_op,
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(1))],
+                ref_field_descr(),
+            ),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CallR)
+                .filter_map(|o| o.arg(0).to_opref().inline_const_bits())
+                .collect::<Vec<_>>(),
+            vec![TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN]
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CondCallGcWb)
+                .count(),
+            1,
+            "an old-generation birth keeps its barrier"
+        );
     }
 
     #[test]

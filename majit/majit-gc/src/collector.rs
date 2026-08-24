@@ -195,7 +195,7 @@ pub fn set_deferred_major_request_probe(probe: Option<DeferredMajorRequestProbeF
 /// Read once and cached: the gate sits on the large-allocation arm, and
 /// `std::env::var_os` takes the environment lock and scans it linearly on every
 /// call. Same shape as [`crate::gc_lifetime_log_enabled`].
-fn young_rawmalloc_enabled() -> bool {
+pub(crate) fn young_rawmalloc_enabled() -> bool {
     // wasm32-unknown-unknown has no process environment, so the guest cannot
     // read the variable and takes the default.
     #[cfg(target_arch = "wasm32")]
@@ -2581,30 +2581,26 @@ impl MiniMarkGC {
     /// resident for as many iterations as it takes the major threshold to
     /// arrive.
     ///
-    /// Two restrictions, both of them refusals rather than adaptations:
+    /// Two restrictions:
     ///
-    /// * A type carrying a destructor or the weakref flag falls back to the
-    ///   born-old birth. `deal_with_young_objects_with_destructors` and
-    ///   `invalidate_young_weakrefs` both decide survival by reading the
-    ///   forwarding header, and a non-moving object never forwards, so a young
-    ///   rawmalloced member of either list would be read as dead while it is
-    ///   alive. Upstream forbids the weakref half by contract —
-    ///   `malloc_fixedsize`'s large arm asserts `not contains_weakptr`.
+    /// * A type carrying the weakref flag falls back to the born-old birth,
+    ///   which is upstream's own contract: `malloc_fixedsize`'s large arm opens
+    ///   with `ll_assert(not contains_weakptr, "'contains_weakptr' specified
+    ///   for a large object")`. `invalidate_young_weakrefs` decides survival by
+    ///   reading the forwarding header, and a non-moving object never forwards,
+    ///   so the assertion is what keeps that read well-defined. A weakref
+    ///   payload is a single `weakptr` slot, so nothing of that type approaches
+    ///   the large-object threshold to begin with.
     ///
-    ///   The destructor half is *not* forbidden there, and that is the whole
-    ///   of the deviation: `malloc_fixedsize` refuses only the heavy arm
-    ///   (`needs_finalizer and not is_finalizer_light`), so a light destructor
-    ///   falls through to the large arm, takes `alloc_young=True`, and is
-    ///   appended to `young_objects_with_destructors`. pyre's `TypeInfo`
-    ///   destructor is that light kind. Following upstream literally would
-    ///   walk into a precondition upstream itself states: `is_forwarded` opens
-    ///   with `ll_assert(self.is_in_nursery(obj), "Can't forward an object
-    ///   outside the nursery.")`, which a rawmalloced address never satisfies.
-    ///   With that assertion compiled out the read returns false and the
-    ///   destructor runs on a reachable object. So the combination is
-    ///   undefined upstream rather than modelled, and pyre takes the arm that
-    ///   is defined; earning it back means giving the sweep a second witness,
-    ///   not relaxing this predicate.
+    ///   A destructor is *not* a restriction. The large arm is reached only
+    ///   after the heavy-finalizer branch
+    ///   (`needs_finalizer and not is_finalizer_light`) has returned, so a
+    ///   light destructor falls through to it, takes `alloc_young=True`, and is
+    ///   appended to `young_objects_with_destructors`; `TypeInfo.destructor` is
+    ///   that light kind. `deal_with_young_objects_with_destructors` reads
+    ///   GCFLAG_VISITED_RMY for such a member instead of a forwarding pointer —
+    ///   the same witness `free_young_rawmalloced_objects` reads a few steps
+    ///   later in the same minor, and final by the time either runs.
     /// * `MAJIT_GC_YOUNG_RAWMALLOC=0` turns the whole path off, so a defect
     ///   that only appears once these objects can die at a minor can be
     ///   bisected against the born-old behaviour without rebuilding.
@@ -2627,16 +2623,22 @@ impl MiniMarkGC {
 
     /// Whether a type's allocation may take the young non-moving birth.
     ///
+    /// The weakref flag is the one exclusion, and it is upstream's:
+    /// `malloc_fixedsize`'s large arm opens with
+    /// `ll_assert(not contains_weakptr, "'contains_weakptr' specified for a
+    /// large object")`. A destructor is *not* excluded — that arm is reached
+    /// only after the heavy-finalizer branch
+    /// (`needs_finalizer and not is_finalizer_light`) has already returned, so
+    /// a light destructor falls through to it, and `TypeInfo.destructor` is
+    /// that light kind.
+    ///
     /// A type id past the end of the table registers neither a destructor nor
     /// a weakref — `finish_alloc_in_oldgen` and `register_young_object_if_needed`
     /// both guard on the same bound — so it is plain by the same reading, not
     /// unknown.
     #[inline]
     fn type_alloc_may_be_young(&self, type_id: u32) -> bool {
-        (type_id as usize) >= self.types.len() || {
-            let info = self.types.get(type_id);
-            info.destructor.is_none() && !info.is_weakref
-        }
+        (type_id as usize) >= self.types.len() || !self.types.get(type_id).is_weakref
     }
 
     /// The header and bookkeeping half of the young non-moving birth.
@@ -2676,6 +2678,11 @@ impl MiniMarkGC {
         if self.threshold_reached(total_size) && deferred_major_request_wanted() {
             majit_ir::eval_breaker_word::set_gc();
         }
+        // `malloc_fixedsize`'s tail runs for both arms: the large arm falls out
+        // of the `if` into the same `if needs_finalizer:
+        // self.young_objects_with_destructors.append(obj)`. A young rawmalloced
+        // object owes that list exactly as a nursery one does.
+        self.register_young_object_if_needed(type_id, obj_addr);
         GcRef(obj_addr)
     }
 
@@ -4065,6 +4072,29 @@ impl MiniMarkGC {
     /// so the next major collection can reclaim it.
     fn deal_with_young_objects_with_destructors(&mut self) {
         while let Some(obj_addr) = self.young_objects_with_destructors.pop() {
+            // A young rawmalloced member reaches here because
+            // `malloc_fixedsize`'s large arm falls into the same registration
+            // tail. It never forwards, so the forwarding read below is not the
+            // question to ask of it — `is_forwarded` states as much, opening
+            // with `ll_assert(self.is_in_nursery(obj), "Can't forward an object
+            // outside the nursery.")`. The witness the minor left for this kind
+            // is GCFLAG_VISITED_RMY, already final at this point: both
+            // `collect_roots_in_nursery` and the `collect_oldrefs_to_nursery`
+            // drain run before this call, and
+            // `free_young_rawmalloced_objects` reads the same flag a few steps
+            // after it.
+            if self.is_young_rawmalloced(obj_addr) {
+                if unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED_RMY) } {
+                    // Promoted in place: the address does not change, so the
+                    // old-generation list takes it unchanged.
+                    self.old_objects_with_destructors.push(obj_addr);
+                } else {
+                    // Dead: run the destructor before
+                    // `free_young_rawmalloced_objects` releases the block.
+                    self.run_destructor(obj_addr);
+                }
+                continue;
+            }
             let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
             if !unsafe { (*hdr_ptr).is_forwarded() } {
                 // Dead: run the destructor before the nursery reset frees
@@ -8637,23 +8667,84 @@ mod tests {
         gc.roots.clear();
     }
 
-    /// A type whose survival is read off a forwarding pointer cannot take the
-    /// non-moving young birth, so it keeps the born-old one.
+    /// A weakref type keeps the born-old birth: `malloc_fixedsize`'s large arm
+    /// asserts `not contains_weakptr`, and `invalidate_young_weakrefs` reads a
+    /// forwarding pointer a non-moving object never has.
     #[test]
-    fn a_destructor_type_keeps_the_born_old_large_allocation() {
-        unsafe fn noop_destructor(_obj: usize) {}
+    fn a_weakref_type_keeps_the_born_old_large_allocation() {
         let mut gc = test_gc(4096);
         let mut info = TypeInfo::simple(16);
-        info.destructor = Some(noop_destructor);
+        info.is_weakref = true;
         let tid = gc.register_type(info);
         let large = gc.config.large_object_threshold + 64;
 
         let obj = gc.alloc_with_type(tid, large);
-        assert!(!gc.is_young_rawmalloced(obj.0), "born old, as before");
+        assert!(!gc.is_young_rawmalloced(obj.0), "born old");
         assert!(
             unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) },
             "and with the old generation's birth flags"
         );
+    }
+
+    /// A *light* destructor does take the young birth — `malloc_fixedsize`
+    /// refuses only `needs_finalizer and not is_finalizer_light` — and the
+    /// minor that never reaches it runs the destructor before
+    /// `free_young_rawmalloced_objects` releases the block.
+    #[test]
+    fn an_unreached_large_destructor_object_is_destroyed_at_the_minor() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+        let large = gc.config.large_object_threshold + 64;
+        let baseline = gc.oldgen.rawmalloced_bytes();
+
+        let obj = gc.alloc_with_type(tid, large);
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "a light destructor reaches the large arm's alloc_young=True"
+        );
+        assert_eq!(gc.young_objects_with_destructors, vec![obj.0]);
+
+        gc.collect_nursery();
+
+        assert_eq!(destructor_runs(), 1, "unreached: the destructor runs");
+        assert_eq!(
+            DESTRUCTOR_LAST_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            obj.0
+        );
+        assert!(gc.old_objects_with_destructors.is_empty());
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            baseline,
+            "and the block is freed by the same minor"
+        );
+    }
+
+    /// The other half: reached means promoted in place, the destructor does
+    /// *not* run, and the entry moves to the old-destructor list at the same
+    /// address — a non-moving object has no forwarding address to translate.
+    #[test]
+    fn a_reached_large_destructor_object_is_promoted_not_destroyed() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+        let large = gc.config.large_object_threshold + 64;
+
+        let mut root = gc.alloc_with_type(tid, large);
+        let born_at = root.0;
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.collect_nursery();
+
+        assert_eq!(destructor_runs(), 0, "reached: the destructor must not run");
+        assert_eq!(root.0, born_at, "a non-moving object keeps its address");
+        assert!(!gc.is_young_rawmalloced(root.0), "it is old now");
+        assert_eq!(gc.old_objects_with_destructors, vec![born_at]);
+        gc.roots.clear();
     }
 
     /// A young rawmalloced object is generation 0, and `gc.get_objects(2)`
@@ -9799,21 +9890,31 @@ mod tests {
     }
 
     #[test]
-    fn destructor_on_direct_oldgen_alloc_runs_on_major_death() {
+    fn destructor_on_a_large_alloc_runs_on_major_death_after_promotion() {
         let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         // large_object_threshold = nursery/2 = 512; a 1024-byte payload
-        // bypasses the nursery and is registered straight onto the old list.
+        // bypasses the nursery. `malloc_fixedsize`'s large arm births it
+        // *young*, so the entry starts on the young list and only reaches the
+        // old one by surviving a minor.
         let mut gc = test_gc(1024);
         let tid = gc.register_type(TypeInfo::with_destructor(1024, counting_destructor));
 
-        let obj = gc.alloc_with_type(tid, 1024);
-        assert!(!gc.is_in_nursery(obj.0));
+        let mut root = gc.alloc_with_type(tid, 1024);
+        let obj_addr = root.0;
+        assert!(!gc.is_in_nursery(obj_addr));
+        assert_eq!(gc.young_objects_with_destructors, vec![obj_addr]);
+        assert!(gc.old_objects_with_destructors.is_empty());
+
+        unsafe { gc.roots.add(&mut root) };
+        gc.collect_nursery();
+        assert_eq!(destructor_runs(), 0);
         assert!(gc.young_objects_with_destructors.is_empty());
-        assert_eq!(gc.old_objects_with_destructors, vec![obj.0]);
+        assert_eq!(gc.old_objects_with_destructors, vec![obj_addr]);
 
         // Unrooted → reclaimed by the major collection.
+        gc.roots.clear();
         gc.collect_full();
         assert_eq!(destructor_runs(), 1);
         assert!(gc.old_objects_with_destructors.is_empty());
