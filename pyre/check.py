@@ -1962,13 +1962,38 @@ def synth_selfcheck_loops(path):
         # pyre-check: selfcheck-loops=8
 
     `run_selfcheck` asks whether the guard reached the JIT at all, and the
-    only figure it can read is `loops_compiled` off the whole-process
-    `[jit-stats]` line — there is no per-function counter. A constant floor of
-    one therefore says nothing about a fixture with more than one loop:
-    `wrapper_subclass_load_method_self` compiles eight, so seven of its
+    figure it reads is `loops_compiled` off the whole-process `[jit-stats]`
+    line. A constant floor of one says nothing about a fixture with more than
+    one loop: `wrapper_subclass_load_method_self` reads eight, so seven of its
     guarded shapes can stop reaching the JIT and it still passes green with
     its assertion intact. That is exactly the failure the floor exists to
     catch, and for every multi-loop fixture it was going uncaught.
+
+    ⚠ Read what this number is and is not before trusting it.
+
+    It is not a count of compiled loops. `MetaInterp::stats.loops_compiled` is
+    bumped at four places in `majit-metainterp/src/pyjitpl.rs`, and the
+    root-FINISH arm counts a non-loop as a loop by design — its own comment in
+    the tree says so, because a root trace ending in FINISH with no LABEL
+    attaches through `ResumeFromInterpDescr.compile_and_attach`, which mints a
+    token of its own. Measured on the fixture named above: `loops_compiled=8`
+    against seven `[jit] compiled loop at key=` lines, all seven keys distinct.
+    A terminal-raise fixture inflates the counter for the same reason.
+
+    It is also not attributed to the loop under test. The figure is
+    whole-process, so any hot loop in the file clears the floor — a bookkeeping
+    loop over the fixture's own recorded events included. `settrace_local_-
+    tracer_armed_before_entry` had to have its counting loop rewritten as
+    `list.count` for exactly that reason, which is the instrument bending the
+    fixture rather than measuring it.
+
+    A per-loop line does exist — `pyjitpl.rs` prints `[jit] compiled loop at
+    key={green_key}` under `majit_log_enabled()` — but the key is an opaque
+    64-bit hash and is not stable across processes, so there is no identity a
+    fixture header could declare. That, not the absence of any per-loop
+    signal, is why this reads an aggregate. `spec-folds` shows the shape the
+    honest version takes: names censused by label, where a declared name that
+    never fires and an unknown label are reported as different failures.
 
     So the floor is per fixture, and the number is measured, not guessed. A
     floor rather than an equality, and one number rather than one per backend:
@@ -4220,8 +4245,9 @@ class Check:
 
         *min_loops* is what makes that true of a fixture with more than one
         guarded shape: `loops_compiled` is a whole-process figure, so a floor
-        of one is reached by any single loop and says nothing about the other
-        seven. `synth_selfcheck_loops` carries the measured floor.
+        of one is reached by any single loop and says nothing about the rest.
+        `synth_selfcheck_loops` carries the measured floor, and documents what
+        that counter does and does not attribute.
 
         *spec_folds* is the `# pyre-check: spec-folds=` list, read the same way
         `run_synthetic_bench` reads it. A fixture written to guard a trace-time
