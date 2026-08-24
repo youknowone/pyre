@@ -176,9 +176,10 @@ Each entry records its reader, purpose, and retirement condition. `UNRECORDED` m
 
 ### `MAJIT_GC_YOUNG_RAWMALLOC`
 
-- Read sites: 1 — `majit/majit-gc/src/collector.rs`
+- Read sites: 2 — `majit/majit-gc/src/collector.rs`, `majit/majit-gc/src/rewrite.rs`
 - Accessor: `young_rawmalloc_enabled()`
 - What it does: `MAJIT_GC_YOUNG_RAWMALLOC` — whether an oversized allocation from a *collecting* entry point may be born YOUNG and non-moving (incminimark.py `external_malloc(..., alloc_young=True)`) instead of straight into the old generation. On by default, because born-old is the deviation: upstream gives every oversized `malloc_fixedsize`/`malloc_varsize` result `alloc_young=True`, while a born-old block can only be reclaimed by a major. `=0` restores the born-old behaviour without a rebuild, which is what makes a defect that appears only once these objects can die at a minor bisectable against a single binary. Read once and cached, for the reason `MAJIT_GC_LIFETIME_LOG` records.
+- Second read site, and why it must exist: `rewrite::GcRewriterImpl::gen_malloc_fixedsize` applies rewrite.py's `remember_write_barrier` to the `malloc_big_fixedsize` result, which is sound only while that helper births young. Turning the gate off births it old, where an elided barrier would lose the first young pointer stored into it — so the same gate must suppress the stamp. The gate being process-wide and read once is what makes the compile-time answer valid for every trace the process compiles; a per-allocation switch could not be consulted here at all.
 - Retirement condition: when a released cycle has shipped with the young path on and no report traces to it, delete the gate and the born-old fallback with it. It exists for the bisection, not as a supported mode.
 
 ### `MAJIT_GUARDLOG`
