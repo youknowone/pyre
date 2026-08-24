@@ -2530,6 +2530,47 @@ def require_fresh_artefacts(artefacts, reason, remedy):
         sys.exit(1)
 
 
+def require_fresh_llbc():
+    """Refuse to measure when `build/llbc/` no longer matches the tree.
+
+    Field offsets are read out of those artefacts, so one that predates an edit
+    names the wrong bytes — and a miscompiled field access returns a NUMBER
+    rather than an error, which makes an unsound run indistinguishable from a
+    real one. `pyre-jit-trace`'s `build.rs` refuses on exactly that, but it can
+    only refuse while a build is running. `--no-build` is the path where
+    nothing else asks, and it is the path a moving tree lands in: a branch that
+    moves after the binaries were built leaves them measurable and the offsets
+    they read stale, with nothing in the output saying so.
+
+    The artefact stamps `require_fresh_artefacts` reads answer a different
+    question — whether *this script* produced the binary from these sources —
+    and an artefact built by a bare `cargo build` carries no stamp at all, so
+    that gate notes and continues. This one does not depend on who built what:
+    it asks the extractor whether what is on disk describes the tree that is on
+    disk.
+    """
+    script = Path(__file__).resolve().parent / "scripts" / "extract-llbc.py"
+    if not script.is_file():
+        return
+    proc = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return
+    print(red("LLBC artefacts under build/llbc/ are STALE."))
+    for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
+        if line.startswith("  ") and ": artefact says" in line:
+            print(line)
+    print("Field offsets come from them, so a run on this tree would measure "
+          "the wrong bytes.")
+    print("Re-extract, then re-run this script:")
+    print("    python3 pyre/scripts/extract-llbc.py "
+          "majit-rlib pyre-object pyre-interpreter pyre-jit")
+    sys.exit(1)
+
+
 # Relative tolerance for wasm float outputs ONLY (see `wasm_outputs_match`).
 WASM_FLOAT_RTOL = 1e-9
 
@@ -4720,6 +4761,11 @@ def main():
     chk = Check(args)
 
     backends = args.backends
+
+    # Once per run, before any backend is measured: the check is over the tree,
+    # not over a backend, and every backend reads the same offsets.
+    if args.no_build:
+        require_fresh_llbc()
 
     for backend in backends:
         if not args.no_build:
