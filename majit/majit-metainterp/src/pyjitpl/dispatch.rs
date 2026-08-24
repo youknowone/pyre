@@ -1904,6 +1904,25 @@ where
         promoted_box
     }
 
+    /// `pyjitpl.py MetaInterp.replace_box(oldbox, newbox)`.
+    ///
+    /// The box has just been proven constant, so every record of it made
+    /// during tracing has to name the constant instead: each frame's active
+    /// boxes, and the virtualref, virtualizable and heapcache records
+    /// `TraceCtx::replace_box` owns. Writing back the one register the
+    /// opcode read leaves an alias in another register still naming the
+    /// non-constant box.
+    ///
+    /// The concrete-value banks are not touched: the constant stands for the
+    /// value the box already had, so every slot that named it already carries
+    /// that value.
+    fn replace_box(&mut self, ctx: &mut TraceCtx, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
+        for frame in self.frames.frames.iter_mut() {
+            frame.replace_active_box_in_frame(oldbox, newbox, oldbox_type);
+        }
+        ctx.replace_box(oldbox, newbox);
+    }
+
     /// `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — returns
     /// `box.nonnull()`, guarding it into the trace on the way.
     ///
@@ -1932,7 +1951,6 @@ where
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        src_reg: usize,
         src: OpRef,
         src_value: i64,
         opcode_pc: usize,
@@ -1953,10 +1971,8 @@ where
             }
         } else if !src.is_constant() {
             self.record_state_guard(ctx, sym, OpCode::GuardIsnull, &[src], opcode_pc, false);
-            // `replace_box(box, constant_from_op(box))` — the register
-            // write-back stand-in, as in [`Self::implement_guard_value`].
             let null = ctx.const_null();
-            self.set_ref_reg(src_reg, Some(null), Some(0));
+            self.replace_box(ctx, src, null, Type::Ref);
         }
         // majit's `nullity_now_known` also records WHICH nullity, where
         // upstream only sets the flag; `is_nullity_known` then answers
@@ -5519,7 +5535,7 @@ where
                     )
                 };
                 let (src, src_value) = self.read_ref_reg(src_idx);
-                let nonnull = self.establish_nullity(ctx, sym, src_idx, src, src_value, opcode_pc);
+                let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
                 // pyjitpl.py:
                 //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
                 //   opimpl_goto_if_not_ptr_iszero:  if     nonnull: self.pc = target
@@ -13329,6 +13345,27 @@ mod tests {
             &[majit_ir::Type::Ref],
             &builder.finish(),
             &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
+    }
+
+    /// `replace_box` rewrites every frame's active boxes, not just the
+    /// register the branch was handed. An alias of the same box in another
+    /// register comes out of the null arm naming `CONST_NULL` too, so a read
+    /// through the alias folds.
+    #[test]
+    fn a_null_ptr_nullity_branch_replaces_the_box_in_an_aliasing_register() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_ptr_iszero(0, target);
+        // Read the ALIAS, not the register the branch resolved.
+        builder.ptr_nonzero(0, 1);
+        builder.mark_label(target);
+        let aliased = OpRef::input_arg_ref(0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
         );
         assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
     }
