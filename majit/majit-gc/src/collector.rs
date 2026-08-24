@@ -1532,9 +1532,8 @@ impl MiniMarkGC {
         // incminimark.py:2603-2615 — a bounded major collection that leaves
         // the heap over `max_heap_size` asks this allocation to fail so the
         // caller raises MemoryError: NULL propagates to the compiled-code
-        // `CHECK_MEMORY_ERROR` path and to the interpreter allocation
-        // chokepoint. Never taken in the unbounded default (`PYPY_GC_MAX`
-        // unset), so the fallback below is unchanged there.
+        // `CHECK_MEMORY_ERROR` path. Never taken in the unbounded default
+        // (`PYPY_GC_MAX` unset), so the fallback below is unchanged there.
         if std::mem::take(&mut self.oom_pending) {
             return GcRef(0);
         }
@@ -6576,24 +6575,48 @@ impl MiniMarkGC {
 
         // incminimark.py:2601-2615 — max heap size (PYPY_GC_MAX). If the capped
         // threshold was bounded by `max_heap_size` and the heap has already
-        // reached it, signal out-of-memory. The first time, ask the triggering
-        // allocation to return NULL so `CHECK_MEMORY_ERROR` (compiled code) or
-        // the interpreter allocation chokepoint raises `MemoryError`, giving the
-        // program a chance to quit cleanly; a second occurrence aborts the
+        // reached it, signal out-of-memory: the first time so the program gets
+        // a chance to quit cleanly, and on a second occurrence by aborting the
         // process (`out_of_memory` -> fatalerror). `max_heap_size == 0`
-        // (unbounded default) never sets `bounded`, so this is inert unless
-        // `PYPY_GC_MAX` is set.
+        // (unbounded default) never sets `bounded`, so this is inert unless a
+        // limit was set.
+        //
+        // Upstream signals it by raising, which unwinds through whichever of
+        // the many drivers of a collection is on the stack. Pyre has to pick a
+        // channel, because only one of those drivers can carry an exception,
+        // and `reserving_size` already says which case this is: it is the size
+        // of the allocation waiting on this collection, and it is nonzero for
+        // exactly the two collecting nursery allocators.
+        //
+        //   * With an allocation waiting, fail it. `oom_pending` is read by
+        //     that allocator the moment the collection returns, and its NULL
+        //     becomes a `MemoryError` at the compiled `CHECK_MEMORY_ERROR`.
+        //   * With none waiting — an explicit `gc.collect()`, a finalizer run,
+        //     and above all the dispatch-loop safepoint, which is where the
+        //     interpreter path's collections happen — there is nothing to fail
+        //     and no frame that can raise, so the eval-breaker bit defers the
+        //     exception to the next bytecode dispatch, exactly as `set_gc`
+        //     defers the collection itself.
+        //
+        // The two are mutually exclusive on purpose. Arming both would leave
+        // whichever channel went undelivered latched onto the *next* breach:
+        // an `oom_pending` no allocation was waiting for is taken by the next
+        // unrelated one, failing an allocation that breached nothing.
         if bounded && self.threshold_reached(reserving_size) {
             if self.max_heap_size_already_raised {
                 panic!("using too much memory, aborting");
             }
             self.max_heap_size_already_raised = true;
-            self.oom_pending = true;
+            if reserving_size > 0 {
+                self.oom_pending = true;
+            } else {
+                majit_ir::eval_breaker_word::set_memory_error();
+            }
             // incminimark.py: STATE_SCANNING then an
             // immediate `raise MemoryError` exits `major_collection_step`
             // before the finalizing phase. Return before the queue-notification
-            // triggers so none fire ahead of the `MemoryError` the pending NULL
-            // will raise.
+            // triggers so none fire ahead of the `MemoryError` the two channels
+            // above will raise.
             self.gc_state = GcState::Scanning;
             return;
         }
@@ -9732,6 +9755,9 @@ mod tests {
         // The allocation that triggered the collection is larger than the
         // remaining headroom (1 - total_memory_used), so threshold_reached holds.
         gc.pending_reserving_size = 4096;
+        // The dispatch-loop channel is process-global; start from a known state
+        // so the assertion below reads this breach and not an earlier one.
+        majit_ir::eval_breaker_word::take_memory_error();
 
         // First bounded breach: flag + signal, no abort.
         gc.gc_state = GcState::Sweeping;
@@ -9744,6 +9770,13 @@ mod tests {
             gc.oom_pending,
             "first bounded breach asks the allocation to fail (NULL)"
         );
+        // The allocation is waiting and will take `oom_pending` the moment this
+        // collection returns, so the deferred channel must stay clear. Arming
+        // both would leave one latched onto an allocation that breached nothing.
+        assert!(
+            !majit_ir::eval_breaker_word::take_memory_error(),
+            "an allocation-driven breach owes the dispatch loop nothing"
+        );
 
         // Second bounded breach aborts (out_of_memory -> fatalerror == panic).
         gc.pending_reserving_size = 4096;
@@ -9752,6 +9785,45 @@ mod tests {
             gc.finish_incremental_cycle();
         }));
         assert!(second.is_err(), "second bounded breach aborts the process");
+    }
+
+    /// The other half of the same policy: a collection with no allocation
+    /// waiting on it.
+    ///
+    /// This is the dispatch-loop safepoint's collection — where the interpreter
+    /// path's majors actually happen — and also `gc.collect()`'s. Upstream
+    /// raises out of all of them alike; pyre has nothing to fail here, so the
+    /// breach has to reach the eval-breaker instead or it is silent, and the
+    /// program's only sign of a full heap becomes the abort on the next one.
+    #[test]
+    fn a_breach_with_no_allocation_waiting_defers_to_the_dispatch_loop() {
+        let mut gc = test_gc(4096);
+        // What separates this from the test above: no allocation is waiting, so
+        // `threshold_reached(0)` decides on the heap as it stands, and the heap
+        // has to actually hold something for it to decide yes. One object past
+        // `large_object_threshold` is born in the old generation, which is what
+        // `get_total_memory_used` counts.
+        let tid = gc.register_type(TypeInfo::simple(4096));
+        let obj = gc.alloc_with_type(tid, 4096);
+        assert!(!obj.is_null());
+        gc.max_heap_size = 1.0;
+        gc.pending_reserving_size = 0;
+        majit_ir::eval_breaker_word::take_memory_error();
+
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert!(
+            gc.max_heap_size_already_raised,
+            "a driverless breach still burns the one grace event"
+        );
+        assert!(
+            !gc.oom_pending,
+            "there is no allocation to fail, so nothing may be latched for the next one"
+        );
+        assert!(
+            majit_ir::eval_breaker_word::take_memory_error(),
+            "a driverless breach owes the dispatch loop a MemoryError"
+        );
     }
 
     /// The default (unbounded, `max_heap_size == 0`) config never sets `bounded`,

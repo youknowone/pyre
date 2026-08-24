@@ -15,6 +15,9 @@
 //!   bit4 EB_GC    — the old-gen allocator reached the next-major threshold;
 //!                   OR'd in by the collector, consumed by the interpreter
 //!                   dispatch-loop GC safepoint.
+//!   bit5 EB_MEMORY_ERROR — a bounded major collection exhausted the heap;
+//!                   OR'd in by the collector where upstream raises, consumed
+//!                   by the dispatch loop, which raises `MemoryError` there.
 //! A compiled loop loads the whole word at the back-edge and deopts to the
 //! interpreter when it is non-zero. The interpreter/warm-up loop and the STW
 //! park gate remain authoritative; this word is only the JIT's deopt trigger.
@@ -41,12 +44,19 @@ pub const EB_GC_INTERP: usize = 8;
 /// bit4 — the old-gen allocator crossed the next-major threshold and a
 /// collection is owed at the next root-complete point.
 pub const EB_GC: usize = 16;
+/// bit5 — a bounded major collection reached `max_heap_size` and a
+/// `MemoryError` is owed at the next root-complete point.
+pub const EB_MEMORY_ERROR: usize = 32;
 /// Bits that require a compiled loop to deopt to the interpreter.
 ///
 /// `EB_GC` belongs here: the allocator only arms the request, and the
 /// collection itself runs at the dispatch-loop safepoint, so a compiled loop
 /// has to leave machine code for the request to be serviced at all.
-pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC;
+///
+/// `EB_MEMORY_ERROR` belongs here for the same reason: the exception is raised
+/// by the dispatch loop, so a compiled loop that never returns to it would run
+/// on past a heap the collector has already declared exhausted.
+pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC | EB_MEMORY_ERROR;
 
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
@@ -137,6 +147,36 @@ pub fn take_gc() -> bool {
     EVAL_BREAKER_WORD.fetch_and(!EB_GC, Ordering::Relaxed) & EB_GC != 0
 }
 
+// --- memory error (bit5): armed by the collector, raised by the dispatch loop ---
+
+/// Record that a bounded major collection reached `max_heap_size`.
+///
+/// incminimark.py `major_collection_step` reacts to that with a plain `raise
+/// MemoryError`, so upstream's exception surfaces wherever the collection was
+/// driven from. Most of pyre's collections are driven from the dispatch-loop
+/// safepoint, which returns `()` and cannot raise, so the collector arms this
+/// bit and the loop raises on the next dispatch instead. The bit rather than a
+/// return value, because the safepoint is one of several drivers — an
+/// allocation, a finalizer run and an explicit collection request reach the
+/// same collection — and only the dispatch loop can turn any of them into an
+/// exception.
+pub fn set_memory_error() {
+    EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+}
+
+/// Consume the owed `MemoryError`, reporting whether one was pending.
+///
+/// Like [`take_gc`], clearing is unconditional: the bit is in
+/// `JIT_BREAKER_MASK`, so one left armed deopts every following back edge.
+pub fn take_memory_error() -> bool {
+    // Same shape as `take_gc`: the taker runs per dispatch and the armer only
+    // when a bounded heap is exhausted, so keep the common case a plain load.
+    if EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_MEMORY_ERROR == 0 {
+        return false;
+    }
+    EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed) & EB_MEMORY_ERROR != 0
+}
+
 /// Depth of the operation chain between the poll's load and its guard.
 ///
 /// The recorder emits `RawLoadI -> IntAnd -> IntIsTrue -> GuardFalse`, so two
@@ -204,6 +244,35 @@ mod tests {
 
     fn bind(op: Op) -> crate::operand::Operand {
         crate::operand::Operand::from_bound_op(&Rc::new(op))
+    }
+
+    /// The owed-`MemoryError` bit is one-shot: armed once by the collector,
+    /// taken once by whichever dispatch loop reaches it first, and reported as
+    /// pending to exactly one of them. A second taker must see nothing, or one
+    /// breach would raise two `MemoryError`s.
+    ///
+    /// It must also be a bit the back-edge poll tests, since the raise happens
+    /// in the dispatch loop and a compiled loop has to leave machine code to
+    /// get there.
+    #[test]
+    fn the_owed_memory_error_is_taken_exactly_once() {
+        assert!(
+            !take_memory_error(),
+            "nothing has armed the bit, so it must not report one pending"
+        );
+        set_memory_error();
+        assert_ne!(
+            load() & JIT_BREAKER_MASK,
+            0,
+            "an armed MemoryError must fail the back-edge poll"
+        );
+        assert!(take_memory_error(), "the armed bit is reported once");
+        assert!(!take_memory_error(), "and only once");
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "taking it clears it, so later back edges are not deopted"
+        );
     }
 
     fn int(value: i64) -> crate::operand::Operand {

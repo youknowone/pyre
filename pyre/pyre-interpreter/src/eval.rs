@@ -2263,6 +2263,27 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         {
             pyre_object::gc_interp::safepoint();
         }
+        // A bounded major collection that reached `max_heap_size` owes a
+        // `MemoryError` — incminimark.py `major_collection_step` raises one
+        // there, and the safepoint above is where the interpreter path's
+        // collections happen but it returns `()` and cannot raise. Deliver it
+        // here, at the same seam an asynchronously delivered signal uses below:
+        // the block search runs at `last_instr`, so a `try` around the region
+        // that was running catches it rather than the frame unwinding.
+        //
+        // Reads the word rather than `dispatch_breaker`: the safepoint above is
+        // the usual armer and it runs after that load, so testing the loaded
+        // copy would defer delivery by a dispatch this loop is not guaranteed
+        // to reach. `take_memory_error` opens with a relaxed load and returns
+        // on it, so the ordinary dispatch pays that load and a branch against a
+        // word it just touched.
+        if majit_ir::eval_breaker_word::take_memory_error() {
+            let mut err = crate::PyError::memory_error("");
+            if handle_exception(frame, &mut err, &mut next_instr) {
+                continue;
+            }
+            return Err(err);
+        }
         // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
         // execute this plain evaluator (their JitDriver state is thread-owned),
         // so they must poll the same process breaker as compiled/JIT-warm
