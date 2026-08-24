@@ -4239,11 +4239,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
     );
-    // bytes / bytearray `data` storage box (off-GC storage). A leaf
-    // `Vec<u8>` (no inner refs) shared by both types; `bytes_object_custom_trace`
-    // / `bytearray_object_custom_trace` grey it through the `data` field slot and
-    // the box tid's drop glue reclaims the buffer on sweep. Keep this id at the
-    // absolute registration tail.
+    // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
+    // refs); `bytearray_object_custom_trace` greys it through the `data` field
+    // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this
+    // id at the absolute registration tail.
     register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
@@ -4425,6 +4424,33 @@ fn build_gc() -> Box<MiniMarkGC> {
         .register_unresolved_struct_tids(|size, offsets| {
             gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
         });
+
+    // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
+    // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
+    // registers with the shape `get_array_token` reads off that one ARRAY and
+    // no destructor: the payload is inside the block, so the sweep reclaims it
+    // with the block and the collector sizes it from the block's own length
+    // header. `bytes_object_custom_trace` greys it through the `data` field
+    // slot, the same edge the storage box was reached by.
+    //
+    // Registered after every other type, synthetic structs included. A tid is a
+    // position in this chain, and the interpreter spells many of them as
+    // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
+    // insertion anywhere earlier renumbers every registration below it while the
+    // `debug_assert_eq!`s that pair each literal with its registration are
+    // compiled out of a release build. Allocations made before this line read a
+    // zero tid and take `alloc_bytes_block`'s plain-allocation arm; the trace
+    // skips those blocks on `try_gc_owns_object`, as it did for the storage box
+    // from its own later registration point.
+    let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
+    let bytes_block_tid = gc.register_type(TypeInfo::varsize(
+        bytes_block_token.base_size,
+        bytes_block_token.item_size,
+        bytes_block_token.len_offset,
+        false,
+        Vec::new(),
+    ));
+    pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
 
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
@@ -7468,6 +7494,12 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // here added no safety beyond the Layer 2 defense above.
             | I::CallFunctionEx
             | I::LoadGlobal { .. }
+            // IMPORT_NAME is the same Python-call boundary as CALL: it
+            // resolves builtins.__import__ and invokes it.  The Layer 2
+            // effect journal above is the replay-safety authority for both;
+            // rejecting only the opcode spelling kept otherwise identical
+            // `for` loops interpreted while PyPy traces them.
+            | I::ImportName { .. }
             | I::Resume { .. }
             // container builders: produce new heap objects but do not mutate
             // existing ones; walk-abort just drops the incomplete object
@@ -13969,6 +14001,16 @@ mod tests {
             "def f(n):\n    s = 0\n    for i in range(n):\n        s = (s + i * i + 3) % 1000000007\n    return s\n",
         )
         .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_cached_import_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec("def f(n):\n    for _ in range(n):\n        import os\n")
+            .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
         assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);

@@ -533,8 +533,8 @@ fn read_private_key(data: &[u8], password: Option<&[u8]>) -> NativeResult<Privat
 #[inline(never)]
 pub unsafe fn context_load_cert_chain(
     context: *mut Context,
-    cert_path: &str,
-    key_path: &str,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
     password: Option<&[u8]>,
 ) -> NativeResult<bool> {
     ensure_provider();
@@ -588,7 +588,10 @@ fn parse_concatenated_der(mut data: &[u8]) -> NativeResult<Vec<Vec<u8>>> {
 /// # Safety
 /// `context` must point to a live [`Context`].
 #[inline(never)]
-pub unsafe fn context_load_verify_file(context: *mut Context, path: &str) -> NativeResult<usize> {
+pub unsafe fn context_load_verify_file(
+    context: *mut Context,
+    path: &std::path::Path,
+) -> NativeResult<usize> {
     let data = std::fs::read(path).map_err(io_error)?;
     let items = rustls_pemfile::read_all(&mut Cursor::new(data))
         .collect::<Result<Vec<_>, _>>()
@@ -627,9 +630,9 @@ pub unsafe fn context_load_verify_file(context: *mut Context, path: &str) -> Nat
 /// # Safety
 /// `context` must point to a live [`Context`].
 #[inline(never)]
-pub unsafe fn context_add_verify_dir(context: *mut Context, path: &str) {
+pub unsafe fn context_add_verify_dir(context: *mut Context, path: &std::path::Path) {
     let context = unsafe { &mut *context };
-    let path = std::path::PathBuf::from(path);
+    let path = path.to_path_buf();
     if !context.capaths.iter().any(|known| known == &path) {
         context.capaths.push(path);
         *context
@@ -988,7 +991,7 @@ pub fn certificate_decode_der(der: &[u8]) -> NativeResult<*mut DecodedCertificat
 }
 
 #[inline(never)]
-pub fn certificate_decode_file(path: &str) -> NativeResult<*mut DecodedCertificate> {
+pub fn certificate_decode_file(path: &std::path::Path) -> NativeResult<*mut DecodedCertificate> {
     let data = std::fs::read(path).map_err(io_error)?;
     let certs = read_pem_certificates(&data)?;
     certificate_decode_der(certs[0].as_ref())

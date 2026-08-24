@@ -395,6 +395,14 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "builtins::builtin_kwargs_marker_dict",
         crate::builtins::builtin_kwargs_marker_dict as *const (),
     );
+    // `builtin_unexpected_keyword_failure` deliberately remains unpublished:
+    // its `&str` and `&Wtf8` arguments are two-word aggregates and its
+    // `Result<Vec<PyObjectRef>, PyError>` return is multiword, neither of
+    // which the one-word residual-call ABI carries.  `bind_builtin_kwargs` is
+    // `unroll_safe`, so the codewriter descends into it and reaches this
+    // `#[cold]` `#[dont_look_inside]` call as a residual; without an address
+    // it falls back to the symbolic hash instead of passing and returning the
+    // wrong number of words.
 
     // RPython annotator PBC parity for `BuiltinCode.func`: every generated
     // interp2app wrapper is a possible value of the indirect function-pointer

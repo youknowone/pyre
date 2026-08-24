@@ -2640,6 +2640,8 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "delete_name"
             | "delete_global"
             | "load_build_class"
+            | "load_import"
+            | "load_import_locals"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -2666,7 +2668,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "match_keys"
             | "match_class"
             | "not_"
-            | "import_name"
             | "import_from"
             | "load_from_dict_or_globals"
             | "load_super_attr"
@@ -3331,6 +3332,13 @@ pub struct LoweringContext {
     /// `load_build_class_fn` descrs-pool index. LOAD_BUILD_CLASS lowers to the
     /// same one-Ref shape as [`Self::load_locals_fn_idx`].
     pub load_build_class_fn_idx: u16,
+    /// `load_import_fn` descrs-pool index. This is the builtin-lookup half of
+    /// IMPORT_NAME; the subsequent invocation uses the ordinary CallFn path.
+    pub load_import_fn_idx: u16,
+    /// `load_import_locals_fn` descrs-pool index. IMPORT_NAME's locals
+    /// argument lowers to the same one-Ref shape as
+    /// [`Self::load_locals_fn_idx`].
+    pub load_import_locals_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py`
@@ -3499,16 +3507,6 @@ pub struct LoweringContext {
     /// `bh_convert_value_fn(value, conv)` runs str/repr/ascii (a user
     /// `__str__` / `__repr__` may force → `MayForce`).
     pub convert_value_fn_idx: u16,
-    /// `import_name_fn` descrs-pool index — see codewriter.rs
-    /// `register_helper_fn_pointers`.  IMPORT_NAME records the
-    /// `import_name(fromlist, level, code, name_idx)` HLOp (code = the
-    /// jitcode's own PyCode as a `Signed(ptr) + Kind::Ref` constant,
-    /// name_idx = `co_names` index) lowered to `residual_call_ir_r(
-    /// ConstInt(fn_idx), ListI([name_idx]), ListR([fromlist, level, code]),
-    /// Descr) → reg` via [`lower_import_name_hlop_to_insn`];
-    /// `bh_import_name_fn` runs `__import__` (module top-level Python may
-    /// run → `MayForce`).
-    pub import_name_fn_idx: u16,
     /// `import_from_fn` descrs-pool index.  IMPORT_FROM records the
     /// `import_from(module, code, name_idx)` HLOp (code = the jitcode's own
     /// PyCode as a `Signed(ptr) + Kind::Ref` constant, name_idx =
@@ -4487,6 +4485,84 @@ where
     )
 }
 
+/// Lower the builtin-lookup half of pyopcode.py IMPORT_NAME to a one-Ref
+/// residual. Its result becomes the callable of a separate `simple_call`.
+pub fn lower_load_import_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_import" || op.args.len() != 1 {
+        return None;
+    }
+    let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    // `get_builtin().getdictvalue('__import__')` is an analyzed, non-elidable
+    // lookup: it can raise ImportError but neither runs Python nor writes the
+    // GC heap.  Use EF_CAN_RAISE with concrete-empty effect sets.  The generic
+    // Plain flavor means “no graph was analyzed” and becomes RANDOM_EFFECTS /
+    // CALL_MAY_FORCE, contradicting PyPy's zero-forcing IMPORT_NAME trace.
+    let mut effect_info = majit_ir::EffectInfo::default();
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadImport;
+    Some(build_residual_call_r_r_insn_with_effect_info(
+        ctx.load_import_fn_idx,
+        vec![frame_operand],
+        effect_info,
+        dst_reg,
+    ))
+}
+
+/// Lower IMPORT_NAME's locals argument to a one-Ref residual call.
+///
+/// `bh_load_import_locals_fn` dereferences `PyFrame.debugdata` and then
+/// `FrameDebugData.w_locals`, and the optimizer caches both: `debugdata` is
+/// virtualizable field 3, and the `f_locals` fold reads `w_locals` through
+/// `frame_debug_data_w_locals_descr`, which is mutable because
+/// `setdictscope` and `fast2locals` rebind it.  Neither read is analyzed
+/// here, so this takes the same `Plain` lowering as `load_locals`, the
+/// sibling helper that reads the same two fields: no write set was computed,
+/// which is `EF_RANDOM_EFFECTS`, and `OptHeap` routes that to `clean_caches`
+/// instead of `force_from_effectinfo`.  It also dispatches as
+/// `CALL_MAY_FORCE` -- `RandomEffects` clears
+/// `check_forces_virtual_or_virtualizable()` -- which is what syncs the
+/// virtualizable the `debugdata` read goes through.
+///
+/// A `PlainCannotRaise` lowering would instead advertise concrete-empty
+/// readonly and write sets, so a lazy set pending on either field would not
+/// be flushed before the helper reads it and `__import__` would receive a
+/// stale mapping.  Declaring the two descrs readonly does not recover that:
+/// `compute_bitstrings` never runs on the `JitDriver` path, so every
+/// `check_readonly_descr_field` lookup misses on the `u32::MAX` sentinel,
+/// and the raw-set fallback in `force_from_effectinfo` covers only the write
+/// side.  The `EF_RANDOM_EFFECTS` boundary is what carries the reads.
+pub fn lower_load_import_locals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_import_locals",
+        ctx.load_import_locals_fn_idx,
+        majit_ir::PyreHelperKind::LoadImportLocals,
+        get_register,
+        lower_constant,
+    )
+}
+
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
 pub fn lower_delete_global_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -4873,7 +4949,6 @@ pub fn build_residual_call_r_r_insn_from_operands(
     pyre_helper: majit_ir::PyreHelperKind,
     dst_reg: Register,
 ) -> Insn {
-    let arg_kinds = vec![Kind::Ref; ref_operands.len()];
     // `bh_call_fn_N` dispatches the callable supplied at runtime.  Its target
     // is therefore the indirect-call top set, not the empty effect set of the
     // helper wrapper itself: user code can mutate any escaped heap location.
@@ -4887,6 +4962,16 @@ pub fn build_residual_call_r_r_insn_from_operands(
         effect_info_for_call_flavor(flavor)
     };
     effect_info.pyre_helper = pyre_helper;
+    build_residual_call_r_r_insn_with_effect_info(fn_idx, ref_operands, effect_info, dst_reg)
+}
+
+fn build_residual_call_r_r_insn_with_effect_info(
+    fn_idx: u16,
+    ref_operands: Vec<Operand>,
+    effect_info: majit_ir::EffectInfo,
+    dst_reg: Register,
+) -> Insn {
+    let arg_kinds = vec![Kind::Ref; ref_operands.len()];
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -5426,6 +5511,13 @@ where
     if let Some(insn) = lower_load_build_class_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_load_import_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_import_locals_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
+        return Some(insn);
+    }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5476,9 +5568,6 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_convert_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
-        return Some(insn);
-    }
-    if let Some(insn) = lower_import_name_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -6683,67 +6772,6 @@ where
             Operand::ConstInt(ctx.load_common_constant_fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(disc)])),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![])),
-            descr_operand,
-        ],
-        dst_reg,
-    ))
-}
-
-/// Lower the IMPORT_NAME pyre HLOp `import_name(fromlist, level, code, frame,
-/// name_idx)` → `result: Ref` to `residual_call_ir_r(ConstInt(
-/// import_name_fn_idx), ListI([name_idx]), ListR([fromlist, level, code,
-/// frame]), Descr) → reg`, the four-Ref sibling of
-/// [`lower_getattr_hlop_to_insn`] (same `(refs.., int) → ref` marshalling the
-/// void STORE_ATTR residual already proves with `[obj, value, code]`).
-/// `bh_import_name_fn` resolves the module name from the code object and runs
-/// `__import__` (module top-level Python may force → `MayForce`); `frame` is
-/// the live red frame the residual reads `__name__`/`__package__` from for
-/// relative-import resolution, mirroring `bh_load_global_fn`'s threaded frame
-/// pointer instead of `getexecutioncontext().gettopframe()`.
-///
-/// Returns `None` for non-`import_name` opnames so the caller can fall
-/// through to other lowering arms.
-pub fn lower_import_name_hlop_to_insn<F, LC>(
-    op: &super::flow::SpaceOperation,
-    ctx: &LoweringContext,
-    get_register: &mut F,
-    lower_constant: &mut LC,
-) -> Option<Insn>
-where
-    F: FnMut(super::flow::Variable) -> Register,
-    LC: FnMut(&Constant) -> Operand,
-{
-    if op.opname != "import_name" || op.args.len() != 5 {
-        return None;
-    }
-    let fromlist = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-    let level = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-    let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
-    let frame = operand_for_value_arg(&op.args[3], get_register, lower_constant)?;
-    let name_idx = const_int_for_value_arg(&op.args[4])?;
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
-    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-        effect_info,
-        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-        result_kind: Some(Kind::Ref),
-        void_word_abi: false,
-    }));
-    Some(Insn::op_with_result(
-        "residual_call_ir_r",
-        vec![
-            Operand::ConstInt(ctx.import_name_fn_idx as i64),
-            Operand::ListOfKind(ListOfKind::new(
-                Kind::Int,
-                vec![Operand::ConstInt(name_idx)],
-            )),
-            Operand::ListOfKind(ListOfKind::new(
-                Kind::Ref,
-                vec![fromlist, level, code, frame],
-            )),
             descr_operand,
         ],
         dst_reg,
@@ -11738,7 +11766,6 @@ mod tests {
             format_simple_fn_idx: 101,
             format_with_spec_fn_idx: 102,
             convert_value_fn_idx: 104,
-            import_name_fn_idx: 105,
             import_from_fn_idx: 117,
             load_super_attr_fn_idx: 106,
             super_attr_unwrap_fn_idx: 107,
@@ -13553,112 +13580,156 @@ mod tests {
     }
 
     #[test]
-    fn lower_import_name_hlop_emits_import_name_fn_residual() {
-        // `import_name(fromlist, level, code, frame, name_idx)` →
-        // `residual_call_ir_r(ConstInt(import_name_fn_idx), ListI([name_idx]),
-        // ListR([fromlist, level, code, frame]), Descr) → reg` (MayForce —
-        // module top-level Python may run).  Four Ref operands plus one Int;
-        // `frame` is the live red frame the residual reads
-        // `__name__`/`__package__` from for relative-import resolution.
-        let fromlist_var = Variable::new(VariableId(8), Kind::Ref);
-        let level_var = Variable::new(VariableId(10), Kind::Ref);
-        let frame_var = Variable::new(VariableId(11), Kind::Ref);
-        let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, code_const, name_idx_const) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "import_name",
-            vec![
-                fromlist_var.into(),
-                level_var.into(),
-                code_const.into(),
-                frame_var.into(),
-                name_idx_const.into(),
-            ],
-            Some(result_var.into()),
+    fn lower_load_import_locals_hlop_keeps_the_unanalyzed_boundary() {
+        // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug locals before the
+        // call, and the helper that answers it dereferences
+        // `PyFrame.debugdata` -- virtualizable field 3 -- and then
+        // `FrameDebugData.w_locals`, which the `f_locals` fold caches and
+        // which `setdictscope` rebinds.  Neither read is analyzed here, so
+        // the residual keeps the one-Ref frame-receiver shape its sibling
+        // `load_locals` carries: `EF_RANDOM_EFFECTS`, dispatched as
+        // `CALL_MAY_FORCE` so the virtualizable is synced and `OptHeap`
+        // flushes the cached field before the helper reads either.
+        let frame = Variable::new(VariableId(8), Kind::Ref);
+        let result = Variable::new(VariableId(9), Kind::Ref);
+        let op = SpaceOperation::new(
+            "load_import_locals",
+            vec![frame.into()],
+            Some(result.into()),
             0,
         );
-        let mut get_register = |var: Variable| match var.id {
-            VariableId(8) => Register {
-                kind: Kind::Ref,
-                index: 101,
-            },
-            VariableId(10) => Register {
-                kind: Kind::Ref,
-                index: 103,
-            },
-            VariableId(11) => Register {
-                kind: Kind::Ref,
-                index: 104,
-            },
-            VariableId(9) => Register {
-                kind: Kind::Ref,
-                index: 102,
-            },
-            _ => panic!("unexpected var id {:?}", var.id),
+        let ctx = LoweringContext {
+            load_import_locals_fn_idx: 135,
+            ..Default::default()
         };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_import_name_hlop_to_insn(
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+        let insn = lower_load_import_locals_hlop_to_insn(
             &op,
             &ctx,
             &mut get_register,
             &mut lower_constant,
         )
-        .expect("5-arg import_name lowering must succeed");
+        .expect("load_import_locals lowering must succeed");
+
         match insn {
             Insn::Op {
                 opname,
                 args,
-                result,
+                result: Some(dst),
             } => {
-                assert_eq!(opname, "residual_call_ir_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(105)),
-                    "import_name_fn pool index, got {:?}",
-                    args[0]
-                );
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(matches!(args[0], Operand::ConstInt(135)));
                 match &args[1] {
                     Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Int);
-                        assert!(
-                            matches!(&list.content[..], [Operand::ConstInt(5)]),
-                            "ListI = [name_idx], got {:?}",
-                            list.content
-                        );
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert!(matches!(
+                            &list.content[..],
+                            [Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 8
+                            })]
+                        ));
                     }
-                    other => panic!("expected ListI, got {other:?}"),
+                    other => panic!("expected one-Ref ListR, got {other:?}"),
                 }
+                assert_eq!(dst, Register::new(Kind::Ref, 9));
                 match &args[2] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info.pyre_helper,
+                                majit_ir::PyreHelperKind::LoadImportLocals
+                            );
+                            // A `CannotRaise` shape here would advertise
+                            // concrete-empty readonly and write sets the
+                            // helper never earned, and `force_from_effectinfo`
+                            // would then skip both fields: there is no
+                            // raw-set fallback on the readonly side, and
+                            // `compute_bitstrings` never runs on this path.
+                            assert_eq!(
+                                stub.effect_info.extraeffect,
+                                majit_ir::ExtraEffect::RandomEffects
+                            );
+                            assert_eq!(
+                                dispatch_kind_for_effect_info(&stub.effect_info),
+                                CallFlavor::MayForce
+                            );
+                            assert!(stub.effect_info.has_random_effects());
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected call descr, got {other:?}"),
+                }
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_load_import_hlop_emits_builtin_lookup_residual() {
+        // PyPy IMPORT_NAME performs the builtin lookup separately from its
+        // ordinary Python call.  The lookup therefore has the same one-frame
+        // analyzed EF_CAN_RAISE residual shape, while the following
+        // `simple_call` remains visible to the meta-tracer.
+        let frame = Variable::new(VariableId(8), Kind::Ref);
+        let result = Variable::new(VariableId(9), Kind::Ref);
+        let op = SpaceOperation::new("load_import", vec![frame.into()], Some(result.into()), 0);
+        let ctx = LoweringContext {
+            load_import_fn_idx: 134,
+            ..Default::default()
+        };
+        let mut get_register = identity_register_mapper();
+        let mut lower_constant = test_constant_lowering();
+        let insn =
+            lower_load_import_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
+                .expect("load_import lowering must succeed");
+
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(dst),
+            } => {
+                assert_eq!(opname, "residual_call_r_r");
+                assert!(matches!(args[0], Operand::ConstInt(134)));
+                match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
-                        match &list.content[..] {
-                            [
-                                Operand::Register(fl),
-                                Operand::Register(lv),
-                                Operand::ConstRef(0x2000),
-                                Operand::Register(fr),
-                            ] => {
-                                assert_eq!(fl.index, 101, "leading Ref operand must be fromlist");
-                                assert_eq!(lv.index, 103, "second Ref operand must be level");
-                                assert_eq!(fr.index, 104, "fourth Ref operand must be frame");
-                            }
-                            other => {
-                                panic!(
-                                    "ListR must be [fromlist, level, code, frame], got {other:?}"
-                                )
-                            }
-                        }
+                        assert!(matches!(
+                            &list.content[..],
+                            [Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 8
+                            })]
+                        ));
                     }
-                    other => panic!("expected ListR, got {other:?}"),
+                    other => panic!("expected one-Ref ListR, got {other:?}"),
                 }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
-                );
+                assert_eq!(dst, Register::new(Kind::Ref, 9));
+                match &args[2] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info.pyre_helper,
+                                majit_ir::PyreHelperKind::LoadImport
+                            );
+                            assert_eq!(
+                                stub.effect_info.extraeffect,
+                                majit_ir::ExtraEffect::CanRaise
+                            );
+                            assert_eq!(
+                                dispatch_kind_for_effect_info(&stub.effect_info),
+                                CallFlavor::Plain
+                            );
+                            assert!(!stub.effect_info.has_random_effects());
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected call descr, got {other:?}"),
+                }
             }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
+            other => panic!("expected residual_call_r_r, got {other:?}"),
         }
     }
 

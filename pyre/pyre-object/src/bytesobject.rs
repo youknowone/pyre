@@ -9,10 +9,11 @@ use crate::pyobject::*;
 
 pub static BYTES_TYPE: PyType = crate::pyobject::new_pytype("bytes");
 
-/// GC-managed byte buffer shared by `bytes` and `bytearray` bodies.
+/// GC-managed byte buffer behind a `bytearray` body.
 ///
 /// The `Vec<u8>` is a leaf (no inner `PyObjectRef`s); its GC box carries only
-/// drop glue that reclaims the buffer on sweep.
+/// drop glue that reclaims the buffer on sweep.  `bytes` holds its payload
+/// inline instead, in a [`BytesBlock`].
 pub type BytesDataStorage = Vec<u8>;
 
 /// Runtime-assigned GC type id for [`BytesDataStorage`]. Like the set-items
@@ -31,16 +32,155 @@ pub fn bytes_data_gc_type_id() -> u32 {
     BYTES_DATA_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `rstr.py` — `STR.become(GcStruct('rpy_string', ('hash', Signed),
+/// ('chars', Array(Char, ...))))`: the byte payload is a varsize `GcArray`
+/// inside the managed heap, not a pointer to memory the collector cannot see.
+///
+/// A storage box holds a `Vec<u8>` whose bytes live in the Rust heap, so the
+/// collector sizes the payload as the 24 bytes of the container and its
+/// major-collection threshold never learns about the buffer. The bytes here sit
+/// after the length header, so `encode_type_shape`'s varsize rule
+/// (`gctypelayout.py`) sizes the block from its own contents and the
+/// threshold moves by what was actually allocated.
+///
+/// Same block shape as [`crate::object_array::TypedItemsBlock`], with `Char`
+/// items instead of words.
+///
+/// The block is that `chars` Array alone, not the whole `rpy_string` struct,
+/// which is also all [`BYTES_BLOCK_TOKEN`] names -- `get_array_token(
+/// Array(Char))`. The struct's other two parts have no reader here:
+///
+/// - `('hash', Signed)` is `ll_strhash`'s cache slot. Nothing caches a
+///   byte-string hash in pyre: `bytes.__hash__` siphashes the buffer on every
+///   call (`_hash_bytes`) and the dict's structural hash runs its own hasher
+///   over `w_bytes_data`, so the slot would be written by nobody and read by
+///   nobody while costing a word per `bytes` object.
+/// - `extra_item_after_alloc: 1` reserves the char slot
+///   `ll_write_final_null_char` (`rlib/rgc.py`) writes, so that a `chars`
+///   array can be handed to C in place as a NUL-terminated string.
+///   `PyBytes_AsString` instead copies into the separate `cached_bytes`
+///   mirror, so no C caller ever reads a terminator off this block.
+#[repr(C)]
+pub struct BytesBlock {
+    /// The GcArray length header — the collector's `ofstolength`.
+    pub length: usize,
+    /// `chars` inline after the header; size known only at allocation time.
+    chars: [u8; 0],
+}
+
+/// Offset of `chars[0]` — the collector's `ofstovar`.
+pub const BYTES_BLOCK_CHARS_OFFSET: usize = std::mem::offset_of!(BytesBlock, chars);
+
+/// Offset of the length header the collector reads as the GcArray length.
+pub const BYTES_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(BytesBlock, length);
+
+/// `get_array_token(Array(Char))` — the one triple every consumer of this
+/// block's shape reads, as `encode_type_shape` reads all three from the one
+/// ARRAY.
+pub const BYTES_BLOCK_TOKEN: crate::object_array::ArrayToken = crate::object_array::ArrayToken {
+    base_size: BYTES_BLOCK_CHARS_OFFSET,
+    item_size: std::mem::size_of::<u8>(),
+    len_offset: BYTES_BLOCK_LEN_OFFSET,
+};
+
+// The collector sizes a block as `base_size + item_size * length` read at
+// `len_offset`, and `bytes_block_chars` reads the payload at `base_size`. A
+// field added to `BytesBlock` moves both silently, so pin the shape here: the
+// length header first, the chars one word in, and one byte per item.
+const _: () = {
+    assert!(BYTES_BLOCK_LEN_OFFSET == 0);
+    assert!(BYTES_BLOCK_CHARS_OFFSET == std::mem::size_of::<usize>());
+    assert!(BYTES_BLOCK_TOKEN.item_size == 1);
+};
+
+/// Runtime-assigned GC type id for [`BytesBlock`], published by
+/// `pyre-jit::eval` with the other tail registrations.
+static BYTES_BLOCK_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for [`BytesBlock`].
+pub fn set_bytes_block_gc_type_id(id: u32) {
+    BYTES_BLOCK_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for [`BytesBlock`].
+#[majit_macros::dont_look_inside]
+pub fn bytes_block_gc_type_id() -> u32 {
+    BYTES_BLOCK_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Allocate a [`BytesBlock`] holding `bytes`.
+///
+/// The tier is the stable (old-gen) one the storage box already used: a
+/// caller holds the returned block on the unrooted Rust stack while it
+/// allocates the object body, and `try_gc_alloc_stable_raw` is the hook whose
+/// address survives both collection kinds. It also keeps
+/// [`w_bytes_data`]'s `&'static [u8]` pointing at bytes that never move.
+///
+/// Falls back to a plain allocation before the GC is up or in a unit test,
+/// where the block is immortal, as the storage box's `malloc_raw` fallback is.
+pub fn alloc_bytes_block(bytes: &[u8]) -> *mut BytesBlock {
+    let size = BYTES_BLOCK_CHARS_OFFSET + bytes.len();
+    let tid = bytes_block_gc_type_id();
+    let raw = if tid != 0 {
+        crate::gc_hook::try_gc_alloc_stable_raw(tid, size)
+    } else {
+        std::ptr::null_mut()
+    };
+    let block = if raw.is_null() {
+        let layout = bytes_block_layout(bytes.len());
+        // SAFETY: the layout is non-zero — the header alone occupies a word.
+        unsafe { std::alloc::alloc(layout) }
+    } else {
+        raw
+    };
+    if block.is_null() {
+        std::alloc::handle_alloc_error(bytes_block_layout(bytes.len()));
+    }
+    // SAFETY: `block` names `size` writable bytes, which is the header
+    // followed by `bytes.len()` char slots.
+    unsafe {
+        let block = block as *mut BytesBlock;
+        (*block).length = bytes.len();
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            std::ptr::addr_of_mut!((*block).chars) as *mut u8,
+            bytes.len(),
+        );
+        block
+    }
+}
+
+/// The `[header | chars]` layout of a block holding `len` bytes.
+fn bytes_block_layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(
+        BYTES_BLOCK_CHARS_OFFSET + len,
+        std::mem::align_of::<BytesBlock>(),
+    )
+    .expect("bytes block layout")
+}
+
+/// The `chars` of a block, as `rstr.py`'s `ll_chars` reads them.
+///
+/// # Safety
+/// `block` must name a live [`BytesBlock`].
+pub unsafe fn bytes_block_chars(block: *const BytesBlock) -> &'static [u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!((*block).chars) as *const u8,
+            (*block).length,
+        )
+    }
+}
+
 /// Python bytes object — immutable byte sequence.
 ///
-/// PyPy: W_BytesObject stores `_value` (RPython string).
-/// pyre: stores a heap-allocated `Vec<u8>` in a GC-managed non-moving storage
-/// box (off-GC storage), same layout as W_BytearrayObject but without
-/// setitem/extend.
+/// `W_BytesObject._value` is an RPython string, whose `chars` array
+/// (`rstr.py`'s `STR`) lives in the managed heap; [`BytesBlock`] is that
+/// array. Same layout as W_BytearrayObject but without setitem/extend.
 #[repr(C)]
 pub struct W_BytesObject {
     pub ob_header: PyObject,
-    pub data: *const Vec<u8>,
+    pub data: *const BytesBlock,
     pub len: usize,
     /// Strong references owned by ctypes `_objects` dictionaries.  Pyre is a
     /// tracing-GC runtime, so it has no CPython `ob_refcnt`; this trailing
@@ -56,7 +196,7 @@ pub struct W_BytesObject {
     pub w_weakreflifeline: PyObjectRef,
 }
 
-/// `W_BytesObject.data` — the pointer to the heap-allocated byte buffer.
+/// `W_BytesObject.data` — the pointer to the block holding the bytes.
 pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);
 
 /// `W_BytesObject.len` — the byte count, the analogue of the `strlen` PyPy
@@ -89,8 +229,8 @@ impl crate::lltype::GcType for W_BytesObject {
 
 /// Allocate a new bytes object from a byte slice.
 ///
-/// The `data` buffer lives in a GC-managed non-moving storage box; the sweep
-/// reclaims it through the box tid's drop glue. The `W_BytesObject` body is
+/// The `data` block is a varsize GcArray in the managed heap, so the sweep
+/// reclaims it with no drop glue to run. The `W_BytesObject` body is
 /// allocated in GC old-gen (`try_gc_alloc_stable_raw`) so the collector traces
 /// through it and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back
 /// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
@@ -100,37 +240,40 @@ impl crate::lltype::GcType for W_BytesObject {
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let len = bytes.len();
-    let data = crate::gc_storage::gc_alloc_storage_box(bytes.to_vec(), bytes_data_gc_type_id());
-    let header = PyObject {
-        ob_type: &BYTES_TYPE as *const PyType,
-        w_class: get_instantiate(&BYTES_TYPE),
-    };
+    // `build_list_storage` (listobject.rs) states the rule the block obeys:
+    // old-gen is mark-sweep, so a block with no heap edge yet is sweepable
+    // rather than merely immobile, and it has to be rooted across every later
+    // GC operation. `try_gc_alloc_stable_raw` is one of them
+    // (`IntArray::pin_block`), and `get_instantiate` allocates as well, so both
+    // the block and the class travel on the shadow stack and are read back from
+    // their slots once the last allocation is behind them.
+    let _roots = crate::gc_roots::push_roots();
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let data = alloc_bytes_block(bytes);
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
-    if !raw.is_null() {
+    let body = W_BytesObject {
+        ob_header: PyObject {
+            ob_type: &BYTES_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
+        data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
+        len,
+        ctypes_keepalive_refs: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
+    let w_bytes = if !raw.is_null() {
         unsafe {
-            std::ptr::write(
-                raw as *mut W_BytesObject,
-                W_BytesObject {
-                    ob_header: header,
-                    data,
-                    len,
-                    ctypes_keepalive_refs: 0,
-                    w_dict: PY_NULL,
-                    w_weakreflifeline: PY_NULL,
-                },
-            );
+            std::ptr::write(raw as *mut W_BytesObject, body);
         }
         raw as PyObjectRef
     } else {
-        crate::lltype::malloc_typed(W_BytesObject {
-            ob_header: header,
-            data,
-            len,
-            ctypes_keepalive_refs: 0,
-            w_dict: PY_NULL,
-            w_weakreflifeline: PY_NULL,
-        }) as PyObjectRef
-    }
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    };
+    w_bytes
 }
 
 /// Allocate a bytes-subclass instance in the managed heap.  PyPy's
@@ -141,6 +284,13 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
+    // The block is allocated before the body and rooted across it, not built
+    // inside the struct literal: the literal is evaluated after
+    // `try_gc_alloc_stable_raw` has already produced `raw`, which leaves that
+    // fresh body unrooted across the block's own allocation.
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let data = alloc_bytes_block(bytes);
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         <W_BytesObject as crate::lltype::GcType>::type_id(),
         <W_BytesObject as crate::lltype::GcType>::SIZE,
@@ -150,7 +300,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
             ob_type: &BYTES_TYPE as *const PyType,
             w_class: crate::gc_roots::shadow_stack_get(root_base),
         },
-        data: crate::lltype::malloc_raw(bytes.to_vec()),
+        data: crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock,
         len: bytes.len(),
         ctypes_keepalive_refs: 0,
         w_dict: PY_NULL,
@@ -262,8 +412,7 @@ pub unsafe fn w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
 pub unsafe fn w_bytes_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         let b = obj as *const W_BytesObject;
-        let data_ref: &Vec<u8> = &*(*b).data;
-        data_ref.as_slice()
+        bytes_block_chars((*b).data)
     }
 }
 

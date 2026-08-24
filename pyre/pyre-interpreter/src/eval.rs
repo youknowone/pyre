@@ -4102,11 +4102,15 @@ impl OpcodeStepExecutor for PyFrame {
         Self::push_anchored(&anchor, result)
     }
 
-    fn import_name(&mut self, name: &str) -> Result<(), PyError> {
+    fn import_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         let w_fromlist = self.pop();
         let w_flag = self.pop();
         let anchor = FrameAnchor::new(self);
-        let w_obj = crate::importing::import_name(self, name, w_fromlist, w_flag)?;
+        // PyPy pyopcode.py `w_modulename = self.getname_w(nameindex)`.
+        let w_modulename = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
+        let w_obj = crate::importing::import_name(self, w_modulename, w_fromlist, w_flag)?;
         Self::push_anchored(&anchor, w_obj)
     }
 

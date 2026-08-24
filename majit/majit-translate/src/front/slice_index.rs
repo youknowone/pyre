@@ -980,6 +980,12 @@ fn rangeto_static_length_bound_matches(
 /// required wraparound semantics. `ArrayLen` and plain `sub` are the measured
 /// post-lowering forms (`front/mir.rs`).
 fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable) -> bool {
+    let Some(end) = resolve_block_alias(graph, end) else {
+        return false;
+    };
+    let Some(slice) = resolve_block_alias(graph, slice) else {
+        return false;
+    };
     let Some((lhs, rhs)) = graph
         .blocks
         .iter()
@@ -993,15 +999,18 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
                     rhs,
                     result_ty: ValueType::Unsigned,
                 },
-            ) if result == end && op == "sub" => Some((lhs.clone(), rhs.clone())),
+            ) if result == &end && op == "sub" => Some((lhs.clone(), rhs.clone())),
             _ => None,
         })
     else {
         return false;
     };
+    let lhs = resolve_block_alias(graph, &lhs).unwrap_or(lhs);
+    let rhs = resolve_block_alias(graph, &rhs).unwrap_or(rhs);
     let has_len = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
         op.result.as_ref() == Some(&lhs)
-            && matches!(&op.kind, OpKind::ArrayLen { base, .. } if base == slice)
+            && matches!(&op.kind, OpKind::ArrayLen { base, .. }
+                if resolve_block_alias(graph, base).as_ref() == Some(&slice))
     });
     let has_one = graph
         .blocks
