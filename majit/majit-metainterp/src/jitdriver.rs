@@ -4359,13 +4359,40 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.clear_trace_session();
                 }
                 TraceAction::AbortPermanent => {
-                    if self.meta.bridge_info().is_some() {
+                    // The permanent answer belongs to a PRIMARY trace, where the
+                    // green key names the code the walk gave up on: that is
+                    // `codewriter/policy.py look_inside_graph` answering "no" for
+                    // the graph, and `JC_DONT_TRACE_HERE` is the same terminal
+                    // state — never traced here, never inlined from elsewhere.
+                    //
+                    // A bridge session's green key names the SOURCE LOOP instead
+                    // (`start_retrace_from_guard` builds its `TraceCtx` with the
+                    // key it looked the compiled loop up by), while the
+                    // coordinate the walk could not record lies in the guard's
+                    // resume region.  Retiring it would answer for a loop that
+                    // already compiled, and answer twice: `abort_tracing(key,
+                    // true)` runs `disable_noninlinable_function`, whose flag is
+                    // both what refuses a later trace at that key and what
+                    // `can_inline_callable` (`warmstate.py`) reads — so one
+                    // unrecordable opcode reached from one guard made the whole
+                    // enclosing function permanently non-inlinable everywhere.
+                    // Upstream never reaches that flag from here: `pyjitpl.py`
+                    // `handle_guard_failure` answers a `SwitchToBlackhole` with
+                    // `run_blackhole_interp_to_cancel_tracing`, whose only
+                    // bookkeeping is `aborted_tracing(stb.reason)`, and
+                    // `disable_noninlinable_function` is reached from the
+                    // `ABORT_TOO_LONG` arm of `blackhole_if_trace_too_long`
+                    // alone — which names the huge function's greenkey, not the
+                    // trace's.
+                    let is_bridge = self.meta.bridge_info().is_some();
+                    if is_bridge {
+                        crate::mc_diag_bump(82); // bridge_abort_permanent
                         crate::debug::log_one("jit-abort", "AbortPermanent during bridge tracing");
                     }
                     if self.bridge_attempt_declined {
                         crate::mc_diag_bump(52); // abort_after_declined
                     }
-                    self.meta.abort_trace(true);
+                    self.meta.abort_trace(!is_bridge);
                     self.sym = None;
                     // The session ends here, so the latch must not outlive it. The
                     // sibling `bridge_body_start_op_count` is cleared on the
@@ -8805,6 +8832,72 @@ mod tests {
         assert_eq!(
             delivered, ESCAPING_EXC,
             "the exception the trace finished with must survive the compile half",
+        );
+    }
+
+    /// `TraceAction::AbortPermanent` retires the trace's green key through
+    /// `abort_trace(true)` -> `disable_noninlinable_function`.  For a PRIMARY
+    /// trace that key names the code the walk gave up on, which is
+    /// `codewriter/policy.py look_inside_graph` answering "no".  A BRIDGE's
+    /// green key names the SOURCE LOOP instead — a loop that already compiled
+    /// — and `JC_DONT_TRACE_HERE` is also what `can_inline_callable`
+    /// (`warmstate.py`) reads, so the permanent answer additionally made the
+    /// whole enclosing function non-inlinable everywhere.  `pyjitpl.py`
+    /// `handle_guard_failure` never reaches that flag: its unwind ends in
+    /// `run_blackhole_interp_to_cancel_tracing` -> `aborted_tracing(reason)`.
+    ///
+    /// Both halves run in one test so the assertion is a difference between
+    /// the two sessions, not a claim about `AbortPermanent` in general.
+    #[test]
+    fn an_abort_permanent_on_a_bridge_does_not_retire_the_source_loop() {
+        #[derive(Debug)]
+        struct BridgeOriginDescr;
+        impl majit_ir::Descr for BridgeOriginDescr {}
+
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+
+        let primary_pc = 7usize;
+        let primary_key = primary_pc as u64;
+        driver.force_start_tracing(primary_key, primary_pc, &mut state, &());
+        assert!(driver.is_tracing(), "fixture: the primary trace started");
+        driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
+        assert!(
+            !driver
+                .meta
+                .warm_state_mut()
+                .can_inline_callable(primary_key),
+            "a primary AbortPermanent must retire the key it names",
+        );
+
+        let bridge_pc = 11usize;
+        let bridge_key = bridge_pc as u64;
+        driver.force_start_tracing(bridge_key, bridge_pc, &mut state, &());
+        assert!(driver.is_tracing(), "fixture: the bridge trace started");
+        driver
+            .meta
+            .set_bridge_trace_info(crate::pyjitpl::BridgeTraceInfo {
+                green_key: bridge_key,
+                trace_id: 1,
+                fail_index: 0,
+                code_ptr: 0,
+                source_descr: std::sync::Arc::new(BridgeOriginDescr),
+            });
+        let before = crate::mc_diag(82);
+        driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
+        assert!(
+            driver.meta.warm_state_mut().can_inline_callable(bridge_key),
+            "an AbortPermanent reached from a guard retired the source loop",
+        );
+        // `MC_DIAG` is a process-wide static, so a concurrent test can only
+        // inflate the delta.
+        assert!(
+            crate::mc_diag(82) > before,
+            "the bridge arm must name itself in slot 82",
         );
     }
 
