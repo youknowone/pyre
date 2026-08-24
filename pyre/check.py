@@ -4772,10 +4772,18 @@ def main():
     #
     # A positional binary names one built somewhere else, so `build/llbc/` was
     # not among its inputs and says nothing about it — the reason
-    # `require_fresh_artefacts` skips its stamp on the same argument. The wasm
-    # runner is the exception: the module it loads is still this tree's, and
-    # building that module is what reads the LLBC.
-    if args.no_build and (not args.pyre_path or backends == ["wasm"]):
+    # `require_fresh_artefacts` skips its stamp on the same argument. An
+    # external wasm runner is the exception, but only while the module it loads
+    # is this tree's, because building that module is what reads the LLBC: a
+    # `PYRE_WASM_MODULE` naming one built elsewhere leaves neither artefact
+    # described by these offsets, and refusing that pair would contradict the
+    # arm below, which stamps such a module instead of rejecting it. A module
+    # that does not exist answers False here and is left to the existence check
+    # below, which says far more about it than a stale-LLBC message would.
+    local_wasm_only = backends == ["wasm"] and same_file(
+        effective_wasm_module(), WASM_MODULE_PATH
+    )
+    if args.no_build and (not args.pyre_path or local_wasm_only):
         require_fresh_llbc()
 
     for backend in backends:
