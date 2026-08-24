@@ -1458,6 +1458,23 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::issubtype_slow_and_wrong",
         crate::baseobjspace::issubtype_slow_and_wrong,
     );
+    // Two helpers a descent reaches on an executed path and cannot get past:
+    // neither is given a jitcode, so the codewriter residualizes the call, and
+    // an unpublished residual carries a symbolic funcbox the walker refuses
+    // (`OrthodoxSubWalkTraceUnsupported`). Both signatures are one machine
+    // word per argument and one result word, so the typed helpers bind them.
+    upa1(
+        &mut entries,
+        "pyre_interpreter::builtins::abs_uses_builtin",
+        "pyre_interpreter::abs_uses_builtin",
+        crate::builtins::abs_uses_builtin,
+    );
+    upa3(
+        &mut entries,
+        "pyre_object::bytearrayobject::w_bytearray_find",
+        "pyre_object::w_bytearray_find",
+        pyre_object::bytearrayobject::w_bytearray_find,
+    );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
     // `dictmultiobject::dict_view_iterator_gc_type_id` read the
