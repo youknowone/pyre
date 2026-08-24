@@ -2,6 +2,14 @@
 //! reach application-level Python, and therefore a collection.
 //!
 //! Usage: `cargo run -p majit-translate --release --example gc-root-reachability -- <file.ullbc>...`
+//!
+//! The donor set is not a matter of taste; see `GC_JOIN_WITH` below.  For the
+//! interpreter the answer is
+//!
+//! ```text
+//! GC_JOIN_WITH=build/llbc/pyre-jit.ullbc,build/llbc/pyre-object.ullbc,build/llbc/majit-rlib.ullbc \
+//!   ./target/release/examples/gc-root-reachability build/llbc/pyre-interpreter.ullbc
+//! ```
 
 use majit_translate::memory::gctransform::{framework, liveness};
 
@@ -21,6 +29,33 @@ fn main() {
     // Donors are loaded once and their `Llbc` dropped: only the graph is kept,
     // because holding two multi-hundred-megabyte artefacts open at once is what
     // the memory goes to.
+    //
+    // `pyre-object.ullbc` is not optional either, and leaving it out fails
+    // quietly rather than loudly.  `gc_hook::try_gc_alloc_collecting_rooted` --
+    // the hook every host-side collecting allocation goes through -- occurs 16
+    // times in `pyre-object.ullbc` and **zero** times in
+    // `pyre-interpreter.ullbc` (a nonsense pattern scores zero in both, so the
+    // search is not the thing that is broken).  Charon inlines only the callees
+    // a crate reaches, and 1359 `pyre_object` bodies is not the whole crate.
+    // Joined with `pyre-jit.ullbc` alone the run therefore reports that seed as
+    // UNMATCHED and then answers, measured 2026-08-24 over the same artefacts:
+    //
+    // | | jit only | + pyre-object | + majit-rlib |
+    // |---|---|---|---|
+    // | can reach a collection | 5365 | 6856 | 6899 |
+    // | brackets reaching NO collection | 262 | 3 | 3 |
+    // | unbracketed collecting calls, live ref | 1331 | 2066 | 2066 |
+    //
+    // The middle row is the one that misleads: 262 `push_roots` brackets read
+    // as protecting nothing, and every one of them was a false report of a
+    // pointless bracket.  Only the two `standalone_*` seeds stay unmatched with
+    // all three donors, and those are the no-GC-box test configuration, so
+    // their absence from a production artefact is the correct answer.
+    //
+    // What did NOT move across the three runs: tier 1 (10 calls in 8 fns),
+    // tier 1.5 (0), and frames carried across a collecting call (0).  The
+    // move-hazard verdict is donor-independent; only the liveness backlog is
+    // not.
     let donors: Vec<String> = std::env::var("GC_JOIN_WITH")
         .ok()
         .map(|v| {
