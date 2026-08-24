@@ -128,6 +128,18 @@ pub const W_SET_GC_TYPE_ID: u32 = 30;
 /// GC-managed element table shared by `set` and `frozenset` bodies.
 pub type SetItemsStorage = indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>;
 
+/// Remove the entry at `index` in O(1).
+///
+/// `rordereddict.py _ll_dict_del_entry` marks the slot dummy so remaining
+/// keys keep their order. `IndexMap` has no dummy, and `shift_remove_index`
+/// is O(n) in the tail — discarding the first of n keys n times is
+/// quadratic. `swap_remove_index` is the O(1) primitive. Set iteration
+/// order after a mid-table delete is unspecified (sets are unordered); a
+/// dummy port is the rordereddict convergence.
+unsafe fn set_remove_index(items: *mut SetItemsStorage, index: usize) {
+    let _ = (*items).swap_remove_index(index);
+}
+
 // PyPy serializes set strategy/storage operations with the GIL. Pyre is
 // free-threaded, so use the same narrow address-striped reentrant-lock
 // adaptation as listobject and dictmultiobject. Semantic state remains on
@@ -562,7 +574,7 @@ pub unsafe fn w_set_discard_key_checked(
         }
         match index {
             Some(index) => {
-                (*s.items).shift_remove_index(index);
+                set_remove_index(s.items, index);
                 s.len = (*s.items).len();
                 s.hash = -1;
                 true
@@ -579,7 +591,7 @@ pub unsafe fn w_set_discard_key_checked(
     if let Some(index) = found {
         // Remove from the captured box; a `clear` during the probe orphans it,
         // leaving the live storage untouched (`discard` of an absent element).
-        (*items).shift_remove_index(index);
+        set_remove_index(items, index);
         let s = &mut *(obj as *mut W_SetObject);
         s.len = (*s.items).len();
         s.hash = -1;
@@ -999,7 +1011,7 @@ unsafe fn w_set_remove_key_for_update(
             return;
         }
         if let Some(index) = index {
-            (*items).shift_remove_index(index);
+            set_remove_index(items, index);
             let set = &mut *(dst as *mut W_SetObject);
             set.len -= 1;
             set.hash = -1;
@@ -1044,7 +1056,7 @@ unsafe fn w_set_remove_key_for_update(
             i += 1;
         }
         if let Some(index) = found {
-            (*items).shift_remove_index(index);
+            set_remove_index(items, index);
             let set = &mut *(dst as *mut W_SetObject);
             set.len -= 1;
             set.hash = -1;
@@ -1191,6 +1203,27 @@ mod tests {
             assert!(!w_set_discard(s, w_int_new(99)));
             assert_eq!(w_set_len(s), 1);
             assert!(w_set_contains(s, w_int_new(2)));
+        }
+    }
+
+    #[test]
+    fn discard_from_the_front_keeps_later_members() {
+        install_test_hash_hook();
+        let s = w_set_new();
+        unsafe {
+            for i in 0..64 {
+                w_set_add(s, w_int_new(i));
+            }
+            for i in 0..32 {
+                assert!(w_set_discard(s, w_int_new(i)));
+            }
+            assert_eq!(w_set_len(s), 32);
+            for i in 0..32 {
+                assert!(!w_set_contains(s, w_int_new(i)));
+            }
+            for i in 32..64 {
+                assert!(w_set_contains(s, w_int_new(i)));
+            }
         }
     }
 
