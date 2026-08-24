@@ -86,8 +86,66 @@ pub mod frame_locals_proxy {
             unsafe { &mut *(self.w_frame as *mut PyFrame) }
         }
 
+        /// Materialize the viewed frame's `locals_cells_stack_w`.
+        ///
+        /// `rvirtualizable.py hook_access_field` puts the force at the field
+        /// access.  The `f_locals` getter forces once, when it builds the
+        /// proxy, and a proxy is a live view that outlives that force: bind one
+        /// before a loop the JIT afterwards compiles and the two sides stop
+        /// agreeing.  Both directions diverge, and each needs a store in the
+        /// loop *body* to show, because a store outside it precedes the compile:
+        ///
+        /// - a write through the proxy lands in the frame array while the
+        ///   compiled loop answers that local from its shadow;
+        /// - a `STORE_FAST` in the body lands in the shadow while a read
+        ///   through the proxy answers from the array.
+        ///
+        /// Only the write takes this.  **The read direction cannot, yet**, and
+        /// the reason is the missing injection rather than a preference:
+        /// `hook_access_field` runs in residual code, while inside a trace the
+        /// same accesses are *redirected* to the shadow, so upstream never
+        /// forces from a traced read -- `pyframe.py fast2locals` is
+        /// `@jit.unroll_safe` for exactly that reason.  Pyre cannot tell the two
+        /// apart at this call, so forcing on every read forces the traced ones
+        /// too; measured, that aborts the loop where a hot `len(fr.f_locals)` or
+        /// `fr.f_locals["x"]` sits in the traced body.  Telling them apart needs
+        /// the redirected-field injection itself.
+        ///
+        /// [`Self::frame`] does not take it either: [`Self::fast_local_index`]
+        /// goes through it only for `code`, which is not a redirected field.
+        ///
+        /// The `vable_token` test is `virtualizable.py`'s, and it is required
+        /// rather than a shortcut:
+        ///
+        /// ```text
+        /// def force_virtualizable_if_necessary(virtualizable):
+        ///     if virtualizable.vable_token:
+        ///         force_now(virtualizable)
+        /// ```
+        ///
+        /// The backend hook behind `force_frame` signals a frame escape before
+        /// it tests any token, and a proxy write reached while this frame is
+        /// being traced holds no token.  Calling it there raises an escape with
+        /// no committed resume pc, so the walk replays from entry and
+        /// double-applies the residual's body effects; measured, that aborts
+        /// the loop and leaves a name string where the operand stack expects
+        /// its iterator.  The token is set only once compiled code owns the
+        /// frame, which is exactly when the write has a shadow to reach.
+        fn force_locals(&self) {
+            let frame = self.w_frame as *mut PyFrame;
+            if unsafe { (*frame).vable_token } == 0 {
+                return;
+            }
+            // The force materializes through a backend hook this crate cannot
+            // follow and is judged as able to collect, so the frame is
+            // anchored across it.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+            crate::executioncontext::force_frame_before_locals_read(anchor.live());
+        }
+
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
+            // No force here; see [`Self::force_locals`] on the read direction.
             self.frame().frame_locals_proxy_snapshot()
         }
 
@@ -188,6 +246,11 @@ pub mod frame_locals_proxy {
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.publish(&[key, value]);
             roots.normalize(key_slot, 2);
+            // The stores below target `locals_cells_stack_w`, so materialize it
+            // first.  The force follows the publish rather than preceding the
+            // region: it can collect, and `key` and `value` are pre-allocation
+            // copies until they are rooted.
+            self.force_locals();
             let value_slot = key_slot + 1;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
                 let frame = self.frame();
@@ -231,6 +294,7 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
+            // No force here; see [`Self::force_locals`] on the read direction.
             // Hashing runs before the scan, so an unhashable key is a
             // `TypeError` even for a frame with no locals to compare against.
             let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;

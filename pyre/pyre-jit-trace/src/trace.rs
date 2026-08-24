@@ -1128,6 +1128,9 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // leftover here would restore wrong-generation locals onto a frame many
     // iterations ahead.
     crate::jitcode_dispatch::discard_escape_flush_undo();
+    // And the record of a frame an earlier walk forced without writing, so it
+    // cannot decline this walk's blackhole adopt.
+    crate::jitcode_dispatch::reset_unflushed_escaped_callee();
     // `TraceCtx.reads_module_global` needs no reset here: a fresh TraceCtx is
     // built per trace (zero-init `false`), unlike the walk-end TLS flags above.
     // Likewise clear any no-replay finish payload a prior trace left
@@ -2985,6 +2988,33 @@ fn try_adopt_multi_frame_blackhole(
             return false;
         };
         per_frame.push((frame_ptr, frame_stack_base));
+    }
+    // A level whose frame a residual forced WITHOUT writing cannot be resumed.
+    // `flush_active_frame_escape` matches two disjuncts — the traced
+    // virtualizable itself, and an inline callee published on the execution
+    // context — and its own flush is keyed on the traced virtualizable, so for
+    // the second disjunct it writes the callee's locals region from that
+    // level's `CalleeLocalsShadow` instead.  When the shadow cannot supply the
+    // whole region the frame is recorded here, and the array keeps whatever it
+    // held before the compiled trace ran: every local the trace was holding in
+    // a register for that frame is absent, and a level resumed on it reads
+    // those slots as Python NULL.  The witness is an `f_locals` write in the
+    // resumed tail of a recursive callee, where the following `LOAD_FAST` of a
+    // local assigned one line earlier lowers to `getarrayitem_vable_r` and
+    // answers NULL (`TypeError: comparison on null operand`).
+    //
+    // `virtualizable.py write_boxes` has no decline, so upstream never reaches
+    // this state; declining is the sound answer for the residue, and the walk
+    // keeps the legacy escape/replay path, which re-runs the region in the
+    // interpreter.
+    let unflushed = crate::jitcode_dispatch::unflushed_escaped_callee();
+    if unflushed != 0
+        && let Some(index) = per_frame
+            .iter()
+            .position(|&(frame_ptr, _)| frame_ptr as usize == unflushed)
+    {
+        mfdbg!("frame {index}: {unflushed:#x} was forced without a locals write");
+        return false;
     }
     // The walked frame has two representations here: `cf_addr` is the
     // `snapshot_for_tracing` copy the walk steps concretely, and
