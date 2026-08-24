@@ -1,9 +1,14 @@
+# pyre-check: platforms=darwin,linux
 # CPython-suite gap: test__locale guards every `nl_langinfo` assertion behind
 # `hasattr(locale, name)`, so a module that publishes none of the item keys
 # skips the whole file.
 # parity-tests reason: `_locale.nl_langinfo` accepted any key, but 54 of the
 # 55 names `_localemodule.c langinfo_constants` publishes were absent, so the
 # only key that could be spelled was `CODESET`.
+
+# Windows has no `<langinfo.h>` and no `nl_langinfo`, so the whole family is
+# absent there on every interpreter; the test is scoped to the hosts that
+# carry it.
 
 # `<langinfo.h>` numbers the items per platform — the BSD headers count from
 # zero while glibc packs the category into the high bits — so the test reads

@@ -1,3 +1,4 @@
+# pyre-check: platforms=darwin,linux
 # CPython-suite gap: test_signal never asks for a signal number above the
 # platform's range, so nothing in the suite reads the bound back.
 # parity-tests reason: `NSIG` was a single 64 on every unix, so `getsignal`
@@ -11,7 +12,9 @@
 
 # `NSIG` is what `Py_NSIG` names: one past the highest signal the platform
 # has.  It is 32 on darwin and 65 under glibc, so every assertion below is
-# written against the value rather than a literal.
+# written against the value rather than a literal.  Windows counts its own
+# 23 but has neither `SIGUSR1` nor the POSIX delivery model, so it is out of
+# scope here.
 
 import signal
 
@@ -31,12 +34,14 @@ for out_of_range in (0, NSIG, NSIG + 1, NSIG + 8):
         else:
             raise AssertionError(f"{name}({out_of_range}) did not raise")
 
-# `valid_signals()` is bounded by the same number, so every member it reports
-# is a named signal rather than a bare int.
+# `valid_signals()` sweeps `sigismember` over the same half-open range, so
+# nothing it reports can sit at or past the bound.  Membership is not
+# enum-membership: glibc's realtime signals have no `Signals` name and come
+# back as plain ints on every interpreter.
 valid = signal.valid_signals()
 assert valid, valid
 for sig in valid:
-    assert isinstance(sig, signal.Signals), (sig, type(sig))
+    assert isinstance(sig, int), (sig, type(sig))
     assert 1 <= sig < NSIG, sig
 
 # The pending-signal bits are still delivered after the bound moved.
