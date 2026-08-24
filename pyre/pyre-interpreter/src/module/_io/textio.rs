@@ -973,33 +973,36 @@ impl W_TextIOWrapper {
         Some(unsafe { &*(stream as *const Self) }.write_newline())
     }
 
-    /// Whether `stream` writes a `str` as the strict utf-8 bytes `print()`'s
-    /// native path produces.
+    /// The error handler the native `print()` path has to render with, for a
+    /// `stream` whose codec that path can spell at all.
     ///
     /// `print()` short-circuits the unmodified `sys.stdout` to `print_output`,
-    /// which renders strict utf-8 and hands those bytes to the descriptor. That
-    /// is what the stream itself would have written only while its codec is
-    /// utf-8 and its handler is `strict`: under `PYTHONIOENCODING=cp424`,
+    /// which writes utf-8 bytes straight to the descriptor, so the
+    /// short-circuit stands in for the stream's own `write` only while the
+    /// stream's codec is utf-8: under `PYTHONIOENCODING=cp424`,
     /// `sys.stdout.write(chr(0xa2))` writes `b'J'` where the native path writes
-    /// `b'Â¢'`. `reconfigure` rewrites both fields, so this follows it.
+    /// `b'\xc2\xa2'`. Both handlers pyre's own standard streams take -- `strict`
+    /// and the `surrogateescape` a C/POSIX locale asks for -- are spelled by
+    /// `encode_object`, and they part company only for a string holding a
+    /// surrogate. `reconfigure` rewrites both fields, so this follows it.
     ///
-    /// False for a stream this did not build: it states no codec here, and the
-    /// caller has to go through `write`.
-    pub fn stdio_renders_strict_utf8(stream: PyObjectRef) -> bool {
+    /// `None` for every other stream, including one this did not build: it
+    /// states no codec here, and the caller has to go through `write`.
+    pub fn stdio_native_print_errors(stream: PyObjectRef) -> Option<&'static str> {
         if stream.is_null()
             || !std::ptr::eq(
                 unsafe { pyre_object::ll_type(stream) },
                 <Self as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
             )
         {
-            return false;
+            return None;
         }
         let payload = unsafe { &*(stream as *const Self) };
         let (Some(encoding), Some(errors)) = (
             unsafe { pyre_object::w_str_get_value_opt(payload.w_encoding) },
             unsafe { pyre_object::w_str_get_value_opt(payload.w_errors) },
         ) else {
-            return false;
+            return None;
         };
         // `encodings.normalize_encoding` folds case and separators, so the
         // aliases `utf8`, `utf-8` and `UTF_8` all name the same codec.
@@ -1008,7 +1011,14 @@ impl W_TextIOWrapper {
             .filter(|c| !matches!(c, '-' | '_'))
             .flat_map(char::to_lowercase)
             .collect();
-        errors == "strict" && normalized == "utf8"
+        if normalized != "utf8" {
+            return None;
+        }
+        match errors {
+            "strict" => Some("strict"),
+            "surrogateescape" => Some("surrogateescape"),
+            _ => None,
+        }
     }
 
     /// Give a stream [`allocate_stdio`] built the encoder and decoder it had to

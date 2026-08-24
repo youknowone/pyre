@@ -3832,18 +3832,24 @@ fn print_sep_check(
     )))
 }
 
-/// Render `str(obj)` for writing to the (utf-8, strict) stdout stream.  The
-/// common all-UTF-8 result is returned directly; a lone surrogate is routed
-/// through `encode_object`'s strict handler, raising `UnicodeEncodeError`
-/// rather than panicking in `w_str_get_value`.
-unsafe fn print_render(obj: PyObjectRef) -> Result<String, crate::PyError> {
+/// Write `str(obj)` to the native stdout path under the stream's own error
+/// handler.
+///
+/// The common all-UTF-8 result goes out as it stands, which is what either
+/// handler produces for it.  A lone surrogate is routed through
+/// `encode_object` rather than panicking in `w_str_get_value`: `strict` raises
+/// `UnicodeEncodeError` there, and `surrogateescape` spells the escape as the
+/// byte it stands for, which is no longer a `str`.
+unsafe fn print_emit_native(obj: PyObjectRef, errors: &str) -> Result<(), crate::PyError> {
     let w = unsafe { crate::py_str_wtf8(obj)? };
     if let Ok(s) = w.as_str() {
-        return Ok(s.to_owned());
+        crate::print_output(s);
+        return Ok(());
     }
     let s_obj = pyre_object::w_str_from_wtf8(w);
-    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
-    Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
+    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", errors)?;
+    crate::print_output_bytes(&bytes);
+    Ok(())
 }
 
 /// A text stream's `encoding`/`errors` (defaults `utf-8`/`strict`), read so a
@@ -3867,10 +3873,10 @@ unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
 /// `sys.stdout = ...` redirects `print()`.
 enum DefaultPrintTarget {
     /// Unmodified default stdout (`sys.stdout is sys.__stdout__`) still
-    /// configured for the codec the native path renders: keep pyre's
-    /// `print_output` path (its strict-utf-8 `print_render` render and direct
-    /// write), leaving default output and surrogate handling unchanged.
-    Native,
+    /// configured for a codec the native path renders: keep pyre's
+    /// `print_output` path (its `print_emit_native` render and direct write),
+    /// carrying the stream's own error handler for the surrogate case.
+    Native(&'static str),
     /// A `sys.stdout` the native path cannot stand in for -- rebound, or the
     /// default stream under a codec other than strict utf-8; write through its
     /// `write` / `flush` methods.
@@ -3890,7 +3896,7 @@ enum DefaultPrintTarget {
 fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
     let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
         // No `sys` yet (very early bootstrap) — native path.
-        return Ok(DefaultPrintTarget::Native);
+        return Ok(DefaultPrintTarget::Native("strict"));
     };
     let stdout = match crate::baseobjspace::getattr_str(sys_mod, "stdout") {
         Ok(w) => w,
@@ -3904,9 +3910,9 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
     }
     if let Ok(orig) = crate::baseobjspace::getattr_str(sys_mod, "__stdout__")
         && std::ptr::eq(orig, stdout)
-        && crate::module::_io::W_TextIOWrapper::stdio_renders_strict_utf8(stdout)
+        && let Some(errors) = crate::module::_io::W_TextIOWrapper::stdio_native_print_errors(stdout)
     {
-        return Ok(DefaultPrintTarget::Native);
+        return Ok(DefaultPrintTarget::Native(errors));
     }
     Ok(DefaultPrintTarget::Rebound(stdout))
 }
@@ -4124,11 +4130,13 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // With no explicit `file` (absent or `file=None`), the sink is the live
     // `sys.stdout`, resolved per call so a Python-level rebinding redirects
     // `print()`.  The unmodified default keeps the native path (`file = None`).
-    let file = match file {
-        Some(f) => Some(f),
+    // `native_errors` is read only on the native path, i.e. only where `file`
+    // came back `None`; an explicit `file=` never reaches it.
+    let (file, native_errors) = match file {
+        Some(f) => (Some(f), "strict"),
         None => match resolve_default_print_target()? {
-            DefaultPrintTarget::Native => None,
-            DefaultPrintTarget::Rebound(fp) => Some(fp),
+            DefaultPrintTarget::Native(errors) => (None, errors),
+            DefaultPrintTarget::Rebound(fp) => (Some(fp), "strict"),
             DefaultPrintTarget::Silent => return Ok(w_none()),
         },
     };
@@ -4157,9 +4165,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `print_render`.
     let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
         let Some(file_slot) = file_slot else {
-            let s = unsafe { print_render(source)? };
-            crate::print_output(&s);
-            return Ok(());
+            return unsafe { print_emit_native(source, native_errors) };
         };
         let s_obj = pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_str_wtf8(source)? });
         // `s_obj` is a fresh managed str reachable only through this Rust local.
@@ -4270,9 +4276,8 @@ fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
     let part_slot = roots.base();
     let _ = roots.pin_root(part);
     match resolve_default_print_target()? {
-        DefaultPrintTarget::Native => {
-            let s = unsafe { print_render(roots.get(part_slot))? };
-            crate::print_output(&s);
+        DefaultPrintTarget::Native(errors) => {
+            unsafe { print_emit_native(roots.get(part_slot), errors)? };
         }
         DefaultPrintTarget::Rebound(fp) => {
             let r = crate::baseobjspace::call_method(fp, "write", &[roots.get(part_slot)]);

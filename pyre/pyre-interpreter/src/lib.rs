@@ -1390,6 +1390,29 @@ pub fn stdio_newline(stream_name: &str) -> Option<&'static str> {
     stated.unwrap_or(platform_default)
 }
 
+/// Write already-encoded bytes through the print hook (if set) or stdout.
+///
+/// The bytes are what `sys.stdout`'s own encoder would have produced, which the
+/// native `print()` path stands in for only while that encoding is utf-8 --
+/// [`stdio_line_endings_bytes`] substitutes at the byte level, which no wider
+/// encoding survives. Only a string holding a surrogate reaches here: every
+/// other render is a `str` and takes [`print_output`].
+pub fn print_output_bytes(bytes: &[u8]) {
+    let bytes = stdio_line_endings_bytes(bytes, "stdout");
+    let bytes = bytes.as_ref();
+    if print_hook_emit_bytes(bytes) {
+        return;
+    }
+    #[cfg(all(unix, feature = "sandbox"))]
+    let _ = crate::host_seam::ops::write(1, bytes);
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().lock().write_all(bytes);
+    }
+    crate::host_seam::flush_stdout_when_unbuffered();
+}
+
 /// Write a string through the print hook (if set) or stdout.
 pub fn print_output(s: &str) {
     // `print()` writing to the unmodified `sys.stdout` short-circuits to here
