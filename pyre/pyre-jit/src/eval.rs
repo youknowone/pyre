@@ -14288,11 +14288,12 @@ mod tests {
         let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
         assert!(!w_code.is_null());
 
-        let hash = green_key_from_pycode(17, w_code).expect("nonnull PyCode has a green key");
-        let typed =
-            green_key_typed_from_pycode(17, w_code).expect("nonnull PyCode has a typed green key");
+        let hash =
+            green_key_from_pycode(17, false, w_code).expect("nonnull PyCode has a green key");
+        let typed = green_key_typed_from_pycode(17, false, w_code)
+            .expect("nonnull PyCode has a typed green key");
 
-        assert_eq!(hash, make_green_key(w_code.cast(), 17));
+        assert_eq!(hash, make_green_key(w_code.cast(), 17, false));
         assert_eq!(typed.get_uhash(), hash);
     }
 
