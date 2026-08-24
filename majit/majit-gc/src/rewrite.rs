@@ -1674,8 +1674,21 @@ impl GcRewriterImpl {
     /// `MiniMarkGC::try_alloc_young_nonmoving_clear`, which the collecting
     /// `alloc_with_type` entry points take for an oversized object — but these
     /// helpers still route through `alloc_oldgen_typed`, so the reasoning above
-    /// is unchanged until they are moved onto it.  Moving them is what would
-    /// earn the stamp back.
+    /// is unchanged.
+    ///
+    /// Moving them onto it is necessary but *not* sufficient, because the stamp
+    /// is a compile-time claim and pyre's birth is a runtime decision.  Upstream
+    /// may stamp unconditionally: its large arm is
+    /// `external_malloc(typeid, 0, alloc_young=True)` with no other outcome.
+    /// pyre's would fall back to the born-old birth on three of them — a type
+    /// carrying a destructor or the weakref flag, `MAJIT_GC_YOUNG_RAWMALLOC=0`,
+    /// and a failed young allocation — and an old result under an elided
+    /// barrier loses the first young pointer stored into it.  So the stamp
+    /// needs the birth to be decidable where it is emitted: a descr-level
+    /// predicate for the plain-type half, in the shape `SizeDescr::non_moving`
+    /// already uses, and the rollback gate read at rewrite time rather than
+    /// only in the collector.  Until both hold, moving the helpers alone would
+    /// make the stamp wrong rather than earn it.
     ///
     /// pyre is framework-GC only; the Boehm `else` arm
     /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
