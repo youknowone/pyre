@@ -1978,33 +1978,19 @@ pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_glob
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
-/// Whether a line table records no position for any instruction.
-///
-/// A `None`-kind entry is the spelling for "this instruction has no line",
-/// which `co_positions()` reports as `None`; every other kind carries one,
-/// `NoColumns` included, which drops the columns and keeps the line.  A
-/// `None` entry has no payload, so a table made only of them can be walked a
-/// byte at a time and any other kind ends the walk at its first byte.
-fn linetable_records_no_position(linetable: &[u8]) -> bool {
-    linetable.iter().all(|&byte| {
-        byte & 0x80 != 0
-            && (byte >> 3) & 0x0f == crate::bytecode::PyCodeLocationInfoKind::None as u8
-    })
-}
-
 /// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
 /// Matches RPython: negative `stopat` means "frame not yet started", returns
 /// first-line.
 ///
-/// The same row lookup as [`crate::pycode::w_code_addr2line`], which takes the
-/// byte offset `tb_lasti` carries rather than an instruction index and reports
-/// a miss instead of clamping.  This one clamps to the first line, so it can
-/// never express the `None` a `tb_lineno` read answers.
+/// [`crate::pycode::w_code_addr2line`] with the instruction index converted to
+/// the byte offset `tb_lasti` carries.  `-1` is its miss, the value upstream
+/// returns from the same zero-length walk and the value both readers of a line
+/// number render as `None`; it is also `LINENO_NOT_COMPUTED`, so a traceback
+/// node stamped with it resolves lazily and answers `None` there too.
 #[inline]
-pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
+pub fn offset2lineno(code: &CodeObject, stopat: isize) -> isize {
     let addrq = (stopat as i64).saturating_mul(2);
-    crate::pycode::w_code_addr2line(code, addrq)
-        .unwrap_or_else(|| code.first_line_number.map_or(1, |n| n.get()))
+    crate::pycode::w_code_addr2line(code, addrq).map_or(-1, |line| line as isize)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -4230,6 +4216,12 @@ impl PyFrame {
     }
 
     /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
+    ///
+    /// `-1` is `PyFrame_GetLineNumber`'s no-line answer, which
+    /// [`PyFrame::fget_f_lineno`] renders as `None`.  It reaches here for a
+    /// replacement `co_linetable` that describes no range covering
+    /// `last_instr` — including an empty one — and for the `NO_LOCATION`
+    /// ranges a compiler-generated cleanup sits in.
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
         self.get_lineno_at(self.last_instr)
@@ -4244,23 +4236,7 @@ impl PyFrame {
     /// coordinate answers this read without one.
     #[inline]
     pub fn get_lineno_at(&self, last_instr: isize) -> isize {
-        // A line table that records no position at all reports ``f_lineno is
-        // None`` rather than the code object's first line number.  The decoded
-        // `locations` cannot answer this: a `SourceLocation` always carries a
-        // line, so an entry that records none is padded out to the same value
-        // an entry that records a line without columns produces.  The raw
-        // table separates them.
-        if linetable_records_no_position(&self.code().linetable) {
-            return -1;
-        }
-        // CPython exposes ``None`` when a code object's line table has no
-        // usable entry for the current instruction.  Ruff's decoded
-        // zero-line entries reach us as line 0; preserve the frame getter's
-        // existing -1 sentinel instead of leaking that implementation value.
-        match offset2lineno(self.code(), last_instr) {
-            0 => -1,
-            lineno => lineno as isize,
-        }
+        offset2lineno(self.code(), last_instr)
     }
 
     /// pycode.py `_get_lineno_for_pc_tracing(frame.last_instr)` — the line a
@@ -4291,8 +4267,19 @@ impl PyFrame {
 
     /// pyframe.py fget_f_lineno — the line currently executing.
     ///
-    /// `None` when an untraced frame's line table yields no entry; the
-    /// `f_trace` test only selects the -1 fallback.
+    /// ```c
+    /// int lineno = PyFrame_GetLineNumber(f);
+    /// if (lineno < 0) {
+    ///     Py_RETURN_NONE;
+    /// }
+    /// return PyLong_FromLong(lineno);
+    /// ```
+    ///
+    /// `frame_getlineno` reads the same number whether or not the frame is
+    /// traced, so the `f_trace` test that used to substitute the code
+    /// object's first line for a missing one is gone: it stood in for a
+    /// resolver that answered `-1` only for a line table it could not decode,
+    /// and the resolver now answers `-1` wherever `PyCode_Addr2Line` does.
     #[inline]
     pub fn fget_f_lineno(&self) -> PyObjectRef {
         self.f_lineno_at(self.last_instr)
@@ -4302,25 +4289,15 @@ impl PyFrame {
     /// terms as [`Self::get_lineno_at`].
     ///
     /// The whole getter body stays here rather than being split across the
-    /// caller: the `f_trace` test, the `-1` sentinel and the `first_line_number`
-    /// fallback are one decision, and a caller reproducing part of it would
-    /// answer a differently-shaped read.
+    /// caller: the `-1` sentinel and the `None` it renders as are one
+    /// decision, and a caller reproducing part of it would answer a
+    /// differently-shaped read.
     #[inline]
     pub fn f_lineno_at(&self, last_instr: isize) -> PyObjectRef {
         let lineno = self.get_lineno_at(last_instr);
-        if self.get_w_f_trace().is_null() {
-            if lineno == -1 {
-                return pyre_object::w_none();
-            }
-            return pyre_object::w_int_new(lineno as i64);
+        if lineno < 0 {
+            return pyre_object::w_none();
         }
-        let lineno = if lineno == -1 {
-            self.code()
-                .first_line_number
-                .map_or(-1, |n| n.get() as isize)
-        } else {
-            lineno
-        };
         pyre_object::w_int_new(lineno as i64)
     }
 

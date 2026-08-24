@@ -321,11 +321,12 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// `walker_specialize_traceback_walk_field`, which folds the raw slot against
 /// a guard that it is not the sentinel.
 ///
-/// `record_application_traceback` still stamps the line eagerly, so a recorded
-/// node reaches the first branch and never resolves here.  That timing is not
-/// observable: `tb_lasti` and `tb_lineno` are read-only, so the only way to
-/// hand a live node a sentinel is the constructor, which lands in the second
-/// branch either way.
+/// `record_application_traceback` stamps the line eagerly, so a recorded node
+/// reaches the first branch — unless its `tb_lasti` names no line, where the
+/// eager walk answers `-1` and stamps the sentinel, and the resolution below
+/// runs and answers `None`.  That timing is not observable: `tb_lasti` and
+/// `tb_lineno` are read-only, so the only other way to hand a live node a
+/// sentinel is the constructor, which lands in the second branch either way.
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
@@ -434,12 +435,13 @@ pub unsafe fn record_application_traceback(
         crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number eagerly
-        // here rather than leaving the sentinel for the getter, so the
-        // slot never holds `LINENO_NOT_COMPUTED` for a node built here.
+        // here rather than leaving the sentinel for the getter.
         // `_PyTraceBack_FromFrame` records the sentinel instead and
         // `tb_lineno_get` resolves it, but a node's `tb_lasti` and
         // `tb_lineno` are both read-only there, so which of the two
-        // moments does the walk is not app-level observable.
+        // moments does the walk is not app-level observable.  An offset
+        // that names no line resolves to `-1`, which IS the sentinel, so
+        // such a node is stamped unresolved and reaches the getter.
         //
         // What the eager stamp buys is the JIT fold
         // `walker_specialize_traceback_walk_field` (pyre-jit-trace): it

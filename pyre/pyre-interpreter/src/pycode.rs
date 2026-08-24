@@ -77,6 +77,39 @@ impl<'a> PyCodeAddressRange<'a> {
         true
     }
 
+    /// `_PyCode_CheckLineNumber` — the line the byte offset `lasti` sits on,
+    /// or `-1` when the walk runs out of ranges before reaching it.
+    ///
+    /// ```c
+    /// while (bounds->ar_end <= lasti) {
+    ///     if (!advance(bounds)) {
+    ///         return -1;
+    ///     }
+    /// }
+    /// while (bounds->ar_start > lasti) {
+    ///     if (!retreat(bounds)) {
+    ///         return -1;
+    ///     }
+    /// }
+    /// return bounds->ar_line;
+    /// ```
+    ///
+    /// The retreat loop has no counterpart here: a range built by
+    /// [`PyCodeAddressRange::new`] starts before the first offset and this is
+    /// the only walker, so `ar_start` never runs past `lasti`.
+    ///
+    /// `-1` covers two answers upstream also conflates: an offset past the
+    /// last range, and an offset inside a `NO_LOCATION` range, which
+    /// [`PyCodeAddressRange::advance`] reports by leaving `ar_line` at `-1`.
+    fn check_line_number(&mut self, lasti: i32) -> i32 {
+        while self.ar_end <= lasti {
+            if !self.advance() {
+                return -1;
+            }
+        }
+        self.ar_line
+    }
+
     fn get_line_delta(&mut self, code: u8) -> i32 {
         let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
             return 0;
@@ -2972,8 +3005,8 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// table.  `pyframe::offset2lineno` carries the name but takes an instruction
 /// index, so this is the one a `tb_lasti` reaches.
 ///
-/// `addrq` counts bytes, two per instruction, so the row index is `addrq / 2`
-/// — the same conversion `traceback._get_code_position` makes app-level.
+/// `addrq` counts bytes, two per instruction — the same unit
+/// `traceback._get_code_position` works in app-level.
 ///
 /// EVERY negative offset names the code object's first line, which is the
 /// answer for a frame that has not run an instruction yet.  Upstream tests
@@ -2989,18 +3022,38 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// The `addrq < 0` arm above is 3.14's, and `traceback_lineno_sentinel.py`
 /// pins it.
 ///
-/// An offset past the last row answers `None`, and `tb_lineno` hands that back
-/// as `None`.  `_PyCode_CheckLineNumber` also answers `-1` for an in-range
-/// instruction that carries no line at all; pyre's rows cannot spell that,
-/// because `SourceLocation::line` is a `OneIndexed`.
+/// `None` is `_PyCode_CheckLineNumber`'s `-1`, which both readers of this
+/// answer render as `None`: `tb_lineno_get` and `frame_getlineno` each return
+/// `Py_None` for a line below zero.  It covers an offset past the last range
+/// AND an offset inside a `NO_LOCATION` range — the compiler-generated
+/// cleanup a `with` or a `try`/`finally` leaves at the end of a code object,
+/// which `co_positions` reports with a `None` line.
+///
+/// The walk goes through [`PyCodeAddressRange`], not [`code_locations`]: the
+/// expanded array holds a `SourceLocation` per instruction and its `line` is a
+/// `OneIndexed`, so a `NO_LOCATION` range comes back carrying whatever line
+/// preceded it.  Reading `linetable` directly is also what lets a zero
+/// `co_firstlineno` — which `CodeType(...)` and `code.replace` both accept and
+/// `OneIndexed` cannot hold — reach the answer, and it takes no lock, where
+/// the array is behind a process-global mutex once `w_code_new` releases it.
 pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
     if addrq < 0 {
-        return Some(code.first_line_number.map_or(1, |line| line.get()));
+        return usize::try_from(code_firstlineno_raw(code)).ok();
     }
-    let index = usize::try_from(addrq / 2).ok()?;
-    code_locations(code)
-        .get(index)
-        .map(|(start, _)| start.line.get())
+    let lasti = i32::try_from(addrq).unwrap_or(i32::MAX);
+    let mut bounds = PyCodeAddressRange::new(&code.linetable, code_firstlineno_raw(code));
+    usize::try_from(bounds.check_line_number(lasti)).ok()
+}
+
+/// The first line number `linetable` is decoded against, as the Python
+/// integer `co_firstlineno` answers rather than as a `OneIndexed`.
+///
+/// `CodeObject.first_line_number` is `None` for exactly the values
+/// `OneIndexed` cannot spell: both writers — the `CodeType(...)` constructor
+/// and `code.replace(co_firstlineno=...)` — take that branch on `<= 0`, and
+/// `replace` rejects a negative one, so `None` means zero.
+fn code_firstlineno_raw(code: &crate::CodeObject) -> i32 {
+    code.first_line_number.map_or(0, |line| line.get() as i32)
 }
 
 /// Whether the instruction at `pc` may be reported to a trace function as the
@@ -3756,9 +3809,9 @@ mod tests {
         assert_eq!(result, pyre_object::pyobject::PY_NULL);
     }
 
-    /// `PyCode_Addr2Line` on a real code object: the byte offset halves into a
-    /// row index, a negative offset names the first line, and an offset past
-    /// the last row reports no line at all.
+    /// `PyCode_Addr2Line` on a real code object: a negative offset names the
+    /// first line, an in-range offset names the line its range carries, and an
+    /// offset past the last range reports no line at all.
     #[test]
     fn w_code_addr2line_halves_the_offset_and_reports_a_miss() {
         let code = compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile failed");
@@ -3766,22 +3819,32 @@ mod tests {
         assert_eq!(w_code_addr2line(&code, -1), Some(firstlineno));
         assert_eq!(w_code_addr2line(&code, -2), Some(firstlineno));
 
-        let rows: Vec<usize> = code_locations(&code)
-            .iter()
-            .map(|(start, _)| start.line.get())
+        let count = code.instructions.len();
+        assert!(count > 0);
+        let lines: Vec<Option<usize>> = (0..count)
+            .map(|index| w_code_addr2line(&code, index as i64 * 2))
             .collect();
-        assert!(!rows.is_empty());
-        for (index, line) in rows.iter().copied().enumerate() {
-            let addrq = index as i64 * 2;
-            assert_eq!(w_code_addr2line(&code, addrq), Some(line));
+        for (index, line) in lines.iter().copied().enumerate() {
             // The odd byte inside an instruction reads that instruction's row.
-            assert_eq!(w_code_addr2line(&code, addrq + 1), Some(line));
+            assert_eq!(w_code_addr2line(&code, index as i64 * 2 + 1), line);
         }
         // Each of the three statements contributes at least one instruction.
-        assert!(rows.contains(&(firstlineno + 2)), "{rows:?}");
+        for statement in 0..3 {
+            assert!(lines.contains(&Some(firstlineno + statement)), "{lines:?}");
+        }
 
-        assert_eq!(w_code_addr2line(&code, rows.len() as i64 * 2), None);
         assert_eq!(w_code_addr2line(&code, 1 << 30), None);
+        // An empty line table describes no range, so nothing resolves against
+        // it — `linetable_to_locations` instead expands one first-line row per
+        // instruction, which is why this reads `linetable` directly.
+        let mut blank = compile_exec("a = 1\n").expect("compile failed");
+        blank.linetable = Vec::new().into_boxed_slice();
+        assert_eq!(w_code_addr2line(&blank, 0), None);
+        assert_eq!(w_code_addr2line(&blank, 2), None);
+        assert_eq!(
+            w_code_addr2line(&blank, -1),
+            Some(blank.first_line_number.map_or(0, |line| line.get()))
+        );
     }
 
     #[test]
