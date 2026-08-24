@@ -2636,9 +2636,29 @@ impl MiniMarkGC {
     /// a weakref — `finish_alloc_in_oldgen` and `register_young_object_if_needed`
     /// both guard on the same bound — so it is plain by the same reading, not
     /// unknown.
+    ///
+    /// Upstream states that exclusion as an assertion rather than a branch,
+    /// and it never fires: a WEAKREF is a fixed three-word structure, so no
+    /// registered weakref type is oversized in the first place. The assertion
+    /// is carried here as a debug one, because a live interpreter cannot be
+    /// aborted on the strength of a condition that has never been reachable —
+    /// but it is said out loud instead of being folded into the return value,
+    /// so a type that ever does reach it is a failure to look at rather than a
+    /// silent placement change. The release arm still declines, and born-old
+    /// is the right answer to decline to: `invalidate_young_weakrefs` decides
+    /// survival by reading a forwarding pointer, which a non-moving object
+    /// never has, so a young weakref would read as dead while alive.
     #[inline]
     fn type_alloc_may_be_young(&self, type_id: u32) -> bool {
-        (type_id as usize) >= self.types.len() || !self.types.get(type_id).is_weakref
+        if (type_id as usize) >= self.types.len() {
+            return true;
+        }
+        let contains_weakptr = self.types.get(type_id).is_weakref;
+        debug_assert!(
+            !contains_weakptr,
+            "'contains_weakptr' specified for a large object"
+        );
+        !contains_weakptr
     }
 
     /// The header and bookkeeping half of the young non-moving birth.
@@ -8721,17 +8741,26 @@ mod tests {
         gc.roots.clear();
     }
 
-    /// A weakref type keeps the born-old birth: `malloc_fixedsize`'s large arm
-    /// asserts `not contains_weakptr`, and `invalidate_young_weakrefs` reads a
-    /// forwarding pointer a non-moving object never has.
+    /// A weakref type is refused the young large birth: `malloc_fixedsize`'s
+    /// large arm asserts `not contains_weakptr`, and `invalidate_young_weakrefs`
+    /// decides survival by reading a forwarding pointer a non-moving object
+    /// never has.
     #[test]
-    fn a_weakref_type_keeps_the_born_old_large_allocation() {
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "'contains_weakptr' specified for a large object")
+    )]
+    fn a_weakref_type_is_refused_the_young_large_birth() {
         let mut gc = test_gc(4096);
         let mut info = TypeInfo::simple(16);
         info.is_weakref = true;
         let tid = gc.register_type(info);
         let large = gc.config.large_object_threshold + 64;
 
+        // Two tests wearing one name, because the exclusion is carried as a
+        // debug assertion: with `debug_assertions` the call must fail with
+        // upstream's own message, and without them it must still decline to
+        // the born-old placement rather than take the young birth.
         let obj = gc.alloc_with_type(tid, large);
         assert!(!gc.is_young_rawmalloced(obj.0), "born old");
         assert!(
