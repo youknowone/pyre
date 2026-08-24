@@ -3311,6 +3311,79 @@ impl Repr for InstanceRepr {
         ReprClassId::InstanceRepr
     }
 
+    /// RPython `InstanceRepr.rtype_type(self, hop)` (rclass.py):
+    ///
+    /// ```python
+    /// def rtype_type(self, hop):
+    ///     if hop.s_result.is_constant():
+    ///         return hop.inputconst(hop.r_result, hop.s_result.const)
+    ///     instance_repr = self.common_repr()
+    ///     vinst, = hop.inputargs(instance_repr)
+    ///     if hop.args_s[0].can_be_none():
+    ///         return hop.gendirectcall(ll_inst_type, vinst)
+    ///     else:
+    ///         return instance_repr.getfield(vinst, '__class__', hop.llops)
+    /// ```
+    fn rtype_type(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+
+        // upstream: `if hop.s_result.is_constant(): ...`.
+        let s_result = hop
+            .s_result
+            .borrow()
+            .clone()
+            .ok_or_else(|| TyperError::message("InstanceRepr.rtype_type: s_result missing"))?;
+        if s_result.is_constant() {
+            let r_result =
+                hop.r_result.borrow().clone().ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_type: r_result missing")
+                })?;
+            let value = s_result
+                .const_()
+                .expect("s_result.is_constant() implies const_() is Some");
+            return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), value)
+                .map(Hlvalue::Constant)
+                .map(Some);
+        }
+
+        // upstream: `instance_repr = self.common_repr();
+        //            vinst, = hop.inputargs(instance_repr)`.
+        let instance_repr = self.common_repr()?;
+        let mut vinst =
+            hop.inputargs(vec![ConvertedTo::Repr(instance_repr.as_ref() as &dyn Repr)])?;
+        let vinst = vinst
+            .pop()
+            .expect("one converted argument for unary type operation");
+
+        // upstream: `if hop.args_s[0].can_be_none():
+        //                return hop.gendirectcall(ll_inst_type, vinst)`.
+        let can_be_none = hop
+            .args_s
+            .borrow()
+            .first()
+            .ok_or_else(|| TyperError::message("InstanceRepr.rtype_type: args_s[0] missing"))?
+            .can_be_none();
+        if can_be_none {
+            let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_type: rtyper weak ref expired")
+            })?;
+            let helper = rtyper.lowlevel_helper_function(
+                "ll_inst_type",
+                vec![instance_repr.lowleveltype().clone()],
+                CLASSTYPE.clone(),
+            )?;
+            return hop.gendirectcall(&helper, vec![vinst]);
+        }
+
+        // upstream non-null arm: read the root instance's `__class__`
+        // field directly.
+        let mut llops = hop.llops.borrow_mut();
+        let vtype =
+            instance_repr.getfield(vinst, "__class__", &mut llops, false, &Flags::default())?;
+        Ok(Some(Hlvalue::Variable(vtype)))
+    }
+
     /// RPython `InstanceRepr.rtype_getattr(self, hop)` (rclass.py):
     ///
     /// ```python
@@ -5615,6 +5688,51 @@ mod tests {
         assert_eq!(mangled, "typeptr");
         assert_eq!(field_repr.lowleveltype(), &CLASSTYPE.clone());
         assert!(repr.allinstancefields().contains_key("__class__"));
+    }
+
+    #[test]
+    fn instance_repr_rtype_type_nonnull_reads_class_field() {
+        use crate::annotator::model::{SomeInstance, SomeObject, SomeTypeOf, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let rtyper = fresh_rtyper();
+        let repr = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root instance repr");
+        Repr::setup(repr.as_ref()).expect("setup root instance repr");
+
+        let v_obj = Variable::new();
+        v_obj.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_obj_h = Hlvalue::Variable(v_obj.clone());
+        let v_result = Variable::new();
+        let spaceop =
+            SpaceOperation::new("type", vec![v_obj_h.clone()], Hlvalue::Variable(v_result));
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_obj_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance {
+                base: SomeObject::default(),
+                classdef: None,
+                can_be_none: false,
+                flags: Default::default(),
+            }));
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        *hop.s_result.borrow_mut() = Some(SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(v_obj)])));
+        *hop.r_result.borrow_mut() = Some(get_type_repr(&rtyper).expect("type repr"));
+
+        let out = repr
+            .rtype_type(&hop)
+            .expect("nonnull instance type() must rtype")
+            .expect("type() returns a class pointer");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        let Hlvalue::Variable(result) = &ops.ops[0].result else {
+            panic!("getfield result must be a Variable")
+        };
+        assert_eq!(result.concretetype(), Some(CLASSTYPE.clone()));
     }
 
     #[test]

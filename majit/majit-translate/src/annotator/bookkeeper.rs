@@ -2391,7 +2391,47 @@ impl Bookkeeper {
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
-        let mut cur = name.to_string();
+        // A normal Rust struct constructor arrives from
+        // `SyntheticTransparentCtor` under Charon's dotted,
+        // crate-included spelling (`pyre_object.celldict.VersionTag`), while
+        // field projection names the same declaration by the crate-relative
+        // registry identity (`celldict::VersionTag`).  RPython keys both on
+        // the one class object, so normalize the constructor spelling before
+        // the first cache lookup when the declaration is a plain non-header
+        // struct.  Header-bearing classes must keep the existing chain walk:
+        // first-minting them directly under the leaf identity loses their
+        // `ob_header`/`base` superclass, the measured W_Root cascade described
+        // in `annotator::model::same_struct_identity`.
+        let initial = self
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .and_then(|reg| {
+                if name.contains("::") || !name.contains('.') {
+                    return None;
+                }
+                let lookup = name.replace('.', "::");
+                if reg.is_enum_base(&lookup)
+                    || lookup
+                        .rsplit_once("::")
+                        .is_some_and(|(parent, _)| reg.is_enum_base(parent))
+                {
+                    return None;
+                }
+                let (first_name, _) = reg.fields.get(&lookup)?.first()?;
+                if first_name == "ob_header" || first_name == "base" {
+                    return None;
+                }
+                Some(
+                    lookup
+                        .split_once("::")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or(&lookup)
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| name.to_string());
+        let mut cur = initial;
         loop {
             let key = majit_ir::descr::canonical_struct_name(&cur);
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
@@ -2521,11 +2561,10 @@ impl Bookkeeper {
     /// function source for a field attribute would union-conflict in
     /// `generalize_attr`.
     pub fn struct_root_has_field(&self, root: &str, name: &str) -> bool {
-        self.struct_fields.borrow().as_ref().is_some_and(|reg| {
-            reg.fields
-                .get(root)
-                .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
-        })
+        self.struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.owner_or_variant_has_field(root, name))
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type
@@ -2540,6 +2579,19 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // `pyre_object::PyObjectRef` is a Rust type alias for
+        // `*mut pyobject::PyObject`.  Charon expands aliases in MIR type
+        // nodes, but the source-derived struct-field registry deliberately
+        // keeps the source spelling, so flexible-array tails such as
+        // `FixedObjectArray._items: [PyObjectRef; 0]` reach this projector
+        // with the alias still intact.  RPython has no alias object at this
+        // point: the corresponding `W_Root` array item is the root instance
+        // annotation itself.  Resolve the alias before the ordinary named
+        // struct arm so list item repr construction sees that same root
+        // `ClassDef`, rather than minting a classdef-less placeholder.
+        if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+            return self.project_struct_field_type("pyobject::PyObject");
+        }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
         // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
@@ -2737,7 +2789,11 @@ impl Bookkeeper {
         // array arm above to `SomeList(item=SomeInstance(PyObjectRef),
         // resized=false)`, giving a typed element rather than a
         // classdef-less stub.
-        if majit_ir::descr::canonical_struct_name(stripped) == "object_array::FixedObjectArray" {
+        let canonical_stripped = majit_ir::descr::canonical_struct_name(stripped);
+        if canonical_stripped == "FixedObjectArray"
+            || canonical_stripped == "object_array::FixedObjectArray"
+            || canonical_stripped.ends_with("::object_array::FixedObjectArray")
+        {
             let items_ty = self
                 .struct_fields
                 .borrow()
@@ -4453,6 +4509,187 @@ mod tests {
             Rc::ptr_eq(&code_cd, &template),
             "RPython has one CodeObject class, not per-generic classdefs"
         );
+    }
+
+    #[test]
+    fn pyobjectref_field_alias_projects_to_pyobject_class_identity() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let SomeValue::Instance(alias_item) = bk.project_struct_field_type("PyObjectRef") else {
+            panic!("PyObjectRef must project to the PyObject instance annotation")
+        };
+        let alias_class = alias_item.classdef.expect("typed PyObjectRef classdef");
+        let pyobject_class = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        assert!(
+            Rc::ptr_eq(&alias_class, &pyobject_class),
+            "the source alias and registered PyObject root must share one ClassDef"
+        );
+
+        let SomeValue::List(array) = bk.project_struct_field_type("[PyObjectRef; 0]") else {
+            panic!("a PyObjectRef array tail must project to a list")
+        };
+        let SomeValue::Instance(array_item) = array.listdef.s_value() else {
+            panic!("the projected array item must be a PyObject instance")
+        };
+        assert!(
+            array_item
+                .classdef
+                .as_ref()
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &pyobject_class))
+        );
+
+        let SomeValue::List(qualified_array) =
+            bk.project_struct_field_type("[pyre_object::PyObjectRef; 0]")
+        else {
+            panic!("a qualified PyObjectRef array tail must project to a list")
+        };
+        let SomeValue::Instance(qualified_item) = qualified_array.listdef.s_value() else {
+            panic!("the qualified array item must be a PyObject instance")
+        };
+        assert!(
+            qualified_item
+                .classdef
+                .as_ref()
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &pyobject_class))
+        );
+    }
+
+    #[test]
+    fn qualified_fixed_object_array_projects_typed_pyobject_items() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyre_object::object_array::FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                (
+                    "_items".to_string(),
+                    "[pyre_object::PyObjectRef; 0]".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let SomeValue::List(array) = bk.project_struct_field_type(
+            "*mut pyre_object::object_array::FixedObjectArray",
+        ) else {
+            panic!("qualified FixedObjectArray pointer must project to its item list")
+        };
+        let SomeValue::Instance(item) = array.listdef.s_value() else {
+            panic!("FixedObjectArray item must be a PyObject instance")
+        };
+        assert!(item.classdef.is_some(), "PyObject item must keep its ClassDef");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_llbc_pyframe_locals_array_projects_typed_pyobject_items() {
+        use crate::annotator::model::SomeValue;
+        use majit_charon_reader::Llbc;
+
+        let interpreter_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let object_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let interpreter = Llbc::load(interpreter_path).expect("load real interpreter LLBC");
+        let object = Llbc::load(object_path).expect("load real object LLBC");
+        let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object, interpreter],
+            crate::HostStaticAddrs::default(),
+            &["pyframe"],
+            &["__metadata_only__"],
+        )
+        .expect("derive real interpreter metadata");
+        let field_ty = program
+            .struct_fields
+            .field_type("PyFrame", "locals_cells_stack_w")
+            .expect("PyFrame locals array field")
+            .to_string();
+        let fixed_array_rows: Vec<_> = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(key, _)| key.ends_with("FixedObjectArray"))
+            .map(|(key, rows)| (key.clone(), rows.clone()))
+            .collect();
+        majit_ir::descr::register_struct_origins(program.struct_origins);
+
+        let bk = bk();
+        bk.set_struct_fields(Rc::new(program.struct_fields));
+        let pyframe = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame classdef");
+        let locals = pyframe
+            .borrow()
+            .attrs
+            .get("locals_cells_stack_w")
+            .expect("locals array attr")
+            .s_value
+            .clone();
+        let SomeValue::List(array) = locals else {
+            panic!(
+                "{field_ty} must project to a list, got {locals:?}; registry rows: {fixed_array_rows:?}"
+            )
+        };
+        let SomeValue::Instance(item) = array.listdef.s_value() else {
+            panic!("{field_ty} item must be an instance")
+        };
+        assert!(
+            item.classdef.is_some(),
+            "{field_ty} item must retain the PyObject ClassDef"
+        );
+    }
+
+    #[test]
+    fn nonheader_dotted_constructor_reuses_crate_relative_struct_identity() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("__pos_0".to_string(), "u64".to_string())];
+        reg.fields.insert(
+            "pyre_object::celldict::VersionTag".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("VersionTag".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let from_field = bk.intern_class_by_qualname("celldict::VersionTag");
+        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.VersionTag");
+        assert_eq!(from_field, from_ctor);
+        let field_class = bk
+            .getuniqueclassdef(&from_field)
+            .expect("field-side VersionTag classdef");
+        let ctor_class = bk
+            .getuniqueclassdef(&from_ctor)
+            .expect("constructor-side VersionTag classdef");
+        assert!(Rc::ptr_eq(&field_class, &ctor_class));
     }
 
     #[test]

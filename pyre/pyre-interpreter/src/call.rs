@@ -834,14 +834,14 @@ fn builtin_keyword_failure(
 /// same graph boundary explicitly.
 #[inline(never)]
 fn make_user_call_frame(
-    w_code: *const (),
+    w_code: PyObjectRef,
     args: &[PyObjectRef],
     w_globals: PyObjectRef,
     execution_context: *const crate::PyExecutionContext,
     closure: PyObjectRef,
 ) -> Result<crate::pyframe::FrameBox, crate::PyError> {
     let frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
+        w_code as *const (),
         args,
         w_globals,
         execution_context,
@@ -971,7 +971,7 @@ pub fn call_user_function_resolved(
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame =
             crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 args,
                 w_globals,
                 execution_context,
@@ -985,7 +985,7 @@ pub fn call_user_function_resolved(
 
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             args,
             w_globals,
             execution_context,
@@ -2118,7 +2118,7 @@ pub fn call_user_function_plain_with_ctx(
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame =
             crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 &final_args,
                 w_globals,
                 execution_context,
@@ -2130,7 +2130,7 @@ pub fn call_user_function_plain_with_ctx(
 
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &final_args,
             w_globals,
             execution_context,
@@ -3362,7 +3362,7 @@ fn call_with_kwargs_in_ctx_impl(
             let closure = unsafe { function_get_closure(current_callable()) };
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                    w_code,
+                    w_code as *const (),
                     &final_args,
                     w_globals,
                     execution_context,
@@ -4168,7 +4168,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame = crate::pyframe::FrameBox::new(
             match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 &final_args,
                 w_globals,
                 exec_ctx,
@@ -4193,7 +4193,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
 
     let mut frame = crate::pyframe::FrameBox::new(
         match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &final_args,
             w_globals,
             exec_ctx,
@@ -4257,7 +4257,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             args,
             w_globals,
             exec_ctx,
@@ -5035,7 +5035,7 @@ fn build_class_inner(
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &[],
             w_globals,
             exec_ctx,

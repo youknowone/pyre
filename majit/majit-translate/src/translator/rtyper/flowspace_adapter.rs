@@ -4089,7 +4089,7 @@ pub fn function_graph_to_flowspace(
                     legacy_link.target, legacy_block.id,
                 ))
             })?;
-            let args: Vec<Hlvalue> = legacy_link
+            let mut args: Vec<Hlvalue> = legacy_link
                 .args
                 .iter()
                 .enumerate()
@@ -4103,6 +4103,37 @@ pub fn function_graph_to_flowspace(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // RPython `FlowContext.exc_from_raise` always computes
+            // `w_type = op.type(w_value)` before constructing the
+            // `(w_type, w_value)` link to `exceptblock`
+            // (`flowspace/flowcontext.py:629-630`).  Pyre's pre-flowspace
+            // model historically elided that operation and used the
+            // exception value in both slots because `flatten.make_return`
+            // only emits the second slot.  The rtyper observes the link
+            // earlier, however: `_convert_link` assigns
+            // `ExceptionData.r_exception_type` to slot 0 and must therefore
+            // receive the class representation, not the instance
+            // representation.
+            //
+            // Restore the upstream flowspace shape at this adapter boundary.
+            // Limit the reconstruction to the exact legacy adaptation:
+            // a direct, non-LastException link to `exceptblock` whose two
+            // arguments are the same Variable.  Ordinary exception edges
+            // already carry their distinct link-scoped `(last_exception,
+            // last_exc_value)` variables and must remain untouched.
+            let duplicated_direct_raise = legacy_link.target == legacy.exceptblock
+                && legacy_link.last_exception.is_none()
+                && legacy_link.last_exc_value.is_none()
+                && matches!(
+                    legacy_link.args.as_slice(),
+                    [LinkArg::Value(etype), LinkArg::Value(evalue)] if etype == evalue
+                );
+            if duplicated_direct_raise {
+                let evalue = args[1].clone();
+                let etype = Hlvalue::Variable(Variable::new());
+                translated_ops.push(FlowspaceOp::new("type", vec![evalue], etype.clone()));
+                args[0] = etype;
+            }
             let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref());
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
             // RPython `Link.__init__` (`flowspace/model.rs:Link::new`) leaves
@@ -6527,6 +6558,66 @@ mod tests {
             exc_link.last_exc_value.as_ref(),
             "exception value arg must reuse link.last_exc_value Variable"
         );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_restores_type_op_for_duplicated_direct_raise() {
+        // `front::exc_from_raise` / `front::result_exc` historically encode a
+        // direct raise as `(evalue, evalue)` because the final `raise`
+        // bytecode reads only slot 1.  RPython's rtyper sees this graph before
+        // flattening and requires slot 0 to be the result of `type(evalue)`.
+        let mut graph = LegacyGraph::new("direct_raise");
+        let vars = mint_vars(&mut graph, 5);
+        setbinding(&vars[1], ValueType::Ref(None));
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(vars[1].clone()),
+                    LinkArg::Value(vars[1].clone()),
+                ],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[3, 4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("direct raise graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        let [type_op] = startblock.operations.as_slice() else {
+            panic!("direct raise must gain exactly one type operation");
+        };
+        assert_eq!(type_op.opname, "type");
+        let exc_link = startblock.exits[0].borrow();
+        assert_eq!(type_op.args, vec![exc_link.args[1].clone().unwrap()]);
+        assert_eq!(exc_link.args[0].as_ref(), Some(&type_op.result));
+        assert_ne!(exc_link.args[0], exc_link.args[1]);
     }
 
     #[test]

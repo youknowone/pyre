@@ -984,13 +984,13 @@ pub unsafe fn _check_code_mutable(func: PyObjectRef, attr: &str) -> Result<(), c
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn _get_immutable_code(func: PyObjectRef) -> *const () {
+pub unsafe fn _get_immutable_code(func: PyObjectRef) -> PyObjectRef {
     // function.py:25
     debug_assert!(
         !unsafe { (*(func as *const Function)).can_change_code },
         "_get_immutable_code called on function with can_change_code=true"
     );
-    unsafe { (*(func as *const Function)).code }
+    unsafe { (*(func as *const Function)).code as PyObjectRef }
 }
 
 /// Check if an object is a user-defined function.
@@ -1382,7 +1382,7 @@ pub unsafe fn is_function_with_fixed_code(obj: PyObjectRef) -> bool {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
+pub unsafe fn getcode(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let func = obj as *const Function;
         if majit_metainterp::jit::we_are_jitted() {
@@ -1391,10 +1391,10 @@ pub unsafe fn getcode(obj: PyObjectRef) -> *const () {
                 return _get_immutable_code(obj);
             }
             // function.py:82
-            return majit_metainterp::jit::promote((*func).code as usize) as *const ();
+            return majit_metainterp::jit::promote((*func).code as usize) as PyObjectRef;
         }
         // function.py:83
-        (*func).code
+        (*func).code as PyObjectRef
     }
 }
 
@@ -2367,7 +2367,7 @@ pub unsafe fn fdel_func_kwdefaults(obj: PyObjectRef) -> Result<(), crate::PyErro
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn function_get_func_code(obj: PyObjectRef) -> *const () {
+pub unsafe fn function_get_func_code(obj: PyObjectRef) -> PyObjectRef {
     unsafe { getcode(obj) }
 }
 
@@ -3660,7 +3660,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn() -> PyObjectRef;
-static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<()> =
+static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();
 
@@ -3670,8 +3670,8 @@ static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync:
 /// `code` pointer is the BuiltinCode object underlying the `exc_info`
 /// builtin function; `direct_fn` is the JIT-direct equivalent of the
 /// closure body. `funccall_valuestack` consults both to take the fast path.
-pub fn register_sys_exc_info_path(code: *const (), direct_fn: ExcInfoDirectFn) {
-    SYS_EXC_INFO_CODE.store(code.cast_mut(), std::sync::atomic::Ordering::Release);
+pub fn register_sys_exc_info_path(code: PyObjectRef, direct_fn: ExcInfoDirectFn) {
+    SYS_EXC_INFO_CODE.store(code, std::sync::atomic::Ordering::Release);
     // Reinitializing the sys module may replace its BuiltinCode object, but
     // every instance is backed by the same `exc_info_direct` symbol. Preserve
     // the object-space-wide helper installed by the first initialization.
@@ -3679,7 +3679,7 @@ pub fn register_sys_exc_info_path(code: *const (), direct_fn: ExcInfoDirectFn) {
 }
 
 #[inline]
-fn sys_exc_info_code() -> *const () {
+fn sys_exc_info_code() -> PyObjectRef {
     SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
@@ -3881,7 +3881,7 @@ pub fn funccall_valuestack(
 /// without intermediate Vec allocation.
 fn _flat_pycall(
     func: PyObjectRef,
-    code: *const (),
+    code: PyObjectRef,
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
@@ -3901,7 +3901,7 @@ fn _flat_pycall(
     // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
     let mut new_frame = crate::pyframe::FrameBox::new(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            code,
+            code as *const (),
             &[], // locals filled below directly from stack
             w_globals,
             crate::call::getexecutioncontext(),
@@ -3965,7 +3965,7 @@ fn _flat_pycall(
 /// verified as a tuple by the caller in `funccall_valuestack`).
 fn _flat_pycall_defaults(
     func: PyObjectRef,
-    code: *const (),
+    code: PyObjectRef,
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
     defs: PyObjectRef,
@@ -3980,7 +3980,7 @@ fn _flat_pycall_defaults(
     // FrameBox: header-bearing heap frame for the JIT write barrier.
     let mut new_frame = crate::pyframe::FrameBox::new(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            code,
+            code as *const (),
             &[], // locals filled below
             w_globals,
             crate::call::getexecutioncontext(),

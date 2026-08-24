@@ -227,13 +227,13 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// `::` form (the spelling `canonical_struct_name` already yields for the
 /// field-read side) and compare.
 ///
-/// Deliberately a COMPARE-time identity, NOT an interning cache key: keying
-/// `struct_root_classes` on this collapse starves the header/base-chain
-/// walk for `ob_header`-bearing `W_*` structs (they mint base-less under
-/// first-mint-wins and lose their `W_Root` base — a measured +184 phaseA
-/// cascade across `_io`/`_pickle`).  This check fires only where
+/// Normal non-header constructors now normalize at
+/// `Bookkeeper::intern_class_by_qualname`, while header-bearing structs retain
+/// their full base-chain walk (collapsing those early caused a measured +184
+/// phaseA cascade across `_io`/`_pickle`).  Keep this compare-time fallback for
+/// registry-absent or ambiguous constructor spellings: it fires only where
 /// `commonbase` is already None, which the base-bearing `W_*` structs never
-/// reach (they share `W_Root`), so it cannot perturb them.
+/// reach because they share `W_Root`.
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
         if !name.contains("::")

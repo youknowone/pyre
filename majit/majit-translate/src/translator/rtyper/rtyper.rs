@@ -3200,6 +3200,7 @@ fn lowlevel_helper_graph(
         "ll_isinstance_pytype" => {
             lowlevel_isinstance_pytype_helper_graph(rtyper, name, args, result)
         }
+        "ll_inst_type" => lowlevel_inst_type_helper_graph(name, args, result),
         "ll_type" => lowlevel_type_helper_graph(name, args, result),
         _ => Ok(synthetic_lowlevel_helper_graph(name, args, result)),
     }
@@ -3511,6 +3512,104 @@ fn lowlevel_type_helper_graph(
         Hlvalue::Variable(typeptr.clone()),
     ));
     startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(typeptr)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// RPython `ll_inst_type(obj)` (rclass.py):
+///
+/// ```python
+/// def ll_inst_type(obj):
+///     if obj:
+///         return obj.typeptr
+///     else:
+///         return nullptr(OBJECT_VTABLE)
+/// ```
+///
+/// `obj` has already been converted through `InstanceRepr.common_repr`, so
+/// it is either OBJECTPTR or NONGCOBJECTPTR and both layouts expose the same
+/// `typeptr: CLASSTYPE` field.
+fn lowlevel_inst_type_helper_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if !(args.len() == 1 && (args[0] == *OBJECTPTR || args[0] == *NONGCOBJECTPTR))
+        || result != &CLASSTYPE.clone()
+    {
+        return Err(TyperError::message(format!(
+            "{name} expects ((OBJECTPTR|NONGCOBJECTPTR)) -> CLASSTYPE, got ({args:?}) -> {result:?}"
+        )));
+    }
+    let obj_lltype = args[0].clone();
+    let LowLevelType::Ptr(class_ptr) = CLASSTYPE.clone() else {
+        unreachable!("CLASSTYPE is a pointer")
+    };
+    let null_type = constant_with_lltype(
+        ConstValue::LLPtr(Box::new(class_ptr.as_ref().clone()._defl())),
+        CLASSTYPE.clone(),
+    );
+
+    let argnames = vec!["arg0".to_string()];
+    let obj0 = variable_with_lltype("arg0", obj_lltype.clone());
+    let is_nonnull = variable_with_lltype("is_nonnull", LowLevelType::Bool);
+    let obj1 = variable_with_lltype("obj", obj_lltype);
+    let typeptr = variable_with_lltype("typeptr", CLASSTYPE.clone());
+    let return_var = variable_with_lltype("result", CLASSTYPE.clone());
+
+    let startblock = Block::shared(vec![Hlvalue::Variable(obj0.clone())]);
+    let readblock = Block::shared(vec![Hlvalue::Variable(obj1.clone())]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(obj0.clone())],
+        Hlvalue::Variable(is_nonnull.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_nonnull));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(obj0)],
+            Some(readblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![null_type],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+
+    readblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(obj1), void_field_const("typeptr")],
+        Hlvalue::Variable(typeptr.clone()),
+    ));
+    readblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(typeptr)],
             Some(graph.returnblock.clone()),
@@ -8630,5 +8729,42 @@ mod tests {
         };
         assert_eq!(field, "ob_type");
         assert_eq!(cb.operations[1].opname, "direct_call");
+    }
+
+    #[test]
+    fn inst_type_helper_graph_null_checks_then_reads_typeptr() {
+        let pygraph = lowlevel_inst_type_helper_graph(
+            "ll_inst_type",
+            &[OBJECTPTR.clone()],
+            &CLASSTYPE.clone(),
+        )
+        .expect("ll_inst_type must build");
+        let graph = pygraph.graph.borrow();
+        let start = graph.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "ptr_nonzero");
+        assert_eq!(start.exits.len(), 2);
+
+        let readblock = start.exits[0]
+            .borrow()
+            .target
+            .clone()
+            .expect("nonnull link has a read block");
+        let read = readblock.borrow();
+        assert_eq!(read.operations.len(), 1);
+        assert_eq!(read.operations[0].opname, "getfield");
+        let Hlvalue::Constant(field) = &read.operations[0].args[1] else {
+            panic!("getfield name must be constant")
+        };
+        assert_eq!(field.value, ConstValue::byte_str("typeptr"));
+
+        let null_link = start.exits[1].borrow();
+        let Some(Some(Hlvalue::Constant(null_type))) = null_link.args.first() else {
+            panic!("null arm must return a pointer constant")
+        };
+        let ConstValue::LLPtr(null_type) = &null_type.value else {
+            panic!("null arm must carry LLPtr")
+        };
+        assert!(!null_type.nonzero());
     }
 }

@@ -7335,7 +7335,7 @@ impl<'a> Lowering<'a> {
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
-                .or_else(|| self.option_ref_payload_class_root(&call.dest.ty))
+                .or_else(|| self.option_niche_payload_class_root(&call.dest.ty))
                 // A `dont_look_inside` residual returning `Option<*mut PyObject>`
                 // erases the same way — `dont_look_inside_return_token` maps it to
                 // the `ref` GCREF token, so `result_ty` is `Ref(None)` too — but its
@@ -7835,6 +7835,17 @@ impl<'a> Lowering<'a> {
                 if let Some((item_ty, array_type_id)) = index_element
                     && (workspace_index || array_type_id.is_some() || element_is_addressable)
                 {
+                    // A trait-associated `Index::Output` can stay a TypeVar
+                    // in this call's destination even though the workspace
+                    // gate has resolved the concrete receiver. In that case
+                    // `result_narrow_root` cannot recover the pointee name,
+                    // but the canonical object-array identity is already the
+                    // positive proof that the element is `PyObjectRef` (the
+                    // int/float workspaces have non-Ref banks).
+                    let item_narrow_root = result_narrow_root.clone().or_else(|| {
+                        (array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID))
+                            .then(|| "PyObject".to_string())
+                    });
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7859,7 +7870,31 @@ impl<'a> Lowering<'a> {
                             array_type_id,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    // This intercept returns before the generic call-result
+                    // tail below.  Repeat its registered-pointee narrow so
+                    // `rlist.py:recast` exposes the concrete W_Root-equivalent
+                    // repr after the GCREF-backed getarrayitem.
+                    if let Some(root) = item_narrow_root {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        "__pyre_cast_instance".to_string(),
+                                        root.clone(),
+                                    ],
+                                },
+                                args: vec![res],
+                                result_ty: ValueType::Ref(Some(root)),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(narrowed);
+                    } else {
+                        self.local_var[dest_local] = Some(res);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -12401,13 +12436,14 @@ impl<'a> Lowering<'a> {
         ))
     }
 
-    /// Registered ADT pointee of `Option<&T>` / `Option<&mut T>`.
+    /// Registered ADT pointee of a one-word niche `Option<&T>` /
+    /// `Option<&mut T>` / `Option<*mut T>`.
     ///
     /// Rust uses the null pointer niche for this Option shape. It therefore
     /// maps to RPython's nullable `SomeInstance(T)`, not to an Option
     /// container class with `__discriminant` / `__pos_0` fields.
-    fn option_ref_payload_class_root(&self, dest_ty: &TyRef) -> Option<String> {
-        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+    fn option_niche_payload_class_root(&self, dest_ty: &TyRef) -> Option<String> {
+        if !self.tyref_is_niche_option_ptr(dest_ty) {
             return None;
         }
         let mut payload = tyref_node(dest_ty, self.llbc)?
@@ -12429,6 +12465,9 @@ impl<'a> Lowering<'a> {
             {
                 payload = &parts[1];
                 continue;
+            }
+            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+                return Some(root);
             }
             let pointee = obj.get("Ref")?.as_array()?.get(1)?;
             return adt_node_class_root(strip_ty_wrappers(pointee, self.llbc)?, self.llbc);
@@ -27718,6 +27757,40 @@ mod tests {
         assert_eq!(
             transparent_ctors, 0,
             "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
+        );
+    }
+
+    /// Real-LLBC anchor for the `FixedObjectArray` Index intercept.  The
+    /// intercept returns before `lower_call`'s ordinary result-narrowing tail,
+    /// so an object element must carry its own `PyObject` narrow immediately
+    /// after the lifted ArrayRead.  Ignored by default because it loads the
+    /// large interpreter snapshot.
+    #[test]
+    #[ignore]
+    fn load_local_value_arrayread_narrows_pyobject_item() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::eval::<Impl>::load_local_value",
+        )
+        .expect("lower eval::<Impl>::load_local_value");
+        let has_pyobject_narrow = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                    && segments.get(1).is_some_and(|root| root.ends_with("PyObject"))
+            )
+        });
+        assert!(
+            has_pyobject_narrow,
+            "FixedObjectArray getitem must recast its GCREF item to PyObject"
         );
     }
 

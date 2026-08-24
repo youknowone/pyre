@@ -67,6 +67,10 @@ use crate::translator::rtyper::flowspace_adapter::{
     FlowspaceAdapterOutput, LegacyToTyped, LegacyToTypedCandidates,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::call_registry::{
+    exception_object_result_annotation,
+    is_exception_object_materializer,
+};
 
 /// The `graph.return_type` marker the front-end stamps on a
 /// `dont_look_inside` callee that returns `*mut PyObject` (a
@@ -2139,7 +2143,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
             || graph.hints.iter().any(|h| h == "elidable");
         if residualize {
-            let result_shell = residual_return_shell(graph.return_type.as_deref());
+            // The materialisers' raw `*mut PyObject` return is only their
+            // residual-call ABI.  Their FunctionDesc carries the orthodox
+            // `_signature_`-style SomeInstance result, so the synthetic
+            // annotator graph must carry that same result on its return link.
+            // Leaving the generic OBJECTPTR/SomePtr shell here makes Phase B
+            // insert a PtrRepr -> InstanceRepr conversion that upstream never
+            // has, then the first failed specialization replaces the shared
+            // stub and strands every later caller on an unbound return var.
+            let result_shell = residual_stub_result_shell(
+                entry.function_desc.borrow().name.as_str(),
+                graph.return_type.as_deref(),
+            );
             if let Some(result_shell) = result_shell {
                 let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
@@ -2483,6 +2498,25 @@ pub(crate) fn residual_return_shell(
         );
     }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
+}
+
+/// Choose the annotation carried by a `dont_look_inside` stub's return link.
+///
+/// Normally the front-end's FUNC.RESULT token is the semantic annotation
+/// source.  The two exception materialisers are the deliberate exception:
+/// their `*mut PyObject` token describes only the residual trampoline ABI,
+/// while their registered `_signature_` describes the interpreter-visible
+/// exception instance.  The cached stub must agree with that signature, just
+/// as an upstream flow graph constrained by `_signature_` does.
+fn residual_stub_result_shell(
+    function_name: &str,
+    token: Option<&str>,
+) -> Option<crate::annotator::model::SomeValue> {
+    if is_exception_object_materializer(function_name) {
+        Some(exception_object_result_annotation())
+    } else {
+        residual_return_shell(token)
+    }
 }
 
 /// Project a FUNC.RESULT token (the `return_type` string) to its
@@ -5853,6 +5887,28 @@ mod tests {
         let s = default_someshell_for_lltype(&LowLevelType::Address)
             .expect("Address must project to SomeAddress");
         assert!(matches!(s, SomeValue::Address(_)), "got {s:?}");
+    }
+
+    #[test]
+    fn exception_materializer_stub_uses_semantic_instance_result() {
+        use crate::annotator::model::SomeValue;
+
+        for name in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
+            let shell = residual_stub_result_shell(name, Some(OBJECTPTR_RETURN_TYPE))
+                .expect("exception materializer must have a result shell");
+            let SomeValue::Instance(instance) = shell else {
+                panic!("{name}: raw pointer ABI must not leak into annotation")
+            };
+            assert!(instance.classdef.is_none());
+            assert!(!instance.can_be_none);
+        }
+
+        let ordinary = residual_stub_result_shell("ordinary", Some(OBJECTPTR_RETURN_TYPE))
+            .expect("ordinary object-pointer residual must have a result shell");
+        assert!(
+            matches!(ordinary, SomeValue::Ptr(_)),
+            "ordinary object-pointer residuals keep their typed Ptr shell"
+        );
     }
 
     #[test]

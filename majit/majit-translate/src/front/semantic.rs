@@ -156,6 +156,31 @@ impl StructFieldRegistry {
             .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
     }
 
+    /// Whether `owner` itself, or one of its enum variants, declares
+    /// `field_name`.
+    ///
+    /// Rust keeps fields and methods in separate namespaces, while the
+    /// RPython class model used by the annotator has one attribute namespace.
+    /// A method on an enum base therefore also collides with a same-named
+    /// payload field on a variant: seeding that method on the base would make
+    /// the variant constructor inherit a function as the field's default.
+    pub fn owner_or_variant_has_field(&self, owner: &str, field_name: &str) -> bool {
+        if self.field_type(owner, field_name).is_some() {
+            return true;
+        }
+        if !self.is_enum_base(owner) {
+            return false;
+        }
+        let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
+        self.fields.iter().any(|(key, rows)| {
+            let Some((parent, _variant)) = key.rsplit_once("::") else {
+                return false;
+            };
+            majit_ir::descr::canonical_struct_name(parent) == canonical_owner
+                && rows.iter().any(|(field, _)| field == field_name)
+        })
+    }
+
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
         // A per-instantiation enum spelling (`Result<Tuple>`,
         // `Result<Tuple>::Ok`) shares the bare template's rows: the
@@ -1700,5 +1725,21 @@ mod tests {
             !owner_tail.is_some_and(|t| reg.is_enum_base(t)),
             "bare-tail-only probe misses under collision"
         );
+    }
+
+    #[test]
+    fn enum_base_method_collides_with_variant_payload_field() {
+        let mut reg = StructFieldRegistry::default();
+        let base = vec![("__discriminant".to_string(), "i64".to_string())];
+        let variant = vec![("w_obj".to_string(), "PyObjectRef".to_string())];
+        reg.fields.insert("buffer::Buffer".to_string(), base.clone());
+        reg.fields.insert("Buffer".to_string(), base);
+        reg.fields
+            .insert("buffer::Buffer::Array".to_string(), variant.clone());
+        reg.fields.insert("Buffer::Array".to_string(), variant);
+
+        assert!(reg.owner_or_variant_has_field("buffer::Buffer", "w_obj"));
+        assert!(reg.owner_or_variant_has_field("Buffer", "w_obj"));
+        assert!(!reg.owner_or_variant_has_field("buffer::Buffer", "readonly"));
     }
 }
