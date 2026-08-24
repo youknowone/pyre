@@ -1773,9 +1773,10 @@ pub unsafe fn load_attr_fast_path(
 /// an instance slot.
 ///
 /// `type_attr_value_fast_path` is the type-receiver twin
-/// (`typeobject.py:822`); this is the instance-receiver arm of the same
-/// "no descriptor protocol" answer.  A `__get__` or a heap-type value
-/// declines — those bind or could gain a `__get__` without bumping the
+/// (`W_TypeObject.descr_getattribute`); this is the instance-receiver arm
+/// of the same "no descriptor protocol" answer, the `space.get(w_descr,
+/// w_obj)` tail of `Object.descr__getattribute__`.  A `__get__` or a
+/// heap-type value declines — those bind or could gain a `__get__` without bumping the
 /// type version.  A devolved map declines because `find_map_attr` cannot
 /// prove the instance does not shadow the name.
 ///

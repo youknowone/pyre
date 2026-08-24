@@ -2911,12 +2911,24 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
 
     // Class attribute that object.__getattribute__ returns unchanged
-    // (`typeobject.py:822` / `class_attr_fast_path`).  The instance-slot
-    // fold above needs a mapdict storage index; a name that lives only on
-    // the type has none and would otherwise residualize `space.getattr`.
+    // (`Object.descr__getattribute__` / `class_attr_fast_path`).  The
+    // instance-slot fold above needs a mapdict storage index; a name that
+    // lives only on the type has none and would otherwise residualize
+    // `space.getattr`.
     if let Some((w_type, version_tag, map, w_value)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::class_attr_fast_path(concrete_obj, name)
     } {
+        // The movability test is load-bearing, not conservative.  A recorded
+        // `ConstPtr` is forwarded — `remove_constptrs_in` rewrites it to a
+        // `LoadFromGcTable` at emit and `gcreftracer` keeps the table slot
+        // current at run — but `write_residual_call_result_to_dst` first parks
+        // the `OpRef` in the walker's own `registers_r`, and no registered
+        // mutator extra area walks that bank.  A collection between the mint
+        // and the use would leave the inline `GcRef` stale.  The ungated folds
+        // are not counter-examples: `try_walker_specialize_load_type_attr`
+        // bakes a type object and `emit_module_dict_cell_fold` a `malloc_typed`
+        // cell, neither of which moves, whereas a class attribute is an
+        // arbitrary object and can sit in the nursery.
         if !majit_gc::can_move(majit_ir::GcRef(w_value as usize)) {
             walker_guard_mapdict_instance_shape(
                 ctx,
@@ -2928,10 +2940,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 map,
             )?;
             let value = ctx.trace_ctx.const_ref(w_value as i64);
-            ctx.trace_ctx.set_opref_concrete(
-                value,
-                majit_ir::Value::Ref(majit_ir::GcRef(w_value as usize)),
-            );
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
             return Ok(Some(()));
         }
