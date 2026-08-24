@@ -45,6 +45,21 @@ pub fn bytes_data_gc_type_id() -> u32 {
 ///
 /// Same block shape as [`crate::object_array::TypedItemsBlock`], with `Char`
 /// items instead of words.
+///
+/// The block is that `chars` Array alone, not the whole `rpy_string` struct,
+/// which is also all [`BYTES_BLOCK_TOKEN`] names -- `get_array_token(
+/// Array(Char))`. The struct's other two parts have no reader here:
+///
+/// - `('hash', Signed)` is `ll_strhash`'s cache slot. Nothing caches a
+///   byte-string hash in pyre: `bytes.__hash__` siphashes the buffer on every
+///   call (`_hash_bytes`) and the dict's structural hash runs its own hasher
+///   over `w_bytes_data`, so the slot would be written by nobody and read by
+///   nobody while costing a word per `bytes` object.
+/// - `extra_item_after_alloc: 1` reserves the char slot
+///   `ll_write_final_null_char` (`rlib/rgc.py`) writes, so that a `chars`
+///   array can be handed to C in place as a NUL-terminated string.
+///   `PyBytes_AsString` instead copies into the separate `cached_bytes`
+///   mirror, so no C caller ever reads a terminator off this block.
 #[repr(C)]
 pub struct BytesBlock {
     /// The GcArray length header — the collector's `ofstolength`.
