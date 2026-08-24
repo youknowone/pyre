@@ -4,6 +4,15 @@ from io import BufferedReader, BytesIO, FileIO, RawIOBase, StringIO, TextIOWrapp
 from testutils import assert_raises
 
 
+# PyPy W_TextIOWrapper.readline_w distinguishes its untranslated missing
+# argument sentinel from an explicit Python None.
+text_reader = TextIOWrapper(BytesIO(b"hello\nworld"), encoding="utf-8")
+assert text_reader.readline() == "hello\n"
+with assert_raises(TypeError) as error:
+    text_reader.readline(None)
+assert str(error.exception) == "'NoneType' object cannot be interpreted as an integer"
+
+
 # Python 3.14 exposes _checkClosed as a no-argument helper.  In particular,
 # an extra object must be rejected by argument parsing rather than interpreted
 # as an unchecked string pointer.
