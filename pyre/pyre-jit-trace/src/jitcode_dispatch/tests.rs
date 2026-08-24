@@ -504,6 +504,36 @@ fn frame_debug_data_w_globals_descr_reads_the_mutable_override_field() {
     );
 }
 
+/// `FRAME_DEBUG_DATA_DESCR_GROUP`'s accessors name their field by POSITION,
+/// so a field added ahead of one of them re-points it at its neighbour and
+/// nothing fails to compile. Assert the offset each accessor resolves to
+/// against the layout constant, which is the only channel that disagrees.
+#[test]
+fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
+    for (name, descr, offset) in [
+        (
+            "w_globals",
+            crate::descr::frame_debug_data_w_globals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+        ),
+        (
+            "w_locals",
+            crate::descr::frame_debug_data_w_locals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
+        ),
+        (
+            "w_extra_locals",
+            crate::descr::frame_debug_data_w_extra_locals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
+        ),
+    ] {
+        let field = descr
+            .as_field_descr()
+            .unwrap_or_else(|| panic!("{name} resolves to a FieldDescr"));
+        assert_eq!(field.offset(), offset, "{name} reads the wrong group index");
+    }
+}
+
 #[test]
 fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
