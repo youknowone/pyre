@@ -3979,6 +3979,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         simplequeue_descr.ptr_offsets,
     );
 
+    // `_PyLineIterator` / `_PyPositionsIterator` — each holds the code object
+    // whose `co_linetable` its suspended walk reads.  Both are unconditional,
+    // so they close the ungated block here rather than joining the
+    // target-gated tail, whose ids would otherwise move per target.
+    for descriptor in [
+        <pyre_interpreter::pycode::W_LineIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::pycode::W_PositionsIterObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
+
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
