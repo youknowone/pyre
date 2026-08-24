@@ -3563,10 +3563,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if bound_method.is_some() && nparams == 0 {
             return resolved_inline_decline(op.pc, line!());
         }
-        if callee_arg_concretes.len() != callee_args.len() || callee_args.len() <= nparams {
-            // The empty tuple is a runtime singleton (`() is tuple([])`), so a
-            // freshly allocated walker tuple would not be the object the
-            // interpreter installs for a zero-surplus call.
+        if callee_arg_concretes.len() != callee_args.len() || callee_args.len() < nparams {
             return resolved_inline_decline(op.pc, line!());
         }
         let surplus_ops: Vec<OpRef> = callee_args[nparams..].to_vec();
@@ -3580,10 +3577,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             surplus_concretes.push(obj);
         }
-        // A new allocation with no heap mutation, safe during the walk, and the
-        // same constructor `emit_object_tuple_inline` reproduces.
+        // The constructor the interpreter's own `pack_varargs` reaches, so the
+        // walk binds the object the residual would have: a new allocation with
+        // no heap mutation for a surplus — the one `emit_object_tuple_inline`
+        // reproduces below — and the shared `()` for none.
         let concrete = pyre_object::w_tuple_new_array_backed(surplus_concretes);
         if concrete.is_null() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        // A zero-surplus vararg is baked rather than built (see the emit
+        // below), and a freshly minted `ConstPtr` sits in the walker's
+        // `registers_r`, which no registered root area walks.  So the object
+        // has to be one a collection during this walk cannot move.
+        if surplus_ops.is_empty() && majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
             return resolved_inline_decline(op.pc, line!());
         }
         callee_args.truncate(nparams);
@@ -4705,11 +4711,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `scope_w[co_argcount + co_kwonlyargcount] = space.newtuple(starargs_w)`
     // (`argument.py:233-234`), replacing the placeholder pushed above.
     if let Some((surplus_ops, concrete)) = vararg_surplus {
-        let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &surplus_ops);
-        ctx.trace_ctx.set_opref_concrete(
-            tuple_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        );
+        let tuple_op = if surplus_ops.is_empty() {
+            // `space.newtuple([])` hands back one process-wide object — a
+            // call that passes no surplus binds the same `()` every time, and
+            // `is_w` is pointer identity for a tuple — so building a fresh
+            // empty tuple here would bind an object the interpreter never
+            // installs.  Bake the one it does.  This is the ordinary way a
+            // `*args` callee is called, not a corner: `def f(a, *rest)` reached
+            // as `f(i)` was the whole shape being refused, and it ran 509x
+            // slower than the same callee reached as `f(i, 9)`, which inlined.
+            ctx.trace_ctx.const_ref(concrete as i64)
+        } else {
+            let op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &surplus_ops);
+            ctx.trace_ctx
+                .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)));
+            op
+        };
         callee_args[nparams] = tuple_op;
     }
 

@@ -31,6 +31,9 @@ class Holder:
     def method(self, *args):
         return (self.tag, args)
 
+    def leading_method(self, a, *args):
+        return (self.tag, a, args)
+
     def receiverless(*args):
         # No positional parameter to hold the receiver, so it becomes the
         # first element of the vararg tuple instead.
@@ -108,6 +111,20 @@ def bound_method(rounds):
     return acc
 
 
+def bound_method_no_surplus(rounds):
+    # A receiver plus every declared parameter and nothing left over, so the
+    # vararg is the empty singleton while the receiver still has to reach the
+    # frame -- the one shape where both halves of the seeding are exercised at
+    # once.
+    holder = Holder()
+    acc = 0
+    first = holder.leading_method(0)[2]
+    for i in range(rounds):
+        tag, a, rest = holder.leading_method(i)
+        acc = (acc * 31 + tag + a + (1 if rest is first else 0)) & 0xFFFFFFFF
+    return acc
+
+
 def bound_method_receiverless(rounds):
     holder = Holder()
     acc = 0
@@ -164,7 +181,8 @@ def forwarding(rounds):
 
 for fn in (one_surplus, many_surplus, no_surplus, with_leading, with_default,
            with_kwonly, with_starstar, bound_method,
-           bound_method_receiverless, detached_method, escaping, as_dict_key,
+           bound_method_no_surplus, bound_method_receiverless,
+           detached_method, escaping, as_dict_key,
            alternating, forwarding):
     print(fn.__name__, fn(3000))
 print("OK")
