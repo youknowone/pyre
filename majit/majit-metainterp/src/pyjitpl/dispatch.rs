@@ -3947,6 +3947,12 @@ where
                 } else {
                     OpCode::New
                 };
+                // A site that executes the operation itself still owes the
+                // funnel its two counts: `execute_and_record` counts what it
+                // executes and `_record_helper` counts what it appends.
+                ctx.profiler().count_ops(kind, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(kind, crate::counters::RECORDED_OPS);
                 let op = ctx.record_op_with_descr(kind, &[], descr);
                 ctx.set_opref_concrete(op, Value::Ref(majit_ir::GcRef(ptr as usize)));
                 self.set_ref_reg(dest, Some(op), Some(ptr));
@@ -3987,6 +3993,10 @@ where
                     }
                     _ => self.read_int_reg(value_reg),
                 };
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     OpCode::SetfieldGc,
                     &[struct_opref, value_opref],
@@ -4063,6 +4073,10 @@ where
                     None,
                     &[base_opref, ea_opref, value_opref],
                 );
+                ctx.profiler()
+                    .count_ops(OpCode::RawStore, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::RawStore, crate::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     OpCode::RawStore,
                     &[base_opref, ea_opref, value_opref],
@@ -4634,6 +4648,9 @@ where
                             None,
                             &[array_opref, index_opref],
                         );
+                        // The mismatch fallback records without executing: `_record_helper` alone.
+                        ctx.profiler()
+                            .count_ops(opcode, crate::counters::RECORDED_OPS);
                         let _ =
                             ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
                         debug_assert!(
@@ -4650,6 +4667,9 @@ where
                     };
                     (cached, reg_concrete)
                 } else {
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    ctx.profiler()
+                        .count_ops(opcode, crate::counters::RECORDED_OPS);
                     let opref =
                         ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
                     // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
@@ -4720,6 +4740,10 @@ where
                     );
                     cached
                 } else {
+                    ctx.profiler()
+                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
+                    ctx.profiler()
+                        .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
                     let opref = ctx.record_op_with_descr(
                         OpCode::GetarrayitemGcR,
                         &[array_opref, index_opref],
@@ -4784,6 +4808,10 @@ where
                     None,
                     &[array_opref, index_opref, value_opref],
                 );
+                ctx.profiler()
+                    .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     OpCode::SetarrayitemGc,
                     &[array_opref, index_opref, value_opref],
@@ -8397,6 +8425,9 @@ where
                         // because the bytecode is `_i_ir_v`.
                         let result_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        // `opimpl_record_known_result_i_ir_v` records without executing.
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
                             result_val,
                             trace_ptr,
@@ -8412,6 +8443,9 @@ where
                         // `Type::Ref`.
                         let result_val =
                             self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
+                        // `opimpl_record_known_result_r_ir_v` records without executing.
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
                             result_val,
                             trace_ptr,
@@ -8983,10 +9017,17 @@ where
                         .expect("BC_NEWLIST_CLEAR: invalid list-header layout");
                     unsafe { std::alloc::alloc_zeroed(layout) as i64 }
                 };
+                ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
                 let sbox_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
                 ctx.set_opref_concrete(sbox_op, Value::Ref(majit_ir::GcRef(struct_ptr as usize)));
 
                 // ── 2. store the length into the header's `length` field. ──
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(
                     OpCode::SetfieldGc,
                     &[sbox_op, length_opref],
@@ -9027,12 +9068,20 @@ where
                 {
                     unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
                 }
+                ctx.profiler()
+                    .count_ops(OpCode::NewArrayClear, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::NewArrayClear, crate::counters::RECORDED_OPS);
                 let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
                 ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
 
                 // ── 4. store the items block into the header's `items` field.
                 // A ref store adds a heap edge header→items, so notify the GC
                 // on the container (mirrors BC_SETFIELD_GC_R / bh_setfield_gc_r).
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
+                ctx.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
                 if struct_ptr != 0 {
                     unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
@@ -12494,6 +12543,44 @@ mod tests {
         });
         assert_eq!(sf_i, Some((0, true)));
         assert_eq!(sf_r, Some((1, true)));
+    }
+
+    /// `_record_helper` counts what it appends and `execute_and_record`
+    /// counts what it executes, so a body built only from ops that reach the
+    /// trace through that pair leaves `RECORDED_OPS` and `OPS` agreeing with
+    /// the trace itself. A dispatch arm that records the operation by hand
+    /// without the counts breaks the equality here rather than silently
+    /// under-reporting to `jit-summary`.
+    #[test]
+    fn ops_the_dispatch_records_by_hand_are_still_counted() {
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(
+            0,
+            16,
+            0xCD,
+            false,
+            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+        );
+        builder.load_const_i_value(0, 99);
+        builder.setfield_gc_i(0, 0, 0, 0xCD, "value");
+        builder.getfield_gc_i(1, 0, 0, 0xCD, "value");
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+        let recorded = ctx.profiler().get_counter(crate::counters::RECORDED_OPS);
+        let executed = ctx.profiler().get_counter(crate::counters::OPS);
+        let opcodes: Vec<_> = ctx.into_recorder().ops().iter().map(|o| o.opcode).collect();
+        // Naming the arms keeps the equality below from going vacuous if the
+        // body ever stops reaching `BC_NEW` and `BC_SETFIELD_GC_I`.
+        assert_eq!(
+            opcodes,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcI],
+        );
+        assert_eq!(recorded, Some(opcodes.len()), "RECORDED_OPS");
+        assert_eq!(executed, Some(opcodes.len()), "OPS");
     }
 
     #[test]
