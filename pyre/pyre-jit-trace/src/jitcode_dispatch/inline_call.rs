@@ -7906,7 +7906,8 @@ pub(crate) fn allocate_callee_register_banks(
         regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
         concrete_i[body.num_regs_i + i] = ConcreteValue::Int(v);
     }
-    for (i, &v) in body.constants_r.iter().enumerate() {
+    for (i, v) in body.constants_r.iter().enumerate() {
+        let v = v.get();
         regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
         concrete_r[body.num_regs_r + i] =
             ConcreteValue::Ref(v as usize as pyre_object::PyObjectRef);

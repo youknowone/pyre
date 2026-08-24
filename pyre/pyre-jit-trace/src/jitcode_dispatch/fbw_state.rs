@@ -2690,7 +2690,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
     num_regs_i: usize,
     constants_i: &[i64],
     num_regs_r: usize,
-    constants_r: &[i64],
+    constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
     callee_descr_refs: &[DescrRef],
     method_form_deferred_helpers: bool,
 ) -> CalleeReplaySafety {
@@ -2738,14 +2738,14 @@ pub(crate) fn fbw_callee_body_replay_safety(
     // holds the caller's argument.
     let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
     let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
-    for (index, &raw) in constants_r.iter().enumerate() {
+    for (index, raw) in constants_r.iter().enumerate() {
         let Some(reg) = num_regs_r
             .checked_add(index)
             .filter(|r| *r < seed_numeric_ref_regs.len())
         else {
             break;
         };
-        let obj = raw as usize as pyre_object::PyObjectRef;
+        let obj = raw.get() as usize as pyre_object::PyObjectRef;
         if !obj.is_null() {
             let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
             seed_plain_int_ref_regs[reg] = exact_int;

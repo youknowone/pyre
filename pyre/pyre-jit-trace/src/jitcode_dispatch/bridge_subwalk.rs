@@ -137,7 +137,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // Top-level jitcode's per-bank constant pool — seeded into
     // register slots `[num_regs_*, num_regs_* + constants_*.len())`
     // per `pyjitpl.py copy_constants`.
-    top_constants_r: &[i64],
+    top_constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
     top_constants_i: &[i64],
     top_constants_f: &[i64],
     // PyPy `pyjitpl.py setup_call(argboxes)` analog.
@@ -219,7 +219,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
         top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
     }
-    for (i, &v) in top_constants_r.iter().enumerate() {
+    for (i, v) in top_constants_r.iter().enumerate() {
+        let v = v.get();
         top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
         if v != 0 {
             top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
@@ -1163,7 +1164,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_i[num_regs_i + i] = ctx.const_int(v);
         concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
     }
-    for (i, &v) in jc.constants_r.iter().enumerate() {
+    for (i, v) in jc.constants_r.iter().enumerate() {
+        let v = v.get();
         regs_r[num_regs_r + i] = ctx.const_ref(v);
         if v != 0 {
             concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);

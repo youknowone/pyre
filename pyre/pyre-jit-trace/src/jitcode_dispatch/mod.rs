@@ -279,7 +279,7 @@ pub struct SubJitCodeBody {
     /// Callee's Ref-bank constant pool (`JitCode.constants_r`). Each
     /// `i64` is the erased `PyObjectRef` of a const object resolved
     /// at codewriter time.
-    pub constants_r: &'static [i64],
+    pub constants_r: &'static [majit_translate::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
 }

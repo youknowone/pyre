@@ -5455,7 +5455,7 @@ impl JitCodeBuilder {
             calldescr: self.calldescr,
             code: self.code,
             constants_i: self.constants_i,
-            constants_r: self.constants_r,
+            constants_r: self.constants_r.into_iter().map(Into::into).collect(),
             constants_f: self.constants_f,
             // This builder constructs bytecode directly and never emits
             // prebuilt-string ref constants, so the descriptor bank is empty.

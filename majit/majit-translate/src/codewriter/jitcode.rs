@@ -74,6 +74,87 @@ pub struct StrConstDescriptor {
 /// JitCode object in place; pyre groups the late-set fields into a body
 /// struct that is committed via `OnceLock::set` so `Arc<JitCode>` shells
 /// handed out by `CallControl::get_jitcode` can be filled while shared.
+/// One `constants_r` slot.
+///
+/// Interior-mutable because the GC's constant-pool walker forwards these slots
+/// at every collection, and by then the body is published behind an `Arc` with
+/// no `&mut` route left — [`JitCode::body_mut`] takes `&mut self` and its own
+/// doc records that `runtime_fnaddr_patch` can only call it *before*
+/// publication.  Writing through a `*mut` derived from `Vec::as_ptr()` on a
+/// shared body is undefined by the aliasing model even where it happens to
+/// work today, and a compiler free to keep the pre-write value in a register
+/// is precisely the stale-GC-reference failure the walker exists to prevent.
+///
+/// `AtomicI64` rather than `Cell<i64>`: the pool is reachable from more than
+/// one thread (`METAINTERP_SD` is thread-local, the `Arc` is not), so the
+/// element type has to stay `Sync`, and relaxed accesses lower to ordinary
+/// aligned loads and stores.
+///
+/// `repr(transparent)` keeps the pool bit-identical to the `Vec<i64>` it
+/// replaced.  Nothing reads it at a raw address today -- a jitcode operand is
+/// a register-slot byte (`const_pool_slot`) into a register file seeded from
+/// the pool, and the walker indexes the slice -- so this is about keeping the
+/// serialized form and any future word-level consumer honest, not about a
+/// current address-level reader.
+#[repr(transparent)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConstSlotR(std::sync::atomic::AtomicI64);
+
+impl ConstSlotR {
+    pub const fn new(bits: i64) -> Self {
+        Self(std::sync::atomic::AtomicI64::new(bits))
+    }
+
+    #[inline]
+    pub fn get(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Store a forwarded address back into the slot. Shared-reference receiver
+    /// on purpose: the GC walker reaches the pool through an `Arc`.
+    #[inline]
+    pub fn set(&self, bits: i64) {
+        self.0.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Unsynchronised access for a caller that still holds `&mut`, i.e. before
+    /// the jitcode is published behind an `Arc`. `runtime_fnaddr_patch` bakes
+    /// host addresses in during that window.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut i64 {
+        self.0.get_mut()
+    }
+}
+
+impl Clone for ConstSlotR {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl PartialEq for ConstSlotR {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for ConstSlotR {}
+
+/// Compare a slot against a plain word, so an assertion can spell the expected
+/// pool as `vec![0x1234]` rather than wrapping every element.
+impl PartialEq<i64> for ConstSlotR {
+    fn eq(&self, other: &i64) -> bool {
+        self.get() == *other
+    }
+}
+
+impl From<i64> for ConstSlotR {
+    fn from(bits: i64) -> Self {
+        Self::new(bits)
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct JitCodeBody {
     /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython sets
@@ -91,7 +172,7 @@ pub struct JitCodeBody {
     /// RPython uses `lltype.cast_opaque_ptr(GCREF, ...)`; pyre stores the
     /// raw 64-bit address as `i64` to match the runtime jitcode/blackhole
     /// register file (where `r` registers also flow through `i64`).
-    pub constants_r: Vec<i64>,
+    pub constants_r: Vec<ConstSlotR>,
     /// RPython `jitcode.py:34` `self.constants_f`.
     /// RPython packs the float as `longlong.FLOATSTORAGE` (a 64-bit int
     /// reinterpretation); pyre stores the same bitwise representation as
