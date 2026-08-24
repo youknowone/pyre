@@ -1933,9 +1933,16 @@ def synth_selfcheck_interpreted(path):
     which for a guard against a *compiled* mis-admission is a pass that
     establishes nothing. `run_selfcheck` therefore requires the run to have
     compiled a loop, and this is how a fixture says its invariant is not about
-    compiled code: the two that carry it (`oserror_errno_fields_regression`,
-    `posix_replace_regression`) guard interpreter-level behaviour and measure
-    `loops_compiled=0` on every backend.
+    compiled code: the three that carry it (`oserror_errno_fields_regression`,
+    `posix_replace_regression`, `settrace_local_tracer_armed_before_entry`)
+    guard interpreter-level behaviour and measure `loops_compiled=0` on every
+    backend.
+
+    Note the floor it turns off is corpus-level — `loops_compiled >= 1` for the
+    run, not "the loop under test compiled" — so any hot loop in the file
+    satisfies it, a bookkeeping loop over recorded events included. A fixture
+    whose subject never compiles can therefore clear the floor by accident;
+    measure which loop was counted before concluding the floor covered it.
 
     An opt-out rather than an opt-in, so a fixture that quietly stops being
     compiled is reported rather than passing on in silence.

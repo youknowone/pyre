@@ -279,7 +279,7 @@ pub struct SubJitCodeBody {
     /// Callee's Ref-bank constant pool (`JitCode.constants_r`). Each
     /// `i64` is the erased `PyObjectRef` of a const object resolved
     /// at codewriter time.
-    pub constants_r: &'static [i64],
+    pub constants_r: &'static [majit_translate::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
 }
@@ -10246,12 +10246,21 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         // that compiled at the 400th guard failure.
         //
         // A frame whose `debugdata` already exists records no guard below, so
-        // it looks like a residual half of this gap.  Measured, it is not.
-        // Reading `f_lineno`, `f_locals`, `locals()`, `f_lasti` or `f_back`
-        // does not create `debugdata` at all — among the paths tried only a
-        // write to one of the `f_trace*` attributes did — and a frame that HAS
-        // it still reports its whole tail: 99999 of 99999 `call` events at a
-        // 100000 tail, against 1042 with this decline disabled.  The exit is
+        // it looks like a residual half of this gap.  For tracing it is not:
+        // reading `f_lineno`, `f_locals`, `locals()`, `f_lasti` or `f_back`
+        // does not create `debugdata` at all, and a frame that HAS it still
+        // reports its whole tail — 99999 of 99999 `call` events at a 100000
+        // tail, against 1042 with this decline disabled.
+        //
+        // The creator is not only an `f_trace*` write, though.  `getorcreatedebug`
+        // is the single creation point, and `setprofile` / `setllprofile` reach
+        // it as `getorcreatedebug(-1).is_being_profiled = ...`, which mints a
+        // `debugdata` whose `w_f_trace` stays null.  So this arm is reachable
+        // with no tracer ever installed, and the guard-free return below is
+        // then load-bearing for the PROFILING path rather than incidental.
+        // That path is a separate open defect — its event ceiling measures the
+        // same with this decline and without it, so the decline is not what
+        // bounds it — and closing it is not what this change is for.  The exit is
         // `GuardNotForced` (`settrace` forces every frame) where the guard
         // below would otherwise be it, and this decline then refuses to
         // recompile, so the frame stays interpreted either way.  The decline

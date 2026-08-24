@@ -303,13 +303,25 @@ pub fn current_extra_area() -> &'static str {
     CURRENT_EXTRA_AREA.with(|cell| cell.get())
 }
 
+/// Restores [`CURRENT_EXTRA_AREA`] on every exit path out of
+/// [`walk_one_extra_area`], an unwind included.  A plain store after the call
+/// is skipped when the area's walk panics, which leaves the finished area's
+/// label installed and makes the next validation failure name the wrong
+/// registrar -- the opposite of what the label exists for.
+struct ExtraAreaLabel(&'static str);
+
+impl Drop for ExtraAreaLabel {
+    fn drop(&mut self) {
+        CURRENT_EXTRA_AREA.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Run one area's walk with [`current_extra_area`] naming it.
 fn walk_one_extra_area(area: &MutatorExtraArea, visitor: &mut dyn FnMut(&mut GcRef)) {
-    let previous = CURRENT_EXTRA_AREA.with(|cell| cell.replace(area.name));
+    let _label = ExtraAreaLabel(CURRENT_EXTRA_AREA.with(|cell| cell.replace(area.name)));
     // SAFETY: the callers below establish the quiescence / ownership
     // precondition; this helper only brackets the call.
     unsafe { (area.walk)(area.data, visitor) };
-    CURRENT_EXTRA_AREA.with(|cell| cell.set(previous));
 }
 
 /// Pruner for one owner-keyed side table owned by a registered mutator.

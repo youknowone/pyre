@@ -479,7 +479,7 @@ impl BlackholeInterpreter {
             &mut self.registers_r,
             jitcode.num_regs_and_consts_r(),
             jitcode.num_regs_r(),
-            jitcode.constants_r.iter().copied(),
+            jitcode.constants_r.iter().map(|slot| slot.get()),
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
@@ -514,7 +514,7 @@ impl BlackholeInterpreter {
             &mut self.registers_r,
             jitcode.num_regs_and_consts_r(),
             jitcode.num_regs_r(),
-            body.constants_r.iter().copied(),
+            body.constants_r.iter().map(|slot| slot.get()),
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,

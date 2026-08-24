@@ -574,7 +574,14 @@ impl Assembler {
             calldescr: BhCallDescr::default(),
             code: state.code,
             constants_i: state.constants_i,
-            constants_r: state.constants_r,
+            // The builder keeps plain `i64` — nothing walks a pool that is
+            // still being assembled. Interior mutability is owed only from
+            // publication onward, so the conversion happens here.
+            constants_r: state
+                .constants_r
+                .into_iter()
+                .map(super::jitcode::ConstSlotR::new)
+                .collect(),
             constants_f: state.constants_f,
             str_consts: state.str_consts,
             c_num_regs_i: num_regs_i as u16,
