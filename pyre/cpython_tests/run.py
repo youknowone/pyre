@@ -234,11 +234,38 @@ STATS_STDERR_INCOMPATIBLE = {
 
 # ── classification ───────────────────────────────────────────────────
 
-# The collector's `GC BUG` panics carry the holder and child words, both
-# generations, the remembered-set membership and the enclosing container after
-# the `site=` field. At 200 characters every one of them is cut, which leaves a
-# rare crash unattributable from the run it appeared in.
+# Width of the panic MESSAGE kept next to the `panicked at file:line:col:`
+# location. The collector's marking-bug report is the widest one pyre emits:
+# it names the holder, the child, both generations, whether the holder is in
+# the remembered set, and formats two `[usize; 8]` word dumps.
 PANIC_BODY_CHARS = 2000
+
+
+def panic_message_body(lines: list[str]) -> str:
+    """The panic message following a `panicked at file:line:col:` line.
+
+    Rust's default hook writes the location line, then the message, then a
+    `note:` / `stack backtrace:` trailer, so the message is everything in
+    between. It is not one line: `{:#x?}` is alternate debug, which puts every
+    element of an array on its own line, so a report carrying a word dump
+    spans ~20 of them. Joining them is what keeps `holder_in_remembered`,
+    `child_gen` and `child_vtable_type_id` — the fields that separate a stale
+    remembered-set entry from a mis-declared GC offset — in a CI log, which is
+    the only place a crash that does not reproduce locally is ever observed.
+    """
+    body: list[str] = []
+    used = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("note:", "stack backtrace:")):
+            break
+        body.append(stripped[: PANIC_BODY_CHARS - used])
+        used += len(body[-1])
+        if used >= PANIC_BODY_CHARS:
+            break
+    return " ".join(body)
 
 
 def jit_panic_reason(stderr: str) -> str | None:
@@ -254,18 +281,15 @@ def jit_panic_reason(stderr: str) -> str | None:
         for idx, line in enumerate(lines):
             if "panicked" in line:
                 reason = f"rust panic: {line.strip()[:80]}"
-                # Rust's default hook prints the panic MESSAGE on the line(s)
-                # after 'panicked at file:line:col:'. That body carries the
-                # actionable detail; the location line alone cannot triage a
-                # crash from a CI log, so append the first message line, at the
-                # width check.py uses — 200 cut the GC's `invalid major child`
-                # diagnostic at `holder_words`, which is where the fields that
-                # name the culprit start.
-                for follow in lines[idx + 1:]:
-                    follow = follow.strip()
-                    if follow:
-                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
-                        break
+                # The location line alone cannot triage a crash from a CI log.
+                # 200 cut the GC's `invalid major child` diagnostic at
+                # `holder_words`, which is where the fields that name the
+                # culprit start; and those dumps are `{:#x?}` arrays printed one
+                # element per line, so a first-line excerpt truncates them at
+                # any width. Keep the whole message body instead.
+                body = panic_message_body(lines[idx + 1:])
+                if body:
+                    reason += f" | {body}"
                 return reason
         return "rust panic"
     for line in stderr.splitlines():
