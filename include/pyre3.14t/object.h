@@ -24,6 +24,8 @@ struct _object {
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
 #define Py_IS_TYPE(ob, type) (Py_TYPE(ob) == (type))
+/* bpo-39573: writing `ob_type` and `ob_size` goes through these. */
+#define Py_SET_TYPE(ob, type) ((void)(Py_TYPE(ob) = (type)))
 
 /* The reference-counting macros are in `refcount.h`, which `Python.h` includes
    after the declarations they expand to. */
@@ -59,6 +61,7 @@ struct PyVarObject {
 #define PyObject_VAR_HEAD PyVarObject ob_base;
 #define PyVarObject_HEAD_INIT(type, size) { PyObject_HEAD_INIT(type) size },
 #define Py_SIZE(ob) (((PyVarObject *)(ob))->ob_size)
+#define Py_SET_SIZE(ob, size) ((void)(Py_SIZE(ob) = (size)))
 
 typedef void (*destructor)(PyObject *);
 typedef PyObject *(*unaryfunc)(PyObject *);
@@ -84,7 +87,12 @@ typedef PyObject *(*vectorcallfunc)(PyObject *, PyObject *const *, size_t, PyObj
 
 typedef Py_ssize_t (*lenfunc)(PyObject *);
 typedef PyObject *(*ssizeargfunc)(PyObject *, Py_ssize_t);
+/* The two-index slot no type carries any more.  It is named because an
+   extension written against the older layout still spells the type, and
+   because a `PyType_Slot` array may hold one. */
+typedef PyObject *(*ssizessizeargfunc)(PyObject *, Py_ssize_t, Py_ssize_t);
 typedef int (*ssizeobjargproc)(PyObject *, Py_ssize_t, PyObject *);
+typedef int (*ssizessizeobjargproc)(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *);
 typedef int (*objobjproc)(PyObject *, PyObject *);
 typedef int (*objobjargproc)(PyObject *, PyObject *, PyObject *);
 
@@ -222,6 +230,7 @@ struct PyMemberDef {
 #define Py_T_FLOAT 3
 #define Py_T_DOUBLE 4
 #define Py_T_STRING 5
+#define _Py_T_OBJECT 6
 #define Py_T_OBJECT_EX 16
 #define Py_T_CHAR 7
 #define Py_T_BYTE 8
@@ -229,11 +238,15 @@ struct PyMemberDef {
 #define Py_T_USHORT 10
 #define Py_T_UINT 11
 #define Py_T_ULONG 12
+#define Py_T_STRING_INPLACE 13
 #define Py_T_BOOL 14
 #define Py_T_LONGLONG 17
 #define Py_T_ULONGLONG 18
 #define Py_T_PYSSIZET 19
+#define _Py_T_NONE 20
 #define Py_READONLY 1
+#define Py_AUDIT_READ 2
+#define Py_RELATIVE_OFFSET 8
 /* Type flags.  `Py_TPFLAGS_DEFAULT` is 0 here as it is upstream, where it
    reduces to `Py_TPFLAGS_HAVE_STACKLESS_EXTENSION | 0` and that half is 0 off
    Stackless.

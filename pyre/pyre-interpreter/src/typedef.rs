@@ -2464,14 +2464,27 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
 /// The roots built before the `type` typeobject is published read `PY_NULL`
 /// here; the sweep still fills them. A type whose metatype is not `type`
 /// (`_ctypes`' metaclasses) overwrites the slot after construction.
+///
+/// `w_metatype` is the type's own type; `PY_NULL` asks for `type`.  It is
+/// written once, here, and a builtin type's metatype is never changed
+/// afterwards: `try_walker_specialize_load_type_attr` folds a type-attribute
+/// load on the premise that the metatype is `type` and guards the receiver's
+/// identity rather than this slot, which is sound only because a type object
+/// does not exist until this function returns.  Changing a published type's
+/// metatype would owe that fold a guard and `mutated()` a call.
 fn new_builtin_typeobject(
     name: &str,
     bases: PyObjectRef,
     dict_ptr: *mut u8,
     layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
 ) -> PyObjectRef {
     let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
-    unsafe { (*type_obj).w_class = w_type() };
+    let w_metatype = match w_metatype.is_null() {
+        true => w_type(),
+        false => w_metatype,
+    };
+    unsafe { store_subclass_tag(type_obj, w_metatype) };
     type_obj
 }
 
@@ -2496,6 +2509,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         PY_NULL,
         ns as *mut u8,
         &INSTANCE_TYPE as *const PyType,
+        PY_NULL,
     );
     // typeobject.py setup_builtin_type — root type gets its own Layout.
     unsafe {
@@ -2539,16 +2553,44 @@ fn new_typeobject_with_base_and_layout(
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
+    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, PY_NULL)
+}
+
+/// [`new_typeobject_with_base_and_layout`] for a type whose own type is not
+/// `type` — the `metaclass` a C extension names through `PyType_FromMetaclass`,
+/// and the metatype a static `PyTypeObject` declares in its `ob_type`.
+///
+/// `PY_NULL` asks for `type`, which is what every builtin here passes.
+fn new_typeobject_with_metatype_and_layout(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
     let ns = pyre_object::gc_roots::pin_root(ns);
     init(ns);
-    // `type_ready_set_dict` — a static type whose `tp_name` is qualified
-    // publishes the leading component as a `__module__` entry, so
+    // `type_ready_set_dict` — a type whose `tp_name` is qualified publishes the
+    // leading component as a `__module__` entry, so
     // `array.array.__dict__["__module__"] == "array"`.  An unqualified name
     // stores nothing and the `type.__module__` getset reports "builtins".
-    if let Some((module, _)) = name.rsplit_once('.') {
+    //
+    // A namespace that already names `__module__` keeps what it has: a member
+    // row may be declared under that name precisely to shadow it.
+    // `type_new_set_module` and `_PyType_FromMetaclass_impl`'s `module_from_spec`
+    // are the same refusal.
+    let named = unsafe {
+        pyre_object::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            "__module__",
+        )
+    };
+    if named.is_none()
+        && let Some((module, _)) = name.rsplit_once('.')
+    {
         // Allocate the value first: reading `ns` before `w_str_new` would hand
         // the store an address the allocation is free to move.
         let w_module = w_str_new(module);
@@ -2566,7 +2608,7 @@ fn new_typeobject_with_base_and_layout(
     // The type object it allocates is what the namespace has to survive: the
     // word handed over is stored in the new type, but this frame's copy is
     // pre-move, so the probes below take a fresh read.
-    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype, w_metatype);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // typeobject.py setup_builtin_type:
@@ -2584,7 +2626,28 @@ fn new_typeobject_with_base_and_layout(
         let has_dict = pyre_object::w_dict_getitem_str(ns, "__dict__").is_some();
         let has_weakref = pyre_object::w_dict_getitem_str(ns, "__weakref__").is_some();
         let layout = if reuse {
-            parent_layout
+            // A `dict` subclass keeps its entries in a reserved layout slot
+            // rather than in the dict layout.  `create_all_slots` reserves
+            // one for a class written in Python; a type readied from C takes
+            // this route instead and is owed the same slot, or
+            // `set_dict_backing` has nowhere to write and every `dict` method
+            // rejects the instance as a foreign receiver.
+            //
+            // The typedef is still the base's, so what this mints is the
+            // base's layout plus that slot rather than an instance layout of
+            // its own -- everything else is inherited, not re-derived from
+            // the namespace.
+            match crate::type_methods::base_owes_dict_backing(base) {
+                false => parent_layout,
+                true => pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
+                    typedef: layout_pytype,
+                    nslots: (*parent_layout).nslots + 1,
+                    newslotnames: vec![crate::type_methods::DICT_DATA_SLOT.to_string()],
+                    base_layout: parent_layout,
+                    acceptable_as_base_class: (*parent_layout).acceptable_as_base_class,
+                    typedef_hasdict: (*parent_layout).typedef_hasdict,
+                }),
+            }
         } else {
             let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
@@ -2658,7 +2721,7 @@ pub fn make_builtin_type_with_bases(
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype, PY_NULL);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     unsafe {
@@ -2755,6 +2818,20 @@ pub fn mark_cpython_static_extension_type(type_obj: PyObjectRef) {
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(type_obj, false, false, true);
     }
+}
+
+/// [`make_builtin_type_with_layout`] for a type whose own type is not `type`.
+///
+/// The metatype must be a subclass of `type` whose instances are laid out as
+/// `W_TypeObject` — the caller establishes both; `PY_NULL` asks for `type`.
+pub fn make_builtin_type_with_metatype(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
+) -> PyObjectRef {
+    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, w_metatype)
 }
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
@@ -11117,6 +11194,35 @@ fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
     unsafe { pyre_object::w_type_get_have_gc(w_type) }
 }
 
+/// The four numbers `typeobject.c type_members` publishes off a
+/// `PyTypeObject`, for a type an extension declared in C.
+pub(crate) struct DeclaredTypeLayout {
+    pub basicsize: i64,
+    pub itemsize: i64,
+    pub dictoffset: i64,
+    pub weaklistoffset: i64,
+}
+
+/// What a type declared in C reports for those four; `None` for a type this
+/// runtime defines, and in every build without the extension layer.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn declared_type_layout(w_type: PyObjectRef) -> Option<DeclaredTypeLayout> {
+    crate::cpyext::typeobject::declared_type_layout(w_type)
+}
+
+#[cfg(not(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+fn declared_type_layout(_w_type: PyObjectRef) -> Option<DeclaredTypeLayout> {
+    None
+}
+
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.
@@ -11134,7 +11240,13 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     let word = std::mem::size_of::<usize>() as i64;
     let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
     let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
-    let (base, item) = if is(&pyre_object::INSTANCE_TYPE) {
+    let (base, item) = if let Some(declared) = declared_type_layout(w_type) {
+        // A type declared in C sizes its instances by the struct it wrote
+        // down, and `type_members` publishes that struct's own numbers.  The
+        // prefix a type of this runtime's would contribute is not what those
+        // fields were laid out against, so the declaration precedes the table.
+        (declared.basicsize, declared.itemsize)
+    } else if is(&pyre_object::INSTANCE_TYPE) {
         (4 * word, 0)
     } else if is(&pyre_object::TYPE_TYPE) {
         // `PyHeapTypeObject`, which keeps a unique-id word here that a build
@@ -11230,6 +11342,8 @@ fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (0, 26 * word)
     } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
         (0, 19 * word)
+    } else if let Some(declared) = declared_type_layout(w_type) {
+        (declared.dictoffset, declared.weaklistoffset)
     } else {
         (0, 0)
     };
@@ -24748,11 +24862,13 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn bytearray_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "__repr__")?;
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let class_name = crate::typedef::r#type(args[0])
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-        .unwrap_or("bytearray");
+    // `bytearray_repr` names the receiver's type through `_PyType_Name`, so a
+    // subclass whose name is qualified reports only its own component --
+    // unlike `set_repr`, which spells the whole `tp_name`.
+    let class_name = crate::gateway::short_type_name(args[0]);
     Ok(w_str_new_managed(&crate::display::bytearray_repr_string(
-        data, class_name,
+        data,
+        &class_name,
     )))
 }
 

@@ -29,6 +29,11 @@ extern "C" {
 /* An `int` here is an ordinary mirror with no digit array of its own, so the
    name exists only so these two declarations read as they do upstream. */
 
+/* The unchecked spelling, which a caller uses where it already knows the
+   object is an `int` small enough to fit.  There is no field to read, so it
+   is the checked call. */
+#define PyLong_AS_LONG(op) PyLong_AsLong((PyObject *)(op))
+
 #ifdef __cplusplus
 }
 #endif

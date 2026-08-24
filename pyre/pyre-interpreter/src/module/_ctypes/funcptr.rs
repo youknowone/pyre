@@ -1353,9 +1353,13 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let target = args[2];
+    // `_ctypes.c cast_check_pointertype`: a pointer type, a function-pointer
+    // type, or a simple type whose code is one of the pointer-shaped ones.
     let is_pointer = stginfo::stginfo_of(target)
         .is_some_and(|i| stginfo::stginfo_paramfunc(i) == "pointer")
-        || cdata::type_code_of(target).is_some_and(|tc| matches!(tc.as_str(), "z" | "Z" | "P"));
+        || is_funcptr_type(target)
+        || cdata::type_code_of(target)
+            .is_some_and(|tc| matches!(tc.as_str(), "s" | "P" | "z" | "U" | "Z" | "X" | "O"));
     if !is_pointer {
         return Err(crate::PyError::type_error(
             "cast() argument 2 must be a pointer type",
@@ -1363,12 +1367,18 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let address = argument_address(args[0])?;
     let result = crate::call::type_call_instantiate(target, &[])?;
-    let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
-        "P",
-        host_ctypes::SimpleStorageValue::Pointer(address),
-        false,
-    );
-    cdata::cdata_write(result, 0, &bytes);
+    if is_funcptr_type(target) {
+        // A foreign function keeps its address beside the buffer, and that is
+        // the copy a call reads.
+        store_funcptr_addr(result, address)?;
+    } else {
+        let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+            "P",
+            host_ctypes::SimpleStorageValue::Pointer(address),
+            false,
+        );
+        cdata::cdata_write(result, 0, &bytes);
+    }
     if cdata::is_cdata_instance(args[1]) {
         cdata::share_objects_for_cast(result, args[1]);
     } else {

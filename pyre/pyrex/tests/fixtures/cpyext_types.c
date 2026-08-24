@@ -148,11 +148,35 @@ static PyObject *point_named(PyObject *self, PyObject *args, PyObject *kwds)
     return PyUnicode_FromString(buffer);
 }
 
+/* A METH_METHOD row: the call is handed the class the definition was
+   declared in, on top of the receiver and the argument vector. */
+static PyObject *point_declared_in(PyObject *self, PyTypeObject *cls,
+                                   PyObject *const *args, Py_ssize_t nargs,
+                                   PyObject *kwnames)
+{
+    PointObject *point = (PointObject *)self;
+    Py_ssize_t named = kwnames == NULL ? 0 : PyTuple_GET_SIZE(kwnames);
+    (void)args;
+    return Py_BuildValue("slnn", cls->tp_name, point->x, nargs, named);
+}
+
+/* A row that reads nothing off its receiver, so the same definition answers
+   whether it was reached through an instance or through the class. */
+static PyObject *point_receiver(PyObject *self, PyObject *unused)
+{
+    (void)unused;
+    return Py_BuildValue("(ss)", Py_TYPE(self)->tp_name,
+                         PyType_Check(self) ? ((PyTypeObject *)self)->tp_name : "-");
+}
+
 static PyMethodDef point_methods[] = {
+    {"receiver", point_receiver, METH_NOARGS, "what this row was reached through"},
     {"translate", (PyCFunction)point_translate, METH_VARARGS, "shift in place"},
     {"norm", (PyCFunction)point_norm, METH_NOARGS, "squared length"},
     {"named", (PyCFunction)(void (*)(void))point_named, METH_VARARGS | METH_KEYWORDS,
      "prefixed name"},
+    {"declared_in", (PyCFunction)(void (*)(void))point_declared_in,
+     METH_METHOD | METH_FASTCALL | METH_KEYWORDS, "the class this row belongs to"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -936,6 +960,9 @@ static PyObject *m_protocol(PyObject *self, PyObject *args)
     if (strcmp(what, "float") == 0) {
         return PyNumber_Float(first);
     }
+    if (strcmp(what, "long") == 0) {
+        return PyNumber_Long(first);
+    }
     if (strcmp(what, "number_check") == 0) {
         return PyBool_FromLong(PyNumber_Check(first));
     }
@@ -1278,9 +1305,59 @@ static PyObject *blob_read(PyObject *self, PyObject *source)
     return copy;
 }
 
+/* A writable export: fill every byte of whatever was handed in. */
+static PyObject *blob_fill(PyObject *self, PyObject *args)
+{
+    PyObject *target = NULL;
+    int value = 0;
+    if (!PyArg_ParseTuple(args, "Oi", &target, &value)) {
+        return NULL;
+    }
+    Py_buffer view;
+    if (PyObject_GetBuffer(target, &view, PyBUF_WRITABLE) < 0) {
+        return NULL;
+    }
+    memset(view.buf, value, (size_t)view.len);
+    Py_ssize_t written = view.len;
+    PyBuffer_Release(&view);
+    return PyLong_FromSsize_t(written);
+}
+
+/* The geometry a full request reports, so the caller can check each field. */
+static PyObject *blob_describe(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_FULL_RO) < 0) {
+        return NULL;
+    }
+    PyObject *described = Py_BuildValue(
+        "(nnisnn)", view.len, view.itemsize, view.ndim,
+        view.format == NULL ? "" : view.format,
+        view.shape == NULL ? (Py_ssize_t)-1 : view.shape[0],
+        view.strides == NULL ? (Py_ssize_t)-1 : view.strides[0]);
+    PyBuffer_Release(&view);
+    return described;
+}
+
+/* The address a request reports, so two exports of one object can be
+   compared: a live window answers the same address twice, a copy does not. */
+static PyObject *blob_address(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    PyObject *address = PyLong_FromVoidPtr(view.buf);
+    PyBuffer_Release(&view);
+    return address;
+}
+
 static PyMethodDef blob_methods[] = {
     {"exports", blob_exports, METH_NOARGS, "live export count"},
     {"read", blob_read, METH_O, "PyObject_GetBuffer over any exporter"},
+    {"fill", blob_fill, METH_VARARGS, "write through a PyBUF_WRITABLE export"},
+    {"describe", blob_describe, METH_O, "the geometry a full request reports"},
+    {"address", blob_address, METH_O, "the address a request reports"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1475,6 +1552,77 @@ static PyTypeObject TickerType = {
     ticker_new,                                 /* tp_new */
 };
 
+/* ── Sealed: a static type that declares no tp_new ──────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long token;
+} SealedObject;
+
+static PyObject *sealed_token(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return PyLong_FromLong(((SealedObject *)self)->token);
+}
+
+static PyMethodDef sealed_methods[] = {
+    {"token", sealed_token, METH_NOARGS, "the token the factory stamped"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyTypeObject SealedType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Sealed",                      /* tp_name */
+    sizeof(SealedObject),                       /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a type only its factory builds",           /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    sealed_methods,                             /* tp_methods */
+};
+
+/* The factory standing in for the constructor the type does not declare. */
+static PyObject *m_seal(PyObject *self, PyObject *args)
+{
+    long token = 0;
+    if (!PyArg_ParseTuple(args, "l", &token)) {
+        return NULL;
+    }
+    SealedObject *made = (SealedObject *)PyType_GenericAlloc(&SealedType, 0);
+    if (made == NULL) {
+        return NULL;
+    }
+    made->token = token;
+    return (PyObject *)made;
+}
+
+static PyObject *m_sealed_flags(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    unsigned long flags = PyType_GetFlags(&SealedType);
+    return Py_BuildValue("(kk)",
+                         flags & Py_TPFLAGS_DISALLOW_INSTANTIATION,
+                         (unsigned long)(SealedType.tp_new != NULL));
+}
+
 /* ── Spec: a heap type built with PyType_FromSpec ───────────────────── */
 
 typedef struct {
@@ -1585,10 +1733,23 @@ static PyMethodDef extra_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+/* `Py_RELATIVE_OFFSET` counts from the extra data rather than from the block,
+   so the same `offsetof` the accessors above use serves the descriptors.
+   `weight` also asks to be audited on every read. */
+static PyMemberDef extra_members[] = {
+    {"tag", Py_T_LONG, offsetof(extra_data, tag), Py_RELATIVE_OFFSET,
+     "the tag, through a descriptor"},
+    {"weight", Py_T_DOUBLE, offsetof(extra_data, weight),
+     Py_READONLY | Py_RELATIVE_OFFSET | Py_AUDIT_READ,
+     "the weight, through a descriptor"},
+    {NULL, 0, 0, 0, NULL},
+};
+
 static char extra_token;
 
 static PyType_Slot extra_slots[] = {
     {Py_tp_methods, extra_methods},
+    {Py_tp_members, extra_members},
     {Py_tp_token, &extra_token},
     {0, NULL},
 };
@@ -1809,7 +1970,89 @@ static PyObject *m_freeze(PyObject *self, PyObject *type)
     Py_RETURN_NONE;
 }
 
+/* ── the descriptors a namespace holds ────────────────────────────────── */
+
+/* `PyMethodDescr_Check`, together with the two fields a caller that agrees
+   reads off the block straight afterwards. */
+static PyObject *m_descr_facts(PyObject *self, PyObject *value)
+{
+    PyMethodDescrObject *descr;
+    (void)self;
+    if (!PyMethodDescr_Check(value)) {
+        return Py_BuildValue("(iOO)", 0, Py_None, Py_None);
+    }
+    descr = (PyMethodDescrObject *)value;
+    return Py_BuildValue("(isz)", 1, descr->d_common.d_type->tp_name,
+                         descr->d_method->ml_name);
+}
+
+/* The name a descriptor block carries, through the accessor rather than the
+   field. */
+static PyObject *m_descr_name(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return Py_NewRef(PyDescr_NAME(value));
+}
+
+/* `PyDescr_NewMethod(Point, point_methods[0])`. */
+static PyObject *m_new_method_descr(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return PyDescr_NewMethod(&PointType, &point_methods[0]);
+}
+
+/* `PyDescr_NewClassMethod` over the same row, which binds the class. */
+static PyObject *m_new_classmethod_descr(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return PyDescr_NewClassMethod(&PointType, &point_methods[0]);
+}
+
+/* What either of them answers when the type argument is not a type: the class
+   name of the exception it left behind, or `None` when it left none. */
+static PyObject *m_new_descr_bad_type(PyObject *self, PyObject *unused)
+{
+    PyObject *made, *raised, *name;
+    (void)self;
+    (void)unused;
+    made = PyDescr_NewClassMethod((PyTypeObject *)Py_None, &point_methods[0]);
+    if (made != NULL) {
+        Py_DECREF(made);
+        Py_RETURN_NONE;
+    }
+    raised = PyErr_GetRaisedException();
+    if (raised == NULL) {
+        Py_RETURN_NONE;
+    }
+    name = PyUnicode_FromString(Py_TYPE(raised)->tp_name);
+    Py_DECREF(raised);
+    return name;
+}
+
+/* `PyClassMethod_New` and `PyStaticMethod_New`, over whatever was handed in. */
+static PyObject *m_class_method_new(PyObject *self, PyObject *function)
+{
+    (void)self;
+    return PyClassMethod_New(function);
+}
+
+static PyObject *m_static_method_new(PyObject *self, PyObject *function)
+{
+    (void)self;
+    return PyStaticMethod_New(function);
+}
+
 static PyMethodDef methods[] = {
+    {"descr_facts", m_descr_facts, METH_O, "PyMethodDescr_Check and the block"},
+    {"descr_name", m_descr_name, METH_O, "PyDescr_NAME"},
+    {"new_method_descr", m_new_method_descr, METH_NOARGS, "PyDescr_NewMethod"},
+    {"new_classmethod_descr", m_new_classmethod_descr, METH_NOARGS,
+     "PyDescr_NewClassMethod"},
+    {"new_descr_bad_type", m_new_descr_bad_type, METH_NOARGS, "a type that is not one"},
+    {"class_method_new", m_class_method_new, METH_O, "PyClassMethod_New"},
+    {"static_method_new", m_static_method_new, METH_O, "PyStaticMethod_New"},
     {"type_owner", m_type_owner, METH_O, "the module a spec type belongs to"},
     {"type_token", m_type_token, METH_O, "PyType_GetBaseByToken three ways"},
     {"type_token_null", m_type_token_null, METH_O, "a NULL token is an error"},
@@ -1832,6 +2075,8 @@ static PyMethodDef methods[] = {
     {"owner_deallocs", m_owner_deallocs, METH_NOARGS, "how often Owner.tp_dealloc ran"},
     {"collect_then_owner_deallocs", m_collect_then_owner_deallocs, METH_NOARGS,
      "gc.collect(), then the count as it stands on return"},
+    {"seal", m_seal, METH_VARARGS, "build a Sealed from C"},
+    {"sealed_flags", m_sealed_flags, METH_NOARGS, "Sealed's instantiation flag and tp_new"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1868,6 +2113,9 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &OwnerType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &SealedType) < 0) {
         return -1;
     }
     if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {

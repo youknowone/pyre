@@ -17,6 +17,12 @@ struct PyMethodDef {
     const char *ml_doc;
 };
 
+/* A `METH_NOARGS` or `METH_O` function is written with the parameters its own
+   convention passes, which need not be the two `PyCFunction` names.  Calling
+   one through a mismatched pointer type is undefined, so a table entry says
+   here that the cast is deliberate (bpo-33012). */
+#define _PyCFunction_CAST(func) _Py_FUNC_CAST(PyCFunction, func)
+
 #define METH_VARARGS 0x0001
 #define METH_KEYWORDS 0x0002
 #define METH_NOARGS 0x0004
@@ -31,13 +37,12 @@ struct PyMethodDef {
 
 /* The two layouts a C function carries.
  *
- * Nothing pyre makes is read through these: what a `PyMethodDef`-backed
- * callable holds is reached through the entry points below, which is why they
- * are calls where the reference header spells them as field reads.  The fields
- * are declared because an extension defining a type derived from
- * `PyCFunction_Type` embeds one of these in its own instance layout and writes
- * them itself -- the block a C-defined type's instance gets is `tp_basicsize`
- * bytes, so those fields are that instance's own storage. */
+ * A carrier's block holds these fields, so a source spelling them as field
+ * reads gets what the entry points below answer -- cffi's `_cpyextfunc_get`
+ * reads `m_ml` and `m_module` that way, and the module read is an identity
+ * test against the reference it handed `PyCFunction_NewEx`.  The macros stay
+ * calls because a type derived from `PyCFunction_Type` embeds one of these in
+ * its own instance layout and fills it itself. */
 typedef struct {
     PyObject_HEAD
     PyMethodDef *m_ml;

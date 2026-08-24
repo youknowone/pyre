@@ -1900,6 +1900,20 @@ pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_glob
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
+/// Whether a line table records no position for any instruction.
+///
+/// A `None`-kind entry is the spelling for "this instruction has no line",
+/// which `co_positions()` reports as `None`; every other kind carries one,
+/// `NoColumns` included, which drops the columns and keeps the line.  A
+/// `None` entry has no payload, so a table made only of them can be walked a
+/// byte at a time and any other kind ends the walk at its first byte.
+fn linetable_records_no_position(linetable: &[u8]) -> bool {
+    linetable.iter().all(|&byte| {
+        byte & 0x80 != 0
+            && (byte >> 3) & 0x0f == crate::bytecode::PyCodeLocationInfoKind::None as u8
+    })
+}
+
 /// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
 /// Matches RPython: negative `stopat` means "frame not yet started", returns
 /// first-line.
@@ -4130,16 +4144,13 @@ impl PyFrame {
     /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
-        // A malformed replacement linetable is decoded by the compiler-core
-        // marshal reader as repeated zero-width positions on the first line.
-        // CPython reports ``frame.f_lineno is None`` for that table rather
-        // than manufacturing the code object's first line number.
-        let locations = crate::pycode::code_locations(self.code());
-        if !locations.is_empty()
-            && locations.iter().all(|(start, end)| {
-                start.character_offset.get() == 1 && end.character_offset.get() == 1
-            })
-        {
+        // A line table that records no position at all reports ``f_lineno is
+        // None`` rather than the code object's first line number.  The decoded
+        // `locations` cannot answer this: a `SourceLocation` always carries a
+        // line, so an entry that records none is padded out to the same value
+        // an entry that records a line without columns produces.  The raw
+        // table separates them.
+        if linetable_records_no_position(&self.code().linetable) {
             return -1;
         }
         // CPython exposes ``None`` when a code object's line table has no
@@ -4514,6 +4525,16 @@ impl PyFrame {
             }
         }
 
+        // `_PyFrame_GetLocals`: a frame that is not optimized and has no hidden
+        // locals hands back its mapping as it stands.  Its namespace is
+        // authoritative -- every binding that belongs there arrived by
+        // `STORE_NAME` -- so a cell holds nothing the mapping is missing, and
+        // copying one in publishes a name the body never bound.  A class body
+        // carries `__classdict__` as a cell whose value is the namespace
+        // itself, and writing that back leaves the namespace holding itself.
+        if !code.flags.contains(CodeFlags::OPTIMIZED) {
+            return Ok(());
+        }
         let pure_cells: Vec<&_> = code
             .cellvars
             .iter()
@@ -4526,12 +4547,7 @@ impl PyFrame {
             })
             .collect();
         let npure = pure_cells.len();
-        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
-        let freevarnames_len = if include_freevars {
-            npure + code.freevars.len()
-        } else {
-            npure
-        };
+        let freevarnames_len = npure + code.freevars.len();
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
                 pure_cells[i].as_ref()
@@ -4549,14 +4565,9 @@ impl PyFrame {
                 };
                 if !w_value.is_null() {
                     setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
-                } else if code.flags.contains(CodeFlags::OPTIMIZED) {
-                    // Optimized (function) frames own their cellvars in the
-                    // cell, so an empty cell means the local is unbound and its
-                    // locals entry must be removed.  Module/class frames are
-                    // namespace-authoritative: a cellvar can hold its binding in
-                    // `w_locals` via STORE_NAME while its cell stays empty
-                    // (`__conditional_annotations__`), so an empty cell there
-                    // must not erase the STORE_NAME binding.
+                } else {
+                    // A function frame owns its cellvars in the cell, so an
+                    // empty cell means the local is unbound and its entry goes.
                     delitem_str_object(locals_roots.get(locals_slot), name)?;
                 }
             }

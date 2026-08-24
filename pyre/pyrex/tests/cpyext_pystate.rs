@@ -52,6 +52,12 @@ eq('ensure_states', m.ensure_states(), (0, 0, True))
 # One state per thread, and swapping NULL out and back answers what it replaced.
 eq('thread_state_identity', m.thread_state_identity(), (True, True, True))
 
+# Taking the GIL inside a block that gave it up makes this thread's state the
+# current one, so the entry points that answer with it have an answer; UNLOCKED,
+# because taking it is what that call had to do.  The release gives it back.
+eq('ensure_inside_allow_threads',
+   m.ensure_inside_allow_threads(), (1, True, True, True, True))
+
 # A thread pyre never created runs Python under PyGILState_Ensure, which reports
 # UNLOCKED because taking the GIL is what that call had to do.
 eq('call_from_foreign_thread',

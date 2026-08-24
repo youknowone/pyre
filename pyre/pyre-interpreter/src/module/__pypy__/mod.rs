@@ -55,6 +55,19 @@ fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
     Ok(pyre_object::w_none())
 }
 
+/// `interp_magic.py newlist_hint`: an empty list to be filled with about
+/// `sizehint` items.
+///
+/// The hint names a storage length, not a length, so what comes back is `[]`.
+/// A list here grows its block as it is appended to and carries no capacity
+/// that can be set before the first item, so the number is read -- upstream
+/// unwraps it as an `int` and a caller passing something else is owed the
+/// error -- and nothing else is done with it.
+fn newlist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let _sizehint = crate::baseobjspace::int_w(args[0])?;
+    Ok(pyre_object::w_list_new(Vec::new()))
+}
+
 /// `interp_magic.py add_memory_pressure`: report a raw allocation to
 /// incminimark so the next major collection is scheduled sooner. The public
 /// builtin has no owner object; translated internal callers use the same GC
@@ -228,6 +241,7 @@ crate::py_module! {
         "get_contextvar_context" / 0 = get_contextvar_context,
         "set_contextvar_context" / 1 = set_contextvar_context,
         "add_memory_pressure" / 1 = add_memory_pressure,
+        "newlist_hint" / 1 = newlist_hint,
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,

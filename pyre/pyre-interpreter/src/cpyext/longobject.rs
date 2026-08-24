@@ -136,6 +136,13 @@ pub unsafe extern "C" fn PyLong_AsSsize_t(object: *mut CPyObject) -> isize {
     as_i64(object).unwrap_or(-1) as isize
 }
 
+/// `longobject.py _PyLong_Sign` — -1, 0 or 1, and no error to report:
+/// the caller has already established that the object is an `int`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyLong_Sign(object: *mut CPyObject) -> c_int {
+    as_bigint(object, |value| value.get_sign()).unwrap_or(0) as c_int
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyLong_AsUnsignedLong(object: *mut CPyObject) -> c_ulong {
     as_unsigned(object).unwrap_or(u64::MAX) as c_ulong
@@ -692,7 +699,22 @@ pub unsafe extern "C" fn PyNumber_Long(object: *mut CPyObject) -> *mut CPyObject
     let Some(object) = argument(object) else {
         return std::ptr::null_mut();
     };
-    result(crate::baseobjspace::gateway_int_w(object).map(pyre_object::w_int_new))
+    // `number.py PyNumber_Long`: `space.call_function(space.w_int, w_obj)`.
+    // The class, not the unwrap -- `int(12.9)` truncates and `int("12")`
+    // parses, where `int_w` takes only what already is one.
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(object);
+    let Some(class) = crate::typedef::gettypefor(&pyre_object::INT_TYPE) else {
+        return result(Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyNumber_Long(): the int class is not built yet",
+        )));
+    };
+    result(crate::call::call_function_impl_result(
+        class.as_ptr(),
+        &[pyre_object::gc_roots::shadow_stack_get(slot)],
+    ))
 }
 
 fn bool_of(value: bool) -> PyObjectRef {
@@ -716,6 +738,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyLong_AsLong as *const ());
     std::hint::black_box(PyLong_AsLongLong as *const ());
     std::hint::black_box(PyLong_AsSsize_t as *const ());
+    std::hint::black_box(_PyLong_Sign as *const ());
     std::hint::black_box(PyLong_AsUnsignedLong as *const ());
     std::hint::black_box(PyLong_AsUnsignedLongLong as *const ());
     std::hint::black_box(PyLong_AsSize_t as *const ());

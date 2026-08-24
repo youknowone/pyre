@@ -90,6 +90,11 @@ static inline int PyUnicodeWriter_Format(PyUnicodeWriter *writer,
     return written;
 }
 
+/* The encoding the filesystem paths are decoded with.  It is always `utf-8`
+   here, and it is a data symbol rather than a call because an extension reads
+   it as one -- cffi compares it against a literal. */
+PyAPI_DATA(const char *) Py_FileSystemDefaultEncoding;
+
 #ifdef __cplusplus
 }
 #endif

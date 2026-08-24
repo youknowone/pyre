@@ -40,6 +40,40 @@ assert m.bump.__self__ is m
 assert m.bump.__module__ == 'cpyext_methods'
 assert callable(m.bump)
 
+
+def refuses(kind, message, call):
+    try:
+        call()
+    except kind as error:
+        assert str(error) == message, '%r != %r' % (str(error), message)
+    else:
+        raise AssertionError('%s was not raised: %s' % (kind.__name__, message))
+
+
+# `__module__` is the one member of the carrier a store may reach; deleting it
+# leaves the slot reading `None` rather than removing it, so the delete is
+# repeatable and the name never falls through to anything else.
+m.bump.__module__ = 'renamed'
+assert m.bump.__module__ == 'renamed'
+del m.bump.__module__
+assert m.bump.__module__ is None
+del m.bump.__module__
+assert m.bump.__module__ is None
+m.bump.__module__ = 'cpyext_methods'
+assert m.bump.__module__ == 'cpyext_methods'
+
+refuses(
+    AttributeError,
+    "attribute '__name__' of 'builtin_function_or_method' objects is not writable",
+    lambda: setattr(m.bump, '__name__', 'nope'),
+)
+refuses(
+    AttributeError,
+    "'builtin_function_or_method' object has no attribute 'spam' "
+    'and no __dict__ for setting new attributes',
+    lambda: setattr(m.bump, 'spam', 1),
+)
+
 def rejects(call, *args, **kwargs):
     try:
         call(*args, **kwargs)
@@ -80,6 +114,25 @@ assert m.layout(1, a=2, b=3) == ([1], [('a', 2), ('b', 3)])
 assert m.apply(abs, -4) == 4
 assert m.apply(str, 12) == '12'
 rejects(m.apply, abs)
+
+# The count reported is the bound the call missed, and the callable is named
+# without the `()` every other argument error carries.
+def message(call, *args):
+    try:
+        call(*args)
+    except TypeError as error:
+        return str(error)
+    raise AssertionError('%r accepted %r' % (call, args))
+
+assert message(m.apply, abs) == 'apply expected 2 arguments, got 1'
+assert message(m.apply) == 'apply expected 2 arguments, got 0'
+assert message(m.apply, abs, 1, 2) == 'apply expected 2 arguments, got 3'
+assert message(m.at_most_two, 1, 2, 3) == 'at_most_two expected at most 2 arguments, got 3'
+assert message(m.at_most_two) == 'at_most_two expected at least 1 argument, got 0'
+
+# A carrier's block holds the definition, the receiver and the module it was
+# built with, and the module is the same reference that was handed over.
+assert m.carrier_fields(m, 'a-module-name') == (True, True, True, True, True)
 
 present, text, shown, size, truth = m.inspect([1, 2], 'append')
 assert (present, text, shown, size, truth) == (1, '[1, 2]', '[1, 2]', 2, 1)
@@ -150,7 +203,8 @@ assert m.restore() == (1, 1, 1, 1, 1), m.restore()
 # patchlevel.h, as an extension expands it: a banner string, the parts, and the
 # packed hex.  Each is compared against what the runtime reports, so a header
 # that drifts from sys is a failure rather than a silent disagreement.
-banner, major, minor, micro, level, serial, version, hexversion = m.version_macros()
+(banner, major, minor, micro, level, serial, version, hexversion,
+ pypy_version, pypy_version_num) = m.version_macros()
 assert (major, minor, micro) == sys.version_info[:3], (major, minor, micro)
 assert version == '%d.%d.%d' % sys.version_info[:3], version
 assert (level, serial) == (0xF, 0), (level, serial)
@@ -158,6 +212,10 @@ assert sys.version_info.releaselevel == 'final'
 assert hexversion == sys.hexversion, (hex(hexversion), hex(sys.hexversion))
 assert banner.startswith('python ' + version + ' / pyre '), banner
 assert banner.endswith('.'.join(str(p) for p in sys.pyre_version_info[:3])), banner
+# The macro an extension branches on to ask whose object layouts these are, and
+# the number beside it.
+assert pypy_version.startswith('8.'), pypy_version
+assert pypy_version_num == 0x08000000, hex(pypy_version_num)
 # The swallowed exception must not leak into the caller.
 assert m.bump() == 4
 
@@ -515,8 +573,12 @@ except TypeError:
     pass
 else:
     raise AssertionError("'y*' accepted a str")
-# 'w*' asks for a writable view, which an interpreter object never exports.
-assert m.writable_buffer(bytearray(b'ab')) == 'read-only'
+# 'w*' asks for a writable view: an exporter with writable storage answers
+# one and the write lands in the object, and read-only storage refuses.
+target = bytearray(b'ab')
+assert m.writable_buffer(target) == 2
+assert target == bytearray(b'Wb')
+assert m.writable_buffer(b'ab') == 'read-only'
 
 # ── the argument formats that hand over a pointer ──────────────────────
 # Every row here was taken from CPython 3.14.6 running this same table against

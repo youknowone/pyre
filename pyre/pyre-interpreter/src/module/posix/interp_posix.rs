@@ -343,10 +343,14 @@ fn run_fork_callbacks(kind: &str) {
         let Some(callback) = callback else { continue };
         if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
+            let repr = unsafe { crate::display::py_repr_wtf8(callback as PyObjectRef) }
+                .unwrap_or_else(|_| {
+                    rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
+                });
             error.write_unraisable(
                 pyre_object::w_none(),
-                rustpython_wtf8::Wtf8::new("fork hook"),
-                callback as PyObjectRef,
+                &crate::display::wtf8_format!("Exception ignored in atfork callback ", repr),
+                pyre_object::w_none(),
             );
         }
     }

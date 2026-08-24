@@ -607,6 +607,12 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                     &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
                 forward(bases_slot);
                 let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
+                // The metatype.  `type_object_custom_trace` forwards it too,
+                // but never runs for the Box-immortal owners this walk stands
+                // in for.  It is the immortal `type` for all but a type built
+                // through `PyType_FromMetaclass`, whose metatype is an
+                // ordinary object with no other root here.
+                forward(&mut t.ob_header.w_class);
                 forward(&mut t.w_name);
                 forward(&mut t.w_qualname);
                 // Heap and builtin types both hold a managed W_DictObject.
@@ -3027,42 +3033,53 @@ impl PyFrame {
     ///         self.space.getexecutioncontext().exception_trace(self, operr)
     /// ```
     ///
-    /// Only the traceback arm is ported, and `w_iterator` is unused as a
-    /// result.  Upstream calls its two generator arms "an approximative
-    /// rule" for a case it says it cannot emulate; 3.14 turns out to be
-    /// exactly the third disjunct.  Counting `exception` events in the
-    /// consuming frame under `sys.settrace` on 3.14.2:
+    /// Upstream calls the three arms "an approximative rule" for a case it
+    /// says it cannot emulate.  Counting `exception` events in the consuming
+    /// frame under `sys.settrace` on 3.14.6, each row the same on the first
+    /// call and on the tenth:
     ///
     /// ```text
     /// for _ in CustomIter():   # Python-level __next__ raising StopIteration
     ///     -> [('__next__', 'StopIteration'), ('consume', 'StopIteration')]
     /// for _ in map(stop, [1]): # native __next__, Python-raised StopIteration
     ///     -> [('stop', 'StopIteration'), ('consume', 'StopIteration')]
-    /// for _ in gen():          -> []
     /// for _ in [1]:            -> []
     /// for _ in range(1):       -> []
     /// for _ in iter(step, 3):  -> []
     /// ```
     ///
-    /// So the report fires when the StopIteration carries a traceback and
-    /// not otherwise; porting the generator arms would fire an event 3.14
-    /// does not.  The `map` row is what settles that the rule is about the
-    /// traceback rather than about the iterator's kind: its `__next__` is
-    /// native, and the event still fires, because the StopIteration passed
-    /// through a Python frame on the way out.
+    /// The traceback arm covers those rows: the report fires when the
+    /// StopIteration carries a traceback and not otherwise.  The `map` row is
+    /// what settles that this arm is about the traceback rather than about the
+    /// iterator's kind: its `__next__` is native, and the event still fires,
+    /// because the StopIteration passed through a Python frame on the way out.
+    ///
+    /// A generator's ending carries no traceback and is the iterator arm's
+    /// own row.  3.14 answers it two ways for one code object -- silence on
+    /// the first execution, which runs the unspecialised `_FOR_ITER` and jumps
+    /// past `END_FOR`, then an event once the loop specialises to
+    /// `FOR_ITER_GEN` and the end arrives at `INSTRUMENTED_END_FOR`, where
+    /// `monitor_stop_iteration` mints it.  The event it mints is for a
+    /// traceback-less StopIteration, so the traceback arm alone cannot reach
+    /// it; the iterator arm answers a warm loop the way 3.14 does and a cold
+    /// one the way pypy3 does, which is to say the same way every time.
     ///
     /// `pyre/extra_tests/parity_tests/foriter_stopiteration_exception_event.py`
-    /// pins all of it.
+    /// pins the table.
     ///
     /// The exhaustion an iterator signals from Rust never materialises an
     /// exception, so the common loop exit answers `has_any_traceback` false
     /// off a null carrier and never reaches the tracer test.
     fn _report_stopiteration_sometimes(
         &mut self,
-        _w_iterator: PyObjectRef,
+        w_iterator: PyObjectRef,
         operr: &mut PyError,
     ) -> Result<(), PyError> {
-        if !operr.has_any_traceback() {
+        let generator = unsafe {
+            pyre_object::generator::is_generator_or_coroutine(w_iterator)
+                || pyre_object::generator::is_async_gen_asend(w_iterator)
+        };
+        if !generator && !operr.has_any_traceback() {
             return Ok(());
         }
         let ec = self.execution_context as *mut crate::PyExecutionContext;

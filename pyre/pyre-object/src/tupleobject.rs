@@ -156,6 +156,32 @@ pub unsafe fn w_tuple_setitem_initializing(
     index: usize,
     value: PyObjectRef,
 ) -> bool {
+    match w_tuple_setitem_unchecked(obj, index, value) {
+        Some(previous) => {
+            debug_assert!(previous.is_null());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Fill one slot of an array-backed tuple whatever the slot holds now, and
+/// answer with what it held -- `PyTuple_SET_ITEM`.
+///
+/// The one thing that separates this from [`w_tuple_setitem_initializing`] is
+/// that the slot need not be empty: a caller may swap a value in and put the
+/// old one back, which `ffi_obj.c _ffi_callback_decorator` does around the
+/// argument tuple it borrows.  The construction-time contract is the same --
+/// the tuple must not have escaped to Python code or had its hash observed --
+/// and so is everything owed to the collector.
+///
+/// # Safety
+/// `obj` must be a general array-backed tuple.
+pub unsafe fn w_tuple_setitem_unchecked(
+    obj: PyObjectRef,
+    index: usize,
+    value: PyObjectRef,
+) -> Option<PyObjectRef> {
     let roots = crate::gc_roots::push_roots();
     let base = roots.base();
     let _ = roots.pin_root(obj);
@@ -163,16 +189,14 @@ pub unsafe fn w_tuple_setitem_initializing(
     crate::gc_hook::try_gc_write_barrier_managed(roots.get(base) as *mut u8);
     let obj = roots.get(base);
     let value = roots.get(base + 1);
-    let Some((items, len)) = w_tuple_object_items_ptr_len(obj) else {
-        return false;
-    };
+    let (items, len) = w_tuple_object_items_ptr_len(obj)?;
     if index >= len {
-        return false;
+        return None;
     }
     let slot = (items as *mut PyObjectRef).add(index);
-    debug_assert!((*slot).is_null());
+    let previous = *slot;
     *slot = value;
-    true
+    Some(previous)
 }
 
 /// Walk, in place, every element `PyObjectRef` slot of any tuple — general

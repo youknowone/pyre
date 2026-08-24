@@ -25,6 +25,32 @@ pub unsafe extern "C" fn PyTuple_New(size: isize) -> *mut CPyObject {
     pyobject::make_ref(pyre_object::tupleobject::w_tuple_new_array_backed(items))
 }
 
+/// The tuple `object` stands for, or nothing -- with nothing said about why.
+///
+/// For what stands in for a macro, which reports no error and is not written
+/// to be checked for one: setting one would leave it pending for whatever
+/// entry point the extension reaches next.
+fn tuple_value(object: *mut CPyObject) -> Option<PyObjectRef> {
+    let value = unsafe { pyobject::from_ref(object) };
+    (!value.is_null() && unsafe { pyre_object::is_tuple(value) }).then_some(value)
+}
+
+/// Whether a write can reach `value`'s items.
+///
+/// The arity-2 specialisations of `specialisedtupleobject.py` keep their two
+/// in fields of their own rather than in a block; a general tuple carries the
+/// block at the one offset, a subclass included.
+fn is_array_backed(value: PyObjectRef) -> bool {
+    use pyre_object::specialisedtupleobject::{
+        is_specialised_tuple_ff, is_specialised_tuple_ii, is_specialised_tuple_oo,
+    };
+    unsafe {
+        !is_specialised_tuple_ii(value)
+            && !is_specialised_tuple_ff(value)
+            && !is_specialised_tuple_oo(value)
+    }
+}
+
 fn tuple_argument(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     let value = argument(object)?;
     if !unsafe { pyre_object::is_tuple(value) } {
@@ -61,8 +87,78 @@ pub unsafe extern "C" fn PyTuple_GetItem(object: *mut CPyObject, index: isize) -
     pyobject::borrow_from(object, item)
 }
 
-/// Steals a reference to `item`, and is only defined on a tuple no other code
-/// has seen yet — the contract `PyTuple_SetItem` documents.
+/// The item array a tuple mirror hands out — `tupleobject.py` gives its mirror
+/// an `ob_item` of `ob_size` `PyObject *`, and `PyTuple_GET_ITEM` reads it.
+///
+/// Built on first ask and kept: what a tuple holds does not change, save
+/// through [`PyTuple_SetItem`] and [`_PyTuple_SET_ITEM`], which write the slot
+/// they changed.  The entries are references the array owns, so a slot read
+/// through it is good for as long as the mirror is, and they go back when the
+/// mirror dies.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyTuple_ITEMS(object: *mut CPyObject) -> *mut *mut CPyObject {
+    let Some(value) = tuple_value(object) else {
+        return std::ptr::null_mut();
+    };
+    pyobject::items_or_build(object, || {
+        let length = unsafe { pyre_object::tupleobject::w_tuple_len(value) };
+        (0..length)
+            .map(|index| {
+                // Read immediately before `make_ref`, which allocates: the
+                // tuple is reached through the mirror's link, which the
+                // collector keeps current.
+                let w_tuple = unsafe { pyobject::from_ref(object) };
+                let item =
+                    unsafe { pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64) };
+                match item {
+                    Some(item) => pyobject::make_ref(item) as usize,
+                    None => 0,
+                }
+            })
+            .collect()
+    })
+}
+
+/// `PyTuple_SET_ITEM(op, i, v)` -- slot `i` is given `v`, whatever it held
+/// before, and `v`'s reference goes with it.
+///
+/// The macro's assignment, which is not [`PyTuple_SetItem`]: it does not give
+/// back what the slot held, and an extension counts on that.  cffi's
+/// `ffi_obj.c _ffi_callback_decorator` reads a slot, puts a borrowed function
+/// in its place for the length of one call, and puts the old value back --
+/// neither write owns what it stores, and the ledger balances only because
+/// neither release happens.
+///
+/// Silent about a receiver it cannot serve, as the macro is.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyTuple_SET_ITEM(
+    object: *mut CPyObject,
+    index: isize,
+    item: *mut CPyObject,
+) {
+    super::object::realize_all([object, item]);
+    if unsafe { _PyTuple_ITEMS(object) }.is_null() || index < 0 {
+        return;
+    }
+    let Some(value) = tuple_value(object) else {
+        return;
+    };
+    if !is_array_backed(value) {
+        return;
+    }
+    let w_item = unsafe { pyobject::from_ref(item) };
+    let written = unsafe {
+        pyre_object::tupleobject::w_tuple_setitem_unchecked(value, index as usize, w_item)
+    };
+    if written.is_some() {
+        // What comes back is dropped rather than released: see above.
+        pyobject::replace_cached_item(object, index as usize, item);
+    }
+}
+
+/// Steals a reference to `item`, gives back the one the slot held, and is only
+/// defined on a tuple no other code has seen yet — the contract
+/// `PyTuple_SetItem` documents.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyTuple_SetItem(
     object: *mut CPyObject,
@@ -84,16 +180,26 @@ pub unsafe extern "C" fn PyTuple_SetItem(
         return -1;
     }
     let w_item = unsafe { pyobject::from_ref(item) };
-    let stored = unsafe {
-        pyre_object::tupleobject::w_tuple_setitem_initializing(value, index as usize, w_item)
-    };
-    unsafe { pyobject::decref(item) };
-    if !stored {
+    let stored = is_array_backed(value)
+        .then(|| unsafe {
+            pyre_object::tupleobject::w_tuple_setitem_unchecked(value, index as usize, w_item)
+        })
+        .flatten();
+    if stored.is_none() {
+        unsafe { pyobject::decref(item) };
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             "PyTuple_SetItem(): the tuple is not one PyTuple_New built",
         ));
         return -1;
+    }
+    // A caller holding the address `PyTuple_GET_ITEM` gave it reads the new
+    // value through it, so the slot is written rather than the array rebuilt,
+    // and the stolen reference is what the array is given.  Where there is no
+    // array to take it, it is released here instead.
+    match pyobject::replace_cached_item(object, index as usize, item) {
+        Some(previous) => unsafe { pyobject::decref(previous) },
+        None => unsafe { pyobject::decref(item) },
     }
     0
 }
@@ -129,6 +235,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyTuple_New as *const ());
     std::hint::black_box(PyTuple_Size as *const ());
     std::hint::black_box(PyTuple_GetItem as *const ());
+    std::hint::black_box(_PyTuple_ITEMS as *const ());
     std::hint::black_box(PyTuple_SetItem as *const ());
     std::hint::black_box(PyTuple_GetSlice as *const ());
     std::hint::black_box(PyTuple_Check as *const ());

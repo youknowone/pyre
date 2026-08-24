@@ -5394,6 +5394,36 @@ pub(crate) fn getdict_native(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// [`getdict_backing`] under the same restriction as [`getdict_native`].
+/// `StopIteration.value` — `fget_value`, which is what the attribute answers.
+///
+/// `readwrite_attrproperty_w('w_value')` is a slot of its own, so an explicit
+/// `e.value = x` wins over the constructor-time `args_w[0]`.  Pyre keeps no
+/// dedicated slot and lands that write in the hasdict instance dict, so read
+/// it first — the same shape as `syntax_error_attr`.  `generator_send_ex`
+/// stamps a generator's return value into `args`, which is where the default
+/// comes from.
+///
+/// # Safety
+/// `obj` must point to a valid `W_BaseException` whose kind is
+/// `StopIteration`.
+pub(crate) unsafe fn stopiteration_value(obj: PyObjectRef) -> PyObjectRef {
+    let w_dict = getdict_backing_native(obj);
+    if !w_dict.is_null()
+        && let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "value") }
+    {
+        return value;
+    }
+    // `w_exception_get_args` always returns a real tuple — the empty one when
+    // `args_w` was never stamped — so it needs no null check.
+    let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
+    if unsafe { pyre_object::w_tuple_len(args) } > 0
+        && let Some(value) = unsafe { pyre_object::w_tuple_getitem(args, 0) }
+    {
+        return value;
+    }
+    w_none()
+}
+
 fn getdict_backing_native(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(
         !crate::module::thread::is_local(obj),
@@ -7570,30 +7600,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             // attribute lookup fall-through.
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if kind == pyre_object::interp_exceptions::ExcKind::StopIteration {
-                // `readwrite_attrproperty_w('w_value')` is a slot of its
-                // own, so an explicit `e.value = x` wins over the
-                // constructor-time `args_w[0]`.  Pyre keeps no dedicated
-                // slot and lands that write in the hasdict instance dict,
-                // so read it first — the same shape as
-                // `syntax_error_attr`.
-                let w_dict = getdict_backing_native(obj);
-                if !w_dict.is_null()
-                    && let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "value") }
-                {
-                    return Ok(v);
-                }
-                let args_tuple =
-                    unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                // `w_exception_get_args` always returns a real
-                // tuple — empty tuple when `args_w` was never
-                // stamped — so the null-check above is unneeded.
-                let len = unsafe { pyre_object::w_tuple_len(args_tuple) };
-                if len > 0
-                    && let Some(v) = unsafe { pyre_object::w_tuple_getitem(args_tuple, 0) }
-                {
-                    return Ok(v);
-                }
-                return Ok(w_none());
+                return Ok(unsafe { stopiteration_value(obj) });
             }
         }
         "code" => {
@@ -8384,8 +8391,19 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             } {
                 return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
             }
-            if let Some(result) = unsafe { get(method, obj, w_type.as_ptr())? } {
-                return Ok(result);
+            match unsafe { get(method, obj, w_type.as_ptr()) } {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                // `_handle_getattribute` runs the hook for an AttributeError
+                // raised anywhere in `__getattribute__`, and a receiver with no
+                // instance dict is no exception -- an unset `__slots__` member
+                // raises exactly here.  A class shadowing an inherited method
+                // with a slot of the same name, so that `__getattr__` can
+                // install one on first read, is a receiver of that shape.
+                Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                    return unsafe { instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e) };
+                }
+                Err(e) => return Err(e),
             }
             return Ok(method);
         }
@@ -9159,7 +9177,7 @@ impl SimpleBufferBytes {
         if let Err(mut error) = crate::builtins::memoryview_release(&[view]) {
             error.write_unraisable(
                 pyre_object::w_none(),
-                Wtf8::new("Exception ignored in __release_buffer__:"),
+                Wtf8::new("Exception ignored in __release_buffer__"),
                 view,
             );
         }
@@ -19157,11 +19175,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         if let Some(slot) = exc_slot {
             err.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
         }
-        err.write_unraisable(
-            w_none(),
-            &where_desc,
-            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-        );
+        err.write_unraisable(w_none(), &where_desc, w_none());
     }
 }
 

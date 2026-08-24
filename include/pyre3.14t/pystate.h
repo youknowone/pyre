@@ -22,8 +22,29 @@ extern "C" {
    an entry point. */
 typedef struct _is PyInterpreterState;
 
+/* The twin of `CPyThreadState` in `cpyext/pystate.rs`, which pins each offset
+   below with a static assertion.
+
+   `interp` and `dict` are the fields an extension reads directly; the rest of
+   what the state stands for is reached through an entry point.  `_status` is
+   published because an extension writes to it -- cffi clears `bound_gilstate`
+   on a state it is about to delete -- and it has to land in storage of its own
+   rather than past the end of the block.  Nothing here reads it. */
 typedef struct _ts {
     PyInterpreterState *interp;
+    PyObject *dict;
+    uint64_t id;
+    struct {
+        unsigned int initialized:1;
+        unsigned int bound:1;
+        unsigned int unbound:1;
+        unsigned int bound_gilstate:1;
+        unsigned int active:1;
+        unsigned int finalizing:1;
+        unsigned int cleared:1;
+        unsigned int finalized:1;
+        unsigned int :24;
+    } _status;
 } PyThreadState;
 
 /* The spelling an extension written before 3.9 uses for the same call. */

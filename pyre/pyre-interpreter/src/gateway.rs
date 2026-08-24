@@ -599,6 +599,18 @@ pub struct MethodOwner {
     pub is_instance: Option<fn(PyObjectRef) -> bool>,
 }
 
+/// The C function a slot wrapper routes to, and the body that calls it.
+///
+/// `W_PyCWrapperObject.func` and `get_func_to_call`.  A wrapper is published
+/// on the type whose slot it names and carries that type's function however
+/// it is later reached, so a call that named a base reaches the base's
+/// implementation rather than being redirected to whatever the receiver's own
+/// type carries.
+pub struct WrapperCall {
+    pub slot: *const std::ffi::c_void,
+    pub call: fn(*const std::ffi::c_void, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+}
+
 /// A built-in function object.
 ///
 /// `docstring` mirrors PyPy `BuiltinCode.docstring` (gateway.py
@@ -637,6 +649,10 @@ pub struct BuiltinCode {
     /// off (`len()`, not `builtins.len()`).  `'static` like `name`, so it is
     /// neither a Drop obligation nor a GC pointer.
     pub module: &'static str,
+    /// The slot a wrapper was published with, or null for every builtin that
+    /// is not one.  `'static` like the rest, so it is neither a Drop
+    /// obligation nor a GC pointer.
+    pub wrapper: *const WrapperCall,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -738,6 +754,7 @@ fn builtin_code_new_full(
         sig,
         owner: std::ptr::null(),
         module: "",
+        wrapper: std::ptr::null(),
     }) as PyObjectRef
 }
 
@@ -894,7 +911,14 @@ pub unsafe fn builtin_code_call(
             positional.len(),
         ));
     }
-    unsafe { ((*code).func)(args) }
+    // `get_func_to_call`: a wrapper answers with the slot it was published
+    // with, and every other builtin with the body it was registered with.
+    let wrapper = unsafe { (*code).wrapper };
+    if wrapper.is_null() {
+        return unsafe { ((*code).func)(args) };
+    }
+    let wrapper = unsafe { &*wrapper };
+    (wrapper.call)(wrapper.slot, args)
 }
 
 /// Wording for a keyword passed to a positional-only builtin.  A slot wrapper
@@ -1390,6 +1414,32 @@ pub fn make_builtin_function_with_arity(
     arity: u16,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_arity(name, func, arity);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
+/// The body a wrapper's own `func` field carries.  A wrapper answers through
+/// its captured slot instead; reaching this means one was built without one.
+fn wrapper_without_a_slot(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::new(
+        crate::PyErrorKind::SystemError,
+        "a slot wrapper was called without the slot it was published with",
+    ))
+}
+
+/// `PyDescr_NewWrapper` — a callable that routes to `wrapper`'s captured slot.
+///
+/// `arity` counts the receiver, as it does for every other fixed-arity
+/// builtin; a wrapper whose call shape has no fixed count passes `HOPELESS`.
+pub fn make_wrapper_over_slot(
+    name: &'static str,
+    arity: u16,
+    wrapper: &'static WrapperCall,
+) -> PyObjectRef {
+    let code = match arity <= 4 {
+        true => builtin_code_new_with_arity(name, wrapper_without_a_slot, arity),
+        false => builtin_code_new(name, wrapper_without_a_slot),
+    };
+    unsafe { (*(code as *mut BuiltinCode)).wrapper = wrapper };
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 

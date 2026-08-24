@@ -129,6 +129,18 @@ def eq(name, got, want):
 eq('concat', m.str_concat('ab', 'cd'), 'abcd')
 eq('concat non-str', m.str_concat('ab', 3),
    ('TypeError', 'can only concatenate str (not "int") to str'))
+# `PyUnicode_Format` is `%` between a format and its operands, which is what
+# a Cython `"..." % x` compiles into.
+eq('format tuple', m.str_format('%s=%d', ('n', 7)), 'n=7')
+eq('format one', m.str_format('[%s]', 'x'), '[x]')
+eq('format mapping', m.str_format('%(a)s', {'a': 1}), '1')
+eq('format non-str format', m.str_format(3, ()),
+   ('TypeError', 'must be str, not int'))
+eq('format wrong operand', m.str_format('%d', 'x'),
+   ('TypeError', '%d format: a real number is required, not str'))
+eq('format too few', m.str_format('%s %s', ('one',)),
+   ('TypeError', 'not enough arguments for format string'))
+
 eq('append', m.str_append('ab', 'cd'), 'abcd')
 eq('append_and_del', m.str_append_and_del('ab', 'cd'), 'abcd')
 

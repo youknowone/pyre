@@ -117,11 +117,23 @@ fn block_at(address: usize) -> Option<Block> {
     BLOCK_SIZES.lock().get(&address).copied()
 }
 
+/// Whether the block at `address` is one this layer handed out.
+///
+/// Only such a block arrives with a header worth reading: [`allocate_raw`]
+/// clears one.  An extension that allocates its own does not have to --
+/// `_cffi_backend.c allocate_owning_object` takes its blocks from plain
+/// `malloc` -- so what sits in the three header words of one of those means
+/// nothing until it is stamped.
+pub(super) fn is_own_block(address: usize) -> bool {
+    block_at(address).is_some()
+}
+
 pub(super) unsafe fn after_fork_child() {
     unsafe {
         BLOCK_SIZES.reinit_after_fork();
         BORROWED.reinit_after_fork();
         BYTE_CACHE.reinit_after_fork();
+        ITEM_ARRAYS.reinit_after_fork();
     }
 }
 
@@ -139,11 +151,11 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 
 /// `w_obj`'s mirror, allocated on first demand.
 ///
-/// A type gets a `PyTypeObject`-shaped block by whichever route reaches it
+/// A type gets a `PyHeapTypeObject`-shaped block by whichever route reaches it
 /// first: `Py_TYPE(x)->tp_basicsize` is read off any type mirror, so a type may
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
-fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
     if existing != 0 {
         return existing as *mut CPyObject;
@@ -156,17 +168,50 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             w_obj,
             REFCNT_FROM_PYRE,
             std::ptr::null_mut(),
-            size_of::<CPyTypeObject>(),
+            size_of::<super::typeobject::CPyHeapTypeObject>(),
         ) as *mut CPyTypeObject;
+        // `typeobject.py type_alloc`.  The suites are the blocks the
+        // `PyHeapTypeObject` above declares, so an extension that reads one
+        // off `ht_type` and one off `tp_as_number` reads the same words.
+        unsafe {
+            let heap = mirror as *mut super::typeobject::CPyHeapTypeObject;
+            (*mirror).tp_as_async = &raw mut (*heap).as_async;
+            (*mirror).tp_as_number = &raw mut (*heap).as_number;
+            (*mirror).tp_as_sequence = &raw mut (*heap).as_sequence;
+            (*mirror).tp_as_mapping = &raw mut (*heap).as_mapping;
+            (*mirror).tp_as_buffer = &raw mut (*heap).as_buffer;
+        }
         super::typeobject::describe_interpreter_type(mirror, w_obj);
         // `typeobject.py:727-732`: the metatype is referenced from here only
         // when it is itself a heap type.
         let of_type = type_mirror(w_obj);
         unsafe { set_ob_type(&raw mut (*mirror).ob_base.ob_base, of_type) };
+        // Only the startup table has a reason to defer this: every base a
+        // mirror reached from here can name already has its own mirror, or
+        // gets one from this same call a level down.
+        super::typeobject::finish_interpreter_type(mirror, w_obj);
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
-    attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type))
+    let size = mirror_size(ob_type);
+    let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, size);
+    // Each fill allocates, so the object is read back through the mirror
+    // before the next one rather than kept in a local: the block's address
+    // does not move and the object's does, and the link is what the collector
+    // updates.
+    let linked = || unsafe { (*raw).ob_pyre_link };
+    unsafe { super::typeobject::stamp_ob_size(raw, linked(), size) };
+    // The types whose blocks carry fields past the header; every other block
+    // this runtime hands out is exactly its header.
+    super::frameobject::attach(raw, linked());
+    super::sliceobject::attach(raw, linked());
+    super::pyerrors::attach(raw, linked());
+    super::cdatetime::attach(raw, linked());
+    super::complexobject::attach(raw, linked());
+    super::methodobject::attach(raw, linked());
+    super::structobject::attach(raw, linked());
+    super::typeobject::descriptor_attach(raw, linked());
+    raw
 }
 
 /// `pyobject.py:91-93` — a block references its type's mirror only when that
@@ -196,6 +241,20 @@ fn release_heap_type(ob_type: *mut CPyTypeObject) {
 /// `raw` must be a live block whose `ob_type` is either null or a live mirror.
 pub(super) unsafe fn set_ob_type(raw: *mut CPyObject, ob_type: *mut CPyTypeObject) {
     let previous = unsafe { (*raw).ob_type };
+    unsafe { exchange_ob_type(raw, ob_type, previous) };
+}
+
+/// [`set_ob_type`] where the caller says what the block named before, which a
+/// block that has never been an object does not: `Py_SET_TYPE` in
+/// `object.c _PyObject_Init` stores the type rather than exchanging it.
+///
+/// # Safety
+/// `raw` must be a live block, and `previous` either null or a live mirror.
+pub(super) unsafe fn exchange_ob_type(
+    raw: *mut CPyObject,
+    ob_type: *mut CPyTypeObject,
+    previous: *mut CPyTypeObject,
+) {
     unsafe { (*raw).ob_type = ob_type };
     // The new reference is taken first: the two can name the same mirror, and
     // releasing it to the bare link share and back would trip the floor a
@@ -329,6 +388,16 @@ fn deallocating_marker() -> usize {
     &raw const MARKER as usize
 }
 
+/// Whether `raw`'s deallocator is running -- its link slot holds the marker
+/// [`dealloc`] parks there for the duration.
+///
+/// An entry point a deallocator is written to call is handed a mirror in
+/// exactly this state, and has to tell it apart from a NULL: reading the
+/// object out of it through [`from_ref`] answers null for both.
+pub(super) fn is_deallocating(raw: *mut CPyObject) -> bool {
+    !raw.is_null() && unsafe { (*raw).ob_pyre_link } as usize == deallocating_marker()
+}
+
 /// `pyobject.py:330-337` — build the interpreter object of a mirror that has
 /// none yet.
 ///
@@ -348,6 +417,7 @@ pub(super) unsafe fn realize(raw: *mut CPyObject) {
     }
     super::unicodeobject::realize_pending(raw);
     super::bytesobject::realize_pending(raw);
+    super::frameobject::realize_pending(raw);
 }
 
 /// `pyobject.py:from_ref` — the interpreter object a mirror links to,
@@ -451,11 +521,18 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // be the last reference to its own container, so that recursion runs here.
     release_borrowed(raw);
     BYTE_CACHE.lock().remove(&address);
+    forget_items(address);
     super::dictobject::forget_iteration(address);
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
-    super::typeobject::forget_type_name(address);
+    super::frameobject::forget_block(raw);
+    super::sliceobject::forget_block(raw);
+    super::pyerrors::forget_block(raw);
+    super::cdatetime::forget_block(raw);
+    super::methodobject::forget_block(raw);
+    super::typeobject::forget_descriptor_block(raw);
+    unsafe { super::typeobject::forget_type_mirror(raw) };
     super::gc::forget(address);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
@@ -466,7 +543,13 @@ unsafe fn dealloc(raw: *mut CPyObject) {
         // The generation and not just the address decides it: a `tp_dealloc`
         // that allocates after freeing can be handed the address back, and
         // what sits there then is somebody else's live block.
-        block_at(address) != block
+        //
+        // A block that never came from here is answered yes without asking:
+        // an extension allocating its instances itself frees them the same
+        // way -- `_cffi_backend.c allocate_owning_object` takes a block from
+        // plain `malloc` and its deallocator gives it back to `free` -- which
+        // leaves the census unchanged and the address unreadable.
+        block.is_none() || block_at(address) != block
     } else {
         false
     };
@@ -483,6 +566,10 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     }
     if !returned {
         unsafe { free_block(raw) };
+    } else {
+        // What this layer keys by the address goes with the block, and
+        // [`free_block`] is only reached for one it handed out itself.
+        super::gc::forget_finalized(address);
     }
     release_heap_type(ob_type);
 }
@@ -566,6 +653,12 @@ pub(super) unsafe fn reallocate_raw(
 /// # Safety
 /// `raw` must be a block this module entered, and must not be used afterwards.
 pub(super) unsafe fn free_block(raw: *mut CPyObject) {
+    // The tracked set is keyed by address, so a block that stops existing has
+    // to leave it here rather than only where a deallocator started: a
+    // `tp_dealloc` may re-track the block it is tearing down -- Cython's does,
+    // between its `PyObject_GC_UnTrack` and the base deallocator it ends in --
+    // and the collector would then read a freed address.
+    super::gc::forget(raw as usize);
     super::gc::forget_finalized(raw as usize);
     let Some(block) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
         return;
@@ -587,9 +680,21 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
 /// mirror can decref others, which is why the queue is re-read every iteration
 /// rather than drained into a list.
 pub fn drain_dead() {
-    // First, because a block the collector could not bring to zero is one the
-    // queue never names: its remaining references are a cycle's, and breaking
-    // them is what lets the deallocators below run at all.
+    // `gcmodule.c:delete_garbage` is preceded by `finalize_garbage`, and for
+    // the same reason: a finalizer is handed the object it belongs to, and
+    // reads the fields of its block.  The collection that queued these kept
+    // both alive for exactly this call.
+    loop {
+        let raw = majit_gc::gc_rawrefcount_next_finalize() as *mut CPyObject;
+        if raw.is_null() {
+            break;
+        }
+        super::gc::run_claimed_finalizer(raw);
+    }
+    // Before the deallocators, because a block the collector could not bring to
+    // zero is one the queue never names: its remaining references are a
+    // cycle's, and breaking them is what lets the deallocators below run at
+    // all.
     super::gc::clear_garbage();
     loop {
         let raw = majit_gc::gc_rawrefcount_next_dead() as *mut CPyObject;
@@ -685,6 +790,108 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
     }
 }
 
+/// The item array a container mirror hands out — the `ob_item` field upstream's
+/// `PyTupleObject` mirror carries, and the storage a list's mirror points into.
+///
+/// A mirror block here is exactly what its type declares, so the array is kept
+/// beside the container instead, keyed by its mirror.  The address has to stay
+/// good after the call returns — `PyTuple_GET_ITEM` is an lvalue and a caller
+/// takes its address — which is what the box gives: it owns its slots, so a
+/// rehash of the map does not move them.
+///
+/// Each entry is a reference the array owns, as `ob_item`'s are: a slot read
+/// through `PyTuple_GET_ITEM` is borrowed from the container, and it stays
+/// good for as long as the container does because the array holds it.
+/// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
+type ItemCache = HashMap<usize, Box<[usize]>, BuildHasherDefault<std::hash::DefaultHasher>>;
+static ITEM_ARRAYS: ForkMutex<ItemCache> =
+    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+
+/// Give `raw`'s array `items` and answer where they sit.
+///
+/// An array that already holds these items keeps the address it was handed out
+/// at, and this call's references are given back instead: two reads of an
+/// unchanged sequence have to answer the same address, and one of them may be
+/// on another thread that is still holding the first.  Replacing the array is
+/// the reallocation upstream documents, which is why a caller may only read one
+/// while the sequence does not change.
+pub(super) fn publish_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut CPyObject {
+    let (address, spare) = {
+        let mut cache = ITEM_ARRAYS.lock();
+        let unchanged = cache
+            .get(&(raw as usize))
+            .is_some_and(|array| array[..] == items[..]);
+        let spare = match unchanged {
+            true => Some(items.into_boxed_slice()),
+            false => cache.insert(raw as usize, items.into_boxed_slice()),
+        };
+        (
+            cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject,
+            spare,
+        )
+    };
+    // Outside the lock: a deallocator this runs takes it again.
+    release_item_array(spare);
+    address
+}
+
+/// Give back the references an array owned.
+fn release_item_array(array: Option<Box<[usize]>>) {
+    for entry in array.into_iter().flatten() {
+        unsafe { decref(entry as *mut CPyObject) };
+    }
+}
+
+/// `raw`'s array, built by `items` the first time it is asked for.
+///
+/// For a container whose contents cannot change behind the array — a tuple —
+/// so that reading it slot by slot costs what reading a field costs.
+pub(super) fn items_or_build(
+    raw: *mut CPyObject,
+    items: impl FnOnce() -> Vec<usize>,
+) -> *mut *mut CPyObject {
+    let existing = ITEM_ARRAYS
+        .lock()
+        .get(&(raw as usize))
+        .map(|array| array.as_ptr() as *mut *mut CPyObject);
+    if let Some(array) = existing {
+        return array;
+    }
+    // Built with the lock released: an entry is taken through `make_ref`,
+    // which allocates and takes locks of its own.  Another thread reading the
+    // same container can have built and published one meanwhile, which is why
+    // publishing keeps whichever array is already there.
+    let built = items();
+    publish_items(raw, built)
+}
+
+/// Put `item` in one slot of an array already handed out, leaving its address
+/// alone, and answer with what it displaced.
+///
+/// What changes a tuple after C has seen it is `PyTuple_SetItem` and
+/// `PyTuple_SET_ITEM`, and a caller holding the address `PyTuple_GET_ITEM`
+/// gave it has to read the new value through it.
+///
+/// The array takes over `item`'s reference and gives up the one it answers
+/// with; a caller that gets nothing back -- no array, or an index past its end
+/// -- still holds `item`'s.
+pub(super) fn replace_cached_item(
+    raw: *mut CPyObject,
+    index: usize,
+    item: *mut CPyObject,
+) -> Option<*mut CPyObject> {
+    let mut cache = ITEM_ARRAYS.lock();
+    let slot = cache.get_mut(&(raw as usize))?.get_mut(index)?;
+    Some(std::mem::replace(slot, item as usize) as *mut CPyObject)
+}
+
+/// Drop the array a dying container mirror handed out, and the references it
+/// owned with it.
+fn forget_items(raw: usize) {
+    let array = ITEM_ARRAYS.lock().remove(&raw);
+    release_item_array(array);
+}
+
 /// The NUL-terminated byte view of a mirror, filled on first use.
 ///
 /// This is the counterpart of the `c_utf8` field PyPy fills on its
@@ -758,6 +965,7 @@ pub(super) unsafe fn resize_cached_bytes(
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
     majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
+    majit_gc::gc_rawrefcount_set_finalizer_claim(super::gc::claim_finalizer);
 }
 
 /// Fired from inside a collection, so it may only schedule.
@@ -843,6 +1051,21 @@ pub unsafe extern "C" fn Py_DecRef(object: *mut CPyObject) {
     unsafe { decref(object) };
 }
 
+/// `Py_SET_REFCNT` — the whole count field, which is what `Py_REFCNT` reports.
+///
+/// A value written here has to have come from `Py_REFCNT`: the count carries
+/// the share the interpreter link contributes, and an absolute number in the
+/// units C code counts in would take that share away and free a block the
+/// interpreter still points at.  A mirror that must never be freed keeps the
+/// count it has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_SetRefcnt(object: *mut CPyObject, refcnt: isize) {
+    if object.is_null() || unsafe { (*object).ob_refcnt } >= REFCNT_IMMORTAL {
+        return;
+    }
+    unsafe { (*object).ob_refcnt = refcnt };
+}
+
 /// The C-visible reference count, with the interpreter's own share removed —
 /// `Py_REFCNT` as a test can read it without depending on the link share.
 #[unsafe(no_mangle)]
@@ -857,4 +1080,5 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(Py_IncRef as *const ());
     std::hint::black_box(Py_DecRef as *const ());
     std::hint::black_box(_PyPyre_RefCount as *const ());
+    std::hint::black_box(_Py_SetRefcnt as *const ());
 }

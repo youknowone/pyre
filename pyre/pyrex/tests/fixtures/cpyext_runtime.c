@@ -1,6 +1,6 @@
 /* The runtime services an extension reaches for around a call: the exception
-   a failed syscall becomes, the audit events it raises, and importing one
-   attribute out of a module. */
+   a failed syscall becomes, the audit events it raises, importing one
+   attribute out of a module, and writing a name into a module's namespace. */
 
 #include <Python.h>
 
@@ -170,6 +170,42 @@ static PyObject *module_attr_object(PyObject *self, PyObject *args)
     return row;
 }
 
+/* ── a name written into a module's namespace ───────────────── */
+
+/* `PyModule_AddObjectRef(target, name, value)`, where the caller names the
+   target rather than being handed a module, so a non-module reaches it. */
+static PyObject *add_object_ref(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *target;
+    const char *name;
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "OsO", &target, &name, &value)) {
+        return NULL;
+    }
+    int answer = PyModule_AddObjectRef(target, name, value);
+    return Py_BuildValue("(iN)", answer, pending());
+}
+
+/* The same with a NULL value, which is how a caller reports that the object it
+   meant to add could not be built.  `raise` says whether it left an exception
+   behind first, which is what the entry point is documented to require. */
+static PyObject *add_object_ref_null(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *target;
+    const char *name;
+    int raise;
+    if (!PyArg_ParseTuple(args, "Osi", &target, &name, &raise)) {
+        return NULL;
+    }
+    if (raise) {
+        PyErr_SetString(PyExc_KeyError, "the caller's own reason");
+    }
+    int answer = PyModule_AddObjectRef(target, name, NULL);
+    return Py_BuildValue("(iN)", answer, pending());
+}
+
 static PyMethodDef methods[] = {
     {"from_errno", from_errno, METH_VARARGS, NULL},
     {"check_signals", check_signals, METH_NOARGS, NULL},
@@ -177,6 +213,8 @@ static PyMethodDef methods[] = {
     {"audit_tuple", audit_tuple, METH_VARARGS, NULL},
     {"module_attr", module_attr, METH_VARARGS, NULL},
     {"module_attr_object", module_attr_object, METH_VARARGS, NULL},
+    {"add_object_ref", add_object_ref, METH_VARARGS, NULL},
+    {"add_object_ref_null", add_object_ref_null, METH_VARARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {PyModuleDef_HEAD_INIT, "cpyext_runtime", NULL, -1,

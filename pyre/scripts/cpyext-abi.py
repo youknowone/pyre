@@ -156,9 +156,11 @@ STRUCTS = {
     "CPyMethodDef": "PyMethodDef", "CPyMemberDef": "PyMemberDef",
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
     "CPyThreadState": "PyThreadState", "CPyComplex": "Py_complex",
+    "CPyFrameObject": "PyFrameObject",
     "CPyInterpreterState": "PyInterpreterState",
     "CPyMutex": "PyMutex",
     "CPyUnicodeWriter": "PyUnicodeWriter",
+    "CPyDateTimeCAPI": "PyDateTime_CAPI",
 }
 
 
@@ -233,6 +235,34 @@ def read_header_inlines():
     for path in sorted(HEADER_DIR.glob("*.h")):
         text = strip_comments(path.read_text(errors="replace"))
         for match in INLINE.finditer(text):
+            params = [param_type(p) for p in split_commas(match.group("params"))]
+            ret = tidy(match.group("ret") + " " + match.group("stars"))
+            yield path.name, match.group("name"), params or ["void"], ret
+
+
+C_SOURCE_DIR = CPYEXT / "src"
+
+C_DEFINITION = re.compile(
+    r"^(?P<ret>[A-Za-z_][A-Za-z0-9_ ]*?)\s*(?P<stars>\**)\s*"
+    r"(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^;{]*?)\)\s*\{",
+    re.M | re.S)
+
+
+def read_c_definitions():
+    """The entry points whose bodies are C rather than Rust.
+
+    A variadic entry point cannot have a Rust body -- no Rust compiler walks a
+    `va_list` -- so `PyArg_ParseTuple`, `Py_BuildValue` and their peers are C
+    translation units compiled into the interpreter and exported from it. They
+    are entry points an extension resolves like any other, so they are checked
+    against the record the same way; the headers carry their declarations and
+    this is where the definitions are.
+    """
+    for path in sorted(C_SOURCE_DIR.glob("*.c")):
+        text = strip_comments(path.read_text(errors="replace"))
+        for match in C_DEFINITION.finditer(text):
+            if match.group("ret").split()[0] == "static":
+                continue
             params = [param_type(p) for p in split_commas(match.group("params"))]
             ret = tidy(match.group("ret") + " " + match.group("stars"))
             yield path.name, match.group("name"), params or ["void"], ret
@@ -408,11 +438,13 @@ def command_check(args):
     # calling the real name finds no symbol.
     by_lowercase = {n.lower(): n for n in declarations}
     disagree, converted, misspelled = [], [], []
-    checked = {"export": 0, "header inline": 0}
+    checked = {"export": 0, "header inline": 0, "C body": 0}
     entry_points = [("export", f"cpyext/{m}.rs", n, p, r)
                     for m, n, p, r in read_exports()]
     entry_points += [("header inline", f"{HEADER_DIR.name}/{h}", n, p, r)
                      for h, n, p, r in read_header_inlines()]
+    entry_points += [("C body", f"cpyext/src/{f}", n, p, r)
+                     for f, n, p, r in read_c_definitions()]
     for kind, where_defined, name, params, ret in entry_points:
         if name not in declarations:
             spelled = by_lowercase.get(name.lower())
@@ -429,8 +461,9 @@ def command_check(args):
         elif abi_slot(ret, typedefs) != abi_slot(their_ret, typedefs):
             disagree.append((where_defined, name, [ret], [their_ret], "return"))
     disagree += check_data(data, typedefs, misspelled)
-    print(f"{checked['export']} exports and {checked['header inline']} header "
-          f"inlines checked against the recorded CPython ABI; "
+    print(f"{checked['export']} exports, {checked['header inline']} header "
+          f"inlines and {checked['C body']} C bodies checked against the "
+          f"recorded CPython ABI; "
           f"{len(converted)} have no CPython declaration")
     for where_defined, name, spelled in misspelled:
         print(f"\n{name} is spelled {spelled} by CPython  [{where_defined}]")

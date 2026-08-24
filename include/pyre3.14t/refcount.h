@@ -19,6 +19,11 @@ extern "C" {
 #define Py_XINCREF(ob) do { if ((ob) != NULL) Py_INCREF(ob); } while (0)
 #define Py_XDECREF(ob) do { if ((ob) != NULL) Py_DECREF(ob); } while (0)
 #define Py_CLEAR(ob) do { PyObject *_tmp = (PyObject *)(ob); (ob) = NULL; Py_XDECREF(_tmp); } while (0)
+/* The count `Py_REFCNT` reports is the whole field, including the share the
+   interpreter link contributes, so a value written back here has to have come
+   from `Py_REFCNT` rather than be a number counted up from zero. */
+#define Py_SET_REFCNT(ob, refcnt) _Py_SetRefcnt((PyObject *)(ob), (refcnt))
+
 #define Py_SETREF(ob, value) do { PyObject *_old = (PyObject *)(ob); (ob) = (value); Py_XDECREF(_old); } while (0)
 
 /* A reference taken and handed back in one expression, so that a borrowed

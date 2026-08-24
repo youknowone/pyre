@@ -661,6 +661,15 @@ fn w_memoryview_new_with_flags_impl(
                     "cannot create a new view from a restricted memoryview",
                 ));
             }
+            // `memory_getbuf`: read-only storage cannot answer a writable
+            // request, and the wording names the view rather than what it is
+            // over because a view is what refused.
+            if flags & 0x0001 != 0 && w_memoryview_view(w_obj).readonly() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not writable",
+                ));
+            }
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
@@ -775,6 +784,9 @@ pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
 
 /// Little-endian unsigned unpack of one `itemsize`-wide element at byte
 /// offset `base` — the fallback for formats the shared decoder rejects.
+///
+/// `itemsize` is at most the width of the result; a wider item has no integer
+/// to fold into, and the caller answers with its bytes instead.
 fn memoryview_unpack(data: &[u8], itemsize: usize, base: usize) -> i64 {
     let mut val: i64 = 0;
     for j in 0..itemsize {
@@ -793,6 +805,18 @@ fn memoryview_format_code(fmt: &str) -> u8 {
         Some(b'@' | b'=' | b'<' | b'>' | b'!') => b.get(1).copied().unwrap_or(b'B'),
         Some(&c) => c,
         None => b'B',
+    }
+}
+
+/// `memoryobject.c adjust_fmt` — the one character a format an element can be
+/// read or written through is, with a leading `@` stripped.  Anything else
+/// names a compound item, which a view does not take apart.
+fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
+    match fmt.strip_prefix('@').unwrap_or(fmt).len() {
+        1 => Ok(()),
+        _ => Err(crate::PyError::not_implemented(format!(
+            "memoryview: unsupported format {fmt}"
+        ))),
     }
 }
 
@@ -816,10 +840,16 @@ unsafe fn memoryview_unpack_element(
         }
         tc => {
             let w = pyre_object::interp_array::unpack_value(tc, buf);
-            if w == pyre_object::PY_NULL {
+            if w != pyre_object::PY_NULL {
+                w
+            } else if itemsize <= size_of::<i64>() {
                 w_int_new(memoryview_unpack(data, itemsize, base))
             } else {
-                w
+                // An item wider than the fold above: its bytes, which is all
+                // the one caller still reaching here needs.  `==` compares
+                // element by element and every other operation has refused
+                // the format by now (`memoryview_adjust_fmt`).
+                pyre_object::bytesobject::w_bytes_from_bytes(buf)
             }
         }
     }
@@ -1155,6 +1185,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return memoryview_slice_view(mv, index);
         }
         if index_check(index) {
+            memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
                     "invalid indexing of 0-dim memory",
@@ -1191,6 +1222,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
             if all_index {
+                memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
                 let length = pyre_object::w_tuple_len(index) as i64;
                 if length < ndim {
                     return Err(crate::PyError::not_implemented(
@@ -1239,6 +1271,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
         if w_memoryview_readonly(mv) {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
@@ -1419,6 +1452,7 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         crate::baseobjspace::iter(w_list_new(memoryview_values(mv)))
     }
 }
@@ -1597,6 +1631,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if ndim == 0 {
             // `buffer.py w_tolist` raises for a 0-dim view.
@@ -1898,7 +1933,7 @@ unsafe fn memoryview_call_python_release_unraisable(
                 w_none(),
                 rustpython_wtf8::Wtf8::new(
                     format!(
-                        "Exception ignored in __release_buffer__ of {}:",
+                        "Exception ignored in __release_buffer__ of {}",
                         crate::baseobjspace::object_functionstr_type_name(r_exporter)
                     )
                     .as_str(),
@@ -16156,6 +16191,10 @@ pub(crate) struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
+    /// A `memoryview` this acquisition made itself, over an exporter that
+    /// answers only through `bf_getbuffer`.  Nobody else holds it, so the
+    /// export it took ends here rather than whenever it is collected.
+    made_view: bool,
     address: *mut u8,
     length: usize,
 }
@@ -16169,7 +16208,7 @@ impl WritableBuffer {
         let roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let (data, owner) =
+        let (data, owner, made_view) =
             unsafe { fileio_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
         let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -16177,6 +16216,7 @@ impl WritableBuffer {
         let held = unsafe { buffer_export_incref(owner) };
         Ok(Self {
             _roots: roots,
+            made_view,
             owner_slot,
             held,
             address: data.as_mut_ptr(),
@@ -16191,9 +16231,15 @@ impl WritableBuffer {
 
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
+        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
         if self.held {
-            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
             unsafe { buffer_export_decref(owner) };
+        }
+        if self.made_view {
+            // The count above is what a release refuses over, so it goes
+            // first.  A failure has nowhere to be reported and nothing to
+            // report: the view is this one's own and no caller named it.
+            let _ = memoryview_release(&[owner]);
         }
     }
 }
@@ -16202,7 +16248,7 @@ impl Drop for WritableBuffer {
 /// writable exporters; a memoryview contributes its exact contiguous window.
 unsafe fn fileio_writebuf(
     obj: PyObjectRef,
-) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
         // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
         // type.  CPython 3.14's readinto gateways keep the same information
@@ -16215,12 +16261,17 @@ unsafe fn fileio_writebuf(
 
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
+            return Ok((
+                pyre_object::bytearrayobject::w_bytearray_data_mut(obj),
+                obj,
+                false,
+            ));
         }
         if pyre_object::interp_array::is_array(obj) {
             return Ok((
                 pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice(),
                 obj,
+                false,
             ));
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
@@ -16230,6 +16281,7 @@ unsafe fn fileio_writebuf(
                 return Ok((
                     std::slice::from_raw_parts_mut(address as *mut u8, length),
                     obj,
+                    false,
                 ));
             }
         }
@@ -16239,7 +16291,7 @@ unsafe fn fileio_writebuf(
         {
             let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
             if offset <= full.len() && length <= full.len() - offset {
-                return Ok((&mut full[offset..offset + length], backing));
+                return Ok((&mut full[offset..offset + length], backing, false));
             }
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
@@ -16259,7 +16311,25 @@ unsafe fn fileio_writebuf(
                     "memoryview buffer is no longer valid",
                 ));
             }
-            return Ok((&mut full[offset..offset + length], obj));
+            return Ok((&mut full[offset..offset + length], obj, false));
+        }
+        // An exporter whose storage only `bf_getbuffer` names -- a type an
+        // extension defined -- is asked for a writable window and answers with
+        // one this layer then reads as any other view.  The request is what
+        // decides: an exporter with nothing writable refuses it, and the
+        // refusal is the argument error the arms above raise.
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        if crate::cpyext::buffer::exports_buffer(obj) {
+            let Ok(view) = w_memoryview_new_with_flags(obj, 0x0001) else {
+                return Err(type_error(obj));
+            };
+            let _ = pyre_object::gc_roots::pin_root(view);
+            let (data, owner, _) = fileio_writebuf(view)?;
+            return Ok((data, owner, true));
         }
         Err(type_error(obj))
     }

@@ -5640,26 +5640,10 @@ pub unsafe fn create_all_slots(
         // slotted dict subclass (PyPy's defaultdict shape) has nowhere to
         // store its mapping and dict operations recurse through the missing
         // backing.
-        let dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        let is_dict_subclass = !dict_type.is_null()
-            && !std::ptr::eq(w_type, dict_type)
-            && crate::baseobjspace::issubtype_w(w_type, dict_type);
-        let mut inherited_dict_data = false;
-        let mut ancestor_layout = base_layout;
-        while !ancestor_layout.is_null() {
-            if (*ancestor_layout)
-                .newslotnames
-                .iter()
-                .any(|name| name == crate::type_methods::DICT_DATA_SLOT)
-            {
-                inherited_dict_data = true;
-                break;
-            }
-            ancestor_layout = (*ancestor_layout).base_layout;
-        }
-        if is_dict_subclass && !inherited_dict_data {
-            // No Member is stored for this: it is interpreter storage, not an
-            // attribute the subclass exposes.
+        //
+        // No Member is stored for the slot: it is interpreter storage, not an
+        // attribute the subclass exposes.
+        if crate::type_methods::base_owes_dict_backing(w_bestbase) {
             newslotnames.push(crate::type_methods::DICT_DATA_SLOT.to_string());
         }
 

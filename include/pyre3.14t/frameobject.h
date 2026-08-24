@@ -10,9 +10,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* A frame is opaque: nothing outside this runtime reads a field of one, and
-   an extension only ever holds a pointer. */
-typedef struct _frame PyFrameObject;
+/* The storage a frame an extension built for itself carries.
+ *
+ * A frame this runtime is executing is not one of these: it lives in the
+ * interpreter, and a mirror of it is filled from that side.  What the fields
+ * are declared for is the other direction -- `PyFrame_New` hands back a frame
+ * whose line number the caller then writes, which is a field assignment in
+ * every extension that reports a traceback of its own.
+ *
+ * `pyre-interpreter/src/cpyext/frameobject.rs` holds this layout from the
+ * other side; each offset is pinned in both places. */
+struct _frame {
+    PyObject_HEAD
+    PyCodeObject *f_code;
+    PyObject *f_globals;
+    PyObject *f_locals;
+    int f_lineno;
+    struct _frame *f_back;
+};
 
 #define PyFrame_Check(op) Py_IS_TYPE((op), &PyFrame_Type)
 
