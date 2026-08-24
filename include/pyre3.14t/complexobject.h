@@ -16,6 +16,14 @@ typedef struct {
     double imag;
 } Py_complex;
 
+/* The block a `complex` is mirrored into.  The pair is a snapshot filled when
+   the block is made; `complex` is immutable, so it cannot come apart from the
+   object it was read off. */
+typedef struct {
+    PyObject_HEAD
+    Py_complex cval;
+} PyComplexObject;
+
 #ifdef __cplusplus
 }
 #endif

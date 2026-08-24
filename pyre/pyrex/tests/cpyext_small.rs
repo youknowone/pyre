@@ -190,6 +190,83 @@ eq('alias pair error', error, None)
 eq('alias pair str', str(pair), 'dict[str, int]')
 eq('alias pair args', pair.__args__, (str, int))
 
+# ── the count field ────────────────────────────────────────────────────
+
+# `Py_SET_REFCNT` and `Py_REFCNT` speak the same units, so the bracket Cython
+# puts around a `__dealloc__` body leaves the count where it found it.
+subject = ['held']
+eq('refcount bracket', m.refcount_round_trip(subject), (1, 0))
+eq('refcount bracket again', m.refcount_round_trip(subject), (1, 0))
+eq('the object is untouched', subject, ['held'])
+
+# A count that must never be reached is left alone.
+eq('immortal is left alone', m.refcount_immortal(), (1, 1))
+# The write it refused would have freed the block `Py_None` names, so the
+# singleton still being itself is the other half of the answer.
+eq('None is still None', [None, None.__class__], [None, type(None)])
+
+# ── the number a prefix of a string reads as ───────────────────────────
+
+# With an `endptr` the caller owns whatever follows the number.
+eq('a whole number', m.string_to_double('2.5', 1), (2.5, '', None))
+eq('a number and a tail', m.string_to_double('2.5abc', 1), (2.5, 'abc', None))
+eq('an exponent', m.string_to_double('1e3', 1), (1000.0, '', None))
+# An `e` no exponent follows ends the number before it.
+eq('an e with nothing after it', m.string_to_double('1e', 1), (1.0, 'e', None))
+eq('a leading point', m.string_to_double('.5', 1), (0.5, '', None))
+eq('a trailing point', m.string_to_double('5.', 1), (5.0, '', None))
+eq('a sign', m.string_to_double('-2.5', 1), (-2.5, '', None))
+eq('infinity', m.string_to_double('-Infinity', 1), (float('-inf'), '', None))
+# The separators a Python literal may carry are not part of this grammar.
+eq('an underscore ends it', m.string_to_double('1_000', 1), (1.0, '_000', None))
+
+# Without one there is nowhere to report a remainder, so a remainder fails.
+eq('a tail with nowhere to go', m.string_to_double('2.5abc', 0),
+   ('ValueError', "could not convert string to float: '2.5abc'"))
+eq('nothing at all', m.string_to_double('abc', 1),
+   ('ValueError', "could not convert string to float: 'abc'"))
+eq('the empty string', m.string_to_double('', 1),
+   ('ValueError', "could not convert string to float: ''"))
+
+# A magnitude the type cannot hold is only an error where a class was named
+# to report it through.
+eq('overflow unreported', m.string_to_double('1e500', 1), (float('inf'), '', None))
+eq('overflow reported', m.string_to_double('1e500', 1, OverflowError),
+   ('OverflowError', "value too large to convert to float: '1e500'"))
+# `inf` spells the value rather than overflowing to it.
+eq('inf is not an overflow', m.string_to_double('inf', 1, OverflowError),
+   (float('inf'), '', None))
+
+eq('the double behind a float', m.float_as_double(2.5), 2.5)
+eq('float from a str', m.float_from_string('2.5'), (2.5, None))
+eq('float from a str with spaces', m.float_from_string('  2.5  '), (2.5, None))
+eq('float from a str that is not one', m.float_from_string('x')[0], 'ValueError')
+
+# ── splitting a str ────────────────────────────────────────────────────
+
+eq('split on a separator', m.split('a,b,c', ',', -1), (['a', 'b', 'c'], None))
+eq('split with a limit', m.split('a,b,c', ',', 1), (['a', 'b,c'], None))
+# A null separator splits on runs of whitespace, dropping the empty pieces.
+eq('split on whitespace', m.split('  a  b ', None, -1), (['a', 'b'], None))
+eq('split what is not a str', m.split(3, ',', -1),
+   ('TypeError', 'must be str, not int'))
+eq('split on what is not a str', m.split('a b', 3, -1),
+   ('TypeError', 'must be str, not int'))
+
+# ── the namespace behind a type ────────────────────────────────────────
+
+
+class Named:
+    marker = 7
+
+
+namespace, again = m.type_dict(Named)
+eq('the namespace answers', namespace['marker'], 7)
+# The same block every time: a copy would take a write nothing reads back.
+eq('the same block twice', again, 1)
+namespace_of_int, _ = m.type_dict(int)
+eq('a builtin has one too', namespace_of_int['real'] is int.real, True)
+
 print('cpyext-small-ok')
 "#;
 

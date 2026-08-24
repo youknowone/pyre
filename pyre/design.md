@@ -32,7 +32,8 @@ Rust, and a PyPy-equivalent (pyre) on top of that.**
 |---|---|---|
 | RPython the language | **Rust** | The host language is no longer a Python subset; it is a real language with a real type system. See §3.1. |
 | RPython translator (flowspace → annotator → rtyper) | **majit-translate** (`front/ast` → `flowspace/` → `annotator/` → `rtyper/`) over **Charon LLBC** artifacts | Same pipeline, same module names, run at `cargo build` time over extracted `.ullbc` instead of live bytecode. |
-| `jtransform`/codewriter → JitCode | **codewriter/** → JitCode | Identical role. |
+| `jtransform`/codewriter → JitCode | **majit-translate `codewriter/`** → JitCode | Same role, at `cargo build` time. pyre additionally runs a *second*, hand-written codewriter over user `CodeObject`s at runtime; see §3.7. |
+| `warmspot` — translation-time portal generator | **split**: build-time derivation in majit-translate, hand-written warm entry in pyre-jit | Not a port. `apply_jit` is unwired and `warmspot.rs` is a `pub use` namespace; see §3.7. |
 | metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. |
 | x86/ARM/… hand-written backends (~300k LOC) | **majit-backend-dynasm / -cranelift / -wasm** | Three thin backends behind one trait, current primary dynasm; see §3.4. |
 | incminimark GC | **majit-gc** (nursery + oldgen + incremental + card marking) | Port of the winner, not of Boehm/refcount/mark-sweep. |
@@ -297,6 +298,97 @@ configuration. pyre keeps:
   a staging area, not a home.
 - Aspect combinations (e.g. wasm × JIT × GC modes) are individually declared
   supported or unsupported; silence means unsupported.
+
+---
+
+### 3.7 The portal boundary: warmspot split in two
+
+Upstream mints the portal at translation time. `warmspot.apply_jit` — the body
+of the translator task literally named "JIT compiler generation"
+(`task_pyjitpl_lltype`) — derives each driver's green/red specification
+(`make_args_specification`), rewrites the `jit_merge_point` and `can_enter_jit`
+markers into calls (`rewrite_jit_merge_point`, `rewrite_can_enter_jits`), and
+fills the fields `JitDriverStaticData` declares but never computes. Upstream's
+`jitdriver.py` is an attribute container with two executable statements
+precisely because warmspot writes the rest. pyre splits that pipeline across two
+layers, unevenly:
+
+- **The derivation and the marker erasure do run at build time**, over Charon
+  LLBC, in majit-translate's `jtransform` and `CallControl::setup_jitdriver`,
+  driven from `pyre-jit-trace/build.rs`. The derived green/red layout is
+  asserted against the real MIR operands and a mismatch fails the build. This
+  half is at the right layer and is not debt.
+- **`apply_jit` itself is unported.** `task_pyjitpl_lltype` assembles every
+  upstream-shaped argument and then returns `TaskError`, because majit-translate
+  does not depend on majit-metainterp; `warmspot.rs` is a `pub use` namespace,
+  not an implementation. Seven `missing_task_leaf` sites exist across that
+  driver, so the stub is not unique — it is named here because the fields it
+  would fill are instead written by hand from consumer source.
+- **A second codewriter runs at runtime.** majit-translate's
+  `transform_graph_to_jitcode` consumes a `FunctionGraph` once per build;
+  pyre-jit's `transform_graph_to_jitcode` consumes a user `CodeObject`, is
+  fallible, and runs unboundedly. Upstream has one, over the interpreter's own
+  graphs. This is the A1 debt in this area — it is written, it carries Python
+  opcode semantics, and it has already produced a wrong answer of exactly the
+  class N3 names: in a chained blackhole resume `portal_frame_reg` aliased the
+  caller frame, so an inlined callee's `LOAD_GLOBAL` indexed the caller's
+  `names` table. A1 is **not** weakened to accommodate it; it stands as a
+  tracked generation defect whose convergence target is majit-translate's
+  codewriter.
+
+**Measured cost, 2026-08-22.** Installing `sys.setprofile`, `sys.settrace` or
+`cProfile` costs **1168–2836×** on a hot loop where PyPy 7.3.20 pays
+**1.1–4.6×** and stays compiled. It is a total outage, not a reuse failure:
+warming *under* the profiler never compiles at all. Event counts match CPython
+exactly, so this is a cliff and not a wrong answer. Stated plainly: **a profile
+taken on pyre measures the interpreter, not the JIT**, and pdb and coverage.py
+are in the same position.
+
+**The root is a missing bracket, not the folded green.** Upstream brackets the
+portal itself: `PyFrame.execute_frame` wraps `dispatch` — the function that
+carries the merge point and nothing else — in `ExecutionContext.enter`,
+`call_trace`, then `return_trace` and `leave` in `finally` clauses. pyre put
+that bracket *inside* the plain dispatch body (`eval_frame_plain_with_resume`)
+and left the JIT dispatch body bare: `eval_with_jit_inner` substitutes
+`install_current_frame`, which performs only `enter`'s topframeref/f_backref
+half, and `CurrentFrameGuard`'s drop, which performs only `leave`'s
+topframeref half. Neither emits an event, and `pyre-jit` contains no
+`call_trace` or `return_trace` call at all.
+
+A JIT-activated frame therefore emits no `call` and no `return` event, and the
+only thing hiding that is the refusal itself — `frame_tracing_active` sends
+every traced or profiled frame down `execute_frame_plain`, which is the
+bracketed path. `run_with_jit` states the dependency in the affirmative: it
+routes non-JIT-eligible frames through `execute_frame` "so `call_trace` /
+`return_trace` frame events still fire". **The gate is not a performance
+concession; it is the whole implementation of frame events for JIT-eligible
+frames**, and the measured event parity above is produced by it. Restoring the
+bracket above the portal is a prerequisite for touching the gate, and it needs
+no green.
+
+**What upstream does not do.** It does not fold the tracing state away.
+`ExecutionContext` declares `_immutable_fields_` with `profilefunc?` and
+`w_tracefunc?`, yet the recorded traces read both as ordinary fields and guard
+them, and the comment directly above that declaration says so: the fields
+"should be known to a constant … but they're not". They are cheap because
+they sit on the entry bridge, once per frame activation — not because they
+disappear. Nor would the declaration help here: `quasi_immut_descr` requires a
+constant struct operand, and pyre's `ec` is a portal red (`PYPYJIT_RED_VARS`),
+so it is never one. The per-opcode half is a different mechanism again —
+`dispatch_bytecode`'s explicit `we_are_jitted()` arm tests the *per-frame*
+`w_f_trace` through the virtualizable `debugdata`, not the global tracefunc.
+
+Where the green does pay is the profiled-call dispatch: `call_valuestack` and
+its keyword/ex siblings branch on `get_is_being_profiled()` before
+`call_args_and_c_profile`, and a real green folds those branches to nothing in
+the unprofiled trace while giving the profiled state its own cell, counter and
+procedure token. That is the last step of the repair, not the first.
+
+**Falsification.** Restoring the activation bracket should leave event counts
+unchanged with the gate still in place, and should let the gate's
+`profilefunc`/global-tracefunc disjuncts be dropped without losing events. If
+events go missing once the bracket is above the portal, the bracket is not what
+the gate was standing in for and this entry is wrong.
 
 ---
 

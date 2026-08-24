@@ -11,8 +11,8 @@
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::flowspace::model::{
-    Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation, Variable,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
@@ -23,8 +23,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, constant_with_lltype, functionptr_const, helper_pygraph_from_graph,
-    variable_with_lltype, void_field_const,
+    ConvertedTo, HighLevelOp, constant_with_lltype, exception_args, functionptr_const,
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 fn ptr_to_lowlevel(target: LowLevelType) -> LowLevelType {
@@ -782,11 +782,12 @@ pub fn build_ll_shrink_final_helper_graph(
 /// (`total_size = ovfcheck(total_size + size)`, malloc PIECE, link it).
 /// Else the slow path copies the head into the current buffer, `ll_grow_by`s
 /// a fresh buffer, and copies the tail. The short-circuit `and` becomes four
-/// chained tests each falling to the slow path; the `except OverflowError:
-/// pass` overflow edge is unmodelled (bare `int_add_ovf`, so the fast body
-/// always runs when the four tests hold). `mallocfn` / `copy_string_contents`
-/// / `ll_grow_by` are `direct_call` callee consts. Debug-only `ll_assert`s
-/// omitted. Returns `Void`.
+/// chained tests each falling to the slow path. The fast body's
+/// `total_size = ovfcheck(total_size + size)` is split into `block_fast_check`
+/// (the trailing `int_add_ovf`) and `block_fast_body`; the `except
+/// OverflowError: pass` edge routes the overflow to the slow path.
+/// `mallocfn` / `copy_string_contents` / `ll_grow_by` are `direct_call` callee
+/// consts. Debug-only `ll_assert`s omitted. Returns `Void`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_ll_grow_and_append_helper_graph(
     name: &str,
@@ -855,92 +856,110 @@ pub fn build_ll_grow_and_append_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // ---- block_fast: append ll_str as a new big piece ----
-    let f = arg_tuple(&builder_ptr_lltype, &buf_lltype);
-    let block_fast = Block::shared(tuple_vals(&f));
-    let f_orig_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    let overflow_error = exception_args("OverflowError")?;
+
+    // ---- block_fast_body: append ll_str as a new big piece (no-overflow) ----
+    // Receives (ll_builder, ll_str, total_size) where total_size is the
+    // ovfcheck result computed in block_fast_check.
+    let fb_llb = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let fb_str = variable_with_lltype("ll_str", buf_lltype.clone());
+    let fb_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    let block_fast_body = Block::shared(vec![
+        Hlvalue::Variable(fb_llb.clone()),
+        Hlvalue::Variable(fb_str.clone()),
+        Hlvalue::Variable(fb_total.clone()),
+    ]);
+    let fb_piece = variable_with_lltype("old_piece", piece_ptr_lltype.clone());
     push(
-        &block_fast,
-        "getfield",
-        vec![
-            Hlvalue::Variable(f.0.clone()),
-            void_field_const("total_size"),
-        ],
-        Hlvalue::Variable(f_orig_total.clone()),
-    );
-    let f_total_new = variable_with_lltype("total_size", LowLevelType::Signed);
-    push(
-        &block_fast,
-        "int_add_ovf",
-        vec![
-            Hlvalue::Variable(f_orig_total),
-            Hlvalue::Variable(f.3.clone()),
-        ],
-        Hlvalue::Variable(f_total_new.clone()),
-    );
-    let f_piece = variable_with_lltype("old_piece", piece_ptr_lltype.clone());
-    push(
-        &block_fast,
+        &block_fast_body,
         "malloc",
         vec![
             lowlevel_type_const(piece_struct.clone()),
             gc_flavor_const()?,
         ],
-        Hlvalue::Variable(f_piece.clone()),
+        Hlvalue::Variable(fb_piece.clone()),
     );
     push(
-        &block_fast,
+        &block_fast_body,
         "setfield",
         vec![
-            Hlvalue::Variable(f_piece.clone()),
+            Hlvalue::Variable(fb_piece.clone()),
             void_field_const("buf"),
-            Hlvalue::Variable(f.1.clone()),
+            Hlvalue::Variable(fb_str),
         ],
         Hlvalue::Variable(void_result()),
     );
-    let f_extra = variable_with_lltype("extra_pieces", piece_ptr_lltype.clone());
+    let fb_extra = variable_with_lltype("extra_pieces", piece_ptr_lltype.clone());
     push(
-        &block_fast,
+        &block_fast_body,
         "getfield",
         vec![
-            Hlvalue::Variable(f.0.clone()),
+            Hlvalue::Variable(fb_llb.clone()),
             void_field_const("extra_pieces"),
         ],
-        Hlvalue::Variable(f_extra.clone()),
+        Hlvalue::Variable(fb_extra.clone()),
     );
     push(
-        &block_fast,
+        &block_fast_body,
         "setfield",
         vec![
-            Hlvalue::Variable(f_piece.clone()),
+            Hlvalue::Variable(fb_piece.clone()),
             void_field_const("prev_piece"),
-            Hlvalue::Variable(f_extra),
+            Hlvalue::Variable(fb_extra),
         ],
         Hlvalue::Variable(void_result()),
     );
     push(
-        &block_fast,
+        &block_fast_body,
         "setfield",
         vec![
-            Hlvalue::Variable(f.0.clone()),
+            Hlvalue::Variable(fb_llb.clone()),
             void_field_const("total_size"),
-            Hlvalue::Variable(f_total_new),
+            Hlvalue::Variable(fb_total),
         ],
         Hlvalue::Variable(void_result()),
     );
     push(
-        &block_fast,
+        &block_fast_body,
         "setfield",
         vec![
-            Hlvalue::Variable(f.0.clone()),
+            Hlvalue::Variable(fb_llb),
             void_field_const("extra_pieces"),
-            Hlvalue::Variable(f_piece),
+            Hlvalue::Variable(fb_piece),
         ],
         Hlvalue::Variable(void_result()),
     );
-    block_fast.closeblock(vec![
+    block_fast_body.closeblock(vec![
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
+
+    // ---- block_fast_check: total_size = ovfcheck(total_size + size) ----
+    // `except OverflowError: pass` -> the overflow edge falls to the slow path
+    // (block_slow), so the trailing int_add_ovf is the block's last op and its
+    // exception edge carries the four slow-path inputs, not [class, instance].
+    let fc = arg_tuple(&builder_ptr_lltype, &buf_lltype);
+    let block_fast_check = Block::shared(tuple_vals(&fc));
+    let fc_orig_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        &block_fast_check,
+        "getfield",
+        vec![
+            Hlvalue::Variable(fc.0.clone()),
+            void_field_const("total_size"),
+        ],
+        Hlvalue::Variable(fc_orig_total.clone()),
+    );
+    let fc_total_new = variable_with_lltype("total_size", LowLevelType::Signed);
+    push(
+        &block_fast_check,
+        "int_add_ovf",
+        vec![
+            Hlvalue::Variable(fc_orig_total),
+            Hlvalue::Variable(fc.3.clone()),
+        ],
+        Hlvalue::Variable(fc_total_new.clone()),
+    );
+    // Closed after block_slow is built (see close_ovfcheck_block call below).
 
     // ---- block_slow: copy head, grow, copy tail ----
     let s = arg_tuple(&builder_ptr_lltype, &buf_lltype);
@@ -1063,6 +1082,25 @@ pub fn build_ll_grow_and_append_helper_graph(
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
+    // Wire the fast-path ovfcheck now that block_slow exists: no-overflow
+    // threads [ll_builder, ll_str, total_new] to block_fast_body; the
+    // OverflowError edge carries the four slow-path inputs to block_slow
+    // (`except OverflowError: pass`). exc_args (four data vars) differ from the
+    // [class, instance] extravars, so `make_exception_link` routes to block_slow
+    // instead of re-raising.
+    close_ovfcheck_block(
+        &block_fast_check,
+        &overflow_error,
+        &block_fast_body,
+        vec![
+            Hlvalue::Variable(fc.0.clone()),
+            Hlvalue::Variable(fc.1.clone()),
+            Hlvalue::Variable(fc_total_new),
+        ],
+        &block_slow,
+        tuple_vals(&fc),
+    );
+
     // ---- Condition chain: size > 1280 -> pos == 0 -> start == 0 ->
     //      size == len(ll_str.chars); any failure jumps to block_slow. ----
     // block_b3: size == len(ll_str.chars)
@@ -1094,7 +1132,7 @@ pub fn build_ll_grow_and_append_helper_graph(
     );
     block_b3.borrow_mut().exitswitch = Some(Hlvalue::Variable(b3_eq));
     block_b3.closeblock(vec![
-        Link::new(tuple_vals(&b3), Some(block_fast), bool_case(true)).into_ref(),
+        Link::new(tuple_vals(&b3), Some(block_fast_check), bool_case(true)).into_ref(),
         Link::new(tuple_vals(&b3), Some(block_slow.clone()), bool_case(false)).into_ref(),
     ]);
 
@@ -4050,6 +4088,37 @@ pub fn build_ll_jit_try_append_slice_helper_graph(
     ))
 }
 
+/// Close a block whose LAST operation is an `int_add_ovf` (`ovfcheck`) with the
+/// OverflowError-catching exit shape `flatten.rs insert_exits` requires for any
+/// block containing an `_ovf` op: a `c_last_exception` exitswitch with exit 0
+/// the no-overflow fall-through (`normal_args` → `normal_target`) and exit 1 the
+/// OverflowError catch (`exc_args` → `exc_target`). `overflow_error` is
+/// `exception_args("OverflowError")` (`[class, instance]`); its elements are the
+/// exit's `exitcase` and its `last_exception` / `last_exc_value` extravars.
+/// `exc_args` must differ from `[class, instance]` so `make_exception_link`
+/// routes to `exc_target` instead of taking its bare-reraise fast path.
+fn close_ovfcheck_block(
+    block: &BlockRef,
+    overflow_error: &[Hlvalue],
+    normal_target: &BlockRef,
+    normal_args: Vec<Hlvalue>,
+    exc_target: &BlockRef,
+    exc_args: Vec<Hlvalue>,
+) {
+    block.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+    let normal_link = Link::new(normal_args, Some(normal_target.clone()), None).into_ref();
+    let mut exc_link = Link::new(
+        exc_args,
+        Some(exc_target.clone()),
+        Some(overflow_error[0].clone()),
+    );
+    exc_link.extravars(
+        Some(overflow_error[0].clone()),
+        Some(overflow_error[1].clone()),
+    );
+    block.closeblock(vec![normal_link, exc_link.into_ref()]);
+}
+
 /// Synthesise `ll_grow_by(ll_builder, needed)` (`rbuilder.py`):
 ///
 /// ```python
@@ -4070,15 +4139,14 @@ pub fn build_ll_jit_try_append_slice_helper_graph(
 /// ll_builder.extra_pieces = old_piece
 /// ```
 ///
-/// The `ovfcheck`s lower to bare `int_add_ovf` ops (the exception
-/// transformer attaches overflow edges later); the `except OverflowError:
-/// raise MemoryError` is a MemoryError path, which this port leaves
-/// unmodelled — MemoryError is an implicit (always-possible) exception, not
-/// a Python-level one the caller's flow graph handles (same precedent as
-/// `rlist.rs` `build_ll_extend_helper_graph` and `rordereddict.rs`
-/// `build_ll_dict_setitem_lookup_done_helper_graph`'s `_ll_dict_rescue`).
-/// `~63` is the `int_and` mask `-64`. `mallocfn` is a `direct_call` callee
-/// const; `piece_struct` is `PIECE` (`STRINGPIECE`/`UNICODEPIECE`).
+/// Each `ovfcheck` is the trailing `int_add_ovf` of its own block, switched on
+/// `c_last_exception` ([`close_ovfcheck_block`]): the no-overflow edge threads
+/// forward, the OverflowError edge lands in the shared handler that raises
+/// `MemoryError` (a link to the graph's `exceptblock` carrying the prebuilt
+/// MemoryError class/instance). `flatten.rs` rejects an `_ovf` op in a block
+/// that does not catch OverflowError, so the edges are load-bearing, not
+/// decorative. `~63` is the `int_and` mask `-64`. `mallocfn` is a `direct_call`
+/// callee const; `piece_struct` is `PIECE` (`STRINGPIECE`/`UNICODEPIECE`).
 /// Debug-only `ll_assert` omitted. Returns `Void`.
 pub fn build_ll_grow_by_helper_graph(
     name: &str,
@@ -4098,12 +4166,21 @@ pub fn build_ll_grow_by_helper_graph(
         ))
     };
     let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, out: Hlvalue| {
+        block
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(opname, args, out));
+    };
+    let overflow_error = exception_args("OverflowError")?;
 
-    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
-    let needed = variable_with_lltype("needed", LowLevelType::Signed);
+    // ── block_a (startblock): orig_total = total_size;
+    //    needed1 = ovfcheck(needed + orig_total) ──
+    let a_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let a_needed = variable_with_lltype("needed", LowLevelType::Signed);
     let startblock = Block::shared(vec![
-        Hlvalue::Variable(ll_builder.clone()),
-        Hlvalue::Variable(needed.clone()),
+        Hlvalue::Variable(a_builder.clone()),
+        Hlvalue::Variable(a_needed.clone()),
     ]);
     let return_var = variable_with_lltype("result", LowLevelType::Void);
     let mut graph = FunctionGraph::with_return_var(
@@ -4111,70 +4188,97 @@ pub fn build_ll_grow_by_helper_graph(
         startblock.clone(),
         Hlvalue::Variable(return_var),
     );
-    let push = |opname: &str, args: Vec<Hlvalue>, out: Hlvalue| {
-        startblock
-            .borrow_mut()
-            .operations
-            .push(SpaceOperation::new(opname, args, out));
-    };
-
-    // orig_total = ll_builder.total_size (read once; the 3rd ovfcheck uses the
-    // pre-update field value).
-    let orig_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    // orig_total is read once; the 3rd ovfcheck uses the pre-update field value.
+    let a_total = variable_with_lltype("total_size", LowLevelType::Signed);
     push(
+        &startblock,
         "getfield",
         vec![
-            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(a_builder.clone()),
             void_field_const("total_size"),
         ],
-        Hlvalue::Variable(orig_total.clone()),
+        Hlvalue::Variable(a_total.clone()),
     );
-    // needed = ovfcheck(needed + total_size)
-    let needed1 = variable_with_lltype("needed", LowLevelType::Signed);
+    let a_needed1 = variable_with_lltype("needed", LowLevelType::Signed);
     push(
+        &startblock,
         "int_add_ovf",
         vec![
-            Hlvalue::Variable(needed),
-            Hlvalue::Variable(orig_total.clone()),
+            Hlvalue::Variable(a_needed),
+            Hlvalue::Variable(a_total.clone()),
         ],
-        Hlvalue::Variable(needed1.clone()),
+        Hlvalue::Variable(a_needed1.clone()),
     );
-    // needed = ovfcheck(needed + 63) & ~63
-    let needed2 = variable_with_lltype("needed", LowLevelType::Signed);
+
+    // ── block_b: needed2 = ovfcheck(needed1 + 63) ──
+    let b_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let b_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    let b_needed1 = variable_with_lltype("needed", LowLevelType::Signed);
+    let block_b = Block::shared(vec![
+        Hlvalue::Variable(b_builder.clone()),
+        Hlvalue::Variable(b_total.clone()),
+        Hlvalue::Variable(b_needed1.clone()),
+    ]);
+    let b_needed2 = variable_with_lltype("needed", LowLevelType::Signed);
     push(
+        &block_b,
         "int_add_ovf",
-        vec![Hlvalue::Variable(needed1), signed(63)],
-        Hlvalue::Variable(needed2.clone()),
+        vec![Hlvalue::Variable(b_needed1), signed(63)],
+        Hlvalue::Variable(b_needed2.clone()),
     );
-    let needed3 = variable_with_lltype("needed", LowLevelType::Signed);
+
+    // ── block_c: needed3 = needed2 & ~63; total_new = ovfcheck(orig_total + needed3) ──
+    let c_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let c_total = variable_with_lltype("total_size", LowLevelType::Signed);
+    let c_needed2 = variable_with_lltype("needed", LowLevelType::Signed);
+    let block_c = Block::shared(vec![
+        Hlvalue::Variable(c_builder.clone()),
+        Hlvalue::Variable(c_total.clone()),
+        Hlvalue::Variable(c_needed2.clone()),
+    ]);
+    let c_needed3 = variable_with_lltype("needed", LowLevelType::Signed);
     push(
+        &block_c,
         "int_and",
-        vec![Hlvalue::Variable(needed2), signed(-64)],
-        Hlvalue::Variable(needed3.clone()),
+        vec![Hlvalue::Variable(c_needed2), signed(-64)],
+        Hlvalue::Variable(c_needed3.clone()),
     );
-    // total_size = ovfcheck(total_size + needed)
-    let total_new = variable_with_lltype("total_size", LowLevelType::Signed);
+    let c_total_new = variable_with_lltype("total_size", LowLevelType::Signed);
     push(
+        &block_c,
         "int_add_ovf",
         vec![
-            Hlvalue::Variable(orig_total),
-            Hlvalue::Variable(needed3.clone()),
+            Hlvalue::Variable(c_total),
+            Hlvalue::Variable(c_needed3.clone()),
         ],
-        Hlvalue::Variable(total_new.clone()),
+        Hlvalue::Variable(c_total_new.clone()),
     );
+
+    // ── block_d: mallocfn(needed), chain the old buffer into a fresh piece,
+    //    install the new empty buffer ──
+    let d_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let d_needed = variable_with_lltype("needed", LowLevelType::Signed);
+    let d_total_new = variable_with_lltype("total_size", LowLevelType::Signed);
+    let block_d = Block::shared(vec![
+        Hlvalue::Variable(d_builder.clone()),
+        Hlvalue::Variable(d_needed.clone()),
+        Hlvalue::Variable(d_total_new.clone()),
+    ]);
     // new_string = ll_builder.mallocfn(needed)
     let new_string = variable_with_lltype("new_string", buf_lltype.clone());
     push(
+        &block_d,
         "direct_call",
         vec![
             Hlvalue::Constant(mallocfn),
-            Hlvalue::Variable(needed3.clone()),
+            Hlvalue::Variable(d_needed.clone()),
         ],
         Hlvalue::Variable(new_string.clone()),
     );
     // old_piece = lltype.malloc(PIECE)
     let old_piece = variable_with_lltype("old_piece", piece_ptr_lltype.clone());
     push(
+        &block_d,
         "malloc",
         vec![lowlevel_type_const(piece_struct), gc_flavor_const()?],
         Hlvalue::Variable(old_piece.clone()),
@@ -4182,14 +4286,16 @@ pub fn build_ll_grow_by_helper_graph(
     // old_piece.buf = ll_builder.current_buf
     let cur_buf = variable_with_lltype("current_buf", buf_lltype);
     push(
+        &block_d,
         "getfield",
         vec![
-            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(d_builder.clone()),
             void_field_const("current_buf"),
         ],
         Hlvalue::Variable(cur_buf.clone()),
     );
     push(
+        &block_d,
         "setfield",
         vec![
             Hlvalue::Variable(old_piece.clone()),
@@ -4201,14 +4307,16 @@ pub fn build_ll_grow_by_helper_graph(
     // old_piece.prev_piece = ll_builder.extra_pieces
     let cur_extra = variable_with_lltype("extra_pieces", piece_ptr_lltype);
     push(
+        &block_d,
         "getfield",
         vec![
-            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(d_builder.clone()),
             void_field_const("extra_pieces"),
         ],
         Hlvalue::Variable(cur_extra.clone()),
     );
     push(
+        &block_d,
         "setfield",
         vec![
             Hlvalue::Variable(old_piece.clone()),
@@ -4218,27 +4326,81 @@ pub fn build_ll_grow_by_helper_graph(
         Hlvalue::Variable(void_result()),
     );
     // ll_builder.current_buf = new_string; current_pos = 0; current_end = needed;
-    // total_size = total_size; extra_pieces = old_piece.
+    // total_size = total_new; extra_pieces = old_piece.
     for (field, value) in [
         ("current_buf", Hlvalue::Variable(new_string)),
         ("current_pos", signed(0)),
-        ("current_end", Hlvalue::Variable(needed3)),
-        ("total_size", Hlvalue::Variable(total_new)),
+        ("current_end", Hlvalue::Variable(d_needed)),
+        ("total_size", Hlvalue::Variable(d_total_new)),
         ("extra_pieces", Hlvalue::Variable(old_piece)),
     ] {
         push(
+            &block_d,
             "setfield",
             vec![
-                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(d_builder.clone()),
                 void_field_const(field),
                 value,
             ],
             Hlvalue::Variable(void_result()),
         );
     }
-    startblock.closeblock(vec![
+    block_d.closeblock(vec![
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
+
+    // ── handler: except OverflowError -> raise MemoryError ──
+    // No operations; a single link to the graph's exceptblock carrying the
+    // prebuilt MemoryError class/instance is the low-level `raise MemoryError`.
+    let handler = Block::shared(vec![]);
+    handler.closeblock(vec![
+        Link::new(
+            exception_args("MemoryError")?,
+            Some(graph.exceptblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // Wire the ovfcheck exits: no-overflow threads a->b->c->d; each OverflowError
+    // edge lands in the shared MemoryError handler. `exc_args` is empty (≠ the
+    // [class, instance] extravars) so `make_exception_link` enters the handler.
+    close_ovfcheck_block(
+        &startblock,
+        &overflow_error,
+        &block_b,
+        vec![
+            Hlvalue::Variable(a_builder),
+            Hlvalue::Variable(a_total),
+            Hlvalue::Variable(a_needed1),
+        ],
+        &handler,
+        vec![],
+    );
+    close_ovfcheck_block(
+        &block_b,
+        &overflow_error,
+        &block_c,
+        vec![
+            Hlvalue::Variable(b_builder),
+            Hlvalue::Variable(b_total),
+            Hlvalue::Variable(b_needed2),
+        ],
+        &handler,
+        vec![],
+    );
+    close_ovfcheck_block(
+        &block_c,
+        &overflow_error,
+        &block_d,
+        vec![
+            Hlvalue::Variable(c_builder),
+            Hlvalue::Variable(c_needed3),
+            Hlvalue::Variable(c_total_new),
+        ],
+        &handler,
+        vec![],
+    );
 
     let func = GraphFunc::new(
         name.to_string(),
@@ -6676,6 +6838,20 @@ impl Repr for UnicodeBuilderRepr {
                     )
                 }
             }
+            "append_slice" => {
+                let string_repr = crate::translator::rtyper::rstr::unicode_repr();
+                rtype_builder_append_slice(
+                    self,
+                    string_repr.as_ref(),
+                    hop,
+                    UNICODEBUILDERPTR.clone(),
+                    UNICODEPIECEPTR.clone(),
+                    UNICODEPIECE.clone(),
+                    UNICODEPTR.clone(),
+                    "mallocunicode",
+                    "copyunicodecontent",
+                )
+            }
             "build" => rtype_builder_build(
                 self,
                 hop,
@@ -7476,20 +7652,56 @@ mod tests {
         drop(startblock);
 
         let (count, all_ops) = walk_ops(&inner.startblock);
-        // b0, b1, b2, b3, fast, slow, returnblock
-        assert_eq!(count, 7);
+        // b0, b1, b2, b3, fast_check, fast_body, slow, returnblock. The fast
+        // path splits: fast_check holds the trailing ovfcheck (its overflow
+        // edge falls to slow, `except OverflowError: pass`), fast_body the
+        // malloc/link. The exceptblock is unreachable (overflow does not raise).
+        assert_eq!(count, 8);
         let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
         assert_eq!(n("int_gt"), 1);
         assert_eq!(n("int_eq"), 3); // pos==0, start==0, size==len
         assert_eq!(n("getsubstruct"), 1);
         assert_eq!(n("getarraysize"), 1);
-        assert_eq!(n("int_add_ovf"), 1); // fast: total_size + size
-        assert_eq!(n("malloc"), 1); // fast: new piece
+        assert_eq!(n("int_add_ovf"), 1); // fast_check: total_size + size
+        assert_eq!(n("malloc"), 1); // fast_body: new piece
         assert_eq!(n("getfield"), 7);
         assert_eq!(n("setfield"), 5); // 4 fast + 1 slow (current_pos)
         assert_eq!(n("int_sub"), 2); // slow: part1, size-part1
         assert_eq!(n("int_add"), 1); // slow: start+part1
         assert_eq!(n("direct_call"), 3); // slow: copy, grow_by, copy
+
+        // Exactly one block is a canraise ovfcheck (fast_check); its overflow
+        // edge targets a block with operations (slow) carrying four data args,
+        // not the [class, instance] extravars -> no MemoryError raise here.
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![inner.startblock.clone()];
+        let mut ovf_blocks = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(std::rc::Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            let bb = b.borrow();
+            if bb.canraise() {
+                ovf_blocks += 1;
+                let exc = bb.exits[1].borrow();
+                let exc_target = exc.target.clone().expect("ovf exc edge has a target");
+                assert!(
+                    !exc_target.borrow().operations.is_empty(),
+                    "overflow falls to the slow path, not a bare raise block"
+                );
+                assert_eq!(
+                    exc.args.len(),
+                    4,
+                    "overflow carries the four slow-path inputs"
+                );
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        assert_eq!(ovf_blocks, 1);
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
@@ -7511,36 +7723,120 @@ mod tests {
         .expect("build_ll_grow_by_helper_graph");
         assert_eq!(helper.func.name, "ll_grow_by");
         let inner = helper.graph.borrow();
+
+        // Each `ovfcheck` is the trailing op of its own block so the
+        // OverflowError -> raise MemoryError edge can attach. block_a
+        // (startblock): total_size read once, then `needed + total_size`.
         let startblock = inner.startblock.borrow();
         let ops: Vec<&str> = startblock
             .operations
             .iter()
             .map(|o| o.opname.as_str())
             .collect();
-        assert_eq!(
-            ops,
-            vec![
-                "getfield",    // total_size (read once)
-                "int_add_ovf", // needed + total_size
-                "int_add_ovf", // needed + 63
-                "int_and",     // & ~63
-                "int_add_ovf", // total_size + needed
-                "direct_call", // mallocfn
-                "malloc",      // old_piece
-                "getfield",    // current_buf
-                "setfield",    // old_piece.buf
-                "getfield",    // extra_pieces
-                "setfield",    // old_piece.prev_piece
-                "setfield",    // current_buf
-                "setfield",    // current_pos
-                "setfield",    // current_end
-                "setfield",    // total_size
-                "setfield",    // extra_pieces
-            ]
-        );
+        assert_eq!(ops, vec!["getfield", "int_add_ovf"]);
         assert_eq!(startblock.inputargs.len(), 2);
-        // No exception edge: MemoryError path unmodelled -> single exit.
-        assert_eq!(startblock.exits.len(), 1);
+        // c_last_exception switch: normal fall-through + OverflowError catch.
+        assert_eq!(startblock.exits.len(), 2);
+        assert!(startblock.canraise());
+        assert_eq!(startblock.exits[0].borrow().exitcase, None);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // block_a, block_b, block_c, block_d, handler, returnblock, exceptblock
+        assert_eq!(count, 7);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("int_add_ovf"), 3); // one ovfcheck per block
+        assert_eq!(n("int_and"), 1); // & ~63
+        assert_eq!(n("direct_call"), 1); // mallocfn
+        assert_eq!(n("malloc"), 1); // old_piece
+        assert_eq!(n("getfield"), 3); // total_size, current_buf, extra_pieces
+        assert_eq!(n("setfield"), 7); // buf, prev_piece + 5 builder fields
+
+        // The OverflowError handler has no ops and raises MemoryError via a
+        // single link to the graph exceptblock carrying [class, instance].
+        let except_ptr = std::rc::Rc::as_ptr(&inner.exceptblock) as usize;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![inner.startblock.clone()];
+        let mut raises = 0usize;
+        while let Some(b) = stack.pop() {
+            if !seen.insert(std::rc::Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            let bb = b.borrow();
+            for link in &bb.exits {
+                let l = link.borrow();
+                if let Some(t) = l.target.clone() {
+                    if std::rc::Rc::as_ptr(&t) as usize == except_ptr {
+                        assert!(bb.operations.is_empty(), "handler has no ops");
+                        assert_eq!(l.args.len(), 2, "MemoryError raise carries class+instance");
+                        raises += 1;
+                    }
+                    stack.push(t);
+                }
+            }
+        }
+        assert_eq!(raises, 1, "exactly one MemoryError raise edge");
+
+        // Data-flow guard (not just op-name counts): in block_d the mallocfn
+        // allocation size must be the SAME Variable written to `current_end`
+        // (allocated size == recorded buffer end, matching `rbuilder.py:104`
+        // `new_string = mallocfn(needed)` and `:113` `current_end = needed`),
+        // and `total_size` must be a distinct value (`total_new`, not the
+        // rounded `needed`). Swapping which variant feeds mallocfn / current_end
+        // / total_size is a buffer-size regression op-name counts cannot see.
+        let mut block_d = None;
+        let mut seen_d = std::collections::HashSet::new();
+        let mut stack_d = vec![inner.startblock.clone()];
+        while let Some(b) = stack_d.pop() {
+            if !seen_d.insert(std::rc::Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            if b.borrow()
+                .operations
+                .iter()
+                .any(|o| o.opname == "direct_call")
+            {
+                block_d = Some(b.clone());
+            }
+            let exits: Vec<_> = b.borrow().exits.clone();
+            for link in &exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack_d.push(t);
+                }
+            }
+        }
+        let block_d = block_d.expect("block_d holds the mallocfn direct_call");
+        let bd = block_d.borrow();
+        let malloc_size = bd
+            .operations
+            .iter()
+            .find(|o| o.opname == "direct_call")
+            .map(|o| o.args[1].clone())
+            .expect("mallocfn(size) direct_call");
+        let field_value = |field: &str| {
+            bd.operations
+                .iter()
+                .find(|o| o.opname == "setfield" && o.args[1] == super::void_field_const(field))
+                .map(|o| o.args[2].clone())
+                .unwrap_or_else(|| panic!("block_d setfield {field}"))
+        };
+        let current_end = field_value("current_end");
+        let total_size = field_value("total_size");
+        assert_eq!(
+            malloc_size, current_end,
+            "mallocfn size must be the same value written to current_end"
+        );
+        assert_ne!(
+            current_end, total_size,
+            "current_end (rounded needed) must differ from total_size (total_new)"
+        );
+        assert_eq!(
+            field_value("current_pos"),
+            super::constant_with_lltype(super::ConstValue::Int(0), LowLevelType::Signed),
+            "current_pos initialised to 0"
+        );
+        drop(bd);
+
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
@@ -8256,6 +8552,52 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_new");
     }
 
+    /// rtyper/rbuilder.py — `rtyper_new` on a `with_capacity(n)` constructor
+    /// (`len(hop.args_v) != 0`) threads the size operand into `ll_new`
+    /// instead of the `INIT_SIZE` default, so the emitted `direct_call`
+    /// carries the requested size (200), not the default.
+    #[test]
+    fn stringbuilder_rtyper_new_with_size_threads_size_into_direct_call() {
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(super::STRINGBUILDERPTR.clone()));
+        // A `Constant` size arg lets `HighLevelOp.inputarg` short-circuit to
+        // `inputconst` without an `args_r` binding — the single operand is all
+        // `rtype_builder_new`'s `nb_args() != 0` branch needs.
+        let size = super::constant_with_lltype(super::ConstValue::Int(200), LowLevelType::Signed);
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "newstringbuilder".to_string(),
+                vec![size],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let result = super::stringbuilder_repr()
+            .rtyper_new(&hop)
+            .unwrap_or_else(|err| panic!("rtyper_new: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        assert_single_direct_call_to(&llops, "ll_new");
+        // `direct_call(ll_new_funcptr, size)` — the size operand (args[1]) is
+        // the threaded 200, not the `INIT_SIZE` default.
+        let ops = llops.borrow();
+        let Hlvalue::Constant(size_arg) = &ops.ops[0].args[1] else {
+            panic!(
+                "ll_new size arg must be a Constant, got {:?}",
+                ops.ops[0].args[1]
+            );
+        };
+        let dbg = format!("{:?}", size_arg.value);
+        assert!(dbg.contains("200"), "expected threaded size 200 in {dbg}");
+    }
+
     /// The `newstringbuilder` ctor op flows through the rtyper's real
     /// `translate_operation` dispatch: the result builder repr's
     /// `rtyper_new` lowers it to a single `direct_call` against `ll_new`.
@@ -8329,6 +8671,99 @@ mod tests {
             .unwrap_or_else(|err| panic!("rtype_method getlength: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         assert_single_direct_call_to(&llops, "ll_getlength");
+    }
+
+    /// UnicodeBuilder mirror of the StringBuilder `append_slice` surface: the
+    /// same shared `rtype_builder_append_slice` body, threaded with the UNICODE
+    /// pointer / piece lltypes and the `mallocunicode` malloc helper.
+    #[test]
+    fn unicodebuilder_rtype_method_append_slice_emits_direct_call() {
+        use super::{ConstValue, constant_with_lltype};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        let (_ann, rtyper) = setup_rtyper();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ));
+        let v_builder = Variable::new();
+        v_builder.set_concretetype(Some(super::UNICODEBUILDERPTR.clone()));
+        let v_piece = Variable::new();
+        v_piece.set_concretetype(Some(super::UNICODEPTR.clone()));
+        let c_start = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+        let c_end = constant_with_lltype(ConstValue::Int(5), LowLevelType::Signed);
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = crate::translator::rtyper::rtyper::HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "append_slice".to_string(),
+                vec![
+                    Hlvalue::Variable(v_builder.clone()),
+                    Hlvalue::Variable(v_piece.clone()),
+                    c_start,
+                    c_end,
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        {
+            let LowLevelType::Ptr(inner) = super::UNICODEBUILDERPTR.clone() else {
+                panic!("builder lltype must be a Ptr");
+            };
+            let mut s = hop.args_s.borrow_mut();
+            s.push(crate::annotator::model::SomeValue::Ptr(
+                crate::translator::rtyper::lltypesystem::lltype::SomePtr::new(*inner),
+            ));
+            s.push(crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+            s.push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(true, false),
+            ));
+        }
+        {
+            let mut r = hop.args_r.borrow_mut();
+            r.push(Some(
+                super::unicodebuilder_repr() as std::sync::Arc<dyn Repr>
+            ));
+            r.push(Some(
+                crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>
+            ));
+            r.push(None);
+            r.push(None);
+        }
+        let result = super::unicodebuilder_repr()
+            .rtype_method("append_slice", &hop)
+            .unwrap_or_else(|err| panic!("rtype_method append_slice: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_)) | None));
+        assert_single_direct_call_to(&llops, "ll_append_slice");
+
+        let graph_names: std::collections::HashSet<String> = _ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|g| g.borrow().name.clone())
+            .collect();
+        for expected in [
+            "ll_append_slice",
+            "ll_append_res_slice",
+            "_ll_append",
+            "ll_grow_and_append",
+            "ll_grow_by",
+            "ll_copy_string_contents",
+            "mallocunicode",
+        ] {
+            assert!(
+                graph_names.contains(expected),
+                "append_slice helper tree missing `{expected}`; minted graphs = {graph_names:?}"
+            );
+        }
     }
 
     /// rbuilder.py mirror for UnicodeBuilderRepr.

@@ -736,8 +736,10 @@ fn build_module_with_write_barrier_target(
         external_jump_slot: 0,
         external_jump_key: 0,
         // The allocated trace keeps both Ref inputs live across New; reserve
-        // their homes in the shared helper geometry.
-        frame: codegen::FrameGeometry::compact(4, 2, 0),
+        // their homes in the shared helper geometry.  The value count is the
+        // fail index, this trace's three-slot value area, and the trace-wide
+        // GUARD_VALUE counter slot `normal_frame_value_slots` always reserves.
+        frame: codegen::FrameGeometry::compact(5, 2, 0),
         ca: codegen::CaParams::default(),
     };
     let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
@@ -5024,5 +5026,83 @@ fn guard_value_parks_its_operand_past_every_exits_fail_args() {
         read(codegen::FRAME_SLOT_BASE + 16),
         7,
         "the compared operand parks past every exit's fail args"
+    );
+}
+
+/// A bridge executes in its source token's frame, whose offsets froze when that
+/// token was compiled, and `compile_bridge` refuses a bridge whose
+/// `frame_value_slots` exceeds `source_frame.value_slots` — a refusal
+/// `declined_bridge_guards` makes permanent, so the guard blackholes for the
+/// rest of the run.  A source loop that spills nothing must therefore already
+/// carry the GUARD_VALUE counter slot: promoting a value is the ordinary way a
+/// bridge acquires one, and the two traces below have the same value area, so a
+/// conditional reservation would make the second one slot wider than the first.
+#[test]
+fn a_counterless_trace_reserves_the_slot_a_bridge_may_need() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    // Shared prefix: three values, a two-fail-arg exit, and a FINISH.
+    let common = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(5)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(2), OpRef::int_op(3)],
+        ),
+    ];
+
+    let mut counterless = common.clone();
+    counterless.push(Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]));
+
+    // The bridge shape: one more GUARD_VALUE whose compared operand is not
+    // among its own fail args, so it needs the parked slot. Its single fail
+    // argument keeps the value area at the same two slots.
+    let mut with_counter = common;
+    with_counter.push(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(7)],
+        OpRef::int_op(1),
+    ));
+    with_counter.push(make_guard(
+        OpCode::GuardValue,
+        &[OpRef::int_op(1), OpRef::const_int(999)],
+        &[OpRef::int_op(2)],
+    ));
+    with_counter.push(Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]));
+
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+    let (_, counterless_guards) = build_module_default(&inputargs, &counterless, &constants);
+    let (_, counter_guards) = build_module_default(&inputargs, &with_counter, &constants);
+    assert!(
+        counterless_guards
+            .iter()
+            .all(|g| g.counter_value_spill.is_none()),
+        "control: the first trace spills nothing, so a conditional reservation \
+         would leave its frame one slot narrower"
+    );
+    assert!(
+        counter_guards
+            .iter()
+            .any(|g| g.counter_value_spill.is_some()),
+        "the second trace is the bridge shape that needs the parked slot"
+    );
+
+    assert_eq!(
+        codegen::frame_value_slots(&inputargs, &counterless),
+        codegen::frame_value_slots(&inputargs, &with_counter),
+        "a source loop that spills nothing must still fit a bridge that does"
     );
 }

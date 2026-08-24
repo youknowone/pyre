@@ -6299,6 +6299,43 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// payload would overwrite their slot.
 pub const DICT_DATA_SLOT: &str = "dict subclass w_dict_data";
 
+/// Whether a type built on `w_base` owes its instances a reserved
+/// [`DICT_DATA_SLOT`] of their own: the base's instances are dicts, and no
+/// layout along its chain reserves the slot already.
+///
+/// Both routes that build a type owe this — `create_all_slots` for a class
+/// written in Python and the builtin layout mint for one readied from C — so
+/// the question is asked here rather than answered twice.  The base's layout
+/// typedef settles "are these dicts" without consulting the `dict` type
+/// object, which the builtin route cannot look up while it is still being
+/// built.
+///
+/// # Safety
+/// `w_base` must be null or a valid `W_TypeObject` pointer.
+pub unsafe fn base_owes_dict_backing(w_base: PyObjectRef) -> bool {
+    unsafe {
+        if w_base.is_null() {
+            return false;
+        }
+        let mut layout = pyre_object::w_type_get_layout_ptr(w_base);
+        let dict_typedef = &pyre_object::pyobject::DICT_TYPE as *const pyre_object::PyType;
+        if layout.is_null() || !std::ptr::eq((*layout).typedef, dict_typedef) {
+            return false;
+        }
+        while !layout.is_null() {
+            if (*layout)
+                .newslotnames
+                .iter()
+                .any(|name| name == DICT_DATA_SLOT)
+            {
+                return false;
+            }
+            layout = (*layout).base_layout;
+        }
+        true
+    }
+}
+
 /// True when `obj` can be read as a dict — an exact dict, a dict subclass
 /// carrying a mapping payload, or a mapping proxy wrapping one.  This is the
 /// receiver test a `dict` method descriptor applies, so an object that merely

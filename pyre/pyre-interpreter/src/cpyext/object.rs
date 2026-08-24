@@ -6,6 +6,44 @@ use super::typeobject::{CPyTypeObject, CPyVarObject};
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
+/// Call `callable` with `arguments` and the keywords `names` spells.
+///
+/// The keywords form an `Arguments(..., keyword_names_w=names)`, which needs
+/// the running frame: an entry point reached with none is being called from
+/// outside any interpreter and reports that rather than guessing one.
+pub(super) fn call_named(
+    callable: PyObjectRef,
+    arguments: &[PyObjectRef],
+    names: &[(rustpython_wtf8::Wtf8Buf, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "a cpyext keyword call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, names)
+    })
+}
+
+/// [`call_named`] for the single keyword an entry point names itself.
+pub(super) fn call_keyword(
+    callable: PyObjectRef,
+    arguments: &[PyObjectRef],
+    name: &str,
+    value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    call_named(
+        callable,
+        arguments,
+        &[(
+            rustpython_wtf8::Wtf8Buf::from_string(name.to_string()),
+            value,
+        )],
+    )
+}
+
 /// The interpreter object behind an argument, or a recorded `SystemError`.
 ///
 /// Upstream's generated wrappers reject a NULL argument with
@@ -880,20 +918,11 @@ fn call_with_keywords(
         .iter()
         .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name.clone()), *value))
         .collect();
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "cpyext keyword call has no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(
-            unsafe { &mut *frame },
-            pyre_object::gc_roots::shadow_stack_get(callable_slot),
-            &arguments,
-            &names,
-        )
-    })
+    call_named(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &arguments,
+        &names,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1092,11 +1121,18 @@ pub unsafe extern "C" fn PyObject_VisitManagedDict(
 }
 
 /// `PyObject_ClearManagedDict(object)` — empty the instance namespace.
+///
+/// `dictobject.c:7488-7491` states when it is called: "when the object is
+/// being freed or cleared by the GC and therefore known to have no
+/// references".  A block reached from `clear_garbage` has no interpreter
+/// object left to hold a namespace, and this reports nothing -- it returns
+/// void, so an error recorded here would be found by whoever calls next.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_ClearManagedDict(object: *mut CPyObject) {
-    let Some(object) = argument(object) else {
+    let object = unsafe { pyobject::from_ref(object) };
+    if object.is_null() {
         return;
-    };
+    }
     let dict = crate::baseobjspace::getdict_native(object);
     if !dict.is_null() {
         unsafe { pyre_object::dictmultiobject::w_dict_clear(dict) };
@@ -1302,7 +1338,35 @@ pub unsafe extern "C" fn Py_HashBuffer(pointer: *const std::ffi::c_void, length:
     crate::builtins::hash_buffer(bytes) as isize
 }
 
+/// `pyobject.py _Py_HashPointer` — the hash an object's address gives.
+///
+/// Upstream answers with the address itself.  The rotation here is what the
+/// same call does for CPython, and it is what an extension keying a table by
+/// address wants: an allocator hands out addresses that agree in their low
+/// bits, and a table indexed by the low bits of the hash would put all of them
+/// in one chain.
+///
+/// -1 is what an error is reported by, so the one value that would be mistaken
+/// for one is moved.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_HashPointer(pointer: *const std::ffi::c_void) -> isize {
+    let bits = pointer as usize;
+    let hash = ((bits >> 4) | (bits << (usize::BITS - 4))) as isize;
+    match hash {
+        -1 => -2,
+        hash => hash,
+    }
+}
+
+/// The name [`Py_HashPointer`] was published under before 3.13.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_HashPointer(pointer: *const std::ffi::c_void) -> isize {
+    unsafe { Py_HashPointer(pointer) }
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(Py_HashPointer as *const ());
+    std::hint::black_box(_Py_HashPointer as *const ());
     std::hint::black_box(Py_ReprEnter as *const ());
     std::hint::black_box(Py_ReprLeave as *const ());
     std::hint::black_box(Py_HashBuffer as *const ());
@@ -1457,20 +1521,11 @@ unsafe fn call_vector(
         .enumerate()
         .map(|(index, name)| (name, value_at(nargs + index)))
         .collect();
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "cpyext keyword call has no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(
-            unsafe { &mut *frame },
-            pyre_object::gc_roots::shadow_stack_get(callable_slot),
-            &positional,
-            &keywords,
-        )
-    })
+    call_named(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &positional,
+        &keywords,
+    )
 }
 
 /// `PyObject_Vectorcall(callable, args, nargsf, kwnames)`.
@@ -1521,9 +1576,24 @@ pub unsafe extern "C" fn PyObject_VectorcallMethod(
     result(unsafe { call_vector(method, args.add(1), nargs, kwnames) })
 }
 
+/// The C signature a `tp_vectorcall_offset` names.
+type VectorcallFunc = unsafe extern "C" fn(
+    *mut CPyObject,
+    *const *mut CPyObject,
+    usize,
+    *mut CPyObject,
+) -> *mut CPyObject;
+
 /// `PyVectorcall_Call(callable, tuple, dict)` — the tuple/dict spelling of a
 /// vectorcall, which is what a type's `tp_call` is set to when it declares one
-/// (`cpyext/src/call.c:114-161`).
+/// (`src/call.c PyVectorcall_Call`).
+///
+/// The function is read out of the instance at its type's
+/// `tp_vectorcall_offset` and called.  Answering with `tp_call` in every case
+/// cannot work: a type that declares an offset is one whose `tp_call` is this
+/// very entry point, so the two call each other without end.  Cython's
+/// function objects are exactly that shape, and calling one recursed until the
+/// stack ran out.
 ///
 /// # Safety
 /// `tuple` must be a tuple and `dict` NULL or a dict.
@@ -1534,7 +1604,114 @@ pub unsafe extern "C" fn PyVectorcall_Call(
     dict: *mut CPyObject,
 ) -> *mut CPyObject {
     realize_all([callable, tuple, dict]);
-    unsafe { PyObject_Call(callable, tuple, dict) }
+    if callable.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    // `_PyVectorcall_Call` asserts both of these before it unpacks them.  An
+    // assertion is a crash in one build and a wild read in every other, so a
+    // caller that broke the contract is told so instead.
+    let mismatched = |object: *mut CPyObject, wanted_tuple: bool| unsafe {
+        let value = pyobject::from_ref(object);
+        !value.is_null()
+            && !match wanted_tuple {
+                true => pyre_object::is_tuple(value),
+                false => pyre_object::is_dict(value),
+            }
+    };
+    if mismatched(tuple, true) || mismatched(dict, false) {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let tp = unsafe { (*callable).ob_type };
+    let offset = match tp.is_null() {
+        true => 0,
+        false => unsafe { (*tp).tp_vectorcall_offset },
+    };
+    // `src/call.c`: an object whose type declares no offset -- which is every
+    // object this runtime owns, since a mirror carries none -- is called
+    // through `tp_call` as it stands.
+    if offset == 0 && !tp.is_null() && !unsafe { (*tp).tp_call }.is_null() {
+        return unsafe { PyObject_Call(callable, tuple, dict) };
+    }
+    let function = match offset > 0 {
+        false => None,
+        true => unsafe { *((callable as *mut u8).offset(offset) as *const Option<VectorcallFunc>) },
+    };
+    let Some(function) = function else {
+        let name = crate::type_methods::arg_type_name(unsafe { pyobject::from_ref(callable) });
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "'{name}' object does not support vectorcall"
+        )));
+        return std::ptr::null_mut();
+    };
+    unsafe { call_vectorcall_slot(function, callable, tuple, dict) }
+}
+
+/// `_PyStack_UnpackDict` and the call it feeds: the positional values first,
+/// then one value per name in `kwnames`, in that order.
+///
+/// Each value is handed over as an owned reference and released afterwards,
+/// which is what the unpacking upstream does -- the callee may drop the tuple
+/// or the mapping the values came from.
+///
+/// # Safety
+/// `tuple` must be a tuple and `dict` NULL or a dict.
+unsafe fn call_vectorcall_slot(
+    function: VectorcallFunc,
+    callable: *mut CPyObject,
+    tuple: *mut CPyObject,
+    dict: *mut CPyObject,
+) -> *mut CPyObject {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let w_tuple = unsafe { pyobject::from_ref(tuple) };
+    let _ = roots.pin_root(w_tuple);
+    let w_dict = unsafe { pyobject::from_ref(dict) };
+    let _ = roots.pin_root(w_dict);
+    let at = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+
+    let positional: Vec<PyObjectRef> = match at(0).is_null() {
+        true => Vec::new(),
+        false => (0..unsafe { pyre_object::w_tuple_len(at(0)) })
+            .filter_map(|index| unsafe { pyre_object::w_tuple_getitem(at(0), index as i64) })
+            .collect(),
+    };
+    let nargs = positional.len();
+    let keywords: Vec<(PyObjectRef, PyObjectRef)> = match at(1).is_null() {
+        true => Vec::new(),
+        false => unsafe { pyre_object::dictmultiobject::w_dict_items(at(1)) },
+    };
+
+    // The names go over as one tuple, which allocates, so every value is on
+    // the shadow stack before it is built and all of them are read back.
+    let values = base + 2;
+    for value in positional
+        .into_iter()
+        .chain(keywords.iter().map(|&(_, value)| value))
+    {
+        let _ = roots.pin_root(value);
+    }
+    let names = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(match keywords.is_empty() {
+        true => pyre_object::PY_NULL,
+        false => pyre_object::w_tuple_new(keywords.iter().map(|&(name, _)| name).collect()),
+    });
+
+    let count = nargs + keywords.len();
+    let vector: Vec<*mut CPyObject> = (0..count)
+        .map(|index| pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(values + index)))
+        .collect();
+    let kwnames = match pyre_object::gc_roots::shadow_stack_get(names).is_null() {
+        true => std::ptr::null_mut(),
+        false => pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(names)),
+    };
+    let answer = unsafe { function(callable, vector.as_ptr(), nargs, kwnames) };
+    for held in vector {
+        unsafe { pyobject::decref(held) };
+    }
+    unsafe { pyobject::decref(kwnames) };
+    answer
 }
 
 /// `PyObject_CallNoArgs(callable)`.

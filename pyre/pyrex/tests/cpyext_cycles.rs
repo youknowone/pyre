@@ -95,6 +95,27 @@ del mapping, holder
 collect()
 assert watch() is None, 'a dict cycle through a borrow was not collected'
 
+# ── a finalizer is handed what its block still references ──────────────
+# `finalize_garbage` before `delete_garbage`: the block is dying and nothing
+# outside it names either field, so the call can only be made while the
+# collection that found it dead is still keeping both.
+seen = []
+
+
+class Payload:
+    pass
+
+
+payload = Payload()
+doomed = m.Doomed(seen.append, payload)
+del doomed
+collect()
+assert seen == [payload], seen
+
+# ── and once, however many collections follow ──────────────────────────
+collect()
+assert seen == [payload], seen
+
 print('cpyext-cycles-collected-ok')
 "#;
 

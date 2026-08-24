@@ -57,6 +57,14 @@ assert True > 0
 assert int(True) == 1
 assert True.conjugate() == 1
 assert isinstance(True.conjugate(), int)
+# `_self_unaryop` → `self.int(space)`: bool is an int subclass, so
+# floor/ceil (and the other identity unaries) return a plain int.
+assert True.__ceil__() == 1
+assert type(True.__ceil__()) is int
+assert False.__floor__() == 0
+assert type(False.__floor__()) is int
+assert True.__trunc__() == 1
+assert type(True.__trunc__()) is int
 
 # Boolean operations on pairs of Bools should return Bools, not ints
 assert (False | True) is True

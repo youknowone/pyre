@@ -216,15 +216,23 @@ fn tls_result<T>(result: pyre_native::ssl::TlsResult<T>) -> Result<T, crate::PyE
     result.map_err(|(code, message)| tls_error(code, message))
 }
 
-fn path_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn fs_path(obj: PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
     if obj.is_null() || unsafe { is_none(obj) || is_bool(obj) } {
         return Err(crate::PyError::type_error(
             "path should be string, bytes, os.PathLike or integer, not NoneType",
         ));
     }
-    Ok(crate::gateway::fspath_buf(obj)?
-        .to_string_lossy()
-        .into_owned())
+    // `PyUnicode_FSConverter`: a path is named by a `str`, by the filesystem
+    // `bytes` that `str` encodes to, or by an `os.PathLike`, and all three
+    // reach the host as those bytes. `fspath_buf` takes a `str` its caller has
+    // already established — reading a `bytes` through it decodes the payload
+    // as text and takes a length word out of the middle of the path.
+    // Those bytes stay a path all the way to the host call. Decoding them to
+    // text is lossy on a name the filesystem accepts but UTF-8 does not: two
+    // distinct files collapse onto one `U+FFFD` spelling, and re-encoding that
+    // spelling names neither of them.
+    let bytes = crate::gateway::fsencode_bytes_w(obj)?;
+    Ok(crate::gateway::os_string_from_fs_bytes(&bytes).into())
 }
 
 fn password_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, crate::PyError> {
@@ -818,9 +826,9 @@ mod context_methods {
             let password =
                 crate::builtins::bind_pos_or_kw(user, kwargs, 2, "password", "load_cert_chain", 3)?;
             crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_cert_chain")?;
-            let cert_path = path_string(cert)?;
+            let cert_path = fs_path(cert)?;
             let key_path = match key {
-                Some(value) if !unsafe { is_none(value) } => path_string(value)?,
+                Some(value) if !unsafe { is_none(value) } => fs_path(value)?,
                 _ => cert_path.clone(),
             };
             // OpenSSL asks its callback only after parsing discovers an
@@ -891,14 +899,14 @@ mod context_methods {
                 ));
             }
             if let Some(cafile) = cafile {
-                let path = path_string(cafile)?;
+                let path = fs_path(cafile)?;
                 native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
                 })?;
             }
             if let Some(capath) = capath {
-                let path = path_string(capath)?;
-                if !std::path::Path::new(&path).is_dir() {
+                let path = fs_path(capath)?;
+                if !path.is_dir() {
                     return Err(crate::PyError::os_error_with_errno(
                         libc::ENOENT,
                         "CA directory does not exist",
@@ -948,14 +956,14 @@ mod context_methods {
         /// the first and `SSL_CERT_DIR` only the second, so neither variable
         /// may suppress the other's source.
         fn set_default_verify_paths(&mut self) -> Result<(), crate::PyError> {
+            // `SSL_CERT_FILE` and `SSL_CERT_DIR` name files, so their bytes
+            // reach the host as a path for the same reason `fs_path`'s do.
             let env_path = |name: &[u8]| {
-                crate::host_seam::getenv(name)
-                    .ok()
-                    .flatten()
-                    .map(|value| String::from_utf8_lossy(&value).into_owned())
+                crate::host_seam::getenv(name).ok().flatten().map(|value| {
+                    std::path::PathBuf::from(crate::gateway::os_string_from_fs_bytes(&value))
+                })
             };
-            let cert_file =
-                env_path(b"SSL_CERT_FILE").filter(|path| std::path::Path::new(path).is_file());
+            let cert_file = env_path(b"SSL_CERT_FILE").filter(|path| path.is_file());
             match cert_file {
                 Some(path) => native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
@@ -967,8 +975,8 @@ mod context_methods {
                 .map(|_| ())?,
             }
             let (_, default_dir) = pyre_native::ssl::default_verify_paths();
-            let cert_dir = env_path(b"SSL_CERT_DIR").unwrap_or(default_dir);
-            if std::path::Path::new(&cert_dir).is_dir() {
+            let cert_dir = env_path(b"SSL_CERT_DIR").unwrap_or_else(|| default_dir.into());
+            if cert_dir.is_dir() {
                 // OpenSSL defers hashed directory loading until chain lookup,
                 // so it does not contribute to cert_store_stats here.
                 unsafe { pyre_native::ssl::context_add_verify_dir(self.backend, &cert_dir) };
@@ -1074,7 +1082,7 @@ mod context_methods {
                     "load_dh_params() missing required path argument",
                 ));
             }
-            let path = path_string(path)?;
+            let path = fs_path(path)?;
             let data = std::fs::read(&path).map_err(|error| {
                 crate::PyError::os_error_with_errno(
                     error.raw_os_error().unwrap_or(libc::EIO),
@@ -2586,7 +2594,7 @@ mod cert_store {
 }
 
 fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let path = path_string(args[0])?;
+    let path = fs_path(args[0])?;
     let cert = native_result(pyre_native::ssl::certificate_decode_file(&path))?;
     Ok(decoded_certificate_dict(cert))
 }

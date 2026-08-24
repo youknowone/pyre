@@ -395,6 +395,14 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "builtins::builtin_kwargs_marker_dict",
         crate::builtins::builtin_kwargs_marker_dict as *const (),
     );
+    // `builtin_unexpected_keyword_failure` deliberately remains unpublished:
+    // its `&str` and `&Wtf8` arguments are two-word aggregates and its
+    // `Result<Vec<PyObjectRef>, PyError>` return is multiword, neither of
+    // which the one-word residual-call ABI carries.  `bind_builtin_kwargs` is
+    // `unroll_safe`, so the codewriter descends into it and reaches this
+    // `#[cold]` `#[dont_look_inside]` call as a residual; without an address
+    // it falls back to the symbolic hash instead of passing and returning the
+    // wrong number of words.
 
     // RPython annotator PBC parity for `BuiltinCode.func`: every generated
     // interp2app wrapper is a possible value of the indirect function-pointer
@@ -1979,6 +1987,25 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::lowlevel_string::jit_ll_shrink_array",
         "pyre_object::jit_ll_shrink_array",
         pyre_object::lowlevel_string::jit_ll_shrink_array as *const (),
+    );
+    // `dont_look_inside` residual append targets for the StringBuilder value:
+    // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
+    // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these
+    // are not retargeted by `jtransform`, so the graph target path is the bare
+    // leaf — the crate-root alias leaf must stay un-prefixed (strips to
+    // `["ll_append_res0"]`) to satisfy both the leaf-name gate and the
+    // `function_fnaddrs.contains_key` lookup; the real symbols carry `jit_`.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::rbuilder::ll_append_res0",
+        "pyre_object::ll_append_res0",
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res0 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::rbuilder::ll_append_res_slice",
+        "pyre_object::ll_append_res_slice",
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_append_res_slice as *const (),
     );
     push_alias_pair(
         &mut entries,

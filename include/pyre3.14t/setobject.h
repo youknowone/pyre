@@ -13,6 +13,11 @@ extern "C" {
 /* The set protocol (`cpyext/setobject.py`).  The `Check` spellings are
    functions here, as pyre's other type checks are. */
 
+typedef struct {
+    PyObject_HEAD
+    PyObject *_tmplist; /* a private place to put values during _PySet_Next */
+} PySetObject;
+
 #define PySet_GET_SIZE(ob) PySet_Size((PyObject *)(ob))
 
 #ifdef __cplusplus

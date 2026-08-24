@@ -9726,7 +9726,7 @@ impl CraneliftBackend {
                 // `counter_slot_for` reserves one slot past the value area, so
                 // a bridge that parks a GUARD_VALUE operand there needs the
                 // wider frame too.
-                let counter = usize::from(counter_slot_for(inputargs, ops).is_some());
+                let counter = usize::from(counter_slot.is_some());
                 (precompute_max_output_slots(inputargs, ops) + counter + reserved_tail) as i64
             } else {
                 (max_output_slots + reserved_tail) as i64

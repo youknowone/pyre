@@ -6218,7 +6218,9 @@ mod fail_descr_tests {
     /// `isinstance(key, ResumeAtPositionDescr)` where `key =
     /// resumedescr.get_resumestorage()` (pyjitpl.py:2917 / :2941), so a copied
     /// guard sharing a short-preamble donor answers yes even though the copied
-    /// descr is not itself a `ResumeAtPositionDescr`.
+    /// descr is not itself a `ResumeAtPositionDescr`.  One hop reaches the
+    /// donor for every copied descr; the sibling test below pins the
+    /// constructor assert that rules a copied-over-copied chain out.
     #[test]
     fn get_resumestorage_reports_a_copied_guards_resume_at_position_donor() {
         let donor = make_resume_at_position_descr_typed(vec![Type::Int]);
@@ -6239,6 +6241,22 @@ mod fail_descr_tests {
         let plain = make_resume_guard_descr_typed(vec![Type::Int]);
         assert_eq!(Arc::as_ptr(&get_resumestorage(&plain)), Arc::as_ptr(&plain));
         assert!(!get_resumestorage(&plain).is_resume_at_position());
+    }
+
+    /// `get_resumestorage` hops to `prev` exactly once because a chain of
+    /// copied descrs cannot exist: `compile.py
+    /// ResumeGuardCopiedDescr.__init__` asserts `isinstance(prev,
+    /// ResumeGuardDescr)`, and `ResumeGuardCopiedDescr` is a sibling of that
+    /// class rather than a subclass, so it can never be a donor.  The
+    /// constructor carries that assert, which is what makes the single hop in
+    /// `get_resumestorage` complete rather than a truncated walk.
+    #[test]
+    #[should_panic(expected = "assert isinstance(prev, ResumeGuardDescr)")]
+    fn a_copied_descr_is_refused_as_a_copied_descrs_donor() {
+        let donor = make_resume_at_position_descr_typed(vec![Type::Int]);
+        let copied = make_resume_guard_copied_descr(donor);
+        assert!(copied.is_resume_guard_copied() && !copied.is_resume_guard());
+        let _chained = make_resume_guard_copied_descr(copied);
     }
 
     /// `get_resumestorage()` chases to `prev`, `fail_arg_types`

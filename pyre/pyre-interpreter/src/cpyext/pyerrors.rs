@@ -60,6 +60,16 @@ pub fn has_pending_error() -> bool {
     !pending_raw().is_null()
 }
 
+/// `State.get_exception` — the pending exception instance, borrowed, without
+/// taking the indicator back.
+pub(super) fn pending_exception() -> Option<PyObjectRef> {
+    let raw = pending_raw();
+    match raw.is_null() {
+        true => None,
+        false => Some(unsafe { pyobject::from_ref(raw) }),
+    }
+}
+
 /// Record an interpreter-level failure and report it to C as `None`.
 ///
 /// Every C entry point that can fail funnels through this, which is what
@@ -81,6 +91,114 @@ pub(super) fn bad_argument<T>(function: &str) -> Option<T> {
         "bad argument type for built-in operation {function}()"
     )));
     None
+}
+
+// ── the StopIteration mirror ────────────────────────────────────────────
+
+/// C-visible `PyStopIterationObject`, the twin of the struct in
+/// `include/pyre3.14t/pyerrors.h`.
+///
+/// The fields are `pyerrors.py:24 PyStopIterationObjectFields`: the header and
+/// `value`, with none of the exception words a runtime that keeps its
+/// exceptions as C structs would have between them.  An extension reads the
+/// rest through `PyException_GetTraceback` and its neighbours, so there is
+/// nothing here for them to be read out of.
+#[repr(C)]
+pub struct CPyStopIterationObject {
+    pub ob_base: CPyObject,
+    pub value: *mut CPyObject,
+}
+
+/// The layout is written out twice — here and in the header — so each offset
+/// is pinned in both, and a field added to one without the other stops
+/// compiling rather than writing somewhere unclaimed.
+///
+/// `pyre/pyrex/tests/fixtures/cpyext_stopiteration.c` carries the C half.
+const _: () = {
+    assert!(std::mem::offset_of!(CPyStopIterationObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPyStopIterationObject, value) == 3 * size_of::<usize>());
+    assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
+};
+
+type BlockSet =
+    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+
+/// The mirrors [`attach`] filled, which is what says whose `value` is a
+/// reference to release.
+///
+/// A block cannot be classified back from its own header at release time: a
+/// class derived from `StopIteration` has a type mirror of its own, and asking
+/// the size instead is what turns an unrelated C type's storage into a
+/// reference to decrement.
+static ATTACHED: super::ForkMutex<BlockSet> =
+    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe { ATTACHED.reinit_after_fork() };
+}
+
+/// The builtin `StopIteration` class, or null before it is built.
+fn stopiteration_class() -> PyObjectRef {
+    crate::builtins::lookup_exc_class("StopIteration").unwrap_or(PY_NULL)
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries —
+/// `pyerrors.py:31-35 basestruct=PyStopIterationObject.TO` for `StopIteration`
+/// and the classes derived from it, and 0 for every other type, which asks for
+/// the plain header.
+///
+/// A class derived from it in C declares its own size, and the C rule that a
+/// subclass's storage begins with its base's is what puts `value` in the same
+/// place there.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    let class = stopiteration_class();
+    let derived = !w_type.is_null()
+        && !class.is_null()
+        && unsafe { crate::baseobjspace::issubtype_w(w_type, class) };
+    match derived {
+        true => size_of::<CPyStopIterationObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill a freshly allocated mirror of `w_obj` when `w_obj` is a
+/// `StopIteration` — `pyerrors.py:37-43 stopiteration_attach`.
+///
+/// The value is a snapshot: a later `e.value = x` reaches the attribute and
+/// not this word, which is the same bargain upstream states at the assignment.
+/// What reads it is `__Pyx_PyGen_FetchStopIterationValue`, immediately after
+/// the fetch that hands the exception over.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    let w_type = match crate::typedef::r#type(w_obj) {
+        Some(w_type) => w_type.as_ptr(),
+        None => return,
+    };
+    if basicsize(w_type) == 0 {
+        return;
+    }
+    // The size is asserted rather than tested: a block that belongs to a
+    // `StopIteration` and is too small for one means `basicsize` and the
+    // allocator have come apart, and the write below would land past its end.
+    assert!(
+        unsafe { (*(*raw).ob_type).tp_basicsize } >= size_of::<CPyStopIterationObject>() as isize,
+        "a StopIteration mirror was allocated at the plain PyObject size"
+    );
+    let value = pyobject::make_ref(unsafe { crate::baseobjspace::stopiteration_value(w_obj) });
+    unsafe { (*(raw as *mut CPyStopIterationObject)).value = value };
+    ATTACHED.lock().insert(raw as usize);
+}
+
+/// Release the reference a `StopIteration` mirror owns — `pyerrors.py:45-50
+/// stopiteration_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    if !ATTACHED.lock().remove(&(raw as usize)) {
+        return;
+    }
+    let py_stopiteration = raw as *mut CPyStopIterationObject;
+    unsafe {
+        pyobject::decref((*py_stopiteration).value);
+        (*py_stopiteration).value = std::ptr::null_mut();
+    }
 }
 
 // ── the exception type mirrors ──────────────────────────────────────────
@@ -850,6 +968,122 @@ fn write_unraisable(context: Option<String>, object: *mut CPyObject) {
     );
 }
 
+/// `pyerrors.py PyErr_PrintEx` — report the pending exception through
+/// `sys.excepthook` and clear the indicator.
+///
+/// A caller that calls this with nothing pending has nothing to report, and
+/// that is the caller's mistake rather than a silent no-op.
+///
+/// `set_sys_last_vars` also leaves the exception on `sys` under the four names
+/// a post-mortem debugger reads it back from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
+    let Some(mut error) = take_pending_error() else {
+        unsafe { PyErr_BadInternalCall() };
+        return;
+    };
+    let space = pyre_object::w_none();
+    let w_value = error
+        .normalize_exception(space)
+        .unwrap_or_else(|_| error.to_exc_object());
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let w_value = roots.pin_root(w_value);
+    let w_type = crate::baseobjspace::exception_getclass(w_value);
+    let _ = roots.pin_root(match w_type.is_null() {
+        true => pyre_object::w_none(),
+        false => w_type,
+    });
+    let w_tb = match !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+        true => unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) },
+        false => pyre_object::PY_NULL,
+    };
+    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+    let _ = roots.pin_root(match w_tb.is_null() {
+        true => pyre_object::w_none(),
+        false => w_tb,
+    });
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+
+    // `_PyErr_PrintEx`'s `else` arm: the caller asked to have the exception
+    // printed, so a hook that cannot be reached is said so and the exception is
+    // printed by the one `sys.__excepthook__` names.
+    let without_hook = || {
+        crate::PyError::write_report_line(b"sys.excepthook is missing\n");
+        let _ = crate::builtins::sys_excepthook(&[reload(1), reload(0), reload(2)]);
+    };
+    let Some(sys_module) = crate::importing::get_sys_module("sys") else {
+        without_hook();
+        return;
+    };
+    let sys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(sys_module);
+    if set_sys_last_vars != 0 {
+        // `last_exc` names the exception itself; the three beside it are the
+        // triple that predates it.  A store that fails leaves that one name
+        // alone -- the exception being reported is the one worth keeping.
+        for (name, index) in [
+            ("last_exc", 0),
+            ("last_type", 1),
+            ("last_value", 0),
+            ("last_traceback", 2),
+        ] {
+            let stored = crate::baseobjspace::setattr_str(
+                pyre_object::gc_roots::shadow_stack_get(sys_slot),
+                name,
+                reload(index),
+            );
+            drop(stored);
+        }
+    }
+    // `_PySys_GetOptionalAttr(&_Py_ID(excepthook), &hook)`: a miss arrives as
+    // an `AttributeError` and is a hook that is not there, while any other
+    // failure is reported before the fallback runs.  `None` is a hook that is
+    // there, and calling it is what reports it.
+    let w_hook = match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "excepthook",
+    ) {
+        Ok(w_hook) => w_hook,
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => pyre_object::PY_NULL,
+        Err(mut failure) => {
+            failure.write_unraisable(
+                space,
+                rustpython_wtf8::Wtf8::new("Exception ignored when trying to fetch sys.excepthook"),
+                pyre_object::PY_NULL,
+            );
+            pyre_object::PY_NULL
+        }
+    };
+    if w_hook.is_null() {
+        without_hook();
+        return;
+    }
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_hook);
+    let arguments = [reload(1), reload(0), reload(2)];
+    let reported = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        &arguments,
+    );
+    if let Err(mut failure) = reported {
+        // The hook is what failed, and this entry point has no way to say so
+        // to its caller: reporting it as unraisable both names it and leaves
+        // the indicator clear, which is what the next C call needs.
+        failure.write_unraisable(
+            space,
+            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
+            pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        );
+    }
+}
+
+/// `pyerrors.py PyErr_Print` — `PyErr_PrintEx(1)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_Print() {
+    unsafe { PyErr_PrintEx(1) };
+}
+
 /// `PyErr_WriteUnraisable(object)` — report the pending exception through
 /// `sys.unraisablehook` and clear it, naming `object` as what was being
 /// operated on.
@@ -919,6 +1153,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_ExceptionMatches as *const ());
     std::hint::black_box(PyErr_GivenExceptionMatches as *const ());
     std::hint::black_box(PyErr_Fetch as *const ());
+    std::hint::black_box(PyErr_PrintEx as *const ());
+    std::hint::black_box(PyErr_Print as *const ());
     // ── the failed syscall ──────────────────────────────────────────────────
 
     /// `PyErr_CheckSignals` — run whatever a signal handler left pending.

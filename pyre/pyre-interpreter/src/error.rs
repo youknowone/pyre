@@ -1969,6 +1969,14 @@ impl PyError {
         Self::write_unraisable_default(space, w_type, w_value, w_tb, &first_line, w_object, "");
     }
 
+    /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
+    /// is one and on the host's stream when there is not.
+    pub(crate) fn write_report_line(buf: &[u8]) {
+        if !Self::write_unraisable_to_sys_stderr(buf) {
+            emit_report_to_host_stderr(buf);
+        }
+    }
+
     fn write_unraisable_to_sys_stderr(buf: &[u8]) -> bool {
         let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
             return false;
@@ -2005,10 +2013,13 @@ impl PyError {
     ) {
         let _ = (space, w_type);
         let mut first_line = if first_line.is_empty() {
-            Wtf8Buf::from_string("Exception ignored in:".to_string())
+            Wtf8Buf::from_string("Exception ignored in".to_string())
         } else {
             first_line.to_wtf8_buf()
         };
+        // `errors.c write_unraisable_exc_file` ends the stated message here,
+        // whether or not an object follows it.
+        first_line.push_str(":");
         if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
             let objrepr = unsafe { crate::display::py_repr_wtf8(w_object) }
                 .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
@@ -3950,7 +3961,7 @@ fn format_obj_as_utf8(obj: PyObjectRef, format: char) -> Wtf8Buf {
         Err(mut error) => {
             error.write_unraisable(
                 pyre_object::w_none(),
-                rustpython_wtf8::Wtf8::new("exception formatting: "),
+                rustpython_wtf8::Wtf8::new("exception formatting"),
                 obj(),
             );
             Wtf8Buf::from_string(fallback.to_string())

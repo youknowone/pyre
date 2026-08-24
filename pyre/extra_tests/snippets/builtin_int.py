@@ -394,6 +394,11 @@ class SubInt(int):
 subint = int.__new__(SubInt, 11)
 assert subint.real is not subint
 assert type(subint.real) is int
+# `_self_unaryop` → `self.int(space)`
+assert type(subint.__ceil__()) is int
+assert subint.__ceil__() == 11
+assert type(subint.__floor__()) is int
+assert subint.__floor__() == 11
 
 
 # sys.set_int_max_str_digits enforced on int → str conversions (PEP 644).

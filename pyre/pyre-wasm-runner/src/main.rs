@@ -959,6 +959,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "guard_resume_bridge_no_handoff",
                 "abort_ceiling_banned",
                 "abort_ceiling_refused",
+                "bridge_abort_permanent",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

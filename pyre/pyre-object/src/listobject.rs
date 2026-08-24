@@ -530,6 +530,10 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(item) {
         return true;
     }
+    // listobject.py `is_plain_int1`: `type(w_obj) is W_IntObject or
+    // (type(w_obj) is W_LongObject and w_obj._fits_int())`. Layout identity
+    // first (`is_int` is W_IntObject, `is_long` is W_LongObject); they do
+    // not overlap. A non-fitting bigint stays off IntegerListStrategy.
     if is_int(item) && !is_bool(item) {
         // type(w_obj) is W_IntObject — reject int subclasses.
         // Subclass instances share ob_type == &INT_TYPE but have w_class
@@ -545,8 +549,6 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
         return true;
     }
     if is_long(item) {
-        // `type(w_obj) is W_LongObject` — reject app-level int
-        // subclasses that reuse the W_LongObject payload layout.
         let int_typeobj = get_instantiate(&INT_TYPE);
         let w_class = (*item).w_class;
         if int_typeobj.is_null() {
@@ -3037,6 +3039,28 @@ mod tests {
             assert_eq!(crate::intobject::w_int_get_value(item), 10);
             let item = w_list_getitem(list, 2).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(item), 30);
+        }
+    }
+
+    #[test]
+    fn is_plain_int1_rejects_a_bigint_that_does_not_fit_i64() {
+        // listobject.py is_plain_int1 / IntegerListStrategy.is_correct_type:
+        // a W_LongObject is only a plain int when `_fits_int()` holds.
+        // 2**70 must stay on the object-strategy / Generic sort path.
+        let big = crate::longobject::w_long_new(
+            majit_rlib::rbigint::RBigInt::fromint(i64::MAX)
+                + majit_rlib::rbigint::RBigInt::fromint(1),
+        );
+        let bigger = crate::longobject::w_long_new(majit_rlib::rbigint::RBigInt::fromint(1) << 70);
+        unsafe {
+            assert!(crate::pyobject::is_long(big));
+            assert!(!is_plain_int1(big));
+            assert!(crate::pyobject::is_long(bigger));
+            assert!(!is_plain_int1(bigger));
+            assert!(!w_list_uses_int_storage(w_list_new(vec![
+                bigger,
+                w_int_new(5)
+            ])));
         }
     }
 

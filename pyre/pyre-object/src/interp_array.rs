@@ -277,27 +277,35 @@ pub unsafe fn w_array_unpack_item(obj: PyObjectRef, index: usize) -> PyObjectRef
 }
 
 /// Box a single element from `buf` (exactly `itemsize` native-order bytes).
+///
+/// Null for a typecode this does not decode, and for a `buf` that is not the
+/// width the typecode reads: a memoryview over a format naming more than one
+/// member reaches here with the item's whole width, which no arm can read.
 pub fn unpack_value(typecode: u8, buf: &[u8]) -> PyObjectRef {
-    match typecode {
-        b'b' => crate::intobject::w_int_new(buf[0] as i8 as i64),
-        b'B' => crate::intobject::w_int_new(buf[0] as i64),
-        b'h' => crate::intobject::w_int_new(i16::from_ne_bytes([buf[0], buf[1]]) as i64),
-        b'H' => crate::intobject::w_int_new(u16::from_ne_bytes([buf[0], buf[1]]) as i64),
-        b'i' => crate::intobject::w_int_new(i32::from_ne_bytes(buf.try_into().unwrap()) as i64),
-        b'I' => crate::intobject::w_int_new(u32::from_ne_bytes(buf.try_into().unwrap()) as i64),
-        b'l' | b'q' => crate::intobject::w_int_new(i64::from_ne_bytes(buf.try_into().unwrap())),
+    unpack_exact(typecode, buf).unwrap_or(PY_NULL)
+}
+
+fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
+    Some(match typecode {
+        b'b' => crate::intobject::w_int_new(i8::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'B' => crate::intobject::w_int_new(u8::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'h' => crate::intobject::w_int_new(i16::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'H' => crate::intobject::w_int_new(u16::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'i' => crate::intobject::w_int_new(i32::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'I' => crate::intobject::w_int_new(u32::from_ne_bytes(buf.try_into().ok()?) as i64),
+        b'l' | b'q' => crate::intobject::w_int_new(i64::from_ne_bytes(buf.try_into().ok()?)),
         b'L' | b'Q' => {
-            let v = u64::from_ne_bytes(buf.try_into().unwrap());
+            let v = u64::from_ne_bytes(buf.try_into().ok()?);
             if v <= i64::MAX as u64 {
                 crate::intobject::w_int_new(v as i64)
             } else {
                 crate::longobject::w_long_new(BigInt::from(v))
             }
         }
-        b'f' => crate::floatobject::w_float_new(f32::from_ne_bytes(buf.try_into().unwrap()) as f64),
-        b'd' => crate::floatobject::w_float_new(f64::from_ne_bytes(buf.try_into().unwrap())),
+        b'f' => crate::floatobject::w_float_new(f32::from_ne_bytes(buf.try_into().ok()?) as f64),
+        b'd' => crate::floatobject::w_float_new(f64::from_ne_bytes(buf.try_into().ok()?)),
         b'u' | b'w' => {
-            let cp = u32::from_ne_bytes(buf.try_into().unwrap());
+            let cp = u32::from_ne_bytes(buf.try_into().ok()?);
             match char::from_u32(cp) {
                 Some(c) => crate::unicodeobject::w_str_new(&c.to_string()),
                 None => {
@@ -311,8 +319,8 @@ pub fn unpack_value(typecode: u8, buf: &[u8]) -> PyObjectRef {
                 }
             }
         }
-        _ => PY_NULL,
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

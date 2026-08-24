@@ -172,6 +172,30 @@ static PyObject *thread_lock(PyObject *self, PyObject *Py_UNUSED(ignored))
     return Py_BuildValue("(iiiii)", first, again, after, (int)timed, (int)waited);
 }
 
+/* The blocking wait an extension reaches from inside `Py_BEGIN_ALLOW_THREADS`.
+
+   `ffi_obj.c ffi_init_once` is written exactly this way: the thread leaves the
+   interpreter, waits for a lock, and comes back.  Both halves say the thread is
+   about to block, and the second says it about a thread that already is. */
+static PyObject *lock_while_threads_allowed(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    (void)self;
+    PyThread_type_lock lock = PyThread_allocate_lock();
+    if (lock == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "no lock");
+        return NULL;
+    }
+    int taken;
+    PyLockStatus waited;
+    Py_BEGIN_ALLOW_THREADS
+    taken = PyThread_acquire_lock(lock, WAIT_LOCK);
+    waited = PyThread_acquire_lock_timed(lock, 1000, 0);
+    PyThread_release_lock(lock);
+    Py_END_ALLOW_THREADS
+    PyThread_free_lock(lock);
+    return Py_BuildValue("(ii)", taken, (int)waited);
+}
+
 static PyObject *thread_ident(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
     (void)self;
@@ -223,6 +247,8 @@ static PyMethodDef methods[] = {
     {"mutex_states", mutex_states, METH_NOARGS, NULL},
     {"mutex_local", mutex_local, METH_NOARGS, NULL},
     {"thread_lock", thread_lock, METH_NOARGS, NULL},
+    {"lock_while_threads_allowed", lock_while_threads_allowed, METH_NOARGS,
+     NULL},
     {"thread_ident", thread_ident, METH_NOARGS, NULL},
     {"chain", chain, METH_VARARGS, NULL},
     {"bad_internal_call", bad_internal_call, METH_NOARGS, NULL},

@@ -1863,12 +1863,15 @@ pub fn translate_op(
                     // `newstringbuilder` arms already consume, mirroring the
                     // `Vec::push` / `slice.reverse` method arms below.
                     //
-                    // `__pyre_stringbuilder_new` → `newstringbuilder` (no
-                    // operands; a `with_capacity` size arg is dropped, like
-                    // `is_vec_ctor_segments`).  `rtype_newstringbuilder` picks
-                    // the initial buffer size.
+                    // `__pyre_stringbuilder_new` → `newstringbuilder`, forwarding
+                    // the ctor operands verbatim: `new()` carries none and
+                    // `with_capacity(n)` carries the size `n`.  The operand count
+                    // mirrors `len(hop.args_v)` in
+                    // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py),
+                    // which `rtype_newstringbuilder` honours — no arg selects
+                    // `ll_new(INIT_SIZE)`, the size arg threads `ll_new(n)`.
                     if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_new" {
-                        return Ok(vec![FlowspaceOp::new("newstringbuilder", vec![], result)]);
+                        return Ok(vec![FlowspaceOp::new("newstringbuilder", arg_hls, result)]);
                     }
                     // `__pyre_stringbuilder_append(recv, piece)` →
                     // `getattr(recv, "append") + simple_call(bound, piece)`,
@@ -5371,9 +5374,10 @@ mod tests {
 
     #[test]
     fn translate_op_stringbuilder_new_marker_lowers_to_newstringbuilder() {
-        // `__pyre_stringbuilder_new` (front builder-mode ctor rewrite) →
-        // one `newstringbuilder` op with no operands; the annotator types
-        // its result `SomeStringBuilder`.
+        // Bare `new()` `__pyre_stringbuilder_new` (front builder-mode ctor
+        // rewrite) → one `newstringbuilder` op with no operands; the annotator
+        // types its result `SomeStringBuilder` and `rtype_newstringbuilder`
+        // picks `ll_new(INIT_SIZE)` (`len(hop.args_v) == 0`).
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11);
@@ -5394,6 +5398,38 @@ mod tests {
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "newstringbuilder");
         assert!(translated[0].args.is_empty());
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_stringbuilder_new_marker_forwards_with_capacity_size() {
+        // `with_capacity(n)` `__pyre_stringbuilder_new` → `newstringbuilder`
+        // carrying the size operand `n`.  `rtype_newstringbuilder` then takes
+        // the `len(hop.args_v) != 0` branch and threads `ll_new(n)`
+        // (rtyper/rbuilder.py) instead of the `INIT_SIZE` default.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let size = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[2].clone(), size.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_new".into()],
+                },
+                args: vec![vars[2].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__pyre_stringbuilder_new marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newstringbuilder");
+        assert_eq!(translated[0].args.len(), 1);
+        assert_eq!(translated[0].args[0], size);
         assert_eq!(translated[0].result, result_var);
     }
 

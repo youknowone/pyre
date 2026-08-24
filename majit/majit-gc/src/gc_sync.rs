@@ -334,7 +334,7 @@ pub fn unregister_thread() {
 /// makes the mutator RUNNING again.
 #[must_use = "the GIL is only released for as long as the guard is alive"]
 pub struct BlockingGuard {
-    registered: bool,
+    left_census: bool,
     held_gil: bool,
     /// The guard hands the GIL back to the thread that released it, and
     /// rejoins *that* thread's census entry, so it must not cross threads.
@@ -362,7 +362,7 @@ impl Drop for BlockingGuard {
         if self.held_gil {
             crate::rgil::acquire();
         }
-        if !self.registered {
+        if !self.left_census {
             return;
         }
         let mut state = GC_SYNC.quiesce.lock().unwrap();
@@ -387,13 +387,16 @@ pub fn before_external_block() -> BlockingGuard {
     if held_gil {
         crate::rgil::release();
     }
-    let registered = GC_THREAD.with(|t| t.registered.get());
-    if registered {
+    // A thread already outside the census stays outside, as
+    // [`enter_external_callback`] already reads its own half: an extension may
+    // reach a blocking entry point from inside `Py_BEGIN_ALLOW_THREADS`, which
+    // has left the census already -- `ffi_obj.c ffi_init_once` brackets
+    // `PyThread_acquire_lock` that way.  The inner block then has nothing to
+    // leave, and nothing to rejoin when it ends.
+    let left_census = GC_THREAD.with(|t| t.registered.get() && t.running.get());
+    if left_census {
         let mut state = GC_SYNC.quiesce.lock().unwrap();
-        assert!(
-            GC_THREAD.with(|t| t.running.replace(false)),
-            "GC mutator entered an external block twice"
-        );
+        GC_THREAD.with(|t| t.running.set(false));
         state.running = state
             .running
             .checked_sub(1)
@@ -401,7 +404,7 @@ pub fn before_external_block() -> BlockingGuard {
         GC_SYNC.quiesced.notify_all();
     }
     BlockingGuard {
-        registered,
+        left_census,
         held_gil,
         _not_send: std::marker::PhantomData,
     }

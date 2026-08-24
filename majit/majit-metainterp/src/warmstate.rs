@@ -347,6 +347,15 @@ impl BaseJitCell {
         self.loop_token.is_some()
     }
 
+    /// Whether pyre's abort ceiling has latched this cell.
+    ///
+    /// Named so the two `abort_tracing` arms read as one decision; see
+    /// `MAX_TRACE_ABORT_COUNT` for why that decision also answers
+    /// [`WarmEnterState::can_inline_callable`].
+    fn abort_ceiling_latched(&self) -> bool {
+        self.abort_count >= MAX_TRACE_ABORT_COUNT
+    }
+
     /// Whether this cell should be removed (for GC of dead cells).
     /// Mirrors BaseBaseJitCell.should_remove_jitcell.
     pub fn should_remove_jitcell(&self) -> bool {
@@ -437,7 +446,65 @@ fn default_enable_opts() -> Vec<String> {
 /// removing it buys no compiled loop on any of them while multiplying
 /// `loops_aborted` by 4-6x (see [`WarmEnterState::maybe_compile_decision`] for
 /// why the upstream cell lifecycle that would retire these cells first cannot
-/// be ported as written).  `mc_diag` slots 79/80 measure it.
+/// be ported as written).  `mc_diag` slots 80/81 measure it.
+///
+/// THE FLAG IT SETS IS ALSO THE INLINE GATE, AND THAT IS DELIBERATE.
+/// `JC_DONT_TRACE_HERE` is what [`WarmEnterState::can_inline_callable`] reads
+/// (`warmstate.py`), so a location the ceiling retires also stops being inlined
+/// into other traces.  Upstream writes that flag from two places only —
+/// `disable_noninlinable_function` (`warmstate.py`, reached from the
+/// `ABORT_TOO_LONG` arm of `blackhole_if_trace_too_long`, `pyjitpl.py`) and
+/// `dont_trace_here` (`warmstate.py`, `max_unroll_recursion`) — and there it
+/// does not even mean "never trace here": `maybe_compile_and_run`
+/// (`warmstate.py`) traces a flagged, tokenless cell immediately, and
+/// `prepare_trace_segmenting` (`pyjitpl.py`) sets it with the comment
+/// "bizarrely enough, this means *do trace here* ??!".  So the coupling is a
+/// pyre-local extension, not a port, and it reads like an accident.
+///
+/// It is not.  The ceiling's premise is that a pyre walker abort is STRUCTURAL
+/// and recurs identically, and that premise applies to the callee position too:
+/// inlining a body whose own walk gave up five times walks the caller into the
+/// same give-up.  Splitting the two — latching the ceiling on `abort_count`
+/// alone and leaving `JC_DONT_TRACE_HERE` to its two upstream writers — was
+/// built and measured over the whole synth corpus on 2026-08-24.  It improved
+/// NOTHING (every other row byte-identical on dynasm, cranelift and wasm) and
+/// cost `synth/generator_tree_recursion`: `bridges_compiled` 26 -> 60,
+/// `guard_failures` 2999 -> 25297, `loops_aborted` 0 -> 3, and the pypy ratio
+/// from under its 7.6x gate to 26.0x (dynasm) / 28.6x (cranelift).  A guard
+/// census of that run puts 24_819 of the 25_297 failures on ONE green key
+/// across nine fail indices, so the sixty bridges built there do not converge —
+/// the ban is holding a bridge non-convergence shut.  Reopening it means fixing
+/// that first; the two numbers above are the acceptance test.
+///
+/// A SECOND, INDEPENDENT ROUTE reached the same wall, which is what pins the
+/// diagnosis.  `abort_trace_live` (`pyjitpl.rs`) charges `abort_tracing` to the
+/// trace's green key, and a bridge session's green key is the source loop's,
+/// so guard-side walks that gave up were driving already-compiled loops into
+/// this ceiling — `synth/generator_frame_handout_image` reaches it with 14
+/// such charges and `loops_aborted=0`, i.e. no primary trace aborted there at
+/// all.  Not charging them is the upstream answer: `aborted_tracing` reads
+/// `greenkey = None # we're in the bridge` and touches no JitCell, and a
+/// bridge never passes through `bound_reached`, which is the only place
+/// upstream touches a cell for a trace.  Doing it removed one of
+/// `generator_tree_recursion`'s two bans and reproduced the paragraph above to
+/// the digit — `bridges_compiled` 26 -> 60, `guard_failures` 2999 -> 25297,
+/// `loops_aborted` 0 -> 3, ratio 41.7x/32.4x — with every other row of the
+/// corpus unchanged on all three backends.
+///
+/// What is known about that unbanned loop, from `MAJIT_GUARDLOG=1` over the bad
+/// regime.  Bridges are NOT decorative there: `MAJIT_NO_BRIDGE=1` on the same
+/// binary reads 239874 guard failures against 25297 with bridges on, so the
+/// tally counts failures a bridge serves as well as deopts, and the 25297 is
+/// 8.4x the banned regime's 2999 at the SAME `loops_compiled=3`.  Every
+/// `(trace_id, fail_index)` coordinate is offered a bridge exactly once in the
+/// whole run — 103 offers, 60 bridges — and `must_compile` answers no to all
+/// 21802 later failures at those coordinates, one of which (`trace` 7,
+/// `fail` 2) accounts for 7777 by itself.  Whether those 43 offers that
+/// produced no bridge should have been retried the way `must_compile` retries
+/// upstream (`jitcounter.tick` resets the counter when a bridge does not
+/// compile, `compile.py done_compiling`) is the open question; reading it
+/// needed `trace_id` next to `fail_index`, since an index is allocated per
+/// trace and a bridge re-uses the numbers of the loop it hangs off.
 const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
@@ -1107,7 +1174,7 @@ impl WarmEnterState {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
             let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
-            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            let ceiling_reached = cell.abort_ceiling_latched();
             if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
             }
@@ -1233,9 +1300,11 @@ impl WarmEnterState {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
             // The last disjunct is pyre's abort ceiling: too many failed
-            // attempts permanently disable tracing here.
+            // attempts permanently disable tracing here — and, through the same
+            // flag, inlining from elsewhere.  `MAX_TRACE_ABORT_COUNT` carries
+            // the measurement that keeps the two together.
             let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
-            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            let ceiling_reached = cell.abort_ceiling_latched();
             if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
             }
@@ -4317,6 +4386,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The abort ceiling and the inline gate share `JC_DONT_TRACE_HERE`, so a
+    /// location the ceiling retires also stops being inlined into other
+    /// traces.  That coupling has no upstream analogue — upstream writes the
+    /// flag from `disable_noninlinable_function` and `dont_trace_here` only —
+    /// and it was measured on 2026-08-24: splitting the two improved no row of
+    /// the synth corpus and cost `synth/generator_tree_recursion`
+    /// `bridges_compiled` 26 -> 60 and `guard_failures` 2999 -> 25297.  This
+    /// test is the pin; see `MAX_TRACE_ABORT_COUNT` for the full record.
+    #[test]
+    fn the_abort_ceiling_also_closes_the_inline_gate() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xCE111;
+
+        assert!(ws.can_inline_callable(key), "a fresh key is inlinable");
+
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            let mut started = false;
+            for _ in 0..64 {
+                match ws.maybe_compile(key) {
+                    HotResult::StartTracing => {
+                        started = true;
+                        break;
+                    }
+                    HotResult::NotHot => {}
+                    _ => panic!("the door answered for a live token"),
+                }
+            }
+            assert!(started, "the location never became hot");
+            // `false`: no `disable_noninlinable_function`, so the ceiling is
+            // the only thing that can stamp the flag.
+            ws.abort_tracing(key, false);
+        }
+
+        let cell = ws.get_cell(key).unwrap();
+        assert!(
+            cell.abort_ceiling_latched(),
+            "the ceiling did not latch after {MAX_TRACE_ABORT_COUNT} aborts",
+        );
+        assert!(
+            !ws.can_inline_callable(key),
+            "a ceiling-latched location is still inlinable as a callee",
+        );
     }
 
     #[test]

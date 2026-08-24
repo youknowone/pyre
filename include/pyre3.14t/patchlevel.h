@@ -47,9 +47,19 @@ PyAPI_DATA(const unsigned long) Py_Version;
    branches on it, and so does much of the ecosystem -- and the value tracks
    PyPy's own so that a version gate written for PyPy lands on the same side
    for pyre.  Code that wants to know which of the two it has reads
-   `PYRE_VERSION` above. */
+   `PYRE_VERSION` above.
+
+   A module cffi generated is the exception, and `_CFFI_` is how it says so:
+   `_cffi_include.h` defines it on its first line, before it includes this
+   header.  Such a module has two forms -- one built out of `_cffi_exports` and
+   `PyInit_`, one exporting `_cffi_pypyinit_` and handing its type context to a
+   built-in backend -- and it picks between them on `PYPY_VERSION`.  The backend
+   here is cffi's own `_cffi_backend` extension, which is the first form's, so
+   that is the form a cffi module compiles to. */
+#ifndef _CFFI_
 #define PYPY_VERSION "8.0.0-alpha0"
 #define PYPY_VERSION_NUM 0x08000000
+#endif
 
 /* A reference cpyext holds is a regular one: it keeps the interpreter object
    alive for as long as the block does. */

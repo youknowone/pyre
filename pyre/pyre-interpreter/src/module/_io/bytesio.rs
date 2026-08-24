@@ -455,6 +455,17 @@ impl W_BytesIO {
         Ok(true)
     }
 
+    // `W_BytesIO.typedef` has no `flush`; `W_IOBase.flush_w` uses `_CLOSED()`
+    // (`__IOBase_closed`), so a closed BytesIO still flushes. `BytesIO_flush`
+    // lives on the BytesIO type and raises `ValueError` once `.closed` is true
+    // (measured on 3.14.6; extra_tests `stdlib_io_bytesio.py` asserts both the
+    // type-dict key and the closed raise). `_immutable_` on BytesIOBuffer /
+    // BytesIOView does not govern this.
+    fn flush(&self) -> Result<(), crate::PyError> {
+        self.check_closed()?;
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<(), crate::PyError> {
         // Any replacement of the exported bytearray would invalidate the
         // view, so it takes the same resize lock as write/truncate/__init__.

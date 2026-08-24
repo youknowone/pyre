@@ -12,9 +12,25 @@ extern "C" {
 #endif
 /* tuple. */
 
-#define PyTuple_GET_SIZE(ob) PyTuple_Size((PyObject *)(ob))
-#define PyTuple_GET_ITEM(ob, i) PyTuple_GetItem((PyObject *)(ob), (i))
-#define PyTuple_SET_ITEM(ob, i, v) ((void)PyTuple_SetItem((PyObject *)(ob), (i), (v)))
+/* A `tuple` mirror hands out an array of its items, which is the `ob_item`
+   field `tupleobject.py` gives its own mirror: an extension reads a slot
+   without a call, and takes the address of one -- cffi writes
+   `(CTypeDescrObject **)&PyTuple_GET_ITEM(fargs, 0)`.  Dereferencing what
+   `_PyTuple_ITEMS` answers with is that lvalue.
+
+   The struct is spelled out because an extension names the type, and its
+   `ob_item` is declared the way the reference header declares it: one element
+   standing for however many `ob_size` says.  Nothing here reads it through the
+   struct -- the array lives beside the block rather than at the end of it, so
+   `_PyTuple_ITEMS` is what finds it. */
+typedef struct {
+    PyObject_VAR_HEAD
+    PyObject *ob_item[1];
+} PyTupleObject;
+
+#define PyTuple_GET_SIZE(ob) Py_SIZE(ob)
+#define PyTuple_GET_ITEM(ob, i) (_PyTuple_ITEMS((PyObject *)(ob))[i])
+#define PyTuple_SET_ITEM(ob, i, v) _PyTuple_SET_ITEM((PyObject *)(ob), (i), (v))
 
 /* Variadic, so it is built here out of the non-variadic exports. */
 static inline PyObject *PyTuple_Pack(Py_ssize_t n, ...)

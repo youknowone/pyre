@@ -1,5 +1,6 @@
 /* The `PyTypeObject` statics an extension names by address: what each one is
-   bound to, and the three things C does with the address. */
+   bound to, the three things C does with the address, and the two size fields
+   a block is read through. */
 
 #include <Python.h>
 
@@ -159,6 +160,31 @@ static PyObject *type_flags(PyObject *self, PyObject *unused)
         PyType_HasFeature(&PyDict_Type, Py_TPFLAGS_BASETYPE) ? 1 : 0);
 }
 
+/* What a class reports an instance of it is sized as, beside what this
+   extension was compiled believing a type is sized as.  An importer refuses a
+   class whose `tp_basicsize` is under the struct it declared, so a metaclass
+   has to answer for the whole heap-type block. */
+static PyObject *heap_type_sizes(PyObject *self, PyObject *object)
+{
+    (void)self;
+    if (!PyType_Check(object)) {
+        PyErr_SetString(PyExc_TypeError, "a type was expected");
+        return NULL;
+    }
+    return Py_BuildValue("(nn)", ((PyTypeObject *)object)->tp_basicsize,
+                         (Py_ssize_t)sizeof(PyHeapTypeObject));
+}
+
+/* The length word a block carries beside the two numbers its class reports.
+   `Py_SIZE` is a field read, so a class whose instances are counted has to
+   have made room for it and filled it. */
+static PyObject *block_size(PyObject *self, PyObject *object)
+{
+    (void)self;
+    return Py_BuildValue("(nnn)", Py_SIZE(object), Py_TYPE(object)->tp_basicsize,
+                         Py_TYPE(object)->tp_itemsize);
+}
+
 /* ── the address as a converter argument ──────────────────────────────── */
 
 /* `O!`, which takes the static's address and names the type of whatever it
@@ -228,6 +254,8 @@ static PyMethodDef methods[] = {
     {"type_is", type_is, METH_O, NULL},
     {"list_checks", list_checks, METH_O, NULL},
     {"type_flags", type_flags, METH_NOARGS, NULL},
+    {"heap_type_sizes", heap_type_sizes, METH_O, NULL},
+    {"block_size", block_size, METH_O, NULL},
     {"parse_typed", parse_typed, METH_VARARGS, NULL},
     {"derive_from_dict", derive_from_dict, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};

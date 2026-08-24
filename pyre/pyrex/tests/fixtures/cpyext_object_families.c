@@ -1,4 +1,5 @@
-/* `bytearray`, `complex` and `weakref` through their concrete C API.
+/* `bytearray`, `complex`, `memoryview`, `weakref` and `struct.Struct` through
+   their concrete C API.
 
    Each function answers the observable outcome, so a Python-side comparison
    against CPython running the same code says whether the two agree. */
@@ -127,6 +128,56 @@ static PyObject *cx_as_ccomplex(PyObject *s, PyObject *o)
     return Py_BuildValue("(dd)", value.real, value.imag);
 }
 
+/* The pair a `complex` block carries, read straight out of the block rather
+   than through an accessor: the block only has room for it if `tp_basicsize`
+   says so. */
+static PyObject *cx_block(PyObject *s, PyObject *o)
+{
+    (void)s;
+    if (!PyComplex_Check(o)) return failed("not-a-complex");
+    if (Py_TYPE(o)->tp_basicsize < (Py_ssize_t)sizeof(PyComplexObject)) {
+        return failed("block-too-small");
+    }
+    Py_complex value = ((PyComplexObject *)o)->cval;
+    return Py_BuildValue("(dd)", value.real, value.imag);
+}
+
+/* What `complex` reports an instance is sized as, beside what this extension
+   was compiled believing. */
+static PyObject *cx_basicsize(PyObject *s, PyObject *unused)
+{
+    (void)s;
+    (void)unused;
+    return Py_BuildValue("(nn)", PyComplex_Type.tp_basicsize,
+                         (Py_ssize_t)sizeof(PyComplexObject));
+}
+
+/* ── memoryview ───────────────────────────────────────────────────────── */
+
+/* `mode` is 'r' or 'w' for the two buffer types, and anything else is passed
+   through so that the refusal can be observed; `order` goes through
+   untouched for the same reason. */
+static PyObject *mv_contiguous(PyObject *s, PyObject *args)
+{
+    (void)s;
+    PyObject *object;
+    const char *mode;
+    const char *order;
+    if (!PyArg_ParseTuple(args, "Oss", &object, &mode, &order)) return NULL;
+    int buffertype = mode[0] == 'r' ? PyBUF_READ : mode[0] == 'w' ? PyBUF_WRITE : 0;
+    PyObject *view = PyMemoryView_GetContiguous(object, buffertype, order[0]);
+    if (view == NULL) {
+        PyObject *raised = PyErr_GetRaisedException();
+        PyObject *text = raised == NULL ? NULL : PyObject_Str(raised);
+        PyObject *pair = Py_BuildValue("(sO)", raised == NULL ? "?" : Py_TYPE(raised)->tp_name,
+                                       text == NULL ? Py_None : text);
+        Py_XDECREF(text);
+        Py_XDECREF(raised);
+        return pair;
+    }
+    return view;
+}
+
 /* ── weakref ──────────────────────────────────────────────────────────── */
 static PyObject *wr_check(PyObject *s, PyObject *o)
 { (void)s; return PyBool_FromLong(PyWeakref_Check(o)); }
@@ -179,7 +230,82 @@ static PyObject *wr_is_dead(PyObject *s, PyObject *o)
     return PyBool_FromLong(dead);
 }
 
+/* `_cffi_backend.c ctypedescr_dealloc` breaks the weak references to a dying
+   object from the object's own deallocator, which `weakrefobject.c
+   PyObject_ClearWeakRefs` states is the only place it may be called from: it
+   rejects a receiver whose count has not fallen to zero.  What matters here is
+   what the call leaves behind, because the next entry point inherits it. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *weaklist;
+} ClearedObject;
+
+static long wr_cleared;
+
+static void cleared_dealloc(PyObject *self)
+{
+    PyObject_ClearWeakRefs(self);
+    wr_cleared += 1;
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyTypeObject ClearedType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "cpyext_object_families.Cleared",
+    .tp_basicsize = sizeof(ClearedObject),
+    .tp_weaklistoffset = offsetof(ClearedObject, weaklist),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_new = PyType_GenericNew,
+    .tp_dealloc = cleared_dealloc,
+};
+
+static PyObject *wr_cleared_count(PyObject *s, PyObject *unused)
+{ (void)s; (void)unused; return PyLong_FromLong(wr_cleared); }
+
 #define M(name, fn) {name, fn, METH_O, NULL}
+/* A one-dimensional view whose format names two members per item.  Such a
+   view usually comes from `_testbuffer`'s `ndarray`; this is the same shape
+   built by hand, so the fixture needs no second extension. */
+static unsigned int compound_storage[4] = {1, 2, 3, 4};
+static Py_ssize_t compound_shape[1] = {2};
+static Py_ssize_t compound_strides[1] = {2 * sizeof(unsigned int)};
+
+static PyObject *mv_compound_format(PyObject *self, PyObject *unused)
+{
+    Py_buffer view;
+    (void)self;
+    (void)unused;
+    memset(&view, 0, sizeof(view));
+    view.buf = compound_storage;
+    view.len = (Py_ssize_t)sizeof(compound_storage);
+    view.itemsize = 2 * (Py_ssize_t)sizeof(unsigned int);
+    view.format = "II";
+    view.ndim = 1;
+    view.shape = compound_shape;
+    view.strides = compound_strides;
+    view.readonly = 1;
+    return PyMemoryView_FromBuffer(&view);
+}
+
+/* ── struct.Struct ── */
+
+/* `_struct.c` keeps the byte size and the value count as fields of
+   `PyStructObject` and declares that struct in its own source, so the only way
+   to read them is to copy the prefix and cast -- which is what
+   `Modules/_testbuffer.c` does to size the tuple it packs one item from. */
+typedef struct {
+    PyObject_HEAD
+    Py_ssize_t s_size;
+    Py_ssize_t s_len;
+} PyPartialStructObject;
+
+static PyObject *struct_counts(PyObject *self, PyObject *value)
+{
+    PyPartialStructObject *s = (PyPartialStructObject *)value;
+    (void)self;
+    return Py_BuildValue("(nn)", s->s_size, s->s_len);
+}
+
 static PyMethodDef methods[] = {
     M("ba_check", ba_check), M("ba_check_exact", ba_check_exact),
     M("ba_size", ba_size), M("ba_from_null", ba_from_null),
@@ -191,14 +317,20 @@ static PyMethodDef methods[] = {
 
     M("cx_check", cx_check), M("cx_check_exact", cx_check_exact),
     M("cx_round_trip", cx_round_trip), M("cx_parts", cx_parts),
-    M("cx_as_ccomplex", cx_as_ccomplex),
+    M("cx_as_ccomplex", cx_as_ccomplex), M("cx_block", cx_block),
     {"cx_from_doubles", cx_from_doubles, METH_VARARGS, NULL},
+    {"cx_basicsize", cx_basicsize, METH_NOARGS, NULL},
+
+    {"mv_contiguous", mv_contiguous, METH_VARARGS, NULL},
+    {"mv_compound_format", mv_compound_format, METH_NOARGS, NULL},
 
     M("wr_check", wr_check), M("wr_check_ref", wr_check_ref),
     M("wr_check_proxy", wr_check_proxy), M("wr_new_ref", wr_new_ref),
     M("wr_new_proxy", wr_new_proxy), M("wr_get_object", wr_get_object),
     M("wr_get_ref", wr_get_ref), M("wr_is_dead", wr_is_dead),
     {"wr_new_ref_with_callback", wr_new_ref_with_callback, METH_VARARGS, NULL},
+    {"wr_cleared_count", wr_cleared_count, METH_NOARGS, NULL},
+    {"struct_counts", struct_counts, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {
@@ -206,5 +338,14 @@ static struct PyModuleDef def = {
 
 PyMODINIT_FUNC PyInit_cpyext_object_families(void)
 {
-    return PyModule_Create(&def);
+    PyObject *module = PyModule_Create(&def);
+    if (module == NULL) {
+        return NULL;
+    }
+    if (PyType_Ready(&ClearedType) < 0
+        || PyModule_AddObjectRef(module, "Cleared", (PyObject *)&ClearedType) < 0) {
+        Py_DECREF(module);
+        return NULL;
+    }
+    return module;
 }

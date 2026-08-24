@@ -76,6 +76,8 @@ eq('mutex local', m.mutex_local(), (0, 1, 0))
 # deadline gives up rather than blocking for good; a wait on a free lock takes
 # it at once.
 eq('thread lock', m.thread_lock(), (1, 0, 1, 0, 1))
+# The same waits, reached from a thread that has already left the interpreter.
+eq('a lock taken while threads are allowed', m.lock_while_threads_allowed(), (1, 0))
 
 eq('ident is this thread', m.thread_ident(), threading.get_ident())
 seen = []

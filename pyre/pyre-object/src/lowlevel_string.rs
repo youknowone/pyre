@@ -119,40 +119,168 @@ pub fn bh_free_lowlevel_string(string: i64, base_size: usize, item_size: usize) 
     unsafe { std::alloc::dealloc(string as *mut u8, layout) };
 }
 
-/// `rgc.ll_shrink_array(buf, new_len)` for a raw STR low-level string — the
-/// non-virtual residual target of the StringBuilder `build` tree's
-/// `ll_shrink_final`.
+/// STR / UNICODE width `(base_size, item_size)` of the low-level string at
+/// `buf`, read from its GC type id.
+///
+/// A GC-managed buffer carries the width in its header tid — the collector's own
+/// record of the element size — exactly as `rgc.ll_shrink_array` recovers the
+/// element type from the array it is handed. A raw-fallback buffer (no GC owner,
+/// principally unit tests) has no header to read and defaults to STR, the only
+/// width the raw path allocates. The `gc_owns_object` guard before the header
+/// read mirrors `majit_gc::gc_finalizer_has_run`.
+fn shrink_array_width(buf: i64) -> (usize, usize) {
+    if buf != 0 && majit_gc::gc_owns_object(buf as usize) {
+        let tid = unsafe { (*majit_gc::header::header_of(buf as usize)).type_id() };
+        if tid != 0 && tid == lowlevel_unicode_gc_type_id() {
+            return (LOWLEVEL_UNICODE_BASE_SIZE, 4);
+        }
+    }
+    (LOWLEVEL_STR_BASE_SIZE, 1)
+}
+
+/// Width-parametric `rgc.ll_shrink_array(buf, new_len)` core.
 ///
 /// Because the `len` word doubles as the freeing capacity, the shrink cannot
 /// truncate in place: it allocates a fresh `new_len` buffer, copies `new_len`
-/// chars, frees the old buffer, and returns the new one (whose `len` word is now
+/// items, frees the old buffer, and returns the new one (whose `len` word is now
 /// exactly `new_len`, so a caller returning it directly reports the right
-/// length). STR width only (`item_size == 1`) — the width the `build` tree wires
-/// today; the UNICODE builder is a future parallel set.
-///
-/// `extern "C"` with an `(i64, i64) -> i64` ABI so the JIT residual call reaches
-/// it through the fnaddr registry.
-pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
+/// length). `base_size`/`item_size` select STR (`LOWLEVEL_STR_BASE_SIZE`, 1) vs
+/// UNICODE (`LOWLEVEL_UNICODE_BASE_SIZE`, 4); the `chars` array offset is the
+/// same two words in both widths.
+fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: usize) -> i64 {
     if buf == 0 {
         return 0;
     }
     let new_len = if new_len < 0 { 0 } else { new_len as usize };
-    const ITEM_SIZE: usize = 1;
-    let new_buf = bh_alloc_lowlevel_string(new_len, LOWLEVEL_STR_BASE_SIZE, ITEM_SIZE);
+    let new_buf = bh_alloc_lowlevel_string(new_len, base_size, item_size);
     if new_buf == 0 {
         return 0;
     }
-    // SAFETY: `buf` holds at least `new_len` valid chars (the builder shrinks to
+    // SAFETY: `buf` holds at least `new_len` valid items (the builder shrinks to
     // its own `current_pos`), and `new_buf` was allocated for exactly `new_len`.
     unsafe {
-        // Copy the fixed `hash` field (@0) before the variable char array, as
+        // Copy the fixed `hash` field (@0) before the variable item array, as
         // `ll_shrink_array` copies the fixed field first; a fresh allocation
         // zeroes it, so a non-zero cached hash would otherwise be lost.
         (new_buf as *mut usize).write(*(buf as *const usize));
         let src = (buf as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         let dst = (new_buf as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
-        std::ptr::copy_nonoverlapping(src, dst, new_len * ITEM_SIZE);
+        std::ptr::copy_nonoverlapping(src, dst, new_len * item_size);
     }
-    bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, ITEM_SIZE);
+    bh_free_lowlevel_string(buf, base_size, item_size);
     new_buf
+}
+
+/// `rgc.ll_shrink_array(buf, new_len)` — the non-virtual residual target of the
+/// StringBuilder / UnicodeBuilder `build` tree's `ll_shrink_final`.
+///
+/// Selects the STR / UNICODE width from `buf`'s GC type id
+/// ([`shrink_array_width`]) so a single residual target serves both builder
+/// widths; the jtransform retarget names this one symbol for either. Only the
+/// non-virtual buffer reaches here — a virtual buffer is folded by
+/// `opt_call_shrink_array`.
+///
+/// `extern "C"` with an `(i64, i64) -> i64` ABI so the JIT residual call reaches
+/// it through the fnaddr registry.
+pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
+    let (base_size, item_size) = shrink_array_width(buf);
+    shrink_lowlevel_array(buf, new_len, base_size, item_size)
+}
+
+pub fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
+    if item_size == 1 {
+        LOWLEVEL_STR_BASE_SIZE - 1
+    } else {
+        LOWLEVEL_UNICODE_BASE_SIZE
+    }
+}
+
+pub fn bh_read_lowlevel_string(string: i64, item_size: usize) -> Vec<i64> {
+    let len = bh_lowlevel_string_len(string);
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    let mut chars = Vec::with_capacity(len);
+    for index in 0..len {
+        let addr = unsafe { (string as *const u8).add(chars_offset + index * item_size) };
+        let value = unsafe {
+            match item_size {
+                1 => *addr as i64,
+                4 => *(addr as *const u32) as i64,
+                _ => *(addr as *const i64),
+            }
+        };
+        chars.push(value);
+    }
+    chars
+}
+
+pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: usize) {
+    if string == 0 {
+        return;
+    }
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    unsafe {
+        let addr = (string as *mut u8).add(chars_offset + index * item_size);
+        match item_size {
+            1 => addr.write(char as u8),
+            4 => (addr as *mut u32).write(char as u32),
+            _ => (addr as *mut i64).write(char),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrink_lowlevel_array_str_truncates_and_preserves_hash() {
+        let buf = bh_alloc_lowlevel_string(8, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_ne!(buf, 0);
+        // A non-zero cached hash must survive the realloc-shrink.
+        unsafe { (buf as *mut usize).write(0xdead_beef) };
+        for index in 0..8 {
+            bh_write_lowlevel_char(buf, index, (b'a' + index as u8) as i64, 1);
+        }
+        let new_buf = shrink_lowlevel_array(buf, 5, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_ne!(new_buf, 0);
+        assert_eq!(bh_lowlevel_string_len(new_buf), 5);
+        assert_eq!(unsafe { *(new_buf as *const usize) }, 0xdead_beef);
+        assert_eq!(
+            bh_read_lowlevel_string(new_buf, 1),
+            vec![97, 98, 99, 100, 101]
+        );
+        bh_free_lowlevel_string(new_buf, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn shrink_lowlevel_array_unicode_copies_width_4_items() {
+        let buf = bh_alloc_lowlevel_string(4, LOWLEVEL_UNICODE_BASE_SIZE, 4);
+        assert_ne!(buf, 0);
+        for index in 0..4 {
+            bh_write_lowlevel_char(buf, index, 0x1_0000 + index as i64, 4);
+        }
+        let new_buf = shrink_lowlevel_array(buf, 2, LOWLEVEL_UNICODE_BASE_SIZE, 4);
+        assert_ne!(new_buf, 0);
+        assert_eq!(bh_lowlevel_string_len(new_buf), 2);
+        assert_eq!(
+            bh_read_lowlevel_string(new_buf, 4),
+            vec![0x1_0000, 0x1_0001]
+        );
+        bh_free_lowlevel_string(new_buf, LOWLEVEL_UNICODE_BASE_SIZE, 4);
+    }
+
+    #[test]
+    fn jit_ll_shrink_array_defaults_to_str_for_a_raw_buffer() {
+        // A raw-fallback buffer is not GC-owned, so the width defaults to STR.
+        let buf = bh_alloc_lowlevel_string(6, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_ne!(buf, 0);
+        for index in 0..6 {
+            bh_write_lowlevel_char(buf, index, (b'A' + index as u8) as i64, 1);
+        }
+        let new_buf = jit_ll_shrink_array(buf, 3);
+        assert_ne!(new_buf, 0);
+        assert_eq!(bh_lowlevel_string_len(new_buf), 3);
+        assert_eq!(bh_read_lowlevel_string(new_buf, 1), vec![65, 66, 67]);
+        bh_free_lowlevel_string(new_buf, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
 }
