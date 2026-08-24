@@ -6548,18 +6548,20 @@ pub(crate) fn call_depth() -> u32 {
 
 /// RPython green_key = (pycode, next_instr).
 /// Each (code, pc) pair has independent warmup counter and compiled loop.
-// dont_look_inside: green-key construction (pypyjit_greenkey_uhash); JIT-driver machinery.
+// dont_look_inside: green-key construction; JIT-driver machinery.
 #[majit_macros::dont_look_inside]
 pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
-    // Full `JitCell.get_uhash` over the pypyjit green tuple
-    // `[next_instr, is_being_profiled, pycode]` (warmstate.py `JitCell`),
-    // computed allocation-free. The caller supplies the same live frame green
-    // the portal markers use -- `PyFrame.dispatch` (extended in `interp_jit.py`)
-    // hoists `self.get_is_being_profiled()` into a local and hands that one
-    // value to `jit_merge_point` -- so this and the typed marker-path key
+    // The eval loop's name for the walker's key, not a second implementation
+    // of it: both have to fold the same green tuple to the same cell, and one
+    // body is how that stays true.
+    //
+    // The caller supplies the same live frame green the portal markers use --
+    // `PyFrame.dispatch`, extended in `interp_jit.py`, hoists
+    // `self.get_is_being_profiled()` into a local and hands that one value to
+    // `jit_merge_point` -- so this and the typed marker-path key
     // (`green_key_typed_from_pycode`) resolve to the same cell, and a profiled
     // portal gets its own.
-    majit_ir::pypyjit_greenkey_uhash(pc, is_being_profiled, code_ptr as u64)
+    pyre_jit_trace::driver::make_green_key(code_ptr, pc, is_being_profiled)
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::PY_RECURSION_DEPTH is the
