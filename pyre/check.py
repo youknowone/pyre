@@ -4240,6 +4240,11 @@ class Check:
         chatter. A wasm-only run reads the census back through the guest's
         `pyre_fbw_spec_census` export instead of skipping, which would leave
         the gate vacuous exactly where nothing else observes the walker.
+
+        Because the backend is chosen here rather than by the caller, *timeout*
+        is the fixture's own unscaled budget: the scale belongs to a backend,
+        and which one that is is not known until the line above. A caller that
+        hands over its own already-scaled figure squares the scale.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
@@ -4252,7 +4257,7 @@ class Check:
                 return True
             backend = "wasm"
         census, code = spec_fold_census(
-            default_binary(backend),
+            self._pyre(backend),
             path,
             scaled_timeout(timeout, self._timeout_scale(backend)),
             wasm=backend == "wasm",
@@ -4362,7 +4367,7 @@ class Check:
             return
 
         if spec_folds and not self._check_spec_folds(
-            name, path, spec_folds, effective_timeout, t_cpython, t_pypy,
+            name, path, spec_folds, timeout, t_cpython, t_pypy,
         ):
             return
 
@@ -4764,7 +4769,13 @@ def main():
 
     # Once per run, before any backend is measured: the check is over the tree,
     # not over a backend, and every backend reads the same offsets.
-    if args.no_build:
+    #
+    # A positional binary names one built somewhere else, so `build/llbc/` was
+    # not among its inputs and says nothing about it — the reason
+    # `require_fresh_artefacts` skips its stamp on the same argument. The wasm
+    # runner is the exception: the module it loads is still this tree's, and
+    # building that module is what reads the LLBC.
+    if args.no_build and (not args.pyre_path or backends == ["wasm"]):
         require_fresh_llbc()
 
     for backend in backends:
