@@ -32,7 +32,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 # only when the fingerprint algorithm or the meaning of its input set changes.
 # Ordinary refactors, diagnostics and comments in this file do not change what
 # Charon compiles and must not invalidate every multi-minute LLBC artefact.
-FINGERPRINT_SCHEMA = "3"
+FINGERPRINT_SCHEMA = "4"
 
 
 @dataclass
@@ -2173,6 +2173,29 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     # rustc), so this never thrashes the runtime build's cache, and the LLBC is
     # independent of debuginfo so the artefact is byte-identical.
     env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
+    # The extracted image must describe the interpreter the JIT accompanies,
+    # and that one is built by `cargo build --release`, where
+    # `debug_assertions` is off. The dev profile leaves it on (the workspace
+    # `[profile.dev]` comment says so outright), so every `debug_assert!` and
+    # every `cfg(debug_assertions)` arm in the closure was being translated
+    # into the jitcodes: `w_bytearray_len` is `debug_assert_eq!(ba.length,
+    # (*ba.data).len()); ba.length`, and its body came out 44 bytes — a
+    # `residual_call` on an un-lowered `__len`, an allocation and two stores
+    # for the `assert_eq!` operand pair, then the field read the function
+    # actually is.
+    #
+    # The divergence runs the dangerous way. Compiled code carrying a check
+    # the interpreter does not have can fail where the interpreter succeeds;
+    # compiled code missing a debug-only check merely loses a diagnostic. The
+    # `cfg(debug_assertions)` arms in the closure are all of the second kind —
+    # `gc_roots`' `ShadowStackWalk` re-entrancy guard, whose own doc says
+    # "release builds match upstream's raw root-stack access without that
+    # diagnostic" — so off is both the matching and the safer setting.
+    #
+    # Set rather than defaulted, unlike `CARGO_PROFILE_DEV_DEBUG` above: that
+    # one cannot change the LLBC, this one is the LLBC. An inherited override
+    # would produce an artefact its own stamp misdescribes.
+    env["CARGO_PROFILE_DEV_DEBUG_ASSERTIONS"] = "false"
     # The dev profile enables incremental compilation, which splits a crate into
     # codegen units and reuses object files from the previous session. Charon
     # drives rustc for the crates it extracts while plain rustc builds the rest,
