@@ -1128,6 +1128,11 @@ impl W_Struct {
     /// [`Parsed::expected_args`] answers; PyPy's object keeps no such field, so
     /// the immutable format is reparsed here rather than cached beside it, as
     /// [`W_Struct::__sizeof__`] already does for the code count.
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
     pub(crate) fn c_size_and_len(&self) -> (i64, i64) {
         if self.size < 0 {
             return (-1, -1);
