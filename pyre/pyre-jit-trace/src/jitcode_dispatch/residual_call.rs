@@ -6571,6 +6571,23 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // guards, the heapcache invalidation and the `None` writeback are the ones
     // the generic path already emits.  A decline leaves every binding
     // untouched.
+    //
+    // One thing the substitution does move.  The descr it installs is
+    // `MOST_GENERAL` with no helper tag and a `Ref` result, which is exactly
+    // the shape `writes_live_heap` does not read as a store; the generic call
+    // arrived tagged `CallFn` and did.  So the substituted residual stops
+    // bumping the executed-effect odometer, and a walk that aborts behind it is
+    // rewound and runs the call a second time.
+    //
+    // That is sound for this store and not in general: `set_add_value` with the
+    // same element twice leaves the same contents, the same length and the same
+    // table as once, so there is nothing for a journal to undo -- which is why
+    // `list.append`, whose second append is a second element, needs one.  The
+    // part of the insert that is not idempotent is the element's `__hash__` and
+    // any `__eq__` a collision reaches; both run a Python frame, and the
+    // frame-entry odometer sampled around the call reports that whatever the
+    // descr says.  A substitution for a store without both properties inherits
+    // neither argument.
     let set_add_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
