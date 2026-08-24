@@ -35,6 +35,16 @@ extern "C" {
 #  endif
 #endif
 
+/* A cast written so the one spelling compiles as C and as C++, where the
+   implicit conversions C allows are errors. */
+#define _Py_CAST(type, expr) ((type)(expr))
+
+/* A function pointer cast to `T`, through `void (*)(void)` so that no warning
+   is emitted for the change of signature.  It silences the compiler only: the
+   function is still called through whichever type the caller uses, and calling
+   it through the wrong one is undefined at run time. */
+#define _Py_FUNC_CAST(T, func) _Py_CAST(T, _Py_CAST(void (*)(void), (func)))
+
 typedef uintptr_t Py_uintptr_t;
 typedef intptr_t Py_intptr_t;
 typedef Py_intptr_t Py_ssize_t;

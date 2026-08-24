@@ -17,6 +17,12 @@ struct PyMethodDef {
     const char *ml_doc;
 };
 
+/* A `METH_NOARGS` or `METH_O` function is written with the parameters its own
+   convention passes, which need not be the two `PyCFunction` names.  Calling
+   one through a mismatched pointer type is undefined, so a table entry says
+   here that the cast is deliberate (bpo-33012). */
+#define _PyCFunction_CAST(func) _Py_FUNC_CAST(PyCFunction, func)
+
 #define METH_VARARGS 0x0001
 #define METH_KEYWORDS 0x0002
 #define METH_NOARGS 0x0004

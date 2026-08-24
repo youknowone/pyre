@@ -24,6 +24,8 @@ struct _object {
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
 #define Py_IS_TYPE(ob, type) (Py_TYPE(ob) == (type))
+/* bpo-39573: writing `ob_type` and `ob_size` goes through these. */
+#define Py_SET_TYPE(ob, type) ((void)(Py_TYPE(ob) = (type)))
 
 /* The reference-counting macros are in `refcount.h`, which `Python.h` includes
    after the declarations they expand to. */
@@ -59,6 +61,7 @@ struct PyVarObject {
 #define PyObject_VAR_HEAD PyVarObject ob_base;
 #define PyVarObject_HEAD_INIT(type, size) { PyObject_HEAD_INIT(type) size },
 #define Py_SIZE(ob) (((PyVarObject *)(ob))->ob_size)
+#define Py_SET_SIZE(ob, size) ((void)(Py_SIZE(ob) = (size)))
 
 typedef void (*destructor)(PyObject *);
 typedef PyObject *(*unaryfunc)(PyObject *);
