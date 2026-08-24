@@ -867,9 +867,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     // `interp_signal.py valid_signals` returns
-                    // `set(...)` via `_sigset_to_signals` (line 513),
-                    // not a frozenset.  PyPy passes NSIG (64) here.
-                    let sigs = rustpython_host_env::signal::valid_signals(64).unwrap_or_default();
+                    // `set(...)` via `_sigset_to_signals`, not a frozenset.
+                    // The bound is `NSIG`, exclusive: `sigfillset` sets the
+                    // bit for `NSIG - 1` and one past it too on darwin, so a
+                    // wider bound answers with a signal that has no name.
+                    let sigs = rustpython_host_env::signal::valid_signals(
+                        signalstate::NSIG as usize,
+                    )
+                    .unwrap_or_default();
                     let items: Vec<pyre_object::PyObjectRef> = sigs
                         .into_iter()
                         .map(|n| pyre_object::w_int_new(n as i64))
@@ -1460,6 +1465,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
         crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+        // `SIGIOT` is the BSD spelling of `SIGABRT` and `SIGEMT`/`SIGINFO` are
+        // BSD signals linux has no number for, so the three are answered where
+        // `<signal.h>` names them.
+        #[cfg(target_vendor = "apple")]
+        for (name, val) in [
+            ("SIGEMT", libc::SIGEMT as i64),
+            ("SIGINFO", libc::SIGINFO as i64),
+            ("SIGIOT", libc::SIGIOT as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
     }
     // The seven the MSVC runtime defines, and the two console events
     // `os.kill` sends in place of a signal.  `Lib/signal.py` builds its
