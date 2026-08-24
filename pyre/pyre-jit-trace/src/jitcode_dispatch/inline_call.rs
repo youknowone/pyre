@@ -5826,6 +5826,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // the callee must still reach its own portal, because the loops
             // that do compile on this fixture ARE the callees' function-entry
             // traces, and suppressing those reads `loops_compiled=2`.
+            //
+            // `foriter_deferred_admit` names the LEGACY `DeferredCall`
+            // admission only.  A body the poisoned-pc reading admits instead
+            // reaches this same escape without the deny, because that arm
+            // requires `!legacy_admit` and never sets this flag, so it rebuilds
+            // the decision until the enclosing key is retired.  Left as is
+            // deliberately: `fbw_inline_poison_enabled` gates that arm off by
+            // default and `gate-triage.md` records its ON arm as known wrong,
+            // so widening the deny here would change a default-off path whose
+            // resume leg is the thing actually being fixed.
             if foriter_deferred_admit
                 && matches!(e, DispatchError::VableEscapedDuringResidualCall { .. })
             {

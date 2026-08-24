@@ -1807,9 +1807,18 @@ pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
 /// That separation is what the caller has to choose between.  The warm state's
 /// `disable_noninlinable_function` sets `JC_DONT_TRACE_HERE` on the callee's
 /// green key at pc 0, which is the callee's ENTRY key, so it suppresses that
-/// entry trace as well.  Measured on `locals_in_inlined_callee`, where the four
-/// loops that compile ARE the callees' entry traces: taking the warm-state half
-/// as well reads `loops_compiled=2`, against 4 without any deny.
+/// entry trace as well.
+///
+/// `locals_in_inlined_callee` separates all three choices, and the committed
+/// baselines are this one: `loops_compiled=3`, `loops_aborted=6`
+/// (`locals_in_inlined_callee.*.jitstats`).  The three loops that compile ARE
+/// the callees' entry traces, so taking the warm-state half as well suppresses
+/// them and reads `loops_compiled=2`.  Denying nothing reads 2 as well, for the
+/// opposite reason and at four aborts more: the escape is a property of the
+/// callee body, so the next attempt rebuilds it byte for byte until
+/// `MAX_TRACE_ABORT_COUNT` retires the ENCLOSING green key, which the fixture
+/// header records as 2 loops against 10 aborts.  The walker-local half is the
+/// only one of the three that reaches 3.
 pub(crate) fn fbw_deny_inline_callee_here(callee_code_key: usize) {
     FBW_HAZARDOUS_INLINE_DENY.with(|c| {
         c.borrow_mut().insert(callee_code_key);

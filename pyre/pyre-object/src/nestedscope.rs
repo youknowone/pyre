@@ -77,6 +77,19 @@ impl CellFamily {
 /// Held as a leaked address rather than a `OnceLock<CellFamily>` because the
 /// `std::cell::Cell<bool>` inside makes the family non-`Sync`, and the
 /// allocation must outlive every cell pointing at it anyway.
+///
+/// This one family is shared by every cell that has no table of its own, so it
+/// must stay WRITE-FREE, and the `usize` the `OnceLock` stores hides its
+/// interior mutability from the compiler — nothing here is checked for you.
+/// The invariant holds today by arithmetic rather than by construction: cells
+/// carrying this family do reach [`CellFamily::set_ever_mutated`] (the rebind
+/// and delete paths below both call it), but every caller passes `true` and
+/// this family is born `true`, so each such call takes that method's
+/// unchanged-value early return and never reaches the `Cell` write or the
+/// watcher sweep.  A caller that passed `false` would write through a shared
+/// address and sweep the quasi-immut watchers of every unrelated cell that
+/// landed on the dummy — a process-wide effect rather than a data race, since
+/// the GIL (`majit-gc` `rgil`) already serialises mutators.
 pub fn dummy_family() -> *const CellFamily {
     static DUMMY_FAMILY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DUMMY_FAMILY.get_or_init(|| {
