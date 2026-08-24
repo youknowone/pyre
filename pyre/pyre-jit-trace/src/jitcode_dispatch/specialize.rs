@@ -12063,10 +12063,13 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
 /// cache and forces virtualizables across itself — the reason a `str(i)` loop
 /// costs far more than the one allocation it performs.
 ///
-/// The callable must be the canonical `str` type object: a rebound name or a
-/// `str` subclass reboxes through `__new__` instead. The argument must be an
-/// exact `int`, because `bool` renders `True`/`False`, an `int` subclass may
-/// override `__str__`, and a `W_LongObject`'s payload is a pointer where
+/// The callable must be the canonical `str` type object or the `repr` builtin
+/// itself: a rebound name or a `str` subclass reboxes through `__new__`
+/// instead. `repr(i)` shares the arm because it renders the same decimal text
+/// for an exact `int` — the cross-check below is what holds that, so the two
+/// callables need no separate reasoning. The argument must be an exact `int`,
+/// because `bool` renders `True`/`False`, an `int` subclass may override
+/// `__str__` / `__repr__`, and a `W_LongObject`'s payload is a pointer where
 /// `intval` would be. Any other shape falls through to the generic residual
 /// (SAFE).
 pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
@@ -12094,7 +12097,9 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         return Ok(None);
     }
     let str_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    if !std::ptr::eq(concrete_callable, str_type_obj) {
+    let renders_an_int = std::ptr::eq(concrete_callable, str_type_obj)
+        || pyre_interpreter::jit_builtin_folds::is_repr_builtin(concrete_callable);
+    if !renders_an_int {
         return Ok(None);
     }
     // A tagged immediate has no header for the `w_class` and unbox guards to
