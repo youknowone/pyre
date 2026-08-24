@@ -822,6 +822,14 @@ pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
 /// ```
 pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
+    // PyPy's interp2app gateway types W_WeakrefBase.descr__repr__ as a
+    // `weakref-or-proxy` method before entering this shared body.
+    if !is_w_weakref(w_self) && !is_w_abstract_proxy(w_self) {
+        return Err(PyError::type_error(format!(
+            "'weakref-or-proxy' object expected, got '{}' instead",
+            crate::baseobjspace::object_functionstr_type_name(w_self)
+        )));
+    }
     let w_obj = dereference(w_self);
     let type_name = unsafe {
         match crate::typedef::r#type(w_self) {
