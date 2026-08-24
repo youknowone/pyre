@@ -1120,6 +1120,24 @@ impl W_Struct {
             Ok(())
         }
     }
+
+    /// The `s_size` and `s_len` a `PyStructObject` carries as fields, both -1
+    /// before `__init__` has run.
+    ///
+    /// `s_len` counts the values a pack consumes, which is what
+    /// [`Parsed::expected_args`] answers; PyPy's object keeps no such field, so
+    /// the immutable format is reparsed here rather than cached beside it, as
+    /// [`W_Struct::__sizeof__`] already does for the code count.
+    pub(crate) fn c_size_and_len(&self) -> (i64, i64) {
+        if self.size < 0 {
+            return (-1, -1);
+        }
+        let fmt = unsafe { w_str_get_value(self.format) };
+        match parse_format(fmt) {
+            Ok(parsed) => (self.size, parsed.expected_args() as i64),
+            Err(_) => (self.size, -1),
+        }
+    }
 }
 
 #[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]

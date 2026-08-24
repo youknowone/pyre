@@ -50,6 +50,7 @@ pub mod pystrtod;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
+pub mod structobject;
 pub mod sysmodule;
 pub mod tupleobject;
 pub mod typeobject;

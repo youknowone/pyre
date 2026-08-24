@@ -209,6 +209,7 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     super::cdatetime::attach(raw, linked());
     super::complexobject::attach(raw, linked());
     super::methodobject::attach(raw, linked());
+    super::structobject::attach(raw, linked());
     super::typeobject::descriptor_attach(raw, linked());
     raw
 }

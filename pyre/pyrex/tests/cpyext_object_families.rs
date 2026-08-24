@@ -278,6 +278,43 @@ fn a_contiguous_view_over_an_exporter() {
     fixtures.expect_ok(MEMORYVIEW_SCRIPT, &[], "cpyext-memoryview-ok");
 }
 
+const STRUCT_SCRIPT: &str = r#"
+import struct
+
+import cpyext_object_families as m
+
+
+def eq(name, got, want):
+    assert got == want, '%s: got %r, want %r' % (name, got, want)
+
+
+# The pair is (byte size, number of values), which is `calcsize` beside the
+# length of what `unpack` answers.
+for fmt, size, count in (('B', 1, 1),
+                         ('3B', 3, 3),
+                         ('i4d', 40, 5),
+                         ('4s', 4, 1),
+                         ('3x', 3, 0),
+                         ('0i', 0, 0),
+                         ('', 0, 0)):
+    eq(fmt, m.struct_counts(struct.Struct(fmt)), (size, count))
+    eq(fmt + ' calcsize', struct.calcsize(fmt), size)
+    eq(fmt + ' values', len(struct.unpack(fmt, bytes(size))), count)
+
+# `Struct.__new__` without `__init__` leaves the pair every operation but the
+# `size` getter rejects.
+eq('uninitialised', m.struct_counts(struct.Struct.__new__(struct.Struct)), (-1, -1))
+
+print('cpyext-struct-ok')
+"#;
+
+#[test]
+fn the_counts_a_struct_carries_as_fields() {
+    let fixtures = Fixtures::new("cpyext-struct");
+    fixtures.compile("cpyext_object_families");
+    fixtures.expect_ok(STRUCT_SCRIPT, &[], "cpyext-struct-ok");
+}
+
 #[test]
 fn reading_through_a_weak_reference_does_not_keep_the_referent_alive() {
     let fixtures = Fixtures::new("cpyext-weakref");

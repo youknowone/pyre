@@ -1,5 +1,5 @@
-/* `bytearray`, `complex`, `memoryview` and `weakref` through their concrete
-   C API.
+/* `bytearray`, `complex`, `memoryview`, `weakref` and `struct.Struct` through
+   their concrete C API.
 
    Each function answers the observable outcome, so a Python-side comparison
    against CPython running the same code says whether the two agree. */
@@ -263,6 +263,25 @@ static PyObject *wr_cleared_count(PyObject *s, PyObject *unused)
 { (void)s; (void)unused; return PyLong_FromLong(wr_cleared); }
 
 #define M(name, fn) {name, fn, METH_O, NULL}
+/* ── struct.Struct ── */
+
+/* `_struct.c` keeps the byte size and the value count as fields of
+   `PyStructObject` and declares that struct in its own source, so the only way
+   to read them is to copy the prefix and cast -- which is what
+   `Modules/_testbuffer.c` does to size the tuple it packs one item from. */
+typedef struct {
+    PyObject_HEAD
+    Py_ssize_t s_size;
+    Py_ssize_t s_len;
+} PyPartialStructObject;
+
+static PyObject *struct_counts(PyObject *self, PyObject *value)
+{
+    PyPartialStructObject *s = (PyPartialStructObject *)value;
+    (void)self;
+    return Py_BuildValue("(nn)", s->s_size, s->s_len);
+}
+
 static PyMethodDef methods[] = {
     M("ba_check", ba_check), M("ba_check_exact", ba_check_exact),
     M("ba_size", ba_size), M("ba_from_null", ba_from_null),
@@ -286,6 +305,7 @@ static PyMethodDef methods[] = {
     M("wr_get_ref", wr_get_ref), M("wr_is_dead", wr_is_dead),
     {"wr_new_ref_with_callback", wr_new_ref_with_callback, METH_VARARGS, NULL},
     {"wr_cleared_count", wr_cleared_count, METH_NOARGS, NULL},
+    {"struct_counts", struct_counts, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {
