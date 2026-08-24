@@ -1215,7 +1215,7 @@ fn io_base_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
-            "_IOBase",
+            "_io._IOBase",
             init_iobase_type,
             crate::typedef::w_object(),
         );
@@ -1235,7 +1235,7 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
-            "_RawIOBase",
+            "_io._RawIOBase",
             init_rawiobase_type,
             io_base_type(),
         );
@@ -1302,7 +1302,7 @@ pub(super) fn buffered_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
-            "_BufferedIOBase",
+            "_io._BufferedIOBase",
             init_buffered_iobase_type,
             io_base_type(),
         );
@@ -1321,7 +1321,7 @@ fn text_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
-            "_TextIOBase",
+            "_io._TextIOBase",
             init_text_iobase_type,
             io_base_type(),
         );

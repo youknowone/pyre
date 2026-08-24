@@ -1,7 +1,19 @@
 import os
+import _io
 from io import BufferedReader, BytesIO, FileIO, RawIOBase, StringIO, TextIOWrapper
 
 from testutils import assert_raises
+
+
+# PyPy's W_IOBase/W_RawIOBase/W_BufferedIOBase/W_TextIOBase TypeDefs are
+# qualified with the owning _io module.
+for io_base_type in (
+    _io._IOBase,
+    _io._RawIOBase,
+    _io._BufferedIOBase,
+    _io._TextIOBase,
+):
+    assert io_base_type.__module__ == "_io"
 
 
 # PyPy W_TextIOWrapper.readline_w distinguishes its untranslated missing
