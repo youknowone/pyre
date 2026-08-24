@@ -2046,6 +2046,20 @@ pub struct W_PositionsIterObject {
     pub end_column: i64,
 }
 
+/// `branchesiterator` — the object `co_branches()` returns.
+///
+/// `_PyBranchesIterator` reports `line_iterator` as its `tp_name`, the same
+/// string `_PyLineIterator` carries, so the two distinct types are
+/// indistinguishable by name; only `type(a) is type(b)` tells them apart.
+#[crate::pyre_class("line_iterator", static_name = "BRANCHES_ITER")]
+pub struct W_BranchesIterObject {
+    /// `bi_code` — the code object whose bytecode the walk reads, held so it
+    /// outlives the iterator.
+    pub w_code: PyObjectRef,
+    /// `bi_offset`, in code units.
+    pub offset: i64,
+}
+
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -2064,6 +2078,29 @@ pub unsafe fn is_positions_iter(obj: PyObjectRef) -> bool {
         return false;
     }
     !obj.is_null() && std::ptr::eq(unsafe { (*obj).ob_type }, &POSITIONS_ITER_TYPE)
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_branches_iter(obj: PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && std::ptr::eq(unsafe { (*obj).ob_type }, &BRANCHES_ITER_TYPE)
+}
+
+/// Whether `obj` is an instance of *a* type named `line_iterator`.
+///
+/// The owner a builtin method reports its receiver against is keyed by type
+/// name, and two types answer to `line_iterator`, so the name-keyed test
+/// admits either; each method body still checks the one layout it reads.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_named_line_iterator(obj: PyObjectRef) -> bool {
+    unsafe { is_line_iter(obj) || is_branches_iter(obj) }
 }
 
 /// The `co_linetable` an iterator walks, or `None` once its code object is
@@ -2258,70 +2295,114 @@ pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError
     }))
 }
 
+/// `int_triple` — the `(a, b, c)` tuple every branch row is reported as.
+fn int_triple(a: i64, b: i64, c: i64) -> PyObjectRef {
+    w_tuple_new(vec![w_int_new(a), w_int_new(b), w_int_new(c)])
+}
+
+/// `branchesiter_next` — the next branch instruction's
+/// `(instruction, not-taken target, taken target)` triple, in byte offsets.
+///
+/// The scan resumes at `bi_offset` and stops at the branch it reports, so a
+/// caller that reads one row does not pay for the rest of the bytecode.
+///
+/// # Safety
+/// `obj` must be a live [`W_BranchesIterObject`].
+pub unsafe fn branches_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let it = &mut *(obj as *mut W_BranchesIterObject);
+        if it.w_code.is_null() {
+            return None;
+        }
+        let code = w_code_get_ptr(it.w_code) as *const crate::CodeObject;
+        if code.is_null() {
+            return None;
+        }
+        let code = &*code;
+        let mut offset = usize::try_from(it.offset).ok()?;
+        let mut op_arg = 0usize;
+        while offset < code.instructions.len() {
+            let op = code.instructions.read_op(offset).deoptimize();
+            let next_offset = offset + 1 + op.cache_entries();
+            let arg = u8::from(code.instructions.read_arg(offset)) as usize;
+            match op {
+                crate::bytecode::Instruction::ExtendedArg => {
+                    op_arg = (op_arg << 8) | arg;
+                }
+                crate::bytecode::Instruction::ForIter { .. } => {
+                    op_arg = (op_arg << 8) | arg;
+                    it.offset = next_offset as i64;
+                    // Skips END_FOR and POP_ITER.
+                    let target = next_offset + op_arg + 2;
+                    return Some(int_triple(
+                        (offset * 2) as i64,
+                        (next_offset * 2) as i64,
+                        (target * 2) as i64,
+                    ));
+                }
+                crate::bytecode::Instruction::PopJumpIfFalse { .. }
+                | crate::bytecode::Instruction::PopJumpIfTrue { .. }
+                | crate::bytecode::Instruction::PopJumpIfNone { .. }
+                | crate::bytecode::Instruction::PopJumpIfNotNone { .. } => {
+                    op_arg = (op_arg << 8) | arg;
+                    // Skip NOT_TAKEN, which Python 3.14 emits at the
+                    // fallthrough edge so branch instrumentation can tell the
+                    // untaken path apart.
+                    let not_taken = next_offset + 1;
+                    it.offset = not_taken as i64;
+                    return Some(int_triple(
+                        (offset * 2) as i64,
+                        (not_taken * 2) as i64,
+                        ((next_offset + op_arg) * 2) as i64,
+                    ));
+                }
+                crate::bytecode::Instruction::EndAsyncFor => {
+                    op_arg = (op_arg << 8) | arg;
+                    let src_offset = next_offset - op_arg;
+                    it.offset = next_offset as i64;
+                    debug_assert!(matches!(
+                        code.instructions.read_op(src_offset).deoptimize(),
+                        crate::bytecode::Instruction::EndSend
+                    ));
+                    debug_assert!(matches!(
+                        code.instructions.read_op(src_offset + 1).deoptimize(),
+                        crate::bytecode::Instruction::NotTaken
+                    ));
+                    let not_taken = src_offset + 2;
+                    return Some(int_triple(
+                        (src_offset * 2) as i64,
+                        (not_taken * 2) as i64,
+                        (next_offset * 2) as i64,
+                    ));
+                }
+                _ => op_arg = 0,
+            }
+            offset = next_offset;
+        }
+        it.offset = offset as i64;
+        None
+    }
+}
+
+/// `_PyInstrumentation_BranchesIterator` — `co_branches()`.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "co_branches")? };
-    let mut rows = Vec::new();
-    let mut index = 0usize;
-    let mut op_arg = 0usize;
-    while index < code.instructions.len() {
-        let op = code.instructions.read_op(index).deoptimize();
-        let next = index + 1 + op.cache_entries();
-        let arg = u8::from(code.instructions.read_arg(index)) as usize;
-        match op {
-            crate::bytecode::Instruction::ExtendedArg => {
-                op_arg = (op_arg << 8) | arg;
-            }
-            crate::bytecode::Instruction::ForIter { .. } => {
-                op_arg = (op_arg << 8) | arg;
-                rows.push(w_tuple_new(vec![
-                    w_int_new((index * 2) as i64),
-                    w_int_new((next * 2) as i64),
-                    w_int_new(((next + op_arg + 2) * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            crate::bytecode::Instruction::PopJumpIfFalse { .. }
-            | crate::bytecode::Instruction::PopJumpIfTrue { .. }
-            | crate::bytecode::Instruction::PopJumpIfNone { .. }
-            | crate::bytecode::Instruction::PopJumpIfNotNone { .. } => {
-                op_arg = (op_arg << 8) | arg;
-                // Python 3.14 inserts NOT_TAKEN at the fallthrough edge so
-                // branch instrumentation can distinguish the untaken path.
-                let not_taken = next + 1;
-                rows.push(w_tuple_new(vec![
-                    w_int_new((index * 2) as i64),
-                    w_int_new((not_taken * 2) as i64),
-                    w_int_new(((next + op_arg) * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            crate::bytecode::Instruction::EndAsyncFor => {
-                op_arg = (op_arg << 8) | arg;
-                let source = next - op_arg;
-                debug_assert!(matches!(
-                    code.instructions.read_op(source).deoptimize(),
-                    crate::bytecode::Instruction::EndSend
-                ));
-                debug_assert!(matches!(
-                    code.instructions.read_op(source + 1).deoptimize(),
-                    crate::bytecode::Instruction::NotTaken
-                ));
-                rows.push(w_tuple_new(vec![
-                    w_int_new((source * 2) as i64),
-                    w_int_new(((source + 2) * 2) as i64),
-                    w_int_new((next * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            _ => op_arg = 0,
-        }
-        index = next.max(index + 1);
-    }
-    let n = rows.len();
-    Ok(w_seq_iter_new(w_list_new(rows), n))
+    unsafe { require_code(obj, "co_branches")? };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
+    Ok(W_BranchesIterObject::allocate_stable(
+        W_BranchesIterObject {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_code: obj,
+            offset: 0,
+        },
+    ))
 }
 
 /// `code.replace(**kwds)` — `pypy/interpreter/pycode.py` applevel

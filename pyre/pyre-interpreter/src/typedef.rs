@@ -776,9 +776,12 @@ pub fn init_typeobjects() {
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(none_type, false) };
         reg.insert(&NONE_TYPE as *const PyType as usize, none_type as usize);
 
-        // `_PyLineIterator` / `_PyPositionsIterator` — the two walks over a
-        // code object's line table.  Both carry `Py_TPFLAGS_BASETYPE` and have
-        // no `tp_new`: only `co_lines()` and `co_positions()` produce one.
+        // `_PyLineIterator` / `_PyPositionsIterator` /
+        // `_PyBranchesIterator` — the three walks over a code object.  All
+        // three carry `Py_TPFLAGS_BASETYPE` and have no `tp_new`: only
+        // `co_lines()`, `co_positions()` and `co_branches()` produce one.
+        // The branches iterator answers to `line_iterator` as well, so the
+        // two are distinguishable only by identity.
         for (name, init, tp) in [
             (
                 "line_iterator",
@@ -789,6 +792,11 @@ pub fn init_typeobjects() {
                 "positions_iterator",
                 init_positions_iterator_type as fn(PyObjectRef),
                 &crate::pycode::POSITIONS_ITER_TYPE as *const PyType as usize,
+            ),
+            (
+                "line_iterator",
+                init_branches_iterator_type as fn(PyObjectRef),
+                &crate::pycode::BRANCHES_ITER_TYPE as *const PyType as usize,
             ),
         ] {
             let w_type = new_typeobject_with_base(name, init, object_type);
@@ -2095,7 +2103,9 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "set" => pyre_object::is_set,
         "frozenset" => pyre_object::is_frozenset,
         "set_iterator" => pyre_object::is_set_iterator,
-        "line_iterator" => crate::pycode::is_line_iter,
+        // Two types report `line_iterator`; the name-keyed owner admits
+        // either and each method body checks the layout it reads.
+        "line_iterator" => crate::pycode::is_named_line_iterator,
         "positions_iterator" => crate::pycode::is_positions_iter,
         "range" => pyre_object::functional::is_w_range,
         "slice" => pyre_object::is_slice,
@@ -27642,6 +27652,11 @@ fn init_positions_iterator_type(ns: PyObjectRef) {
     init_line_table_iterator_type(ns, positions_iter_self, positions_iter_next);
 }
 
+/// `_PyBranchesIterator`, the same shape over `branchesiter_next`.
+fn init_branches_iterator_type(ns: PyObjectRef) {
+    init_line_table_iterator_type(ns, branches_iter_self, branches_iter_next);
+}
+
 fn init_line_table_iterator_type(
     ns: PyObjectRef,
     self_fn: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
@@ -27699,6 +27714,26 @@ fn positions_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         crate::pycode::is_positions_iter,
     )?;
     unsafe { crate::pycode::positions_iter_next(receiver) }
+        .ok_or_else(crate::PyError::stop_iteration)
+}
+
+fn branches_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_line_table_iterator(
+        args,
+        "__iter__",
+        "line_iterator",
+        crate::pycode::is_branches_iter,
+    )
+}
+
+fn branches_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = require_line_table_iterator(
+        args,
+        "__next__",
+        "line_iterator",
+        crate::pycode::is_branches_iter,
+    )?;
+    unsafe { crate::pycode::branches_iter_next(receiver) }
         .ok_or_else(crate::PyError::stop_iteration)
 }
 
