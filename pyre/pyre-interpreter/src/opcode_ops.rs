@@ -1012,22 +1012,6 @@ pub extern "C" fn jit_set_add(set: i64, value: i64) {
     }
 }
 
-/// Shared body of [`jit_set_discard`].  Tracing is execution, so the walker
-/// arm applies this before recording the residual.
-pub fn set_discard_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
-    crate::type_methods::set_discard_checked(set, value).map(|_| ())
-}
-
-/// `s.discard(x)` twin of [`jit_set_add`].  `set.discard` answers None and
-/// does not raise when the element is absent; a raising `__hash__`/`__eq__`
-/// is published the same way.
-#[majit_macros::jit_may_force]
-pub extern "C" fn jit_set_discard(set: i64, value: i64) {
-    if let Err(mut err) = set_discard_value(set as PyObjectRef, value as PyObjectRef) {
-        crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-    }
-}
-
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
     match crate::setitem(

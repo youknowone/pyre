@@ -12409,48 +12409,6 @@ pub(crate) fn try_walker_orthodox_set_add<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    try_walker_orthodox_set_method(
-        ctx,
-        code,
-        op,
-        r_args,
-        dst,
-        "add",
-        pyre_interpreter::opcode_ops::jit_set_add as *const (),
-    )
-}
-
-/// `s.discard(x)` twin of [`try_walker_orthodox_set_add`].  The same two
-/// `CallMayForceR` tax applies: without this arm a hot `discard` loop is
-/// an attribute lookup plus a bound-method call, where pypy keeps one
-/// `guard_nonnull_class(W_SetObject)` and one call.
-pub(crate) fn try_walker_orthodox_set_discard<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    try_walker_orthodox_set_method(
-        ctx,
-        code,
-        op,
-        r_args,
-        dst,
-        "discard",
-        pyre_interpreter::opcode_ops::jit_set_discard as *const (),
-    )
-}
-
-fn try_walker_orthodox_set_method<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-    method_name: &str,
-    residual: *const (),
-) -> Result<Option<()>, DispatchError> {
     if r_args.len() != 3 {
         return Ok(None);
     }
@@ -12465,9 +12423,9 @@ fn try_walker_orthodox_set_method<Sym: WalkSym>(
     }
 
     // Recognition: a bound method whose function is still the builtin
-    // `set.{add,discard}`, over an exact `set`.  The residual stores by
-    // container type instead of dispatching, which is sound only for a
-    // receiver that cannot be a subclass.
+    // `set.add`, over an exact `set`.  The residual stores by container
+    // type instead of dispatching, which is sound only for a receiver
+    // that cannot be a subclass.
     let set_typeobj = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
     let (inner_func, inner_self) = unsafe {
         if !pyre_object::function::is_method(callable) {
@@ -12488,7 +12446,7 @@ fn try_walker_orthodox_set_method<Sym: WalkSym>(
         if set_typeobj.is_null() || !std::ptr::eq((*inner_self).w_class, set_typeobj) {
             return Ok(None);
         }
-        if pyre_interpreter::lookup_in_type(set_typeobj, method_name) != Some(inner_func) {
+        if pyre_interpreter::lookup_in_type(set_typeobj, "add") != Some(inner_func) {
             return Ok(None);
         }
         (inner_func, inner_self)
@@ -12498,12 +12456,7 @@ fn try_walker_orthodox_set_method<Sym: WalkSym>(
     // store before recording so the recorded iteration is not skipped.
     // A raising `__hash__`/`__eq__` declines and the generic residual
     // performs the call (do not record IR on this path).
-    let applied = if method_name == "add" {
-        pyre_interpreter::opcode_ops::set_add_value(inner_self, value)
-    } else {
-        pyre_interpreter::opcode_ops::set_discard_value(inner_self, value)
-    };
-    if applied.is_err() {
+    if pyre_interpreter::opcode_ops::set_add_value(inner_self, value).is_err() {
         return Ok(None);
     }
 
@@ -12541,7 +12494,7 @@ fn try_walker_orthodox_set_method<Sym: WalkSym>(
     walker_guard_exact_w_class(ctx, op.pc, self_ref, set_typeobj)?;
 
     ctx.trace_ctx.call_may_force_void_typed_with_effect(
-        residual,
+        pyre_interpreter::opcode_ops::jit_set_add as *const (),
         &[self_ref, value_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
         majit_metainterp::default_effect_info(),
