@@ -8600,6 +8600,60 @@ mod tests {
         );
     }
 
+    /// The other side of the entry-point split, pinned because it is what
+    /// decides how much of the interpreter the young birth reaches.
+    ///
+    /// `alloc_with_type_no_collect` exists for a caller that holds the
+    /// returned pointer on the Rust stack without registering it as a root.
+    /// That caller cannot tolerate a collection *at* the allocation, and it
+    /// cannot tolerate one just afterwards either — a young birth would let
+    /// the next minor free the block while the unrooted local still names it.
+    /// So the born-old arm here is not an oversight the young birth forgot to
+    /// convert; it is the property the entry point is for.
+    ///
+    /// This is also the reason the young arm changes nothing an interpreter
+    /// workload can observe today. The oversized populations the host
+    /// allocates reach the collector on this side of the split — a list's
+    /// items block through `try_gc_alloc` (`object_array.rs`
+    /// `alloc_items_block_gc`), an rbigint's digits through
+    /// `alloc_oldgen_typed` — while the host callers of the *collecting*
+    /// entry (`listobject.rs`, `unicodeobject.rs`, `weakref.rs`) all pass a
+    /// fixed object-header size that is never oversized. Compiled code is the
+    /// door that does reach it, through `alloc_varsize_typed` above.
+    #[test]
+    fn the_no_collect_entry_keeps_its_born_old_arm_when_oversized() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+
+        let obj = gc.alloc_with_type_no_collect(tid, large);
+        assert!(!obj.is_null());
+        assert!(
+            !gc.is_young_rawmalloced(obj.0),
+            "the no-collect entry births an oversized object old"
+        );
+        let born_old_bytes = gc.oldgen.rawmalloced_bytes();
+
+        // The same type at the same size through the *collecting* entry, so
+        // neither assertion can pass by `is_young_rawmalloced` answering no to
+        // everything: the split is between the two entry points, not between
+        // two sizes or two types.
+        let collecting = gc.alloc_with_type(tid, large);
+        assert!(
+            gc.is_young_rawmalloced(collecting.0),
+            "the collecting entry births the same allocation young"
+        );
+
+        gc.do_collect_nursery();
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            born_old_bytes,
+            "one minor, two fates: the young block dies unreached and the \
+             born-old one survives with no root at all -- which is exactly \
+             what the no-collect entry's unrooted Rust local depends on"
+        );
+    }
+
     /// The other half of the same rule: reached means promoted, and promoted
     /// means the SAME address — a young rawmalloced object never moves.
     #[test]
