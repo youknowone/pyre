@@ -110,6 +110,11 @@ pub mod gate {
     pub const GUESS_CALL_KIND: &str = "call::guess_call_kind";
     /// The policy clause behind a discovery refusal.
     pub const LOOK_INSIDE_GRAPH: &str = "policy::look_inside_graph";
+    /// The `<[T]>::get(slice, i)` bounds-checked-diamond recognizer.  Its
+    /// three conjuncts answer different questions, so each records its own
+    /// reason: which one dominates decides whether the next stretch of work
+    /// is a `SliceIndex` widening or a narrow-root one.
+    pub const SLICE_GET_SITE: &str = "mir::recognize_slice_get_site";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.
@@ -251,10 +256,17 @@ pub fn record_reason(gate: &'static str, class: &'static str, reason: &str, subj
 /// decline, and the dump labels it so a reader cannot add it into one.
 #[inline]
 pub fn observe_accept(gate: &'static str, class: &'static str, subject: &str) {
-    if level() == Level::Off {
+    let level = level();
+    if level == Level::Off {
         return;
     }
     bump(gate, Cow::Borrowed(class), Some(subject));
+    if level == Level::Events {
+        // `[accept]`, not `[decline]`: the per-event lines are what a reader
+        // greps, and a shared prefix would put accepts into a decline count
+        // the summary rows deliberately keep apart.
+        eprintln!("[accept] {gate} {class}: {subject}");
+    }
 }
 
 /// Every `(gate, reason, events, distinct_subjects)` recorded so far,

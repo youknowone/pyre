@@ -12437,10 +12437,36 @@ impl<'a> Lowering<'a> {
         result_var: &Variable,
     ) -> Option<crate::front::slice_get::SliceGetSite> {
         if index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) != Some("Usize") {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "index-not-usize",
+                &self.graph.name,
+            );
             return None;
         }
-        self.option_residual_narrow_root(dest_ty)?;
-        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        if self.option_residual_narrow_root(dest_ty).is_none() {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "payload-has-no-narrow-root",
+                &self.graph.name,
+            );
+            return None;
+        }
+        let Some((option_owner, some_owner, payload_ty)) =
+            self.resolve_bool_then_option_dest(dest_ty)
+        else {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "dest-not-a-resolvable-option",
+                &self.graph.name,
+            );
+            return None;
+        };
+        crate::decline::observe_accept(
+            crate::decline::gate::SLICE_GET_SITE,
+            "site-recognized (ACCEPT, not a decline)",
+            &self.graph.name,
+        );
         Some(crate::front::slice_get::SliceGetSite {
             result_var: result_var.clone(),
             option_owner,
