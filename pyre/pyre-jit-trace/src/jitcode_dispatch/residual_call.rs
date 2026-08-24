@@ -5043,6 +5043,30 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     Some(())
 }
 
+/// The `CodeObject` of the frame the walk is currently in.
+///
+/// Every `__build_class__` the walker meets is reached with an empty
+/// `WalkSession::framestack` — a class statement is never inside an inlined
+/// callee sub-walk — so the portal jitcode's own code object is the code
+/// running the statement.
+fn walker_portal_py_code<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<&'static pyre_interpreter::CodeObject> {
+    let sym = ctx.fbw_mode.snapshot_sym;
+    if sym.is_null() {
+        return None;
+    }
+    // SAFETY: identical contract to the other `snapshot_sym` readers — the
+    // pointer is set only for the lifetime of the full-body walk.
+    let sym = unsafe { &*sym };
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let jitcode = unsafe { &*sym.jitcode() };
+    let code_ptr = jitcode.payload.code_ptr;
+    (!code_ptr.is_null()).then(|| unsafe { &*code_ptr })
+}
+
 /// Tracer-side `pyjitpl.py opimpl_jit_force_quasi_immutable` for the store a
 /// class statement performs.
 ///
@@ -5652,9 +5676,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // `jit_force_quasi_immutable` question before anything applies the call, so
     // the abort resumes the interpreter at this opcode with the class not yet
     // built.
+    //
+    // `opimpl_jit_force_quasi_immutable` raises only under `mutatebox.nonnull()`
+    // — nothing watching, nothing to abandon the trace for.  That test cannot be
+    // asked here: the namespace does not exist until the residual runs.  What
+    // stands in for it is the frame the statement runs in.  The abort earns its
+    // cost when the fresh class reaches the caller's trace and is promoted
+    // there, and a frame whose every return is a constant hands nothing back,
+    // so the question is not asked for one.  This reads the return value only;
+    // a class stored to a global, a cell or a container still escapes unseen,
+    // which loses the brake rather than applying a wrong one.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && walker_portal_py_code(ctx)
+            .is_none_or(|portal| !pyre_interpreter::code_returns_only_constants(portal))
         && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
     {
         // Carry the reason to the `abort_trace` that follows, the way upstream
