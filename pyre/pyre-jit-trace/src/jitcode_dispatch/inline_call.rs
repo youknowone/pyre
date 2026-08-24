@@ -5808,39 +5808,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
             // kept"), re-running every effect the walk already executed —
             // `threading.Thread.start` calling `_start_joinable_thread` twice.
-            // The `DeferredCall` admission above rests on "one it cannot inline
-            // aborts before executing and denies this callee".  A vable escape
-            // keeps the first half and drops the second: `trace.rs` routes
-            // `VableEscapedDuringResidualCall` to its own blackhole and
-            // escape-pc recovery, which never reaches
-            // `fbw_decline_inline_callee`.  What forced the vable is the callee
-            // body's own residual, so the next attempt rebuilds the same
-            // decision byte for byte until `MAX_TRACE_ABORT_COUNT` retires the
-            // ENCLOSING location — the failure `fbw_decline_inline_callee`'s
-            // note describes, and the whole of `locals_in_inlined_callee`'s
-            // `probe_closure` loop: five identical escapes at the callee's
-            // `locals()` and the loop is never compiled.  Refuse to inline it
-            // from here on, so the next attempt leaves the call residual --
-            // the state the `Dirty` classification produced before this body
-            // was admitted.  The walker's own set and not the warm state's:
-            // the callee must still reach its own portal, because the loops
-            // that do compile on this fixture ARE the callees' function-entry
-            // traces, and suppressing those reads `loops_compiled=2`.
-            //
-            // `foriter_deferred_admit` names the LEGACY `DeferredCall`
-            // admission only.  A body the poisoned-pc reading admits instead
-            // reaches this same escape without the deny, because that arm
-            // requires `!legacy_admit` and never sets this flag, so it rebuilds
-            // the decision until the enclosing key is retired.  Left as is
-            // deliberately: `fbw_inline_poison_enabled` gates that arm off by
-            // default and `gate-triage.md` records its ON arm as known wrong,
-            // so widening the deny here would change a default-off path whose
-            // resume leg is the thing actually being fixed.
-            if foriter_deferred_admit
-                && matches!(e, DispatchError::VableEscapedDuringResidualCall { .. })
-            {
-                fbw_deny_inline_callee_here(callee_code_key);
-            }
             if matches!(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }

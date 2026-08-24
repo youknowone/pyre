@@ -53,14 +53,7 @@
 # GetarrayitemGcR and aborting at the result branch.
 #
 # The abort is what this fixture guards, and check.py's regression floor gates
-# `loops_aborted` at 0 independently of the ratio below.  `forward` reaches that
-# floor through the admitted path, not around it: `load_deref_value` carries
-# `PyreHelperKind::LoadDeref`, so the body classifies `DeferredCall` rather than
-# `Dirty` and is admitted on its first attempt, and the `adjust(scaled)` call it
-# then reaches leaves its `Fraction.__add__` residual standing without breaking
-# the admission -- `fbw_abort_nested_unjournaled_residual` declines only the
-# hazardous self-recursive callee shape.  An abort at the LOAD_DEREF result
-# branch is the regression this guards.  Bridge resume must
+# `loops_aborted` at 0 independently of the ratio below.  Bridge resume must
 # retain the callee frame's own globals identity: treating its valid pc=0 as a
 # failed decode leaves two guards failing on nearly every iteration, while
 # guarding the callee namespace through the portal/root frame compiles an
@@ -85,17 +78,17 @@ from fractions import Fraction
 # point to keep the fixed point on a host that needs a few more iterations to
 # reach it.
 #
-# The seventh loop this fixture used to record was `forward`'s OWN
-# function-entry trace, and it existed only while `forward` stayed residual. A
-# residual CALL runs the callee through the interpreter, so its green key ticks
-# its own portal counter, reaches the threshold and compiles. Once
-# `load_deref_value` carries `PyreHelperKind::LoadDeref` the body classifies
-# `DeferredCall` instead of `Dirty`, the `DeferredCall` arm admits it, and both
-# `forward` and the `adjust` one level under it are inlined into the `<module>`
-# loop; `forward` is then only ever entered from compiled code, its portal
-# counter never trips, and the seventh trace is never attempted. `mc_diag`
-# reads `caro_funcentry=5 caro_backedge=1` with every `abrt_*` at zero -- the
-# loop is absent, not aborted.
+# Seven loops and the third guard failure are the `catch_exception/L` arm being
+# compiled: once jd0's staticdata carries the assembler's real opcode ids
+# instead of the 255 `op_live` sentinel, an exception the blackhole used to let
+# escape is caught. That arm stopped being reached for a while and the counters
+# fell back to six loops; it is reached again as of `d6408935b3c`, and all three
+# legs agreed on the way back up, which is what the current baselines record.
+# Two things about that return are unattributed. The guard failures did not come
+# back to the 1007/1012 pair the arm earned historically but to 1005/1009. And
+# wasm gained the loop as well -- its baseline moved off six at the same commit
+# -- while its guard failures stayed at 1004, so on that backend the arm costs a
+# loop and no guard failure.
 #
 # The earlier reading of this counter -- that the seventh loop was a
 # `catch_exception/L` blackhole arm -- does not survive measurement:
