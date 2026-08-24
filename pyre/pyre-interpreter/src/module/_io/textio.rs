@@ -491,7 +491,7 @@ impl W_TextIOWrapper {
     }
 
     fn size_limit(w_size: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-        if unsafe { pyre_object::is_none(w_size) } {
+        if w_size.is_null() || unsafe { pyre_object::is_none(w_size) } {
             return Ok(None);
         }
         let size = crate::builtins::space_index_w(w_size)?;
@@ -1127,7 +1127,7 @@ impl W_TextIOWrapper {
 
     fn readline(
         &mut self,
-        #[default(pyre_object::w_none())] w_size: PyObjectRef,
+        #[default(pyre_object::PY_NULL)] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed()?;
         self.ensure_read_decoder()?;
@@ -1135,6 +1135,13 @@ impl W_TextIOWrapper {
             return Err(super::unsupported("not readable"));
         }
         self.write_flush()?;
+        // PyPy `W_TextIOWrapper.readline_w` keeps the interp2app default as
+        // the untranslated null sentinel and rejects only an explicit None.
+        if !w_size.is_null() && unsafe { pyre_object::is_none(w_size) } {
+            return Err(crate::PyError::type_error(
+                "'NoneType' object cannot be interpreted as an integer",
+            ));
+        }
         self.readline_impl(Self::size_limit(w_size)?)
     }
 
@@ -1834,7 +1841,10 @@ impl W_TextIOWrapper {
     fn __next__(&mut self) -> Result<PyObjectRef, crate::PyError> {
         self.check_attached()?;
         self.telling = false;
-        let line = self.readline(w_none())?;
+        // PyPy `W_TextIOWrapper.next_w` reaches a virtual `readline()` with
+        // no limit argument; preserve that missing sentinel instead of
+        // manufacturing an explicit Python None.
+        let line = self.readline(PY_NULL)?;
         if unsafe { pyre_object::w_str_len(line) == 0 } {
             self.telling = self.seekable_flag;
             Err(crate::PyError::stop_iteration())

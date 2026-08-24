@@ -29,6 +29,19 @@ class DefaultDictSetDefaultOverride(defaultdict):
 setdefault_override = DefaultDictSetDefaultOverride(lambda: 3)
 assert setdefault_override["key"] == 3
 
+
+# PyPy app_defaultdict.defaultdict.__init__ writes default_factory through
+# the class slot descriptor, bypassing a subclass __setattr__ override.
+class DefaultDictSetAttrOverride(defaultdict):
+    def __setattr__(self, name, value):
+        raise AssertionError("defaultdict initialization called __setattr__")
+
+
+setattr_override = DefaultDictSetAttrOverride(int)
+assert setattr_override["missing"] == 0
+setattr_override["updated"] += 3
+assert setattr_override["updated"] == 3
+
 d = deque([0, 1, 2])
 
 d.append(1)

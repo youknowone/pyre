@@ -15078,7 +15078,7 @@ pub(crate) unsafe fn builtin_iter_replacement(
     if w_class.is_null() || std::ptr::eq(w_class, exact) {
         return None;
     }
-    let (src, method) = unsafe { lookup_where_pair(w_class, "__iter__") }?;
+    let (src, method) = unsafe { lookup_where_with_method_cache(w_class, "__iter__") }?;
     if std::ptr::eq(src, exact) {
         None
     } else {
@@ -15095,7 +15095,7 @@ unsafe fn builtin_iter_override(
     obj: PyObjectRef,
     base: &'static pyre_object::PyType,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    // `lookup_where_pair` walks the MRO and fills the method cache, so the
+    // typeobject.py `lookup` = `lookup_where_with_method_cache`.  The
     // receiver must survive that step to be the one handed to the override.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -15321,7 +15321,8 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__iter__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__iter__")
                 && !std::ptr::eq(src, exact)
             {
                 if is_none(method) {
@@ -15903,7 +15904,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // A subtype's Python `__next__` overrides W_ISlice.next_w.
             let exact = get_instantiate(&pyre_object::interp_itertools::ISLICE_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -15979,7 +15981,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_batched(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::BATCHED_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -16037,7 +16040,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_product(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::PRODUCT_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -16160,7 +16164,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_combinations(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -16314,7 +16319,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -16450,7 +16456,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_permutations(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::PERMUTATIONS_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);
@@ -16548,7 +16555,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         if pyre_object::interp_itertools::is_groupby(obj) {
             let exact = get_instantiate(&pyre_object::interp_itertools::GROUPBY_TYPE);
             if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_pair((*obj).w_class, "__next__")
+                && let Some((src, method)) =
+                    lookup_where_with_method_cache((*obj).w_class, "__next__")
                 && !std::ptr::eq(src, exact)
             {
                 return crate::call::call_function_impl_result(method, &[obj]);

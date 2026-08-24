@@ -4677,7 +4677,8 @@ unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__abs__") })
+    let Some((src, _)) =
+        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__abs__") })
     else {
         return true;
     };
@@ -4703,10 +4704,8 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let Some(tp) = crate::typedef::r#type(obj) else {
             return Err(abs_bad_operand(obj));
         };
-        // Uncached MRO walk: the method cache projects only the value half
-        // and a stale slot would resolve a heap-type override back to
-        // `int.__abs__`.
-        match crate::baseobjspace::lookup_where(tp.as_ptr(), "__abs__") {
+        // typeobject.py `lookup` = `lookup_where_with_method_cache`.
+        match crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__abs__") {
             Some((src, method))
                 if [
                     &pyre_object::INT_TYPE,
@@ -10690,7 +10689,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__float__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__float__") }
         {
             let result = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -10721,7 +10720,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
         if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__index__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__index__") }
         {
             let r = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -18726,7 +18725,8 @@ unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__round__") })
+    let Some((src, _)) =
+        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__round__") })
     else {
         return true;
     };
@@ -18861,7 +18861,7 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
     if let Some(tp) = crate::typedef::r#type(obj)
         && !slot
         && let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__round__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__round__") }
     {
         let result = unsafe {
             match ndigits {

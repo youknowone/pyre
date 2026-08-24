@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## Primary porting boundary: PyPy's module surface
+
+**PyPy's implementation shape is the default and module presence follows
+PyPy.** Before implementing any module, first verify that the real `pypy3`
+oracle imports it and identify its owner in `pypy/`, `rpython/`, or
+`lib_pypy/`. If PyPy has no such module, it is not a pyre porting target unless
+the user explicitly expands the scope. A skipped CPython test does not override
+this boundary; fix PyPy's real public-module owner or fallback instead. See
+“Module presence follows PyPy” below for the full rule and examples.
+
 ## The JIT is generated from the interpreter source
 
 pyre is structured like PyPy: `pyre-interpreter` is the RPython-interpreter
