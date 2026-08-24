@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: rebuilds a code object through `types.CodeType` to reach `co_firstlineno <= 0`; pypy3 has no `co_exceptiontable` to hand it
 # CPython-suite gap: `test_code`, `test_frame` and `test_traceback` only ever
 # build code objects whose `co_firstlineno` is a real source line, and
 # `code.replace(co_firstlineno=...)` rejects anything below 1.  The

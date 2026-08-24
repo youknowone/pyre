@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins the line a NO_LOCATION range reports; pypy3's 3.11 codegen gives a `with` cleanup real positions and emits no such range
 # CPython-suite gap: `test_traceback`, `test_frame` and `test_sys_settrace` all
 # read line numbers, but only off instructions the compiler gave a position to.
 # Nothing in the suite stops on one of the `NO_LOCATION` ranges a `with` or a

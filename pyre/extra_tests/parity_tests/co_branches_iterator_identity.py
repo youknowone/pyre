@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins the object `co_branches()` returns; pypy3 has no `co_branches` at all
 # CPython-suite gap: `test_monitoring` and `test_code` read the *values*
 # `co_branches()` yields and never look at the object producing them, so a
 # runtime that materializes the whole list up front and hands back a generic

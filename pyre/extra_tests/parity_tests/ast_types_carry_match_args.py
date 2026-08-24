@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins `__match_args__` on every `_ast` type, the base included; pypy3 binds it on the concrete nodes but `ast.AST` carries none
 # CPython-suite gap: `test_ast` reads `_fields` on every node type but never
 # reads `__match_args__`, and its pattern-matching tests build their own
 # classes.  A runtime that binds only `_fields` passes the whole module while
@@ -12,7 +13,9 @@
 # `TypeError: Expr() accepts 0 positional sub-patterns` and every traceback
 # rendered through `traceback.py` loses its `~`/`^` anchor row.
 #
-# PyPy 7.3.20 builds `_ast` the same way and passes.
+# PyPy 7.3.20 binds `__match_args__` on the concrete node types the same
+# way, `Pass` and its empty tuple included, but leaves the base `ast.AST`
+# without one, so the last line of the surface check cannot hold there.
 
 import ast
 import sys
