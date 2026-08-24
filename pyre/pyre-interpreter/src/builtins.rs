@@ -784,6 +784,9 @@ pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
 
 /// Little-endian unsigned unpack of one `itemsize`-wide element at byte
 /// offset `base` — the fallback for formats the shared decoder rejects.
+///
+/// `itemsize` is at most the width of the result; a wider item has no integer
+/// to fold into, and the caller answers with its bytes instead.
 fn memoryview_unpack(data: &[u8], itemsize: usize, base: usize) -> i64 {
     let mut val: i64 = 0;
     for j in 0..itemsize {
@@ -802,6 +805,18 @@ fn memoryview_format_code(fmt: &str) -> u8 {
         Some(b'@' | b'=' | b'<' | b'>' | b'!') => b.get(1).copied().unwrap_or(b'B'),
         Some(&c) => c,
         None => b'B',
+    }
+}
+
+/// `memoryobject.c adjust_fmt` — the one character a format an element can be
+/// read or written through is, with a leading `@` stripped.  Anything else
+/// names a compound item, which a view does not take apart.
+fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
+    match fmt.strip_prefix('@').unwrap_or(fmt).len() {
+        1 => Ok(()),
+        _ => Err(crate::PyError::not_implemented(format!(
+            "memoryview: unsupported format {fmt}"
+        ))),
     }
 }
 
@@ -825,10 +840,16 @@ unsafe fn memoryview_unpack_element(
         }
         tc => {
             let w = pyre_object::interp_array::unpack_value(tc, buf);
-            if w == pyre_object::PY_NULL {
+            if w != pyre_object::PY_NULL {
+                w
+            } else if itemsize <= size_of::<i64>() {
                 w_int_new(memoryview_unpack(data, itemsize, base))
             } else {
-                w
+                // An item wider than the fold above: its bytes, which is all
+                // the one caller still reaching here needs.  `==` compares
+                // element by element and every other operation has refused
+                // the format by now (`memoryview_adjust_fmt`).
+                pyre_object::bytesobject::w_bytes_from_bytes(buf)
             }
         }
     }
@@ -1164,6 +1185,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return memoryview_slice_view(mv, index);
         }
         if index_check(index) {
+            memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
                     "invalid indexing of 0-dim memory",
@@ -1200,6 +1222,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
             if all_index {
+                memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
                 let length = pyre_object::w_tuple_len(index) as i64;
                 if length < ndim {
                     return Err(crate::PyError::not_implemented(
@@ -1248,6 +1271,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
         if w_memoryview_readonly(mv) {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
@@ -1428,6 +1452,7 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         crate::baseobjspace::iter(w_list_new(memoryview_values(mv)))
     }
 }
@@ -1606,6 +1631,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if ndim == 0 {
             // `buffer.py w_tolist` raises for a 0-dim view.

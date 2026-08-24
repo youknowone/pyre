@@ -263,6 +263,30 @@ static PyObject *wr_cleared_count(PyObject *s, PyObject *unused)
 { (void)s; (void)unused; return PyLong_FromLong(wr_cleared); }
 
 #define M(name, fn) {name, fn, METH_O, NULL}
+/* A one-dimensional view whose format names two members per item.  Such a
+   view usually comes from `_testbuffer`'s `ndarray`; this is the same shape
+   built by hand, so the fixture needs no second extension. */
+static unsigned int compound_storage[4] = {1, 2, 3, 4};
+static Py_ssize_t compound_shape[1] = {2};
+static Py_ssize_t compound_strides[1] = {2 * sizeof(unsigned int)};
+
+static PyObject *mv_compound_format(PyObject *self, PyObject *unused)
+{
+    Py_buffer view;
+    (void)self;
+    (void)unused;
+    memset(&view, 0, sizeof(view));
+    view.buf = compound_storage;
+    view.len = (Py_ssize_t)sizeof(compound_storage);
+    view.itemsize = 2 * (Py_ssize_t)sizeof(unsigned int);
+    view.format = "II";
+    view.ndim = 1;
+    view.shape = compound_shape;
+    view.strides = compound_strides;
+    view.readonly = 1;
+    return PyMemoryView_FromBuffer(&view);
+}
+
 /* ── struct.Struct ── */
 
 /* `_struct.c` keeps the byte size and the value count as fields of
@@ -298,6 +322,7 @@ static PyMethodDef methods[] = {
     {"cx_basicsize", cx_basicsize, METH_NOARGS, NULL},
 
     {"mv_contiguous", mv_contiguous, METH_VARARGS, NULL},
+    {"mv_compound_format", mv_compound_format, METH_NOARGS, NULL},
 
     M("wr_check", wr_check), M("wr_check_ref", wr_check_ref),
     M("wr_check_proxy", wr_check_proxy), M("wr_new_ref", wr_new_ref),

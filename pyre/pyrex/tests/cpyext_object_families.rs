@@ -268,6 +268,34 @@ eq('an order that is none of the three', m.mv_contiguous(b'abcdef', 'r', 'X'),
 kind, _ = m.mv_contiguous(object(), 'r', 'C')
 eq('an object with no buffer to export', kind, 'TypeError')
 
+# An item naming two members is one the view does not take apart: the geometry
+# is readable, and every operation that would read or write a single element
+# refuses.  `adjust_fmt` is reached before the dimension and before the
+# writability check, so the format is what each of them reports.
+compound = m.mv_compound_format()
+eq('compound geometry',
+   (compound.format, compound.itemsize, compound.nbytes, compound.ndim),
+   ('II', 8, 16, 1))
+
+wanted = ('NotImplementedError', 'memoryview: unsupported format II')
+for what, call in (
+    ('getitem', lambda: compound[0]),
+    ('getitem tuple', lambda: compound[0,]),
+    ('setitem', lambda: compound.__setitem__(0, 8)),
+    ('slice assignment', lambda: compound.__setitem__(slice(0, 1), b'')),
+    ('tolist', compound.tolist),
+    ('iter', lambda: list(compound)),
+):
+    try:
+        call()
+    except Exception as exc:
+        eq(what, (type(exc).__name__, str(exc)), wanted)
+    else:
+        raise AssertionError('%s did not refuse' % what)
+
+# The geometry stays readable, and so does the raw memory.
+eq('compound bytes', compound.tobytes(), bytes(compound))
+
 print('cpyext-memoryview-ok')
 "#;
 
