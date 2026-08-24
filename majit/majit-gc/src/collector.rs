@@ -8167,7 +8167,14 @@ impl GcAllocator for MiniMarkGC {
             return;
         }
         unsafe { (*hdr).set_flag(flags::FINALIZER_REGISTERED) };
-        if self.oldgen.contains(obj.0) {
+        // `oldgen.contains` is not the "is it old" question on its own: both
+        // raw-malloc births share `try_rawmalloc_block`, so a young one is in
+        // `rawmalloced_payloads` as well and answers yes. It has to be excluded
+        // here, because filing it as old skips the GCFLAG_VISITED_RMY stamp
+        // `deal_with_young_objects_with_finalizers` owes a raw-malloced member,
+        // and `free_young_rawmalloced_objects` then releases the block at the
+        // end of that minor with its address still on the old deque.
+        if self.oldgen.contains(obj.0) && !self.is_young_rawmalloced(obj.0) {
             // Pyre's host allocations can be born directly in old-gen and an
             // explicit non-moving major intentionally skips the leading minor.
             // This is the post-`_trace_drag_out1` destination of PyPy's
@@ -8671,6 +8678,54 @@ mod tests {
             "one minor, two fates: the young block dies unreached and the \
              born-old one survives with no root at all -- which is exactly \
              what the no-collect entry's unrooted Rust local depends on"
+        );
+    }
+
+    /// incminimark.py:1755-1760 `register_finalizer` appends to
+    /// `probably_young_objects_with_finalizers` unconditionally, and that deque
+    /// is what makes the registration a root for the next minor.
+    /// `deal_with_young_objects_with_finalizers` is already written for a
+    /// raw-malloced member: it stamps GCFLAG_VISITED_RMY instead of copying the
+    /// object out, then hands it to the old deque itself.
+    ///
+    /// Pyre routes an object it considers already old straight to the old
+    /// deque, which is sound for a born-old allocation. `oldgen.contains` is
+    /// not that question though: both raw-malloc births share
+    /// `try_rawmalloc_block`, so a YOUNG raw-malloced object sits in
+    /// `rawmalloced_payloads` as well and answers yes. Filing it as old skips
+    /// the stamp, and `free_young_rawmalloced_objects` then releases the block
+    /// at the end of that same minor while the old deque still holds its
+    /// address.
+    #[test]
+    fn a_young_large_finalizer_registration_survives_its_first_minor() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+
+        let obj = gc.alloc_with_type(tid, large);
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "the collecting entry births an oversized allocation young"
+        );
+        let registered_bytes = gc.oldgen.rawmalloced_bytes();
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+
+        // Deliberately unrooted: the registration is the only thing that can
+        // keep this block alive, which is the property being tested.
+        gc.do_collect_nursery();
+
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            registered_bytes,
+            "a registered finalizer is a root for the minor, so the block is \
+             promoted -- not freed with its address left on the old deque"
+        );
+        assert!(
+            !gc.is_young_rawmalloced(obj.0),
+            "and the promotion moves it off the young list rather than leaving \
+             it to be freed by a later minor"
         );
     }
 
