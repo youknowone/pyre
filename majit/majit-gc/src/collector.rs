@@ -2172,8 +2172,7 @@ impl MiniMarkGC {
             // `rawmalloced_payloads` like an old one, so it has to be asked
             // about separately — the same reading `bh_probe_stale_young_slots`
             // takes.
-            let holder_is_old =
-                self.oldgen.contains(here) && !self.is_young_rawmalloced(here);
+            let holder_is_old = self.oldgen.contains(here) && !self.is_young_rawmalloced(here);
             let remembered = self.remembered_set.contains(&here);
             let parent_remembered = parent.is_some_and(|p| self.remembered_set.contains(&p));
             self.visit_referent_slots(here, &mut |slot| {
@@ -8503,7 +8502,10 @@ mod tests {
 
         let obj = gc.alloc_with_type(tid, large);
         assert!(!obj.is_null());
-        assert!(!gc.is_in_nursery(obj.0), "an oversized object skips the nursery");
+        assert!(
+            !gc.is_in_nursery(obj.0),
+            "an oversized object skips the nursery"
+        );
         assert!(
             gc.is_young_rawmalloced(obj.0),
             "an oversized object from a collecting entry point is born young"
@@ -8630,7 +8632,10 @@ mod tests {
             gc.do_get_objects(generation, &mut |obj| seen.push(obj.0));
             seen
         };
-        assert!(collect(&mut gc, 0).contains(&addr), "born into generation 0");
+        assert!(
+            collect(&mut gc, 0).contains(&addr),
+            "born into generation 0"
+        );
         assert!(
             !collect(&mut gc, 2).contains(&addr),
             "not old while a minor can still free it"
@@ -8639,7 +8644,10 @@ mod tests {
         gc.do_collect_nursery();
 
         assert_eq!(root.0, addr, "a non-moving object keeps its address");
-        assert!(collect(&mut gc, 2).contains(&addr), "the promotion moves it");
+        assert!(
+            collect(&mut gc, 2).contains(&addr),
+            "the promotion moves it"
+        );
         assert!(!collect(&mut gc, 0).contains(&addr));
 
         gc.roots.clear();
