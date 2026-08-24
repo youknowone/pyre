@@ -2482,12 +2482,36 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         (!w.is_null() && unsafe { pyre_object::is_int(w) })
             .then(|| unsafe { pyre_object::intobject::w_int_get_value(w) })
     };
-    let filename = wtf8_of(attr("filename"));
+    // `traceback.py _format_syntax_error`: the header goes out whenever the
+    // instance carries a line number, with the filename rendered through
+    // `str()` -- a `bytes` filename shows as `b'…'` -- and `<string>` standing
+    // in for one that is falsy. Without a line number there is no header and
+    // the filename becomes a ` (…)` suffix on the message line instead.
+    //
+    // Each read below takes the attribute off the pinned exception again
+    // rather than holding one reference across a call that re-enters Python.
+    let filename_is_set = {
+        let w = attr("filename");
+        !w.is_null() && !unsafe { pyre_object::is_none(w) }
+    };
+    let filename_is_truthy =
+        filename_is_set && crate::baseobjspace::is_true(attr("filename")).unwrap_or(true);
+    let filename_text = filename_is_set.then(|| {
+        unsafe { crate::py_str_wtf8(attr("filename")) }
+            .unwrap_or_else(|_| Wtf8Buf::from_string(String::new()))
+    });
     let lineno = int_of(attr("lineno"));
-    if let (Some(fname), Some(lineno)) = (filename.as_ref(), lineno) {
+    let mut filename_suffix = None;
+    if let Some(lineno) = lineno {
+        let shown = match (&filename_text, filename_is_truthy) {
+            (Some(text), true) => text.as_bytes(),
+            _ => b"<string>".as_slice(),
+        };
         writer.write_all(b"  File \"")?;
-        writer.write_all(fname.as_bytes())?;
+        writer.write_all(shown)?;
         writeln!(writer, "\", line {lineno}")?;
+    } else {
+        filename_suffix = filename_text;
     }
     if let Some(text) = wtf8_of(attr("text")) {
         // A constructor-supplied `text` is any str, so it may hold a lone
@@ -2533,10 +2557,15 @@ fn write_syntax_error_object<W: Write>(writer: &mut W, exc: PyObjectRef) -> std:
         Some(msg) if !msg.is_empty() => {
             write!(writer, "{name}: ")?;
             writer.write_all(msg.as_bytes())?;
-            writer.write_all(b"\n")
         }
-        _ => writeln!(writer, "{name}"),
+        _ => write!(writer, "{name}")?,
     }
+    if let Some(suffix) = filename_suffix {
+        writer.write_all(b" (")?;
+        writer.write_all(suffix.as_bytes())?;
+        writer.write_all(b")")?;
+    }
+    writer.write_all(b"\n")
 }
 
 /// Emit `write_syntax_error` through the mediated stderr seam, mirroring
