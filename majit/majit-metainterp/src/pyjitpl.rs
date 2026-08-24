@@ -2580,19 +2580,29 @@ impl<M: Clone> MetaInterp<M> {
     /// hook see every failure, since bridge-compilation thresholds and guard
     /// attribution still apply to the poll.
     #[inline]
+    ///
+    /// `trace_id` names the trace the failing descr belongs to, and it is not
+    /// redundant with `fail_index`: an index is allocated per trace, so a
+    /// bridge's own guards re-use the numbers of the loop they hang off.
+    /// Without it an event log cannot say whether a coordinate that keeps
+    /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
+    /// have patched away once a bridge attached (`compile.py`) — or a fresh
+    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
+    /// measurement that made the distinction load-bearing.
     fn record_guard_failure_event(
         &mut self,
         green_key: u64,
+        trace_id: u64,
         fail_index: u32,
         back_edge_poll: bool,
     ) {
         if guardlog_enabled() {
-            eprintln!("@@@GUARD key={green_key} fail={fail_index}");
+            eprintln!("@@@GUARD key={green_key} tid={trace_id} fail={fail_index}");
         }
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] guard failure at key={}, guard={}",
-                green_key, fail_index
+                "[jit] guard failure at key={}, tid={}, guard={}",
+                green_key, trace_id, fail_index
             );
         }
         let tally = if back_edge_poll {
@@ -10707,7 +10717,7 @@ impl<M: Clone> MetaInterp<M> {
                 .descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -10796,7 +10806,7 @@ impl<M: Clone> MetaInterp<M> {
             let back_edge_poll = descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         let exit_arity = exit_types.len();
@@ -11123,7 +11133,7 @@ impl<M: Clone> MetaInterp<M> {
             let back_edge_poll = descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         // Fresh lookup, and fallible: the run can re-enter the driver through

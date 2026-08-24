@@ -475,6 +475,36 @@ fn default_enable_opts() -> Vec<String> {
 /// across nine fail indices, so the sixty bridges built there do not converge —
 /// the ban is holding a bridge non-convergence shut.  Reopening it means fixing
 /// that first; the two numbers above are the acceptance test.
+///
+/// A SECOND, INDEPENDENT ROUTE reached the same wall, which is what pins the
+/// diagnosis.  `abort_trace_live` (`pyjitpl.rs`) charges `abort_tracing` to the
+/// trace's green key, and a bridge session's green key is the source loop's,
+/// so guard-side walks that gave up were driving already-compiled loops into
+/// this ceiling — `synth/generator_frame_handout_image` reaches it with 14
+/// such charges and `loops_aborted=0`, i.e. no primary trace aborted there at
+/// all.  Not charging them is the upstream answer: `aborted_tracing` reads
+/// `greenkey = None # we're in the bridge` and touches no JitCell, and a
+/// bridge never passes through `bound_reached`, which is the only place
+/// upstream touches a cell for a trace.  Doing it removed one of
+/// `generator_tree_recursion`'s two bans and reproduced the paragraph above to
+/// the digit — `bridges_compiled` 26 -> 60, `guard_failures` 2999 -> 25297,
+/// `loops_aborted` 0 -> 3, ratio 41.7x/32.4x — with every other row of the
+/// corpus unchanged on all three backends.
+///
+/// What is known about that unbanned loop, from `MAJIT_GUARDLOG=1` over the bad
+/// regime.  Bridges are NOT decorative there: `MAJIT_NO_BRIDGE=1` on the same
+/// binary reads 239874 guard failures against 25297 with bridges on, so the
+/// tally counts failures a bridge serves as well as deopts, and the 25297 is
+/// 8.4x the banned regime's 2999 at the SAME `loops_compiled=3`.  Every
+/// `(trace_id, fail_index)` coordinate is offered a bridge exactly once in the
+/// whole run — 103 offers, 60 bridges — and `must_compile` answers no to all
+/// 21802 later failures at those coordinates, one of which (`trace` 7,
+/// `fail` 2) accounts for 7777 by itself.  Whether those 43 offers that
+/// produced no bridge should have been retried the way `must_compile` retries
+/// upstream (`jitcounter.tick` resets the counter when a bridge does not
+/// compile, `compile.py done_compiling`) is the open question; reading it
+/// needed `trace_id` next to `fail_index`, since an index is allocated per
+/// trace and a bridge re-uses the numbers of the loop it hangs off.
 const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
