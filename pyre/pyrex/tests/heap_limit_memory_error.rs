@@ -59,6 +59,14 @@ const WORDS: usize = 1024;
 /// never raises terminates with a diagnosis instead of hanging.
 const ROUNDS: usize = 25_000;
 
+/// 160 KiB of items per object, which puts each one over the collector's
+/// `large_object_threshold` of `(16384 + 512) * 8` bytes and so onto a
+/// different allocation path from `WORDS` — see the large-object test.
+const WORDS_LARGE: usize = 20_000;
+
+/// `ROUNDS_LARGE * WORDS_LARGE * 8` = 320 MiB, again well past the limit.
+const ROUNDS_LARGE: usize = 2_000;
+
 /// Keeps every object reachable, so the live set really does grow — a dead one
 /// would be reclaimed and the limit never reached.
 const GROW: &str = "\
@@ -69,9 +77,13 @@ print('completed')
 ";
 
 fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
+    run_shape(env, args, ROUNDS, WORDS)
+}
+
+fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -> Output {
     let src = GROW
-        .replace("ROUNDS", &ROUNDS.to_string())
-        .replace("WORDS", &WORDS.to_string());
+        .replace("ROUNDS", &rounds.to_string())
+        .replace("WORDS", &words.to_string());
     let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     argv.push("-c".to_string());
     argv.push(src);
@@ -133,6 +145,64 @@ fn a_bounded_heap_reports_a_memory_error_rather_than_only_aborting() {
         "{}",
         report("the limit never became a Python exception", &out)
     );
+}
+
+/// Objects past `large_object_threshold` are not exempt from the limit.
+///
+/// They take a different allocation path — `alloc_with_type_slow` hands them
+/// to `alloc_in_oldgen_clear` and returns, ahead of the point where a nursery
+/// allocation would consult `oom_pending` — so "the policy is enforced" does
+/// not follow from the two tests above, which only ever allocate under the
+/// threshold. It holds for a different reason, and that reason is worth
+/// pinning: the breach is detected in the collector, by the safepoint-driven
+/// collection that observes the old generation growing, rather than in an
+/// allocator's return path. Routing the exception through the eval-breaker
+/// word is what makes that detection point able to report at all, so this
+/// shape would regress with the small one if the channel were removed —
+/// but it would also regress alone if delivery were moved back into the
+/// nursery allocator, which is the case the tests above cannot see.
+///
+/// Both dispatch loops in one test: the seam they share is already covered
+/// per-loop above, and what is new here is only the allocation path.
+#[test]
+fn objects_over_the_large_object_threshold_are_bounded_too() {
+    // Its own control, for the reason the small shape has one, plus one it
+    // does not: this shape asks the host for 320 MiB, and a host that cannot
+    // supply that would fail the assertions below for a reason that has
+    // nothing to do with `--heapsize`.
+    let control = run_shape(&[], &[], ROUNDS_LARGE, WORDS_LARGE);
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains("completed"),
+        "{}",
+        report("large objects, unbounded control did not finish", &control)
+    );
+
+    let limit = HEAP_LIMIT.to_string();
+    for env in [&[][..], &[("PYRE_JIT", "0")][..]] {
+        let out = run_shape(env, &["--heapsize", &limit], ROUNDS_LARGE, WORDS_LARGE);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let what = if env.is_empty() {
+            "large objects, jit loop"
+        } else {
+            "large objects, plain loop"
+        };
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("completed"),
+            "{}",
+            report(
+                &format!("{what}: the limited run was not bounded at all"),
+                &out
+            )
+        );
+        assert!(
+            stderr.contains("MemoryError"),
+            "{}",
+            report(
+                &format!("{what}: the limit never became a Python exception"),
+                &out
+            )
+        );
+    }
 }
 
 /// The same, on the plain evaluator.
