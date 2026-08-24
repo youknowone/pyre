@@ -13307,35 +13307,6 @@ mod tests {
         assert_eq!(recorded, vec![OpCode::GuardNonnull], "{recorded:?}");
     }
 
-    /// `nullity_now_known` records a known-**null** box too, and upstream's
-    /// `is_nullity_known` answers true for it, so a second nullity branch on
-    /// that box short-circuits instead of re-guarding. Reading only
-    /// `Some(true)` out of pyre's three-valued answer emits a second
-    /// `GUARD_ISNULL`.
-    ///
-    /// The two branches must read the box through **different registers**.
-    /// The null arm rebinds only the register it was handed, so branching on
-    /// the same one twice reaches the heapcache holding `CONST_NULL` — a
-    /// constant, which upstream answers false for — and the test would pass
-    /// without ever exercising the known-null answer.
-    #[test]
-    fn a_second_nullity_branch_on_a_known_null_box_is_answered_by_the_heapcache() {
-        let mut builder = JitCodeBuilder::new();
-        let first = builder.new_label();
-        builder.goto_if_not_ptr_nonzero(0, first);
-        builder.mark_label(first);
-        let second = builder.new_label();
-        builder.goto_if_not_ptr_nonzero(1, second);
-        builder.mark_label(second);
-        let aliased = OpRef::input_arg_ref(0);
-        let recorded = traced_opcodes(
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            &builder.finish(),
-            &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
-        );
-        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
-    }
-
     /// The null arm's `replace_box(box, constant_from_op(box))`: the source
     /// register comes out of the branch holding `CONST_NULL`, so a following
     /// nullity read of it folds instead of recording a `PTR_NE`.

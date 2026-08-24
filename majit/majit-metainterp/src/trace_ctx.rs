@@ -5837,6 +5837,33 @@ mod tests {
         assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
     }
 
+    /// `heapcache.py is_nullity_known` answers truthy for a non-`Const` box
+    /// whatever its nullity — `nullity_now_known` sets one flag for both — and
+    /// falsy for a null `Const`, whose answer is `bool(box.getref_base())`.
+    ///
+    /// Pinned here rather than through a second nullity branch: the walker's
+    /// `replace_box` puts `CONST_NULL` in every register naming the box, so
+    /// after the null arm no branch can reach it as a non-constant again.
+    #[test]
+    fn a_known_null_box_answers_the_nullity_question_unless_it_is_constant() {
+        let mut ctx = TraceCtx::for_test(1);
+        let box_ = OpRef::input_arg_ref(0);
+        assert!(
+            !ctx.heapcache_nullity_answered(box_),
+            "an unknown box answers nothing",
+        );
+        ctx.heap_cache_mut().nullity_now_known(box_, false);
+        assert!(
+            ctx.heapcache_nullity_answered(box_),
+            "a non-constant box known to be null short-circuits",
+        );
+        let null = ctx.const_null();
+        assert!(
+            !ctx.heapcache_nullity_answered(null),
+            "a null constant falls through to the guard arm",
+        );
+    }
+
     /// M1: constant OpRefs resolve via `OpRef::inline_const_to_value` for
     /// type-preserving Box::Const* construction.
     #[test]
