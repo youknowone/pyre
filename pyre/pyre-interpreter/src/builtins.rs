@@ -1625,18 +1625,15 @@ unsafe fn memoryview_tolist_rec(
     }
 }
 
-/// `memoryview.tolist` — the element-value list (format-aware); a 1-D view
-/// is flat, an N-D view nests one list per dimension (`_tolist_rec`).
+/// `memoryview.tolist` — the element-value list (format-aware); a 0-D view
+/// answers its one element bare, a 1-D view is flat, an N-D view nests one
+/// list per dimension (`_tolist_rec`).
 fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
         memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
-        if ndim == 0 {
-            // `buffer.py w_tolist` raises for a 0-dim view.
-            return Err(crate::PyError::not_implemented(""));
-        }
         if ndim == 1 {
             return Ok(w_list_new(memoryview_values(mv)));
         }
@@ -1646,6 +1643,9 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .backing()
             .as_bytes();
         let start = pyre_object::memoryview::w_memoryview_offset(mv);
+        if ndim == 0 {
+            return Ok(memoryview_unpack_element(fmt, full, start as usize, isz));
+        }
         Ok(memoryview_tolist_rec(mv, fmt, full, isz, ndim, 0, start))
     }
 }
