@@ -1193,8 +1193,15 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
 /// `ArrayRead` `front::mir`'s `is_vec_index_call` emits, or a residual
 /// `<[T]>::get` — plus the element-bank and classdef facts that say whether
 /// the projections off the element resolved.
+///
+/// `array_descr_keys` is parallel to `array_reads`: the `(array_type_id,
+/// nolength)` pair the same `ArrayRead` carries. Together with the item bank
+/// that pair is the whole descr key `codewriter::assembler`'s `ArrayRead` arm
+/// hands to `arraydescrof`, so recording it lets a test mint the very descr
+/// the bytecode emit would.
 struct SlotReadShape {
     array_reads: Vec<majit_translate::model::ValueType>,
+    array_descr_keys: Vec<(Option<String>, bool)>,
     residual_gets: usize,
     typed_discriminant_reads: usize,
     classdefless_discriminant_reads: usize,
@@ -1205,6 +1212,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
     let graph = lower_function(load_corpus(), name).expect("lowering");
     let mut shape = SlotReadShape {
         array_reads: Vec::new(),
+        array_descr_keys: Vec::new(),
         residual_gets: 0,
         typed_discriminant_reads: 0,
         classdefless_discriminant_reads: 0,
@@ -1212,7 +1220,17 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
-                OpKind::ArrayRead { item_ty, .. } => shape.array_reads.push(item_ty.clone()),
+                OpKind::ArrayRead {
+                    item_ty,
+                    array_type_id,
+                    nolength,
+                    ..
+                } => {
+                    shape.array_reads.push(item_ty.clone());
+                    shape
+                        .array_descr_keys
+                        .push((array_type_id.clone(), *nolength));
+                }
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
@@ -1235,28 +1253,77 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
     shape
 }
 
-/// `v[i]` on a `Vec<T>` with a scalar subscript is lowered eagerly to an
-/// `ArrayRead` by `front::mir`'s `is_vec_index_call`, and that arm gates on
-/// the index type alone — the element bank it produces is whatever
-/// `tyref_deref_value_type` answers. `aggregate_slot_index` reads a
-/// multi-word by-value enum and matches it, so the discriminant read and the
-/// per-variant payload reads all land on the `ArrayRead` result: the shape
-/// that says whether the element alias carries an aggregate or is silently
-/// mis-shaped.
+/// A defect witness, not an endorsement. `&v[i]` on a `Vec<T>` whose `T` is
+/// a multi-word by-value ADT stored inline lowers to an `ArrayRead` whose
+/// descr strides by **one word**. Every index > 0 therefore addresses the
+/// wrong element, and even index 0 loads only the element's first word —
+/// whichever of the tag or a payload field `repr(Rust)` put there — and banks
+/// that word as a GC reference. Nothing below is a licence to
+/// spell a hot read as `&v[i]` over such a `Vec`; the front-end shape this
+/// test pins is what majit produces today, and it is wrong.
 ///
-/// `aggregate_slot_get` is the control, and it is load-bearing. It is the
-/// same body spelled with `<[T]>::get`, whose `Option<&SlotValue>`
-/// destination `recognize_slice_get_site` either lifts to
-/// `front::slice_get`'s diamond or declines. If the two functions lowered
-/// alike the pair would discriminate nothing, and no conclusion about the
-/// index arm could be drawn from either one.
+/// The chain, by symbol:
+///
+/// 1. `front::mir`'s `is_vec_index_call` arm sets `item_ty =
+///    tyref_deref_value_type(call.dest.ty)`, dereferencing the `&T` that
+///    `Index::index` returns down to `T`. The arm's own header comment says
+///    the `Deref` read collapses onto the bound element, so the `ArrayRead`
+///    result models the element **value** and no address of it survives.
+/// 2. `tyref_deref_value_type` delegates to `tyref_to_value_type`, whose
+///    every non-primitive ADT falls through to `ValueType::Ref(None)`. The
+///    element's width is gone by this point.
+/// 3. The same arm stamps `array_type_id = Some(PYOBJECT_GCARRAY_TYPE_ID)`
+///    only when `is_workspace_index_call` held. The `Vec<T>` leg is not a
+///    workspace index, so it ships `array_type_id: None` — the ARRAY has no
+///    identity at all.
+/// 4. `codewriter::call`'s `arraydescrof_concrete` derives `elem_ref` from
+///    `array_type_id`, so a `None` identity leaves `elem_ref` `None`. That
+///    makes the `ArrayFlag::Struct` arm — the only one that reaches
+///    `compute_struct_size` and so the only one that could produce a
+///    multi-word stride — unreachable, and the else arm sets `item_size =
+///    layout::target_word_size()`.
+/// 5. `codewriter::assembler` names the op `getarrayitem_gc_r` off the `Ref`
+///    bank, and `majit-backend-cranelift`'s `GetarrayitemGcR` arm computes
+///    `base + base_size + index * item_size`, loads `item_size` bytes, and
+///    banks the result by `ArrayDescr::item_type`.
+///
+/// `aggregate_slot_get` is the **safe** spelling of the same read, and it is
+/// the control precisely because it does not take this path: its
+/// `Option<&SlotValue>` destination leaves the call residual, so real Rust
+/// computes the element address at the real `size_of::<SlotValue>()` stride.
+/// It is not an inferior alternative to the index spelling — until the descr
+/// is fixed it is the correct one. Its value as a control is unchanged: if
+/// the two functions lowered alike the pair would discriminate nothing, and
+/// no conclusion about the index arm could be drawn from either.
 #[test]
-fn an_aggregate_element_indexes_to_an_array_read_where_get_stays_residual() {
+fn an_aggregate_element_array_read_is_given_a_one_word_item_size() {
     use majit_translate::model::ValueType;
 
+    // `charon_corpus` declares its own `[workspace]` table and is not a
+    // dependency of this crate, so `size_of::<SlotValue>()` is not callable
+    // here. This mirrors the corpus declaration field for field — an `i64`
+    // variant, a thin raw-pointer variant and a two-`i64` variant, none of
+    // which leaves a niche free — so the `Pair` payload alone is two words
+    // before any tag. The load-bearing claim is only "wider than one word",
+    // which holds under any `repr(Rust)` layout choice.
+    #[allow(dead_code)]
+    enum SlotValueLayout {
+        Int(i64),
+        Object(*const u8),
+        Pair { lhs: i64, rhs: i64 },
+    }
+    let elem_size = std::mem::size_of::<SlotValueLayout>();
+    let word = majit_translate::layout::target_word_size();
+    assert!(
+        elem_size > word,
+        "the fixture element must be wider than one word to witness the \
+         defect, got {elem_size} vs {word}",
+    );
+
     let indexed = slot_read_shape("aggregate_slot_index");
-    // The element read is the eager `ArrayRead`, not a residual
-    // `Index::index` and not a residual `get`.
+    // Step 1+2 of the chain, observed: the element read is the eager
+    // `ArrayRead` — not a residual `Index::index`, not a residual `get` — and
+    // its bank is the `Ref(None)` fallback, which carries no width.
     assert_eq!(
         indexed.array_reads,
         vec![ValueType::Ref(None)],
@@ -1266,8 +1333,17 @@ fn an_aggregate_element_indexes_to_an_array_read_where_get_stays_residual() {
         indexed.residual_gets, 0,
         "the index spelling reaches no `get`",
     );
+    // Step 3, observed: the `Vec<T>` leg ships no ARRAY identity, which is
+    // what routes step 4 into the one-word else arm.
+    assert_eq!(
+        indexed.array_descr_keys,
+        vec![(None, false)],
+        "the Vec leg ships array_type_id: None and a length-prefixed layout",
+    );
     // The discriminant read downstream of the element resolves against
     // `SlotValue`'s own classdef rather than arriving as a bare pointer.
+    // This is the part that reads as healthy, and it is: the graph is
+    // well-typed. Only the descr behind it is wrong.
     assert_eq!(
         indexed.typed_discriminant_reads, 1,
         "the match reads __discriminant once, against a resolved owner",
@@ -1277,11 +1353,56 @@ fn an_aggregate_element_indexes_to_an_array_read_where_get_stays_residual() {
         "no classdef-less discriminant read survives the element alias",
     );
 
-    // The control lowers differently, so the contrast above is real.
+    // Step 4+5, reached directly. `codewriter::assembler`'s `ArrayRead` arm
+    // calls the module-level `arraydescrof(item_ty, array_type_id,
+    // len_offset, callcontrol)` with `len_offset = None` when `nolength` and
+    // `Some(0)` otherwise, and that routes straight through
+    // `CallControl::arraydescrof_for_type`. The `ir_type` it passes comes
+    // from the private `value_type_to_ir_type_for_descr`, whose wildcard arm
+    // answers `Type::Ref` for `ValueType::Ref(_)`.
+    //
+    // A bare `CallControl::new()` answers the same as the production one
+    // here, and that is itself the defect: with `array_type_id: None`,
+    // `arraydescrof_concrete` never consults `is_known_struct`, so no
+    // registered struct layout can reach this descr's item size.
+    let (array_type_id, nolength) = indexed.array_descr_keys[0].clone();
+    let len_offset = if nolength { None } else { Some(0) };
+    let callcontrol = majit_translate::codewriter::call::CallControl::new();
+    let descr = callcontrol.arraydescrof_for_type(
+        &ValueType::Ref(None),
+        &array_type_id,
+        majit_ir::value::Type::Ref,
+        len_offset,
+    );
+    let array_descr = descr
+        .as_array_descr()
+        .expect("arraydescrof_for_type must answer an ArrayDescr");
+
+    // THESE TWO ASSERTIONS ARE EXPECTED TO FAIL ONCE THE DEFECT IS FIXED.
+    // Invert them, do not delete them: a fix makes `item_size` the element's
+    // real width (`elem_size` here) and `item_type` something other than a GC
+    // reference, and this test is where that change should be recorded.
+    assert_eq!(
+        array_descr.item_size(),
+        word,
+        "the aggregate element's ArrayRead strides by one word ({word}) \
+         while the element is {elem_size} bytes wide — every index > 0 \
+         addresses the wrong element",
+    );
+    assert_eq!(
+        array_descr.item_type(),
+        majit_ir::value::Type::Ref,
+        "and the single word it does load is banked as a GC reference, so \
+         even at index 0 the backend hands a non-pointer word to the ref bank",
+    );
+
+    // The control lowers differently, so the contrast above is real — and it
+    // is the spelling that is actually safe over this element type.
     let got = slot_read_shape("aggregate_slot_get");
     assert_eq!(
         got.residual_gets, 1,
-        "the `get` spelling leaves its call residual",
+        "the `get` spelling leaves its call residual, so real Rust computes \
+         the element address at the real stride",
     );
     assert!(
         got.array_reads.is_empty(),

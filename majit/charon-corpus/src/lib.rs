@@ -346,6 +346,14 @@ pub fn host_registry_dispatch_optional(reg: &HostRegistry, x: i64) -> i64 {
 // genuine tag-plus-payload aggregate several words wide and not a wrapper the
 // front end can collapse to its inner bank (`tyref_transparent_inner_value_type`,
 // `tyref_is_fieldless_enum_free`).
+//
+// That question is now answered, in the negative: the fallback bank is
+// `ValueType::Ref(None)`, the `Vec` leg ships no `array_type_id`, and
+// `arraydescrof_concrete` therefore hands the read a one-word `item_size`.
+// The index spelling is UNSOUND over this element type — see
+// `an_aggregate_element_array_read_is_given_a_one_word_item_size` in
+// `majit-translate/tests/test_mir_frontend.rs` for the full chain. These four
+// functions stay as they are because they are what witnesses it.
 pub enum SlotValue {
     Int(i64),
     Object(*const ObjectHeader),
@@ -355,7 +363,8 @@ pub enum SlotValue {
 /// The treatment: read one element by scalar index and match it. The
 /// discriminant read and the per-variant payload reads all land on the
 /// `ArrayRead` result, so this is the shape that says whether the alias
-/// projections carry an aggregate element.
+/// projections carry an aggregate element. They do not — this is the spelling
+/// whose descr strides by one word, not a spelling to copy.
 #[inline(never)]
 pub fn aggregate_slot_index(v: &Vec<SlotValue>, i: usize) -> i64 {
     match &v[i] {
@@ -370,7 +379,9 @@ pub fn aggregate_slot_index(v: &Vec<SlotValue>, i: usize) -> i64 {
 /// `recognize_slice_get_site` accepts or declines, so the call either becomes
 /// `front::slice_get`'s bounds-checked diamond or stays residual — either way
 /// it is a different lowering from the index arm. If it is not, the pair
-/// discriminates nothing and neither function grades the index arm.
+/// discriminates nothing and neither function grades the index arm. Given the
+/// index arm's descr, the residual outcome is also the *safe* one: real Rust
+/// keeps computing the element address at the real stride.
 #[inline(never)]
 pub fn aggregate_slot_get(v: &Vec<SlotValue>, i: usize) -> i64 {
     match v.get(i) {
