@@ -561,6 +561,14 @@ jobs:
       # and that costs more than the two backends cost in sequence. Collapsing
       # the two back into one job on macOS and Windows is worth 1847 runner-
       # seconds a run against the 253 the Linux split saves.
+      # Re-measured on run 32712894722, where both collapsed jobs are green.
+      # Windows confirms it at 3957s against the 5449s it split into. macOS read
+      # 4089s and confirms nothing either way: `cargo test (macos-latest)`, which
+      # nothing here touches, went 1516s to 2757s across the same pair of runs,
+      # so that runner was about 1.8x slower and the two macOS figures are not
+      # comparable. The mechanism is the same on all three -- the split builds
+      # the shared release workspace twice and the collapsed job builds it once
+      # -- and macOS has the slowest build of the three.
       # `fail-fast: false` because one backend going red says nothing about the
       # other, and cancelling it would hide a second failure.
       fail-fast: false
