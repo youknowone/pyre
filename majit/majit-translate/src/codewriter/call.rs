@@ -1399,17 +1399,40 @@ pub struct CallControl {
     /// itself carries the immutability.  Pyre annotates per-field; the
     /// summary collapses field-level marks to type-level lookup keys.
     pub immutable_array_types: HashSet<String>,
-    /// Metadata-only registration carrier — `(segments,
-    /// Signature, return_lltype)` for every `unsafe fn` and unsafe
-    /// impl-method discovered by the LLBC/module-path pipeline.  These
-    /// callees cannot lower their bodies (`build_flow.rs:215` rejects
-    /// `sig.unsafety.is_some()` because raw-pointer ops are not
-    /// modelled), but `OpKind::Call::FunctionPath` sites still need
-    /// the path registered in `CallRegistry`.  Populated by `lib.rs`
-    /// from `program.unsafe_fn_stubs` via
-    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`; consumed by
-    /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
-    /// `dual_gate_registry` after the function-graph populate pass.
+    /// Metadata-only registration carrier — `(name_path segments,
+    /// Signature, return token)`.  Populated in `lib.rs` from
+    /// `program.unsafe_fn_stubs`, which chains
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc` (local `unsafe fn`s
+    /// whose return projects to a token
+    /// `translator::rtyper::cutover::residual_return_shell` can model)
+    /// with `front::mir::collect_marked_class_ctor_stubs_from_llbc` (the
+    /// `#[pyre_class]` `<Owner>::allocate[_stable]` constructors) — so the
+    /// contents are wider than the field name says.
+    /// `CodeWriter::dual_gate_registry` hands the carrier to
+    /// `cutover::populate_call_registry_from_call_graphs`, which seeds it
+    /// through `cutover::register_unsafe_fn_stubs` *between* that
+    /// function's alias-explosion and callee-lift passes.
+    ///
+    /// What a stub buys is a KEY, not a body.  It registers the
+    /// crate-included `name_path()` split on `::`, verbatim and
+    /// un-aliased — the spelling an `OpKind::Call::FunctionPath` site
+    /// emits — where the `function_graphs` pass registers the
+    /// crate-stripped `{module_path, name}` plus its alias fan-out.
+    /// `register_unsafe_fn_stubs` yields to any key already present, so
+    /// the two never fight.  Measured on the `pyre-jit-trace` prepass over
+    /// the production LLBC set: 10837 specs, 3296 already resolved and
+    /// skipped, 7541 newly registered — the new ones led by impl methods
+    /// spelled with an `<Impl>` segment and by raw-pointer / allocation
+    /// plumbing.
+    ///
+    /// An `unsafe fn` is NOT held back from body lowering: no gate reads
+    /// `signature.is_unsafe` anywhere except the collector above, and
+    /// `front::mir::build_semantic_program_from_llbc` over
+    /// `build/llbc/pyre-object.ullbc` lowers 1445 of the 1445 unsafe fns
+    /// that carry a body — `is_generic_alias` and `is_union` among them.
+    /// A stub therefore stands in for a missing registry key, and for the
+    /// declarations Charon emits with no body at all; it does not stand in
+    /// for a body some gate refused.
     pub unsafe_fn_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
