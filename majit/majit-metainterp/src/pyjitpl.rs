@@ -25586,7 +25586,7 @@ mod tests {
     /// function permanently non-inlinable into every other trace.
     ///
     /// `GUARD_OVERFLOW` behind a non-overflowing op is the optimizer's own
-    /// `InvalidLoop` (`intbounds.py:236-238`), which makes it the cheapest way
+    /// `InvalidLoop` (`intbounds.py optimize_GUARD_OVERFLOW`), the cheapest way
     /// to reach the arm without building a trace the rest of the pipeline
     /// would reject for some other reason.
     #[test]
