@@ -6551,6 +6551,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && let Some(outcome) = spec_gate("bare_super_call", || {
+            try_walker_specialize_bare_super_call(ctx, code, op, &r_args, dst)
+        })?
+    {
+        // The fold carries `super()`'s raising arms itself rather than handing
+        // this call to the generic residual a second time, so its outcome —
+        // not a fixed `Continue` — is what the step reports.
+        return Ok((outcome, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && spec_gate("float_call", || {
             try_walker_specialize_float_call(ctx, code, op, &r_args, dst)
         })?

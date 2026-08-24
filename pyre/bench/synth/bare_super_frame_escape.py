@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: spec-folds=bare_super_call
 # Self-checking guard for zero-argument `super()` bound to a name, which is the
 # spelling that reaches the frame-escape path.
 #
@@ -32,6 +33,10 @@
 #      returns the caller's override.
 #   C  a three-deep chain, so a proxy built one level off is still wrong but
 #      would not be caught by a two-level shape alone.
+#   D  a `super()` that raises, which the fold carries rather than declines.
+#      Declining here would hand the same call to the generic residual a second
+#      time, and `super_check`'s `__class__` lookup is free to run Python, so
+#      the message and the raise count both have to survive the re-route.
 N = 20000
 
 
@@ -69,17 +74,28 @@ def main():
     site_a = set()
     site_b = set()
     site_c = set()
+    site_d = set()
     total = 0
     for _ in range(N):
         site_a.add(middle.val())
         site_b.add(leaf.val())
         site_c.add(leaf.tag())
+        try:
+            Leaf.val(42)
+        except TypeError as exc:
+            site_d.add(str(exc))
         total += 1
 
     for label, seen, want in (
         ("A", site_a, 11),
         ("B", site_b, 111),
         ("C", site_c, "leaf-middle-base"),
+        (
+            "D",
+            site_d,
+            "super(type, obj): obj (instance of int) is not an instance "
+            "or subtype of type (Leaf).",
+        ),
     ):
         if len(seen) != 1:
             print(f"FAIL site {label} diverged across iterations: {sorted(seen)}")

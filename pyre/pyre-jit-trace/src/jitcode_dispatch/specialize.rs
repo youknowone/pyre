@@ -2647,36 +2647,49 @@ fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
 /// A receiver that is not this level's own frame declines, which is what keeps
 /// a suspended generator's frame, a traceback node's frame and a caller's
 /// frame read from inside a callee on the residual getter that reads the heap.
+/// The box and concrete address of the frame the walk is executing.
+///
+/// Two sources, chosen by whether a sub-walk is active, because they describe
+/// different frames: the portal's virtualizable describes the PORTAL, so an
+/// inlined callee has to answer from its own shadow or it reports its caller's.
+fn walker_executing_frame_box<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(OpRef, usize)> {
+    let inline_frame = current_inline_concrete_frame();
+    if inline_frame != 0 {
+        let shadow = ctx.callee_shadow.as_ref()?;
+        if shadow.concrete_frame != inline_frame || shadow.frame_box == OpRef::NONE {
+            return None;
+        }
+        return Some((shadow.frame_box, inline_frame));
+    }
+    if ctx.fbw_mode.inline_subwalk {
+        return None;
+    }
+    let vable_box = ctx.trace_ctx.standard_virtualizable_box()?;
+    let vable_ptr = ctx.trace_ctx.standard_virtualizable_ptr()?;
+    Some((vable_box, vable_ptr))
+}
+
 fn walker_frame_executing_py_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     concrete_obj: pyre_object::PyObjectRef,
     op_pc: usize,
 ) -> Option<(OpRef, u32)> {
-    let inline_frame = current_inline_concrete_frame();
-    if inline_frame != 0 {
-        let shadow = ctx.callee_shadow.as_ref()?;
-        if shadow.concrete_frame != inline_frame
-            || shadow.frame_box == OpRef::NONE
-            || concrete_obj as usize != inline_frame
-        {
-            return None;
-        }
-        return Some((
-            shadow.frame_box,
-            residual_call::inline_callee_py_pc(ctx, op_pc)?,
-        ));
+    let (frame_box, frame_ptr) = walker_executing_frame_box(ctx)?;
+    if frame_ptr != concrete_obj as usize {
+        return None;
+    }
+    if current_inline_concrete_frame() != 0 {
+        return Some((frame_box, residual_call::inline_callee_py_pc(ctx, op_pc)?));
     }
     // An inline sub-walk with no concrete callee frame has no level-local
     // coordinate to answer with: `vstack_cur_pypc` is the outer walk's mirror
     // and a sub-walk never advances it.
-    if ctx.fbw_mode.inline_subwalk || !ctx.vstack_valid {
+    if !ctx.vstack_valid {
         return None;
     }
-    let vable_box = ctx.trace_ctx.standard_virtualizable_box()?;
-    if ctx.trace_ctx.standard_virtualizable_ptr() != Some(concrete_obj as usize) {
-        return None;
-    }
-    Some((vable_box, ctx.vstack_cur_pypc))
+    Some((frame_box, ctx.vstack_cur_pypc))
 }
 
 /// Prove the receiver IS the frame the walk is executing, and answer that
@@ -2851,6 +2864,138 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
+}
+
+/// Zero-argument `super()` reached as a call, i.e. the `LOAD_GLOBAL super` +
+/// `CALL` spelling a name binding produces rather than `LOAD_SUPER_ATTR`.
+///
+/// Both spellings force the virtualizable — `codewriter.rs` binds
+/// `load_super_attr_fn` with `CallFlavor::MayForce`, because a descriptor
+/// `__get__` may run Python — so this is not about removing a force.  What
+/// differs is where the force happens.  `LOAD_SUPER_ATTR` forces inside a
+/// may-force residual that carries the red frame as an operand, which the
+/// walker models.  The call spelling reaches `builtin_super`'s zero-argument
+/// tail, whose `ExecutionContext::gettopframe()` runs `force_frame` INSIDE an
+/// opaque `bh_call_fn`; that clears `TOKEN_TRACING_RESCALL` and
+/// `tracing_after_residual_call` reads it back as
+/// `VableEscapedDuringResidualCall`.  The frame `gettopframe` answers with is
+/// the one being traced, so that residual always escapes and the loop always
+/// aborts.
+///
+/// So the emission is a re-route: name
+/// [`crate::helpers::jit_bare_super_from_frame`] — the same `descriptor.py
+/// _super_from_frame` half `bh_load_super_attr_fn` calls — as a may-force
+/// residual taking the walk's own frame box.  The force still happens; it moves
+/// to the channel the walker can see, which is the difference between an
+/// escape and an ordinary forced residual.
+///
+/// A raise is carried, not declined.  Declining after the concrete call would
+/// hand the same work to the generic residual a second time, and this call is
+/// not repeatable: `super_check` reaches `getattr_str(obj, "__class__")`
+/// whenever neither `obj` nor `type(obj)` is already a subtype of the
+/// `__class__` cell, so a `__class__` property would run twice.  The raising
+/// arms take the generic residual's own `Err` route instead — seed
+/// `last_exc_value`, emit `GuardException`, surface `SubRaise`.
+pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    // `super()` with no user arguments arrives as `[callable, null_or_self]`.
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
+    {
+        return Ok(None);
+    }
+    let Some((frame_box, frame_ptr)) = walker_executing_frame_box(ctx) else {
+        return Ok(None);
+    };
+    // Pin the callable the way the constructor folds do, so rebinding the
+    // global `super` side-exits instead of keeping this route.
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+    // Steps 2-3 of `MetaInterp._do_jit_call` bracket the CONCRETE execution,
+    // and this execution can run Python on the `super_check` arm above.  A
+    // `__class__` property is free to touch a frame the loop handed out, and a
+    // vref forced that way keeps its pre-call token unless the bracket reads it
+    // back: `vrefs_after_residual_call` would never record `VIRTUAL_REF_FINISH`
+    // and the resume snapshot would go on claiming the frame is still virtual.
+    // Both halves run before the CALL op is recorded, which is the order
+    // `stop_tracking_virtualref` documents.
+    ctx.trace_ctx.vrefs_before_residual_call();
+    let concrete = pyre_interpreter::builtins::builtin_super_from_frame(
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+    );
+    ctx.trace_ctx.vrefs_after_residual_call();
+    let result = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallMayForceR,
+        crate::helpers::jit_bare_super_from_frame as *const (),
+        &[frame_box],
+        &[majit_ir::Type::Ref],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    // The leaf answers null on its raising arm, so the recorded result carries
+    // the same shadow the raising execution produced.
+    let raised = match concrete {
+        Ok(proxy) => {
+            ctx.trace_ctx.set_opref_concrete(
+                result,
+                majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),
+            );
+            None
+        }
+        Err(mut err) => {
+            let exc = err.to_exc_object();
+            ctx.trace_ctx
+                .set_opref_concrete(result, majit_ir::Value::Ref(majit_ir::GcRef(0)));
+            // `execute_raised(exception, constant=False)`: the walk's standing
+            // exception lives in `last_exc_value`, and the class has not been
+            // proven by a guard yet.
+            let exc_op = ctx.trace_ctx.const_ref(exc as i64);
+            let exc_concrete = ConcreteValue::Ref(exc);
+            ctx.last_exc_value = Some(exc_op);
+            ctx.last_exc_value_concrete = exc_concrete;
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
+            Some((exc_op, exc_concrete))
+        }
+    };
+    // The dst is written before both guards, the ordering
+    // `_opimpl_residual_call*` keeps so the dst slot's OpRef rides their
+    // snapshots.
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    if let Some((exc, exc_concrete)) = raised {
+        walker_record_guard_exception(ctx, op.pc);
+        return Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }));
+    }
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
