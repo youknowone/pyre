@@ -33,10 +33,17 @@
 #      returns the caller's override.
 #   C  a three-deep chain, so a proxy built one level off is still wrong but
 #      would not be caught by a two-level shape alone.
-#   D  a `super()` that raises, which the fold carries rather than declines.
-#      Declining here would hand the same call to the generic residual a second
-#      time, and `super_check`'s `__class__` lookup is free to run Python, so
-#      the message and the raise count both have to survive the re-route.
+#   D  a receiver `super_check` rejects by walking MROs, so the fold declines
+#      before running anything and the generic residual owns the TypeError.
+#   E  a receiver `super_check` can only classify by asking Python, which the
+#      fold also declines.  E carries per-iteration data in its exception on
+#      purpose: D's message is identical every iteration, so D alone cannot
+#      tell a correctly-declined call from a folded one that answers with the
+#      RECORDING-time exception object.  E can — that answer collapses the
+#      distinct-message count, and it is what an earlier version of this fold
+#      did (20000 iterations, 1662 distinct).  E also pins that the `__class__`
+#      property runs exactly once per iteration, which a fold that executed the
+#      call and then declined would double.
 N = 20000
 
 
@@ -68,6 +75,30 @@ class Leaf(Middle):
         return "leaf-" + s.tag()
 
 
+class Tricky:
+    """A receiver `super_check` can only classify by asking Python."""
+
+    hits = 0
+
+    @property
+    def __class__(self):
+        Tricky.hits += 1
+        raise ValueError(str(Tricky.hits))
+
+
+class ETrap(Base):
+    """Site E's own method, reached only with a `Tricky` receiver.
+
+    Sharing `Leaf.val` does not work: the sites above compile it against a real
+    instance first, so the raising call side-exits on those guards and runs
+    interpreted, where the defect cannot appear.
+    """
+
+    def val(self):
+        s = super()
+        return s.val()
+
+
 def main():
     leaf = Leaf()
     middle = Middle()
@@ -75,6 +106,8 @@ def main():
     site_b = set()
     site_c = set()
     site_d = set()
+    site_e = set()
+    tricky = Tricky()
     total = 0
     for _ in range(N):
         site_a.add(middle.val())
@@ -85,6 +118,15 @@ def main():
         except TypeError as exc:
             site_d.add(str(exc))
         total += 1
+
+    # Site E gets its own loop on purpose.  Sharing the loop above leaves this
+    # call on a path the backend never compiles, and an uncompiled site cannot
+    # witness a compiled-iteration defect.
+    for _ in range(N):
+        try:
+            ETrap.val(tricky)
+        except ValueError as exc:
+            site_e.add(str(exc))
 
     for label, seen, want in (
         ("A", site_a, 11),
@@ -106,6 +148,16 @@ def main():
             return 1
     if total != N:
         print(f"FAIL dropped iteration: total={total}")
+        return 1
+    # Site E's message is the raise count, so one distinct message per
+    # iteration is the only answer that has the property running every
+    # iteration AND each raise reporting its own value.  A compiled iteration
+    # answering with the recording-time exception object collapses this.
+    if Tricky.hits != N:
+        print(f"FAIL site E ran the property {Tricky.hits} times, want {N}")
+        return 1
+    if len(site_e) != N:
+        print(f"FAIL site E saw {len(site_e)} distinct messages, want {N}")
         return 1
     print("PASS bare super frame escape")
     return 0

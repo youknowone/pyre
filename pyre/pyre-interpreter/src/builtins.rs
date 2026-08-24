@@ -11278,6 +11278,38 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 pub fn builtin_super_from_frame(
     frame_ptr: *mut crate::pyframe::PyFrame,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let (w_class, w_self) = super_operands_from_frame(frame_ptr)?;
+    let obj_type = super_check(w_class, w_self)?;
+    Ok(pyre_object::descriptor::w_super_new(
+        w_class, obj_type, w_self,
+    ))
+}
+
+/// [`builtin_super_from_frame`] for a caller that must not run Python.
+///
+/// `None` where the full entry point would either raise or reach
+/// [`super_check`]'s `__class__` lookup, which a property answers with
+/// arbitrary code.  The meta-tracer executes this concretely while recording,
+/// where running Python could force the virtualizable it is recording against
+/// and where a raise it then declined would run those side effects twice, so
+/// it takes only the settled half and leaves the rest to the generic residual.
+pub fn builtin_super_from_frame_python_free(
+    frame_ptr: *mut crate::pyframe::PyFrame,
+) -> Option<PyObjectRef> {
+    let (w_class, w_self) = super_operands_from_frame(frame_ptr).ok()?;
+    let obj_type = super_check_python_free(w_class, w_self)?;
+    Some(pyre_object::descriptor::w_super_new(
+        w_class, obj_type, w_self,
+    ))
+}
+
+/// The `(__class__ cell, arg[0])` pair zero-argument `super()` is built from.
+///
+/// Every raising arm here reads frame state and runs no Python, so a caller
+/// may take the `Err` and walk away without having changed anything.
+fn super_operands_from_frame(
+    frame_ptr: *mut crate::pyframe::PyFrame,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     if frame_ptr.is_null() {
         return Err(crate::PyError::runtime_error("super(): no current frame"));
     }
@@ -11329,10 +11361,7 @@ pub fn builtin_super_from_frame(
         ));
     }
 
-    let obj_type = super_check(w_class, w_self)?;
-    Ok(pyre_object::descriptor::w_super_new(
-        w_class, obj_type, w_self,
-    ))
+    Ok((w_class, w_self))
 }
 
 /// Exact builtins-namespace `super` type identity used by the meta-tracer's
@@ -11346,21 +11375,40 @@ pub fn is_builtin_super_type(obj: PyObjectRef) -> bool {
 
 /// `descriptor.py _super_check` — validate the explicit `(type, obj)` pair
 /// and return the class whose MRO a bound super proxy walks.
-pub(crate) fn super_check(
+/// The arms of [`super_check`] that settle by walking installed MROs, before
+/// it consults `__class__`.
+///
+/// Split out because the third arm runs `getattr_str`, and a `__class__`
+/// property answers it with arbitrary Python.  A caller that must not run
+/// Python asks for this half alone; `super_check` itself keeps the full
+/// sequence by starting here.
+pub(crate) fn super_check_python_free(
     start_type: PyObjectRef,
     obj_or_type: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Option<PyObjectRef> {
     unsafe {
         if pyre_object::is_type(obj_or_type)
             && crate::baseobjspace::issubtype_w(obj_or_type, start_type)
         {
-            return Ok(obj_or_type);
+            return Some(obj_or_type);
         }
         if let Some(obj_type) = crate::typedef::r#type(obj_or_type)
             && crate::baseobjspace::issubtype_w(obj_type.as_ptr(), start_type)
         {
-            return Ok(obj_type.as_ptr());
+            return Some(obj_type.as_ptr());
         }
+    }
+    None
+}
+
+pub(crate) fn super_check(
+    start_type: PyObjectRef,
+    obj_or_type: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if let Some(obj_type) = super_check_python_free(start_type, obj_or_type) {
+        return Ok(obj_type);
+    }
+    unsafe {
         match crate::baseobjspace::getattr_str(obj_or_type, "__class__") {
             Ok(apparent_type) => {
                 if pyre_object::is_type(apparent_type)
