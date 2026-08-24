@@ -473,106 +473,6 @@ jobs:
       CHARON_VERSION: nightly-2026.05.29
     steps: *cargo-test-steps
 
-  cpython-suite-linux:
-    name: CPython suite + pip (ubuntu-24.04)
-    runs-on: ubuntu-24.04
-    needs: prepare-charon-llbc-linux
-    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    # These three steps used to ride `cargo test`'s Linux copy, on the argument
-    # that a job of their own costs a second checkout, toolchain, Cargo cache
-    # restore and Charon/LLBC download. That preamble measured about three
-    # minutes; the steps themselves measured 27, and they started only after
-    # the cargo passes had spent 27 of their own. The two halves share nothing
-    # but the checkout, so keeping them in one job made `cargo test
-    # (ubuntu-24.04)` the longest job in the workflow by roughly the suite's
-    # whole wall time. Side by side they cost the same runner minutes and half
-    # the wall clock, and as separate jobs neither can hide the other's verdict
-    # — which is what the `!cancelled()` conditions were emulating.
-    timeout-minutes: 60
-    env:
-      # See prepare-charon-llbc: downstream jobs download the prepared Charon
-      # artifact into this workspace path.
-      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.05.29
-    steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      with:
-        persist-credentials: false
-    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-    - name: Set up CPython
-      # Both runners below are Python programs.
-      id: cpython
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-      with:
-        python-version: "3.14"
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        cache-bin: false
-        shared-key: ${{ runner.arch }}
-        # Restore-only on PRs (they pull main's cache via restore-keys); save
-        # only on main so per-PR target caches don't multiply across refs past
-        # GitHub's 10 GB cache budget and trigger LRU eviction.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
-    - name: Download Charon artifact
-      # Run-scoped handoff from prepare-charon-llbc, as in the cargo test job.
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-      with:
-        name: charon-${{ runner.os }}-${{ runner.arch }}
-        path: .pyre-build/charon
-    - name: Restore Charon executable permissions
-      shell: bash
-      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
-    - name: Download LLBC artifact
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-      with:
-        name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
-    - name: Verify prepared Charon/LLBC
-      shell: bash
-      run: |
-        test -d .pyre-build/charon
-        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
-          test -s "build/llbc/${crate}.ullbc"
-          # The sidecar carries the artefact's own file table, which is what
-          # `source=` hashes. Without it the fingerprint falls back to the whole
-          # cargo closure and every consumer reports LLBC STALE, so fail here
-          # where the cause is still visible.
-          test -s "build/llbc/${crate}.ullbc.readfiles"
-        done
-    - name: Build pyre-dynasm
-      id: build
-      shell: bash
-      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
-    - name: Run pyre/extra_tests/pip (hermetic pip end-to-end)
-      # Drives the binary built above through venv, ensurepip, a wheel
-      # install, a PEP 517 build under real isolation, and an uninstall.
-      # Everything it resolves is a wheel already in the checkout, so it never
-      # reaches an index — and one of its checks asserts that, by requiring a
-      # plain `pip download` to fail.
-      #
-      # Ahead of the suite so its verdict lands early rather than after the
-      # suite's wall time, and `--dynasm-only` because the restored target
-      # directory can hold a `pyre-cranelift` this job never built.
-      shell: bash
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/pip/run.py --dynasm-only
-    - name: Run CPython suite (gate regressions, JIT on)
-      # This is the only place CI runs the suite — `pyre/check.py` keeps the
-      # stage behind `--cpython-suite`, which no job passes, so its wall time is
-      # paid once. The runner gates against the shared baseline plus its own
-      # `baseline.linux-x86_64.json` overlay; `PLATFORM_GATED` only handles
-      # modules CPython skips wholesale on this host.
-      #
-      # The runner has 3 cores, so `--jobs 4` oversubscribes them and stretches
-      # the wall time of whichever module is running when the extra job lands.
-      # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
-      # and ~2m47s of wall time, which does not fit the former 120s limit.
-      #
-      # Reports even when the pip run above fails; only a missing binary makes
-      # it meaningless.
-      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-      shell: bash
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
-
   dispatcher-graph-linux:
     name: dispatcher-graph acceptance (ubuntu-24.04)
     runs-on: ubuntu-24.04
@@ -644,6 +544,11 @@ jobs:
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
+    # The dynasm leg carries the pip end-to-end and the CPython suite as well,
+    # and measured 48 min without them against the 11 min they take. The cap
+    # comes from the job they used to be, and still bounds a hang rather than
+    # the work.
+    timeout-minutes: 90
     strategy: &pyre-check-backends
       # One job per backend rather than one job running both in sequence.
       # `check.py` builds each backend's release binary itself and the two
@@ -869,6 +774,47 @@ jobs:
       # it is where check.py builds wasm alongside the native backend.
       if: runner.os == 'Linux' && matrix.backend == 'dynasm'
       run: cargo test -p majit-backend-wasm --test codegen_test -- --ignored
+    - name: Run pyre/extra_tests/pip (hermetic pip end-to-end, Linux only)
+      # Drives the release `pyre-dynasm` through venv, ensurepip, a wheel
+      # install, a PEP 517 build under real isolation, and an uninstall.
+      # Everything it resolves is a wheel already in the checkout, so it never
+      # reaches an index -- and one of its checks asserts that, by requiring a
+      # plain `pip download` to fail.
+      #
+      # This and the suite below had a job of their own, which opened by
+      # running `cargo build --release -p pyrex --bin pyre-dynasm
+      # --no-default-features --features dynasm` -- the identical command
+      # `check.py` runs here, 894s in each of the two jobs. The dynasm leg of
+      # this matrix is the one place in the workflow where that binary already
+      # exists. It is also the longest Linux job, so appending 11 minutes to it
+      # is the whole cost: the run is bounded by `cargo test (windows-latest)`
+      # at 4153s against this leg's 3490s.
+      #
+      # `--dynasm-only` because a restored target directory can hold a
+      # `pyre-cranelift` this leg never built. Ahead of the suite so its verdict
+      # lands early rather than after the suite's wall time.
+      if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
+      shell: bash
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/pip/run.py --dynasm-only
+    - name: Run CPython suite (gate regressions, JIT on, Linux only)
+      # This is the only place CI runs the suite -- `pyre/check.py` keeps the
+      # stage behind `--cpython-suite`, which no job passes, so its wall time is
+      # paid once. The runner gates against the shared baseline plus its own
+      # `baseline.linux-x86_64.json` overlay; `PLATFORM_GATED` only handles
+      # modules CPython skips wholesale on this host.
+      #
+      # The runner has 3 cores, so `--jobs 4` oversubscribes them and stretches
+      # the wall time of whichever module is running when the extra job lands.
+      # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
+      # and ~2m47s of wall time, which does not fit the former 120s limit.
+      #
+      # Last, as the longest step here, so every other verdict in this job lands
+      # before it. It reports whatever check.py and the pip run above did; the
+      # one case it cannot report on is check.py failing to build the binary,
+      # where it goes red naming the same cause a second time.
+      if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
+      shell: bash
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
 
   pyre-check-macos:
     name: pyre/check.py ${{ matrix.backend }} (macos-latest)
