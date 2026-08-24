@@ -5511,7 +5511,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             pc: op.pc,
             descr_index,
         })?;
-    let descr_key = descr.index();
     // Void shape `_r_v/iRd` (`pyjitpl.py opimpl_residual_call_r_v =
     // _opimpl_residual_call1`) has no trailing `>X` dst byte. The
     // result OpRef is discarded by `write_residual_call_result_to_dst`'s
@@ -6563,6 +6562,37 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+
+    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
+    // the direct `set_add` store the SET_ADD accumulator opcode records
+    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
+    // fold — the call is still a MayForce residual, still guarded and still
+    // concrete-executed by the shared tail below, so the force/exception
+    // guards, the heapcache invalidation and the `None` writeback are the ones
+    // the generic path already emits.  A decline leaves every binding
+    // untouched.
+    let set_add_subst = if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+    {
+        spec_gate("set_add_method", || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args)
+        })?
+    } else {
+        None
+    };
+    let (funcptr, descr, allboxes) = match set_add_subst {
+        Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),
+        None => (funcptr, descr, allboxes),
+    };
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+    let descr_key = descr.index();
+    let ei = call_descr.get_extra_info();
 
     // pyjitpl.py forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`

@@ -1797,6 +1797,26 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
     }
 }
 
+/// `s.add(value)` written as a bound-method call, for the walker arm that
+/// recognises it (`try_walker_specialize_set_add_method`).
+///
+/// The arm pins the callable to the `set.add` builtin and guards the receiver
+/// in the same spelling `require_set_receiver` uses, so the two checks the
+/// builtin opens with — its receiver predicate and one positional argument —
+/// are answered by those guards, and what remains is the store
+/// [`crate::opcode_ops::set_add_value`] already performs for `SET_ADD`. The
+/// element `__hash__` can run Python, so this is a MayForce residual like the
+/// accumulator it shares its body with.
+///
+/// Returns `None`. A raising `__hash__` publishes through both exception
+/// channels and answers PY_NULL, the residual-call ABI [`jit_next`] documents.
+pub extern "C" fn jit_set_add_method(set: i64, value: i64) -> i64 {
+    match crate::opcode_ops::set_add_value(set as PyObjectRef, value as PyObjectRef) {
+        Ok(()) => pyre_object::w_none() as i64,
+        Err(err) => jit_publish_residual_error(err),
+    }
+}
+
 /// `pyopcode.py` FOR_ITER exception discrimination:
 /// `e.match(space, space.w_StopIteration)`. The caught object and match class
 /// are Python-level objects, so use the same MRO-aware helper as
