@@ -992,26 +992,6 @@ pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     }
 }
 
-/// `s.add(x)` written as a method call, for the walker arm that recognizes it.
-///
-/// The arm has already established that the receiver is an exact `set` and
-/// that its `add` still resolves to the builtin, which is the one thing
-/// [`set_add_value`]'s own doc leaves to the caller: a comprehension cannot
-/// name a subclass, but a method call can.  Under those guards the two spell
-/// the same store, so this reuses the shared body.
-///
-/// `jit_may_force` is not conservatism to be tidied away later: the element's
-/// `__hash__` / `__eq__` can run Python that reaches the frame, and the
-/// virtualizable it would read is only re-synced on a force.
-#[majit_macros::jit_may_force]
-pub extern "C" fn jit_set_add(set: i64, value: i64) {
-    if let Err(mut err) = set_add_value(set as PyObjectRef, value as PyObjectRef) {
-        // The GuardNoException the arm records after this residual deopts and
-        // re-raises through the blackhole resume, as `jit_setitem` below.
-        crate::runtime_ops::jit_publish_exception(err.to_exc_object());
-    }
-}
-
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
     match crate::setitem(
