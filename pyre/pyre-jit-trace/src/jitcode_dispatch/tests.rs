@@ -156,6 +156,29 @@ fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
     );
 }
 
+/// The `s.add(x)` substitution replaces a residual the executed-effect odometer
+/// counts (`CallFn`) with one it judges by descr shape alone.  A `Ref` result
+/// clears the `Void` write proxy, so the helper tag is the only thing left
+/// saying an insert happened — and the element's `__hash__` cannot stand in for
+/// it, since a cpyext `tp_hash` runs native code and moves no frame-entry
+/// odometer.  Drop the tag and a nested abort rewinds past a completed insert.
+#[test]
+fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
+    let descr = super::specialize::set_add_method_descr();
+    let call_descr = descr
+        .as_call_descr()
+        .expect("the substitution installs a call descr");
+    assert_eq!(
+        call_descr.result_type(),
+        Type::Ref,
+        "`set.add` returns None, so the Void write proxy cannot see this store"
+    );
+    assert!(
+        super::residual_call::helper_kind_writes_live_heap(call_descr.get_extra_info().pyre_helper),
+        "an untagged descr takes the insert out of the executed-effect odometer"
+    );
+}
+
 #[test]
 fn specialised_pair_unpack_recognises_the_float_layout() {
     use super::specialize::{SpecialisedPairKind, specialised_pair_kind};

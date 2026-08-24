@@ -2618,6 +2618,20 @@ pub(crate) fn last_declined_symbolic_site()
     DECLINED_SYMBOLIC_SITE.with(|c| c.get())
 }
 
+/// Helper kinds whose residual mutates live heap while RETURNING a value, so
+/// the `Void`-result write proxy the same discriminator opens with cannot see
+/// them.  A kind missing from here is a store the executed-effect odometer does
+/// not count, and a nested abort behind it rewinds and runs it twice.
+pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::PyreHelperKind) -> bool {
+    matches!(
+        helper,
+        majit_ir::PyreHelperKind::StoreSubscr
+            | majit_ir::PyreHelperKind::SetCurrentException
+            | majit_ir::PyreHelperKind::StoreDeref
+            | majit_ir::PyreHelperKind::SetAddMethod
+    )
+}
+
 pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
@@ -3275,12 +3289,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_exact_int_index;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || (helper == majit_ir::PyreHelperKind::CallFn && !replay_safe_tuple_from_list)
-        || matches!(
-            helper,
-            majit_ir::PyreHelperKind::StoreSubscr
-                | majit_ir::PyreHelperKind::SetCurrentException
-                | majit_ir::PyreHelperKind::StoreDeref
-        );
+        || helper_kind_writes_live_heap(helper);
     // Inside an inline sub-walk, decline before any residual that is not
     // provably side-effect-free.  Ref-result getters/dunders/user `__next__`
     // can mutate live heap through user frames while `writes_live_heap` is
@@ -6572,22 +6581,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // the generic path already emits.  A decline leaves every binding
     // untouched.
     //
-    // One thing the substitution does move.  The descr it installs is
-    // `MOST_GENERAL` with no helper tag and a `Ref` result, which is exactly
-    // the shape `writes_live_heap` does not read as a store; the generic call
-    // arrived tagged `CallFn` and did.  So the substituted residual stops
-    // bumping the executed-effect odometer, and a walk that aborts behind it is
-    // rewound and runs the call a second time.
-    //
-    // That is sound for this store and not in general: `set_add_value` with the
-    // same element twice leaves the same contents, the same length and the same
-    // table as once, so there is nothing for a journal to undo -- which is why
-    // `list.append`, whose second append is a second element, needs one.  The
-    // part of the insert that is not idempotent is the element's `__hash__` and
-    // any `__eq__` a collision reaches; both run a Python frame, and the
-    // frame-entry odometer sampled around the call reports that whatever the
-    // descr says.  A substitution for a store without both properties inherits
-    // neither argument.
+    // The substituted descr carries `PyreHelperKind::SetAddMethod` for one
+    // reason: `writes_live_heap` below reads the helper tag and the result
+    // type, and the generic call it replaces arrived tagged `CallFn`.  An
+    // untagged `MOST_GENERAL` descr with a `Ref` result matches neither, so the
+    // substitution would quietly stop bumping the executed-effect odometer and
+    // stop setting `body_effect_candidate` -- and a nested walk that aborted
+    // behind a completed insert would rewind and run it again.  The set table
+    // survives that (adding the same element twice is one insert), but the
+    // element's `__hash__` need not be Python: a cpyext `tp_hash` runs native
+    // code, moves no frame-entry odometer, and can do anything.  Keeping the
+    // marker is what makes the substitution invisible to the rollback rules
+    // rather than merely survivable by them.
     let set_add_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn

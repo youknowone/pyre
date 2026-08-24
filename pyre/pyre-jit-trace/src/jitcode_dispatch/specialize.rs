@@ -12948,18 +12948,36 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
     Ok(Some(SetAddDirectResidual {
         funcptr,
-        // The EI `bind(..., CallFlavor::MayForce)` gives the SET_ADD residual
-        // this one stands in for: `EffectInfo::MOST_GENERAL`, not the
-        // analyzer-empty forcing shape.  Hashing the element runs arbitrary
-        // Python, so no write set was ever computed for it and an empty one
-        // would assert something false (`effect_info_for_call_flavor`).
-        descr: majit_metainterp::make_call_descr_with_effect(
-            &[Type::Ref, Type::Ref],
-            Type::Ref,
-            default_effect_info(),
-        ),
+        descr: set_add_method_descr(),
         allboxes: vec![funcptr, self_ref, r_args[2]],
     }))
+}
+
+/// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
+/// `MOST_GENERAL`, tagged [`majit_ir::PyreHelperKind::SetAddMethod`].
+///
+/// The EI `bind(..., CallFlavor::MayForce)` gives the SET_ADD residual this one
+/// stands in for: `EffectInfo::MOST_GENERAL`, not the analyzer-empty forcing
+/// shape.  Hashing the element runs arbitrary Python, so no write set was ever
+/// computed for it and an empty one would assert something false
+/// (`effect_info_for_call_flavor`).
+///
+/// `SetAddMethod` on top of it: the call inserts into the live set and returns
+/// `None`, so the `Void`-result write proxy in `writes_live_heap` misses it and
+/// the helper tag is all that discriminator has left to read.  The generic
+/// `bh_call_fn` this stands in for was counted through its own `CallFn` tag;
+/// dropping to an untagged descr would take a completed insert out of the
+/// executed-effect odometer, which is what a nested abort consults before
+/// rewinding.  Built here rather than inline so that invariant is testable.
+pub(crate) fn set_add_method_descr() -> DescrRef {
+    majit_metainterp::make_call_descr_with_effect(
+        &[Type::Ref, Type::Ref],
+        Type::Ref,
+        majit_ir::EffectInfo {
+            pyre_helper: majit_ir::PyreHelperKind::SetAddMethod,
+            ..default_effect_info()
+        },
+    )
 }
 
 /// Shared recognition for the #171 orthodox list-append fold: the receiver
