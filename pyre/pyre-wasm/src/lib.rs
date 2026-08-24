@@ -1153,6 +1153,30 @@ mod host_abi {
         pack_into_guest(pyre_jit_trace::jitcode_dispatch::census_report().into_bytes())
     }
 
+    /// Arm the specialization census before `pyre_run_python`.
+    ///
+    /// `PYRE_FBW_SPEC_CENSUS` selects it on a native build; the guest reads no
+    /// environment, so the switch has to arrive as a call. It must precede the
+    /// run — the gate latches whether it is enabled on the first dispatch it
+    /// sees, so a census armed after that stays off.
+    ///
+    /// Unlike the decline census above, these counters are NOT accumulated
+    /// unarmed: the gate's whole point is that an unarmed run does no extra
+    /// work, so arming is what makes the readout non-empty.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_fbw_spec_census_enable() {
+        pyre_jit_trace::jitcode_dispatch::spec_census_enable();
+    }
+
+    /// The armed specialization census (`[spec-census] ...` lines) as the same
+    /// packed pair, for the host to print under `PYRE_WASM_SPEC_CENSUS`. Byte
+    /// for byte what `pyrex` prints natively, so a fold's `fired` count
+    /// compares directly across the two backends. Reading, not draining.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_fbw_spec_census() -> u64 {
+        pack_into_guest(pyre_jit_trace::jitcode_dispatch::spec_census_summary().into_bytes())
+    }
+
     /// Arm the per-guard deopt census before `pyre_run_python`.
     ///
     /// `MAJIT_GUARD_CENSUS` selects it on a native build; the guest reads no

@@ -2030,15 +2030,21 @@ def synth_spec_folds(path):
 SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
 
 
-def spec_fold_census(binary, path, timeout_s):
+def spec_fold_census(binary, path, timeout_s, wasm=False):
     """`({label: fired}, returncode)` for every fold the run registered.
 
     The binary owns the label set, so a declared name absent from this map is
     a typo rather than a fold that stayed quiet, and the caller reports the
     two differently.
+
+    The wasm guest reads no environment, so `PYRE_FBW_SPEC_CENSUS` cannot
+    reach it; `pyre-wasm-runner` arms the same census through the
+    `pyre_fbw_spec_census_enable` export and prints the identical
+    `[spec-census]` lines, so one parser serves both. Setting the name the
+    other backend ignores would only earn the runner's inert-knob warning.
     """
     env = pyre_env()
-    env["PYRE_FBW_SPEC_CENSUS"] = "1"
+    env["PYRE_WASM_SPEC_CENSUS" if wasm else "PYRE_FBW_SPEC_CENSUS"] = "1"
     _, _, code, err = run_timed([binary, path], timeout_s=timeout_s, env=env)
     if code != 0:
         return None, code
@@ -4188,9 +4194,11 @@ class Check:
         """True if every fold the fixture declares fired; else record and report.
 
         The census reads the same on every backend that shares the trace
-        walker, so this runs once on a native backend rather than per backend.
-        A wasm-only run has no walker to census and says so instead of passing
-        quietly, which would make the gate vacuous exactly where it is not run.
+        walker, so this runs once rather than per backend, preferring a native
+        one: it needs no export lookup and its stderr carries no runner
+        chatter. A wasm-only run reads the census back through the guest's
+        `pyre_fbw_spec_census` export instead of skipping, which would leave
+        the gate vacuous exactly where nothing else observes the walker.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
@@ -4198,9 +4206,16 @@ class Check:
             (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
         )
         if backend is None:
-            print(dim("skip (no native backend enabled)"))
-            return True
-        census, code = spec_fold_census(default_binary(backend), path, timeout)
+            if not self.enabled("wasm"):
+                print(dim("skip (no backend enabled)"))
+                return True
+            backend = "wasm"
+        census, code = spec_fold_census(
+            default_binary(backend),
+            path,
+            scaled_timeout(timeout, self._timeout_scale(backend)),
+            wasm=backend == "wasm",
+        )
         if census is None:
             detail = f"spec-folds census run failed (exit {code})"
             print(f"{red('FAIL')}  {detail}")
