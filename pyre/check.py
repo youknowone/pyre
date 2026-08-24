@@ -1957,6 +1957,56 @@ def synth_selfcheck_interpreted(path):
     )
 
 
+def synth_selfcheck_loops(path):
+    """Read a selfcheck fixture's compiled-loop floor from its header:
+        # pyre-check: selfcheck-loops=8
+
+    `run_selfcheck` asks whether the guard reached the JIT at all, and the
+    only figure it can read is `loops_compiled` off the whole-process
+    `[jit-stats]` line — there is no per-function counter. A constant floor of
+    one therefore says nothing about a fixture with more than one loop:
+    `wrapper_subclass_load_method_self` compiles eight, so seven of its
+    guarded shapes can stop reaching the JIT and it still passes green with
+    its assertion intact. That is exactly the failure the floor exists to
+    catch, and for every multi-loop fixture it was going uncaught.
+
+    So the floor is per fixture, and the number is measured, not guessed. A
+    floor rather than an equality, and one number rather than one per backend:
+    the backends do not agree on the count (a fold admitted on dynasm can be
+    declined on wasm), so the value to declare is the SMALLEST count the
+    enabled backends read. Above it the fixture is free to compile more; below
+    it something that used to reach the JIT no longer does.
+
+    Required, not optional. Defaulting a silent fixture to one is what let the
+    multi-loop fixtures sit under a floor that could not see them, and a new
+    guard has no way to notice it inherited the weak version.
+    `selfcheck-interpreted` is the way to say the invariant is not about
+    compiled code at all.
+    """
+    found = _header_directive(path, "# pyre-check: selfcheck-loops=")
+    if found is None:
+        raise ValueError(
+            f"{path} is a selfcheck fixture with no compiled-loop floor. Run it "
+            "on every enabled backend with MAJIT_STATS=1, take the smallest "
+            "`loops_compiled` the run reports, and declare it:\n"
+            "    # pyre-check: selfcheck-loops=<n>\n"
+            "A fixture whose invariant is not about compiled code carries "
+            "`# pyre-check: selfcheck-interpreted` instead."
+        )
+    raw, line = found
+    try:
+        value = int(raw, 10)
+    except ValueError as e:
+        raise ValueError(
+            f"invalid compiled-loop floor in {path}: {line.strip()}"
+        ) from e
+    if value < 1:
+        raise ValueError(
+            f"compiled-loop floor must be at least 1 in {path}: {line.strip()}"
+        )
+    return value
+
+
 def synth_ungated_jitstats(path):
     """Read an optional per-fixture jit-stats exemption from its header:
         # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
@@ -2242,6 +2292,36 @@ def build_input_paths():
     return sorted(set(paths))
 
 
+# Environment the build reads that this script does not spell in a constant.
+#
+# The first five mirror `pyre/pyre-jit-trace/build/prepass.rs` `LOWERING_GATE_ENV`,
+# which folds them into `codegen_cache_key` and declares each one
+# `cargo::rerun-if-env-changed`. They select a *lowering*: `PYRE_MIR_FRAMESTATE=0`
+# sends `majit-translate`'s mir front end down a different path
+# (`front/mir.rs` `framestate_enabled`), and the generated `jit_trace_gen.rs`
+# lands in `OUT_DIR` under `target/`, which [`build_input_paths`] deliberately
+# never reads. So nothing else in the fingerprint can see the difference, and
+# without them a run under a gate stamps a digest a later unset run reproduces
+# exactly — `--no-build` then measures a differently-lowered JIT.
+#
+# `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` are cargo's own: the native builds
+# inherit whatever is set, and only the wasm module build overrides `RUSTFLAGS`
+# with `WASM_RUSTFLAGS` (which the recipe already names).
+#
+# A divergence from `LOWERING_GATE_ENV` is the usual duplicated-list rot;
+# `pyre/pyrex/tests/gate_triage_complete.rs` is where a new gate is registered,
+# and a gate that changes the artefact belongs here as well.
+BUILD_RECIPE_ENV = (
+    "PYRE_DYN_INDIRECT",
+    "PYRE_FNPTR_INDIRECT",
+    "PYRE_MIR_FRAMESTATE",
+    "PYRE_OPTION_RESIDUAL_NARROW",
+    "PYRE_TUPLE_PER_SHAPE_CLASSDEF",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+)
+
+
 def build_recipe_digest():
     """A digest of the options an artefact is built *with*.
 
@@ -2263,6 +2343,13 @@ def build_recipe_digest():
     literal today. Hashing this script whole would cover those and would also
     make every comment edit invalidate every artefact, which in a tree where
     the script is edited far more often than the recipe is the worse trade.
+
+    The recipe is not only what this script spells: `build_backend` runs
+    `cargo` with no `env=`, so the ambient environment reaches the compiler
+    and the build scripts too. [`BUILD_RECIPE_ENV`] names the part of it that
+    selects what lands in the artefact, and an unset variable hashes
+    distinguishably from an empty one — the same distinction
+    `prepass.rs`'s `codegen_cache_key` draws with `write_os(var_os(key))`.
     """
     recipe = "\0".join((
         repr(CARGO_CONFIG),
@@ -2271,6 +2358,7 @@ def build_recipe_digest():
         repr(WASM_BUILD_STD_FLAGS),
         WASM_BUILD_OUTPUT,
         WASM_MODULE_PATH,
+        repr([(key, os.environ.get(key)) for key in BUILD_RECIPE_ENV]),
     ))
     return hashlib.sha256(recipe.encode("utf-8")).hexdigest()
 
@@ -2351,9 +2439,11 @@ def digest_input_paths(paths):
     return digest.hexdigest()
 
 
-# The one input `cargo` itself rewrites during a build. A build window is
-# judged with it left out, because a lock file the build resolved is the build
-# doing its job rather than the tree moving underneath it.
+# The one input `cargo` itself rewrites during a build. It is left out of a
+# window comparison only when [`settle_cargo_resolution`] could not run the
+# resolution up front, because a lock the build resolved is the build doing its
+# job rather than the tree moving underneath it — and the witness alone cannot
+# tell that apart from an external rewrite.
 CARGO_WRITTEN_INPUTS = ("Cargo.lock",)
 
 # What `inputs` says in a stamp whose artefact was built over a tree that
@@ -2362,19 +2452,62 @@ CARGO_WRITTEN_INPUTS = ("Cargo.lock",)
 STAMP_TREE_MOVED = "tree-moved-during-build"
 
 _BUILD_WINDOW_WITNESS = None
+_BUILD_WINDOW_EXCLUDED = CARGO_WRITTEN_INPUTS
+_CARGO_RESOLUTION_SETTLED = False
 
 
-def build_window_witness():
-    """A digest of the inputs a build is about to read, cargo's own aside.
+def settle_cargo_resolution():
+    """Run a build's dependency resolution before the build window opens.
+
+    `cargo` writes `Cargo.lock` during resolution, which happens once at the
+    start of a build. While the lock is excluded from the witness, an
+    *external* rewrite landing anywhere in the window — a `git checkout` of
+    another branch's lock, a sibling worktree's `cargo update` — is
+    indistinguishable from that resolution, and the stamp then records
+    [`build_inputs_fingerprint`] over the new lock against a binary compiled
+    from the old resolution. `build_input_paths` does list `Cargo.lock`
+    (`ROOT_BUILD_INPUTS`), so the two readings disagree about exactly one file
+    and nothing refuses the result.
+
+    `cargo metadata` performs the same resolution a build performs and writes
+    the same lock, without compiling; a lock already in sync makes it a
+    sub-second no-op against a multi-minute build. Once it has returned the
+    lock is settled for the rest of the window, so the lock can be judged like
+    every other input instead of excluded from the comparison.
+
+    Returns whether that held. A resolution this cannot run — no `cargo` on
+    `PATH`, an offline tree whose index is cold — leaves the exclusion in
+    place rather than turning every build into a tree-moved refusal.
+    """
+    global _CARGO_RESOLUTION_SETTLED
+    if _CARGO_RESOLUTION_SETTLED:
+        return True
+    try:
+        proc = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    if proc.returncode != 0:
+        return False
+    _CARGO_RESOLUTION_SETTLED = True
+    return True
+
+
+def build_window_witness(excluded=()):
+    """A digest of the inputs a build is about to read.
 
     Uncached, unlike [`build_inputs_fingerprint`]: the whole point is to be
     read twice and compared, so a memoised second read would answer with the
-    first.
+    first. Both readings must pass the same `excluded`, or the comparison
+    reports a difference the tree does not have.
     """
     paths = build_input_paths()
     if paths is None:
         return None
-    return digest_input_paths([p for p in paths if p not in CARGO_WRITTEN_INPUTS])
+    return digest_input_paths([p for p in paths if p not in excluded])
 
 
 def open_build_window():
@@ -2388,8 +2521,9 @@ def open_build_window():
     tree here as well makes that window observable, which is the only way to
     tell the two orders apart.
     """
-    global _BUILD_WINDOW_WITNESS
-    _BUILD_WINDOW_WITNESS = build_window_witness()
+    global _BUILD_WINDOW_WITNESS, _BUILD_WINDOW_EXCLUDED
+    _BUILD_WINDOW_EXCLUDED = () if settle_cargo_resolution() else CARGO_WRITTEN_INPUTS
+    _BUILD_WINDOW_WITNESS = build_window_witness(_BUILD_WINDOW_EXCLUDED)
 
 
 def invalidate_build_inputs_fingerprint():
@@ -2440,7 +2574,8 @@ def stamp_artefact_inputs(artefact):
     fingerprint = build_inputs_fingerprint()
     if fingerprint is None:
         return
-    if _BUILD_WINDOW_WITNESS is not None and _BUILD_WINDOW_WITNESS != build_window_witness():
+    if (_BUILD_WINDOW_WITNESS is not None
+            and _BUILD_WINDOW_WITNESS != build_window_witness(_BUILD_WINDOW_EXCLUDED)):
         # Some input changed while cargo was reading them, so the artefact
         # holds neither the tree the build started from nor the one that is
         # here now. Stamping the current tree against it would make a later
@@ -4062,7 +4197,7 @@ class Check:
     # ── self-checking regression guard ──
 
     def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
-                      require_jit=True, spec_folds=()):
+                      require_jit=True, spec_folds=(), min_loops=1):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -4074,13 +4209,19 @@ class Check:
         `time`-module timing guard cannot run on the wasm guest, which has no
         `time` module).
 
-        With *require_jit* the run must also have compiled at least one loop.
-        A self-asserted invariant is satisfied by an interpreted run, so
-        without this a fixture guarding a compiled mis-admission passes while
-        establishing nothing — and it would go on passing if the shape it
-        guards stopped reaching the JIT, which is the change most likely to
-        make the guard vacuous. `synth_selfcheck_interpreted` turns it off for
-        a fixture whose invariant is not about compiled code.
+        With *require_jit* the run must also have compiled at least
+        *min_loops* loops. A self-asserted invariant is satisfied by an
+        interpreted run, so without this a fixture guarding a compiled
+        mis-admission passes while establishing nothing — and it would go on
+        passing if a shape it guards stopped reaching the JIT, which is the
+        change most likely to make the guard vacuous.
+        `synth_selfcheck_interpreted` turns it off for a fixture whose
+        invariant is not about compiled code.
+
+        *min_loops* is what makes that true of a fixture with more than one
+        guarded shape: `loops_compiled` is a whole-process figure, so a floor
+        of one is reached by any single loop and says nothing about the other
+        seven. `synth_selfcheck_loops` carries the measured floor.
 
         *spec_folds* is the `# pyre-check: spec-folds=` list, read the same way
         `run_synthetic_bench` reads it. A fixture written to guard a trace-time
@@ -4133,12 +4274,23 @@ class Check:
                 continue
             if require_jit:
                 compiled = _jit_stats_field(stderr, "loops_compiled")
-                if compiled is None or compiled < 1:
-                    seen = "no [jit-stats] line" if compiled is None else "loops_compiled=0"
-                    detail = (
-                        f"the guard ran interpreted ({seen}), so its assertion "
-                        "says nothing about compiled code"
-                    )
+                if compiled is None or compiled < min_loops:
+                    if compiled is None:
+                        detail = (
+                            "the guard ran interpreted (no [jit-stats] line), so "
+                            "its assertion says nothing about compiled code"
+                        )
+                    elif compiled == 0:
+                        detail = (
+                            "the guard ran interpreted (loops_compiled=0), so its "
+                            "assertion says nothing about compiled code"
+                        )
+                    else:
+                        detail = (
+                            f"loops_compiled={compiled} < {min_loops}: a shape this "
+                            "guard covers stopped reaching the JIT, so its assertion "
+                            "no longer says anything about that shape"
+                        )
                     self._record(backend, False, name, detail)
                     print(f"{red('FAIL')}  {detail}")
                     _dump_failed_run(output, stderr)
@@ -4413,7 +4565,14 @@ class Check:
             try:
                 selfcheck = synth_selfcheck(path)
                 skip_backends = synth_skip_backends(path) if selfcheck else ()
+                # Every header a selfcheck fixture owes, read inside the same
+                # try: a missing or malformed directive is an authoring error
+                # to report by name, not a traceback out of the suite loop.
                 selfcheck_folds = synth_spec_folds(path) if selfcheck else ()
+                interpreted = selfcheck and synth_selfcheck_interpreted(path)
+                min_loops = (
+                    synth_selfcheck_loops(path) if selfcheck and not interpreted else 1
+                )
             except ValueError as e:
                 print(f"{red('ERROR')}: {e}")
                 sys.exit(1)
@@ -4423,8 +4582,9 @@ class Check:
                     str(path),
                     self.args.synthetic_timeout,
                     skip_backends=skip_backends,
-                    require_jit=not synth_selfcheck_interpreted(path),
+                    require_jit=not interpreted,
                     spec_folds=selfcheck_folds,
+                    min_loops=min_loops,
                 )
             else:
                 self.run_synthetic_bench(

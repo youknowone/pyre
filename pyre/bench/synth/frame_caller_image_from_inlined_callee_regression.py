@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=1
 # Self-checking regression guard for a caller frame read from inside an inlined
 # callee while the caller's compiled loop is still running.
 #

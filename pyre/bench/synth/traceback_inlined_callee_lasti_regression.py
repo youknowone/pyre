@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=3
 # Self-checking regression guard for the coordinate an UNWOUND frame reports
 # after an exception passed through it.  Sibling of
 # `frame_lineno_mid_replay_regression`, which guards the same coordinate for a

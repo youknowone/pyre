@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=8
 # The BINDING half of `wrapper_subclass_get_override`.  That fixture's
 # `overridden(*args)` absorbs a wrongly prepended leading argument, so it can
 # only ever see a wrong UNWRAP; this one's callable takes exactly one

@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=1
 # A resumed frame carries a payload — the value send() delivered, the exception
 # throw() raised, or a suspended `yield from` delegate — and the JIT entry has
 # five paths that decline the frame and hand it back to the plain interpreter.

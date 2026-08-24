@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=1
 # Self-checking regression guard for `sys._getframemodulename` read from a hot
 # loop, at depth 0 and from one frame further in.
 #

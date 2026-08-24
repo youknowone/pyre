@@ -27,12 +27,24 @@ opt into the same directory's self-checking mode:
 # pyre-check: selfcheck
 ```
 
-Such a fixture must exit successfully, print `PASS`, and have compiled at
-least one loop. The last of those is what stops an interpreted run from
-satisfying a guard written about compiled code: the assertion holds either way,
-so without it the fixture would keep passing if the shape it guards stopped
-reaching the JIT. A fixture whose invariant is not about compiled code says so
-with
+Such a fixture must exit successfully, print `PASS`, and declare how many
+loops it compiles:
+
+```python
+# pyre-check: selfcheck-loops=8
+```
+
+The loop floor is what stops an interpreted run from satisfying a guard
+written about compiled code: the assertion holds either way, so without it the
+fixture would keep passing if the shapes it guards stopped reaching the JIT.
+The number is per fixture because `loops_compiled` is a whole-process figure —
+a fixed floor of one is reached by any single loop, so on a fixture with eight
+of them seven guarded shapes could go cold unnoticed. Measure it by running
+the fixture on every enabled backend with `MAJIT_STATS=1` and declaring the
+*smallest* `loops_compiled` they report; the backends need not agree, and a
+fixture is free to compile more than the floor.
+
+A fixture whose invariant is not about compiled code says so with
 
 ```python
 # pyre-check: selfcheck-interpreted

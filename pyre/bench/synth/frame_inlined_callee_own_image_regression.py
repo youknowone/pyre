@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=3
 # Self-checking regression guard for the image an INLINED CALLEE's own frame
 # reports. The synthetic suite discovers it as a self-checking fixture.
 #

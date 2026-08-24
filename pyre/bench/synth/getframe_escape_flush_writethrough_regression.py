@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=1
 # Self-checking regression guard for the frame-escape flush that resumes past
 # the abort. The synthetic suite discovers it as a self-checking fixture.
 # A residual (may-force) callee stores its own frame; the loop body then reads
