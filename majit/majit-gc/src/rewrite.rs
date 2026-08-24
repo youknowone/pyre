@@ -1670,6 +1670,13 @@ impl GcRewriterImpl {
     /// of a young value into an old object and leave that value unforwarded
     /// after the next minor collection.  The stamp is therefore not applied.
     ///
+    /// The young non-moving birth upstream relies on now exists —
+    /// `MiniMarkGC::try_alloc_young_nonmoving_clear`, which the collecting
+    /// `alloc_with_type` entry points take for an oversized object — but these
+    /// helpers still route through `alloc_oldgen_typed`, so the reasoning above
+    /// is unchanged until they are moved onto it.  Moving them is what would
+    /// earn the stamp back.
+    ///
     /// pyre is framework-GC only; the Boehm `else` arm
     /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
     /// helper itself stamps the tid into the GC header (matching

@@ -180,6 +180,38 @@ pub fn set_deferred_major_request_probe(probe: Option<DeferredMajorRequestProbeF
     DEFERRED_MAJOR_REQUEST_PROBE.set(probe);
 }
 
+/// `MAJIT_GC_YOUNG_RAWMALLOC` — whether an oversized allocation from a
+/// collecting entry point may be born YOUNG and non-moving
+/// (`external_malloc(..., alloc_young=True)`) instead of straight into the old
+/// generation.
+///
+/// On by default, because born-old is the deviation: upstream gives every
+/// oversized `malloc_fixedsize`/`malloc_varsize` result `alloc_young=True`, and
+/// pyre's born-old block can only be reclaimed by a major. `=0` restores the
+/// born-old behaviour without a rebuild, which is what makes a defect that
+/// appears only once these objects can die at a minor bisectable against a
+/// single binary.
+///
+/// Read once and cached: the gate sits on the large-allocation arm, and
+/// `std::env::var_os` takes the environment lock and scans it linearly on every
+/// call. Same shape as [`crate::gc_lifetime_log_enabled`].
+fn young_rawmalloc_enabled() -> bool {
+    // wasm32-unknown-unknown has no process environment, so the guest cannot
+    // read the variable and takes the default.
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("MAJIT_GC_YOUNG_RAWMALLOC").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
+        })
+    }
+}
+
 /// Whether a request armed now would be acted on. False with no probe installed.
 fn deferred_major_request_wanted() -> bool {
     DEFERRED_MAJOR_REQUEST_PROBE
@@ -1463,8 +1495,17 @@ impl MiniMarkGC {
     #[cold]
     #[inline(never)]
     fn alloc_with_type_slow(&mut self, type_id: u32, total_size: usize) -> GcRef {
-        // Large objects go directly to old gen.
+        // incminimark.py:719,767 `malloc_varsize` and :665 `malloc_fixedsize`:
+        // an oversized object skips the nursery through
+        // `external_malloc(..., alloc_young=True)`, so it is non-moving and
+        // still YOUNG — the next minor frees it if nothing reached it. This
+        // entry point already collects on its nursery arm below, so its callers
+        // already present a complete root set at an allocation; the young birth
+        // adds no requirement they do not already meet.
         if total_size > self.config.large_object_threshold {
+            if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
+                return obj;
+            }
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
 
@@ -1625,9 +1666,19 @@ impl MiniMarkGC {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         // Large objects never trigger a nursery collection, so the native
-        // slot needs no temporary registration.
+        // slot needs no temporary registration. `alloc_with_type_slow` records
+        // why the oversized arm is a young non-moving birth.
+        //
+        // `needs_write_barrier` stays true for the young birth as well. The
+        // young object carries no GCFLAG_TRACK_YOUNG_PTRS, so the barrier the
+        // caller then emits finds the flag clear and does nothing — a cost, not
+        // a hazard, and the alternative is a caller that has to know which of
+        // the two births it got.
         if total_size > self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
+            if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
+                return obj;
+            }
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
 
@@ -2059,6 +2110,12 @@ impl MiniMarkGC {
             if gcref.is_null()
                 || !self.is_managed_heap_object(gcref.0)
                 || self.nursery.contains(gcref.0)
+                // A young raw-malloced holder owes no barrier for the same
+                // reason a nursery holder does not: the minor reaches it as an
+                // object and forwards its slots itself. Without this it reads
+                // as an old holder and every young reference it carries is
+                // reported as a missing barrier.
+                || self.is_young_rawmalloced(gcref.0)
                 || !seen.insert(gcref.0)
             {
                 continue;
@@ -2109,9 +2166,14 @@ impl MiniMarkGC {
                 continue;
             }
             let here = gcref.0;
-            // A young holder needs no barrier: the minor traces the nursery in
-            // full, so only an old-generation slot can be left behind.
-            let holder_is_old = self.oldgen.contains(here);
+            // A young holder needs no barrier: the minor reaches it as an
+            // object and forwards its slots itself, so only an old-generation
+            // slot can be left behind. A young raw-malloced holder is in
+            // `rawmalloced_payloads` like an old one, so it has to be asked
+            // about separately — the same reading `bh_probe_stale_young_slots`
+            // takes.
+            let holder_is_old =
+                self.oldgen.contains(here) && !self.is_young_rawmalloced(here);
             let remembered = self.remembered_set.contains(&here);
             let parent_remembered = parent.is_some_and(|p| self.remembered_set.contains(&p));
             self.visit_referent_slots(here, &mut |slot| {
@@ -2508,6 +2570,174 @@ impl MiniMarkGC {
         GcRef(obj_addr)
     }
 
+    /// incminimark.py `external_malloc(typeid, length, alloc_young=True)`,
+    /// the birth [`alloc_in_oldgen`](Self::alloc_in_oldgen) is the
+    /// `alloc_young=False` sibling of.
+    ///
+    /// The block is non-moving like every other rawmalloc block, and *young*:
+    /// the minor collection that ends without reaching it frees it, exactly as
+    /// it drops an unreached nursery object. That is what pyre has been
+    /// missing — `alloc_in_oldgen`'s block can only be reclaimed by a major, so
+    /// a large object allocated and abandoned inside one loop iteration stays
+    /// resident for as many iterations as it takes the major threshold to
+    /// arrive.
+    ///
+    /// Two restrictions, both of them refusals rather than adaptations:
+    ///
+    /// * A type carrying a destructor or the weakref flag falls back to the
+    ///   born-old birth. `deal_with_young_objects_with_destructors` and
+    ///   `invalidate_young_weakrefs` both decide survival by reading the
+    ///   forwarding header, and a non-moving object never forwards, so a young
+    ///   rawmalloced member of either list would be read as dead while it is
+    ///   alive. Upstream forbids the weakref half by contract —
+    ///   `malloc_fixedsize`'s large arm asserts `not contains_weakptr` — and
+    ///   pyre declines the destructor half rather than teach the survivor test
+    ///   a second witness.
+    /// * `MAJIT_GC_YOUNG_RAWMALLOC=0` turns the whole path off, so a defect
+    ///   that only appears once these objects can die at a minor can be
+    ///   bisected against the born-old behaviour without rebuilding.
+    ///
+    /// Returns `None` for either refusal and for an allocation failure; the
+    /// caller falls back to `alloc_in_oldgen_clear`.
+    fn try_alloc_young_nonmoving_clear(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+    ) -> Option<GcRef> {
+        if !young_rawmalloc_enabled() || !self.type_alloc_may_be_young(type_id) {
+            return None;
+        }
+        let ptr = self.oldgen.try_alloc_young(total_size)?;
+        let obj = self.finish_alloc_young_nonmoving(type_id, total_size, ptr);
+        Self::raw_memclear(obj, total_size);
+        Some(obj)
+    }
+
+    /// Whether a type's allocation may take the young non-moving birth.
+    ///
+    /// A type id past the end of the table registers neither a destructor nor
+    /// a weakref — `finish_alloc_in_oldgen` and `register_young_object_if_needed`
+    /// both guard on the same bound — so it is plain by the same reading, not
+    /// unknown.
+    #[inline]
+    fn type_alloc_may_be_young(&self, type_id: u32) -> bool {
+        (type_id as usize) >= self.types.len() || {
+            let info = self.types.get(type_id);
+            info.destructor.is_none() && !info.is_weakref
+        }
+    }
+
+    /// The header and bookkeeping half of the young non-moving birth.
+    fn finish_alloc_young_nonmoving(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+        ptr: *mut u8,
+    ) -> GcRef {
+        // incminimark.py:1013-1019: the non-card rawmalloc arm sets
+        // `extra_flags = 0`, and the `alloc_young` branch never adds
+        // GCFLAG_TRACK_YOUNG_PTRS. A young object needs no write barrier for a
+        // young pointer stored into it, because the minor reaches it whichever
+        // way it is live. The flag arrives when
+        // `visit_young_rawmalloced_object` has made it old and the remembered
+        // walk sets it, exactly as it does for a nursery survivor.
+        let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
+        *hdr = GcHeader::new(type_id);
+        let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        if crate::gc_lifetime_log_enabled() {
+            eprintln!(
+                "[gc][alloc] addr={obj_addr:#x} type_id={type_id} kind=raw-young state={:?}",
+                self.gc_state
+            );
+        }
+        crate::note_bh_object(
+            obj_addr,
+            total_size - GcHeader::SIZE,
+            crate::BH_PROBE_ORIGIN_BORN_YOUNG_RAW,
+        );
+        // `external_malloc` asks the threshold question for this arm as well;
+        // `finish_alloc_in_oldgen` records why pyre can only defer the answer.
+        //
+        // `bytes_made_old_since_cycle` is deliberately NOT bumped here: nothing
+        // was made old. `visit_young_rawmalloced_object` bumps it at promotion,
+        // where upstream bumps `size_objects_made_old`.
+        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
+            majit_ir::eval_breaker_word::set_gc();
+        }
+        GcRef(obj_addr)
+    }
+
+    /// incminimark.py:1213-1221 `is_young_object`, second half.
+    ///
+    /// [`is_nursery_object_start`](Self::is_nursery_object_start) is the
+    /// nursery bound alone, and it is the right question wherever the real
+    /// subject is "can this move". Youth is the wider property, and only the
+    /// sites upstream asks it at ask it.
+    #[inline]
+    fn is_young_rawmalloced(&self, addr: usize) -> bool {
+        self.oldgen.young_rawmalloced_contains(addr)
+    }
+
+    /// incminimark.py:2267-2298 `_visit_young_rawmalloced_object`.
+    ///
+    /// The minor reached a young rawmalloced object. Stamp
+    /// `GCFLAG_VISITED_RMY` so `free_young_rawmalloced_objects` promotes it
+    /// instead of freeing it, and put it on the lists an old object owes.
+    /// Anything this collection never reaches ends without the flag and is
+    /// freed at its end.
+    fn visit_young_rawmalloced_object(&mut self, obj_addr: usize) {
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).has_flag(flags::VISITED_RMY) } {
+            return;
+        }
+        unsafe { (*hdr).set_flag(flags::VISITED_RMY) };
+        // incminimark.py:2280-2283 `size_objects_made_old`: the promotion is
+        // where these bytes become old, so it is where the major-progress
+        // accounting must see them.
+        let type_id = unsafe { (*hdr).type_id() };
+        self.validate_type_id(type_id, obj_addr, "visit_young_rawmalloced");
+        let payload = self.size_for_typeid(obj_addr, type_id, "visit_young_rawmalloced");
+        self.bytes_made_old_since_cycle = self
+            .bytes_made_old_since_cycle
+            .saturating_add(GcHeader::SIZE + payload);
+        // incminimark.py:2285-2297. TRACK_YOUNG_PTRS is clear on every young
+        // birth, so the first arm always runs; the remembered walk is what sets
+        // the flag and forwards whatever nursery children the object holds.
+        if unsafe { !(*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            self.remembered_set.push(obj_addr);
+        }
+        if unsafe { (*hdr).has_flag(flags::HAS_CARDS) } {
+            debug_assert!(
+                unsafe { (*hdr).has_flag(flags::CARDS_SET) },
+                "young array: GCFLAG_HAS_CARDS without GCFLAG_CARDS_SET"
+            );
+            self.old_objects_with_cards_set.push(obj_addr);
+        }
+        // `oldgen_birth_flags` allocates black during MARKING because an object
+        // entering the old generation then enters the lists this cycle will
+        // sweep, after its root scan. A promotion is that same entry — but
+        // unlike a fresh born-old block this object's fields are already
+        // filled, so black alone would leave its children unmarked. Mark it and
+        // re-queue it gray, the way `drag_out_root` does for a root first seen
+        // during MARKING.
+        if self.gc_state == GcState::Marking && unsafe { !(*hdr).has_flag(flags::VISITED) } {
+            unsafe { (*hdr).set_flag(flags::VISITED) };
+            self.incr_state.more_gray_stack.push(obj_addr);
+        }
+    }
+
+    /// incminimark.py:2344-2356
+    /// `remove_young_arrays_from_old_objects_pointing_to_young`.
+    ///
+    /// An entry naming a young rawmalloced object is a contradiction: this
+    /// minor visits it as an object, and if it dies the drain would be reading
+    /// a freed header. Upstream drops those entries before the walk starts.
+    fn remove_young_arrays_from_remembered_set(&mut self) {
+        let oldgen = &self.oldgen;
+        self.remembered_set
+            .retain(|&obj_addr| !oldgen.young_rawmalloced_contains(obj_addr));
+    }
+
     /// Perform a minor (nursery) collection.
     ///
     /// 1. Scan roots: copy referenced nursery objects to old gen.
@@ -2554,6 +2784,14 @@ impl MiniMarkGC {
         self.surviving_pinned_objects.clear();
         self.pinned_objects_in_nursery = 0;
         self.any_pinned_object_kept = false;
+        // incminimark.py:1787-1789: before everything else, drop the young
+        // arrays from the remembered set. An entry naming an object this
+        // collection may free is one the drain below would dereference after
+        // the free; upstream removes them here, ahead of the re-gray and every
+        // root walk.
+        if self.oldgen.has_young_rawmalloced() {
+            self.remove_young_arrays_from_remembered_set();
+        }
         // incminimark.py:1800-1807: a black old parent may expose an unpinned
         // child that will move during this minor, so make the parent gray
         // again before the active major marking cycle can sweep that child.
@@ -2613,6 +2851,13 @@ impl MiniMarkGC {
         let mut visit_jf_root = |gcref: &mut GcRef| {
             if self.is_nursery_object_start(gcref.0) {
                 self.drag_out_root(gcref);
+            } else if self.is_young_rawmalloced(gcref.0) {
+                // Before the `oldgen.contains` arm below: a young rawmalloced
+                // block is registered in `rawmalloced_payloads` too, so that
+                // arm would trace it as an old jitframe and leave it without
+                // GCFLAG_VISITED_RMY — freed at the end of this collection
+                // with its children kept.
+                self.visit_young_rawmalloced_object(gcref.0);
             } else if !gcref.is_null() && self.oldgen.contains(gcref.0) {
                 // RPython parity: old-gen jitframes need their interior
                 // nursery refs traced directly. The custom_trace hook
@@ -2827,8 +3072,20 @@ impl MiniMarkGC {
         // to `surviving_pinned_objects`. A pin that died this cycle must not
         // keep an address-keyed owner table entry alive.
         let nursery = &self.nursery;
+        let oldgen = &self.oldgen;
         let mut classify_young_owner = |owner: usize| -> Option<usize> {
-            if owner == 0 || !nursery.contains(owner) {
+            if owner == 0 {
+                return Some(owner);
+            }
+            if !nursery.contains(owner) {
+                // A young rawmalloced owner is the other address this
+                // collection can hand back to a later allocation. It never
+                // moves, so a survivor keeps its key; one this collection did
+                // not reach is about to be freed and must lose it.
+                if oldgen.young_rawmalloced_contains(owner) {
+                    let hdr = unsafe { header_of(owner) };
+                    return unsafe { (*hdr).has_flag(flags::VISITED_RMY) }.then_some(owner);
+                }
                 return Some(owner);
             }
             // A pinned object is alive and stayed put, so it never forwarded.
@@ -2883,6 +3140,15 @@ impl MiniMarkGC {
         // below, which invalidates the addresses this reads.
         if self.rrc.enabled {
             self.rrc_minor_collection_free();
+        }
+
+        // incminimark.py:1890-1893: walk the young raw-malloced objects and
+        // either free them or make them old. Everything that reads survival off
+        // the nursery — the weakref pass, the destructors, the owner tables,
+        // the rawrefcount free — has already run, and the nursery reset that
+        // invalidates those readings has not.
+        if self.oldgen.has_young_rawmalloced() {
+            self.oldgen.free_young_rawmalloced_objects();
         }
 
         if let Some((used_before, promoted_before)) = drain_sample {
@@ -2942,13 +3208,13 @@ impl MiniMarkGC {
     ///     is in old-gen, the weakref survives — push onto
     ///     `old_objects_with_weakrefs` for the next major cycle.
     ///
-    /// RPython's broader checks for young raw-malloced targets,
-    /// pinned-target NULL semantics, and prebuilt-target skipping
-    /// have no current pyre analog (no raw-malloc young region, no
-    /// pinned-weakref code path, no immortal prebuilt objects with
-    /// `GCFLAG_NO_HEAP_PTRS`), so this slice ports the core branch
-    /// — the remaining filters are out of scope until the matching
-    /// surfaces land.
+    /// The young raw-malloced target is the second branch
+    /// (incminimark.py:3083-3090): it survives without moving, so the slot
+    /// needs no update and only its death has to be written. RPython's
+    /// pinned-target NULL semantics and prebuilt-target skipping still have no
+    /// pyre analog (no pinned-weakref code path, no immortal prebuilt objects
+    /// with `GCFLAG_NO_HEAP_PTRS`), so those filters remain out of scope until
+    /// the matching surfaces land.
     fn invalidate_young_weakrefs(&mut self) {
         while let Some(obj_addr) = self.young_objects_with_weakrefs.pop() {
             // incminimark.py:3065-3066: if not forwarded → weakref died.
@@ -2967,6 +3233,19 @@ impl MiniMarkGC {
 
             // Null targets need no update or follow-up tracking.
             if pointing_to == 0 {
+                continue;
+            }
+
+            // incminimark.py:3083-3090: a young raw-malloced target survives
+            // in place when this collection reached it, and its address does
+            // not change either way — so the surviving case updates nothing and
+            // only hands the weakref to the next major cycle.
+            if self.is_young_rawmalloced(pointing_to) {
+                if unsafe { (*header_of(pointing_to)).has_flag(flags::VISITED_RMY) } {
+                    self.old_objects_with_weakrefs.push(new_obj);
+                } else {
+                    unsafe { (*weakptr_slot).0 = 0 };
+                }
                 continue;
             }
 
@@ -3246,6 +3525,11 @@ impl MiniMarkGC {
         if obj == 0 {
             return false;
         }
+        if self.is_young_rawmalloced(obj) {
+            // incminimark.py:3300-3306: a young raw-malloced object survives
+            // without moving, and GCFLAG_VISITED_RMY is what says so.
+            return unsafe { (*header_of(obj)).has_flag(flags::VISITED_RMY) };
+        }
         if !self.is_nursery_object_start(obj) {
             return true;
         }
@@ -3275,9 +3559,17 @@ impl MiniMarkGC {
                 if self.rrc_young_object_alive(obj) {
                     continue;
                 }
+                if self.is_young_rawmalloced(obj) {
+                    // Young and reachable from a surviving block's C field, so
+                    // it survives — but it does not move, so flagging it is the
+                    // whole of dragging it out.
+                    self.visit_young_rawmalloced_object(obj);
+                    dragged = true;
+                    continue;
+                }
                 if !self.is_nursery_object_start(obj) {
-                    // Neither dead nor this collection's business: an object
-                    // outside the nursery survives every minor.
+                    // Neither dead nor this collection's business: an old
+                    // object survives every minor.
                     continue;
                 }
                 let mut root = GcRef(obj);
@@ -3329,9 +3621,10 @@ impl MiniMarkGC {
     ///
     /// Upstream files a link by two independent questions — which list (young
     /// or old), and which identity table (nursery-keyed or not).  They come
-    /// apart only for a young raw-malloced object, which is young but not in
-    /// the nursery; there is no young raw-malloc region here, so the two
-    /// questions collapse into one and the third combination cannot arise.
+    /// apart for a young raw-malloced object, which is young but not in the
+    /// nursery: the list is chosen by `is_young_object`, the table by
+    /// `is_in_nursery`, so such a link is on the young list and in the
+    /// address-keyed table.
     ///
     /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYRE`] to
     /// the mirror's count: that share is what this link is worth, and what
@@ -3339,11 +3632,14 @@ impl MiniMarkGC {
     pub fn rawrefcount_create_link_pyre(&mut self, obj: usize, pyobject: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
         unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
-        if self.is_in_nursery(obj) {
+        if self.is_in_nursery(obj) || self.is_young_rawmalloced(obj) {
             self.rrc.p_list_young.push(pyobject);
-            self.rrc.p_dict_nurs.insert(obj, pyobject);
         } else {
             self.rrc.p_list_old.push(pyobject);
+        }
+        if self.is_in_nursery(obj) {
+            self.rrc.p_dict_nurs.insert(obj, pyobject);
+        } else {
             self.rrc.p_dict.insert(obj, pyobject);
         }
     }
@@ -3354,7 +3650,7 @@ impl MiniMarkGC {
     /// object on the mirror's behalf and there is no identity table to keep.
     pub fn rawrefcount_create_link_pyobj(&mut self, obj: usize, pyobject: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
-        if self.is_in_nursery(obj) {
+        if self.is_in_nursery(obj) || self.is_young_rawmalloced(obj) {
             self.rrc.o_list_young.push(pyobject);
         } else {
             self.rrc.o_list_old.push(pyobject);
@@ -3484,10 +3780,30 @@ impl MiniMarkGC {
     /// incminimark.py `_rrc_minor_free`.
     fn _rrc_minor_free(&mut self, pyobject: usize, list: RrcList, still_young: &mut Vec<usize>) {
         let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
-        // incminimark.py:3300-3312 handles a young raw-malloced target, which
-        // survives without moving and is recognised by a flag rather than a
-        // forwarding pointer.  There is no young raw-malloc region here, so a
-        // young-list link that is not a nursery address is a filing error.
+        // incminimark.py:3300-3312: a young raw-malloced target survives
+        // without moving and is recognised by GCFLAG_VISITED_RMY rather than by
+        // a forwarding pointer. Its link already names its final address, so a
+        // survivor only changes lists.
+        if self.is_young_rawmalloced(obj) {
+            if unsafe { (*header_of(obj)).has_flag(flags::VISITED_RMY) } {
+                match list {
+                    RrcList::P => {
+                        self.rrc.p_dict.insert(obj, pyobject);
+                        self.rrc.p_list_old.push(pyobject);
+                    }
+                    RrcList::O => self.rrc.o_list_old.push(pyobject),
+                }
+            } else {
+                if list == RrcList::P {
+                    // Dying young large object: it was keyed in `p_dict`, not
+                    // in the nursery table this collection empties, so the
+                    // entry has to be removed by hand.
+                    self.rrc.p_dict.remove(&obj);
+                }
+                self._rrc_free(pyobject);
+            }
+            return;
+        }
         debug_assert!(
             self.is_nursery_object_start(obj),
             "a young rawrefcount list holds a non-nursery link"
@@ -3712,6 +4028,13 @@ impl MiniMarkGC {
                 let hdr = unsafe { header_of(obj_addr) };
                 if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
                     continue;
+                }
+                // incminimark.py:1838-1841 "they all survive": a registered
+                // young finalizer is a root for this collection, and a young
+                // rawmalloced one survives by being flagged rather than by
+                // being copied out.
+                if self.is_young_rawmalloced(obj_addr) {
+                    self.visit_young_rawmalloced_object(obj_addr);
                 }
                 obj_addr
             };
@@ -4263,6 +4586,12 @@ impl MiniMarkGC {
             let slot_addr = gcref as *mut GcRef as usize;
             *gcref =
                 self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
+        } else if self.is_young_rawmalloced(gcref.0) {
+            // incminimark.py:2149-2159 `_trace_drag_out`: an object outside the
+            // nursery needs nothing changed, *except* that a young rawmalloced
+            // one must be flagged so the end of this collection promotes rather
+            // than frees it.
+            self.visit_young_rawmalloced_object(gcref.0);
         }
         // `_trace_drag_out1_marking_phase`: inspect the live object's header
         // only while major marking is active, and append iff neither VISITED
@@ -4320,6 +4649,8 @@ impl MiniMarkGC {
                             slot_ptr as usize,
                         );
                         *slot_ptr = new_ref;
+                    } else if self.is_young_rawmalloced(field_ref.0) {
+                        self.visit_young_rawmalloced_object(field_ref.0);
                     }
                 });
             }
@@ -4366,6 +4697,8 @@ impl MiniMarkGC {
                 unsafe {
                     *slot = new_ref;
                 }
+            } else if self.is_young_rawmalloced(field_ref.0) {
+                self.visit_young_rawmalloced_object(field_ref.0);
             }
         }
 
@@ -4394,6 +4727,8 @@ impl MiniMarkGC {
                     unsafe {
                         *slot = new_ref;
                     }
+                } else if self.is_young_rawmalloced(field_ref.0) {
+                    self.visit_young_rawmalloced_object(field_ref.0);
                 }
             }
         }
@@ -4541,6 +4876,12 @@ impl MiniMarkGC {
     /// The non-moving oldgen major is the one mode that marks the nursery in
     /// place — it leaves those bytes untouched by contract, and
     /// [`Self::note_nonmoving_nursery_mark`] clears the marks afterwards.
+    ///
+    /// A young raw-malloced object is admitted, as upstream admits it, and the
+    /// entry cannot outlive the object: it is only reachable from a root, which
+    /// the next minor walks, or from an old parent, which the write barrier put
+    /// on the remembered set — and either route runs
+    /// [`Self::visit_young_rawmalloced_object`], whose MARKING arm greys it.
     #[inline]
     fn may_enter_marking_worklist(&self, addr: usize) -> bool {
         self.oldgen_nonmoving_active || !self.is_in_nursery(addr)
@@ -4895,8 +5236,11 @@ impl MiniMarkGC {
             unsafe { (*hdr).set_flag(flags::EXTRA) };
             let is_requested_generation = match generation {
                 -1 => true,
-                0 => self.is_in_nursery(gcref.0),
-                2 => !self.is_in_nursery(gcref.0),
+                // Youth, not nursery residency: a young raw-malloced object is
+                // in generation 0 and dies at the next minor like any other
+                // young object.
+                0 => self.is_in_nursery(gcref.0) || self.is_young_rawmalloced(gcref.0),
+                2 => !self.is_in_nursery(gcref.0) && !self.is_young_rawmalloced(gcref.0),
                 _ => false,
             };
             let type_id = unsafe { (*hdr).type_id() };
@@ -5476,6 +5820,11 @@ impl MiniMarkGC {
     fn describe_generation(&self, addr: usize) -> &'static str {
         if self.nursery.contains(addr) {
             "nursery"
+        } else if self.is_young_rawmalloced(addr) {
+            // Young and non-moving: it cannot be a stale forwarding address,
+            // but a minor can still free it, so it is not the "oldgen" defect
+            // either. Asked before `oldgen.contains`, which also answers yes.
+            "young-rawmalloced"
         } else if self.oldgen.contains(addr) {
             "oldgen"
         } else {
@@ -7069,6 +7418,8 @@ impl MiniMarkGC {
                                     unsafe {
                                         *slot = new_ref;
                                     }
+                                } else if self.is_young_rawmalloced(field_ref.0) {
+                                    self.visit_young_rawmalloced_object(field_ref.0);
                                 }
                             }
                         }
@@ -8140,6 +8491,160 @@ mod tests {
         })
     }
 
+    /// incminimark.py:1890-1893 `free_young_rawmalloced_objects`: an
+    /// oversized object nothing reached is freed by the minor, not carried to
+    /// the next major.
+    #[test]
+    fn large_object_dies_at_a_minor() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+        let baseline = gc.oldgen.rawmalloced_bytes();
+
+        let obj = gc.alloc_with_type(tid, large);
+        assert!(!obj.is_null());
+        assert!(!gc.is_in_nursery(obj.0), "an oversized object skips the nursery");
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "an oversized object from a collecting entry point is born young"
+        );
+        assert!(gc.oldgen.rawmalloced_bytes() > baseline);
+
+        gc.do_collect_nursery();
+
+        assert!(
+            !gc.is_young_rawmalloced(obj.0),
+            "the young list is emptied by every minor"
+        );
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            baseline,
+            "an unreached young rawmalloced object is freed by the minor"
+        );
+    }
+
+    /// The other half of the same rule: reached means promoted, and promoted
+    /// means the SAME address — a young rawmalloced object never moves.
+    #[test]
+    fn rooted_large_object_is_promoted_in_place_and_then_dies() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+        let baseline = gc.oldgen.rawmalloced_bytes();
+
+        let mut root = gc.alloc_with_type(tid, large);
+        let born_at = root.0;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+
+        assert_eq!(root.0, born_at, "a non-moving object keeps its address");
+        assert!(!gc.is_young_rawmalloced(root.0), "it is old now");
+        assert!(
+            gc.oldgen.rawmalloced_bytes() > baseline,
+            "a reached object survives its minor"
+        );
+        assert!(
+            unsafe { !(*header_of(root.0)).has_flag(flags::VISITED_RMY) },
+            "incminimark.py:2663 clears the flag on the survivor"
+        );
+        // A second minor must not free it either: it is on
+        // `old_rawmalloced_objects` now, which only a major sweeps.
+        gc.roots.clear();
+        gc.do_collect_nursery();
+        assert!(gc.oldgen.rawmalloced_bytes() > baseline);
+    }
+
+    /// The write barrier is the only route by which an old parent keeps a
+    /// young child alive, and it has to work for the non-moving young child
+    /// too — the parent's entry is what makes the minor reach it.
+    #[test]
+    fn large_object_held_by_a_barriered_old_parent_survives() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+
+        // Promote the holder first, so the store below is a real old->young
+        // edge rather than a young->young one.
+        let mut holder = gc.alloc_with_type(holder_tid, ptr_size);
+        unsafe { *(holder.0 as *mut GcRef) = GcRef::NULL };
+        unsafe { gc.roots.add(&mut holder) };
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(holder.0));
+
+        let baseline = gc.oldgen.rawmalloced_bytes();
+        let child = gc.alloc_with_type(leaf_tid, large);
+        assert!(gc.is_young_rawmalloced(child.0));
+        gc.do_write_barrier(holder);
+        unsafe { *(holder.0 as *mut GcRef) = child };
+
+        gc.do_collect_nursery();
+        assert!(
+            gc.oldgen.rawmalloced_bytes() > baseline,
+            "a young rawmalloced child of a barriered old parent survives"
+        );
+        assert_eq!(unsafe { *(holder.0 as *const GcRef) }.0, child.0);
+
+        // Drop the edge and the next minor cannot free it any more — it is old.
+        gc.roots.clear();
+    }
+
+    /// A type whose survival is read off a forwarding pointer cannot take the
+    /// non-moving young birth, so it keeps the born-old one.
+    #[test]
+    fn a_destructor_type_keeps_the_born_old_large_allocation() {
+        unsafe fn noop_destructor(_obj: usize) {}
+        let mut gc = test_gc(4096);
+        let mut info = TypeInfo::simple(16);
+        info.destructor = Some(noop_destructor);
+        let tid = gc.register_type(info);
+        let large = gc.config.large_object_threshold + 64;
+
+        let obj = gc.alloc_with_type(tid, large);
+        assert!(!gc.is_young_rawmalloced(obj.0), "born old, as before");
+        assert!(
+            unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) },
+            "and with the old generation's birth flags"
+        );
+    }
+
+    /// A young rawmalloced object is generation 0, and `gc.get_objects(2)`
+    /// must not report it as old while it can still die at a minor.
+    #[test]
+    fn a_young_rawmalloced_object_is_generation_zero() {
+        let mut gc = test_gc(4096);
+        let mut info = TypeInfo::simple(16);
+        info.is_object = true;
+        let tid = gc.register_type(info);
+        let large = gc.config.large_object_threshold + 64;
+
+        let mut root = gc.alloc_with_type(tid, large);
+        let addr = root.0;
+        unsafe { gc.roots.add(&mut root) };
+        assert!(gc.is_young_rawmalloced(addr));
+        assert!(!gc.is_in_nursery(addr));
+
+        let collect = |gc: &mut MiniMarkGC, generation: i8| {
+            let mut seen = Vec::new();
+            gc.do_get_objects(generation, &mut |obj| seen.push(obj.0));
+            seen
+        };
+        assert!(collect(&mut gc, 0).contains(&addr), "born into generation 0");
+        assert!(
+            !collect(&mut gc, 2).contains(&addr),
+            "not old while a minor can still free it"
+        );
+
+        gc.do_collect_nursery();
+
+        assert_eq!(root.0, addr, "a non-moving object keeps its address");
+        assert!(collect(&mut gc, 2).contains(&addr), "the promotion moves it");
+        assert!(!collect(&mut gc, 0).contains(&addr));
+
+        gc.roots.clear();
+    }
+
     #[test]
     fn root_set_removes_lifo_and_out_of_order_roots() {
         let mut roots = RootSet::new();
@@ -8964,11 +9469,15 @@ mod tests {
     }
 
     #[test]
-    fn test_large_object_goes_to_oldgen() {
+    fn test_large_object_skips_the_nursery() {
         let mut gc = test_gc(1024);
         gc.register_type(TypeInfo::simple(1024));
 
-        // 1024 > large_object_threshold (512), so goes to old gen.
+        // 1024 > large_object_threshold (512), so it is rawmalloced rather
+        // than bumped. Which generation it is born into is the separate
+        // question `large_object_dies_at_a_minor` asks: from a collecting
+        // entry point the answer is YOUNG and non-moving, so this asserts only
+        // what both births share.
         let obj = gc.alloc_with_type(0, 1024);
         assert!(!obj.is_null());
         assert!(!gc.is_in_nursery(obj.0));
