@@ -3,7 +3,7 @@
 //! An interpreter that drives [`JitDriver`] needs to know what its JIT actually
 //! did: a green test suite, agreement with the untraced tier and an exact
 //! answer are all satisfied by an interpreter that never compiled anything.
-//! The evidence lives behind four driver callbacks and a set of process-global
+//! The evidence lives behind six driver callbacks and a set of process-global
 //! diagnostic slots. [`Census`] wires those up once so an embedder does not
 //! rebuild the counters, the callback closures and the serializing lock per
 //! module.
@@ -47,11 +47,22 @@ static COMPILED_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 /// Recorded and optimized op counts, summed over every compiled loop.
 static TRACE_OPS_BEFORE: AtomicUsize = AtomicUsize::new(0);
 static TRACE_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
-/// Driver-internal totals taken off a driver by [`Census::absorb`]. Neither has
-/// a callback, so a driver that is dropped without being absorbed takes its
-/// tallies with it.
-static ABSORBED_BRIDGES: AtomicUsize = AtomicUsize::new(0);
-static ABSORBED_PANICS: AtomicUsize = AtomicUsize::new(0);
+/// Bridges compiled, from the compile-bridge callback.
+///
+/// A callback rather than a read of `JitDriver::get_stats().bridges_compiled`,
+/// which is the same number by a route that cannot be windowed: the tally lives
+/// on the driver, so a reader that only reaches drivers it has already retired
+/// reports zero for a pool whose drivers are all still alive. The hook fires on
+/// the line after each of the two `stats.bridges_compiled += 1` sites, inside
+/// the same block and under no extra condition, so the two counts cannot come
+/// apart.
+static BRIDGES: AtomicUsize = AtomicUsize::new(0);
+/// Compilation panics swallowed by a driver, from the compile-panic callback.
+///
+/// A hook of its own rather than `on_compile_error`, which the same site also
+/// fires: that one fires for every RECOVERABLE compile failure, so counting it
+/// would not be this number.
+static PANICS: AtomicUsize = AtomicUsize::new(0);
 
 /// The last compiled body's optimized op count and shape.
 ///
@@ -78,16 +89,13 @@ static WINDOW_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CensusCounts {
     pub loops_compiled: usize,
-    /// Only what [`Census::absorb`] collected. Zero otherwise, which is not the
-    /// same as "no bridge was compiled".
     pub bridges_compiled: usize,
     pub loops_aborted: usize,
     pub guard_failures: usize,
     /// Non-zero means a trace was dropped by a panic inside compilation and the
     /// tier silently fell back to the untraced path for it. Nothing else
     /// reports this: a run that stops compiling still answers correctly, so
-    /// every other counter here stays plausible. Only what
-    /// [`Census::absorb`] collected, as with `bridges_compiled`.
+    /// every other counter here stays plausible.
     pub internal_compile_panics: usize,
     pub trace_ops_before: usize,
     pub trace_ops_after: usize,
@@ -174,10 +182,10 @@ impl RawCounts {
     fn read() -> Self {
         Self {
             compiles: COMPILES.load(Ordering::Relaxed),
-            bridges: ABSORBED_BRIDGES.load(Ordering::Relaxed),
+            bridges: BRIDGES.load(Ordering::Relaxed),
             aborts: TRACE_ABORTS.load(Ordering::Relaxed),
             guard_failures: GUARD_FAILURES.load(Ordering::Relaxed),
-            panics: ABSORBED_PANICS.load(Ordering::Relaxed),
+            panics: PANICS.load(Ordering::Relaxed),
             ops_before: TRACE_OPS_BEFORE.load(Ordering::Relaxed),
             ops_after: TRACE_OPS_AFTER.load(Ordering::Relaxed),
             compiled_entries: COMPILED_ENTRIES.load(Ordering::Relaxed),
@@ -189,8 +197,9 @@ impl Census {
     /// Wire every driver callback the census reads into the process-global
     /// counters.
     ///
-    /// The four hooks are `set_on_compile_loop`, `set_on_guard_failure`,
-    /// `set_on_trace_abort` and `set_on_compiled_entry`. Each holds ONE
+    /// The six hooks are `set_on_compile_loop`, `set_on_compile_bridge`,
+    /// `set_on_guard_failure`, `set_on_trace_abort`, `set_on_compiled_entry`
+    /// and `set_on_internal_compile_panic`. Each holds ONE
     /// closure, so this replaces whatever was installed before it; an embedder
     /// that was recording the compiled body's shape by hand reads
     /// [`CensusCounts::last_loop_body_shape`] instead of installing its own.
@@ -207,6 +216,9 @@ impl Census {
             LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
             LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
         });
+        driver.set_on_compile_bridge(|_green_key, _fail_index, _num_ops| {
+            BRIDGES.fetch_add(1, Ordering::Relaxed);
+        });
         driver.set_on_guard_failure(|_green_key, _fail_index, _count| {
             GUARD_FAILURES.fetch_add(1, Ordering::Relaxed);
         });
@@ -215,6 +227,9 @@ impl Census {
         });
         driver.set_on_compiled_entry(|_green_key, _target_pc| {
             COMPILED_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        });
+        driver.set_on_internal_compile_panic(|_green_key| {
+            PANICS.fetch_add(1, Ordering::Relaxed);
         });
     }
 
@@ -267,21 +282,6 @@ impl Census {
         render_abort_delta(&self.aborts_before, &abort_reasons())
     }
 
-    /// Take a driver's own tallies before it is dropped.
-    ///
-    /// Bridge compiles and swallowed compilation panics have no callback, so
-    /// they live on the driver and die with it. This adds them to the shared
-    /// counters, which makes them visible to any window still open.
-    ///
-    /// ⚠ Call it ONCE, at the driver's end of life. The driver's tallies are
-    /// cumulative, so absorbing a driver that will keep running counts its
-    /// history again at the next call.
-    pub fn absorb<S: JitState>(driver: &JitDriver<S>) {
-        let stats = driver.get_stats();
-        ABSORBED_BRIDGES.fetch_add(stats.bridges_compiled, Ordering::Relaxed);
-        ABSORBED_PANICS.fetch_add(stats.internal_compile_panics as usize, Ordering::Relaxed);
-    }
-
     /// Absolute counters since process start, or since the last
     /// [`Census::reset`]. Takes no lock, so it is safe to call from inside an
     /// open window — and is a total, not a window, which is why the assertions
@@ -314,13 +314,13 @@ impl Census {
     pub fn reset() {
         for counter in [
             &COMPILES,
+            &BRIDGES,
             &GUARD_FAILURES,
             &TRACE_ABORTS,
             &COMPILED_ENTRIES,
             &TRACE_OPS_BEFORE,
             &TRACE_OPS_AFTER,
-            &ABSORBED_BRIDGES,
-            &ABSORBED_PANICS,
+            &PANICS,
             &LAST_OPS_AFTER,
         ] {
             counter.store(0, Ordering::Relaxed);
@@ -532,7 +532,7 @@ pub fn abort_reasons() -> Vec<(&'static str, u64)> {
 
 /// Render `after - before` over two [`abort_reasons`] snapshots, dropping the
 /// slots that did not move.
-fn render_abort_delta(before: &[(&'static str, u64)], after: &[(&'static str, u64)]) -> String {
+pub fn render_abort_delta(before: &[(&'static str, u64)], after: &[(&'static str, u64)]) -> String {
     after
         .iter()
         .zip(before)

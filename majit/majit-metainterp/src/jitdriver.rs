@@ -6803,6 +6803,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_on_guard_failure(f);
     }
 
+    /// Set a callback for swallowed compilation panics.
+    ///
+    /// `f` receives `(green_key)`. The tally this mirrors lives on the driver
+    /// and is otherwise readable only through [`Self::get_stats`], which a
+    /// process-global reader cannot window.
+    pub fn set_on_internal_compile_panic(&mut self, f: impl Fn(u64) + Send + 'static) {
+        self.meta.set_on_internal_compile_panic(f);
+    }
+
     /// Set a callback fired immediately before a call enters compiled code.
     /// `f` receives `(green_key, target_pc)`.
     ///
@@ -9611,6 +9620,88 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 1);
         assert_eq!(stats.bridges_compiled, 1);
+    }
+
+    /// A [`Census`](crate::embed::Census) reading must report the bridge while
+    /// the driver that compiled it is STILL ALIVE.
+    ///
+    /// The census counters are process-global and the bridge tally is not: it
+    /// lives on the driver. Reading it only out of drivers already handed to
+    /// `Census::absorb` is correct for a one-shot driver and reports zero
+    /// forever for a pool, which is the shape every real embedder has — and a
+    /// zero there is indistinguishable from "no bridge was compiled". So this
+    /// asserts the count with the driver held, and never absorbs it.
+    ///
+    /// It repeats the pipeline of the test above rather than sharing it,
+    /// because what is under test is the OTHER half: that `Census::install`
+    /// wires `set_on_compile_bridge` at all. A driver built by that test would
+    /// pass this one with the hook missing.
+    #[test]
+    fn test_census_counts_a_bridge_from_a_live_driver() {
+        use crate::embed::Census;
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        Census::install(&mut driver);
+
+        let census = Census::begin();
+        assert_eq!(
+            census.counts().bridges_compiled,
+            0,
+            "the window opens before anything has compiled"
+        );
+
+        let key = 51u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::StartedTracing
+        ));
+        let sum = {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+            sum
+        };
+        driver.meta.compile_loop(&[sum], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let fail_index = 0u32;
+        assert!(driver.meta.start_retrace(key, fail_index, &[0]));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
+            let i0 = OpRef::input_arg_int(0);
+            let c2 = ctx.const_int(2);
+            ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        }
+        let trace_id = driver
+            .meta
+            .compiled_root_trace_id(key)
+            .expect("compiled loop should have a root trace_id");
+        assert_eq!(
+            driver
+                .meta
+                .close_bridge(key, trace_id, fail_index, &[OpRef::input_arg_int(0)]),
+            crate::pyjitpl::BridgeCompileResult::Compiled,
+        );
+
+        let counts = census.counts();
+        assert_eq!(
+            counts.bridges_compiled, 1,
+            "the driver is still alive and holds the only bridge tally: {counts}"
+        );
+        assert_eq!(
+            counts.bridges_compiled,
+            driver.get_stats().bridges_compiled,
+            "the callback count and the driver's own tally are the same number"
+        );
     }
 
     #[test]

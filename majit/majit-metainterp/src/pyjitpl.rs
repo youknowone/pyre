@@ -2155,6 +2155,15 @@ pub struct JitHooks {
     /// attempts.  It is a callback tally like the compile hooks, not a
     /// population: it only rises.
     pub on_compiled_entry: Option<Box<dyn Fn(u64, usize) + Send>>,
+    /// Called when a compilation panic is swallowed and the JIT is silently
+    /// disabled for that trace. Args: (green_key).
+    ///
+    /// Narrower than `on_compile_error`, which the same site also fires: that
+    /// one fires for every RECOVERABLE compile failure too, so counting it is
+    /// not counting this. This is the unrecoverable one — the trace is gone
+    /// and the untraced tier answers for it, which no other hook reports and
+    /// which every other counter stays plausible through.
+    pub on_internal_compile_panic: Option<Box<dyn Fn(u64) + Send>>,
 }
 
 /// Runtime callback used to attach an application traceback while the
@@ -4772,6 +4781,15 @@ impl<M: Clone> MetaInterp<M> {
     /// Set a callback for trace abort events.
     pub fn set_on_trace_abort(&mut self, f: impl Fn(u64, bool) + Send + 'static) {
         self.hooks.on_trace_abort = Some(Box::new(f));
+    }
+
+    /// Set a callback for swallowed compilation panics.
+    ///
+    /// `f` receives `(green_key)`. See
+    /// [`JitHooks::on_internal_compile_panic`] for why the error hook below
+    /// cannot stand in for it.
+    pub fn set_on_internal_compile_panic(&mut self, f: impl Fn(u64) + Send + 'static) {
+        self.hooks.on_internal_compile_panic = Some(Box::new(f));
     }
 
     /// Set a callback for compilation error events (loop or bridge).
@@ -7897,6 +7915,9 @@ impl<M: Clone> MetaInterp<M> {
         // failure and missed the unrecoverable one. A degraded trace then reads
         // as `compiles=0 aborts=0` on any dashboard fed by the hooks, which is
         // indistinguishable from "this loop was never hot".
+        if let Some(ref cb) = self.hooks.on_internal_compile_panic {
+            cb(green_key);
+        }
         if let Some(ref cb) = self.hooks.on_compile_error {
             cb(green_key, &msg);
         }
