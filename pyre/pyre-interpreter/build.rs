@@ -73,6 +73,39 @@ fn main() {
             .compile("pyre_cjkcodecs_jp");
     }
 
+    // The variadic C-API entry points cannot have Rust bodies -- no Rust
+    // compiler walks a `va_list` -- so they are C translation units compiled
+    // into the interpreter, which is what `pypy/module/cpyext/src/` is.  The
+    // predicate is the one `lib.rs` gates `mod cpyext` with, and `pyrex`'s
+    // build script exports the symbols a loaded extension resolves against.
+    if std::env::var_os("CARGO_FEATURE_CPYEXT").is_some()
+        && std::env::var_os("CARGO_FEATURE_SANDBOX").is_none()
+        && matches!(
+            std::env::var("CARGO_CFG_TARGET_OS")
+                .unwrap_or_default()
+                .as_str(),
+            "macos" | "linux"
+        )
+    {
+        let cpyext_sources = [
+            "src/cpyext/src/abstract.c",
+            "src/cpyext/src/getargs.c",
+            "src/cpyext/src/modsupport.c",
+            "src/cpyext/src/mysnprintf.c",
+            "src/cpyext/src/pyerrors.c",
+            "src/cpyext/src/unicodeobject.c",
+        ];
+        for source in cpyext_sources {
+            println!("cargo:rerun-if-changed={source}");
+        }
+        let include = Path::new("../../include/pyre3.14t");
+        println!("cargo:rerun-if-changed={}", include.display());
+        cc::Build::new()
+            .files(cpyext_sources)
+            .include(include)
+            .compile("pyre_cpyext_c");
+    }
+
     // `__try`/`__except` is the only thing that reaches a structured exception
     // and no Rust compiler emits one, so the fence a foreign call is made
     // inside (`src/module/_ctypes/seh.rs`) is a C translation unit of its own.

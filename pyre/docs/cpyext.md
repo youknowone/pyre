@@ -44,6 +44,11 @@ per `cpyext` module. `pytypedefs.h` names the shared types once so no
 declaration waits on a definition, and `audit.h` carries the variadic
 `PySys_Audit` the way CPython's own `Include/audit.h` does.
 
+A header declares; it does not implement. The entry points that cannot have
+Rust bodies -- the variadic ones, since rustc's `c_variadic` is unstable -- are
+C translation units under `pyre-interpreter/src/cpyext/src/`, compiled into the
+interpreter and exported from it, which is what `pypy/module/cpyext/src/` is.
+
 `pyre_decl.h` holds the exported entry points and **is generated** by
 `scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
 themselves, so a declaration cannot drift from its implementation. It is
@@ -330,11 +335,11 @@ header declaring it wrongly.
   immortal mirror per constant, since the borrowed spelling hands out a mirror
   it took no reference to and two asks for the same identifier have to answer
   the same pointer;
-- a parenthesised unit in the argument parser (`include/pyre3.14t/modsupport.h`)
+- a parenthesised unit in the argument parser (`cpyext/src/getargs.c`)
   and the compat-mode `PyArg_Parse` over it, where the argument is the value
   itself rather than a tuple holding it and a format naming more than one unit
   is a `SystemError`. `PyOS_snprintf` and `PyOS_vsnprintf` are beside
-  `PyErr_Format` in the headers, being variadic for the same reason. The `O!`
+  `PyErr_Format` in the C sources, being variadic for the same reason. The `O!`
   unit tests the layout -- `PyType_IsSubtype(Py_TYPE(arg), type)`, the way
   `convertsimple` does -- rather than asking `isinstance`, since the caller
   goes on to read the object through the fields that type declares and an
@@ -377,7 +382,8 @@ header declaring it wrongly.
   every error handler the interpreter has is reachable rather than the three
   a hand-written decoder would name;
 - the `%`-format engine and `PyUnicode_FromFormat` / `FromFormatV` over it
-  (`pyre_format.h`), which `PyErr_Format` is now written on. The conversions
+  (`cpyext/src/unicodeobject.c`), which `PyErr_Format` is now written on. The
+  conversions
   are assembled as `str` objects rather than as bytes, because `%6S` pads to a
   count of characters and only the interpreter knows how many a conversion
   produced. That is also what makes `%c` a code point, `%A` `ascii()` rather
@@ -405,8 +411,12 @@ header declaring it wrongly.
   operates on it directly, consulting no override the subclass declares. A
   `list` subclass instance is a `W_ListObject` and needs none of this;
 - `PyArg_ParseTuple`, `PyArg_ParseTupleAndKeywords`, `PyArg_UnpackTuple`,
-  `Py_BuildValue` and `PyErr_Format`, which are `static inline` C in the header
-  because pyre ships no companion library and rustc's `c_variadic` is unstable;
+  `Py_BuildValue`, `PyErr_Format` and the two `PyObject_Call*` pairs, whose
+  bodies are C rather than Rust because rustc's `c_variadic` is unstable. They
+  are compiled into the interpreter and exported from it
+  (`pyre/pyre-interpreter/src/cpyext/src/`, the peer of
+  `pypy/module/cpyext/src/getargs.c` and its siblings), so an extension
+  resolves them at load time rather than compiling a copy of each;
 - PyPy-style path-to-module-dictionary extension caching for single-phase
   modules — a multi-phase module is rebuilt from its definition on each import,
   as upstream's `create_cpyext_module` does;

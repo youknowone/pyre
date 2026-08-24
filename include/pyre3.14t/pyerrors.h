@@ -97,27 +97,9 @@ PyAPI_DATA(PyObject *) PyExc_SyntaxWarning;
 PyAPI_DATA(PyObject *) PyExc_UnicodeWarning;
 PyAPI_DATA(PyObject *) PyExc_UserWarning;
 
-/* `vsnprintf` with the two guarantees the name adds: at most `size` bytes
-   including the terminator, and a NUL at `str[size - 1]` whatever happened.
-   The return value is `vsnprintf`'s, so a truncated conversion still reports
-   the length it would have needed. */
-static inline int PyOS_vsnprintf(char *str, size_t size, const char *format, va_list va)
-{
-    int written = vsnprintf(str, size, format, va);
-    if (size > 0) {
-        str[size - 1] = '\0';
-    }
-    return written;
-}
-
-static inline int PyOS_snprintf(char *str, size_t size, const char *format, ...)
-{
-    va_list va;
-    va_start(va, format);
-    int written = PyOS_vsnprintf(str, size, format, va);
-    va_end(va);
-    return written;
-}
+/* Variadic, so the bodies are C: `cpyext/src/mysnprintf.c`. */
+PyAPI_FUNC(int) PyOS_snprintf(char *, size_t, const char *, ...);
+PyAPI_FUNC(int) PyOS_vsnprintf(char *, size_t, const char *, va_list);
 
 /* Name the caller's own file and line in the report, the way the reference
    header does.  A call made inside the runtime has no such place to name and

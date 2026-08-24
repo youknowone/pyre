@@ -22,6 +22,7 @@ pub mod capsule;
 pub mod cdatetime;
 pub mod complexobject;
 pub mod contextvars;
+pub mod csources;
 pub mod dictobject;
 pub mod eval;
 pub mod exception;
@@ -790,6 +791,7 @@ pub fn ensure_linked() {
     std::hint::black_box(&raw const pyobject::_Py_FalseStruct);
     std::hint::black_box(&raw const pyobject::_Py_NotImplementedStruct);
     std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
+    csources::ensure_linked();
     pyobject::ensure_linked();
     pystate::ensure_linked();
     pystrtod::ensure_linked();

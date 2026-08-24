@@ -73,6 +73,9 @@ fn cpyext_symbols() -> Vec<String> {
     // the scan above cannot see it; each such family is named by the table its
     // macro is invoked with.
     symbols.extend(macro_generated_symbols(&directory));
+    // The C-bodied entry points carry no attribute at all: this side declares
+    // them rather than defining them, and the declarations are the one list.
+    symbols.extend(declared_c_symbols(&directory));
     symbols.sort();
     symbols.dedup();
     symbols
@@ -97,6 +100,25 @@ fn declared_symbol(line: &str) -> Option<String> {
         .take_while(|character| character.is_alphanumeric() || *character == '_')
         .collect();
     (!name.is_empty()).then_some(name)
+}
+
+/// The entry points `cpyext/csources.rs` declares, whose bodies are the C
+/// translation units `pyre-interpreter/build.rs` compiles.
+fn declared_c_symbols(directory: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(directory.join("csources.rs"))
+        .expect("read the cpyext C-source declarations");
+    let Some(block) = text.split("unsafe extern \"C\" {").nth(1) else {
+        return Vec::new();
+    };
+    let Some(block) = block.split("\n}").next() else {
+        return Vec::new();
+    };
+    block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("fn "))
+        .filter_map(|rest| rest.split('(').next())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The globals a table-driven macro declares: the `PyExc_*` pointers
