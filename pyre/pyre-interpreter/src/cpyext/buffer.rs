@@ -1085,6 +1085,12 @@ pub unsafe extern "C" fn PyMemoryView_FromMemory(
 
 /// `PyMemoryView_FromBuffer` — the caller hands its filled `Py_buffer` over and
 /// must not release it itself.
+///
+/// TODO: upstream copies `ndim`, `shape` and `strides` across, and this takes
+/// only a contiguous one-dimensional view.  Nothing measures the gap: the
+/// class that would, `test_buffer`'s `TestBufferProtocol`, is
+/// `skipUnless(ndarray)` and there is no `_testbuffer` to import it from, so
+/// building `lib_pypy/_testbuffer.c` comes before lifting the restriction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const CPyBuffer) -> *mut CPyObject {
     if view.is_null() || unsafe { (*view).buf.is_null() } {
