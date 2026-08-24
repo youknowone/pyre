@@ -14,6 +14,8 @@
 //! `dispatch_inline_call_*` per-shape dispatchers. The `inline_call_*`
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
+use majit_translate::codewriter::jitcode::DescentBlockerSummary;
+
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -707,29 +709,46 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
     true
 }
 
-/// Whether descending into this jitcode body can reach a residual call whose
-/// funcbox is an un-lowered helper's symbolic hash.
+/// The un-lowered helper a descent into this jitcode body can reach on a path
+/// that has already applied an effect, if any.
 ///
-/// [`try_execute_residual_call_via_executor`] refuses to record such a call
-/// while inlining a sub-jitcode — the hash is not a code address, so a
-/// compiled trace would branch to it — and raises
-/// `OrthodoxSubWalkTraceUnsupported` at that call.  By then the descent has
-/// executed every earlier op for real, including residual calls that advance
-/// a generator's internal state, and the abort resumes the enclosing frame at
-/// its own `CALL`.  The Python call therefore runs a second time and the first
-/// result is discarded: `random.random()` in a loop advances the Mersenne
-/// Twister once per aborted descent without producing a value for it
-/// (`gen.random()` drew 4003 times for 4000 appends).
+/// [`try_execute_residual_call_via_executor`] refuses to record a residual call
+/// whose funcbox is an un-lowered helper's symbolic hash — the hash is not a
+/// code address, so a compiled trace would branch to it — and raises
+/// `OrthodoxSubWalkTraceUnsupported` at that call.  The caller answers that
+/// abort in two ways, and which one it can use is the whole question here.  A
+/// descent that executed nothing is cut back to `pre_fold_pos` and re-run as an
+/// ordinary residual call, which applies the effect exactly once.  A descent
+/// that already executed one cannot be rewound: the enclosing frame resumes at
+/// its own `CALL`, the Python call runs a second time, and the first result is
+/// discarded — `random.random()` in a loop advances the Mersenne Twister once
+/// per aborted descent without producing a value for it (`gen.random()` drew
+/// 4003 times for 4000 appends).
 ///
-/// The funcbox is a jitcode constant, so whether a body holds such a call is a
-/// static property of the body.  Answering it before the descent starts turns
-/// the mid-descent abort into an ordinary residual call, which applies the
-/// effect exactly once.
+/// So the property to decline on is not "this body holds such a call" but
+/// "this body can reach one with an effect behind it".  The walk is
+/// execution-driven: at a `goto_if_not` it evaluates the condition, records a
+/// guard, and steps into the taken arm only — the other arm is a guard-failure
+/// resume, never walked.  A blocker sitting on an arm the call at hand does not
+/// take is therefore never reached, and a whole-body scan that declines on it
+/// declines a body the walk would have recorded cleanly.  That is not a corner:
+/// the generated `__pyre_wrap_*` gateways all begin by checking their argument
+/// count and calling `gateway::method_{noarg,arity,min_arity}_failure` on the
+/// reject arm, and those three helpers are `#[dont_look_inside]` precisely so
+/// the formatting stays out of the wrapper's hot JitCode.  Declining on them
+/// refuses the wrapper for the shape of its error path.
+///
+/// [`summarize_descent_blockers`] therefore walks the body's control-flow graph
+/// carrying one fact — whether an effect has been executed on some path to this
+/// point — and reports the two kinds of blocker separately.  Only
+/// `blocker_after_effect` is a decline.
 ///
 /// The scan follows `inline_call_*` into the callee bodies the descent would
 /// enter, because the abort propagates from any depth.  A body already on the
-/// scan stack is a cycle and answers `false`: the occurrence that opened it
-/// decides.
+/// scan stack is a cycle, and answers "executes an effect, names no blocker":
+/// the blockers behind the recursion belong to the occurrence that opened it,
+/// but reporting no effect there would let a blocker past the recursion read
+/// as effect-free, which is the one direction this scan may not err in.
 ///
 /// The answer names the blocker rather than merely reporting one, because a
 /// declined descent is a wall to be removed and the removal work is per
@@ -739,66 +758,247 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 ///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
 /// body rather than once per call site.  Only this entry point memoizes: the
-/// `None` a cycle produces belongs to the occurrence that opened it, not to
-/// the body, so [`scan_body_for_unlowered_helper_call`] caches nothing.
+/// summary a cycle produces belongs to the occurrence that opened it, not to
+/// the body, so [`summarize_descent_blockers`] caches nothing.
 fn descent_unlowered_helper_blocker(jitcode_index: usize) -> Option<i64> {
-    let jitcode = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)?;
-    jitcode.descent_unlowered_helper_blocker(|| {
-        scan_body_for_unlowered_helper_call(jitcode_index, &mut Vec::new())
-    })
+    descent_blocker_summary(jitcode_index).blocker_after_effect
 }
 
-/// Recursive worker of [`descent_unlowered_helper_blocker`].  `seen` is
-/// the stack of jitcode indices currently being scanned.
-fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usize>) -> Option<i64> {
-    if seen.contains(&jitcode_index) {
-        return None;
+/// Memoizing entry point for [`summarize_descent_blockers`].
+fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return DescentBlockerSummary::default();
+    };
+    jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
+}
+
+/// One reachable point of [`summarize_descent_blockers`]'s dataflow.
+///
+/// Both fields only ever lose information when two paths meet — `effect` goes
+/// false to true and a disagreeing `known_i` slot goes to `None` — so the
+/// worklist converges.
+#[derive(Clone)]
+struct DescentPoint {
+    /// Whether some path from the body entry to here executed an effect.
+    effect: bool,
+    /// What each Int-bank slot is known to hold, in the same encoding
+    /// `allocate_callee_register_banks` uses: the slots at and above
+    /// `num_regs_i` are pre-filled from `constants_i`.
+    known_i: Vec<Option<i64>>,
+}
+
+/// Whether stepping `opname` applies an effect the walk would have to undo.
+///
+/// The walk's own odometer (`fbw_bump_executed_effect`) counts an executed
+/// residual call that writes live heap or enters a frame, plus the journaled
+/// list and cell stores.  Deciding those conditions needs the concrete values a
+/// static scan does not have, so read every executed residual call as effectful
+/// and add the direct heap writes, which the odometer reaches only through a
+/// journal.  Both directions are conservative: the scan may call a body
+/// effectful where the walk would not, never the reverse.
+fn descent_op_applies_effect(opname: &str) -> bool {
+    opname.starts_with("residual_call")
+        || opname.starts_with("setfield_gc")
+        || opname.starts_with("setfield_raw")
+        || opname.starts_with("setarrayitem_gc")
+        || opname.starts_with("setarrayitem_raw")
+        || opname.starts_with("setinteriorfield_gc")
+        || opname.starts_with("strsetitem")
+        || opname.starts_with("unicodesetitem")
+}
+
+/// Byte offset of an op's first `L` operand, counted from the byte after the
+/// opcode, or `None` when it carries none.  Same operand widths
+/// `decode_op_at` advances by.
+fn label_operand_offset(argcodes: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut chars = argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'L' => return Some(offset),
+            'i' | 'c' | 'r' | 'f' => offset += 1,
+            'd' | 'j' => offset += 2,
+            // A varlist's width depends on the code bytes, which this shape
+            // question does not read; no opname puts one before its label.
+            'I' | 'R' | 'F' | 'P' => return None,
+            '>' => {
+                chars.next()?;
+                offset += 1;
+            }
+            _ => return None,
+        }
     }
-    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
+    None
+}
+
+/// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
+/// jitcode indices currently being scanned.
+fn summarize_descent_blockers(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        return DescentBlockerSummary {
+            may_execute_effect: true,
+            ..DescentBlockerSummary::default()
+        };
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
         // No installed body means no descent, so there is nothing to answer
         // for; the caller declines on the same lookup.
-        return None;
+        return DescentBlockerSummary::default();
     };
     seen.push(jitcode_index);
     let descrs = crate::jitcode_runtime::descr_ref_table();
-    // What each Int-bank slot is known to hold.  `allocate_callee_register_banks`
-    // pre-fills the slots at and above `num_regs_i` from `constants_i`; the
-    // rest start unknown and are tracked below, because the codewriter loads a
-    // call's funcbox into an ordinary register before the call reads it.
-    let mut known_i = vec![None; body.num_regs_i + body.constants_i.len()];
-    for (slot, &value) in body.constants_i.iter().enumerate() {
-        known_i[body.num_regs_i + slot] = Some(value);
-    }
+    let summary = summarize_body_blockers(
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index| {
+            descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+                .map(|callee| summarize_descent_blockers(callee, seen))
+        },
+    );
+    seen.pop();
+    summary
+}
+
+/// The dataflow of [`summarize_descent_blockers`] over one body's bytes.
+///
+/// `callee_summary` answers an `inline_call`'s descr operand with the callee's
+/// own summary, or `None` when that operand names no JitCode.  Splitting it out
+/// keeps the analysis testable on a hand-built body, which is the only way to
+/// state the two-kind split without an installed jitcode table.
+pub(crate) fn summarize_body_blockers(
+    code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    mut callee_summary: impl FnMut(usize) -> Option<DescentBlockerSummary>,
+) -> DescentBlockerSummary {
+    let mut summary = DescentBlockerSummary::default();
+
+    // Instruction starts, so a decoded branch target that lands mid-op (or
+    // past the end) is dropped rather than decoded as an operand.  The
+    // assembler lays the body out linearly, so one forward decode names them
+    // all, ascending.  `switch` enumerates this as its successor set, so the
+    // order has to be the body's own rather than a hash order: which of
+    // several blockers the answer names would otherwise change per process.
+    let mut starts = Vec::new();
     let mut pc = 0usize;
-    let mut blocker = None;
-    while pc < body.code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
+    while let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        starts.push(pc);
+        pc = d.next_pc;
+        if pc >= code.len() {
             break;
+        }
+    }
+
+    let mut entry_known = vec![None; num_regs_i + constants_i.len()];
+    for (slot, &value) in constants_i.iter().enumerate() {
+        entry_known[num_regs_i + slot] = Some(value);
+    }
+    let mut points: std::collections::HashMap<usize, DescentPoint> =
+        std::collections::HashMap::new();
+    points.insert(
+        0,
+        DescentPoint {
+            effect: false,
+            known_i: entry_known,
+        },
+    );
+    let mut work = std::collections::VecDeque::from([0usize]);
+
+    // `push` is the dataflow's only join: it merges `state` into the point at
+    // `target` and re-queues it when that widened anything.
+    macro_rules! push {
+        ($points:expr, $work:expr, $target:expr, $state:expr) => {{
+            let target: usize = $target;
+            if starts.binary_search(&target).is_ok() {
+                let state: DescentPoint = $state;
+                match $points.get_mut(&target) {
+                    None => {
+                        $points.insert(target, state);
+                        $work.push_back(target);
+                    }
+                    Some(existing) => {
+                        let mut widened = false;
+                        if state.effect && !existing.effect {
+                            existing.effect = true;
+                            widened = true;
+                        }
+                        for (slot, incoming) in existing.known_i.iter_mut().zip(&state.known_i) {
+                            if *slot != *incoming && slot.is_some() {
+                                *slot = None;
+                                widened = true;
+                            }
+                        }
+                        if widened {
+                            $work.push_back(target);
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
+    while let Some(pc) = work.pop_front() {
+        let Some(point) = points.get(&pc).cloned() else {
+            continue;
         };
+        let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            continue;
+        };
+        let mut effect = point.effect;
+        let mut known_i = point.known_i;
+
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.
-            let funcbox = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize;
+            let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
-                blocker = Some(*fnaddr);
-                break;
+                // The walk stops here, so this op has no successors.
+                let slot = if effect {
+                    &mut summary.blocker_after_effect
+                } else {
+                    &mut summary.blocker_effect_free
+                };
+                slot.get_or_insert(*fnaddr);
+                continue;
             }
         } else if d.opname.starts_with("inline_call") {
             // `inline_call_*` opens with the `d` descr operand, a two-byte
             // index into the descriptor pool, naming the callee JitCode.
-            let descr_index = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize
-                | ((body.code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
-            if let Some(callee) = descrs
-                .at(descr_index)
-                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                && let Some(callee_blocker) = scan_body_for_unlowered_helper_call(callee, seen)
-            {
-                blocker = Some(callee_blocker);
-                break;
+            let descr_index = code.get(d.pc + 1).copied().unwrap_or(0) as usize
+                | ((code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
+            if let Some(callee) = callee_summary(descr_index) {
+                // Entering with an effect behind us turns every blocker the
+                // callee holds into one that cannot be rewound.
+                let after = if effect {
+                    callee.blocker_after_effect.or(callee.blocker_effect_free)
+                } else {
+                    callee.blocker_after_effect
+                };
+                if let Some(blocker) = after {
+                    summary.blocker_after_effect.get_or_insert(blocker);
+                } else if let Some(blocker) = callee.blocker_effect_free {
+                    summary.blocker_effect_free.get_or_insert(blocker);
+                }
+                if callee.may_execute_effect {
+                    effect = true;
+                }
             }
         }
+        if descent_op_applies_effect(d.opname) {
+            effect = true;
+        }
+        if effect {
+            summary.may_execute_effect = true;
+        }
+
         // An op writes at most one register, named by the argcode suffix after
         // `>` and encoded as the instruction's last byte.  Only `int_copy/i>i`
         // carries a known value forward; every other Int-bank write makes its
@@ -806,10 +1006,10 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
         if d.argcodes
             .split_once('>')
             .is_some_and(|(_, dst)| dst == "i")
-            && let Some(&dst) = body.code.get(d.next_pc.wrapping_sub(1))
+            && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
             let carried = (d.key == "int_copy/i>i")
-                .then(|| body.code.get(d.pc + 1))
+                .then(|| code.get(d.pc + 1))
                 .flatten()
                 .and_then(|&src| known_i.get(src as usize).copied())
                 .flatten();
@@ -817,10 +1017,58 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
                 *slot = carried;
             }
         }
-        pc = d.next_pc;
+
+        let state = DescentPoint {
+            effect,
+            known_i: known_i.clone(),
+        };
+        let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
+        match d.opname {
+            // Frame exits: the walk leaves this body here.
+            "ref_return" | "int_return" | "float_return" | "void_return" | "raise" | "reraise" => {}
+            "goto" => {
+                if let Some(target) = label {
+                    push!(points, work, target, state);
+                }
+            }
+            name if name.starts_with("goto_if") => {
+                if let Some(target) = label {
+                    push!(points, work, target, state.clone());
+                }
+                push!(points, work, d.next_pc, state);
+            }
+            "catch_exception" => {
+                // The exception this handler catches can be raised by any op in
+                // the region it protects, so the handler is entered with the
+                // join of every state in the body rather than this op's.
+                // Seeding it as effectful is the sound over-approximation of
+                // that join.
+                if let Some(target) = label {
+                    push!(
+                        points,
+                        work,
+                        target,
+                        DescentPoint {
+                            effect: true,
+                            known_i: vec![None; state.known_i.len()],
+                        }
+                    );
+                }
+                push!(points, work, d.next_pc, state);
+            }
+            "switch" => {
+                // The arm table hangs off the descr rather than the code
+                // bytes, so name every instruction start as a successor.  That
+                // is a superset of the arms, which keeps the answer sound.
+                for &target in &starts {
+                    push!(points, work, target, state.clone());
+                }
+            }
+            _ => push!(points, work, d.next_pc, state),
+        }
     }
-    seen.pop();
-    blocker
+
+    summary
 }
 
 /// Whether an exception string-override body issues a nested Python call.  The

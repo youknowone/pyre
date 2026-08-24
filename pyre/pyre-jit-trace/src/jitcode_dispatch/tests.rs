@@ -12,6 +12,76 @@ fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     assert!(!session.claim_abort_coordinate(false));
 }
 
+/// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
+/// operand names the Int-bank slot `funcbox`.
+fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("`residual_call_r_i/iRd>i` must be in insns table");
+    vec![byte, funcbox, 0, 0, 0, 0]
+}
+
+fn goto_if_not(cond: u8, target: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not/iL")
+        .expect("`goto_if_not/iL` must be in insns table");
+    vec![byte, cond, target as u8, (target >> 8) as u8]
+}
+
+fn void_return() -> Vec<u8> {
+    vec![
+        *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table"),
+    ]
+}
+
+/// The generated `__pyre_wrap_*` gateways all put their un-lowerable call — the
+/// `#[dont_look_inside]` arity-error formatter — on the arm the argument-count
+/// check rejects into.  The walk is execution-driven, so a call with the right
+/// count never steps there; declining the wrapper for it refuses a body the
+/// walk would have recorded.  The blocker is still reported, on the leg that
+/// says a rewind covers it.
+#[test]
+fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = goto_if_not(0, 11);
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    code.extend(void_return());
+    assert_eq!(code.len(), 12, "the reject arm ends at the second return");
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(
+        summary.blocker_after_effect, None,
+        "nothing ran before the blocker, so the descent rolls back"
+    );
+    assert!(!summary.may_execute_effect);
+}
+
+/// The same blocker behind an executed residual call is a decline: that call
+/// applied an effect the rollback cannot undo, so an abort there would re-run
+/// the Python call and apply it twice.
+#[test]
+fn a_blocker_behind_an_executed_call_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(!majit_translate::codewriter::call::is_symbolic_fnaddr(real));
+
+    let mut code = residual_call_with_funcbox(1);
+    code.extend(goto_if_not(0, 17));
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    code.extend(void_return());
+    assert_eq!(code.len(), 18);
+
+    let summary =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(summary.may_execute_effect);
+}
+
 #[test]
 fn specialised_pair_unpack_recognises_the_float_layout() {
     use super::specialize::{SpecialisedPairKind, specialised_pair_kind};

@@ -280,17 +280,36 @@ pub struct JitCode {
     derived: DerivedBodyFacts,
 }
 
+/// What descending into a body can reach that the walk cannot record, split by
+/// whether the descent would already have applied an effect on the way there.
+///
+/// The split is what makes the answer actionable. A descent that aborts having
+/// executed nothing is rolled back and re-run as an ordinary residual call, so
+/// a blocker on such a path costs a rewind and nothing else. A descent that
+/// aborts after executing an effect cannot be rewound, and re-running the call
+/// applies that effect twice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DescentBlockerSummary {
+    /// Whether stepping this body can execute an op that the walk counts as an
+    /// applied effect. Propagates to a caller: an `inline_call` into an
+    /// effectful body leaves the caller effectful from that point on.
+    pub may_execute_effect: bool,
+    /// A blocker reachable with no effect executed before it, if any.
+    pub blocker_effect_free: Option<i64>,
+    /// A blocker reachable only after an effect has been executed, if any.
+    pub blocker_after_effect: Option<i64>,
+}
+
 /// Answers computed on demand from an assembled [`JitCode`] body.
 ///
 /// Cloned along with the body they describe: a clone carries the same `code`,
 /// so an answer already computed for the original holds for it too.
 #[derive(Debug, Default, Clone)]
 pub struct DerivedBodyFacts {
-    /// The un-lowered helper a descent into this body can reach, named by
-    /// the symbolic hash standing in for its funcbox, or `None` when the
-    /// descent reaches no such call. Read through
-    /// [`JitCode::descent_unlowered_helper_blocker`].
-    descent_unlowered_helper_blocker: OnceLock<Option<i64>>,
+    /// The un-lowered helpers a descent into this body can reach, each named
+    /// by the symbolic hash standing in for its funcbox. Read through
+    /// [`JitCode::descent_blocker_summary`].
+    descent_blocker_summary: OnceLock<DescentBlockerSummary>,
 }
 
 mod oncelock_usize_serde {
@@ -394,21 +413,17 @@ impl JitCode {
             .expect("JitCode body not yet set — call set_body() before body_mut()")
     }
 
-    /// The un-lowered helper a descent into this body can reach, named by
-    /// the symbolic hash standing in for its funcbox, computing the answer
-    /// with `compute` the first time it is asked. `None` means the descent
-    /// reaches no such call. The property is fixed by the assembled body, so
-    /// the first answer is the only one this instance gives: `body_mut` needs
-    /// `&mut self`, which `runtime_fnaddr_patch` can only take before the
-    /// jitcode is published behind an `Arc`.
-    pub fn descent_unlowered_helper_blocker(
+    /// The un-lowered helpers a descent into this body can reach, computing
+    /// the answer with `compute` the first time it is asked. The property is
+    /// fixed by the assembled body, so the first answer is the only one this
+    /// instance gives: `body_mut` needs `&mut self`, which
+    /// `runtime_fnaddr_patch` can only take before the jitcode is published
+    /// behind an `Arc`.
+    pub fn descent_blocker_summary(
         &self,
-        compute: impl FnOnce() -> Option<i64>,
-    ) -> Option<i64> {
-        *self
-            .derived
-            .descent_unlowered_helper_blocker
-            .get_or_init(compute)
+        compute: impl FnOnce() -> DescentBlockerSummary,
+    ) -> DescentBlockerSummary {
+        *self.derived.descent_blocker_summary.get_or_init(compute)
     }
 
     /// Commit the body once assembly has produced it. Panics on second
