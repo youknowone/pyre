@@ -505,7 +505,14 @@ fn default_enable_opts() -> Vec<String> {
 /// compile, `compile.py done_compiling`) is the open question; reading it
 /// needed `trace_id` next to `fail_index`, since an index is allocated per
 /// trace and a bridge re-uses the numbers of the loop it hangs off.
-const MAX_TRACE_ABORT_COUNT: u32 = 5;
+///
+/// Public because an embedder that demotes a key of its own on repeated
+/// aborts has to agree with this ceiling, and the consumers that do
+/// restated the literal instead.  Sharing it makes the NUMBERS agree, not
+/// the COUNTS: this one is per green key and latches with `>=`, so a host
+/// counter keyed on anything coarser reaches 5 for reasons this one did
+/// not.
+pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;

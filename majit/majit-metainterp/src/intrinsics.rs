@@ -7,6 +7,10 @@
 //! answers differently from the interpreter that fed it. This module is that
 //! function, once, so an interpreter does not hand-write it per module.
 //!
+//! Every body is `#[inline]`: the interpreter tier calls them per opcode, and
+//! reaching them from a consumer crate crosses a boundary a hand-written copy
+//! did not.
+//!
 //! **The macro matches the LAST PATH SEGMENT of the call expression**, not the
 //! definition site. All three spellings therefore lower identically:
 //!
@@ -42,36 +46,43 @@
 /// signedness — not the register's — decides whether the high bits are the
 /// sign or zero. The traced tier reads the same width and signedness off the
 /// array descr the lowerer attaches.
+#[inline]
 pub fn majit_raw_load_i8(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const i8) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at one byte, zero-extended.
+#[inline]
 pub fn majit_raw_load_u8(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const u8) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at two bytes, sign-extended.
+#[inline]
 pub fn majit_raw_load_i16(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const i16) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at two bytes, zero-extended.
+#[inline]
 pub fn majit_raw_load_u16(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const u16) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at four bytes, sign-extended.
+#[inline]
 pub fn majit_raw_load_i32(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const i32) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at four bytes, zero-extended.
+#[inline]
 pub fn majit_raw_load_u32(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const u32) as i64 }
 }
 
 /// `rawstorage.py` `raw_storage_getitem` at eight bytes.
+#[inline]
 pub fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const i64) }
 }
@@ -81,6 +92,7 @@ pub fn majit_raw_load_i64(base: i64, ea: i64) -> i64 {
 /// At the register width there is no extension gap, so this reads the same
 /// bits as [`majit_raw_load_i64`]. It exists because the lowerer accepts the
 /// spelling and stamps an unsigned descr for it.
+#[inline]
 pub fn majit_raw_load_u64(base: i64, ea: i64) -> i64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const u64) as i64 }
 }
@@ -89,6 +101,7 @@ pub fn majit_raw_load_u64(base: i64, ea: i64) -> i64 {
 ///
 /// The only load whose result is a float register; the lowerer stamps a raw
 /// float array descr for it rather than a width/signedness pair.
+#[inline]
 pub fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
     unsafe { core::ptr::read_unaligned(raw_addr(base, ea) as *const f64) }
 }
@@ -99,41 +112,49 @@ pub fn majit_raw_load_f(base: i64, ea: i64) -> f64 {
 /// intrinsic's width. Signedness cannot change which bits land, so the signed
 /// and unsigned spellings at a given width write identically; they differ only
 /// in the descr the traced tier carries.
+#[inline]
 pub fn majit_raw_store_i8(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut i8, val as i8) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at one byte, unsigned descr.
+#[inline]
 pub fn majit_raw_store_u8(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut u8, val as u8) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at two bytes.
+#[inline]
 pub fn majit_raw_store_i16(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut i16, val as i16) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at two bytes, unsigned descr.
+#[inline]
 pub fn majit_raw_store_u16(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut u16, val as u16) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at four bytes.
+#[inline]
 pub fn majit_raw_store_i32(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut i32, val as i32) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at four bytes, unsigned descr.
+#[inline]
 pub fn majit_raw_store_u32(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut u32, val as u32) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at eight bytes.
+#[inline]
 pub fn majit_raw_store_i64(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut i64, val) }
 }
 
 /// `rawstorage.py` `raw_storage_setitem` at eight bytes, unsigned descr.
+#[inline]
 pub fn majit_raw_store_u64(base: i64, ea: i64, val: i64) {
     unsafe { core::ptr::write_unaligned(raw_addr(base, ea) as *mut u64, val as u64) }
 }
@@ -143,12 +164,14 @@ pub fn majit_raw_store_u64(base: i64, ea: i64, val: i64) {
 ///
 /// Lowers to `convert_float_bytes_to_longlong`. A branchless float select uses
 /// this pair to stay bit-exact where an arithmetic blend cannot.
+#[inline]
 pub fn majit_f64_to_bits(x: f64) -> i64 {
     x.to_bits() as i64
 }
 
 /// `longlong2float.py` `longlong2float` — the inverse bitcast, lowering to
 /// `convert_longlong_bytes_to_float`.
+#[inline]
 pub fn majit_bits_to_f64(x: i64) -> f64 {
     f64::from_bits(x as u64)
 }
@@ -160,12 +183,14 @@ pub fn majit_bits_to_f64(x: i64) -> f64 {
 /// to its SIGNED opcode. An explicit intrinsic is therefore the only way to
 /// select the unsigned comparison from the tracing frontend; a bare `<`
 /// disagrees with this body for any operand at or above `2^63`.
+#[inline]
 pub fn majit_uint_lt(a: i64, b: i64) -> i64 {
     ((a as u64) < (b as u64)) as i64
 }
 
 /// Unsigned `<=` over the int bank, lowering to the `uint_le` resop. See
 /// [`majit_uint_lt`].
+#[inline]
 pub fn majit_uint_le(a: i64, b: i64) -> i64 {
     ((a as u64) <= (b as u64)) as i64
 }
@@ -179,6 +204,7 @@ pub fn majit_uint_le(a: i64, b: i64) -> i64 {
 /// The caller must guarantee `b != 0`, exactly the precondition
 /// `ll_uint_py_div_zer` wraps: this body divides unconditionally and the
 /// compiled tier does too.
+#[inline]
 pub fn majit_uint_div(a: i64, b: i64) -> i64 {
     ((a as u64) / (b as u64)) as i64
 }
@@ -186,6 +212,7 @@ pub fn majit_uint_div(a: i64, b: i64) -> i64 {
 /// Unsigned `%` over the int bank — `rint.py` `ll_uint_py_mod`, lowering to the
 /// `int.umod` oopspec residual call. Carries [`majit_uint_div`]'s `b != 0`
 /// precondition.
+#[inline]
 pub fn majit_uint_mod(a: i64, b: i64) -> i64 {
     ((a as u64) % (b as u64)) as i64
 }
@@ -207,6 +234,7 @@ pub fn majit_uint_mod(a: i64, b: i64) -> i64 {
 /// imported bare name in both, or the same qualified path in both. Configured
 /// under one spelling and called under the other, the call lowers as an
 /// ordinary residual and the `u128` below is what the trace executes.
+#[inline]
 pub fn majit_uint_mul_high(a: i64, b: i64) -> i64 {
     (((a as u64 as u128) * (b as u64 as u128)) >> 64) as u64 as i64
 }
