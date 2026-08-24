@@ -1262,8 +1262,15 @@ pub(crate) fn seed_main_loader(
 /// module body (`warnings.py`, its module-level `_processoptions` call).  This
 /// is the step that emits
 /// "Invalid -W option ignored: ..." and that leaves `sys.modules['warnings']`
-/// populated on a `-W` run.  Every failure is swallowed, matching the bare
-/// `except ImportError: pass`.
+/// populated on a `-W` run.
+///
+/// `run_command_line` writes the two branches under one `try` and catches
+/// `ImportError` alone, so a `-W ignore::mod.W` whose `mod` raises anything
+/// else leaves the block and ends the process before user code runs.  The
+/// spec runs that program: the filters apply as far as they got and the
+/// failure is reported on stderr.  So the structure below is that block's,
+/// and the non-`ImportError` arm reports rather than either dropping the
+/// failure or carrying it out of here.
 fn init_warnoptions(
     w_main_globals: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
@@ -1271,19 +1278,35 @@ fn init_warnoptions(
     if importing::warnoptions().is_empty() {
         return;
     }
-    let Some(w_warnings) = importing::get_sys_module("warnings") else {
-        let _ = importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr);
-        return;
-    };
-    let Some(w_sys) = importing::get_sys_module("sys") else {
-        return;
-    };
-    let _ = pyre_interpreter::baseobjspace::getattr_str(w_warnings, "_processoptions").and_then(
-        |process| {
-            let options = pyre_interpreter::baseobjspace::getattr_str(w_sys, "warnoptions")?;
-            pyre_interpreter::call::call_function_impl_result(process, &[options])
-        },
-    );
+    let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
+        let Some(w_warnings) = importing::get_sys_module("warnings") else {
+            importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr)?;
+            return Ok(());
+        };
+        let Some(w_sys) = importing::get_sys_module("sys") else {
+            return Ok(());
+        };
+        // `from warnings import _processoptions` raises `ImportError` when the
+        // name is absent, which the `except` covers; the attribute read that
+        // spells it here raises `AttributeError`, which it would not, so that
+        // lookup keeps its own swallowing arm.
+        let Ok(process) =
+            pyre_interpreter::baseobjspace::getattr_str(w_warnings, "_processoptions")
+        else {
+            return Ok(());
+        };
+        let options = pyre_interpreter::baseobjspace::getattr_str(w_sys, "warnoptions")?;
+        pyre_interpreter::call::call_function_impl_result(process, &[options])?;
+        Ok(())
+    })();
+    if let Err(e) = attempt
+        && !is_import_error(&e)
+    {
+        // Through the same seam the traceback takes, so the two stay ordered
+        // on a mediated stderr.
+        pyre_interpreter::host_seam::emit_stderr(b"'import warnings' failed; traceback:\n");
+        pyre_interpreter::eprint_exception(&e, true);
+    }
 }
 
 pub(crate) fn import_site(
