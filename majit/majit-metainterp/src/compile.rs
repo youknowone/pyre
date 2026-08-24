@@ -6244,7 +6244,7 @@ mod fail_descr_tests {
     }
 
     /// `get_resumestorage` hops to `prev` exactly once because a chain of
-    /// copied descrs cannot exist: `compile.py:837-838
+    /// copied descrs cannot exist: `compile.py
     /// ResumeGuardCopiedDescr.__init__` asserts `isinstance(prev,
     /// ResumeGuardDescr)`, and `ResumeGuardCopiedDescr` is a sibling of that
     /// class rather than a subclass, so it can never be a donor.  The

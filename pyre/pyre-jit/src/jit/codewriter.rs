@@ -10591,9 +10591,10 @@ impl CodeWriter {
                                 // resolved an already-bound `__exit__`, and
                                 // `with_except_start_values` reads that NULL as
                                 // "no receiver" instead of dereferencing it.
-                                // The tag is what tells the walker's may-force
-                                // NULL-ref gate so; without it every bridge out
-                                // of a `with` handler is refused.
+                                // The tag is what lets the walker's may-force
+                                // NULL-ref gate admit that NULL; without it
+                                // every bridge out of a `with` handler is
+                                // refused at this residual.
                                 majit_ir::PyreHelperKind::WithExceptStart,
                                 vec![],
                                 vec![exit_func, exit_self, exc],
