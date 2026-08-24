@@ -1106,6 +1106,16 @@ pub enum PyreHelperKind {
     /// inside a loop virtualizes away instead of allocating a `Function` per
     /// iteration through an opaque residual.
     MakeFunction,
+    /// `jit_set_function_attribute(func, attr, flag)` — the
+    /// SET_FUNCTION_ATTRIBUTE residual
+    /// (`lower_set_function_attribute_hlop_to_insn` → `function.py`'s typed
+    /// setters), which stamps one slot on the function MAKE_FUNCTION just
+    /// built and hands the same object back.  The full-body walker recognises
+    /// this tag to emit the single-slot arms as a `SetfieldGc` on that
+    /// allocation and pass the operand through as the result, so the
+    /// definition sequence stays one virtual instead of escaping through an
+    /// opaque call whose result has to be re-read and re-guarded.
+    SetFunctionAttribute,
     /// `bh_clear_in_flight_exception()` — the `[] -> void` residual emitted by
     /// PUSH_EXC_INFO to complete the caught-exception ownership transfer.  The
     /// full-body walker applies the concrete clear during its authoritative

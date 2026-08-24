@@ -6713,6 +6713,25 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
+    // Emit SET_FUNCTION_ATTRIBUTE's single-slot arms as the `SetfieldGc` they
+    // name on the allocation MAKE_FUNCTION just made, and pass that allocation
+    // through as the result, so the definition sequence stays one virtual
+    // instead of escaping through a call whose opaque result the inline-call
+    // path has to re-read and re-guard.  Falls through to the residual for
+    // every shape it cannot reproduce (SAFE — never declined).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && pyre_helper_kind == majit_ir::PyreHelperKind::SetFunctionAttribute
+        && spec_gate("set_function_attribute", || {
+            try_walker_specialize_set_function_attribute(
+                ctx, op.pc, &i_args, &r_args, dst, dst_bank,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // STORE_ATTR fold (mapdict.py): recognize an existing unboxed
     // integer slot and replace only the generic setattr residual's helper,
     // arguments, and effect.  The transformed CallN continues through the

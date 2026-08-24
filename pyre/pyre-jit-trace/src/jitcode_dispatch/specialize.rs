@@ -5686,6 +5686,135 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// SET_FUNCTION_ATTRIBUTE inline emission: replace the
+/// `jit_set_function_attribute(func, attr, flag)` residual with the `SetfieldGc`
+/// set that flag's setter performs, and hand the operand itself back as the
+/// opcode's result.
+///
+/// The opcode only ever runs on the function the preceding MAKE_FUNCTION just
+/// pushed, so the stores are constructor stores on an allocation this trace
+/// made: nothing has read the slots, the object's `mutate_slots` is still the
+/// allocation's null, and no compiled trace can hold a folded view of a field
+/// belonging to an object that did not exist when it was recorded.  That is
+/// the same footing `emit_make_function_inline` already writes `code`,
+/// `name`, `w_func_globals_obj` and `w_qualname` on — all `function.py:34-42`
+/// slots — so this adds no new class of write.  `heap_cache.is_unescaped`
+/// is what establishes it: the operand must still be an unescaped allocation
+/// of this trace, which a `Function` reaching the opcode from anywhere else
+/// cannot be.
+///
+/// Passing `func` through as the result is the half that pays.  The residual's
+/// result is opaque, so the inline-call path that follows re-reads
+/// `Function.code`, `Function.w_func_globals_obj` and `Function.defs_w` off it
+/// and guards each one; served from the virtual instead, those reads fold to
+/// what the emit stored and the guards go with them, and the whole definition
+/// sequence virtualizes away when the function does not escape.
+///
+/// The two annotation flags name a second slot as well, and both of their
+/// stores are emitted: `Annotations` writes `w_ann` and clears `w_annotate`
+/// unconditionally, PEP 649's `Annotate` writes `w_annotate` and clears
+/// `w_ann` for an operand that is not `None`.  That last one is the only
+/// data-dependent arm, so it is taken only where the operand is provably not
+/// `None` at every execution rather than at this one — a baked constant, or an
+/// unescaped allocation of this trace, which is what the `__annotate__`
+/// function the preceding `MAKE_FUNCTION` built is.  They matter out of
+/// proportion to how often a `def` carries annotations: 3.14 emits
+/// `SET_FUNCTION_ATTRIBUTE annotate` FIRST, so declining it escapes the
+/// allocation and the `defaults` store behind it then declines too, leaving
+/// the whole definition sequence residual.
+///
+/// `TypeParams` names no slot at all — pyre has no PEP 695 surface, so the
+/// residual's arm is empty — and folds to the operand pass-through with no
+/// store emitted.
+pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    i_args: &[OpRef],
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::bytecode::MakeFunctionFlag;
+
+    if r_args.len() != 2 || i_args.len() != 1 {
+        return Ok(None);
+    }
+    let (func_op, attr_op) = (r_args[0], r_args[1]);
+    let Some(majit_ir::Value::Int(flag)) = ctx.trace_ctx.box_value(i_args[0]) else {
+        return Ok(None);
+    };
+    // A constant operand names a function that outlived the recording, and an
+    // escaped one may already be reachable from a compiled trace's folded
+    // view; both keep the residual, which notifies the watcher slot.
+    if func_op.is_constant() || !ctx.trace_ctx.heap_cache().is_unescaped(func_op) {
+        return Ok(None);
+    }
+    let Some(w_func) = walker_concrete_ref_object(ctx, func_op) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_interpreter::is_function(w_func) } {
+        return Ok(None);
+    }
+    let Some(w_attr) = walker_concrete_ref_object(ctx, attr_op) else {
+        return Ok(None);
+    };
+    // What the PEP 649 setter branches on. A baked constant is the same object
+    // at every execution; an unescaped allocation of this trace is a fresh
+    // object, which the singleton is not.
+    let attr_is_never_none = !unsafe { pyre_object::is_none(w_attr) }
+        && (attr_op.is_constant() || ctx.trace_ctx.heap_cache().is_unescaped(attr_op));
+
+    // The lowering bakes the `MakeFunctionFlag` bit-position discriminant, so
+    // the enum's own `#[repr]` layout is what this reads back. Each arm is the
+    // store set its `function.py` setter performs, in the setter's own order;
+    // `true` carries the operand, `false` is the setter's null.
+    let stores: Vec<(DescrRef, bool)> = match flag {
+        f if f == MakeFunctionFlag::Defaults as i64 => {
+            vec![(crate::descr::function_defs_w_descr(), true)]
+        }
+        f if f == MakeFunctionFlag::KwOnlyDefaults as i64 => {
+            vec![(crate::descr::function_w_kw_defs_descr(), true)]
+        }
+        f if f == MakeFunctionFlag::Closure as i64 => {
+            vec![(crate::descr::function_closure_descr(), true)]
+        }
+        // `function.py fset_func_annotations`: the eager dict, and the lazy
+        // `__annotate__` it supersedes cleared.
+        f if f == MakeFunctionFlag::Annotations as i64 => vec![
+            (crate::descr::function_w_ann_descr(), true),
+            (crate::descr::function_w_annotate_descr(), false),
+        ],
+        // PEP 649: the callable, and the eager dict it supersedes cleared --
+        // only for an operand the setter's `is_none` test lets through.
+        f if f == MakeFunctionFlag::Annotate as i64 => {
+            if !attr_is_never_none {
+                return Ok(None);
+            }
+            vec![
+                (crate::descr::function_w_annotate_descr(), true),
+                (crate::descr::function_w_ann_descr(), false),
+            ]
+        }
+        f if f == MakeFunctionFlag::TypeParams as i64 => Vec::new(),
+        _ => return Ok(None),
+    };
+
+    // --- commit to the fold: emit IR (no further declines) ---
+    let null_op = ctx.trace_ctx.const_null();
+    for (descr, carries_operand) in stores {
+        let value = if carries_operand { attr_op } else { null_op };
+        let index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(majit_ir::OpCode::SetfieldGc, &[func_op, value], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(func_op, index, value);
+    }
+    // Tracing is execution: apply the same store the residual would have.
+    pyre_interpreter::runtime_ops::jit_set_function_attribute(w_func as i64, w_attr as i64, flag);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_op)?;
+    Ok(Some(()))
+}
+
 /// Mixed W_LongObject/W_IntObject COMPARE_OP specialization.
 ///
 /// `pypy/objspace/std/longobject.py:_make_descr_cmp` selects the corresponding

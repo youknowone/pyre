@@ -6189,7 +6189,8 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::SetFunctionAttribute;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
