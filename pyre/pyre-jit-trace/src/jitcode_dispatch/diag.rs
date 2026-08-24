@@ -380,6 +380,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 74] = [
     ("instance_next",             "residual_call", "-"),
     ("frame_lasti",               "specialize",    "load_attr"),
     ("load_deref",                "residual_call", "-"),
+    ("frame_lineno",              "specialize",    "load_attr"),
 ];
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();

@@ -4218,6 +4218,18 @@ impl PyFrame {
     /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
+        self.get_lineno_at(self.last_instr)
+    }
+
+    /// [`Self::get_last_lineno`] for an instruction the caller names instead of
+    /// the one the frame's own field records.
+    ///
+    /// `last_instr` is a virtualizable field, so a compiled loop keeps the
+    /// executing coordinate in its own trace-time state and the frame's copy is
+    /// only made current by a force.  A caller that already holds that
+    /// coordinate answers this read without one.
+    #[inline]
+    pub fn get_lineno_at(&self, last_instr: isize) -> isize {
         // A line table that records no position at all reports ``f_lineno is
         // None`` rather than the code object's first line number.  The decoded
         // `locations` cannot answer this: a `SourceLocation` always carries a
@@ -4231,7 +4243,7 @@ impl PyFrame {
         // usable entry for the current instruction.  Ruff's decoded
         // zero-line entries reach us as line 0; preserve the frame getter's
         // existing -1 sentinel instead of leaking that implementation value.
-        match offset2lineno(self.code(), self.last_instr) {
+        match offset2lineno(self.code(), last_instr) {
             0 => -1,
             lineno => lineno as isize,
         }
@@ -4269,7 +4281,19 @@ impl PyFrame {
     /// `f_trace` test only selects the -1 fallback.
     #[inline]
     pub fn fget_f_lineno(&self) -> PyObjectRef {
-        let lineno = self.get_last_lineno();
+        self.f_lineno_at(self.last_instr)
+    }
+
+    /// [`Self::fget_f_lineno`] for an instruction the caller names, on the same
+    /// terms as [`Self::get_lineno_at`].
+    ///
+    /// The whole getter body stays here rather than being split across the
+    /// caller: the `f_trace` test, the `-1` sentinel and the `first_line_number`
+    /// fallback are one decision, and a caller reproducing part of it would
+    /// answer a differently-shaped read.
+    #[inline]
+    pub fn f_lineno_at(&self, last_instr: isize) -> PyObjectRef {
+        let lineno = self.get_lineno_at(last_instr);
         if self.get_w_f_trace().is_null() {
             if lineno == -1 {
                 return pyre_object::w_none();

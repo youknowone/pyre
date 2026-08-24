@@ -2679,6 +2679,44 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     Some((vable_box, ctx.vstack_cur_pypc))
 }
 
+/// Prove the receiver IS the frame the walk is executing, and answer that
+/// frame's executing pc.
+///
+/// Shared by the two owned-frame getter folds, which answer a coordinate the
+/// walk holds rather than the one the frame's own field records and therefore
+/// owe the same proof about the object in hand.
+///
+/// The receiver is pinned two ways.  Its class, its `w_class` and the frame
+/// type's `version_tag` are guarded, so rebinding the getset on the type
+/// revokes the loop instead of the fold outliving the descriptor that produced
+/// it.  And when the receiver arrives in a box other than the frame's own —
+/// a local the loop hoisted the frame into — a `ptr_eq` against that box is
+/// guarded, so a later entry holding a different frame side-exits to the
+/// residual rather than reading this trace's coordinate.
+fn walker_prove_owned_frame_pc<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Result<Option<u32>, DispatchError> {
+    let Some((frame_box, py_pc)) = walker_frame_executing_py_pc(ctx, concrete_obj, op_pc) else {
+        return Ok(None);
+    };
+    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(None);
+    }
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    if obj != frame_box {
+        let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_own_frame, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_own_frame])?;
+    }
+    Ok(Some(py_pc))
+}
+
 /// `pyframe.py fget_f_lasti` — `return self.last_instr`, loop-free and
 /// carrying no hint, so `policy.py look_inside_graph` admits it, `jtransform.py
 /// rewrite_op_jit_force_virtualizable` deletes the force
@@ -2711,13 +2749,7 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
 /// `last_instr` from here would incur that obligation, which is the second
 /// reason this path never does.
 ///
-/// The receiver is pinned two ways.  Its class, its `w_class` and the frame
-/// type's `version_tag` are guarded, so rebinding `f_lasti` on the type
-/// revokes the loop instead of the constant outliving the getset that produced
-/// it.  And when the receiver arrives in a box other than the frame's own —
-/// a local the loop hoisted the frame into — a `ptr_eq` against that box is
-/// guarded, so a later entry holding a different frame side-exits to the
-/// residual rather than reading this trace's coordinate.
+/// The receiver is pinned by [`walker_prove_owned_frame_pc`].
 fn try_walker_specialize_frame_lasti<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2726,21 +2758,9 @@ fn try_walker_specialize_frame_lasti<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    let Some((frame_box, py_pc)) = walker_frame_executing_py_pc(ctx, concrete_obj, op_pc) else {
+    let Some(py_pc) = walker_prove_owned_frame_pc(ctx, op_pc, obj, concrete_obj)? else {
         return Ok(None);
     };
-    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
-    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
-        return Ok(None);
-    }
-    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
-    if obj != frame_box {
-        let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
-        ctx.trace_ctx
-            .set_opref_concrete(is_own_frame, majit_ir::Value::Int(1));
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_own_frame])?;
-    }
     let value = py_pc as i64 * 2;
     let raw = ctx.trace_ctx.const_int(value);
     let boxed = walker_box_int(ctx, op_pc, raw, value)?;
@@ -2754,6 +2774,82 @@ fn try_walker_specialize_frame_lasti<Sym: WalkSym>(
         )),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Runtime half of the owned-frame `f_lineno` getter: `pyframe.py
+/// fget_f_lineno` with the executing `last_instr` supplied by its caller
+/// instead of read back off the frame.
+extern "C" fn jit_frame_f_lineno_at(frame: i64, last_instr: i64) -> i64 {
+    let frame = frame as usize as *const pyre_interpreter::PyFrame;
+    unsafe { &*frame }.f_lineno_at(last_instr as isize) as i64
+}
+
+/// `pyframe.py fget_f_lineno` — the line the frame is currently executing.
+///
+/// Unlike its `f_lasti` sibling this is **not** a constant, and upstream's
+/// compiled shape is not one either.  `policy.py look_inside_graph` admits
+/// `fget_f_lineno` and `pyjitpl.py opimpl_getfield_vable_r` answers the
+/// `debugdata` test out of `virtualizable_boxes`, but the decode underneath —
+/// `pytraceback.py offset2lineno` walking the line table — stays a residual
+/// call.  One non-forcing call is the shape to emit.
+///
+/// What this removes is the FORCE, not the call.  The generic reader
+/// residualizes `space.getattr` as a single `CALL_MAY_FORCE`, and a may-force
+/// boundary materializes the virtualizable — which is the only reason the
+/// getter could read `last_instr` off the frame at all, since that field is
+/// virtualizable and a compiled loop keeps the live coordinate in its own
+/// state.  Handing the leaf the coordinate the walk already holds
+/// ([`walker_prove_owned_frame_pc`]) removes that reason, leaving a leaf call
+/// that names the frame without forcing it.
+///
+/// The leaf is [`PyFrame::f_lineno_at`], i.e. the getter body whole.  Its
+/// `f_trace` test, `-1` sentinel and `first_line_number` fallback are one
+/// decision, and `w_f_trace` can be armed while the loop is already compiled,
+/// so that decision belongs at run time rather than baked into the trace.
+///
+/// Measured on a 200k-iteration read against a same-shape loop that does not
+/// read the frame, best of 5: the read costs 0.0274s through the residual and
+/// 0.0069s through this emission, against 0.0084s on CPython 3.14.6 and
+/// 0.0227s on pypy3.  What removing the boundary is worth is counted rather
+/// than inferred — the optimized trace loses half its `CALL_MAY_FORCE` (16 ->
+/// 8) and half its `GuardNotForced` (16 -> 8) — and the two arms report the
+/// same `loops_compiled`, `loops_aborted` and `guard_failures`, so the
+/// difference is the emission and not one arm compiling less.
+///
+/// The receiver is pinned by [`walker_prove_owned_frame_pc`].
+fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(py_pc) = walker_prove_owned_frame_pc(ctx, op_pc, obj, concrete_obj)? else {
+        return Ok(None);
+    };
+    let pc = ctx.trace_ctx.const_int(py_pc as i64);
+    let value = ctx.trace_ctx.call_ref_typed_with_effect(
+        jit_frame_f_lineno_at as *const (),
+        &[obj, pc],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    // The recording-time shadow comes from the same entry point the leaf calls,
+    // so it carries the getter's own small-int caching rather than a second
+    // rendering of it.
+    let concrete = unsafe {
+        (*(concrete_obj as *const pyre_interpreter::PyFrame)).f_lineno_at(py_pc as isize)
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        value,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
 
@@ -2877,6 +2973,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && spec_gate("frame_lasti", || {
             try_walker_specialize_frame_lasti(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if name == "f_lineno"
+        && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
+        && spec_gate("frame_lineno", || {
+            try_walker_specialize_frame_lineno(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
         })?
         .is_some()
     {
@@ -9730,8 +9835,8 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
 /// frame is always the portal, so the residual always escapes.  Removing it
 /// removes the force with it, and nothing has to replace it: `last_instr` is
 /// published onto the portal frame at every may-force boundary
-/// (`LiveLastInstrGuard`).  A generic `f_lineno` reader still retains that
-/// residual boundary.  Upstream does not: `pyframe.py fget_f_lasti` and
+/// (`LiveLastInstrGuard`).  A generic reader of either getter still retains
+/// that residual boundary.  Upstream does not: `pyframe.py fget_f_lasti` and
 /// `fget_f_lineno` are loop-free and carry no hint, so `policy.py
 /// look_inside_graph` admits them, `jtransform.py
 /// rewrite_op_jit_force_virtualizable` deletes the injected force, and
@@ -9740,10 +9845,13 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
 /// same-shape loop that does not read the frame: pypy3 answers `f_lasti`
 /// faster than that control loop -- the trace constant -- and pyre was 53x it,
 /// while `f_lineno` keeps one non-forcing residual on both and pyre is 2.1x.
-/// [`try_walker_specialize_frame_lasti`] closes the `f_lasti` half by emitting
-/// the constant, leaving `f_lineno` the open one.  Closing either is an
-/// optimization over a correct path, not a fix, and it owes two coordinates
-/// the boundary hides.  `last_instr` is an instruction-unit index here and the
+/// The two halves are closed by two different emissions, because the shapes
+/// they are closing to differ: [`try_walker_specialize_frame_lasti`] emits the
+/// constant, while [`try_walker_specialize_frame_lineno`] emits the one
+/// non-forcing residual upstream also keeps for the line-table decode.  Either
+/// is an optimization over a correct path, not a fix, and both owe two
+/// coordinates the boundary hides.  `last_instr` is an instruction-unit index
+/// here and the
 /// app-level getter reports it doubled (`typedef.rs`, matching `location.py
 /// offset2lineno`'s `stopat // 2` on the byte offset upstream stores), so an
 /// emission at the app level owes the factor.  And the field has two writers
