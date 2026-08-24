@@ -340,11 +340,14 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
         if w_code.is_null() {
             return None;
         }
-        let code = crate::w_code_get_ptr(w_code) as *const crate::CodeObject;
-        if code.is_null() {
+        // `if (lineno < 0) { Py_RETURN_NONE; }` — the test `tb_lineno_get`
+        // applies to what it just resolved, and only to that: a line stored
+        // on the node is returned above whatever its sign.
+        let lineno = crate::pycode::w_code_addr2line(w_code, w_pytraceback_get_lasti(tb));
+        if lineno < 0 {
             return None;
         }
-        crate::pycode::w_code_addr2line(&*code, w_pytraceback_get_lasti(tb)).map(|line| line as i64)
+        Some(lineno as i64)
     }
 }
 
@@ -461,13 +464,10 @@ pub unsafe fn record_application_traceback(
         // `write_traceback_chain` in `error.rs`) MUST go through
         // `w_code` rather than dereferencing the `frame` pointer.
         let w_code = (*frame).pycode as PyObjectRef;
-        let lineno = {
-            let code_obj = crate::pyframe::pyframe_get_pycode(&*frame);
-            if code_obj.is_null() {
-                LINENO_NOT_COMPUTED
-            } else {
-                crate::pyframe::offset2lineno(&*code_obj, last_instruction as isize) as i64
-            }
+        let lineno = if w_code.is_null() {
+            LINENO_NOT_COMPUTED
+        } else {
+            crate::pyframe::offset2lineno(w_code, last_instruction as isize) as i64
         };
         // `tb = operror.get_traceback()` — the read that grows the chain
         // marks the previous head's frame, matching `get_traceback`.

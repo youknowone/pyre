@@ -1987,10 +1987,19 @@ pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 /// returns from the same zero-length walk and the value both readers of a line
 /// number render as `None`; it is also `LINENO_NOT_COMPUTED`, so a traceback
 /// node stamped with it resolves lazily and answers `None` there too.
+///
+/// The `PyCode` wrapper is the argument, not the bare `CodeObject`, because
+/// the walk is seeded with `co_firstlineno` and only the wrapper carries it
+/// as the signed integer app-level set: `CodeObject.first_line_number` is an
+/// `Option<OneIndexed>` and cannot hold the zero and negative values
+/// `CodeType(...)` accepts.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode`.
 #[inline]
-pub fn offset2lineno(code: &CodeObject, stopat: isize) -> isize {
+pub unsafe fn offset2lineno(w_code: PyObjectRef, stopat: isize) -> isize {
     let addrq = (stopat as i64).saturating_mul(2);
-    crate::pycode::w_code_addr2line(code, addrq).map_or(-1, |line| line as isize)
+    unsafe { crate::pycode::w_code_addr2line(w_code, addrq) as isize }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -4222,6 +4231,16 @@ impl PyFrame {
     /// replacement `co_linetable` that describes no range covering
     /// `last_instr` — including an empty one — and for the `NO_LOCATION`
     /// ranges a compiler-generated cleanup sits in.
+    ///
+    /// A frame that has not run an instruction resolves against instruction
+    /// **0**, not against `PyCode_Addr2Line`'s `addrq < 0` arm.  Upstream has
+    /// no "not started" offset to resolve: `_PyInterpreterFrame_LASTI` is 0
+    /// while the frame sits on its `RESUME`, so `frame_getlineno` answers that
+    /// instruction's own line.  The two differ for a module body, whose
+    /// `RESUME` carries line **0** while `co_firstlineno` is 1 — and the gap
+    /// is observable, because `_trace` seeds the last-traced line from here on
+    /// the `call` event, so answering `co_firstlineno` made the `RESUME`'s own
+    /// line look like a change and fired a `line` event upstream does not have.
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
         self.get_lineno_at(self.last_instr)
@@ -4236,7 +4255,7 @@ impl PyFrame {
     /// coordinate answers this read without one.
     #[inline]
     pub fn get_lineno_at(&self, last_instr: isize) -> isize {
-        offset2lineno(self.code(), last_instr)
+        unsafe { offset2lineno(self.pycode as PyObjectRef, last_instr.max(0)) }
     }
 
     /// pycode.py `_get_lineno_for_pc_tracing(frame.last_instr)` — the line a

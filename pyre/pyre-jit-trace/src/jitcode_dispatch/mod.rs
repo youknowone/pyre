@@ -1183,10 +1183,12 @@ fn traceback_node_site<Sym: WalkSym>(
         jitcode_index,
         opcode_position as i32,
     )?;
-    let raw_code = crate::state::raw_code_for_jitcode_index(jitcode_index)?;
-    let lineno =
-        unsafe { pyre_interpreter::pyframe::offset2lineno(&*raw_code, last_instruction as isize) }
-            as i64;
+    let lineno = unsafe {
+        pyre_interpreter::pyframe::offset2lineno(
+            w_code as pyre_object::PyObjectRef,
+            last_instruction as isize,
+        )
+    } as i64;
     let frame = ctx
         .registers_r
         .get(jitcode.metadata.portal_frame_reg as usize)
