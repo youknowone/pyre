@@ -766,6 +766,9 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// summary a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`summarize_descent_blockers`] caches nothing.
 fn descent_decline(jitcode_index: usize) -> Option<DescentDecline> {
+    if !descent_unlowered_helper_scan_enabled() {
+        return None;
+    }
     let summary = descent_blocker_summary(jitcode_index);
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
@@ -791,6 +794,28 @@ impl std::fmt::Display for DescentDecline {
             Self::BodyNotWalked => f.write_str("body holds bytes the scan cannot decode"),
         }
     }
+}
+
+/// Kill switch for the scan above: `PYRE_FBW_DESCENT_SCAN_OFF=1` lets the
+/// descent run into the symbolic call and abort there instead of declining
+/// before it starts.
+///
+/// The same shape and the same reason as `PYRE_WALKABORT_OFF` in
+/// `trace.rs`: the scan decides, for every builtin the walker might descend
+/// into, whether the descent happens at all, and its cost is invisible in
+/// output — a declined descent is a correct answer that is merely slower.
+/// One binary and one env var is the only way to weigh what the
+/// conservatism buys against what it costs.
+///
+/// Graded over the 561 `__pyre_wrap_*` gateway wrappers, 448 of the 487 the
+/// scan declines block on a call no complete path through the descent
+/// executes, so what this switch measures is mostly the price of a static
+/// answer to a dynamic question. It is a diagnostic, not a tuning knob:
+/// the scan is on unless it is explicitly turned off, because the rewind it
+/// prevents is a wrong answer and not a slow one.
+fn descent_unlowered_helper_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
 }
 
 /// Memoizing entry point for [`summarize_descent_blockers`].

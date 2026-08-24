@@ -243,7 +243,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
-`PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
@@ -267,6 +267,14 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
 `PYRE_WASM_TRACE_ENTRY_CENSUS`.
+
+`PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
+(`descent_unlowered_helper_scan_enabled`), so the walker descends into a
+builtin body that holds a symbolic-fnaddr residual call and aborts at the call
+instead of declining before the descent starts. Same shape and same reason as
+`PYRE_WALKABORT_OFF`: the scan decides whether a descent happens at all and its
+cost is invisible in output, so weighing the conservatism against its price
+needs one binary and one variable. It retires when the scan does.
 
 `PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`
 example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
