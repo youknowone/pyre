@@ -15,6 +15,9 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::pyobject::{self, CPyObject};
 
 /// The interpreter an extension is handed a pointer to.
 ///
@@ -34,23 +37,50 @@ static INTERPRETER: CPyInterpreterState = CPyInterpreterState { _private: 0 };
 
 /// The per-thread state an extension is handed a pointer to.
 ///
-/// `interp` is the one field an extension reads directly, which is how it asks
-/// which interpreter the thread runs in without a call; everything else this
-/// stands for is reached through an entry point.
+/// `interp` and `dict` are the fields an extension reads directly, which is
+/// how it asks which interpreter the thread runs in and where to keep its own
+/// per-thread state without a call; everything else this stands for is reached
+/// through an entry point.  `pystate.py` gives its `PyThreadState` the same
+/// three, and `_status` is the bitfield `struct _ts` publishes beside them --
+/// cffi clears `bound_gilstate` on a state it is about to delete.
 #[repr(C)]
 pub struct CPyThreadState {
     interp: *mut CPyInterpreterState,
-    /// Never read through the pointer; a distinct byte so two threads' states
-    /// are distinct addresses.
-    _private: u8,
+    /// The namespace [`PyThreadState_GetDict`] answers with, minted on first
+    /// read and released by [`PyThreadState_Clear`].
+    dict: *mut CPyObject,
+    /// What [`PyThreadState_GetID`] answers with.
+    id: u64,
+    /// The eight one-bit flags and their padding, as one 32-bit unit.  Nothing
+    /// here reads them; they exist so that an extension writing one writes
+    /// into storage of its own rather than past the end of the block.
+    status: u32,
 }
+
+/// The layout is written out twice -- here and in
+/// `include/pyre3.14t/pystate.h` -- so a field added to one without the other
+/// stops compiling rather than writing somewhere unclaimed.
+const _: () = {
+    assert!(std::mem::offset_of!(CPyThreadState, interp) == 0);
+    assert!(std::mem::offset_of!(CPyThreadState, dict) == 8);
+    assert!(std::mem::offset_of!(CPyThreadState, id) == 16);
+    assert!(std::mem::offset_of!(CPyThreadState, status) == 24);
+};
+
+/// `State.threadstate_count` -- what a state's id is taken from, counted up
+/// so that no two live states share one.
+static THREAD_STATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// Stable for as long as the thread lives, which is as long as a
     /// `PyThreadState *` naming it is valid.
     static THREAD_STATE: UnsafeCell<CPyThreadState> = UnsafeCell::new(CPyThreadState {
         interp: &INTERPRETER as *const CPyInterpreterState as *mut CPyInterpreterState,
-        _private: 0,
+        dict: std::ptr::null_mut(),
+        // `new_thread_state` counts from one, so every state that exists has
+        // an id an extension can key its own per-thread data by.
+        id: THREAD_STATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+        status: 0,
     });
     /// `ec.cpyext_threadstate_is_current`.  Swapping NULL in clears it, which
     /// is how an extension says the thread state it was handed is no longer the
@@ -61,6 +91,15 @@ thread_local! {
 /// This thread's state, whether or not it is the current one.
 fn thread_state() -> *mut CPyThreadState {
     THREAD_STATE.with(|state| state.get())
+}
+
+/// Record whether this thread's state is the current one.
+///
+/// The GIL entry points that make it so live in [`crate::module::thread`],
+/// because a build without this layer exports them too; the flag they set is
+/// this one.
+pub(crate) fn set_threadstate_is_current(current: bool) {
+    STATE_IS_CURRENT.with(|state| state.set(current));
 }
 
 /// `pystate.py PyEval_SaveThread` — drop the GIL, and answer the state the
@@ -143,6 +182,135 @@ pub unsafe extern "C" fn PyThreadState_Swap(state: *mut CPyThreadState) -> *mut 
     previous
 }
 
+/// The namespace a thread state answers with, minted on first read.
+///
+/// `InterpreterState.new_thread_state` mints one with the state itself
+/// (`ts.c_dict = make_ref(space, space.newdict())`).  A state here is a
+/// thread-local that exists before there is an interpreter to ask for a dict,
+/// so the mint is deferred to the first reader; the reference it takes is the
+/// one [`PyThreadState_Clear`] gives back.
+///
+/// # Safety
+/// `state` must be null or a live thread state.
+unsafe fn state_dict(state: *mut CPyThreadState) -> *mut CPyObject {
+    if state.is_null() {
+        return std::ptr::null_mut();
+    }
+    let dict = unsafe { (*state).dict };
+    if !dict.is_null() {
+        return dict;
+    }
+    let dict = pyobject::make_ref(pyre_object::dictmultiobject::w_dict_new());
+    unsafe { (*state).dict = dict };
+    dict
+}
+
+/// `pystate.py PyThreadState_GetDict` — the namespace an extension keeps its
+/// own per-thread state in, as a borrowed reference.
+///
+/// NULL when this thread's state is not the current one, which upstream
+/// reports the same way and which the documented contract asks for: a caller
+/// is to read NULL as "no thread state is available" rather than as an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_GetDict() -> *mut CPyObject {
+    if !STATE_IS_CURRENT.with(|current| current.get()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { state_dict(thread_state()) }
+}
+
+/// `pystate.py _PyThreadState_GetDict` — the same namespace, named by state
+/// rather than taken from the current one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyThreadState_GetDict(state: *mut CPyThreadState) -> *mut CPyObject {
+    unsafe { state_dict(state) }
+}
+
+/// `pystate.py PyThreadState_Clear` — give back what the state holds.
+///
+/// Upstream also leaves the thread and drops its execution context; a state
+/// here is the thread's own thread-local and outlives every caller, so what is
+/// left to release is the namespace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_Clear(state: *mut CPyThreadState) {
+    if state.is_null() {
+        return;
+    }
+    unsafe {
+        pyobject::decref((*state).dict);
+        (*state).dict = std::ptr::null_mut();
+    }
+}
+
+/// `pystate.py PyThreadState_Delete` — upstream's body is empty, and for the
+/// same reason: the storage belongs to the thread, not to the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_Delete(_state: *mut CPyThreadState) {}
+
+/// `pystate.py PyThreadState_DeleteCurrent`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_DeleteCurrent() {}
+
+/// `src/pythonrun.c PyThreadState_GetInterpreter` — the one field read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_GetInterpreter(
+    state: *mut CPyThreadState,
+) -> *mut CPyInterpreterState {
+    match state.is_null() {
+        true => std::ptr::null_mut(),
+        false => unsafe { (*state).interp },
+    }
+}
+
+/// `PyThreadState_GetUnchecked()` — the name [`_PyThreadState_UncheckedGet`]
+/// was published under from 3.13, and the same answer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_GetUnchecked() -> *mut CPyThreadState {
+    unsafe { _PyThreadState_UncheckedGet() }
+}
+
+/// `PyThreadState_GetID(tstate)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyThreadState_GetID(state: *mut CPyThreadState) -> u64 {
+    match state.is_null() {
+        true => 0,
+        false => unsafe { (*state).id },
+    }
+}
+
+/// The namespace [`PyInterpreterState_GetDict`] answers with.
+///
+/// One interpreter, so one namespace, and it lives as long as the process:
+/// the reference taken when it is minted is never given back, which is what
+/// makes the borrowed answer good for as long as the caller holds the
+/// interpreter.
+static INTERPRETER_DICT: super::ForkMutex<usize> = super::ForkMutex::new(0);
+
+/// The lock word can be held by a thread the child does not have; the mirror
+/// the payload names is still mapped, because `fork` copies the address space.
+pub(super) unsafe fn after_fork_child() {
+    unsafe { INTERPRETER_DICT.reinit_after_fork() };
+}
+
+/// `PyInterpreterState_GetDict(interp)` — a namespace shared by every thread
+/// of an interpreter, as a borrowed reference.
+///
+/// cffi keeps its `@ffi.def_extern()` table here, so the answer has to be the
+/// same block on every call from every thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyInterpreterState_GetDict(
+    interp: *mut CPyInterpreterState,
+) -> *mut CPyObject {
+    if interp.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut held = INTERPRETER_DICT.lock();
+    if *held == 0 {
+        *held = pyobject::make_ref(pyre_object::dictmultiobject::w_dict_new()) as usize;
+    }
+    *held as *mut CPyObject
+}
+
 /// `pystate.py PyGILState_Check` — whether this thread holds the GIL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_Check() -> c_int {
@@ -214,4 +382,13 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyInterpreterState_GetID as *const ());
     std::hint::black_box(PyEval_InitThreads as *const ());
     std::hint::black_box(PyEval_ThreadsInitialized as *const ());
+    std::hint::black_box(PyThreadState_GetDict as *const ());
+    std::hint::black_box(_PyThreadState_GetDict as *const ());
+    std::hint::black_box(PyThreadState_Clear as *const ());
+    std::hint::black_box(PyThreadState_Delete as *const ());
+    std::hint::black_box(PyThreadState_DeleteCurrent as *const ());
+    std::hint::black_box(PyThreadState_GetInterpreter as *const ());
+    std::hint::black_box(PyThreadState_GetUnchecked as *const ());
+    std::hint::black_box(PyThreadState_GetID as *const ());
+    std::hint::black_box(PyInterpreterState_GetDict as *const ());
 }

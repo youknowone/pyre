@@ -1276,7 +1276,7 @@ static W_BYTES_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "data",
                 pyre_object::bytesobject::BYTES_DATA_OFFSET,
-                std::mem::size_of::<*const Vec<u8>>(),
+                std::mem::size_of::<*const pyre_object::bytesobject::BytesBlock>(),
                 Type::Ref,
                 false,
                 true,

@@ -142,6 +142,13 @@ impl Parse for JitInlineArgs {
             }
             let _ = input.parse::<Token![,]>();
         }
+        jit_interp::reject_overlapping_call_vocabularies(
+            &calls,
+            &native_int_binops,
+            &native_tag_small,
+            &native_identity,
+        )?;
+
         Ok(Self {
             calls,
             ref_params,

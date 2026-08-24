@@ -205,7 +205,7 @@ pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
             for c in body
                 .constants_i
                 .iter_mut()
-                .chain(body.constants_r.iter_mut())
+                .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
             {
                 if let Some(&runtime) = correspondence.get(c) {
                     *c = runtime;
@@ -336,11 +336,11 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
             // The slot must still hold its non-canonical sentinel — never a
             // real address (which has the high bits clear).
             assert_eq!(
-                (body.constants_r[idx] as u64) & SENTINEL_HIGH_MASK,
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
                 (majit_translate::assembler::STR_CONST_SENTINEL_BASE as u64) & SENTINEL_HIGH_MASK,
                 "constants_r[{idx}] did not hold a prebuilt-string sentinel",
             );
-            body.constants_r[idx] = addr;
+            body.constants_r[idx] = addr.into();
         }
     }
 }
@@ -371,7 +371,7 @@ mod tests {
         let jc = JitCode::new("test");
         jc.set_body(JitCodeBody {
             str_consts: descs,
-            constants_r,
+            constants_r: constants_r.into_iter().map(Into::into).collect(),
             ..Default::default()
         });
         Arc::new(jc)
@@ -390,7 +390,7 @@ mod tests {
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
 
-        let addr = jcs[0].body().constants_r[0];
+        let addr = jcs[0].body().constants_r[0].get();
         assert_ne!(addr, sentinel(0), "sentinel must be overwritten");
         assert_eq!(
             (addr as u64) & SENTINEL_HIGH_MASK,
@@ -422,8 +422,8 @@ mod tests {
             jitcode_with_str_consts(vec![desc()]),
         ];
         materialize_str_consts(&mut jcs);
-        let a0 = jcs[0].body().constants_r[0];
-        let a1 = jcs[1].body().constants_r[0];
+        let a0 = jcs[0].body().constants_r[0].get();
+        let a1 = jcs[1].body().constants_r[0].get();
         assert_eq!(
             a0, a1,
             "identical literals must share one immortal W_UnicodeObject",
@@ -470,7 +470,7 @@ mod tests {
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
-        let addr = jcs[0].body().constants_r[0];
+        let addr = jcs[0].body().constants_r[0].get();
         let cpu = crate::pyre_cpu::PyreCpu::new();
         assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
     }

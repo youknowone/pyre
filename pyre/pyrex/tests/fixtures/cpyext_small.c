@@ -229,7 +229,117 @@ static PyObject *generic_alias(PyObject *self, PyObject *args)
     return outcome(Py_GenericAlias(origin, parameters));
 }
 
+/* ── the count field ──────────────────────────────────────────────────── */
+
+/* `Py_SET_REFCNT` writes what `Py_REFCNT` reports, so the two round-trip: the
+   +1/-1 bracket around a `__dealloc__` body is the only shape Cython uses it
+   in, and it has to leave the count where it found it. */
+static PyObject *refcount_round_trip(PyObject *self, PyObject *object)
+{
+    Py_ssize_t before, bumped, after;
+    (void)self;
+    before = Py_REFCNT(object);
+    Py_SET_REFCNT(object, Py_REFCNT(object) + 1);
+    bumped = Py_REFCNT(object);
+    Py_SET_REFCNT(object, Py_REFCNT(object) - 1);
+    after = Py_REFCNT(object);
+    return Py_BuildValue("(nn)", bumped - before, after - before);
+}
+
+/* A count that must never be reached is left alone.  Writing 1 over a
+   singleton's would free a block the interpreter still points at, so the
+   refusal is the whole of what this entry point is checked for. */
+static PyObject *refcount_immortal(PyObject *self, PyObject *unused)
+{
+    Py_ssize_t before, after;
+    (void)self;
+    (void)unused;
+    before = Py_REFCNT(Py_None);
+    Py_SET_REFCNT(Py_None, 1);
+    after = Py_REFCNT(Py_None);
+    return Py_BuildValue("(ii)", before == after, after > 1);
+}
+
+/* ── the number a prefix of a string reads as ─────────────────────────── */
+
+/* `PyOS_string_to_double(text, endptr, overflow)`.  `keep_tail` chooses
+   whether an `endptr` is passed at all, which is what decides whether a
+   remainder is an error; `overflow` names the class a magnitude too large
+   for the type is reported through. */
+static PyObject *string_to_double(PyObject *self, PyObject *args)
+{
+    const char *text;
+    int keep_tail;
+    PyObject *overflow = Py_None;
+    char *tail = NULL;
+    double value;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "si|O", &text, &keep_tail, &overflow)) {
+        return NULL;
+    }
+    value = PyOS_string_to_double(text, keep_tail ? &tail : NULL,
+                                  overflow == Py_None ? NULL : overflow);
+    if (value == -1.0 && PyErr_Occurred()) {
+        return pending();
+    }
+    return Py_BuildValue("(dsO)", value, tail == NULL ? "" : tail, Py_None);
+}
+
+/* `PyFloat_AS_DOUBLE`, which asks no questions. */
+static PyObject *float_as_double(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return PyFloat_FromDouble(PyFloat_AS_DOUBLE(value));
+}
+
+/* `PyFloat_FromString`, which reads whatever `float()` reads. */
+static PyObject *float_from_string(PyObject *self, PyObject *value)
+{
+    (void)self;
+    return outcome(PyFloat_FromString(value));
+}
+
+/* `PyUnicode_Split(s, sep, maxsplit)`, with `None` for the separator that
+   splits on runs of whitespace. */
+static PyObject *split(PyObject *self, PyObject *args)
+{
+    PyObject *string, *separator;
+    Py_ssize_t maxsplit;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "OOn", &string, &separator, &maxsplit)) {
+        return NULL;
+    }
+    return outcome(PyUnicode_Split(string, separator == Py_None ? NULL : separator,
+                                   maxsplit));
+}
+
+/* `PyType_GetDict`, and whether what it answers is the type's own namespace
+   rather than a copy of it. */
+static PyObject *type_dict(PyObject *self, PyObject *type)
+{
+    PyObject *dict, *again, *same;
+    (void)self;
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "type_dict wants a type");
+        return NULL;
+    }
+    dict = PyType_GetDict((PyTypeObject *)type);
+    if (dict == NULL) {
+        return pending();
+    }
+    again = PyType_GetDict((PyTypeObject *)type);
+    same = Py_BuildValue("(Oi)", dict, again == dict);
+    Py_DECREF(dict);
+    Py_XDECREF(again);
+    return same;
+}
+
 static PyMethodDef methods[] = {
+    {"string_to_double", string_to_double, METH_VARARGS, NULL},
+    {"float_as_double", float_as_double, METH_O, NULL},
+    {"float_from_string", float_from_string, METH_O, NULL},
+    {"split", split, METH_VARARGS, NULL},
+    {"type_dict", type_dict, METH_O, NULL},
     {"type_names", type_names, METH_O, NULL},
     {"repr_guard", repr_guard, METH_O, NULL},
     {"guarded_repr", guarded_repr, METH_O, NULL},
@@ -242,6 +352,8 @@ static PyMethodDef methods[] = {
     {"set_default", set_default, METH_VARARGS, NULL},
     {"set_default_no_result", set_default_no_result, METH_VARARGS, NULL},
     {"generic_alias", generic_alias, METH_VARARGS, NULL},
+    {"refcount_round_trip", refcount_round_trip, METH_O, NULL},
+    {"refcount_immortal", refcount_immortal, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {PyModuleDef_HEAD_INIT, "cpyext_small", NULL, -1,

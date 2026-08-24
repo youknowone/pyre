@@ -1,4 +1,4 @@
-# pyre-check: pypy-diverges: pins _json.scanstring indexed past the subject's length; pypy3 has no _json module
+# pyre-check: pypy-diverges: pins marshal/pickle/_json checking an untrusted buffer before it becomes a str; pypy3 has no _json, and its marshal decodes ED C0 80 to a '\uxED' escape instead of raising
 # CPython-suite gap: no test feeds marshal/pickle a three-byte sequence that
 # holds no code point, and none indexes _json past the subject's length.
 # parity-tests reason: these reach pyre's own WTF-8 representation, where the

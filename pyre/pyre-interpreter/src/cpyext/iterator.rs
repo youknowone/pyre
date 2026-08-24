@@ -23,7 +23,7 @@ fn has_method(object: *mut CPyObject, name: &str) -> c_int {
 ///
 /// Exhaustion is NULL with no exception set, so the class has to be tested
 /// rather than the error handed on.
-fn is_stop_iteration(error: &mut crate::PyError) -> bool {
+pub(super) fn is_stop_iteration(error: &mut crate::PyError) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(error.to_exc_object());

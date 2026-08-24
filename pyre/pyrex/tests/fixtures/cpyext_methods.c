@@ -126,6 +126,48 @@ static PyObject *m_layout(PyObject *self, PyObject *const *args,
     return result;
 }
 
+/* The fields a carrier's block holds.  cffi reads `m_ml` and `m_module` off
+   the block rather than through the entry points (`lib_obj.c
+   _cpyextfunc_get`), and the module read is an identity test against the
+   reference it handed `PyCFunction_NewEx`. */
+static PyMethodDef carried_def = {"carried", (PyCFunction)m_bump, METH_NOARGS, NULL};
+
+static PyObject *m_carrier_fields(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *receiver = NULL;
+    PyObject *module = NULL;
+    if (!PyArg_UnpackTuple(args, "carrier_fields", 2, 2, &receiver, &module)) {
+        return NULL;
+    }
+    PyObject *carrier = PyCFunction_NewEx(&carried_def, receiver, module);
+    if (carrier == NULL) {
+        return NULL;
+    }
+    PyCFunctionObject *block = (PyCFunctionObject *)carrier;
+    PyObject *result = Py_BuildValue(
+        "(OOOOO)",
+        PyCFunction_Check(carrier) ? Py_True : Py_False,
+        block->m_ml == &carried_def ? Py_True : Py_False,
+        block->m_self == receiver ? Py_True : Py_False,
+        block->m_module == module ? Py_True : Py_False,
+        PyCFunction_GetFunction(carrier) == carried_def.ml_meth ? Py_True : Py_False);
+    Py_DECREF(carrier);
+    return result;
+}
+
+/* An unpack whose bounds differ, which reports the bound the call missed. */
+static PyObject *m_at_most_two(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *first = NULL;
+    PyObject *second = NULL;
+    if (!PyArg_UnpackTuple(args, "at_most_two", 1, 2, &first, &second)) {
+        return NULL;
+    }
+    return PyLong_FromSsize_t(second == NULL ? 1 : 2);
+}
+
 /* PyArg_UnpackTuple and the object protocol. */
 static PyObject *m_apply(PyObject *self, PyObject *args)
 {
@@ -418,9 +460,11 @@ static PyObject *m_version_macros(PyObject *self, PyObject *unused)
     (void)self;
     (void)unused;
     static const char banner[] = "python " PY_VERSION " / pyre " PYRE_VERSION;
-    return Py_BuildValue("(siiiiisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
+    /* `PYPY_VERSION` is one of them: an extension that is not a cffi-generated
+       module reads the layouts behind these headers as PyPy's. */
+    return Py_BuildValue("(siiiiisisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
                          PY_MICRO_VERSION, PY_RELEASE_LEVEL, PY_RELEASE_SERIAL,
-                         PY_VERSION, PY_VERSION_HEX);
+                         PY_VERSION, PY_VERSION_HEX, PYPY_VERSION, PYPY_VERSION_NUM);
 }
 
 /* `PyErr_Restore` puts back what `PyErr_Fetch` took, and its three degenerate
@@ -1617,8 +1661,14 @@ static PyObject *m_writable_buffer(PyObject *self, PyObject *args)
     (void)self;
     Py_buffer target;
     if (PyArg_ParseTuple(args, "w*", &target)) {
+        /* The write proves the view is the exporter's own storage rather
+           than a copy that would swallow it. */
+        if (target.len > 0) {
+            ((char *)target.buf)[0] = 'W';
+        }
+        Py_ssize_t length = target.len;
         PyBuffer_Release(&target);
-        Py_RETURN_NONE;
+        return PyLong_FromSsize_t(length);
     }
     if (!PyErr_ExceptionMatches(PyExc_BufferError)) {
         return NULL;
@@ -1657,6 +1707,8 @@ static PyMethodDef methods[] = {
     {"layout", (PyCFunction)(void (*)(void))m_layout,
      METH_FASTCALL | METH_KEYWORDS, NULL},
     {"apply", (PyCFunction)m_apply, METH_VARARGS, NULL},
+    {"at_most_two", (PyCFunction)m_at_most_two, METH_VARARGS, NULL},
+    {"carrier_fields", (PyCFunction)m_carrier_fields, METH_VARARGS, NULL},
     {"inspect", (PyCFunction)m_inspect, METH_VARARGS, NULL},
     {"build", (PyCFunction)m_build, METH_NOARGS, NULL},
     {"roundtrip", (PyCFunction)m_roundtrip, METH_VARARGS, NULL},

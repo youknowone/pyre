@@ -792,6 +792,12 @@ pub trait GcAllocator: Send {
     /// finalizer handler.  Backends without finalizer queues ignore it.
     fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef, _trigger: FinalizerTriggerFn) {}
 
+    /// incminimark.py `ignore_finalizer` / framework.py
+    /// `gct_gc_ignore_finalizer`: mark `obj` so the finalizer queues skip it.
+    /// An optimization hint — a backend with no such flag ignores it, and the
+    /// finalizer simply runs.
+    fn ignore_finalizer(&mut self, _obj: GcRef) {}
+
     /// rgc.py `FinalizerQueue.next_dead` / framework.py `gc_fq_next_dead`.
     fn finalizer_next_dead(&mut self, _fq_index: usize) -> Option<GcRef> {
         None
@@ -1381,6 +1387,9 @@ impl GcAllocator for GcHandle {
     }
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
+    }
+    fn ignore_finalizer(&mut self, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.ignore_finalizer(obj))
     }
     fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
         gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
@@ -3049,6 +3058,45 @@ pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTrig
     }
 }
 
+/// rgc.py `collect(gen)` — the internal entry that names how much work to do,
+/// as opposed to `gc.collect()`, which asks for all of it.  `gen < 0` is a
+/// minor with no major progress at all, `0` a minor plus whatever major step
+/// the accounting calls for, `1` that plus starting a cycle if none is running,
+/// and `>= 2` a full collection.
+pub fn gc_collect_gen(generation: i64) {
+    gc_sync::gc_op(|gc| gc.do_collect(generation));
+}
+
+/// incminimark.py `set_max_heap_size` — the `PYPY_GC_MAX` limit, set from
+/// inside a running process instead of read once at startup.  `0` is
+/// unbounded.
+pub fn gc_set_max_heap_size(size: usize) {
+    gc_sync::gc_op(|gc| gc.set_max_heap_size(size));
+}
+
+/// rgc.py `move_out_of_nursery` — "Returns another object which is a copy of
+/// obj; but at any point (either now or in the future) the returned object
+/// might suddenly become identical to the one returned.  NOTE: Only use for
+/// immutable objects!"
+///
+/// The argument must stay reachable across the call: filling the shadow can
+/// allocate one first, and that is a collection point.
+pub fn gc_move_out_of_nursery(obj: GcRef) -> GcRef {
+    gc_sync::gc_op_with_root(obj, |gc, obj| GcRef(gc.move_out_of_nursery(obj.0)))
+}
+
+/// rgc.py `may_ignore_finalizer` — "says that it is valid for any finalizer
+/// for 'obj' to be ignored, depending on the GC".  A hint and nothing else: the
+/// object stays on its queue, and what changes is that the queue skips it when
+/// it comes to deliver.
+///
+/// Unlike [`gc_register_finalizer`] there is no backend trampoline to consult.
+/// The hint is a header bit, and a backend that keeps no such bit is a backend
+/// whose queues never read one.
+pub fn gc_ignore_finalizer(obj: GcRef) {
+    gc_sync::gc_op(|gc| gc.ignore_finalizer(obj));
+}
+
 /// Pop one object from the active GC's RPython-style finalizer death queue.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
     match ACTIVE_FINALIZER_NEXT_DEAD.get() {
@@ -3075,6 +3123,12 @@ pub fn gc_rawrefcount_init(dealloc_trigger: rawrefcount::DeallocTriggerFn) {
 /// own references from.  Upstream has no counterpart; see the type.
 pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_set_c_edge_census(census));
+}
+
+/// Register the [`rawrefcount::FinalizerClaimFn`] the collector claims a dying
+/// block's finalizer through.  Upstream has no counterpart; see the type.
+pub fn gc_rawrefcount_set_finalizer_claim(claim: rawrefcount::FinalizerClaimFn) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_set_finalizer_claim(claim));
 }
 
 /// `rawrefcount.py:create_link_pypy` — `pyobject` is a mirror of `obj`, and
@@ -3129,6 +3183,11 @@ pub fn gc_rawrefcount_to_obj(pyobject: usize) -> GcRef {
 /// 0 when the queue is empty.
 pub fn gc_rawrefcount_next_dead() -> usize {
     gc_sync::gc_op(|gc| gc.rawrefcount_next_dead())
+}
+
+/// The next mirror whose finalizer the drain owes a call, or zero.
+pub fn gc_rawrefcount_next_finalize() -> usize {
+    gc_sync::gc_op(|gc| gc.rawrefcount_next_finalize())
 }
 
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress

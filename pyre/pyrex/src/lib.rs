@@ -180,8 +180,9 @@ fn finalize_flags(flags: LaunchFlags) -> LaunchFlags {
 
 fn parse_args(
     binary_name: &str,
+    argv: Vec<std::ffi::OsString>,
 ) -> Result<(RunMode, LaunchFlags, Vec<std::ffi::OsString>), lexopt::Error> {
-    let mut parser = lexopt::Parser::from_env();
+    let mut parser = lexopt::Parser::from_iter(argv);
     let mut flags = LaunchFlags::default();
 
     while let Some(arg) = parser.next()? {
@@ -288,10 +289,10 @@ fn parse_args(
     ))
 }
 
-/// Parse a `--heapsize` value (`pypy_interact.py:88-102`): a byte count with an
-/// optional `k`/`m`/`g` suffix. pyre's GC has no runtime heap-limit knob, so the
-/// value is validated and accepted for CLI-surface parity but not enforced
-/// (accept-and-ignore); a non-positive or malformed value is a usage error.
+/// Parse a `--heapsize` value (`pypy_interact.py main`): a byte count with an
+/// optional `k`/`m`/`g` suffix. The suffixes are the controller's spelling and
+/// stop here — what it hands the sandboxed program is the byte count written
+/// out, so [`take_heapsize_option`] on the other side parses a plain integer.
 fn parse_heapsize(value: &str) -> Result<u64, lexopt::Error> {
     let value = value.trim().to_ascii_lowercase();
     let (digits, mult) = match value.strip_suffix('k') {
@@ -315,7 +316,45 @@ fn parse_heapsize(value: &str) -> Result<u64, lexopt::Error> {
             "interact: --heapsize must be positive".into(),
         ));
     }
+    // `bytes > sys.maxint` is the upstream OverflowError. `sys.maxsize` is
+    // `i64::MAX` here on every target, and the child parses the count back out
+    // of its own command line, so a value it could not name is refused now.
+    if bytes > i64::MAX as u64 {
+        return Err(lexopt::Error::Custom(
+            format!("interact: --heapsize maximum is {}", i64::MAX).into(),
+        ));
+    }
     Ok(bytes)
+}
+
+/// `targetpypystandalone.py entry_point`: `--heapsize N`, in that position and
+/// no other, is an undocumented interp-level option that exists to support
+/// sandboxing — `pypy_interact.py` is what puts it there. Taking it out here
+/// leaves the argv `parse_args` reads, and the one `sys.orig_argv` records,
+/// equal to what `app_main.py` would have received: `entry_point` rewrites
+/// `argv` before app-level parsing ever sees it.
+fn take_heapsize_option(
+    binary_name: &str,
+    mut argv: Vec<std::ffi::OsString>,
+) -> (Vec<std::ffi::OsString>, Option<u64>) {
+    if argv.len() <= 2 || argv[1] != "--heapsize" {
+        return (argv, None);
+    }
+    // `int(argv[2])` — the controller has already resolved any suffix, so a
+    // value that is not a plain byte count came from somewhere that does not
+    // speak this protocol.  `sys.maxsize` bounds it on this side too: the
+    // controller refuses a larger count rather than write one here, and a
+    // value the limit cannot hold would otherwise be taken and then silently
+    // clamped.
+    let size = match argv[2].to_str().map(str::parse::<u64>) {
+        Some(Ok(size)) if size <= i64::MAX as u64 => size,
+        _ => {
+            eprintln!("{binary_name}: --heapsize: not a byte count");
+            std::process::exit(2);
+        }
+    };
+    argv.drain(1..3);
+    (argv, Some(size))
 }
 
 /// Parse the `interact` subcommand: `pyre interact [--tmp DIR] [--lib DIR]
@@ -329,6 +368,7 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
     let mut allow_net = false;
     let mut log_file = None;
     let mut verbose = false;
+    let mut heapsize = None;
     while let Some(arg) = parser.next()? {
         match arg {
             Long("tmp") => tmpdir = Some(parser.value()?.string()?),
@@ -347,10 +387,12 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
                 }
                 timeout = Some(secs);
             }
-            // pypy_interact.py:88: validated and accepted for CLI parity, but
-            // pyre has no runtime heap-limit knob, so the value is discarded.
+            // `pypy_interact.py main`: the controller does not limit its own
+            // heap. It resolves the suffix and carries the byte count into the
+            // sandboxed program's arguments, where `take_heapsize_option` acts
+            // on it.
             Long("heapsize") => {
-                parse_heapsize(&parser.value()?.string()?)?;
+                heapsize = Some(parse_heapsize(&parser.value()?.string()?)?);
             }
             // setlogfile (sandlib.py): append the guest's stdin to FILE.
             Long("log") => log_file = Some(parser.value()?.string()?),
@@ -365,10 +407,18 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
                 // program's: they are rendered into the child's command line
                 // as text, so one with no UTF-8 form is reported here rather
                 // than carried the way `sys.argv` carries it.
-                let args = drain_args(parser)?
+                let program_args = drain_args(parser)?
                     .into_iter()
                     .map(|arg| arg.into_string().map_err(lexopt::Error::NonUnicodeValue))
                     .collect::<Result<Vec<String>, _>>()?;
+                // `extraoptions + arguments[1:]`: the controller's own options
+                // lead the child's command line, ahead of the arguments meant
+                // for the program itself.
+                let mut args = match heapsize {
+                    Some(bytes) => vec!["--heapsize".to_string(), bytes.to_string()],
+                    None => Vec::new(),
+                };
+                args.extend(program_args);
                 return Ok(RunMode::Interact {
                     exe,
                     args,
@@ -647,10 +697,13 @@ fn real_main(binary_name: &str) {
         }
     }));
     // pypy/interpreter/app_main.py `entry_point`: preserve the executable and
-    // every original launcher argument before command-line parsing rewrites
-    // them into the run mode and `sys.argv`.
-    importing::set_sys_orig_argv(std::env::args_os().collect());
-    let (mode, flags, args) = match parse_args(binary_name) {
+    // every launcher argument reaching app level before command-line parsing
+    // rewrites them into the run mode and `sys.argv`. Only the interp-level
+    // option below is missing from that list, exactly as `sys.orig_argv[:] =
+    // [executable] + argv` records the list `entry_point` handed on.
+    let (argv, heapsize) = take_heapsize_option(binary_name, std::env::args_os().collect());
+    importing::set_sys_orig_argv(argv.clone());
+    let (mode, flags, args) = match parse_args(binary_name, argv) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
@@ -686,6 +739,16 @@ fn real_main(binary_name: &str) {
         // sys.settrace / set_jit_param routing is live from the very first
         // user statement, not only after the first JIT-traced bytecode.
         pyre_jit::eval::init_jit_hooks();
+        // `entry_point` sets the limit ahead of `space.startup()`; the earliest
+        // equivalent here is the line above, which is what builds the
+        // collector. Nothing has allocated yet either way, so the thresholds
+        // `set_max_heap_size` pulls down are still their startup values.
+        // Reaching the GC from the launcher is an entry from outside pyre and
+        // takes the GIL as one.
+        if let Some(size) = heapsize {
+            let _entry = majit_gc::gc_sync::enter_external_callback();
+            majit_gc::gc_set_max_heap_size(usize::try_from(size).unwrap_or(usize::MAX));
+        }
     }
 
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
@@ -2072,7 +2135,10 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedent_command, parse_heapsize, set_last_exec_ctx, setup_exec_context};
+    use super::{
+        RunMode, dedent_command, parse_heapsize, parse_interact, set_last_exec_ctx,
+        setup_exec_context, take_heapsize_option,
+    };
 
     #[test]
     fn command_dedent_removes_shared_space_prefix() {
@@ -2182,6 +2248,72 @@ mod tests {
         assert!(parse_heapsize("0").is_err());
         assert!(parse_heapsize("abc").is_err());
         assert!(parse_heapsize("").is_err());
+        // `bytes > sys.maxint` is refused rather than handed on.
+        assert_eq!(
+            parse_heapsize("9223372036854775807").unwrap(),
+            i64::MAX as u64
+        );
+        assert!(parse_heapsize("9223372036854775808").is_err());
+        // 2**33 gibibytes is 2**63 — one past the maximum, and reached through
+        // a multiplier rather than by naming the count.
+        assert!(parse_heapsize("8589934592g").is_err());
+    }
+
+    #[test]
+    fn interact_carries_heapsize_into_the_child_argv() {
+        // `extraoptions[:0] = ['--heapsize', str(bytes)]` then
+        // `extraoptions + arguments[1:]`: the suffix is resolved by the
+        // controller, and the child is handed the byte count in front of its
+        // own arguments.
+        let mode = parse_interact(&mut lexopt::Parser::from_args([
+            "--heapsize",
+            "64k",
+            "./pyre-sandbox",
+            "prog.py",
+            "--flag",
+        ]))
+        .unwrap();
+        let RunMode::Interact { exe, args, .. } = mode else {
+            panic!("expected an interact mode");
+        };
+        assert_eq!(exe, "./pyre-sandbox");
+        assert_eq!(args, ["--heapsize", "65536", "prog.py", "--flag"]);
+
+        // Without the option the child's arguments are its own alone.
+        let mode = parse_interact(&mut lexopt::Parser::from_args([
+            "./pyre-sandbox",
+            "prog.py",
+        ]))
+        .unwrap();
+        let RunMode::Interact { args, .. } = mode else {
+            panic!("expected an interact mode");
+        };
+        assert_eq!(args, ["prog.py"]);
+    }
+
+    #[test]
+    fn the_leading_heapsize_option_is_taken_out_of_argv() {
+        // `if len(argv) > 2 and argv[1] == '--heapsize': ... argv = argv[:1] +
+        // argv[3:]`.
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", "65536", "prog.py"]));
+        assert_eq!(size, Some(65536));
+        assert_eq!(rest, argv(&["pyre", "prog.py"]));
+
+        // The position is the whole test: anywhere else it is an ordinary
+        // argument, and `parse_args` reports it as one.
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "prog.py", "--heapsize", "65536"]));
+        assert_eq!(size, None);
+        assert_eq!(rest, argv(&["pyre", "prog.py", "--heapsize", "65536"]));
+
+        // `len(argv) > 2` — a trailing `--heapsize` has no value to read.
+        let (rest, size) = take_heapsize_option("pyre", argv(&["pyre", "--heapsize"]));
+        assert_eq!(size, None);
+        assert_eq!(rest, argv(&["pyre", "--heapsize"]));
     }
 
     #[test]

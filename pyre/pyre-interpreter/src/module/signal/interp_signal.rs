@@ -441,14 +441,31 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
     // interp_signal.py:205 — re-install for OSes that clear the handler
     // (no-op on SA_RESTART platforms).
     signalstate::pypysig_reinstall(n);
-    // interp_signal.py:207-209 — call the handler with (signum, frame).
-    // pyre does not wrap the executing frame as a Python object, so the
-    // second argument is None (a valid value per the language spec when
-    // the frame is unavailable).
-    let _ = ec;
+    // interp_signal.py `report_signal`:
+    //     w_frame = ec.gettopframe_nohidden()
+    //     space.call_function(w_handler, space.newint(n), w_frame)
+    let frame = ec.gettopframe_nohidden();
+    let w_frame = if frame.is_null() {
+        pyre_object::w_none()
+    } else {
+        // The handler is app code and reads the frame it is handed, so the
+        // JIT's virtualizable fields owe it a writeback first, and the frame
+        // stops being private to its own execution.  `sys._getframe` marks and
+        // forces in this order for the same reason, and the force can collect.
+        unsafe { (*frame).mark_as_escaped() };
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::executioncontext::force_frame(frame);
+        anchor.live() as PyObjectRef
+    };
+    // `newint` allocates and the handler runs Python, so the frame is rooted
+    // across both and read back out of its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_slot = pyre_object::gc_roots::pin_roots(&[w_frame]);
     let w_n = pyre_object::w_int_new(n as i64);
-    let w_frame = pyre_object::w_none();
-    let res = crate::baseobjspace::call_function(w_handler, &[w_n, w_frame]);
+    let res = crate::baseobjspace::call_function(
+        w_handler,
+        &[w_n, pyre_object::gc_roots::shadow_stack_get(frame_slot)],
+    );
     if res.is_null()
         && let Some(err) = crate::call::take_call_error() {
             return Err(err);

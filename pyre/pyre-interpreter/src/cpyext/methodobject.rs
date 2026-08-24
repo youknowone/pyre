@@ -51,8 +51,9 @@ const CLASS_KEY: &str = "__pyre_mm_class__";
 /// Everything the carrier knows lives in its instance namespace, which is a
 /// mapping like any other; a store into one of these would retarget the
 /// receiver a C callable casts to its own struct, or name a different
-/// `PyMethodDef` row for it to call.  `__module__` is left writable, which is
-/// the one the reference type allows as well.
+/// `PyMethodDef` row for it to call.  `__module__` is the exception, and only
+/// on a function carrier -- `store_attribute` reads the receiver, not the name
+/// alone, because a descriptor has no attribute of that name to write.
 /// The `tp_methods` / `tp_getset` / `tp_members` descriptor carriers in
 /// `typeobject` share this fence and these keys; `__pyre_def__` there holds a
 /// definition's address outright, so a store into it is the same hole in a
@@ -129,25 +130,27 @@ fn store_attribute(
         return Err(crate::PyError::type_error("attribute name must be string"));
     }
     let attribute = unsafe { pyre_object::w_str_get_wtf8(name) }.to_string();
-    if attribute != MODULE_KEY {
+    // `__module__` is the one writable slot, and only on a function carrier:
+    // `meth_members` gives `builtin_function_or_method` a settable member of
+    // that name, while a descriptor carries no such attribute at all.
+    if !(attribute == MODULE_KEY && is_carrier(carrier)) {
         let type_name = unsafe { pyre_object::w_type_get_name((*carrier).w_class) };
         let message = if RESERVED_KEYS.contains(&attribute.as_str()) {
             format!("attribute '{attribute}' of '{type_name}' objects is not writable")
         } else {
-            format!("'{type_name}' object has no attribute '{attribute}'")
+            format!(
+                "'{type_name}' object has no attribute '{attribute}' \
+                 and no __dict__ for setting new attributes"
+            )
         };
         return Err(crate::PyError::attribute_error(message));
     }
     let dict = crate::baseobjspace::getdict_native(carrier);
     if !dict.is_null() {
-        match value {
-            Some(value) => unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(dict, MODULE_KEY, value)
-            },
-            None => {
-                unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(dict, MODULE_KEY) };
-            }
-        }
+        // A deleted member slot reads back as `None` rather than going away,
+        // so the delete spelling stores that and stays repeatable.
+        let value = value.unwrap_or_else(pyre_object::w_none);
+        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str(dict, MODULE_KEY, value) };
     }
     Ok(pyre_object::w_none())
 }
@@ -168,8 +171,8 @@ fn descr_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     store_attribute(args[0], args[1], None)
 }
 
-/// Install the stores every carrier type refuses, so nothing but
-/// `__module__` can be written into its namespace from Python.
+/// Install the stores every carrier type refuses, so only a function
+/// carrier's `__module__` can be written into a namespace from Python.
 pub(super) fn install_attribute_fence(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -295,6 +298,118 @@ pub unsafe extern "C" fn PyCFunction_GetSelf(object: *mut CPyObject) -> *mut CPy
     }
 }
 
+/// `PyMethodDescr_Check(op)` — a descriptor built from a `PyMethodDef` row.
+///
+/// # Safety
+/// `object` must be null or a live reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null()
+        && unsafe {
+            crate::baseobjspace::issubtype_w(
+                (*object).w_class,
+                super::typeobject::method_descriptor_type(),
+            )
+        }) as c_int
+}
+
+/// `PyMethodDescr_CheckExact(op)`.
+///
+/// # Safety
+/// `object` must be null or a live reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMethodDescr_CheckExact(object: *mut CPyObject) -> c_int {
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null()
+        && unsafe { (*object).w_class } == super::typeobject::method_descriptor_type()) as c_int
+}
+
+/// `methodobject.py PyDescr_NewMethod(type, method)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDescr_NewMethod(
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+) -> *mut CPyObject {
+    unsafe {
+        descriptor_over(
+            super::typeobject::method_descriptor_type(),
+            tp,
+            method,
+            "PyDescr_NewMethod",
+        )
+    }
+}
+
+/// `methodobject.py PyDescr_NewClassMethod(type, method)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDescr_NewClassMethod(
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+) -> *mut CPyObject {
+    unsafe {
+        descriptor_over(
+            super::typeobject::classmethod_descriptor_type(),
+            tp,
+            method,
+            "PyDescr_NewClassMethod",
+        )
+    }
+}
+
+/// The descriptor `carrier_type` makes of `method` declared in `tp`, which is
+/// everything the two entry points above share.
+///
+/// # Safety
+/// `tp` must be null or a live type mirror, and `method` null or a live row.
+unsafe fn descriptor_over(
+    carrier_type: PyObjectRef,
+    tp: *mut super::typeobject::CPyTypeObject,
+    method: *mut CPyMethodDef,
+    entry_point: &str,
+) -> *mut CPyObject {
+    let w_type = unsafe { pyobject::from_ref(tp as *mut CPyObject) };
+    if method.is_null() || w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("bad argument to {entry_point}"),
+        ));
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(super::typeobject::new_method_descriptor(
+        carrier_type,
+        w_type,
+        method,
+    ))
+}
+
+/// `methodobject.py PyClassMethod_New(f)` — `classmethod(f)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyClassMethod_New(function: *mut CPyObject) -> *mut CPyObject {
+    unsafe { wrapped_in(function, &pyre_object::function::CLASSMETHOD_TYPE) }
+}
+
+/// `methodobject.py PyStaticMethod_New(f)` — `staticmethod(f)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyStaticMethod_New(function: *mut CPyObject) -> *mut CPyObject {
+    unsafe { wrapped_in(function, &pyre_object::function::STATICMETHOD_TYPE) }
+}
+
+/// `wrapper(function)` — the two above differ only in which class wraps.
+///
+/// # Safety
+/// `function` must be null or a live reference.
+unsafe fn wrapped_in(
+    function: *mut CPyObject,
+    wrapper: &'static pyre_object::pyobject::PyType,
+) -> *mut CPyObject {
+    let Some(function) = super::object::argument(function) else {
+        return std::ptr::null_mut();
+    };
+    let wrapper = crate::typedef::gettypeobject(wrapper);
+    super::object::result(crate::call::call_function_impl_result(wrapper, &[function]))
+}
+
 /// `PyCFunction_New(ml, self)` — the callable a `PyMethodDef` row describes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCFunction_New(
@@ -332,21 +447,6 @@ pub unsafe extern "C" fn PyCMethod_New(
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    let flags = unsafe { (*method).ml_flags };
-    let message = match (flags & METH_METHOD != 0, class.is_null()) {
-        (true, true) => Some("attempting to create PyCMethod with a METH_METHOD flag but no class"),
-        (false, false) => {
-            Some("attempting to create PyCFunction with class but no METH_METHOD flag")
-        }
-        _ => None,
-    };
-    if let Some(message) = message {
-        super::pyerrors::set_pending_error(crate::PyError::new(
-            crate::PyErrorKind::SystemError,
-            message,
-        ));
-        return std::ptr::null_mut();
-    }
     let class = class as *mut CPyObject;
     super::object::realize_all([receiver, module, class]);
     let receiver = unsafe { pyobject::from_ref(receiver) };
@@ -381,12 +481,21 @@ pub unsafe extern "C" fn PyCMethod_GetClass(
         return std::ptr::null_mut();
     }
     let carrier = unsafe { pyobject::from_ref(object) };
-    match carrier_get(carrier, CLASS_KEY) {
+    match carrier_class(carrier) {
         Some(class) => {
             pyobject::borrow_from(object, class) as *mut super::typeobject::CPyTypeObject
         }
         None => std::ptr::null_mut(),
     }
+}
+
+/// The class a `METH_METHOD` carrier was built with.
+///
+/// Whatever answers the key is cast to a `PyTypeObject *` and handed to the C
+/// function, so a value that is not a type is not one of ours.
+fn carrier_class(carrier: PyObjectRef) -> Option<PyObjectRef> {
+    carrier_get(carrier, CLASS_KEY)
+        .filter(|&class| !class.is_null() && unsafe { pyre_object::is_type(class) })
 }
 
 fn carrier_get(carrier: PyObjectRef, key: &str) -> Option<PyObjectRef> {
@@ -441,6 +550,27 @@ pub fn new_pycfunction_in_class(
     w_module: PyObjectRef,
     w_class: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // The flag and the class have to agree, and every carrier is built here:
+    // a module table reaches this with no class, which is what makes a
+    // `METH_METHOD` row in one an error at module creation.
+    let message = match (
+        unsafe { (*method).ml_flags } & METH_METHOD != 0,
+        w_class.is_some(),
+    ) {
+        (true, false) => {
+            Some("attempting to create PyCMethod with a METH_METHOD flag but no class")
+        }
+        (false, true) => {
+            Some("attempting to create PyCFunction with class but no METH_METHOD flag")
+        }
+        _ => None,
+    };
+    if let Some(message) = message {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            message,
+        ));
+    }
     let roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_self);
@@ -505,6 +635,151 @@ pub fn new_pycfunction_in_class(
     Ok(pyre_object::gc_roots::shadow_stack_get(carrier_slot))
 }
 
+/// C-visible `PyCFunctionObject`, the twin of the struct in
+/// `include/pyre3.14t/methodobject.h`.
+///
+/// cffi reads `m_ml` and `m_module` off the block rather than through an entry
+/// point (`lib_obj.c _cpyextfunc_get`), and the module read is an identity
+/// test against the reference the caller passed to `PyCFunction_NewEx`.
+#[repr(C)]
+pub struct CPyCFunctionObject {
+    pub ob_base: CPyObject,
+    pub m_ml: *mut CPyMethodDef,
+    pub m_self: *mut CPyObject,
+    pub m_module: *mut CPyObject,
+    pub m_weakreflist: *mut CPyObject,
+    pub vectorcall: *mut c_void,
+}
+
+/// C-visible `PyCMethodObject` — a `METH_METHOD` carrier, which holds the
+/// defining class past everything the function carrier holds.
+#[repr(C)]
+pub struct CPyCMethodObject {
+    pub func: CPyCFunctionObject,
+    pub mm_class: *mut super::typeobject::CPyTypeObject,
+}
+
+/// The layouts are written out twice -- here and in the header -- so a field
+/// added to one without the other stops compiling rather than writing
+/// somewhere unclaimed.
+const _: () = {
+    assert!(std::mem::offset_of!(CPyCFunctionObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_ml) == 24);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_self) == 32);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_module) == 40);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_weakreflist) == 48);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, vectorcall) == 56);
+    assert!(std::mem::offset_of!(CPyCMethodObject, mm_class) == 64);
+};
+
+/// A carrier type that has been built, and null before it has.
+///
+/// [`pycfunction_type`] mints its type on first call, and this runs from
+/// inside the mint of some other type's mirror; a type that does not exist yet
+/// has no instances, so the answer for one is the same either way.
+fn built_carrier_type(cell: &OnceLock<usize>) -> PyObjectRef {
+    cell.get().copied().unwrap_or(0) as PyObjectRef
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries --
+/// `methodobject.py basestruct=PyCFunctionObject.TO` for a function carrier
+/// and `PyCMethodObject.TO` for a `METH_METHOD` one, and 0 for every other
+/// type, which asks for the plain header.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    if w_type.is_null() {
+        return 0;
+    }
+    let derived_from = |carrier: PyObjectRef| {
+        !carrier.is_null() && unsafe { crate::baseobjspace::issubtype_w(w_type, carrier) }
+    };
+    if derived_from(built_carrier_type(&PYCMETHOD_TYPE_OBJ)) {
+        return size_of::<CPyCMethodObject>() as isize;
+    }
+    match derived_from(built_carrier_type(&PYCFUNCTION_TYPE_OBJ)) {
+        true => size_of::<CPyCFunctionObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill a freshly allocated mirror -- `methodobject.py cfunction_attach`, and
+/// `cmethod_attach` for the one field past it.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    // `is_carrier` would mint the carrier type, and minting allocates: this
+    // runs inside another mirror's fill, whose caller is holding raw reads of
+    // objects a collection would move.
+    let carrier = built_carrier_type(&PYCFUNCTION_TYPE_OBJ);
+    if w_obj.is_null()
+        || carrier.is_null()
+        || !unsafe { crate::baseobjspace::issubtype_w((*w_obj).w_class, carrier) }
+    {
+        return;
+    }
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null() || unsafe { (*tp).tp_basicsize } < size_of::<CPyCFunctionObject>() as isize {
+        return;
+    }
+    // Every value is read out of the namespace before the first `make_ref`,
+    // which allocates and may move the rest.
+    let ml = method_def(w_obj).unwrap_or(std::ptr::null_mut());
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_get(w_obj, SELF_KEY).unwrap_or_else(pyre_object::w_none));
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_get(w_obj, MODULE_KEY).unwrap_or_else(pyre_object::w_none));
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(carrier_class(w_obj).unwrap_or(pyre_object::PY_NULL));
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    let m_self = pyobject::make_ref(reload(self_slot));
+    let m_module = pyobject::make_ref(reload(module_slot));
+    let block = raw as *mut CPyCFunctionObject;
+    unsafe {
+        (*block).m_ml = ml;
+        (*block).m_self = m_self;
+        (*block).m_module = m_module;
+    }
+    if unsafe { (*tp).tp_basicsize } < size_of::<CPyCMethodObject>() as isize {
+        return;
+    }
+    let mm_class = pyobject::make_ref(reload(class_slot)) as *mut super::typeobject::CPyTypeObject;
+    unsafe { (*(raw as *mut CPyCMethodObject)).mm_class = mm_class };
+}
+
+/// Release the references a carrier mirror owns -- `methodobject.py
+/// cfunction_dealloc` and `cmethod_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    if raw.is_null() {
+        return;
+    }
+    let tp = unsafe { (*raw).ob_type } as usize;
+    // `as_pyobj` rather than a realizing read: this runs while a mirror is
+    // being deallocated, where nothing may build an interpreter object.  The
+    // type decides it rather than the size, as it does for a slice mirror: a
+    // C-defined type whose own storage reaches this far fills and frees these
+    // words itself.
+    let carrier = |cell| pyobject::as_pyobj(built_carrier_type(cell)) as usize;
+    let function = carrier(&PYCFUNCTION_TYPE_OBJ);
+    let method = carrier(&PYCMETHOD_TYPE_OBJ);
+    if tp == 0 || (tp != function && tp != method) {
+        return;
+    }
+    let block = raw as *mut CPyCFunctionObject;
+    unsafe {
+        pyobject::decref((*block).m_self);
+        pyobject::decref((*block).m_module);
+        (*block).m_self = std::ptr::null_mut();
+        (*block).m_module = std::ptr::null_mut();
+        (*block).m_ml = std::ptr::null_mut();
+    }
+    if tp != method {
+        return;
+    }
+    let block = raw as *mut CPyCMethodObject;
+    unsafe {
+        pyobject::decref((*block).mm_class as *mut CPyObject);
+        (*block).mm_class = std::ptr::null_mut();
+    }
+}
+
 fn method_def(carrier: PyObjectRef) -> Option<*mut CPyMethodDef> {
     let ml = carrier_get(carrier, ML_KEY)?;
     if !unsafe { pyre_object::is_int(ml) } {
@@ -547,30 +822,14 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "cpyext function carrier lost its receiver",
         ));
     };
-    call_method_def_in_class(
-        method,
-        w_self,
-        carrier_get(carrier, CLASS_KEY),
-        positional,
-        kwargs,
-    )
+    call_method_def_in_class(method, w_self, carrier_class(carrier), positional, kwargs)
 }
 
-/// Validate one call against its `ml_flags` and hand it to the bridge.
+/// Validate one call against its `ml_flags` and hand it to the bridge, naming
+/// the class a `METH_METHOD` row is handed beside its receiver.
 ///
 /// Shared with the `tp_methods` descriptor, whose receiver is the instance the
 /// attribute was read through rather than a bound `__self__`.
-pub(super) fn call_method_def(
-    method: *mut CPyMethodDef,
-    w_self: PyObjectRef,
-    positional: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    call_method_def_in_class(method, w_self, None, positional, kwargs)
-}
-
-/// [`call_method_def`] naming the class the definition was declared in, which
-/// a `METH_METHOD` row is handed beside its receiver.
 pub(super) fn call_method_def_in_class(
     method: *mut CPyMethodDef,
     w_self: PyObjectRef,
@@ -647,4 +906,11 @@ pub(super) fn call_method_def_in_class(
     )
 }
 
-pub(super) fn ensure_linked() {}
+pub(super) fn ensure_linked() {
+    std::hint::black_box(PyMethodDescr_Check as *const ());
+    std::hint::black_box(PyMethodDescr_CheckExact as *const ());
+    std::hint::black_box(PyDescr_NewMethod as *const ());
+    std::hint::black_box(PyDescr_NewClassMethod as *const ());
+    std::hint::black_box(PyClassMethod_New as *const ());
+    std::hint::black_box(PyStaticMethod_New as *const ());
+}

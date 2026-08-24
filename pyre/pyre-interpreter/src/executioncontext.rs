@@ -306,6 +306,24 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
     }
 }
 
+/// `rgc.may_ignore_finalizer` — "Optimization hint: says that it is valid for
+/// any finalizer for 'obj' to be ignored, depending on the GC."  The object
+/// stays on the queue it was registered with; what changes is that the queue
+/// passes over it when the collector comes to deliver.
+///
+/// Only ever a hint, so a build with no collector behind it drops the call and
+/// the finalizer runs — the same answer a collector without the flag gives.
+///
+/// `W_Root.may_unregister_rpython_finalizer` — the same hint behind a
+/// `hasuserdel` guard — has no pyre caller: every module that reaches it
+/// upstream (`_socket`, `zlib`, `select.epoll`/`kqueue`, `_cffi_backend`)
+/// registers no finalizer here, so there is nothing for it to withhold.  `_io`
+/// wants the other guard and carries its own
+/// (`_io::maybe_unregister_rpython_finalizer_io`).
+pub fn may_ignore_finalizer(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_ignore_finalizer(obj);
+}
+
 /// Shared execution context for all frames in one interpreter run.
 ///
 /// Holds the builtin module dict used by module-level frames.

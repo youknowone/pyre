@@ -8843,7 +8843,23 @@ pub fn make_field_descr(
     field_type: Type,
     flag: ArrayFlag,
 ) -> DescrRef {
-    Arc::new(SimpleFieldDescr::new(0, offset, field_size, field_type, false).with_flag(flag))
+    make_field_descr_with_immutability(offset, field_size, field_type, flag, false)
+}
+
+/// [`make_field_descr`] for a caller that knows the field's
+/// `_immutable_fields_` declaration.
+///
+/// Discarding it is not free: `is_always_pure` is what licenses the
+/// constant fold of a read off a constant struct, so a descr that arrives
+/// here immutable and leaves mutable silently costs that fold.
+pub fn make_field_descr_with_immutability(
+    offset: usize,
+    field_size: usize,
+    field_type: Type,
+    flag: ArrayFlag,
+    is_immutable: bool,
+) -> DescrRef {
+    Arc::new(SimpleFieldDescr::new(0, offset, field_size, field_type, is_immutable).with_flag(flag))
 }
 
 /// Create a field descriptor whose `parent_descr` back-references an existing

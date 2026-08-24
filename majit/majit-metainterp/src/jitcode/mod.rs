@@ -884,8 +884,8 @@ mod tests {
             c_num_regs_f: 1,
             constants_i: vec![100, 200, 300],
             constants_r: vec![
-                0xAABB_CCDD_EEFF_0011_u64 as i64,
-                0x2233_4455_6677_8899_u64 as i64,
+                (0xAABB_CCDD_EEFF_0011_u64 as i64).into(),
+                (0x2233_4455_6677_8899_u64 as i64).into(),
             ],
             constants_f: vec![f64::to_bits(1.25_f64) as i64],
             ..Default::default()

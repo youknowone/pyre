@@ -485,7 +485,8 @@ impl MIFrame {
             self.int_values[slot] = Some(value);
         }
         let num_regs_r = self.jitcode.c_num_regs_r as usize;
-        for (i, &value) in self.jitcode.constants_r.iter().enumerate() {
+        for (i, slot) in self.jitcode.constants_r.iter().enumerate() {
+            let value = slot.get();
             let slot = num_regs_r + i;
             self.ref_regs[slot] = Some(ctx.const_ref(value));
             self.ref_values[slot] = Some(value);
@@ -796,7 +797,7 @@ impl MIFrame {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
                     // addresses; we cast through u64 for `Box::ConstPtr`.
-                    OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r] as u64)
+                    OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r].get() as u64)
                 };
                 trace._add_box_to_storage_box(b);
             }
@@ -1000,7 +1001,10 @@ impl MIFrame {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
-                    SnapshotTagged::Const(self.jitcode.constants_r[idx - num_regs_r], Type::Ref)
+                    SnapshotTagged::Const(
+                        self.jitcode.constants_r[idx - num_regs_r].get(),
+                        Type::Ref,
+                    )
                 };
                 boxes.push(tagged);
             }
@@ -1701,7 +1705,7 @@ mod tests {
         {
             let jc = Arc::get_mut(&mut jitcode).expect("fresh Arc");
             jc.body_mut().constants_i = vec![123];
-            jc.body_mut().constants_r = vec![0x1234];
+            jc.body_mut().constants_r = vec![0x1234.into()];
             jc.body_mut().constants_f = vec![1.5f64.to_bits() as i64];
         }
         let sd = Arc::new(crate::MetaInterpStaticData::new());

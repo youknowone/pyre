@@ -17,6 +17,8 @@ use cpyext_fixture::Fixtures;
 
 const SCRIPT: &str = r#"
 import sys
+import types
+
 import cpyext_runtime as m
 
 
@@ -147,6 +149,26 @@ eq('attr imports', (value.__name__, error), ('dumps', None))
 eq('attr object', m.module_attr_object('sys', 'maxsize'), (sys.maxsize, None))
 eq('attr object bad name', m.module_attr_object(5, 'maxsize'),
    (None, ('TypeError', 'module name must be a string')))
+
+# ── a name written into a module's namespace ────────────────────────
+
+victim = types.ModuleType('victim')
+eq('add', m.add_object_ref(victim, 'x', 42), (0, None))
+eq('add stored', victim.x, 42)
+eq('add not a module', m.add_object_ref(42, 'x', 1),
+   (-1, ('TypeError',
+         'PyModule_AddObjectRef() first argument must be a module')))
+
+# The NULL spelling is how a caller reports that the value could not be built,
+# and the exception saying why is the caller's own.  The message below is what
+# stands in for one that was never raised.
+eq('add null', m.add_object_ref_null(victim, 'y', 0),
+   (-1, ('SystemError',
+         'PyModule_AddObjectRef() must be called with an exception raised '
+         'if value is NULL')))
+eq('add null keeps the reason', m.add_object_ref_null(victim, 'y', 1),
+   (-1, ('KeyError', '"the caller\'s own reason"')))
+assert not hasattr(victim, 'y'), victim.y
 
 print('cpyext-runtime-ok')
 "#;

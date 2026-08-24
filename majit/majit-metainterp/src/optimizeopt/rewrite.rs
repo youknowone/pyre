@@ -126,28 +126,32 @@ enum RangeBound {
 /// - Guard-no-exception removal after removed calls
 /// - Range-test fusion (two constant-bounded comparisons multiplied together)
 pub struct OptRewrite {
-    /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, populated by
-    /// optimize_comparison. Upstream has no bool_result_cache; find_rewritable_bool
-    /// / try_boolinvers (rewrite.py) build a synthetic ResOperation and look
-    /// it up via get_pure_result against the shared _pure_operations table.
-    /// Convergence: retire this cache and route the bool lookups through the pure
-    /// optimizer's get_pure_result / pure_from_args2 (both already present at
-    /// `pure.rs`) keyed off the pure-op table — coupled to the pure-optimizer
-    /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
-    /// would entrench a structure upstream does not have.
-    bool_result_cache: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
-    /// Result OpRef → the comparison that produced it, the reverse of
-    /// `bool_result_cache` and populated from the same arm.
+    /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, the sole
+    /// record of the comparisons this pass has seen. Operands are normalized
+    /// through forwarding before they are keyed on, as `OptPure.pure_from_args2`
+    /// (`pure.py`) does, so a probe and a store describe the same value the
+    /// same way.
     ///
-    /// A fold that reaches back from a consumer to its comparison operands
-    /// cannot use `get_producing_op`: that reports a producer only once it is
-    /// in `emitted_operations`, and `OptHeap` — last in the pipeline — holds
-    /// the most recent comparison in `postponed_op` instead of emitting it.
-    /// The comparison immediately preceding a consumer is therefore invisible
-    /// there, which is the common case rather than a corner one. This map is
-    /// written as the comparison passes through this pass, so nothing
-    /// downstream can hide it.
-    comparison_by_result: indexmap::IndexMap<OpRef, (OpCode, Operand, Operand)>,
+    /// Upstream has no such map: `find_rewritable_bool` / `try_boolinvers`
+    /// (`rewrite.py`) build a synthetic `ResOperation` and look the result up
+    /// with `get_pure_result` against the shared `_pure_operations` table.
+    /// Convergence: retire this cache and route the bool lookups through the
+    /// pure optimizer's `get_pure_result` / `pure_from_args2` (both already
+    /// present at `pure.rs`) keyed off the pure-op table — coupled to the
+    /// pure-optimizer subsystem.
+    ///
+    /// A repeated comparison overwrites its key, which is why the reverse
+    /// question gets its own map below rather than a backwards scan of this
+    /// one.
+    comparison_results: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
+    /// The same records keyed by the result, for `comparison_producing`.
+    ///
+    /// Results are unique per operation, so every comparison that passes
+    /// through keeps an entry here even when a later duplicate takes over its
+    /// forward key. A consumer asks under the result CSE left live, which is
+    /// the *earlier* of a duplicate pair — the one the forward map no longer
+    /// names.
+    comparison_by_result: indexmap::IndexMap<OpRef, (OpCode, OpRef, OpRef)>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
@@ -160,7 +164,7 @@ pub struct OptRewrite {
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: indexmap::IndexMap::new(),
+            comparison_results: indexmap::IndexMap::new(),
             comparison_by_result: indexmap::IndexMap::new(),
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
@@ -690,44 +694,36 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Constant fold int_between(a, b, c) => a <= b < c.
-    fn optimize_int_between(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-        let arg2 = op.arg(2);
-
-        if let (Some(a), Some(b), Some(c)) = (
-            ctx.resolve_operand_operand_opt(&arg0)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_operand_operand_opt(&arg1)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-            ctx.resolve_operand_operand_opt(&arg2)
-                .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            let result = (a <= b && b < c) as i64;
-            let b = ctx.materialize_operand_at(op.pos.get());
-            ctx.make_constant_box(&b, Value::Int(result));
-            return OptimizationResult::Remove;
-        }
-
-        OptimizationResult::PassOn
-    }
-
     // ── Comparisons ──
 
     /// Comparison folds (constant folds, knownbits eq/ne, eq_zero /
     /// eq_one / eq_sub_eq) live in OptIntBounds, as upstream. This arm
     /// only records the comparison result for `find_rewritable_bool`
     /// (inverse/reflex lookup).
-    fn optimize_comparison(&mut self, op: &Op) -> OptimizationResult {
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
-        self.bool_result_cache
-            .insert((op.opcode, arg0.to_opref(), arg1.to_opref()), op.pos.get());
+    fn optimize_comparison(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+        let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
+        self.comparison_results
+            .insert((op.opcode, arg0, arg1), op.pos.get());
         self.comparison_by_result
             .insert(op.pos.get(), (op.opcode, arg0, arg1));
 
         OptimizationResult::PassOn
+    }
+
+    /// The comparison whose result is `result`.
+    ///
+    /// A fold that reaches back from a consumer to its comparison operands
+    /// cannot use `get_producing_op`: that reports a producer only once it is
+    /// in `emitted_operations`, and `OptHeap` — last in the pipeline — holds
+    /// the most recent comparison in `postponed_op` instead of emitting it.
+    /// The comparison immediately preceding a consumer is therefore invisible
+    /// there, which is the common case rather than a corner one. This map is
+    /// written as the comparison passes through this pass, so nothing
+    /// downstream can hide it.
+    ///
+    fn comparison_producing(&self, result: OpRef) -> Option<(OpCode, OpRef, OpRef)> {
+        self.comparison_by_result.get(&result).copied()
     }
 
     /// One side of a range test: the value compared, its bound, and whether
@@ -738,20 +734,20 @@ impl OptRewrite {
     /// not a range test side — constant folding owns it.
     fn range_bound_of(
         &self,
-        entry: &(OpCode, Operand, Operand),
+        entry: (OpCode, OpRef, OpRef),
         ctx: &mut OptContext,
-    ) -> Option<(RangeBound, Operand, i64)> {
-        let (opcode, ref arg0, ref arg1) = *entry;
+    ) -> Option<(RangeBound, OpRef, i64)> {
+        let (opcode, arg0, arg1) = entry;
         if opcode != OpCode::IntGe {
             return None;
         }
-        let const_of = |ctx: &mut OptContext, o: &Operand| {
-            ctx.resolve_operand_operand_opt(o)
+        let const_of = |ctx: &mut OptContext, o: OpRef| {
+            ctx.get_box_replacement_operand_opt(o)
                 .and_then(|b| ctx.get_constant_int_box(&b))
         };
         match (const_of(ctx, arg0), const_of(ctx, arg1)) {
-            (None, Some(lo)) => Some((RangeBound::Lower, arg0.clone(), lo)),
-            (Some(hi), None) => Some((RangeBound::Upper, arg1.clone(), hi)),
+            (None, Some(lo)) => Some((RangeBound::Lower, arg0, lo)),
+            (Some(hi), None) => Some((RangeBound::Upper, arg1, hi)),
             _ => None,
         }
     }
@@ -775,14 +771,14 @@ impl OptRewrite {
         let lhs = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let rhs = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
         let (Some(lhs_entry), Some(rhs_entry)) = (
-            self.comparison_by_result.get(&lhs).cloned(),
-            self.comparison_by_result.get(&rhs).cloned(),
+            self.comparison_producing(lhs),
+            self.comparison_producing(rhs),
         ) else {
             return OptimizationResult::PassOn;
         };
         let (Some(left), Some(right)) = (
-            self.range_bound_of(&lhs_entry, ctx),
-            self.range_bound_of(&rhs_entry, ctx),
+            self.range_bound_of(lhs_entry, ctx),
+            self.range_bound_of(rhs_entry, ctx),
         ) else {
             return OptimizationResult::PassOn;
         };
@@ -793,7 +789,7 @@ impl OptRewrite {
             | ((RangeBound::Upper, o, hi), (RangeBound::Lower, v, lo)) => ((v, lo), (o, hi)),
             _ => return OptimizationResult::PassOn,
         };
-        if var.to_opref() != other.to_opref() {
+        if var != other {
             return OptimizationResult::PassOn;
         }
         // An empty range is a constant-false predicate this fold does not
@@ -809,6 +805,7 @@ impl OptRewrite {
         // The value rides on the inline-Const OpRef tag, so a bound needs no
         // producing operation of its own.
         let lo_operand = ctx.materialize_operand_at(majit_ir::OpRef::const_int(lo));
+        let var = ctx.materialize_operand_at(var);
         // opimpl_int_between: `a <= b < a+1` is `b == a`.
         let mut fused = if span == 1 {
             Op::new(OpCode::IntEq, &[var, lo_operand])
@@ -1698,7 +1695,7 @@ impl OptRewrite {
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         let key = (inverse_opcode, arg0, arg1);
-        let cached_ref = self.bool_result_cache.get(&key).copied()?;
+        let cached_ref = self.comparison_results.get(&key).copied()?;
         // rewrite.py:60-65: b = self.getintbound(oldop)
         // First try direct constant (fast path)
         if let Some(val) = ctx
@@ -1743,21 +1740,23 @@ impl OptRewrite {
         if op.num_args() < 2 {
             return None;
         }
-        let arg0 = op.arg(0);
-        let arg1 = op.arg(1);
+        // Probe with the same normalization the recording arm stores under, so
+        // a value renamed by `make_equal_to` between the comparison and its
+        // consumer still finds its entry.
+        let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
+        let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
 
         // rewrite.py:72-75: boolinverse(arg0, arg1)
         if let Some(inverse_opcode) = op.opcode.bool_inverse()
-            && let Some(result) =
-                self.try_boolinvers(op, inverse_opcode, arg0.to_opref(), arg1.to_opref(), ctx)
+            && let Some(result) = self.try_boolinvers(op, inverse_opcode, arg0, arg1, ctx)
         {
             return Some(result);
         }
 
         // rewrite.py:77-83: boolreflex(arg1, arg0)
         if let Some(reflex_opcode) = op.opcode.bool_reflex() {
-            let key = (reflex_opcode, arg1.to_opref(), arg0.to_opref());
-            if let Some(&cached_ref) = self.bool_result_cache.get(&key) {
+            let key = (reflex_opcode, arg1, arg0);
+            if let Some(&cached_ref) = self.comparison_results.get(&key) {
                 let b_old = Operand::from_bound_op(op_rc);
                 let b_cached = ctx.get_box_replacement_operand(cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
@@ -1766,8 +1765,7 @@ impl OptRewrite {
 
             // rewrite.py:87-91: boolreflex.boolinverse(arg1, arg0)
             if let Some(reflex_inverse) = reflex_opcode.bool_inverse()
-                && let Some(result) =
-                    self.try_boolinvers(op, reflex_inverse, arg1.to_opref(), arg0.to_opref(), ctx)
+                && let Some(result) = self.try_boolinvers(op, reflex_inverse, arg1, arg0, ctx)
             {
                 return Some(result);
             }
@@ -1958,7 +1956,6 @@ impl Optimization for OptRewrite {
             OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
             OpCode::IntIsTrue => self.optimize_int_is_true(op, op_rc, ctx),
             OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, op_rc, ctx),
-            OpCode::IntBetween => self.optimize_int_between(op, ctx),
             OpCode::IntMul => self.optimize_int_mul_range_test(op, ctx),
 
             // ── Comparisons ──
@@ -1971,7 +1968,7 @@ impl Optimization for OptRewrite {
             | OpCode::UintLt
             | OpCode::UintLe
             | OpCode::UintGt
-            | OpCode::UintGe => self.optimize_comparison(op),
+            | OpCode::UintGe => self.optimize_comparison(op, ctx),
 
             // ── Guards ──
             OpCode::GuardTrue => self.optimize_guard_true(op, ctx),
@@ -2596,7 +2593,7 @@ impl Optimization for OptRewrite {
         // ctx.last_op_removed is initialised by OptContext::new() and
         // maintained cross-pass by propagate_from_pass_range +
         // emit_operation — no per-pass setup needed.
-        self.bool_result_cache.clear();
+        self.comparison_results.clear();
         self.comparison_by_result.clear();
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();
@@ -3082,6 +3079,44 @@ mod tests {
             2,
             "both bound comparisons must survive the fold"
         );
+    }
+
+    /// A guest that spells the same bound twice leaves two comparisons with
+    /// one forward key, and CSE forwards the multiply's operand to the first
+    /// result. The reverse lookup has to answer for that first result, which
+    /// is the one the forward key no longer names.
+    #[test]
+    fn a_repeated_bound_comparison_still_fuses_its_range_test() {
+        let specs = vec![
+            same_i(),                    // 0: v
+            same_i(),                    // 1: LO
+            same_i(),                    // 2: HI
+            bin_i(OpCode::IntGe, 0, 1),  // 3: v >= LO
+            bin_i(OpCode::IntGe, 2, 0),  // 4: HI >= v
+            bin_i(OpCode::IntGe, 0, 1),  // 5: v >= LO, again
+            bin_i(OpCode::IntMul, 5, 4), // 6: both, reading the repeat
+        ];
+        let constants = vec![
+            (OpRef::int_op(1), Value::Int(2025)),
+            (OpRef::int_op(2), Value::Int(5625)),
+        ];
+        let (ops, queued) = run_rewrite_after_inputs(&specs, 3, &constants);
+        let opcodes = opcodes_of(&ops);
+
+        assert!(
+            !opcodes.contains(&OpCode::IntMul),
+            "the repeat must not hide the range test, got {opcodes:?}"
+        );
+        let sub = queued
+            .iter()
+            .find(|op| op.opcode == OpCode::IntSub)
+            .unwrap_or_else(|| panic!("the offset subtraction must be queued, got {queued:?}"));
+        assert_eq!(sub.arg(1).const_int(), Some(2025), "offset is `v - LO`");
+        let cmp = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::UintLt)
+            .expect("the fused compare must be emitted");
+        assert_eq!(cmp.arg(1).const_int(), Some(3601));
     }
 
     /// opimpl_int_between collapses `a <= b < a+1` to `b == a`; a range whose

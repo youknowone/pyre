@@ -108,6 +108,12 @@ pub(crate) struct RawRefCount {
     /// deallocator the embedder still has to run.
     pub(crate) dealloc_pending: Vec<usize>,
     pub(crate) dealloc_trigger: Option<DeallocTriggerFn>,
+    /// [`FinalizerClaimFn`], and the blocks it has claimed: mirrors kept alive
+    /// for one collection so that the drain can run their finalizers.
+    pub(crate) finalizer_claim: Option<FinalizerClaimFn>,
+    /// A queue rather than a stack: `finalize_garbage` walks the condemned set
+    /// in the order it was collected in, and the drain owes the same order.
+    pub(crate) finalize_pending: std::collections::VecDeque<usize>,
     /// [`CEdgeCensusFn`], and this collection's answer from it.
     pub(crate) c_edge_census: Option<CEdgeCensusFn>,
     pub(crate) c_edges: Vec<(usize, Vec<usize>)>,
@@ -118,6 +124,26 @@ pub(crate) struct RawRefCount {
     /// blocks that only the embedder can now break apart.
     pub(crate) c_garbage: bool,
 }
+
+/// Claims the finalizer of a block whose linked object has just been found
+/// dead, answering whether there was one left to run.
+///
+/// `gcmodule.c finalize_garbage`: a collected type's finalizer runs once, and
+/// it runs while the object is still whole -- it is handed `self`, and an
+/// extension passes that straight back to the interpreter (`ffi.gc` calls its
+/// destructor with the object it was given).  The collector has no way to run
+/// it here, so what this does is claim it: the embedder records that this
+/// block's finalizer is spoken for, the collector keeps the object alive for
+/// this collection and queues the block, and the drain runs the finalizer
+/// afterwards.  The object dies in the next collection, by which time the
+/// finalizer has released whatever it held.
+///
+/// Answering `false` is what makes it a one-time retention: the second
+/// collection to find the object dead gets no claim and frees the block.
+///
+/// Runs with the collector borrowed, so it may not touch the interpreter heap.
+/// Only the block's own type and the embedder's side tables are read.
+pub type FinalizerClaimFn = fn(usize) -> bool;
 
 /// Answers with every block whose references the embedder can enumerate, and
 /// what each one references.

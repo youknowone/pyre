@@ -2272,6 +2272,40 @@ mod tests {
         assert_eq!(ovf_count, 0, "OVF(3,4) should be constant-folded");
     }
 
+    /// The all-constant pair that actually overflows. `constant_fold` panics
+    /// on `Err(NoConstExecutor)` — upstream's `NotImplementedError` — and the
+    /// `all_args_const` pre-check above the call does not filter this case, so
+    /// the executor must answer `Ok(None)` here and not fall through to
+    /// `Err`. The op and its guard then stay, and the runtime guard fires.
+    #[test]
+    fn test_ovf_constant_fold_declines_on_real_overflow() {
+        let result = run_pure(
+            0,
+            &[
+                op_spec(
+                    OpCode::IntAddOvf,
+                    &[Arg::Const(Value::Int(i64::MAX)), Arg::Const(Value::Int(1))],
+                ),
+                op_spec(OpCode::GuardNoOverflow, &[]),
+                op_spec(OpCode::Finish, &[]),
+            ],
+            &mut majit_ir::ConstMap::new(),
+            &[],
+            true,
+        );
+
+        let opcodes: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        let ovf_at = opcodes
+            .iter()
+            .position(|opcode| *opcode == OpCode::IntAddOvf)
+            .unwrap_or_else(|| panic!("the OVF op must survive the fold, got {opcodes:?}"));
+        assert_eq!(
+            opcodes.get(ovf_at + 1),
+            Some(&OpCode::GuardNoOverflow),
+            "the guard that catches the overflow must still follow it, got {opcodes:?}"
+        );
+    }
+
     fn run_immutable_getfield_cse(opcode: OpCode, index: u32, field_type: Type) -> Vec<Op> {
         let flag = match field_type {
             Type::Int => majit_ir::ArrayFlag::Signed,

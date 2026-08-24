@@ -2223,6 +2223,41 @@ impl OpCode {
         (ALWAYS_PURE_FIRST..=ALWAYS_PURE_LAST).contains(&n)
     }
 
+    /// `resoperation.py` `OpHelpers.is_pure_with_descr` — the predicate
+    /// `MIFrame.execute_and_record` consults before folding an operation
+    /// on all-constant arguments. Always-pure opcodes fold on the opcode
+    /// alone; the reads listed below fold only when their descr declares
+    /// the location immutable.
+    ///
+    /// `GETARRAYITEM_GC_*` is deliberately absent from the descr-gated
+    /// list. An immutable GC array read is spelled with the dedicated
+    /// `GETARRAYITEM_GC_PURE_*` opcode, which the always-pure range
+    /// already admits; the plain GC read stays foldable never, whatever
+    /// its descr says.
+    ///
+    /// A `None` descr answers `false` for the gated opcodes, matching the
+    /// explicit `descr is not None` guard `OpHelpers.is_pure_getfield`
+    /// spells for the same question.
+    pub fn is_pure_with_descr(self, descr: Option<&DescrRef>) -> bool {
+        if self.is_always_pure() {
+            return true;
+        }
+        if matches!(
+            self,
+            OpCode::GetfieldRawI
+                | OpCode::GetfieldRawR
+                | OpCode::GetfieldRawF
+                | OpCode::GetfieldGcI
+                | OpCode::GetfieldGcR
+                | OpCode::GetfieldGcF
+                | OpCode::GetarrayitemRawI
+                | OpCode::GetarrayitemRawF
+        ) {
+            return descr.is_some_and(|d| d.is_always_pure());
+        }
+        false
+    }
+
     pub fn has_no_side_effect(self) -> bool {
         let n = self.as_u16();
         (NOSIDEEFFECT_FIRST..=NOSIDEEFFECT_LAST).contains(&n)
@@ -5468,5 +5503,58 @@ mod tests {
         // Sentinel range stays out of the constant namespace.
         assert!(!OpRef::raw_is_constant(u32::MAX));
         assert!(!OpRef::raw_is_constant(u32::MAX - 1));
+    }
+
+    /// Pins `OpHelpers.is_pure_with_descr`, the predicate
+    /// `MIFrame.execute_and_record` consults before folding on all-constant
+    /// arguments.
+    #[test]
+    fn is_pure_with_descr_admits_only_the_upstream_opcode_list() {
+        let field = |is_immutable: bool| -> DescrRef {
+            std::sync::Arc::new(crate::descr::SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Int,
+                is_immutable,
+                crate::descr::ArrayFlag::Signed,
+                "f".to_string(),
+                "f".to_string(),
+            ))
+        };
+        let immutable = field(true);
+        let mutable = field(false);
+
+        // An always-pure opcode answers on the opcode alone, descr or not.
+        assert!(OpCode::IntAdd.is_pure_with_descr(None));
+        assert!(OpCode::IntAdd.is_pure_with_descr(Some(&mutable)));
+
+        // The gated reads follow their descr, and a missing descr is a no.
+        for opcode in [
+            OpCode::GetfieldGcI,
+            OpCode::GetfieldGcR,
+            OpCode::GetfieldGcF,
+            OpCode::GetfieldRawI,
+            OpCode::GetfieldRawR,
+            OpCode::GetfieldRawF,
+            OpCode::GetarrayitemRawI,
+            OpCode::GetarrayitemRawF,
+        ] {
+            assert!(opcode.is_pure_with_descr(Some(&immutable)), "{opcode:?}");
+            assert!(!opcode.is_pure_with_descr(Some(&mutable)), "{opcode:?}");
+            assert!(!opcode.is_pure_with_descr(None), "{opcode:?}");
+        }
+
+        // `GETARRAYITEM_GC_*` is absent from that list at any descr: an
+        // immutable GC array read is spelled `GETARRAYITEM_GC_PURE_*`, which
+        // the always-pure range admits on its own.
+        for opcode in [
+            OpCode::GetarrayitemGcI,
+            OpCode::GetarrayitemGcR,
+            OpCode::GetarrayitemGcF,
+        ] {
+            assert!(!opcode.is_pure_with_descr(Some(&immutable)), "{opcode:?}");
+        }
+        assert!(OpCode::GetarrayitemGcPureI.is_pure_with_descr(None));
     }
 }

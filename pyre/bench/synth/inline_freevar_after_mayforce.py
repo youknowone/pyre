@@ -1,20 +1,46 @@
 # pyre-check: max-pypy-ratio=86
-# pyre-check: jitstats-band=guard_failures=8
-# `guard_failures` here is carried by two things this fixture is not about.
-# One is the host: one tree read 1003 dynasm / 1008 cranelift on macOS and
-# ubuntu and 1004 / 1009 on windows in a single CI run (`1d212895c6b`), with the
-# loop and bridge counts agreeing everywhere. The other is the collection
-# schedule -- one binary swept across nursery sizes read 1034 / 1014 / 1007 /
-# 1007 at 2 / 4 / 6 / 8 MB, 27 counts, while `loops_compiled` and
-# `bridges_compiled` did not move. Suppressing the whole trace-time fold table
-# moved it by one count and suppressing the folds this branch adds by none, so
-# it is not reading those either.
+# pyre-check: jitstats-band=guard_failures=23,loops_compiled=1
+# Both bands cover one measured effect: this fixture's loop count is decided by
+# a warm-up race, not by whether its arm compiles.
 #
-# Width 8 covers both: the one-count host split, and the several counts a tree
-# that allocates differently picks up on top of it -- this branch read 1011 on
-# all three runners against a baseline of 1008. Anything wider than a tree's own
-# allocation behaviour still gates, and `loops_compiled` and `bridges_compiled`
-# stay gated exactly. Only the loop count answers whether the arm compiles.
+# `forward` calls `adjust` exactly once per iteration, so the two green keys
+# tick their function-entry counters in lockstep and which of them crosses the
+# threshold first is emergent. When `forward` wins, it traces `adjust` inlined
+# and `adjust` never reaches the entry door again -- seven loops. When `adjust`
+# wins, it also earns its own 36-op entry trace -- eight loops -- and `forward`
+# still inlines it, its trace going 69 ops to 70 with a `GuardNotInvalidated`
+# as the extra op. Both outcomes are live in one tree at once: windows reads
+# seven while macos and ubuntu read eight, byte-identical to each other.
+#
+# The race is sensitive to how much unrelated work runs before it. Registering
+# one more GC type shifts it -- three added descrs at startup were enough to
+# flip the order -- and so does `PYTHONDONTWRITEBYTECODE`: one binary read
+# seven loops with bytecode writes suppressed and eight with them enabled, at
+# every N from 48000 through 128000. None of it reaches the arm. The arm's
+# trace was read directly in all four combinations and is identical op for op,
+# same call targets modulo the ASLR slide, differing only in the order of an
+# unordered `SetfieldGc` write-back set.
+#
+# So width 1 on `loops_compiled` admits exactly the second outcome, and
+# `guard_failures` has to admit what that outcome costs: 1005 -> 1018 dynasm
+# and 1009 -> 1024 cranelift on both failing runners, 15 counts at the widest.
+# The remaining 8 is what this directive already carried, for two things this
+# fixture is also not about. One is the host: one tree read 1003 dynasm / 1008
+# cranelift on macOS and ubuntu and 1004 / 1009 on windows in a single CI run
+# (`1d212895c6b`), with the loop and bridge counts agreeing everywhere. The
+# other is the collection schedule -- one binary swept across nursery sizes
+# read 1034 / 1014 / 1007 / 1007 at 2 / 4 / 6 / 8 MB, 27 counts, while
+# `loops_compiled` and `bridges_compiled` did not move. Suppressing the whole
+# trace-time fold table moved it by one count and suppressing the folds this
+# branch adds by none, so it is not reading those either.
+#
+# `bridges_compiled` stays gated exactly at 5 and held at 5 in every
+# configuration measured above, and the regression floor still gates
+# `loops_aborted` at 0, so the dead-bridge and abort classes this suite exists
+# to catch are untouched by either band. What is given up is reading a
+# one-count fall in `loops_compiled` as "a hot loop went back to interpreted",
+# which this fixture cannot support anyway while the race decides that count.
+#
 # The ceiling is a function of N, so raising N refits it. pypy's execution here
 # is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
 # backend pays roughly 27us per iteration, so the ratio tracks N nearly one for
@@ -64,10 +90,23 @@ from fractions import Fraction
 # -- while its guard failures stayed at 1004, so on that backend the arm costs a
 # loop and no guard failure.
 #
+# DO NOT RE-RECORD `loops_compiled` here on a six. Seven is base-dependent,
+# not merely a value some tree happens to produce. Measured across three CI
+# runs: main alone at base `5bf59e1f008` reads seven and passes (32565716769);
+# a branch adding `PyreHelperKind::LoadDeref` to the replay-safe read set reads
+# seven on the older base `68a6351bfbf` and passes (32556952922); the *same*
+# six commits on `5bf59e1f008` read six and fail (32572034383). On that branch
+# the loop that goes missing is `forward`'s own portal trace, which vanishes
+# because the admission change inlines the freevar callee -- an improvement,
+# and a different loop from the `catch_exception/L` arm above. A six is a
+# question about which change interacted; re-recording it pins a number the
+# next tracer change moves again.
+#
 # The committed baselines are seven loops, five bridges, and 1005 dynasm / 1009
-# cranelift / 1004 wasm. Only the loop count answers whether the arm compiles,
-# so treat a one-count guard-failure move as the unattributed remainder rather
-# than as this fixture's subject.
+# cranelift / 1004 wasm. Neither count answers whether the arm compiles -- the
+# arm's trace reads identically under every configuration that moved them, see
+# the band note above -- so treat a move in either as the unattributed
+# remainder rather than as this fixture's subject.
 N = 64000
 
 

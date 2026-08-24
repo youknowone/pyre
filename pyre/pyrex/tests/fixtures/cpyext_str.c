@@ -209,6 +209,19 @@ static PyObject *str_concat(PyObject *self, PyObject *args)
     return joined ? joined : refused();
 }
 
+/* `PyUnicode_Format(format, args)` -- `format % args`, which is what Cython
+   compiles a `%` between a literal and anything else into. */
+static PyObject *str_format(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *format, *values;
+    if (!PyArg_ParseTuple(args, "OO", &format, &values)) {
+        return NULL;
+    }
+    PyObject *formatted = PyUnicode_Format(format, values);
+    return formatted ? formatted : refused();
+}
+
 static PyObject *str_append(PyObject *self, PyObject *args)
 {
     (void)self;
@@ -447,6 +460,7 @@ static PyMethodDef methods[] = {
     {"format_pointer", format_pointer, METH_NOARGS, "the '%p' conversion"},
     {"format_error", format_error, METH_VARARGS, "the engine through PyErr_Format"},
     {"str_concat", str_concat, METH_VARARGS, NULL},
+    {"str_format", str_format, METH_VARARGS, NULL},
     {"str_append", str_append, METH_VARARGS, NULL},
     {"str_append_and_del", str_append_and_del, METH_VARARGS, NULL},
     {"str_substring", str_substring, METH_VARARGS, NULL},

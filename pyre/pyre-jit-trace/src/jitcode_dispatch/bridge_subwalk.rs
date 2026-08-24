@@ -137,7 +137,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // Top-level jitcode's per-bank constant pool — seeded into
     // register slots `[num_regs_*, num_regs_* + constants_*.len())`
     // per `pyjitpl.py copy_constants`.
-    top_constants_r: &[i64],
+    top_constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
     top_constants_i: &[i64],
     top_constants_f: &[i64],
     // PyPy `pyjitpl.py setup_call(argboxes)` analog.
@@ -219,7 +219,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
         top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
     }
-    for (i, &v) in top_constants_r.iter().enumerate() {
+    for (i, v) in top_constants_r.iter().enumerate() {
+        let v = v.get();
         top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
         if v != 0 {
             top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
@@ -1163,7 +1164,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_i[num_regs_i + i] = ctx.const_int(v);
         concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
     }
-    for (i, &v) in jc.constants_r.iter().enumerate() {
+    for (i, v) in jc.constants_r.iter().enumerate() {
+        let v = v.get();
         regs_r[num_regs_r + i] = ctx.const_ref(v);
         if v != 0 {
             concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
@@ -1463,6 +1465,24 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // would replay them.  Capture the frames while this `WalkContext` still
         // owns their banks — `drive_bridge_carrier_walk`'s abort tail adopts
         // the image, and a decline there leaves the pre-existing rollback.
+        //
+        // This site does NOT apply the exclusions the walk-level latch applies
+        // (`jitcode_dispatch/mod.rs`), so a `VableEscapedDuringResidualCall`
+        // whose narrower resume-marker image was already latched at force time
+        // gets that image replaced by a broader one rooted here — measured,
+        // `already_latched=true complete_image=false accepted=true`. Adding
+        // those gates here was built and measured twice, and is inert both
+        // times. The witness is an `f_locals` proxy write in the resumed tail
+        // of a CALL_ASSEMBLER callee, read under `PYRE_BRIDGE_LATCH_AUDIT=1`,
+        // and the gate is provably live on it: `accepted` flips true → false,
+        // the adopted image's origin flips `bridge1361` → `escape-flush`, and
+        // the inner frame's resume pc moves 2037 → 2046. Neither observable
+        // moves with it — the returned value stays wrong by the same amount,
+        // and a variant that reads the written local straight back still
+        // answers NULL (`TypeError: comparison on null operand`) under both
+        // images. So the loss is upstream of which image wins; a wrong value
+        // and a NULL slot are two different symptoms of it, and gating here
+        // fixes neither. Left alone until a fixture separates them.
         let audit = bridge_latch_audit_enabled();
         if let Err(ref error) = outcome {
             // Sampled before the latch: afterwards `abort_blackhole_latched` is

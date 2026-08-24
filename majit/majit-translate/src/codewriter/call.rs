@@ -4409,6 +4409,19 @@ impl CallControl {
                 if self.func_effects(p).is_some_and(|f| f.oopspec.is_some()) {
                     return CallKind::Builtin;
                 }
+                // `@jit.dont_look_inside` builder residual helpers
+                // (`rbuilder.py` `ll_append_res0` / `ll_append_res_slice`): the
+                // append jit arm routes through these general residuals so the
+                // grow/malloc body is not retraced on every append. Residualize
+                // the call to the bound native runtime helper instead of tracing
+                // the synthetic body — but only once such a helper address is
+                // registered. The gate is a `function_fnaddrs` entry: without it
+                // the symbolic-fallback address is not callable, so the call must
+                // stay regular (executing the generated jitcode). This is the
+                // codewriter half; the runtime half registers the fnaddr.
+                if is_dont_look_inside_residual_helper(p) && self.function_fnaddrs.contains_key(p) {
+                    return CallKind::Residual;
+                }
             }
         }
         // RPython `call.py:137-139` — both direct_call (fall-through)
@@ -6874,6 +6887,21 @@ pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
     symbolic
 }
 
+/// The `@jit.dont_look_inside` builder residual helpers (`rbuilder.py`
+/// `ll_append_res0` / `ll_append_res_slice`): the general residual targets the
+/// append / append_slice jit arms route through. When a native runtime helper
+/// address is bound for one of these paths (`register_function_fnaddr`),
+/// `guess_call_kind` residualizes the call to it rather than tracing the
+/// synthetic grow/malloc body — matching upstream's `@jit.dont_look_inside`
+/// residualization. Matched by leaf segment so it is agnostic to any crate or
+/// module prefix a callsite spells the target with.
+pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
+    matches!(
+        path.last_segment(),
+        Some("ll_append_res0") | Some("ll_append_res_slice")
+    )
+}
+
 /// Compute the symbolic function address for the same segmented path shape
 /// used by the codewriter.
 pub fn symbolic_fnaddr_for_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> i64 {
@@ -8807,9 +8835,17 @@ const FLOAT_CMP_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["float_ne"]),
 ];
 
-// effectinfo.py: EF_ELIDABLE_CAN_RAISE — may raise (e.g. ZeroDivisionError)
-// int_floordiv and int_mod have distinct oopspec indices (IntPyDiv vs IntPyMod)
-// because intbounds.rs optimizes them differently.
+// effectinfo.py: EF_ELIDABLE_CAN_RAISE — these name the source-level helpers,
+// which check for a zero divisor and raise.
+//
+// They carry no oopspec index. `OS_INT_PY_DIV` / `OS_INT_PY_MOD` identify
+// `rint.py ll_int_py_div` and `ll_int_py_mod`, the machine-word primitives
+// whose zero check `ll_int_py_div_zer` has already inlined away — that is why
+// `jtransform.py _handle_int_special` gives them `EF_ELIDABLE_CANNOT_RAISE` —
+// and `rewrite.py optimize_call_int_py_div` rewrites a call carrying either
+// index into `int_rshift` / `int_neg` on the strength of it. The `int.py_div`
+// / `int.py_mod` oopspec names are the only spelling that identifies those
+// primitives, and `_handle_int_special` is where the indices are minted.
 const INT_FLOORDIV_TARGETS: &[CallTargetPattern] =
     &[CallTargetPattern::FunctionPath(&["int_floordiv"])];
 
@@ -8906,12 +8942,12 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
     CallDescriptorEntry {
         targets: INT_FLOORDIV_TARGETS,
         extraeffect: ExtraEffect::ElidableCanRaise,
-        oopspecindex: OopSpecIndex::IntPyDiv,
+        oopspecindex: OopSpecIndex::None,
     },
     CallDescriptorEntry {
         targets: INT_MOD_TARGETS,
         extraeffect: ExtraEffect::ElidableCanRaise,
-        oopspecindex: OopSpecIndex::IntPyMod,
+        oopspecindex: OopSpecIndex::None,
     },
     // RPython `jtransform.py` `_do_builtin_call` casts —
     // unsigned-domain conversion helpers.  Cannot raise; elidable.
@@ -9190,6 +9226,46 @@ mod tests {
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(unknown)),
             CallKind::Residual
+        );
+    }
+
+    /// The `@jit.dont_look_inside` builder residual helpers residualize only
+    /// once a native runtime helper address is bound. Without one, a candidate
+    /// `ll_append_res_slice` call stays `Regular` (it executes the generated
+    /// jitcode via the symbolic-fallback address); binding a real
+    /// `function_fnaddrs` entry flips it to `Residual`. A non-helper candidate
+    /// with a bound address is unaffected — the leaf-name gate scopes the flip.
+    #[test]
+    fn residual_builder_helper_residualizes_only_with_a_bound_fnaddr() {
+        let mut cc = CallControl::new();
+        let helper = CallPath::from_segments(["ll_append_res_slice"]);
+        cc.register_function_graph(helper.clone(), FunctionGraph::new("ll_append_res_slice"));
+        // A non-helper candidate control: same shape, ordinary name.
+        let other = CallPath::from_segments(["opcode_load_fast"]);
+        cc.register_function_graph(other.clone(), FunctionGraph::new("opcode_load_fast"));
+        cc.find_all_graphs_for_tests();
+
+        let helper_target = CallTarget::function_path(["ll_append_res_slice"]);
+        let other_target = CallTarget::function_path(["opcode_load_fast"]);
+
+        // No native address bound yet → the synthetic jitcode is used (Regular).
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(helper_target.clone())),
+            CallKind::Regular
+        );
+
+        // Binding the native runtime helper residualizes the call to it.
+        cc.register_function_fnaddr(helper, 0x1234);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(helper_target)),
+            CallKind::Residual
+        );
+
+        // A bound address on an ordinary candidate does not residualize it.
+        cc.register_function_fnaddr(other, 0x5678);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(other_target)),
+            CallKind::Regular
         );
     }
 

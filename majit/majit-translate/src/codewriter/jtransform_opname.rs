@@ -194,7 +194,16 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                     Some(Hlvalue::Constant(c)) => exitcase_from_const(&c.value),
                     _ => None,
                 };
-                Link::new_mixed(args, target_id, exitcase)
+                let mut model_link = Link::new_mixed(args, target_id, exitcase);
+                // Carry the exception extravars the flowspace producer set (e.g.
+                // `rbuilder::close_ovfcheck_block`): a canraise exit's
+                // last_exception / last_exc_value are required by flatten's
+                // make_exception_link (it asserts they are Some and, for an
+                // empty-target handler, unwraps them). Dropping them turns a
+                // faithful OverflowError edge into a flatten-time panic.
+                model_link.last_exception = link.last_exception.as_ref().map(linkarg_from_hlvalue);
+                model_link.last_exc_value = link.last_exc_value.as_ref().map(linkarg_from_hlvalue);
+                model_link
             })
             .collect();
 
@@ -738,6 +747,7 @@ mod tests {
     use super::lower_graph;
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link, SpaceOperation,
+        c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -993,6 +1003,79 @@ mod tests {
             .expect("Spine-B drain commits a jitcode body");
         assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
         assert_eq!(jitcode.try_index(), Some(0));
+    }
+
+    /// A flowspace `ovfcheck` block (trailing `int_add_ovf` + `c_last_exception`
+    /// switch, the shape `rbuilder::close_ovfcheck_block` emits for
+    /// `ll_grow_by`/`ll_grow_and_append`) carries `last_exception` /
+    /// `last_exc_value` extravars on its OverflowError exit. `lower_graph` must
+    /// copy them onto the model link: flatten's `make_exception_link` asserts
+    /// they are `Some` and, for the empty-target MemoryError handler, unwraps
+    /// them — dropping them turns the faithful overflow edge into a panic.
+    #[test]
+    fn lower_graph_preserves_ovfcheck_exception_extravars() {
+        use crate::translator::rtyper::rtyper::exception_args;
+
+        let overflow = exception_args("OverflowError").expect("OverflowError args");
+        let mem = exception_args("MemoryError").expect("MemoryError args");
+
+        let a = variable_with_lltype("a", LowLevelType::Signed);
+        let b = variable_with_lltype("b", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(a.clone()),
+            Hlvalue::Variable(b.clone()),
+        ]);
+        let ret = variable_with_lltype("result", LowLevelType::Signed);
+        let graph =
+            FlowGraph::with_return_var("ll_ovf_probe", start.clone(), Hlvalue::Variable(ret));
+
+        let sum = variable_with_lltype("sum", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add_ovf",
+            vec![Hlvalue::Variable(a), Hlvalue::Variable(b)],
+            Hlvalue::Variable(sum.clone()),
+        ));
+
+        // Empty-ops handler that raises MemoryError via the exceptblock — the
+        // grow_by shape whose bare-reraise unwrap would fire on dropped extravars.
+        let handler = Block::shared(vec![]);
+        handler.closeblock(vec![
+            Link::new(mem, Some(graph.exceptblock.clone()), None).into_ref(),
+        ]);
+
+        start.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        let normal = Link::new(
+            vec![Hlvalue::Variable(sum)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        let mut exc = Link::new(vec![], Some(handler), Some(overflow[0].clone()));
+        exc.extravars(Some(overflow[0].clone()), Some(overflow[1].clone()));
+        start.closeblock(vec![normal, exc.into_ref()]);
+
+        let model = lower_graph(&graph);
+
+        let mut canraise_blocks = 0;
+        for block in &model.blocks {
+            if matches!(block.exitswitch, Some(ExitSwitch::LastException)) {
+                canraise_blocks += 1;
+                let exc_exit = block
+                    .exits
+                    .iter()
+                    .find(|l| l.exitcase.is_some())
+                    .expect("canraise block has an exception exit");
+                assert!(
+                    exc_exit.last_exception.is_some(),
+                    "lower_graph dropped last_exception on the OverflowError edge"
+                );
+                assert!(
+                    exc_exit.last_exc_value.is_some(),
+                    "lower_graph dropped last_exc_value on the OverflowError edge"
+                );
+            }
+        }
+        assert_eq!(canraise_blocks, 1, "exactly one c_last_exception block");
     }
 
     /// `ll_bool(builder)` drains end-to-end with NO struct layout registered:

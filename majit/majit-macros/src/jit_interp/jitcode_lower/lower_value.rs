@@ -309,10 +309,10 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_native_tag_small_call(call) {
                     return Some(binding);
                 }
-                // A helper that hands its argument straight back is opened by
-                // the inliner upstream and its residue dropped by
-                // `jtransform.py` `rewrite_op_same_as`; the LLBC tracer sees
-                // the call, so drop it here instead.
+                // A helper that hands its argument straight back is opened
+                // by `inline.auto_inline_graphs` upstream, before the
+                // codewriter ever sees the graph. This front end has no such
+                // stage, so the drop is declared and applied here.
                 if let Some(binding) = self.lower_native_identity_call(call) {
                     return Some(binding);
                 }
@@ -952,6 +952,7 @@ impl<'c> Lowerer<'c> {
 
         let reg = self.alloc_reg();
         let func = &call.func;
+        let word_result_addr = word_result_addr_tokens(func, arg_bindings.len());
         let mut result_kind = BindingKind::Int;
         // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
         // not precede it.  Decide here whether the explicit arm below needs a
@@ -1025,7 +1026,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::new(result_kind, reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1054,7 +1055,7 @@ impl<'c> Lowerer<'c> {
                                 vec![Register::new(result_kind, reg)],
                             ),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                                 #call_invocation
                             },
                         );
@@ -1072,7 +1073,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             __builder.residual_call_int_canonical_via_target_with_effect_info(
                                 __fn_idx,
                                 #typed_args,
@@ -1111,7 +1112,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                             #call_stmt
                         },
                     );
@@ -1500,7 +1501,7 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
-                                #func as *const ()
+                                #word_result_addr
                             } else {
                                 __trace_target
                             };
@@ -1598,7 +1599,7 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild, __save_err) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
-                                #func as *const ()
+                                #word_result_addr
                             } else {
                                 __trace_target
                             };
@@ -1822,6 +1823,7 @@ impl<'c> Lowerer<'c> {
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
                 let __arg_regs: Vec<Register> =
                     arg_bindings.iter().map(Register::from_binding).collect();
+                let word_result_addr = word_result_addr_tokens(&func_path, arg_bindings.len());
                 let call_stmt = match kind {
                     crate::jit_interp::CallPolicyKind::ElidableInt => quote! {
                         __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
@@ -1841,7 +1843,7 @@ impl<'c> Lowerer<'c> {
                         vec![Register::new(result_kind, reg)],
                     ),
                     quote! {
-                        let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                        let __fn_idx = __builder.add_fn_ptr(#word_result_addr);
                         #call_stmt
                     },
                 );
@@ -2057,6 +2059,11 @@ impl<'c> Lowerer<'c> {
     ///
     /// The argument is still lowered, so a receiver that mutates state keeps
     /// running; only the wrapper around its result goes away.
+    ///
+    /// This runs ahead of the `calls` policy machinery, so a path in both
+    /// would take this route and leave its policy dead; the config parse
+    /// rejects that pair rather than let it lower
+    /// (`reject_overlapping_call_vocabularies`).
     fn lower_native_identity_call(&mut self, call: &ExprCall) -> Option<Binding> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(&call.func)?;

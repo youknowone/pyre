@@ -4091,6 +4091,15 @@ impl<'a> Transformer<'a> {
             {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
+            // jtransform.py:489-490 — int.* oopspecs → _handle_int_special.
+            // Unhandled spellings return `None` and fall through to the
+            // residual-call path.
+            if base.starts_with("int.")
+                && let Some(result) =
+                    self._handle_int_special(base, op, target, args, result_ty, graph_name, graph)
+            {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
             // jtransform.py — stroruni.* oopspecs → _handle_stroruni_call.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path (RPython raises `NotSupported`).
@@ -4394,6 +4403,70 @@ impl<'a> Transformer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Port of `jtransform.py _handle_int_special`'s general arm:
+    ///
+    /// ```python
+    /// # int.py_div, int.udiv, int.py_mod, int.umod
+    /// opname = oopspec_name.replace('.', '_')
+    /// os = getattr(EffectInfo, 'OS_' + opname.upper())
+    /// return self._handle_oopspec_call(op, args, os,
+    ///                                  EffectInfo.EF_ELIDABLE_CANNOT_RAISE)
+    /// ```
+    ///
+    /// The index is derived from the DECLARED oopspec string, never from the
+    /// callee's name or path, so a function carrying
+    /// `#[oopspec("int.py_div(x, y)")]` lowers to a residual call whose descr
+    /// says `IntPyDiv` whatever the function is called. That is what lets a
+    /// front end attach one of these to a division helper of its own naming;
+    /// a table of callee paths can only recognise the names it was written
+    /// against.
+    ///
+    /// `getattr` over the `OS_*` namespace has no Rust counterpart, so the
+    /// four spellings upstream's own comment enumerates are matched directly.
+    /// An unlisted one returns `None` and falls through to the ordinary
+    /// residual call, the convention the `rgc.*` and `list.*` siblings use for
+    /// an oopspec this codewriter has not lowered.
+    ///
+    /// The two spellings upstream rewrites into operations here rather than
+    /// into a call — `int.neg_ovf` and `int.uint_mul_high` — are deliberately
+    /// absent. Both are recognised at the MIR front end
+    /// (`front::checked_arith`, `front::checked_arith_uint`), which emits
+    /// `sub_ovf` / `uint_mul_high` directly, so neither can reach a decoded
+    /// oopspec and an arm for them would be unreachable.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn _handle_int_special(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> Option<RewriteResult> {
+        let oopspecindex = match oopspec_name {
+            "int.py_div" => OopSpecIndex::IntPyDiv,
+            "int.udiv" => OopSpecIndex::IntUdiv,
+            "int.py_mod" => OopSpecIndex::IntPyMod,
+            "int.umod" => OopSpecIndex::IntUmod,
+            _ => return None,
+        };
+        Some(self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            oopspecindex,
+            Some(majit_ir::descr::ExtraEffect::ElidableCannotRaise),
+            None,
+        ))
     }
 
     /// Port of `jtransform.py _handle_list_call` for pyre's
@@ -13628,6 +13701,67 @@ mod tests {
             })
             .expect("marked newlist_clear must lower to new_array_clear");
         assert_eq!(new_array_clear, count);
+    }
+
+    /// The `int.*` index comes from the declared oopspec string, so a helper
+    /// whose name is nothing like `int_floordiv` still lowers to a residual
+    /// call carrying `IntPyDiv`. A front end that names its division helper
+    /// after its own domain is the case a callee-path table cannot serve.
+    #[test]
+    fn declared_int_py_div_oopspec_indexes_a_differently_named_helper() {
+        let path = crate::parse::CallPath::from_segments(["band_div"]);
+        let target = CallTarget::function_path(["band_div"]);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.mark_oopspec(path, "int.py_div(x, y)".to_string());
+
+        let mut graph = FunctionGraph::new("caller");
+        let lhs = graph.alloc_value_var();
+        let rhs = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+        let startblock = graph.startblock;
+        graph.push_op_var(
+            startblock,
+            OpKind::Call {
+                target,
+                args: vec![lhs.clone(), rhs.clone()],
+                result_ty: ValueType::Int,
+            },
+            false,
+        );
+        graph
+            .block_mut(startblock)
+            .operations
+            .last_mut()
+            .unwrap()
+            .result = Some(result.clone());
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+
+        let descriptor = transformed
+            .graph
+            .block(startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("a declared int.py_div oopspec must lower to a residual call");
+        assert_eq!(
+            descriptor.get_extra_info().oopspecindex,
+            OopSpecIndex::IntPyDiv
+        );
+        assert_eq!(
+            descriptor.get_extra_info().extraeffect,
+            majit_ir::descr::ExtraEffect::ElidableCannotRaise
+        );
     }
 
     /// T3 end-to-end: the rtyper mints the `_ll_alloc_and_set` family (whose

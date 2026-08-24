@@ -901,6 +901,14 @@ pub enum PyreHelperKind {
     /// helper (`pyopcode.py:866-870`). Same standing as
     /// [`PyreHelperKind::LoadLocals`].
     LoadBuildClass,
+    /// `bh_load_import_fn(frame)` — the builtin lookup half of IMPORT_NAME.
+    /// The following invocation is emitted through [`PyreHelperKind::CallFn`]
+    /// so gateway builtins retain their ordinary meta-traceable call shape.
+    LoadImport,
+    /// `bh_load_import_locals_fn(frame)` — IMPORT_NAME's locals argument
+    /// (`pyopcode.py`'s `IMPORT_NAME`).  Infallible, same standing as
+    /// [`PyreHelperKind::LoadLocals`].
+    LoadImportLocals,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as
@@ -1051,6 +1059,15 @@ pub enum PyreHelperKind {
     /// rejects.  `kwnames` (arg index 2) is the constant kwnames tuple and
     /// is always a live Ref.
     CallKw,
+    /// `bh_with_except_start_fn(exit_func, exit_self, val)` — the
+    /// WITH_EXCEPT_START residual.  `exit_self` (arg index 1) is a `PY_NULL`
+    /// sentinel the helper checks before use: `with_except_start_values`
+    /// prepends it as arg0 only when non-null, exactly as `LOAD_SPECIAL`
+    /// pushes an already-bound `__exit__` beside a NULL receiver slot.  A
+    /// concrete-NULL there is therefore the normal `with` shape — not the
+    /// broken baked-NULL-globals shape the walker's may-force NULL-ref gate
+    /// rejects.
+    WithExceptStart,
     /// `load_attr_fn(obj, code, name_idx)` — the plain (non-method) LOAD_ATTR
     /// residual (`lower_getattr_hlop_to_insn` → `space.getattr`).  The Ref
     /// operands are the receiver and the jitcode's own PyCode; the Int operand

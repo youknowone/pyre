@@ -2448,6 +2448,13 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(gcref);
             }
         }
+        // The per-guard snapshot side table copies inline gcrefs out of the
+        // `ref_regs` slots walked above into words of its own; see
+        // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
+        // forwards them.
+        for snapshot in trace_ctx.snapshots.iter_mut() {
+            snapshot.walk_const_ptr_refs(&mut visitor);
+        }
         // pyjitpl.py:3290-3306 `self.virtualizable_boxes` stores ordinary
         // BoxPtr objects whose concrete refs are traced by RPython's object
         // graph.  Pyre keeps their concrete half in `virtualizable_values`;
@@ -2580,19 +2587,29 @@ impl<M: Clone> MetaInterp<M> {
     /// hook see every failure, since bridge-compilation thresholds and guard
     /// attribution still apply to the poll.
     #[inline]
+    ///
+    /// `trace_id` names the trace the failing descr belongs to, and it is not
+    /// redundant with `fail_index`: an index is allocated per trace, so a
+    /// bridge's own guards re-use the numbers of the loop they hang off.
+    /// Without it an event log cannot say whether a coordinate that keeps
+    /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
+    /// have patched away once a bridge attached (`compile.py`) — or a fresh
+    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
+    /// measurement that made the distinction load-bearing.
     fn record_guard_failure_event(
         &mut self,
         green_key: u64,
+        trace_id: u64,
         fail_index: u32,
         back_edge_poll: bool,
     ) {
         if guardlog_enabled() {
-            eprintln!("@@@GUARD key={green_key} fail={fail_index}");
+            eprintln!("@@@GUARD key={green_key} tid={trace_id} fail={fail_index}");
         }
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] guard failure at key={}, guard={}",
-                green_key, fail_index
+                "[jit] guard failure at key={}, tid={}, guard={}",
+                green_key, trace_id, fail_index
             );
         }
         let tally = if back_edge_poll {
@@ -5492,10 +5509,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_int requires active tracing")
-            .vable_getfield_int(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_r(box, fielddescr, pc)`.
@@ -5506,10 +5524,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_ref requires active tracing")
-            .vable_getfield_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -5520,10 +5539,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_float requires active tracing")
-            .vable_getfield_float(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
@@ -5748,10 +5768,18 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
+            .vable_arraylen_vable(
+                cpu.as_ref(),
+                pc,
+                vable_opref,
+                vable_struct_ptr,
+                fdescr,
+                adescr,
+            )
     }
 
     /// pyjitpl.py `opimpl_hint_force_virtualizable(box)`.
@@ -9613,6 +9641,24 @@ impl<M: Clone> MetaInterp<M> {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abort the trace and fall back to the blackhole interpreter.
+            //
+            // The abort is NOT permanent.  `compile.py compile_trace` answers
+            // an `InvalidLoop` out of `optimize_trace` with
+            // `debug_print('InvalidLoop in compile_new_bridge'); return None`,
+            // and the `giveup()` its caller then raises reaches
+            // `pyjitpl.py aborted_tracing`, which counts the reason and stops.
+            // `disable_noninlinable_function` — the call that sets
+            // `JC_DONT_TRACE_HERE` — is reached from exactly one place
+            // upstream, the `ABORT_TOO_LONG` arm of
+            // `blackhole_if_trace_too_long`.  Banning here instead retired the
+            // location on its FIRST InvalidLoop, and `JC_DONT_TRACE_HERE` is
+            // also what `can_inline_callable` reads, so one rejected
+            // function-entry trace made the function permanently
+            // non-inlinable everywhere else.  The sibling arm in
+            // `compile_loop_body` already spells this out as
+            // `abort_tracing(green_key, !is_invalid_loop)`; pyre's own abort
+            // ceiling (`MAX_TRACE_ABORT_COUNT`) is what retires a location
+            // that keeps failing.
             Err(_invalid_loop) => {
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -9620,14 +9666,14 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("abort finish: InvalidLoop at key={green_key}"),
                     );
                 }
-                self.warm_state.abort_tracing(green_key, true);
+                self.warm_state.abort_tracing(green_key, false);
                 // pyjitpl.py aborted_tracing() reads greenkey from
                 // `current_merge_points`; pyre's analog reads it from
                 // pending_abort_{green_key,permanent} staged here so the
                 // caller-side `aborted_tracing(stb.reason)` hook payload
                 // carries the real trace key instead of 0.
                 self.pending_abort_green_key = Some(green_key);
-                self.pending_abort_permanent = true;
+                self.pending_abort_permanent = false;
                 crate::mc_diag_bump(47);
                 return Err(SwitchToBlackhole::giveup());
             }
@@ -10689,7 +10735,7 @@ impl<M: Clone> MetaInterp<M> {
                 .descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -10778,7 +10824,7 @@ impl<M: Clone> MetaInterp<M> {
             let back_edge_poll = descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         let exit_arity = exit_types.len();
@@ -11105,7 +11151,7 @@ impl<M: Clone> MetaInterp<M> {
             let back_edge_poll = descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         // Fresh lookup, and fallible: the run can re-enter the driver through
@@ -15010,12 +15056,15 @@ impl<M: Clone> MetaInterp<M> {
         self.count_ops(opnum, counters::OPS);
         // pyjitpl.py: resvalue = executor.execute_varargs(self.cpu, self, ...)
         let resvalue = crate::executor::execute_varargs(self, opnum, argboxes, descr_view);
-        // pyjitpl.py:2649-2650: assert not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST
+        // `MetaInterp.execute_and_record_varargs` asserts
+        // `not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST`;
+        // the predicate below is the narrower call-only slice of that range.
         debug_assert!(
             !opnum.is_call_pure(),
-            "execute_and_record_varargs: pure calls go through _record_helper_pure_varargs",
+            "execute_and_record_varargs: pure calls go through \
+             MIFrame.execute_varargs(pure=True) → record_result_of_call_pure",
         );
-        // pyjitpl.py: return self._record_helper_varargs(...)
+        // `MetaInterp._record_helper_varargs`
         let opref_args: Vec<OpRef> = argboxes.iter().map(|(_, opref, _)| *opref).collect();
         self._record_helper_varargs(opnum, resvalue, descr, &opref_args)
     }
@@ -17098,10 +17147,23 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             0
         };
+        // Two distinct `ConstPtr`s cannot be equal at runtime either, so the
+        // funnel's fold is sound here and collapses the pair to `ConstInt(0)`;
+        // `promote_int` then short-circuits on it and no GUARD_VALUE is
+        // recorded. `PTR_EQ` reads no memory, so the fold does not depend on
+        // which backend `self.cpu` is.
+        let cpu = self.cpu.clone();
+        let last_exc_value = self.last_exc_value;
         let eqbox_opref = {
             let ctx = self.tracing.as_mut()?;
-            ctx.recorder
-                .record_op(OpCode::PtrEq, &[vref_box, standard_box])
+            ctx.execute_and_record(
+                Some(cpu.as_ref()),
+                OpCode::PtrEq,
+                None,
+                &[vref_box, standard_box],
+                Some(majit_ir::Value::Int(isstandard_int)),
+                last_exc_value,
+            )
         };
         // pyjitpl.py: eqbox = self.implement_guard_value(eqbox, pc)
         // — pyre's `promote_int` records GUARD_VALUE on the result and
@@ -22910,6 +22972,61 @@ mod tests {
     }
 
     #[test]
+    fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
+        // `get_list_of_active_snapshot_boxes` copies a constant ref register's
+        // gcref into a raw `SnapshotTagged::Const` word, and the vable / vref
+        // lists can hold an inline `ConstPtr` operand. Both accumulate across
+        // the whole trace, so a collection during tracing must forward them.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.snapshots.push(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 4,
+                py_pc: 4,
+                boxes: vec![
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Ref),
+                    // Same bits, non-Ref type: an integer, not an address.
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
+                ],
+            }],
+            vable_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::const_ptr(GcRef(0xA000)),
+                Type::Ref,
+            )],
+            vref_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::input_arg_ref(0),
+                Type::Ref,
+            )],
+        });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
+        assert_eq!(
+            snapshot.frames[0].boxes[0],
+            crate::recorder::SnapshotTagged::Const(0xB000, Type::Ref)
+        );
+        assert_eq!(
+            snapshot.frames[0].boxes[1],
+            crate::recorder::SnapshotTagged::Const(0xA000, Type::Int)
+        );
+        assert_eq!(
+            snapshot.vable_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::const_ptr(GcRef(0xB000)), Type::Ref)
+        );
+        assert_eq!(
+            snapshot.vref_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::input_arg_ref(0), Type::Ref)
+        );
+    }
+
+    #[test]
     fn walk_active_trace_refs_noop_when_not_tracing() {
         // When `MetaInterp.tracing` is `None`, the walker is a no-op;
         // pyjitpl.py:1607 only creates `History()` while tracing is
@@ -25546,6 +25663,53 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, 99);
         assert_eq!(events[0].1, "test error");
+    }
+
+    /// `compile.py compile_trace` answers an `InvalidLoop` out of
+    /// `optimize_trace` with `debug_print('InvalidLoop in compile_new_bridge')`
+    /// followed by `return None` — the location is not retired.  The only
+    /// upstream caller of `disable_noninlinable_function`, which is what sets
+    /// `JC_DONT_TRACE_HERE`, is the `ABORT_TOO_LONG` arm of
+    /// `blackhole_if_trace_too_long` (`pyjitpl.py`).  That flag is also what
+    /// `can_inline_callable` reads, so banning here would additionally make the
+    /// function permanently non-inlinable into every other trace.
+    ///
+    /// `GUARD_OVERFLOW` behind a non-overflowing op is the optimizer's own
+    /// `InvalidLoop` (`intbounds.py optimize_GUARD_OVERFLOW`), the cheapest way
+    /// to reach the arm without building a trace the rest of the pipeline
+    /// would reject for some other reason.
+    #[test]
+    fn a_finish_trace_the_optimizer_rejects_does_not_retire_the_location() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 4242;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        let mut sum = OpRef::input_arg_int(0);
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardOverflow, &[], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+
+        let outcome = meta.finish_and_compile(&[sum], vec![Type::Int], (), false);
+        assert!(
+            outcome.is_err(),
+            "GUARD_OVERFLOW behind IntAdd must reach the optimizer's InvalidLoop"
+        );
+        assert_eq!(
+            meta.warm_state
+                .get_stats()
+                .num_disable_noninlinable_function,
+            0,
+            "an InvalidLoop must not stamp JC_DONT_TRACE_HERE — that flag is \
+             the ABORT_TOO_LONG arm's, and it also disables inlining"
+        );
     }
 
     #[test]

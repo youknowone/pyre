@@ -575,16 +575,38 @@ pub unsafe extern "C" fn PyModule_AddObjectRef(
     value: *mut CPyObject,
 ) -> c_int {
     super::object::realize_all([module, value]);
-    let Some(module) = module_argument(module, "PyModule_AddObjectRef") else {
+    // The two rejections are `src/modsupport.c PyModule_AddObjectRef`'s own,
+    // rather than the `X(): not a module` the entry points implemented in
+    // `modsupport.py` share.
+    let w_module = unsafe { pyobject::from_ref(module) };
+    if w_module.is_null() || !unsafe { pyre_object::module::is_module(w_module) } {
+        pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::TypeError,
+            "PyModule_AddObjectRef() first argument must be a module".to_owned(),
+        ));
         return -1;
-    };
-    if name.is_null() || value.is_null() {
+    }
+    if value.is_null() {
+        // A caller returning NULL is expected to say why, and that exception is
+        // the one the failure carries; the message below stands in only when
+        // there is none.
+        if !pyerrors::has_pending_error() {
+            pyerrors::set_pending_error(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "PyModule_AddObjectRef() must be called with an exception \
+                 raised if value is NULL"
+                    .to_owned(),
+            ));
+        }
+        return -1;
+    }
+    if name.is_null() {
         unsafe { pyerrors::PyErr_BadInternalCall() };
         return -1;
     }
     let key = text_or_empty(name);
     let value = unsafe { pyobject::from_ref(value) };
-    store(module, &key, value);
+    store(w_module, &key, value);
     0
 }
 

@@ -12,6 +12,18 @@ extern "C" {
 #endif
 /* slice. */
 
+/* A `slice` mirror carries its three bounds as fields, which is how an
+   extension reads them without a call: `sliceobject.py slice_attach` fills
+   them when the mirror is minted and its deallocator releases them.  They are
+   the object the slice was built with, so a bound left out is `None` rather
+   than NULL. */
+typedef struct {
+    PyObject_HEAD
+    PyObject *start;
+    PyObject *stop;
+    PyObject *step;
+} PySliceObject;
+
 /* The spelling every extension compiles against.  The exported function is the
    same composition, so a caller reaching either gets the same answer. */
 #define PySlice_GetIndicesEx(slice, length, start, stop, step, slicelen) (      \

@@ -111,6 +111,75 @@ assert m.Point.__dict__['norm'].__objclass__ is m.Point
 # An unbound descriptor takes the receiver as its first argument.
 assert m.Point.__dict__['norm'](p) == 4 * 4 + 5 * 5
 
+
+def raises(kind, message, call):
+    try:
+        call()
+    except kind as error:
+        assert str(error) == message, '%r != %r' % (str(error), message)
+    else:
+        raise AssertionError('%s was not raised: %s' % (kind.__name__, message))
+
+
+# A descriptor only applies to an instance of the type that declared it: the
+# definition it carries names an offset into that type's block, or a function
+# that casts the receiver to it.
+class Foreign:
+    pass
+
+
+foreign = Foreign()
+for kind, spelling, call in [
+    ('method', 'unbound', lambda: m.Point.__dict__['translate'](foreign, 1, 1)),
+    ('method', '__get__', lambda: m.Point.__dict__['norm'].__get__(foreign)),
+    ('member', '__get__', lambda: m.Point.__dict__['x'].__get__(foreign)),
+    ('member', '__set__', lambda: m.Point.__dict__['x'].__set__(foreign, 7)),
+    ('attribute', '__get__', lambda: m.Point.__dict__['total'].__get__(foreign)),
+    ('attribute', '__set__', lambda: m.Point.__dict__['total'].__set__(foreign, 7)),
+]:
+    name = {'method': 'norm', 'member': 'x', 'attribute': 'total'}[kind]
+    if kind == 'method' and spelling == 'unbound':
+        name = 'translate'
+    raises(
+        TypeError,
+        "descriptor '%s' for 'cpyext_types.Point' objects "
+        "doesn't apply to a 'Foreign' object" % name,
+        call,
+    )
+
+# A subclass is an instance of the declaring type, so it passes.
+assert m.Point.__dict__['norm'](m.Point3(1, 2)) == 1 * 1 + 2 * 2
+
+raises(
+    TypeError,
+    'unbound method Point.norm() needs an argument',
+    lambda: m.Point.__dict__['norm'](),
+)
+
+# ── METH_METHOD ────────────────────────────────────────────────────────
+# The row is handed the class it was declared in, and its bound carrier is
+# `builtin_method` where every other row's is `builtin_function_or_method`.
+p = m.Point(3, 4)
+assert p.declared_in(1, 2) == ('cpyext_types.Point', 3, 2, 0)
+assert p.declared_in(1, k=2) == ('cpyext_types.Point', 3, 1, 1)
+assert m.Point.declared_in(p, 1, 2) == ('cpyext_types.Point', 3, 2, 0)
+assert type(p.declared_in).__name__ == 'builtin_method'
+assert type(p.norm).__name__ == 'builtin_function_or_method'
+assert type(p.translate).__name__ == 'builtin_function_or_method'
+assert p.declared_in.__self__ is p
+# Binding names no module of its own.
+assert p.declared_in.__module__ is None
+assert p.norm.__module__ is None
+assert repr(m.Point.__dict__['declared_in']) == (
+    "<method 'declared_in' of 'cpyext_types.Point' objects>"
+)
+raises(
+    TypeError,
+    "descriptor 'declared_in' for 'cpyext_types.Point' objects "
+    "doesn't apply to a 'Foreign' object",
+    lambda: m.Point.declared_in(foreign, 1),
+)
+
 # ── tp_repr, tp_str, tp_hash, tp_call ──────────────────────────────────
 p = m.Point(3, 4)
 assert repr(p) == 'Point(3, 4)'
@@ -262,6 +331,22 @@ assert p('power', 2, 8) == 256
 assert p('negative', 5) == -5
 assert p('index', 7) == 7
 assert p('float', 7) == 7.0
+# `PyNumber_Long` is `int(o)`: a float truncates toward zero, a string or a
+# bytes object is parsed, and what has neither answer is refused.
+assert p('long', 7) == 7
+assert p('long', 12.9) == 12
+assert p('long', -12.9) == -12
+assert p('long', True) == 1
+assert p('long', '  42  ') == 42
+assert p('long', b'42') == 42
+assert p('long', 10 ** 30) == 10 ** 30
+for bad, kind in [('zz', ValueError), ([], TypeError), (None, TypeError)]:
+    try:
+        p('long', bad)
+    except kind:
+        pass
+    else:
+        raise AssertionError('%r was accepted' % (bad,))
 assert p('number_check', 7) is True
 assert p('number_check', 'x') is False
 assert p('as_ssize', 12) == 12
@@ -343,6 +428,19 @@ assert e.get() == (3, 0.5, 9), e.get()
 # The base's own storage is untouched by the extra data behind it.
 e.code = 11
 assert e.get() == (3, 0.5, 11), e.get()
+
+# The same words through descriptors whose offsets were declared relative to
+# the extra data and resolved when the type was built.
+assert e.tag == 3, e.tag
+assert e.weight == 0.5, e.weight
+e.tag = 4
+assert e.get() == (4, 0.5, 11), e.get()
+try:
+    e.weight = 1.0
+except AttributeError:
+    pass
+else:
+    raise AssertionError('a readonly member was written')
 
 module, by_def_is_module, module_name, qualified = m.type_owner(m.Extra)
 assert module is m
@@ -428,6 +526,21 @@ assert live.read(live) == b'zbc'
 assert bytes(m.Blob(b'xy')) == b'xy'
 assert bytearray(m.Blob(b'xy')) == bytearray(b'xy')
 
+# `readinto` writes into an exporter that answers only through the slot, and
+# gives the export back when it is done.
+import io
+
+target = m.Blob(b'......')
+assert io.BytesIO(b'abcdef').readinto(target) == 6
+assert target.read(target) == b'abcdef'
+assert target.exports() == 0
+
+# A short source fills a prefix and leaves the rest, and reports what it wrote.
+short = m.Blob(b'zzzz')
+assert io.BytesIO(b'ab').readinto(short) == 2
+assert short.read(short) == b'abzz'
+assert short.exports() == 0
+
 # PyObject_GetBuffer driven from C, over a C exporter and over a pyre object.
 assert m.Blob(b'').read(m.Blob(b'held')) == b'held'
 assert m.Blob(b'').read(b'plain bytes') == b'plain bytes'
@@ -438,6 +551,82 @@ except TypeError:
     pass
 else:
     raise AssertionError('a non-exporter was accepted')
+
+# ── the buffer slots of an interpreter type ────────────────────────────
+# A writable request reaches the exporter's own storage, so what C writes
+# through it is what Python reads back.
+import array
+driver = m.Blob(b'')
+target = bytearray(b'....')
+assert driver.fill(target, ord('Z')) == 4
+assert target == bytearray(b'ZZZZ')
+window = memoryview(bytearray(b'....'))
+assert driver.fill(window, ord('Q')) == 4
+assert bytes(window) == b'QQQQ'
+numbers = array.array('i', [1, 2, 3])
+assert driver.fill(numbers, 0) == 12
+assert list(numbers) == [0, 0, 0]
+
+# Read-only storage refuses a writable request rather than handing out a
+# copy that would swallow the write.
+for immutable in (b'abcd', memoryview(b'abcd')):
+    try:
+        driver.fill(immutable, ord('Z'))
+    except BufferError:
+        pass
+    else:
+        raise AssertionError('a writable export of read-only storage')
+
+# The address is the exporter's, so two exports of one object name it.
+held = bytearray(b'abcdef')
+assert driver.address(held) == driver.address(held)
+assert driver.address(held) != driver.address(bytearray(b'abcdef'))
+
+# The geometry each exporter reports: (len, itemsize, ndim, format,
+# shape[0], strides[0]).
+assert driver.describe(b'abcdef') == (6, 1, 1, 'B', 6, 1)
+assert driver.describe(bytearray(b'abc')) == (3, 1, 1, 'B', 3, 1)
+assert driver.describe(array.array('i', [1, 2])) == (8, 4, 1, 'i', 2, 4)
+assert driver.describe(memoryview(b'abcd')[1:]) == (3, 1, 1, 'B', 3, 1)
+
+# A strided export is refused by a request that cannot describe one.
+try:
+    driver.read(memoryview(b'abcdef')[::2])
+except BufferError:
+    pass
+else:
+    raise AssertionError('a strided export answered a contiguous request')
+
+# The export the acquisition holds is given back, so the exporter can be
+# resized again once C releases it.
+resizable = bytearray(b'ab')
+assert driver.read(resizable) == b'ab'
+resizable.append(ord('c'))
+assert resizable == bytearray(b'abc')
+
+# A class written in Python earns the slots from `__buffer__`, and keeps
+# its base's when it defines none.
+class Forwarding:
+    def __init__(self, payload):
+        self.payload = payload
+    def __buffer__(self, flags):
+        return memoryview(self.payload)
+
+assert driver.read(Forwarding(bytearray(b'via __buffer__'))) == b'via __buffer__'
+assert driver.fill(Forwarding(bytearray(b'..')), ord('Y')) == 2
+
+class DerivedArray(bytearray):
+    pass
+
+assert driver.read(DerivedArray(b'derived')) == b'derived'
+
+# A type that exports nothing is refused, not snapshotted.
+try:
+    driver.read([1, 2, 3])
+except TypeError:
+    pass
+else:
+    raise AssertionError('a list answered a buffer request')
 
 # ── the async table ────────────────────────────────────────────────────
 ticker = m.Ticker(3)
@@ -509,6 +698,87 @@ except ImportError:
 else:
     raise AssertionError('a missing module imported')
 
+# ── the descriptors a namespace holds ──────────────────────────────────
+
+point = m.Point(3, 4)
+
+
+def eq(name, got, want):
+    assert got == want, '%s: got %r, want %r' % (name, got, want)
+
+
+# `PyMethodDescr_Check`, and the two fields the callers that agree read off
+# the block straight afterwards.
+eq('a tp_methods row is one', m.descr_facts(m.Point.receiver),
+   (1, 'cpyext_types.Point', 'receiver'))
+eq('a bound method is not', m.descr_facts(point.receiver), (0, None, None))
+eq('a python function is not', m.descr_facts(eq), (0, None, None))
+eq('the name it carries', m.descr_name(m.Point.receiver), 'receiver')
+
+# The row reached the ordinary way binds the instance.
+eq('reached through an instance', point.receiver(), ('cpyext_types.Point', '-'))
+
+made = m.new_method_descr()
+eq('a descriptor built by hand', m.descr_facts(made),
+   (1, 'cpyext_types.Point', 'receiver'))
+eq('and it binds an instance', made.__get__(point, m.Point)(),
+   ('cpyext_types.Point', '-'))
+eq('unbound, the instance is the argument', made(point),
+   ('cpyext_types.Point', '-'))
+
+# The class-method spelling of the same row binds the class instead.
+classy = m.new_classmethod_descr()
+eq('bound to the class', classy.__get__(point, m.Point)(),
+   ('type', 'cpyext_types.Point'))
+eq('bound with no instance', classy.__get__(None, m.Point)(),
+   ('type', 'cpyext_types.Point'))
+eq('unbound, the class is the argument', classy(m.Point),
+   ('type', 'cpyext_types.Point'))
+
+try:
+    classy.__get__(None, int)
+except TypeError as error:
+    eq('a type it does not apply to', 'requires a subtype of' in str(error), True)
+else:
+    raise AssertionError('a descriptor reached through a foreign type must refuse')
+
+# A type argument that is not a type is refused rather than cast, which is
+# what makes this a `SystemError` instead of a descriptor whose `d_type` is
+# not a type at all.
+eq('a type argument that is not one', m.new_descr_bad_type(), 'SystemError')
+
+# ── classmethod and staticmethod over whatever was handed in ───────────
+
+
+def plain(*args):
+    return args
+
+
+class Holder:
+    pass
+
+
+Holder.classy = m.class_method_new(plain)
+Holder.staticy = m.static_method_new(plain)
+eq('a class method binds the class', Holder.classy(1), (Holder, 1))
+eq('a static method binds nothing', Holder.staticy(1), (1,))
+eq('reached through an instance too', Holder().classy(2), (Holder, 2))
+
+# ── a type that declares no tp_new ─────────────────────────────────────
+# `type_ready_set_new`: a static type deriving straight from `object` without a
+# constructor of its own does not take `object`'s, and refuses instantiation.
+eq('the flag is set and the slot is empty', m.sealed_flags(), (1 << 7, 0))
+sealed = m.seal(41)
+eq('the factory still builds one', sealed.token(), 41)
+eq('and its methods reach the storage', type(sealed).__name__, 'Sealed')
+try:
+    type(sealed)()
+except TypeError as error:
+    eq('the report names the type', str(error),
+       "cannot create 'cpyext_types.Sealed' instances")
+else:
+    raise AssertionError('a type with no tp_new was instantiated')
+
 print('cpyext-types-ok')
 "#;
 
@@ -565,6 +835,40 @@ after = m.owner_deallocs()
 assert after > before, f'the last Owner was not deallocated: {before} -> {after}'
 gc.collect()
 assert ref() is None, 'releasing the C reference did not let the object go'
+
+# ── and gc.collect() runs the deallocators before it returns ───────────
+# Read from C, so no bytecode runs between the collection and the count: a
+# drain left to the async action would not have happened yet.  Automatic
+# collection is off across the setup and the count is read again once it is
+# built, so a collection nobody asked for cannot be what moves the number.
+was_enabled = gc.isenabled()
+gc.disable()
+try:
+    before = m.owner_deallocs()
+    for _ in range(16):
+        m.Owner()
+    settled = m.owner_deallocs()
+    assert settled == before, f'an Owner was deallocated before the explicit collect: {before} -> {settled}'
+    during = m.collect_then_owner_deallocs()
+finally:
+    if was_enabled:
+        gc.enable()
+assert during > settled, f'gc.collect() returned before tp_dealloc ran: {settled} -> {during}'
+
+# ── a member declaring Py_AUDIT_READ reports every read ────────────────
+# Last, because a hook can never be removed once it is installed.
+import sys
+
+seen = []
+sys.addaudithook(
+    lambda event, args: seen.append(args[1]) if event == 'object.__getattr__' else None
+)
+audited = m.Extra(1)
+audited.set(5, 2.5)
+assert audited.tag == 5, audited.tag
+assert seen == [], seen
+assert audited.weight == 2.5, audited.weight
+assert seen == ['weight'], seen
 
 print('cpyext-lifetime-ok')
 "#;

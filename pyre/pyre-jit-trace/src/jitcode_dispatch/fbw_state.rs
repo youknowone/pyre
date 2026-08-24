@@ -2690,7 +2690,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
     num_regs_i: usize,
     constants_i: &[i64],
     num_regs_r: usize,
-    constants_r: &[i64],
+    constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
     callee_descr_refs: &[DescrRef],
     method_form_deferred_helpers: bool,
 ) -> CalleeReplaySafety {
@@ -2738,14 +2738,14 @@ pub(crate) fn fbw_callee_body_replay_safety(
     // holds the caller's argument.
     let mut seed_numeric_ref_regs = [false; u8::MAX as usize + 1];
     let mut seed_plain_int_ref_regs = [false; u8::MAX as usize + 1];
-    for (index, &raw) in constants_r.iter().enumerate() {
+    for (index, raw) in constants_r.iter().enumerate() {
         let Some(reg) = num_regs_r
             .checked_add(index)
             .filter(|r| *r < seed_numeric_ref_regs.len())
         else {
             break;
         };
-        let obj = raw as usize as pyre_object::PyObjectRef;
+        let obj = raw.get() as usize as pyre_object::PyObjectRef;
         if !obj.is_null() {
             let exact_int = unsafe { pyre_object::is_plain_int1(obj) };
             seed_plain_int_ref_regs[reg] = exact_int;
@@ -2886,10 +2886,30 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // `PyreHelperKind`, so `ei.pyre_helper` is `None` and every closure
             // body that reads a free variable declines here.  Admitting it is a
             // tag away, not a proof away.
+            // `load_import` is `load_global`'s narrower half: both resolve a
+            // name through `finditem_str`, but that one reads the frame's
+            // globals first -- which may be an arbitrary mapping, so it can
+            // reach a user `__getitem__` -- while this one reads only the
+            // builtins module's own dict, and only after `lookup_dunder_import`
+            // has checked `is_module`.  What is left is the collision `__eq__`
+            // `finditem_str` documents, which `load_global` already carries
+            // here, and an ImportError when the name is absent, which replays
+            // as the same error the same way `load_global`'s NameError does.
+            // It writes nothing, so re-running it commits nothing.
+            // `load_import_locals` is the other residual the same opcode emits,
+            // and the weaker claim of the two: `import_locals` reads
+            // `PyFrame.debugdata` and then `FrameDebugData.w_locals` and
+            // returns one or `None`, with no lookup, no user code and no
+            // failure to report.  Its `Plain` lowering is a statement about the
+            // optimizer's heap cache -- the two fields were never analyzed, so
+            // no empty write set may be claimed for them -- and not about
+            // replay: reading a field twice commits nothing either way.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
                     | majit_ir::PyreHelperKind::LoadGlobal
+                    | majit_ir::PyreHelperKind::LoadImport
+                    | majit_ir::PyreHelperKind::LoadImportLocals
                     | majit_ir::PyreHelperKind::BoxInt
                     | majit_ir::PyreHelperKind::NewtupleFromArray
                     | majit_ir::PyreHelperKind::NewlistFromArray

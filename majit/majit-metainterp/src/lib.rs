@@ -106,6 +106,7 @@ pub mod counter;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
+pub mod execute_and_record;
 pub mod executor;
 pub mod gc;
 pub mod graphpage;
@@ -1289,7 +1290,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 82;
+pub const MC_DIAG_SLOTS: usize = 83;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1647,14 +1648,25 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // `blackhole_if_trace_too_long` / `prepare_trace_segmenting`, never from a
     // count of aborts. `abort_count` is never reset and the banned cell is
     // exempt from `should_remove_jitcell` until it has seen a procedure token,
-    // so the ban outlives the condition that caused it. 80 counts the ban
-    // event (once per cell, where the ceiling is what sets the flag); 81 counts
+    // so the ban outlives the condition that caused it. The flag it stamps is
+    // also the one `can_inline_callable` reads, so a banned location stops
+    // being inlined as a CALLEE too; `MAX_TRACE_ABORT_COUNT` carries the
+    // measurement behind keeping the two together. 80 counts the ban event
+    // (once per cell, where the ceiling is what sets the flag); 81 counts
     // every later trace request the ceiling refuses, which is what the ban
     // costs. A zero in 80 says the ceiling is inert on this workload; a
     // nonzero 81 with a small 80 says one banned key is being asked for
     // repeatedly.
     "abort_ceiling_banned",
     "abort_ceiling_refused",
+    // A walk inside a BRIDGE session ended in `TraceAction::AbortPermanent`.
+    // The permanent arm retires the trace's green key, and a bridge's green key
+    // is the SOURCE LOOP's, so this counts the times that answer is asked for a
+    // loop that already compiled. Non-permanent since the arm learned to tell
+    // the two apart (`jitdriver.rs`), so a nonzero here is the cost the old
+    // answer would have charged: that many loops retired and made
+    // non-inlinable by an opcode reached from a guard.
+    "bridge_abort_permanent",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

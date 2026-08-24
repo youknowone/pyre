@@ -661,6 +661,15 @@ fn w_memoryview_new_with_flags_impl(
                     "cannot create a new view from a restricted memoryview",
                 ));
             }
+            // `memory_getbuf`: read-only storage cannot answer a writable
+            // request, and the wording names the view rather than what it is
+            // over because a view is what refused.
+            if flags & 0x0001 != 0 && w_memoryview_view(w_obj).readonly() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not writable",
+                ));
+            }
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
@@ -775,6 +784,9 @@ pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
 
 /// Little-endian unsigned unpack of one `itemsize`-wide element at byte
 /// offset `base` — the fallback for formats the shared decoder rejects.
+///
+/// `itemsize` is at most the width of the result; a wider item has no integer
+/// to fold into, and the caller answers with its bytes instead.
 fn memoryview_unpack(data: &[u8], itemsize: usize, base: usize) -> i64 {
     let mut val: i64 = 0;
     for j in 0..itemsize {
@@ -793,6 +805,18 @@ fn memoryview_format_code(fmt: &str) -> u8 {
         Some(b'@' | b'=' | b'<' | b'>' | b'!') => b.get(1).copied().unwrap_or(b'B'),
         Some(&c) => c,
         None => b'B',
+    }
+}
+
+/// `memoryobject.c adjust_fmt` — the one character a format an element can be
+/// read or written through is, with a leading `@` stripped.  Anything else
+/// names a compound item, which a view does not take apart.
+fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
+    match fmt.strip_prefix('@').unwrap_or(fmt).len() {
+        1 => Ok(()),
+        _ => Err(crate::PyError::not_implemented(format!(
+            "memoryview: unsupported format {fmt}"
+        ))),
     }
 }
 
@@ -816,10 +840,16 @@ unsafe fn memoryview_unpack_element(
         }
         tc => {
             let w = pyre_object::interp_array::unpack_value(tc, buf);
-            if w == pyre_object::PY_NULL {
+            if w != pyre_object::PY_NULL {
+                w
+            } else if itemsize <= size_of::<i64>() {
                 w_int_new(memoryview_unpack(data, itemsize, base))
             } else {
-                w
+                // An item wider than the fold above: its bytes, which is all
+                // the one caller still reaching here needs.  `==` compares
+                // element by element and every other operation has refused
+                // the format by now (`memoryview_adjust_fmt`).
+                pyre_object::bytesobject::w_bytes_from_bytes(buf)
             }
         }
     }
@@ -1155,6 +1185,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return memoryview_slice_view(mv, index);
         }
         if index_check(index) {
+            memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
                     "invalid indexing of 0-dim memory",
@@ -1191,6 +1222,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
             if all_index {
+                memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
                 let length = pyre_object::w_tuple_len(index) as i64;
                 if length < ndim {
                     return Err(crate::PyError::not_implemented(
@@ -1239,6 +1271,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
         if w_memoryview_readonly(mv) {
             return Err(crate::PyError::type_error("cannot modify read-only memory"));
         }
@@ -1419,6 +1452,7 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         crate::baseobjspace::iter(w_list_new(memoryview_values(mv)))
     }
 }
@@ -1597,6 +1631,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let mv = args.first().copied().unwrap_or(w_none());
     unsafe {
         memoryview_check_released(mv)?;
+        memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if ndim == 0 {
             // `buffer.py w_tolist` raises for a 0-dim view.
@@ -1898,7 +1933,7 @@ unsafe fn memoryview_call_python_release_unraisable(
                 w_none(),
                 rustpython_wtf8::Wtf8::new(
                     format!(
-                        "Exception ignored in __release_buffer__ of {}:",
+                        "Exception ignored in __release_buffer__ of {}",
                         crate::baseobjspace::object_functionstr_type_name(r_exporter)
                     )
                     .as_str(),
@@ -3715,7 +3750,8 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
         // `baseobjspace.py:730` keeps that same object as
         // `space.w_default_importlib_import`.
-        let w_import = make_module_builtin_function("__import__", builtin_dunder_import);
+        let w_import =
+            make_module_builtin_function("__import__", __pyre_wrap_builtin_dunder_import);
         crate::importing::set_default_importlib_import(w_import);
         w_import
     });
@@ -4641,7 +4677,8 @@ unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__abs__") })
+    let Some((src, _)) =
+        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__abs__") })
     else {
         return true;
     };
@@ -4667,10 +4704,8 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let Some(tp) = crate::typedef::r#type(obj) else {
             return Err(abs_bad_operand(obj));
         };
-        // Uncached MRO walk: the method cache projects only the value half
-        // and a stale slot would resolve a heap-type override back to
-        // `int.__abs__`.
-        match crate::baseobjspace::lookup_where(tp.as_ptr(), "__abs__") {
+        // typeobject.py `lookup` = `lookup_where_with_method_cache`.
+        match crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__abs__") {
             Some((src, method))
                 if [
                     &pyre_object::INT_TYPE,
@@ -5040,6 +5075,11 @@ pub(crate) fn clinic_arity(
 /// keywords by parameter name without a per-function `Signature`; the
 /// `#[pyre_function]` wrapper supplies the name/required tables it knows
 /// at expansion time.
+// PyPy: `Arguments._match_signature` (`pypy/interpreter/argument.py`)
+// is `@jit.unroll_safe`.  The loops below are bounded by the builtin's static
+// signature and argument count in the same way; without the hint the JIT
+// policy residualizes this gateway step and cannot descend into the builtin.
+#[majit_macros::unroll_safe]
 pub(crate) fn bind_builtin_kwargs(
     args: &[PyObjectRef],
     names: &[&str],
@@ -5052,12 +5092,27 @@ pub(crate) fn bind_builtin_kwargs(
     // leaves an omitted one `PY_NULL`; a positional-only registration hands
     // the body just the arguments the call made. Reading a null slot as an
     // argument that was not passed makes the two registrations bind alike.
-    let supplied = positional.iter().filter(|v| !v.is_null()).count();
+    let mut supplied = 0;
+    let mut positional_index = 0;
+    while positional_index < positional.len() {
+        if !positional[positional_index].is_null() {
+            supplied += 1;
+        }
+        positional_index += 1;
+    }
+    let mut required_count = 0;
+    let mut required_index = 0;
+    while required_index < required.len() {
+        if required[required_index] {
+            required_count += 1;
+        }
+        required_index += 1;
+    }
     clinic_arity(
         fn_name,
         supplied,
         real_kwarg_count(kwargs),
-        required.iter().filter(|r| **r).count(),
+        required_count,
         names.len(),
         0,
     )?;
@@ -5066,18 +5121,47 @@ pub(crate) fn bind_builtin_kwargs(
     // `argument.py` keys the message off `space.text_w(keyword_names_w[i])`,
     // the keyword's own storage, so a name carrying a lone surrogate reaches
     // `e.args[0]` intact. Keep the WTF-8 rather than a lossy `String`.
-    let mut unknown: Option<Wtf8Buf> = None;
-    for (i, &v) in positional.iter().enumerate() {
-        scope[i] = v;
-        filled[i] = !v.is_null();
+    let keyword_entries = kwargs.map(|dict| unsafe { pyre_object::w_dict_str_entries_wtf8(dict) });
+    let mut unknown: Option<usize> = None;
+    // PyPy `_match_signature` copies positional values with
+    // `take = min(num_args, co_argcount - upfront)` and `for i in range(take)`,
+    // so the constant signature bounds let the JIT unroll ordinary indexed
+    // reads. Keep that storage shape instead of Rust iterator adapters, whose
+    // `Filter`/`Enumerate` state has no RPython counterpart — and keep the
+    // `min`: `scope` and `filled` are `names.len()` long, while `clinic_arity`
+    // bounds the count of non-null entries rather than the slice itself, so a
+    // null-padded `positional` longer than the signature reaches here.
+    let take = positional.len().min(names.len());
+    let mut positional_index = 0;
+    while positional_index < take {
+        let value = positional[positional_index];
+        scope[positional_index] = value;
+        filled[positional_index] = !value.is_null();
+        positional_index += 1;
     }
-    if let Some(dict) = kwargs {
-        let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
-        for (key, val) in entries.iter() {
-            if key.as_str() == Ok("__pyre_kw__") {
+    if let Some(entries) = keyword_entries.as_ref() {
+        let mut entry_index = 0;
+        while entry_index < entries.len() {
+            let (key, val) = &entries[entry_index];
+            let key_str = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(key) } {
+                Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(key) })
+            } else {
+                None
+            };
+            if key_str == Some("__pyre_kw__") {
+                entry_index += 1;
                 continue;
             }
-            match names.iter().position(|n| key.as_str() == Ok(*n)) {
+            let mut matched_index = None;
+            let mut name_index = 0;
+            while name_index < names.len() {
+                if key_str == Some(names[name_index]) {
+                    matched_index = Some(name_index);
+                    break;
+                }
+                name_index += 1;
+            }
+            match matched_index {
                 Some(idx) => {
                     if filled[idx] {
                         return Err(crate::PyError::type_error(format!(
@@ -5093,27 +5177,47 @@ pub(crate) fn bind_builtin_kwargs(
                 // so a call that misses a required argument is reported
                 // against that argument even when it also passed a keyword
                 // the function does not know.
-                None => unknown = Some(key.to_wtf8_buf()),
+                None => unknown = Some(entry_index),
             }
+            entry_index += 1;
         }
     }
-    for i in 0..names.len() {
-        if !filled[i] && required[i] {
+    let mut name_index = 0;
+    while name_index < names.len() {
+        if !filled[name_index] && required[name_index] {
             return Err(crate::PyError::type_error(format!(
                 "{fn_name}() missing required argument '{}' (pos {})",
-                names[i],
-                i + 1,
+                names[name_index],
+                name_index + 1,
             )));
         }
+        name_index += 1;
     }
-    if let Some(key) = unknown {
-        let mut msg =
-            Wtf8Buf::from_string(format!("{fn_name}() got an unexpected keyword argument '"));
-        msg.push_wtf8(&key);
-        msg.push_str("'");
-        return Err(crate::PyError::type_error(msg));
+    if let Some(entry_index) = unknown {
+        let entries = keyword_entries
+            .as_ref()
+            .expect("an unknown keyword index requires keyword entries");
+        return builtin_unexpected_keyword_failure(fn_name, &entries[entry_index].0);
     }
     Ok(scope)
+}
+
+/// Cold `Arguments._match_signature` unexpected-keyword formatter.
+///
+/// PyPy retains an `ArgErrUnknownKwds` until the gateway converts it to the
+/// final `TypeError`, so accepted calls never trace WTF-8 string assembly.
+/// Keep the same boundary here; the hot binder carries only the offending
+/// entry index and reaches this residual helper after missing-required checks.
+#[cold]
+#[majit_macros::dont_look_inside]
+pub(crate) fn builtin_unexpected_keyword_failure(
+    fn_name: &str,
+    key: &rustpython_wtf8::Wtf8,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let mut msg = Wtf8Buf::from_string(format!("{fn_name}() got an unexpected keyword argument '"));
+    msg.push_wtf8(key);
+    msg.push_str("'");
+    Err(crate::PyError::type_error(msg))
 }
 
 /// Resolve a builtin with a single required positional-or-keyword parameter
@@ -10585,7 +10689,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
         if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__float__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__float__") }
         {
             let result = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -10616,7 +10720,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
         if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__index__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__index__") }
         {
             let r = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
@@ -13879,6 +13983,10 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // emit and read the answer back out of its slot.
         let _roots = pyre_object::gc_roots::push_roots();
         let res_slot = pyre_object::gc_roots::pin_roots(&[w_res]);
+        // The pin normalizes, and its query is itself a safepoint, so `w_res`
+        // is dead from here on: what the hooks are handed has to come out of
+        // the slot, not out of the copy that named the object beforehand.
+        let w_res = pyre_object::gc_roots::shadow_stack_get(res_slot);
         crate::module::sys::vm::audit("builtins.id", &[w_res])?;
         return Ok(pyre_object::gc_roots::shadow_stack_get(res_slot));
     }
@@ -16152,6 +16260,10 @@ pub(crate) struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
+    /// A `memoryview` this acquisition made itself, over an exporter that
+    /// answers only through `bf_getbuffer`.  Nobody else holds it, so the
+    /// export it took ends here rather than whenever it is collected.
+    made_view: bool,
     address: *mut u8,
     length: usize,
 }
@@ -16165,7 +16277,7 @@ impl WritableBuffer {
         let roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let (data, owner) =
+        let (data, owner, made_view) =
             unsafe { fileio_writebuf(pyre_object::gc_roots::shadow_stack_get(obj_slot))? };
         let _ = pyre_object::gc_roots::pin_root(owner);
         let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -16173,6 +16285,7 @@ impl WritableBuffer {
         let held = unsafe { buffer_export_incref(owner) };
         Ok(Self {
             _roots: roots,
+            made_view,
             owner_slot,
             held,
             address: data.as_mut_ptr(),
@@ -16187,9 +16300,15 @@ impl WritableBuffer {
 
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
+        let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
         if self.held {
-            let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
             unsafe { buffer_export_decref(owner) };
+        }
+        if self.made_view {
+            // The count above is what a release refuses over, so it goes
+            // first.  A failure has nowhere to be reported and nothing to
+            // report: the view is this one's own and no caller named it.
+            let _ = memoryview_release(&[owner]);
         }
     }
 }
@@ -16198,7 +16317,7 @@ impl Drop for WritableBuffer {
 /// writable exporters; a memoryview contributes its exact contiguous window.
 unsafe fn fileio_writebuf(
     obj: PyObjectRef,
-) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
         // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
         // type.  CPython 3.14's readinto gateways keep the same information
@@ -16211,12 +16330,17 @@ unsafe fn fileio_writebuf(
 
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
-            return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
+            return Ok((
+                pyre_object::bytearrayobject::w_bytearray_data_mut(obj),
+                obj,
+                false,
+            ));
         }
         if pyre_object::interp_array::is_array(obj) {
             return Ok((
                 pyre_object::interp_array::w_array_vec_mut(obj).as_mut_slice(),
                 obj,
+                false,
             ));
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
@@ -16226,6 +16350,7 @@ unsafe fn fileio_writebuf(
                 return Ok((
                     std::slice::from_raw_parts_mut(address as *mut u8, length),
                     obj,
+                    false,
                 ));
             }
         }
@@ -16235,7 +16360,7 @@ unsafe fn fileio_writebuf(
         {
             let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
             if offset <= full.len() && length <= full.len() - offset {
-                return Ok((&mut full[offset..offset + length], backing));
+                return Ok((&mut full[offset..offset + length], backing, false));
             }
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
@@ -16255,7 +16380,25 @@ unsafe fn fileio_writebuf(
                     "memoryview buffer is no longer valid",
                 ));
             }
-            return Ok((&mut full[offset..offset + length], obj));
+            return Ok((&mut full[offset..offset + length], obj, false));
+        }
+        // An exporter whose storage only `bf_getbuffer` names -- a type an
+        // extension defined -- is asked for a writable window and answers with
+        // one this layer then reads as any other view.  The request is what
+        // decides: an exporter with nothing writable refuses it, and the
+        // refusal is the argument error the arms above raise.
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        if crate::cpyext::buffer::exports_buffer(obj) {
+            let Ok(view) = w_memoryview_new_with_flags(obj, 0x0001) else {
+                return Err(type_error(obj));
+            };
+            let _ = pyre_object::gc_roots::pin_root(view);
+            let (data, owner, _) = fileio_writebuf(view)?;
+            return Ok((data, owner, true));
         }
         Err(type_error(obj))
     }
@@ -18582,7 +18725,8 @@ unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__round__") })
+    let Some((src, _)) =
+        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__round__") })
     else {
         return true;
     };
@@ -18717,7 +18861,7 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
     if let Some(tp) = crate::typedef::r#type(obj)
         && !slot
         && let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where(tp.as_ptr(), "__round__") }
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__round__") }
     {
         let result = unsafe {
             match ndigits {
@@ -19216,14 +19360,13 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     } else {
         space_index_w(level_obj)?
     };
-    let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            std::ptr::null::<crate::PyExecutionContext>()
-        } else {
-            unsafe { (*frame).execution_context }
-        }
-    });
+    // PyPy's `interp___import__` receives `space` and any slow native-import
+    // fallback reaches the execution context through
+    // `space.getexecutioncontext()`.  Do not recover it from pyre's
+    // portal-level CURRENT_FRAME TLS: an inlined callee has its own red frame,
+    // while that anchor can still name the caller.  The established
+    // object-space analogue owns the shared execution context directly.
+    let exec_ctx = crate::call::getexecutioncontext();
     // The native importer keys every lookup by `&str`, so a name that has no
     // such spelling goes straight to the app-level bootstrap.  Re-read the
     // name through its root: `space_index_w` above may have moved it.
@@ -19235,6 +19378,30 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     crate::importing::dunder_import(name, globals, locals, fromlist, level, exec_ctx)
 }
+
+/// Gateway target for `builtins.__import__`.
+///
+/// PyPy exposes `interp___import__` through `interp2app`; its generated
+/// `BuiltinCode.func` wrapper is therefore a member of the annotator's PBC
+/// family and the meta-interpreter can descend through it.  Hand-written
+/// builtins have to publish that wrapper explicitly in pyre (the same shape
+/// used by `__pyre_wrap_builtin_len` below), otherwise an `IMPORT_NAME`
+/// reached through the ordinary CALL path stops at an opaque native function
+/// pointer instead of tracing `dunder_import` / `gcd_import_fast`.
+pub fn __pyre_wrap_builtin_dunder_import(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    builtin_dunder_import(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_dunder_import"),
+        func: __pyre_wrap_builtin_dunder_import,
+    };
 
 #[cfg(test)]
 mod tests {

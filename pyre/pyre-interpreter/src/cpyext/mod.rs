@@ -19,10 +19,15 @@ pub mod buffer;
 pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod capsule;
+pub mod cdatetime;
 pub mod complexobject;
+pub mod contextvars;
+pub mod csources;
 pub mod dictobject;
+pub mod eval;
 pub mod exception;
 pub mod floatobject;
+pub mod frameobject;
 pub mod funcobject;
 pub mod gc;
 pub mod genericaliasobject;
@@ -41,9 +46,11 @@ pub mod pyerrors;
 pub mod pymem;
 pub mod pyobject;
 pub mod pystate;
+pub mod pystrtod;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
+pub mod structobject;
 pub mod sysmodule;
 pub mod tupleobject;
 pub mod typeobject;
@@ -205,7 +212,13 @@ pub fn after_fork_child() {
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
         bytesobject::after_fork_child();
+        frameobject::after_fork_child();
+        pyerrors::after_fork_child();
+        cdatetime::after_fork_child();
         gc::after_fork_child();
+        buffer::after_fork_child();
+        pystate::after_fork_child();
+        dictobject::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
     // half-finished import must not name the next module created here.
@@ -779,10 +792,13 @@ pub fn ensure_linked() {
     std::hint::black_box(&raw const pyobject::_Py_FalseStruct);
     std::hint::black_box(&raw const pyobject::_Py_NotImplementedStruct);
     std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
+    csources::ensure_linked();
     pyobject::ensure_linked();
     pystate::ensure_linked();
+    pystrtod::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
+    cdatetime::ensure_linked();
     osmodule::ensure_linked();
     warnings::ensure_linked();
     exception::ensure_linked();
@@ -797,6 +813,7 @@ pub fn ensure_linked() {
     sliceobject::ensure_linked();
     sysmodule::ensure_linked();
     modsupport::ensure_linked();
+    methodobject::ensure_linked();
     object::ensure_linked();
     longobject::ensure_linked();
     floatobject::ensure_linked();
@@ -813,4 +830,122 @@ pub fn ensure_linked() {
     mapping::ensure_linked();
     iterator::ensure_linked();
     buffer::ensure_linked();
+    eval::ensure_linked();
+    contextvars::ensure_linked();
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every source file under `src/cpyext`, by name.
+    fn sources() -> Vec<(String, String)> {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cpyext");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&directory)
+            .expect("src/cpyext is readable")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| path.extension().is_some_and(|kind| kind == "rs"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .into_owned();
+                (name, std::fs::read_to_string(&path).expect("a source file"))
+            })
+            .collect();
+        assert!(!sources.is_empty(), "no sources at {}", directory.display());
+        sources.sort();
+        sources
+    }
+
+    /// A lock a forked child inherits from a thread it does not have is reset
+    /// before anything acquires it, and `reinit_after_fork` is the only way to
+    /// do that.  One declared without a reset hangs the child on its first
+    /// acquisition, which is a deadlock rather than an error.
+    ///
+    /// The `BoundFamily.taken` locks are a field of a table rather than a
+    /// static of their own; `typeobject::after_fork_child` walks
+    /// `BOUND_FAMILIES` to reach them.
+    #[test]
+    fn every_fork_lock_is_reset_in_the_child() {
+        let sources = sources();
+        let whole: String = sources.iter().map(|(_, text)| text.as_str()).collect();
+        let mut checked = 0;
+        for (file, text) in &sources {
+            for line in text.lines() {
+                let Some(declaration) = line.trim_start().strip_prefix("static ") else {
+                    continue;
+                };
+                if !declaration.contains("ForkMutex<")
+                    && !declaration.contains("ForkExtensionLoadLock")
+                {
+                    continue;
+                }
+                let (name, _) = declaration.split_once(':').expect("a typed static");
+                assert!(
+                    whole.contains(&format!("{name}.reinit_after_fork()")),
+                    "{file} declares {name}, and nothing resets it after a fork",
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no fork locks found to check");
+    }
+
+    /// Resetting a module's own locks is only reached if [`after_fork_child`]
+    /// calls that module.
+    #[test]
+    fn every_module_after_fork_child_is_called() {
+        let sources = sources();
+        let (_, root) = sources
+            .iter()
+            .find(|(name, _)| name == "mod.rs")
+            .expect("cpyext/mod.rs");
+        let body = root
+            .split_once("pub fn after_fork_child() {")
+            .expect("the entry point")
+            .1
+            .split_once("\n}\n")
+            .expect("its end")
+            .0;
+        for (file, text) in &sources {
+            // The entry point's own file names both spellings, in this test.
+            if file == "mod.rs" || !text.contains("pub(super) unsafe fn after_fork_child()") {
+                continue;
+            }
+            let module = file.strip_suffix(".rs").expect("a Rust source");
+            assert!(
+                body.contains(&format!("{module}::after_fork_child()")),
+                "{file} has an after_fork_child that cpyext::after_fork_child never calls",
+            );
+        }
+    }
+
+    /// An entry point is only in the binary because something names it, and
+    /// `ensure_linked` is what does the naming.  A module's own list is
+    /// reached only if [`ensure_linked`] calls it.
+    #[test]
+    fn every_module_ensure_linked_is_called() {
+        let sources = sources();
+        let (_, root) = sources
+            .iter()
+            .find(|(name, _)| name == "mod.rs")
+            .expect("cpyext/mod.rs");
+        let body = root
+            .split_once("pub fn ensure_linked() {")
+            .expect("the entry point")
+            .1
+            .split_once("\n}\n")
+            .expect("its end")
+            .0;
+        for (file, text) in &sources {
+            if file == "mod.rs" || !text.contains("pub(super) fn ensure_linked()") {
+                continue;
+            }
+            let module = file.strip_suffix(".rs").expect("a Rust source");
+            assert!(
+                body.contains(&format!("{module}::ensure_linked()")),
+                "{file} has an ensure_linked that cpyext::ensure_linked never calls",
+            );
+        }
+    }
 }

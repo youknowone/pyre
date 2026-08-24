@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-interpreted
 # Self-checking guard for the other half of the local-tracing contract: a
 # global tracer that RETURNS ITSELF, so `_trace` (executioncontext.py) installs
 # it as `w_f_trace` on every frame it sees a `call` event for, and the loop
@@ -63,9 +64,17 @@ def main():
     if acc != N * (N - 1) // 2:
         failures.append(f"acc: got {acc!r}, want {N * (N - 1) // 2!r}")
 
-    counts = {}
-    for event in events:
-        counts[event] = counts.get(event, 0) + 1
+    # Counted with `list.count` rather than a `for` loop on purpose.  A
+    # bookkeeping loop here is long enough to become hot and compile, and
+    # `run_selfcheck`'s JIT floor is corpus-level (`loops_compiled >= 1`), not
+    # "the loop under test compiled" -- so it would be satisfied by this loop
+    # while the loop the fixture is about never compiles, which is exactly the
+    # vacuous pass the floor exists to catch.  Measured: with the loop here the
+    # run reports `loops_compiled=1`, without it `0`.
+    counts = {
+        key: events.count(key)
+        for key in (("line", 3), ("line", 2), ("call", 0), ("return", 4))
+    }
     body = counts.get(("line", 3), 0)
     if body != N:
         failures.append(f"loop body: got {body!r} line events, want exactly {N!r}")

@@ -1478,33 +1478,41 @@ fn walk_jitcode_constants_refs_in(
         // `_remember_young_pointer_inlined` puts the written-to object on
         // `old_objects_pointing_to_young`, and the remembered set is scanned at
         // every minor, so the entry is kept and forwarded.  `constants_r` is a
-        // bare Rust `Vec<i64>` with no GC header to carry
+        // bare Rust `Vec` with no GC header to carry
         // GCFLAG_TRACK_YOUNG_PTRS, so this walker IS pyre's remembered set for
         // it, and owes both halves: drag the object out, and store back where
         // it went.
         //
-        // Sound for the same reason the `RefCell::as_ptr` read above is: the
-        // walk runs on the collecting thread with the owning mutator quiesced.
+        // The store goes through `ConstSlotR::set`, whose receiver is `&self`.
+        // By the time the walk runs the body is published behind an `Arc` and
+        // there is no `&mut` route to it, so a `*mut` cast out of
+        // `Vec::as_ptr()` would be a write through shared-reference provenance
+        // — undefined, and free to be compiled as if the slot still held the
+        // pre-write value, which is the stale GC reference this walker exists
+        // to prevent. Interior mutability makes the store well-defined instead
+        // of relying on it happening to survive optimisation.
+        //
         // `METAINTERP_SD` is thread-local while `Arc<RuntimeJitCode>` is not,
         // so two threads' areas can present the same slot; the second visit
         // reads an address that is no longer a nursery start and is a no-op.
+        // That is also why the slot is an `AtomicI64` and not a `Cell`.
         //
         // The pool also carries words that are not gcrefs at all — patched
         // host-static addresses and pre-patch STR sentinels.  `drag_out_root`
         // and `seed_major_root` reject them before any deref, which is what
         // makes handing them the whole pool safe; a fast path that pre-filtered
         // the slots would have to reproduce those gates.
-        let pool = jc.payload.jitcode.constants_r.as_ptr() as *mut i64;
+        let pool = jc.payload.jitcode.constants_r.as_slice();
         for pool_slot in 0..pool_len {
-            let cell = unsafe { pool.add(pool_slot) };
-            let mut gcref = majit_ir::GcRef(unsafe { *cell } as usize);
+            let cell = &pool[pool_slot];
+            let mut gcref = majit_ir::GcRef(cell.get() as usize);
             let before = gcref.0;
             if probe {
                 probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
             }
             visitor(&mut gcref);
             if gcref.0 != before {
-                unsafe { *cell = gcref.0 as i64 };
+                cell.set(gcref.0 as i64);
             }
             if probe {
                 PROBE14_SLOTS.fetch_add(1, Relaxed);
@@ -1616,7 +1624,8 @@ pub(crate) fn sub_jitcode_body_for_code(
             num_regs_i: jc.num_regs_i() as usize,
             num_regs_f: jc.num_regs_f() as usize,
             constants_i: &*(jc.constants_i.as_slice() as *const [i64]),
-            constants_r: &*(jc.constants_r.as_slice() as *const [i64]),
+            constants_r: &*(jc.constants_r.as_slice()
+                as *const [majit_translate::codewriter::jitcode::ConstSlotR]),
             constants_f: &*(jc.constants_f.as_slice() as *const [i64]),
         }
     })
@@ -6755,7 +6764,14 @@ impl PyreSym {
                 runtime_jc.num_regs_r() as usize,
                 runtime_jc.num_regs_f() as usize,
                 runtime_jc.constants_i.clone(),
-                runtime_jc.constants_r.clone(),
+                // Snapshot the pool's current values: `copy_constants`
+                // seeds a register file and never writes back, so it wants
+                // plain words, not the live interior-mutable slots.
+                runtime_jc
+                    .constants_r
+                    .iter()
+                    .map(|slot| slot.get())
+                    .collect::<Vec<i64>>(),
                 runtime_jc.constants_f.clone(),
             )
         };
@@ -14000,7 +14016,7 @@ mod tests {
         runtime_jc.body_mut().c_num_regs_r = 4;
         runtime_jc.body_mut().c_num_regs_f = 2;
         runtime_jc.body_mut().constants_i = vec![100, 200];
-        runtime_jc.body_mut().constants_r = vec![0xAABB_CCDD_u64 as i64];
+        runtime_jc.body_mut().constants_r = vec![(0xAABB_CCDD_u64 as i64).into()];
         runtime_jc.body_mut().constants_f = vec![3.25_f64.to_bits() as i64];
 
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());

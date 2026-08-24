@@ -920,6 +920,30 @@ fn disable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
     }
 }
 
+/// Release the mirrors the collection queued, the way `interp_gc.py collect`
+/// ends with `_rawrefcount_perform` — "perform dealloc callbacks now, instead
+/// of waiting for the next AsyncAction to fire".  A `tp_dealloc` is then part
+/// of the `gc.collect()` that freed its object rather than of whatever runs
+/// next; `PyObjDeallocAction` stays registered and still drains what an
+/// automatic collection queues.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn run_cpyext_deallocs_now() {
+    crate::cpyext::pyobject::drain_dead();
+}
+
+/// The builds with no mirrors to release — upstream reaches its
+/// `_rawrefcount_perform` only under `usemodules.cpyext`.
+#[cfg(not(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+fn run_cpyext_deallocs_now() {}
+
 fn run_finalizers_now() {
     if let Some(action) = user_del_action() {
         let temp_reenable = !action.enabled_at_app_level;
@@ -1383,6 +1407,7 @@ crate::py_module! {
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
             run_finalizers_now();
+            run_cpyext_deallocs_now();
             // The return value is the caller-observable axis and is an int.
             // A collector that never counts unreachable objects has no count
             // to report, so the constant `interp_gc.py:48` carries is what it

@@ -2106,36 +2106,6 @@ impl TraceCtx {
         opref.inline_const_to_value()
     }
 
-    /// Constant-fold a pure field read on a constant object pointer.
-    /// If `obj` is a constant and `descr` is immutable, reads the field
-    /// at runtime and returns the value as a constant OpRef.
-    pub fn try_const_fold_pure_field(
-        &mut self,
-        obj: OpRef,
-        descr: &dyn majit_ir::Descr,
-    ) -> Option<OpRef> {
-        if !descr.is_always_pure() {
-            return None;
-        }
-        let obj_ptr = self.const_value(obj)? as usize;
-        if obj_ptr == 0 {
-            return None;
-        }
-        let fd = descr.as_field_descr()?;
-        let offset = fd.offset();
-        let field_size = fd.field_size();
-        let value = unsafe {
-            let base = obj_ptr as *const u8;
-            match field_size {
-                8 => *(base.add(offset) as *const i64),
-                4 if fd.is_field_signed() => *(base.add(offset) as *const i32) as i64,
-                4 => *(base.add(offset) as *const u32) as i64,
-                _ => return None,
-            }
-        };
-        Some(self.const_int(value))
-    }
-
     /// M1 bridge: translate a pyre `OpRef` into the `opencoder::Box` that
     /// `TraceRecordBuffer::record_op(&[Box], descr)` expects.
     ///
@@ -3692,12 +3662,16 @@ impl TraceCtx {
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
                 let descr = info.static_field_descr(field_index);
-                // pyjitpl.py `gen_store_back_in_vable`.
-                self.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-                self.profiler()
-                    .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                self.vable_setfield_descr(vable_opref, value, descr);
+                // pyjitpl.py `gen_store_back_in_vable`. A store has no
+                // `resvalue` and `SETFIELD_GC` is never pure, so no cpu.
+                self.execute_and_record(
+                    None,
+                    OpCode::SetfieldGc,
+                    Some(descr),
+                    &[vable_opref, value],
+                    None,
+                    0,
+                );
             }
         }
 
@@ -3710,11 +3684,14 @@ impl TraceCtx {
             for item_index in 0..len {
                 if let Some(&value) = boxes.get(flat_box_index) {
                     let index = self.const_int(item_index as i64);
-                    self.profiler()
-                        .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
-                    self.profiler()
-                        .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
-                    self.vable_setarrayitem_descr(array_ref, index, value, array_descr.clone());
+                    self.execute_and_record(
+                        None,
+                        OpCode::SetarrayitemGc,
+                        Some(array_descr.clone()),
+                        &[array_ref, index, value],
+                        None,
+                        0,
+                    );
                 }
                 flat_box_index += 1;
             }
@@ -3858,22 +3835,26 @@ impl TraceCtx {
             (token_descr, clear_ptr, clear_descr)
         };
         //     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
-        // pyjitpl.py `emit_force_virtualizable`.
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let tokenbox = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], token_descr);
+        // pyjitpl.py `emit_force_virtualizable`. Neither read carries a
+        // trace-time concrete, so both pass `resvalue: None` — which closes
+        // the fold and leaves no reader for a cpu to be.
+        let tokenbox = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(token_descr),
+            &[vable_opref],
+            None,
+            0,
+        );
         //     condbox = mi.execute_and_record(rop.PTR_NE, None, tokenbox, CONST_NULL)
         let null_ref = self.const_null();
-        self.profiler()
-            .count_ops(OpCode::PtrNe, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::PtrNe, crate::counters::RECORDED_OPS);
-        let condbox = self.record_op(OpCode::PtrNe, &[tokenbox, null_ref]);
+        let condbox =
+            self.execute_and_record(None, OpCode::PtrNe, None, &[tokenbox, null_ref], None, 0);
         let funcbox = self.const_int(clear_ptr as i64);
         //     self.execute_varargs(rop.COND_CALL, [condbox, funcbox, box],
         //                          calldescr, False, False)
+        // `execute_varargs`, not `execute_and_record`: `COND_CALL_N` is inside
+        // the can-raise range, which the funnel refuses.
         self.profiler()
             .count_ops(OpCode::CondCallN, crate::counters::OPS);
         self.profiler()
@@ -4016,18 +3997,29 @@ impl TraceCtx {
             // guard descr via `num_live` (live-var count), not pc, so the
             // parameter is documented here but not consumed at this layer.
             let _ = pc;
-            // pyjitpl.py `_nonstandard_virtualizable` execute leg.
-            self.profiler()
-                .count_ops(OpCode::PtrEq, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::PtrEq, crate::counters::RECORDED_OPS);
-            let eqbox = self.record_op(OpCode::PtrEq, &[vable_opref, standard_box]);
             let isstandard: i64 = if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref())
             {
                 1
             } else {
                 0
             };
+            // pyjitpl.py `_nonstandard_virtualizable` execute leg. Step 3
+            // already returned for `standard_box is box`, so two constants
+            // arriving here are *different* constants and cannot be equal at
+            // runtime either — the fold to `ConstInt(0)` is sound, and
+            // `promote_int` then short-circuits it into no GUARD_VALUE.
+            // `PTR_EQ` reads no memory, so the fold does not depend on which
+            // backend answers; `TraceCtx` holds no `Cpu`, so the default one
+            // stands in.
+            let cpu = crate::cpu::default_cpu();
+            let eqbox = self.execute_and_record(
+                Some(cpu.as_ref()),
+                OpCode::PtrEq,
+                None,
+                &[vable_opref, standard_box],
+                Some(Value::Int(isstandard)),
+                0,
+            );
             self.promote_int(eqbox, isstandard, 0);
             if isstandard != 0 {
                 // pyjitpl.py:1140-1142 `if box.type == 'r':
@@ -4191,12 +4183,17 @@ impl TraceCtx {
             );
             return cached;
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let op =
-            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr.clone());
+        // The array base is stamped after the fact by
+        // `stamp_vable_array_base`, not handed in, so there is no `resvalue`
+        // for the funnel to fold against and no reader for a cpu to be.
+        let op = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(record_descr.clone()),
+            &[vable_opref],
+            None,
+            0,
+        );
         let vable_concrete = self.concrete_of_opref(vable_opref);
         self.stamp_vable_array_base(op, vable_concrete, &record_descr);
         self.heapcache_getfield_now_known(vable_opref, field_index, op);
@@ -4215,6 +4212,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_int(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4261,27 +4259,32 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
-            // the standard heap operation.
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
             // pyre stamps the frontend value slot for `op` with the live
             // load so subsequent `box_value(op)` sees the
             // executor-returned payload (RPython `IntFrontendOp(pos,
-            // intval)` construction-time field assignment).
+            // intval)` construction-time field assignment).  It is the
+            // funnel's `resvalue`, so the load runs before the record;
+            // `None` — no struct pointer, or an unwired backend — records
+            // without folding.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
+            // the standard heap operation.  GETFIELD_GC_I is not an OVF
+            // opcode, so the funnel never reads `last_exc_value` and 0 names
+            // no copy of it.
+            let op = self.execute_and_record(
+                Some(cpu),
+                OpCode::GetfieldGcI,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4299,18 +4302,56 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        // Fallback for tests/missing layout
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
+        // Fallback for tests/missing layout.  No live load reached this leg,
+        // so the funnel's `resvalue` is `None` and it records unconditionally.
+        let op = self.execute_and_record(
+            Some(cpu),
+            OpCode::GetfieldGcI,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
     /// Record a virtualizable field read with an explicit field descriptor.
     pub fn vable_getfield_int_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
         self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
+    }
+
+    /// `heapcache.py is_nullity_known(box)`, supplying the `getref_base()`
+    /// reader its `Const` arm needs. `Some(true)` / `Some(false)` / `None` are
+    /// known-nonnull / known-null / unknown; only `Some(true)` is upstream's
+    /// truthy answer, for the reason spelled out at
+    /// [`Self::trace_assert_not_none`].
+    /// `if self.metainterp.heapcache.is_nullity_known(box):` — upstream's
+    /// *truthiness* test, which is not the same question as
+    /// [`Self::heapcache_nullity_known`] answering `Some`.
+    ///
+    /// `heapcache.py` returns `bool(box.getref_base())` for a `Const` and
+    /// `_check_flag(box, HF_KNOWN_NULLITY)` otherwise, and
+    /// `nullity_now_known` sets that flag for *either* nullity. So a
+    /// non-`Const` box already known to be **null** answers true here and
+    /// short-circuits, while a **null `Const`** answers false and falls
+    /// through. Reading `Some(true)` alone gets the second of those right and
+    /// the first wrong, and re-guards a box whose nullity is already settled.
+    pub fn heapcache_nullity_answered(&self, opref: OpRef) -> bool {
+        match self.heapcache_nullity_known(opref) {
+            Some(true) => true,
+            Some(false) => !opref.is_constant(),
+            None => false,
+        }
+    }
+
+    pub fn heapcache_nullity_known(&self, opref: OpRef) -> Option<bool> {
+        self.heap_cache.is_nullity_known(opref, |op| {
+            op.inline_const_to_value().and_then(|v| match v {
+                Value::Int(n) => Some(n),
+                Value::Ref(gc) => Some(gc.0 as i64),
+                _ => None,
+            })
+        })
     }
 
     /// pyjitpl.py `opimpl_assert_not_none`:
@@ -4345,14 +4386,7 @@ impl TraceCtx {
         // `Some(true)` for known non-null, `Some(false)` for known
         // null, `None` for unknown — match PyPy's semantics by
         // short-circuiting only on `Some(true)`.
-        let known = self.heap_cache.is_nullity_known(opref, |op| {
-            op.inline_const_to_value().and_then(|v| match v {
-                Value::Int(n) => Some(n),
-                Value::Ref(gc) => Some(gc.0 as i64),
-                _ => None,
-            })
-        });
-        if known == Some(true) {
+        if self.heapcache_nullity_known(opref) == Some(true) {
             self.profiler().count_ops(
                 OpCode::AssertNotNone,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,
@@ -4367,12 +4401,9 @@ impl TraceCtx {
             concrete != 0,
             "do_assert_not_none: ref operand {opref:?} is null at trace time"
         );
-        // pyjitpl.py `execute(ASSERT_NOT_NONE, ...)`.
-        self.profiler()
-            .count_ops(OpCode::AssertNotNone, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::AssertNotNone, crate::counters::RECORDED_OPS);
-        self.record_op(OpCode::AssertNotNone, &[opref]);
+        // pyjitpl.py `execute(ASSERT_NOT_NONE, ...)`. Void result, never
+        // pure — the funnel records it and no cpu is consulted.
+        self.execute_and_record(None, OpCode::AssertNotNone, None, &[opref], None, 0);
         // pyjitpl.py:391 `self.metainterp.heapcache.nullity_now_known(box)`.
         self.heap_cache.nullity_now_known(opref, true);
     }
@@ -4413,12 +4444,16 @@ impl TraceCtx {
             // class argument silently skips the record in RPython.
             return;
         }
-        // pyjitpl.py `execute(RECORD_EXACT_CLASS, ...)`.
-        self.profiler()
-            .count_ops(OpCode::RecordExactClass, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::RecordExactClass, crate::counters::RECORDED_OPS);
-        self.record_op(OpCode::RecordExactClass, &[opref, cls_const]);
+        // pyjitpl.py `execute(RECORD_EXACT_CLASS, ...)`. Void result, never
+        // pure, so the funnel records it without consulting a cpu.
+        self.execute_and_record(
+            None,
+            OpCode::RecordExactClass,
+            None,
+            &[opref, cls_const],
+            None,
+            0,
+        );
         let cls_value = match self.constants_get_value(cls_const) {
             Some(Value::Int(vtable)) => vtable,
             other => panic!(
@@ -4488,11 +4523,14 @@ impl TraceCtx {
             }
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
             // the standard heap operation.
-            self.profiler()
-                .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-            self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], record_descr);
+            self.execute_and_record(
+                None,
+                OpCode::SetfieldGc,
+                Some(record_descr),
+                &[vable_opref, value],
+                None,
+                0,
+            );
             // pyjitpl.py:980 upd.setfield(valuebox).  Cache stores the
             // Box identity (`value` OpRef); the intrinsic concrete
             // travels with the frontend value slot — `value`'s slot was
@@ -4549,6 +4587,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_ref(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4593,23 +4632,24 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
             // recorded opref so subsequent `box_value(op)` matches
-            // RPython's executor-returned Box.
+            // RPython's executor-returned Box.  It is the funnel's
+            // `resvalue`, so the load runs before the record.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            let op = self.execute_and_record(
+                Some(cpu),
+                OpCode::GetfieldGcR,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4625,22 +4665,30 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
+        let op = self.execute_and_record(
+            Some(cpu),
+            OpCode::GetfieldGcR,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
     /// Record a virtualizable ref field read with an explicit field descriptor.
     pub fn vable_getfield_ref_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
-        // pyjitpl.py `gen_store_back_in_vable`.
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], descr)
+        // pyjitpl.py `gen_store_back_in_vable`. No live load reaches this
+        // helper, so the funnel's `resvalue` is `None`; that closes the fold
+        // on its own and no cpu is needed to read a field nobody folds.
+        self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(descr),
+            &[vable_opref],
+            None,
+            0,
+        )
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -4655,6 +4703,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_float(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -4701,22 +4750,23 @@ impl TraceCtx {
                 return (cached, cached_value);
             }
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
-            let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], record_descr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
-            // `box_value(op)` matches RPython's executor-returned Box.
+            // `box_value(op)` matches RPython's executor-returned Box.  It is
+            // the funnel's `resvalue`, so the load runs before the record.
             let live = if vable_struct_ptr != 0 {
                 self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
             } else {
                 None
             };
-            if let Some(live_value) = live {
-                self.set_opref_concrete(op, live_value);
-            }
+            let op = self.execute_and_record(
+                Some(cpu),
+                OpCode::GetfieldGcF,
+                Some(record_descr),
+                &[vable_opref],
+                live,
+                0,
+            );
             self.heapcache_getfield_now_known(vable_opref, field_index, op);
             return (op, live);
         }
@@ -4732,11 +4782,14 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
+        let op = self.execute_and_record(
+            Some(cpu),
+            OpCode::GetfieldGcF,
+            Some(fielddescr),
+            &[vable_opref],
+            None,
+            0,
+        );
         (op, None)
     }
 
@@ -4757,14 +4810,16 @@ impl TraceCtx {
         }
         let index = self.const_int(item_index as i64);
         // pyjitpl.py:1218-1230 vable fallback uses standard array access.
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // The element is stamped afterwards by `stamp_vable_array_item`, so
+        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
+        // either, so nothing would consult a cpu.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcI,
+            Some(adescr.clone()),
             &[array_opref, index],
-            adescr.clone(),
+            None,
+            0,
         );
         let value =
             self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Int);
@@ -4825,12 +4880,7 @@ impl TraceCtx {
             eprintln!("[vable-idx-probe] {constness} pc={pc} value={index_runtime_value}");
         }
         // indexbox = self.implement_guard_value(indexbox, pc)
-        let promoted_index = if index.is_constant() {
-            index
-        } else {
-            self.promote_int(index, index_runtime_value, pc)
-        };
-        let _ = promoted_index;
+        self.promote_int(index, index_runtime_value, pc);
         let item_index = usize::try_from(index_runtime_value).ok()?;
         // arrayindex = vinfo.array_field_by_descrs[arrayfielddescr]
         // assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)
@@ -4911,12 +4961,16 @@ impl TraceCtx {
             return (op, concrete_shadow_value(value));
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let array_opref =
-            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        // `stamp_vable_array_base` supplies the concrete after the record, so
+        // the funnel sees no `resvalue` and cannot fold.
+        let array_opref = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(fdescr.clone()),
+            &[vable_opref],
+            None,
+            0,
+        );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_int_vable(array_opref, &fdescr, item_index, adescr)
@@ -4983,14 +5037,16 @@ impl TraceCtx {
             return (op, concrete_shadow_value(value));
         }
         let index = self.const_int(item_index as i64);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // The element is stamped afterwards by `stamp_vable_array_item`, so
+        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
+        // either, so nothing would consult a cpu.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcR,
+            Some(adescr.clone()),
             &[array_opref, index],
-            adescr.clone(),
+            None,
+            0,
         );
         let value =
             self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Ref);
@@ -5058,12 +5114,16 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let array_opref =
-            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        // `stamp_vable_array_base` supplies the concrete after the record, so
+        // the funnel sees no `resvalue` and cannot fold.
+        let array_opref = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(fdescr.clone()),
+            &[vable_opref],
+            None,
+            0,
+        );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index, adescr)
@@ -5089,14 +5149,16 @@ impl TraceCtx {
             return (op, concrete_shadow_value(value));
         }
         let index = self.const_int(item_index as i64);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // The element is stamped afterwards by `stamp_vable_array_item`, so
+        // there is no `resvalue` here; `GETARRAYITEM_GC_*` is not descr-pure
+        // either, so nothing would consult a cpu.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcF,
+            Some(adescr.clone()),
             &[array_opref, index],
-            adescr.clone(),
+            None,
+            0,
         );
         let value =
             self.stamp_vable_array_item(op, array_opref, item_index as i64, &adescr, Type::Float);
@@ -5156,12 +5218,16 @@ impl TraceCtx {
         {
             return (op, concrete_shadow_value(value));
         }
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let array_opref =
-            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
+        // `stamp_vable_array_base` supplies the concrete after the record, so
+        // the funnel sees no `resvalue` and cannot fold.
+        let array_opref = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(fdescr.clone()),
+            &[vable_opref],
+            None,
+            0,
+        );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_float_vable(array_opref, &fdescr, item_index, adescr)
@@ -5281,11 +5347,14 @@ impl TraceCtx {
         self.heapcache_getfield_now_known(vable_opref, field_descr.index(), array_opref);
         for &(item_index, value) in items {
             let index = self.const_int(item_index);
-            self.profiler()
-                .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
-            self.vable_setarrayitem_descr(array_opref, index, value, array_descr.clone());
+            self.execute_and_record(
+                None,
+                OpCode::SetarrayitemGc,
+                Some(array_descr.clone()),
+                &[array_opref, index, value],
+                None,
+                0,
+            );
         }
         true
     }
@@ -5312,10 +5381,6 @@ impl TraceCtx {
     ) -> VableArrayStore {
         if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
-            self.profiler()
-                .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
-            self.profiler()
-                .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
             self.execute_setarrayitem_gc(array_opref, index, value, adescr);
             return VableArrayStore::Stored(None);
         }
@@ -5356,12 +5421,19 @@ impl TraceCtx {
     ///
     /// `concrete` is the runtime length the `execute_with_descr` box carries
     /// (`arraylen_sanity_load`); `None` leaves the recorded OpRef unstamped
-    /// (the cpu is unwired or the descr lacks a lendescr).
+    /// (the cpu is unwired or the descr lacks a lendescr) and, by
+    /// `execute_and_record`'s rule for a missing concrete, blocks the fold.
+    ///
+    /// `ARRAYLEN_GC` is always-pure, so a constant array base with a concrete
+    /// length folds and records nothing. `last_exc_value` is not consulted for
+    /// an always-pure opcode; only the overflow arm reads it.
     pub fn opimpl_arraylen_gc(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         array_opref: OpRef,
         arraydescr: DescrRef,
         concrete: Option<Value>,
+        last_exc_value: i64,
     ) -> OpRef {
         if let Some(cached_len) = self.heap_cache().arraylen(array_opref) {
             // pyjitpl.py:763 profiler.count_ops(rop.ARRAYLEN_GC, HEAPCACHED_OPS).
@@ -5369,16 +5441,30 @@ impl TraceCtx {
                 .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
             return cached_len;
         }
-        // pyjitpl.py `opimpl_arraylen_gc` miss.
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::RECORDED_OPS);
-        let len = self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], arraydescr);
-        if let Some(v) = concrete {
-            self.set_opref_concrete(len, v);
-        }
+        // `execute_nonspec_const`'s ARRAYLEN_GC row reads the length through
+        // `ArrayDescr::len_descr` and fails loud without one, while
+        // `arraylen_sanity_load` reaches the backend directly and answers even
+        // for a descr that has none. Withhold the concrete in that case so the
+        // funnel records rather than entering a fold it cannot complete.
+        let concrete = concrete.filter(|_| {
+            arraydescr
+                .as_array_descr()
+                .is_some_and(|a| a.len_descr().is_some())
+        });
+        // pyjitpl.py `opimpl_arraylen_gc` miss. The funnel owns the OPS /
+        // RECORDED_OPS pairing this leg used to count by hand.
+        let len = self.execute_and_record(
+            Some(cpu),
+            OpCode::ArraylenGc,
+            Some(arraydescr),
+            &[array_opref],
+            concrete,
+            last_exc_value,
+        );
         // pyjitpl.py:761 heapcache.arraylen_now_known(arraybox, lengthbox).
+        // `HeapCache::arraylen_now_known` returns early for a constant array,
+        // so the fold path self-cancels rather than depositing under a key the
+        // cache does not track.
         self.heap_cache_mut().arraylen_now_known(array_opref, len);
         len
     }
@@ -5399,6 +5485,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_arraylen_vable(
         &mut self,
+        cpu: &dyn crate::cpu::Cpu,
         pc: usize,
         vable_opref: OpRef,
         vable_struct_ptr: i64,
@@ -5409,64 +5496,69 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             let f_index = fdescr.index();
-            let array_opref = if let Some(cached) =
-                self.heapcache_getfield_cached(vable_opref, f_index)
-            {
-                // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
-                //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
-                //     assert resvalue == upd.currfieldbox.getref_base()
-                // `box_value(cached)` resolves the upstream
-                // `currfieldbox.getref_base()` payload through the
-                // full chain (const pool, standard-virtualizable
-                // shadow, the frontend object's `value` field).
-                let expected_ref = match self.box_value(cached) {
-                    Some(Value::Ref(r)) => Some(r),
-                    _ => None,
-                };
-                if let Some(cached_ref) = expected_ref
-                    && vable_struct_ptr != 0
-                    && let Some(Value::Ref(loaded)) =
-                        self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
-                {
-                    assert_eq!(
-                        loaded, cached_ref,
-                        "_opimpl_getfield_gc_any_pureornot sanity \
+            let array_opref =
+                if let Some(cached) = self.heapcache_getfield_cached(vable_opref, f_index) {
+                    // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
+                    //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
+                    //     assert resvalue == upd.currfieldbox.getref_base()
+                    // `box_value(cached)` resolves the upstream
+                    // `currfieldbox.getref_base()` payload through the
+                    // full chain (const pool, standard-virtualizable
+                    // shadow, the frontend object's `value` field).
+                    let expected_ref = match self.box_value(cached) {
+                        Some(Value::Ref(r)) => Some(r),
+                        _ => None,
+                    };
+                    if let Some(cached_ref) = expected_ref
+                        && vable_struct_ptr != 0
+                        && let Some(Value::Ref(loaded)) =
+                            self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
+                    {
+                        assert_eq!(
+                            loaded, cached_ref,
+                            "_opimpl_getfield_gc_any_pureornot sanity \
                                      check (ref): loaded {:#x} != cached {:#x} \
                                      (field_index={f_index}, vable_struct_ptr=\
                                      {vable_struct_ptr:#x})",
-                        loaded.0, cached_ref.0,
+                            loaded.0, cached_ref.0,
+                        );
+                    }
+                    self.profiler().count_ops(
+                        OpCode::GetfieldGcR,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
                     );
-                }
-                self.profiler().count_ops(
-                    OpCode::GetfieldGcR,
-                    crate::pyjitpl::counters::HEAPCACHED_OPS,
-                );
-                cached
-            } else {
-                let record_descr = self.vable_array_record_descr(&fdescr);
-                // pyjitpl.py:1253-1263 nonstandard vable getfield miss.
-                self.profiler()
-                    .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-                self.profiler()
-                    .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-                let op =
-                    self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], record_descr);
-                let live = if vable_struct_ptr != 0 {
-                    self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
+                    cached
                 } else {
-                    None
+                    let record_descr = self.vable_array_record_descr(&fdescr);
+                    // pyjitpl.py:1253-1263 nonstandard vable getfield miss. The
+                    // live load is the funnel's `resvalue`, so it runs first; this
+                    // is the one leg of the family that can reach a fold, which is
+                    // why the cpu is threaded in.
+                    let live = if vable_struct_ptr != 0 {
+                        self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
+                    } else {
+                        None
+                    };
+                    let op = self.execute_and_record(
+                        Some(cpu),
+                        OpCode::GetfieldGcR,
+                        Some(record_descr),
+                        &[vable_opref],
+                        live,
+                        0,
+                    );
+                    self.heapcache_getfield_now_known(vable_opref, f_index, op);
+                    op
                 };
-                if let Some(live_value) = live {
-                    self.set_opref_concrete(op, live_value);
-                }
-                self.heapcache_getfield_now_known(vable_opref, f_index, op);
-                op
-            };
             // return self.opimpl_arraylen_gc(arraybox, adescr) — the
             // nonstandard-virtualizable fallback reads the length through the GC
             // array; no runtime concrete to stamp here (the vable read supplies
             // the length on the standard path below).
-            return self.opimpl_arraylen_gc(array_opref, adescr, None);
+            // No runtime concrete on this leg, so `execute_and_record` records
+            // without consulting an evaluator; the default cpu stands in for
+            // an argument it cannot reach.
+            let cpu = crate::cpu::default_cpu();
+            return self.opimpl_arraylen_gc(cpu.as_ref(), array_opref, adescr, None, 0);
         }
         // arrayindex = vinfo.array_field_by_descrs[fdescr]
         // result = vinfo.get_array_length(virtualizable, arrayindex)
@@ -5478,17 +5570,24 @@ impl TraceCtx {
         {
             return self.const_int(length as i64);
         }
-        // Fallback when the layout is unavailable.
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetfieldGcR, crate::counters::RECORDED_OPS);
-        let array_opref = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::ArraylenGc, crate::counters::RECORDED_OPS);
-        self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr)
+        // Fallback when the layout is unavailable. Neither leg has a
+        // trace-time concrete, so both close the fold on `resvalue`.
+        let array_opref = self.execute_and_record(
+            None,
+            OpCode::GetfieldGcR,
+            Some(fdescr),
+            &[vable_opref],
+            None,
+            0,
+        );
+        self.execute_and_record(
+            None,
+            OpCode::ArraylenGc,
+            Some(adescr),
+            &[array_opref],
+            None,
+            0,
+        )
     }
 
     /// Compute the flat index into virtualizable_boxes for an array element.
@@ -5507,14 +5606,17 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcI, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcI, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // `GETARRAYITEM_GC_*` answers `is_pure_with_descr` false whatever its
+        // descr says — an immutable GC array read is spelled with the
+        // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
+        // consulted.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcI,
+            Some(descr.clone()),
             &[array_opref, index],
-            descr.clone(),
+            None,
+            0,
         );
         if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
             self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Int);
@@ -5529,14 +5631,17 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // `GETARRAYITEM_GC_*` answers `is_pure_with_descr` false whatever its
+        // descr says — an immutable GC array read is spelled with the
+        // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
+        // consulted.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcR,
+            Some(descr.clone()),
             &[array_opref, index],
-            descr.clone(),
+            None,
+            0,
         );
         if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
             self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Ref);
@@ -5551,14 +5656,17 @@ impl TraceCtx {
         index: OpRef,
         descr: DescrRef,
     ) -> OpRef {
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcF, crate::counters::OPS);
-        self.profiler()
-            .count_ops(OpCode::GetarrayitemGcF, crate::counters::RECORDED_OPS);
-        let op = self.record_op_with_descr(
+        // `GETARRAYITEM_GC_*` answers `is_pure_with_descr` false whatever its
+        // descr says — an immutable GC array read is spelled with the
+        // dedicated `_PURE` opcode — so the fold gate is shut and no cpu is
+        // consulted.
+        let op = self.execute_and_record(
+            None,
             OpCode::GetarrayitemGcF,
+            Some(descr.clone()),
             &[array_opref, index],
-            descr.clone(),
+            None,
+            0,
         );
         if let Some(Value::Int(item_index)) = self.concrete_of_opref(index) {
             self.stamp_vable_array_item(op, array_opref, item_index, &descr, Type::Float);
@@ -5596,7 +5704,16 @@ impl TraceCtx {
         descr: DescrRef,
     ) {
         let descr_index = descr.index();
-        self.vable_setarrayitem_descr(array_opref, index, value, descr);
+        // A store has no `resvalue` and `SETARRAYITEM_GC` is never pure, so
+        // the funnel records it without consulting a cpu.
+        self.execute_and_record(
+            None,
+            OpCode::SetarrayitemGc,
+            Some(descr),
+            &[array_opref, index, value],
+            None,
+            0,
+        );
         self.heapcache_setarrayitem(array_opref, index, descr_index, value);
     }
 }
@@ -5720,6 +5837,33 @@ mod tests {
         assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
     }
 
+    /// `heapcache.py is_nullity_known` answers truthy for a non-`Const` box
+    /// whatever its nullity — `nullity_now_known` sets one flag for both — and
+    /// falsy for a null `Const`, whose answer is `bool(box.getref_base())`.
+    ///
+    /// Pinned here rather than through a second nullity branch: the walker's
+    /// `replace_box` puts `CONST_NULL` in every register naming the box, so
+    /// after the null arm no branch can reach it as a non-constant again.
+    #[test]
+    fn a_known_null_box_answers_the_nullity_question_unless_it_is_constant() {
+        let mut ctx = TraceCtx::for_test(1);
+        let box_ = OpRef::input_arg_ref(0);
+        assert!(
+            !ctx.heapcache_nullity_answered(box_),
+            "an unknown box answers nothing",
+        );
+        ctx.heap_cache_mut().nullity_now_known(box_, false);
+        assert!(
+            ctx.heapcache_nullity_answered(box_),
+            "a non-constant box known to be null short-circuits",
+        );
+        let null = ctx.const_null();
+        assert!(
+            !ctx.heapcache_nullity_answered(null),
+            "a null constant falls through to the guard arm",
+        );
+    }
+
     /// M1: constant OpRefs resolve via `OpRef::inline_const_to_value` for
     /// type-preserving Box::Const* construction.
     #[test]
@@ -5831,7 +5975,13 @@ mod tests {
         let cached = ctx.const_int(42);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_int(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream
@@ -5987,7 +6137,13 @@ mod tests {
         let cached = ctx.const_ref(0xAAAA_BBBB);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_ref(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// vable_getfield_float cache-hit (pyjitpl.py:944
@@ -6012,7 +6168,13 @@ mod tests {
         let cached = ctx.const_float((1.5_f64).to_bits() as i64);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        ctx.vable_getfield_float(0, vable, 0xCAFE_BABE, fd);
+        ctx.vable_getfield_float(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
     }
 
     /// Matched (loaded == cached) ref + float cache-hits — no panic;
@@ -6042,9 +6204,21 @@ mod tests {
         let field_index_f = fd_f.index();
         ctx.heapcache_getfield_now_known(vable, field_index_f, cached_f);
 
-        let (r_result, _) = ctx.vable_getfield_ref(0, vable, 0xCAFE_BABE, fd_r);
+        let (r_result, _) = ctx.vable_getfield_ref(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd_r,
+        );
         assert_eq!(r_result, cached_r);
-        let (f_result, _) = ctx.vable_getfield_float(0, vable, 0xCAFE_BABE, fd_f);
+        let (f_result, _) = ctx.vable_getfield_float(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd_f,
+        );
         assert_eq!(f_result, cached_f);
     }
 
@@ -6068,7 +6242,13 @@ mod tests {
         let cached = ctx.const_int(7);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
+        let (result, _) = ctx.vable_getfield_int(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            vable,
+            0xCAFE_BABE,
+            fd,
+        );
         assert_eq!(result, cached);
     }
 
@@ -6165,10 +6345,12 @@ mod tests {
         );
 
         // getfield with offset=8 → static field 0 → box0
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
         // getfield with offset=16 → static field 1 → box1
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd16);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -6208,10 +6390,12 @@ mod tests {
         ctx.vable_setfield(0, vable, fd8.clone(), new_val, Some(ph(Type::Int)));
 
         // Box 0 should now be new_val
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, new_val);
         // Box 1 unchanged
-        let (result, _) = ctx.vable_getfield_int(0, vable, 0, fd16);
+        let (result, _) =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -6234,7 +6418,7 @@ mod tests {
         );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(0, vable, 0, fd8);
+        let _result = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -6334,7 +6518,8 @@ mod tests {
 
         // Unknown offset (999) → fallback to heap op
         let fd999 = majit_ir::make_field_descr(999, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(0, vable, 0, fd999);
+        let _result =
+            ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd999);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -6360,7 +6545,8 @@ mod tests {
 
         ctx.init_virtualizable_boxes(&info, vable, ph(Type::Ref), &[box0], &[ph(Type::Ref)], &[]);
 
-        let (result, _) = ctx.vable_getfield_ref(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_ref(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -6393,7 +6579,8 @@ mod tests {
             &[],
         );
 
-        let (result, _) = ctx.vable_getfield_float(0, vable, 0, fd8);
+        let (result, _) =
+            ctx.vable_getfield_float(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -6735,5 +6922,95 @@ mod tests {
         // The identity slot itself left unseeded.
         ctx.virtualizable_boxes = Some(vec![OpRef::int_op(3), OpRef::NONE]);
         assert!(!ctx.vable_snapshot_buildable());
+    }
+
+    /// `[len][item0][item1][item2]`: the length word at offset 0, items from
+    /// offset 8 — the shape `get_field_arraylen_descr` describes.
+    fn boxed_int_array(items: &[i64]) -> (Box<Vec<i64>>, i64) {
+        let mut words = vec![items.len() as i64];
+        words.extend_from_slice(items);
+        let storage = Box::new(words);
+        let base = storage.as_ptr() as i64;
+        (storage, base)
+    }
+
+    fn int_array_descr(with_lendescr: bool) -> DescrRef {
+        let lendescr: Option<DescrRef> = with_lendescr.then(|| {
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new(
+                0,
+                0,
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+            )) as DescrRef
+        });
+        majit_ir::descr::make_array_descr_from_lltype_shape(
+            1,
+            std::mem::size_of::<i64>(),
+            std::mem::size_of::<i64>(),
+            None,
+            Type::Int,
+            false,
+            false,
+            true,
+            true,
+            lendescr,
+            false,
+            u32::MAX,
+            Vec::new(),
+        ) as DescrRef
+    }
+
+    /// `ARRAYLEN_GC` is always-pure, so a constant array with a trace-time
+    /// length folds; every other combination records.
+    #[test]
+    fn arraylen_gc_folds_only_a_constant_array_with_a_concrete_length() {
+        let cpu = crate::cpu::default_cpu();
+        let (_storage, base) = boxed_int_array(&[10, 20, 30]);
+
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(true),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert_eq!(len, OpRef::const_int(3));
+        assert!(ctx.into_recorder().ops().is_empty());
+
+        // No trace-time concrete: record, and leave the op unstamped.
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(true),
+            None,
+            0,
+        );
+        assert!(!len.is_constant());
+
+        // A descr with no `lendescr` is one the executor row cannot read; the
+        // concrete is withheld so the funnel records instead of failing loud.
+        let mut ctx = TraceCtx::for_test(0);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::const_ptr(majit_ir::GcRef(base as usize)),
+            int_array_descr(false),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert!(!len.is_constant());
+
+        // Non-constant array base.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let len = ctx.opimpl_arraylen_gc(
+            cpu.as_ref(),
+            OpRef::input_arg_ref(0),
+            int_array_descr(true),
+            Some(Value::Int(3)),
+            0,
+        );
+        assert!(!len.is_constant());
     }
 }

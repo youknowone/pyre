@@ -14,16 +14,20 @@
 # The rule is not "always" and not "never".  3.14 reports the event exactly
 # when the StopIteration carries a traceback -- which is to say, when it was
 # raised by Python code rather than signalled by an iterator implemented
-# natively.  A generator ending, a list ending and a range ending all deliver
+# natively.  A list ending, a range ending and a dict ending all deliver
 # nothing; a class whose `__next__` raises delivers one.  That asymmetry is
 # what this pins: reporting always would fire on every `for` over a list, and
 # reporting never would lose the one case a debugger cares about.
 #
-# PyPy 7.3.20 fails `a_natively_signalled_end_reports_nothing` on the generator
-# case: it reports every generator-iterator unconditionally, which its own
-# comment calls "an approximative rule" for a case it says it cannot emulate.
-# The rule pinned here is 3.14's, so this file is a place the two references
-# disagree and CPython wins.
+# A generator's ending carries no traceback and is the other half of the rule:
+# an event is reported because the iterator is a generator.  3.14 answers a
+# cold loop differently -- the first execution runs the unspecialised
+# `_FOR_ITER`, whose exhaustion arm jumps past `END_FOR` without reporting,
+# and only once the loop specialises to `FOR_ITER_GEN` does the end arrive at
+# `INSTRUMENTED_END_FOR` where `monitor_stop_iteration` mints it.  So the
+# warm loop is what is pinned here: it is the answer 3.14 settles on, the
+# answer pypy3 gives from the first call, and the only one of the two that
+# does not depend on which tier is running.
 import sys
 
 
@@ -82,14 +86,6 @@ def the_rule_is_the_traceback_and_not_the_iterator():
 
 
 def a_natively_signalled_end_reports_nothing():
-    def consume_generator():
-        def empty():
-            return
-            yield
-
-        for _ in empty():
-            raise AssertionError('the generator was not empty')
-
     def consume_list():
         for _ in [1, 2]:
             pass
@@ -115,7 +111,6 @@ def a_natively_signalled_end_reports_nothing():
             pass
 
     for consumer in (
-        consume_generator,
         consume_list,
         consume_range,
         consume_dict,
@@ -153,8 +148,24 @@ def the_loop_still_ends_normally():
     assert collected == [2, 1, 0], collected
 
 
+def a_warm_generator_loop_reports_its_end():
+    def empty():
+        return
+        yield
+
+    def consume():
+        for _ in empty():
+            raise AssertionError('the generator yields nothing')
+
+    # Repeated so the loop is warm on the last call, which is the one graded:
+    # 3.14 reports nothing on the first and reports from the second onwards.
+    rows = [exception_events_in(consume) for _ in range(8)]
+    assert rows[-1] == [('consume', 'StopIteration')], rows
+
+
 a_python_level_next_reports_to_the_consuming_frame()
 the_rule_is_the_traceback_and_not_the_iterator()
 a_natively_signalled_end_reports_nothing()
 the_loop_still_ends_normally()
+a_warm_generator_loop_reports_its_end()
 print('OK')

@@ -1259,7 +1259,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // ── Import ──
-    fn import_name(&mut self, _name: &str) -> Result<(), PyError> {
+    fn import_name(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("import_name not implemented"))
     }
     fn import_from(&mut self, _name: &str) -> Result<(), PyError> {
@@ -3386,7 +3386,7 @@ pub fn execute_import_name<E: OpcodeStepExecutor>(
         unreachable!()
     };
     let name_idx = u32_as_usize(namei.get(op_arg));
-    executor.import_name(code.names[name_idx].as_ref())?;
+    executor.import_name(code.names[name_idx].as_ref(), name_idx)?;
     Ok(StepResult::Continue)
 }
 

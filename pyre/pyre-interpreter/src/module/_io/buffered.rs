@@ -862,11 +862,20 @@ impl W_BufferedReader {
             }
             return Err(close_error);
         }
-        self.buffer = PY_NULL;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        // interp_bufferedio.py `close_w`: the `raise` in the flush handler
+        // carries that error out of the `try`/`finally`, so a failed flush
+        // reaches neither of the two lines below it — the raw close in the
+        // `finally` is all that still runs. Releasing the buffer here would
+        // report the object as having nothing left to write while its
+        // finalizer, correctly, still thinks otherwise.
         if let Some(error) = flush_error {
             return Err(error);
         }
+        self.buffer = PY_NULL;
+        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        // `close_w`, on the line after `self.buffer = None`: the object is
+        // closed, so `iobase_del` has nothing left to do for it.
+        super::maybe_unregister_rpython_finalizer_io(self.self_obj());
         Ok(())
     }
 

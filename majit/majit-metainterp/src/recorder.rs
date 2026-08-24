@@ -67,6 +67,42 @@ pub struct Snapshot {
     pub vref_boxes: Vec<SnapshotTagged>,
 }
 
+impl Snapshot {
+    /// Forward every inline gcref this snapshot carries.
+    ///
+    /// `MIFrame.get_list_of_active_snapshot_boxes` copies a constant ref
+    /// register's already-forwarded gcref out of its `OpRef::ConstPtr` into a
+    /// raw [`SnapshotTagged::Const`] word, and `jitcode.constants_r` entries
+    /// reach the same arm. The side table these land in accumulates for the
+    /// whole trace and is only handed to the compiler at the end of it, so
+    /// without this walk a collection between capture and compile leaves the
+    /// resume data naming a pre-move address. RPython has no such copy: its
+    /// snapshot holds the `ConstPtr` box itself, whose `value` the GC traces
+    /// through the object graph.
+    pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        let tagged = self
+            .frames
+            .iter_mut()
+            .flat_map(|f| f.boxes.iter_mut())
+            .chain(self.vable_boxes.iter_mut())
+            .chain(self.vref_boxes.iter_mut());
+        for t in tagged {
+            match t {
+                SnapshotTagged::Const(bits, Type::Ref) => {
+                    let mut gcref = majit_ir::GcRef(*bits as usize);
+                    visitor(&mut gcref);
+                    *bits = gcref.0 as i64;
+                }
+                // `build_vable_snapshot_boxes` / `build_vref_snapshot_boxes`
+                // tag their entries by `OpRef::ty()` without asking whether the
+                // operand is constant, so this arm can hold an inline gcref too.
+                SnapshotTagged::Box(OpRef::ConstPtr(gcref), _) => visitor(gcref),
+                SnapshotTagged::Const(..) | SnapshotTagged::Box(..) => {}
+            }
+        }
+    }
+}
+
 /// `jitcode_index` for a frame the recorder minted with no real coordinate.
 ///
 /// `crate::history::TraceCtx::record_guard_with_snapshot` attaches a

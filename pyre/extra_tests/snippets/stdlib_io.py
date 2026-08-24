@@ -1,7 +1,28 @@
 import os
+import _io
 from io import BufferedReader, BytesIO, FileIO, RawIOBase, StringIO, TextIOWrapper
 
 from testutils import assert_raises
+
+
+# PyPy's W_IOBase/W_RawIOBase/W_BufferedIOBase/W_TextIOBase TypeDefs are
+# qualified with the owning _io module.
+for io_base_type in (
+    _io._IOBase,
+    _io._RawIOBase,
+    _io._BufferedIOBase,
+    _io._TextIOBase,
+):
+    assert io_base_type.__module__ == "_io"
+
+
+# PyPy W_TextIOWrapper.readline_w distinguishes its untranslated missing
+# argument sentinel from an explicit Python None.
+text_reader = TextIOWrapper(BytesIO(b"hello\nworld"), encoding="utf-8")
+assert text_reader.readline() == "hello\n"
+with assert_raises(TypeError) as error:
+    text_reader.readline(None)
+assert str(error.exception) == "'NoneType' object cannot be interpreted as an integer"
 
 
 # Python 3.14 exposes _checkClosed as a no-argument helper.  In particular,

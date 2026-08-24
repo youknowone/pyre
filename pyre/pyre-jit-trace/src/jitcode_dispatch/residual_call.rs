@@ -46,6 +46,18 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static COMMITTED_FRAME_ESCAPE_PC: std::cell::Cell<Option<(usize, EscapeResumeKind)>> =
         const { std::cell::Cell::new(None) };
+    /// The concrete frame a residual forced that the escape flush did NOT
+    /// write: an inline callee published on the execution context, matched by
+    /// [`flush_active_frame_escape`]'s second disjunct while the flush stays
+    /// keyed on the traced virtualizable (the portal frame).
+    ///
+    /// `virtualizable.py write_boxes` writes the array of the virtualizable it
+    /// forces, with no way to decline.  pyre forces here on behalf of a frame
+    /// that is NOT the traced virtualizable, so nothing writes that frame's
+    /// `locals_cells_stack_w`, and every value the compiled trace was holding
+    /// in a register for it stays absent.  A blackhole level resumed on such a
+    /// frame reads those slots as Python NULL.
+    static UNFLUSHED_ESCAPED_CALLEE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Pre-flush frame state captured by [`flush_active_frame_escape`] so a
     /// post-call commit withdrawal can put the live frame back.  The legacy
     /// replay's correctness contract is "the live frame still holds pre-walk
@@ -1150,6 +1162,16 @@ thread_local! {
     /// [`INLINE_CONCRETE_FRAME`], which stays set across the whole sub-walk.
     static PUBLISHED_INLINE_FRAME: std::cell::Cell<*mut pyre_interpreter::PyFrame> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// The inline level's own locals shadow, published alongside
+    /// [`PUBLISHED_INLINE_FRAME`] for the duration of one residual call.
+    ///
+    /// A force inside the residual runs from `force_pyframe`, which reaches
+    /// only the `TraceCtx`; `virtualizable.py write_boxes` writes the array of
+    /// the virtualizable it forces, so the level's own slot source has to be
+    /// reachable there.  The pointer is valid exactly while the guard that set
+    /// it is alive, which brackets the residual.
+    static PUBLISHED_INLINE_SHADOW: std::cell::Cell<Option<(*const super::CalleeLocalsShadow, u16)>> =
+        const { std::cell::Cell::new(None) };
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
@@ -1291,13 +1313,17 @@ struct ResidualFrameChainGuard {
     /// already does for the same field.
     saved_root: usize,
     previous_published: *mut pyre_interpreter::PyFrame,
+    previous_shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
 }
 
 impl ResidualFrameChainGuard {
-    fn enter(frame: usize) -> Option<Self> {
+    fn enter(
+        frame: usize,
+        shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
+    ) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
@@ -1337,11 +1363,13 @@ impl ResidualFrameChainGuard {
         // (`flush_active_frame_escape`), and the chain already naming it makes
         // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
+        let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(shadow));
         Some(Self {
             ec,
             frame,
             saved_root,
             previous_published,
+            previous_shadow,
             entered,
         })
     }
@@ -1362,6 +1390,7 @@ impl Drop for ResidualFrameChainGuard {
                 majit_gc::shadow_stack::get(self.saved_root).0 as *mut pyre_interpreter::PyFrame;
             majit_gc::shadow_stack::pop_to(self.saved_root);
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
+            PUBLISHED_INLINE_SHADOW.with(|slot| slot.set(self.previous_shadow));
             if self.entered {
                 (*self.ec).topframeref = saved_topframeref;
             }
@@ -1423,6 +1452,21 @@ pub fn attribute_last_escape_force() {
     }
 }
 
+/// The frame [`flush_active_frame_escape`] forced without writing, if any.
+///
+/// A blackhole chain that has one of these as a level would run that level
+/// against an array the force never materialized, so the adopt declines and
+/// the walk keeps the legacy escape/replay path.
+pub(crate) fn unflushed_escaped_callee() -> usize {
+    UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.get())
+}
+
+/// Clear the record at the start of a walk, so a frame forced by an earlier
+/// walk cannot decline this one's adopt.
+pub(crate) fn reset_unflushed_escaped_callee() {
+    UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(0));
+}
+
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
     // `executioncontext.py leave` — a frame handed to application code
     // keeps a reference to its caller, so escaping the concrete frame an inline
@@ -1457,6 +1501,63 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                     }
                     LAST_ESCAPE_WAS_CALLEE_ONLY
                         .with(|c| c.set(Some(!escaped_portal && escaped_published)));
+                    if !escaped_portal && escaped_published {
+                        // `virtualizable.py write_boxes` writes the array of
+                        // the virtualizable being forced.  The flush below
+                        // stays keyed on the traced virtualizable — the portal
+                        // frame — so for this disjunct nothing would write the
+                        // frame that was actually handed to the residual, and
+                        // every local the compiled trace held in a register for
+                        // it would stay absent from `locals_cells_stack_w`.  A
+                        // blackhole level later resumed on that frame reads
+                        // those slots as Python NULL; the witness is an
+                        // `f_locals` write in the resumed tail of a recursive
+                        // callee whose following `LOAD_FAST` of a local
+                        // assigned one line earlier lowers to
+                        // `getarrayitem_vable_r` and answers NULL.
+                        //
+                        // A bridge-resume sub-walk seeds this level's locals
+                        // into its own `CalleeLocalsShadow`
+                        // (`bridge_subwalk.rs`), which is what the publish
+                        // carries here; when it cannot supply the whole region
+                        // the frame is recorded so the blackhole adopt declines
+                        // rather than resuming on an unwritten array.
+                        //
+                        // `take` rather than `get`: this is the force's
+                        // write_boxes, and only the FIRST force in a residual
+                        // may perform it.  The callee can legitimately mutate
+                        // its own fastlocals afterwards — an `f_locals`
+                        // write-through is exactly that — and a second force
+                        // re-running the write would put the shadow's
+                        // pre-residual values back over it.  The guard restores
+                        // the previous entry when the residual ends, so the
+                        // suppression is scoped to this residual.
+                        let written = PUBLISHED_INLINE_SHADOW
+                            .with(|slot| slot.take())
+                            .is_some_and(|(shadow, frame_reg)| {
+                                // SAFETY: the pointer is published by
+                                // `ResidualFrameChainGuard`, which brackets the
+                                // residual this force runs inside of, and
+                                // restores the previous entry on drop.
+                                let shadow = unsafe { &*shadow };
+                                // The shadow describes ONE level's frame.  Only
+                                // that frame may be written from it: a nested
+                                // residual publishes its own, and writing one
+                                // level's slots onto another's array would
+                                // replace live values with unrelated ones.
+                                shadow.concrete_frame == frame as usize
+                                    && super::flush_callee_locals_region(shadow, frame, frame_reg)
+                            });
+                        if !written {
+                            UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
+                        }
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-escape-callee] frame={:#x} locals written={written}",
+                                frame as usize
+                            );
+                        }
+                    }
                     true
                 } else {
                     false
@@ -2036,7 +2137,7 @@ pub(crate) fn select_residual_call_opcode(
     }
 }
 
-/// `pyjitpl.py _record_helper_pure` parity for the
+/// `MIFrame.execute_varargs(pure=True)` parity for the
 /// walker layer: when a residual_call routes to `CallPure*` (elidable +
 /// cannot-raise EI per [`select_residual_call_opcode`]) AND every
 /// argument in `allboxes` has a known concrete value
@@ -2054,7 +2155,7 @@ pub(crate) fn select_residual_call_opcode(
 /// with raised exceptions surfaced through `BH_LAST_EXC_VALUE` so
 /// `eval_loop_jit` can route them into the bytecode exception handler.
 ///
-/// RPython upstream `_record_helper_pure` invokes
+/// RPython upstream `MIFrame.execute_varargs` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
 /// which dispatches to `cpu.bh_call_*` and stores the result on
 /// `result_box.value` (`pyjitpl.py`).  Pyre's walker observes the
@@ -2091,7 +2192,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     ) {
         return;
     }
-    // pyjitpl.py — `_record_helper_pure` only fires for
+    // `MIFrame.execute_varargs(pure=True)` only fires for
     // `EF_ELIDABLE_CANNOT_RAISE`. `select_residual_call_opcode` returns
     // `CallPure*` whenever `check_is_elidable()` is true (including
     // `EF_ELIDABLE_CAN_RAISE`), so re-check the can-raise predicate here
@@ -2110,7 +2211,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
     // [`build_allboxes`] preserves the same layout.
     //
-    // pyjitpl.py invariant: `_record_helper_pure` requires
+    // `MIFrame.execute_varargs(pure=True)` invariant: it requires
     // `funcbox` to be a Const so its `getint()` is the actual fn
     // pointer.  Non-constant funcboxes carry a stale-stamped Int
     // (from `cast_ptr_to_int` of a Ref-bank receiver, etc.) and
@@ -2189,7 +2290,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
         // void callees discard the result upstream too (`bh_call_v` has
         // no return value); `CallPureN` is included in the matched set
-        // only to mirror PyPy's `_record_helper_pure` handling of all
+        // only to mirror `MIFrame.execute_varargs(pure=True)`'s handling of all
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return,
     };
@@ -2200,6 +2301,58 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // invariant.  Skipping leaves the result symbolic so the downstream branch
     // aborts the trace into the trait fallback instead of crashing.
     ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
+}
+
+/// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
+/// **checked** `PY_NULL` sentinel — a slot the helper tests before use, so a
+/// concrete NULL there is the operand's normal shape rather than the broken
+/// baked-NULL shape [`DispatchError::MayForceNullRefArgUnsupported`] exists to
+/// catch.  `nargs` is the callee's argument count, for the trailing-slot entry.
+///
+/// One table, read by both `walker_abort_if_mayforce_null_ref_arg` (which
+/// aborts the walk) and `try_execute_residual_call_via_executor` (which leaves
+/// the call symbolic).  They have to agree: an exemption in only the gate lets
+/// the walk continue past a call the executor then declines, and a
+/// `declined_symbolic` drops the recording iteration's call exactly once
+/// (`g(i, d=4)` in a hot loop summed to n-1, with the callee run n-1 times).
+///
+/// * `CallFn` / `CallKw` arg 1 — `null_or_self`: `bh_call_fn_impl` /
+///   `bh_call_kw_N` prepend it as arg0 only when non-null, so NULL is the
+///   ordinary plain-call shape.
+/// * `CallFunctionEx` args 1 and 3 — `self_or_null` and `kwargs_or_null`: NULL
+///   is the ordinary `f(*args)` / no-`**` shape.
+/// * `StoreDeref` arg 1 — `value`: DELETE_DEREF lowers to
+///   `store_deref_value(cell, none)` after its own bound check
+///   (`codewriter.rs` `Instruction::DeleteDeref`) and the helper hands the NULL
+///   straight to `w_cell_set` unread.  Declining it left the clear-the-cell
+///   half of every `del <cellvar>` and every `except E as e` cleanup recorded
+///   but UNEXECUTED, which marks the walk unjournaled — the walk-end flush then
+///   declines and the caller replays the region on top of residuals the walk
+///   already ran concretely.
+/// * `WithExceptStart` arg 1 — `exit_self`: `with_except_start_values` prepends
+///   it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL for every
+///   already-bound `__exit__`, which is the common `with` shape.  Aborting on it
+///   refuses every bridge out of a `with` handler.
+/// * `LoadGlobal` arg 0 — `namespace_ptr`: the helper discards it and resolves
+///   the namespace from the executing frame or the callee's own promoted
+///   `w_code`, because an inlined / chained callee's frame register aliases an
+///   outer frame; the operand survives only as the cell-fold recogniser's hint.
+///   A nested function's `LOAD_GLOBAL` folds it to the NULL constant.
+/// * `RaiseVarargs` trailing arg — `cause`: `normalize_raise_varargs` carries it
+///   as the `raise X` (no `from`) sentinel, never dereferenced when null.
+pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
+    helper: majit_ir::PyreHelperKind,
+    arg_index: usize,
+    nargs: usize,
+) -> bool {
+    use majit_ir::PyreHelperKind as K;
+    match helper {
+        K::CallFn | K::CallKw | K::StoreDeref | K::WithExceptStart => arg_index == 1,
+        K::CallFunctionEx => arg_index == 1 || arg_index == 3,
+        K::LoadGlobal => arg_index == 0,
+        K::RaiseVarargs => arg_index + 1 == nargs,
+        _ => false,
+    }
 }
 
 /// Abort the walk when a result-bearing may-force CALL is recorded with a
@@ -2227,63 +2380,15 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // `GcRef(usize::MAX)` means "no concrete known" and is left alone.
     //
     // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
-    // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
-    // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
-    // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape, not the broken baked-NULL shape.
-    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
-    // `RaiseVarargs` (`normalize_raise_varargs`) carries a trailing `cause`
-    // Ref that is a checked `PY_NULL` sentinel for `raise X` without `from`
-    // (never dereferenced when null); exempt it so the
-    // FBW path can own the raise instead of declining to the trait.
-    let is_raise_varargs =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
-    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
-    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked
-    // `PY_NULL` sentinels (never dereferenced when null), so a concrete-NULL
-    // there is the normal `f(*args)` / no-`**` shape, not the broken baked-NULL.
-    let is_call_function_ex =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
-    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
-    // (arg 1) is a checked `PY_NULL` sentinel (prepended as arg0 only when
-    // non-null), so a concrete-NULL there is the normal plain-call shape.
-    let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    // `bh_store_deref_value_fn(cell, value)` — `value` (arg 1) is a checked
-    // `PY_NULL` sentinel handed to `w_cell_set` unread; DELETE_DEREF lowers to
-    // exactly that shape.  Kept in step with the same exemption in
-    // `try_execute_residual_call_via_executor`.
-    let is_store_deref =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
-    // `bh_load_global_fn(namespace_ptr, w_code, frame, namei)` — `namespace_ptr`
-    // (arg index 0) is never dereferenced.  The helper discards it and resolves
-    // the namespace from the executing frame or the callee's own promoted
-    // `w_code`, because an inlined / chained callee's frame register aliases an
-    // outer frame; the operand survives only as the cell-fold recogniser's hint.
-    // A nested function's `LOAD_GLOBAL` folds it to the NULL constant, so
-    // aborting on it stops the walk after an effectful residual has already run
-    // concretely and the caller replays that region.
-    let is_load_global =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
+    let helper = call_descr.get_extra_info().pyre_helper;
+    let nargs = call_descr.arg_types().len();
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
-        if is_call_fn && i == 1 {
-            continue;
-        }
-        if is_load_global && i == 0 {
-            continue;
-        }
-        if is_call_function_ex && (i == 1 || i == 3) {
-            continue;
-        }
-        if is_call_kw && i == 1 {
-            continue;
-        }
-        if is_raise_varargs && i + 1 == call_descr.arg_types().len() {
-            continue;
-        }
-        if is_store_deref && i == 1 {
+        // The checked-sentinel table, shared with
+        // `try_execute_residual_call_via_executor` so the two cannot drift.
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, nargs) {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -2779,59 +2884,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
     // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
     // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape.  These exemptions MUST match
-    // `walker_abort_if_mayforce_null_ref_arg`'s — otherwise a normal
-    // no-receiver keyword/star call is declined as symbolic
-    // (left symbolic), which drops the recording iteration's call
-    // exactly once (`g(i, d=4)` in a hot loop summed to n-1, callee
-    // ran n-1 times).
-    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
-    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
-    // (arg index 1) is the same checked `PY_NULL` sentinel.
-    let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
-    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked `PY_NULL`
-    // sentinels (never dereferenced when null), so a concrete-NULL there is the
-    // normal `f(*args)` / no-`**` shape.
-    let is_call_function_ex =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
-    // Same `RaiseVarargs` trailing-`cause` sentinel exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`.
-    let is_raise_varargs =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
-    // `bh_store_deref_value_fn(cell, value)` — `value` (arg index 1) is a
-    // checked `PY_NULL` sentinel: DELETE_DEREF lowers to
-    // `store_deref_value(cell, none)` after its own bound check
-    // (`codewriter.rs` `Instruction::DeleteDeref`), and the helper hands the
-    // NULL straight to `w_cell_set` without ever dereferencing it.  Declining
-    // it left the clear-the-cell half of every `del <cellvar>` and every
-    // `except E as e` handler cleanup recorded but UNEXECUTED, which marks the
-    // walk unjournaled — so the walk-end flush declines and the caller replays
-    // the region on top of the residuals the walk already ran concretely.
-    let is_store_deref =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
-    // Same `bh_load_global_fn` `namespace_ptr` exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`: arg index 0 is discarded by the
-    // helper, so a concrete NULL there is the normal nested-function shape.
-    let is_load_global =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
+    // is the normal plain-call shape.  The exemptions are read out of the
+    // same `mayforce_null_ref_arg_is_checked_sentinel` table
+    // `walker_abort_if_mayforce_null_ref_arg` consults, because they MUST
+    // agree — a gate-only exemption leaves a normal no-receiver
+    // keyword/star call declined as symbolic here, which drops the
+    // recording iteration's call exactly once (`g(i, d=4)` in a hot loop
+    // summed to n-1, callee ran n-1 times).
+    let helper = call_descr.get_extra_info().pyre_helper;
     for (i, &arg) in args.iter().enumerate() {
-        if is_call_fn && i == 1 {
-            continue;
-        }
-        if is_load_global && i == 0 {
-            continue;
-        }
-        if is_call_kw && i == 1 {
-            continue;
-        }
-        if is_call_function_ex && (i == 1 || i == 3) {
-            continue;
-        }
-        if is_raise_varargs && i + 1 == args.len() {
-            continue;
-        }
-        if is_store_deref && i == 1 {
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, args.len()) {
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
@@ -3523,7 +3585,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             .map(|shadow| shadow.concrete_frame)
             .filter(|&frame| frame != 0)
             .unwrap_or_else(current_inline_concrete_frame);
-        let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame);
+        // The level's own slot source travels with the frame: a force inside
+        // this residual reaches only the `TraceCtx`, and the frame it forces is
+        // this callee, not the traced virtualizable.
+        let published_shadow = ctx.callee_shadow.as_ref().and_then(|shadow| {
+            let frame_reg = ctx
+                .inline_callee_consts
+                .and_then(|consts| crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index))
+                .map(|jitcode| jitcode.metadata.portal_frame_reg)?;
+            Some((shadow as *const super::CalleeLocalsShadow, frame_reg))
+        });
+        let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame, published_shadow);
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
         } else {
@@ -6458,7 +6530,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity: for
+        // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
         // execute the helper now and stamp `recorded` with the result so
         // downstream walker chain (sub-jitcode bodies that consume the
@@ -7670,7 +7742,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity — see
+        // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
@@ -7909,7 +7981,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity — see
+        // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
         // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):

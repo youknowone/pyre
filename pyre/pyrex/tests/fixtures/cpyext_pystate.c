@@ -101,6 +101,29 @@ static PyObject *ensure_states(PyObject *self, PyObject *args)
     return Py_BuildValue("(iiO)", (int)outer, (int)inner, held ? Py_True : Py_False);
 }
 
+/* The shape a callback delivered through a released GIL has: the extension
+   gave the GIL up around a call into C, and the C code calls back in.  What it
+   takes is not nested inside anything -- the thread state it makes current is
+   the one the block had just stood down. */
+static PyObject *ensure_inside_allow_threads(PyObject *self, PyObject *args)
+{
+    (void)self; (void)args;
+    int state, held, named_interp, named_state, released_again;
+    Py_BEGIN_ALLOW_THREADS
+    state = (int)PyGILState_Ensure();
+    held = PyGILState_Check();
+    named_interp = PyInterpreterState_Get() != NULL;
+    named_state = PyThreadState_Get() != NULL;
+    PyGILState_Release((PyGILState_STATE)state);
+    released_again = !PyGILState_Check();
+    Py_END_ALLOW_THREADS
+    return Py_BuildValue("(iOOOO)", state,
+                         held ? Py_True : Py_False,
+                         named_interp ? Py_True : Py_False,
+                         named_state ? Py_True : Py_False,
+                         released_again ? Py_True : Py_False);
+}
+
 static PyObject *thread_state_identity(PyObject *self, PyObject *args)
 {
     (void)self; (void)args;
@@ -156,6 +179,7 @@ static PyMethodDef methods[] = {
     {"save_restore", save_restore, METH_NOARGS, NULL},
     {"ensure_states", ensure_states, METH_NOARGS, NULL},
     {"thread_state_identity", thread_state_identity, METH_NOARGS, NULL},
+    {"ensure_inside_allow_threads", ensure_inside_allow_threads, METH_NOARGS, NULL},
     {"call_from_foreign_thread", call_from_foreign_thread, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
