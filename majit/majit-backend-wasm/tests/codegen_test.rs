@@ -255,9 +255,9 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // same event `bridges_compiled` counts, since both are bumped only on the
     // `Ok` side of `compile_bridge`. So both follow from the committed
     // `pyre/bench/fib_recursive.wasm.jitstats`: `loops_compiled=1` +
-    // `bridges_compiled=8`. Re-record these two alongside that baseline.
-    assert_eq!(stat_value(&stderr, "compiles"), 9);
-    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 8);
+    // `bridges_compiled=7`. Re-record these two alongside that baseline.
+    assert_eq!(stat_value(&stderr, "compiles"), 8);
+    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
     assert!(
         !stderr.contains("memory.fill"),
         "recursive CA still refills a nursery that is already zeroed:\n{stderr}"
