@@ -2202,6 +2202,58 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
 }
 
+/// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
+/// **checked** `PY_NULL` sentinel — a slot the helper tests before use, so a
+/// concrete NULL there is the operand's normal shape rather than the broken
+/// baked-NULL shape [`DispatchError::MayForceNullRefArgUnsupported`] exists to
+/// catch.  `nargs` is the callee's argument count, for the trailing-slot entry.
+///
+/// One table, read by both `walker_abort_if_mayforce_null_ref_arg` (which
+/// aborts the walk) and `try_execute_residual_call_via_executor` (which leaves
+/// the call symbolic).  They have to agree: an exemption in only the gate lets
+/// the walk continue past a call the executor then declines, and a
+/// `declined_symbolic` drops the recording iteration's call exactly once
+/// (`g(i, d=4)` in a hot loop summed to n-1, with the callee run n-1 times).
+///
+/// * `CallFn` / `CallKw` arg 1 — `null_or_self`: `bh_call_fn_impl` /
+///   `bh_call_kw_N` prepend it as arg0 only when non-null, so NULL is the
+///   ordinary plain-call shape.
+/// * `CallFunctionEx` args 1 and 3 — `self_or_null` and `kwargs_or_null`: NULL
+///   is the ordinary `f(*args)` / no-`**` shape.
+/// * `StoreDeref` arg 1 — `value`: DELETE_DEREF lowers to
+///   `store_deref_value(cell, none)` after its own bound check
+///   (`codewriter.rs` `Instruction::DeleteDeref`) and the helper hands the NULL
+///   straight to `w_cell_set` unread.  Declining it left the clear-the-cell
+///   half of every `del <cellvar>` and every `except E as e` cleanup recorded
+///   but UNEXECUTED, which marks the walk unjournaled — the walk-end flush then
+///   declines and the caller replays the region on top of residuals the walk
+///   already ran concretely.
+/// * `WithExceptStart` arg 1 — `exit_self`: `with_except_start_values` prepends
+///   it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL for every
+///   already-bound `__exit__`, which is the common `with` shape.  Aborting on it
+///   refuses every bridge out of a `with` handler.
+/// * `LoadGlobal` arg 0 — `namespace_ptr`: the helper discards it and resolves
+///   the namespace from the executing frame or the callee's own promoted
+///   `w_code`, because an inlined / chained callee's frame register aliases an
+///   outer frame; the operand survives only as the cell-fold recogniser's hint.
+///   A nested function's `LOAD_GLOBAL` folds it to the NULL constant.
+/// * `RaiseVarargs` trailing arg — `cause`: `normalize_raise_varargs` carries it
+///   as the `raise X` (no `from`) sentinel, never dereferenced when null.
+pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
+    helper: majit_ir::PyreHelperKind,
+    arg_index: usize,
+    nargs: usize,
+) -> bool {
+    use majit_ir::PyreHelperKind as K;
+    match helper {
+        K::CallFn | K::CallKw | K::StoreDeref | K::WithExceptStart => arg_index == 1,
+        K::CallFunctionEx => arg_index == 1 || arg_index == 3,
+        K::LoadGlobal => arg_index == 0,
+        K::RaiseVarargs => arg_index + 1 == nargs,
+        _ => false,
+    }
+}
+
 /// Abort the walk when a result-bearing may-force CALL is recorded with a
 /// concrete-NULL Ref argument — the specialized direct-call shape whose
 /// baked `ptr(0x0)` (the `PUSH_NULL` self-slot) makes the runtime call pass
@@ -2227,73 +2279,15 @@ pub(crate) fn walker_abort_if_mayforce_null_ref_arg<Sym: WalkSym>(
     // `GcRef(usize::MAX)` means "no concrete known" and is left alone.
     //
     // Exemption: `bh_call_fn_N(callable, null_or_self, args...)`'s
-    // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
-    // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
-    // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape, not the broken baked-NULL shape.
-    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
-    // `RaiseVarargs` (`normalize_raise_varargs`) carries a trailing `cause`
-    // Ref that is a checked `PY_NULL` sentinel for `raise X` without `from`
-    // (never dereferenced when null); exempt it so the
-    // FBW path can own the raise instead of declining to the trait.
-    let is_raise_varargs =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
-    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
-    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked
-    // `PY_NULL` sentinels (never dereferenced when null), so a concrete-NULL
-    // there is the normal `f(*args)` / no-`**` shape, not the broken baked-NULL.
-    let is_call_function_ex =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
-    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
-    // (arg 1) is a checked `PY_NULL` sentinel (prepended as arg0 only when
-    // non-null), so a concrete-NULL there is the normal plain-call shape.
-    let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    // `bh_store_deref_value_fn(cell, value)` — `value` (arg 1) is a checked
-    // `PY_NULL` sentinel handed to `w_cell_set` unread; DELETE_DEREF lowers to
-    // exactly that shape.  Kept in step with the same exemption in
-    // `try_execute_residual_call_via_executor`.
-    let is_store_deref =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
-    // `bh_with_except_start_fn(exit_func, exit_self, val)` — `exit_self`
-    // (arg index 1) is a checked `PY_NULL` sentinel: `with_except_start_values`
-    // prepends it as arg0 only when non-null, and `LOAD_SPECIAL` leaves it NULL
-    // for every already-bound `__exit__`, which is the common `with` shape.
-    // Aborting on it refuses every bridge out of a `with` handler.
-    let is_with_except_start =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::WithExceptStart;
-    // `bh_load_global_fn(namespace_ptr, w_code, frame, namei)` — `namespace_ptr`
-    // (arg index 0) is never dereferenced.  The helper discards it and resolves
-    // the namespace from the executing frame or the callee's own promoted
-    // `w_code`, because an inlined / chained callee's frame register aliases an
-    // outer frame; the operand survives only as the cell-fold recogniser's hint.
-    // A nested function's `LOAD_GLOBAL` folds it to the NULL constant, so
-    // aborting on it stops the walk after an effectful residual has already run
-    // concretely and the caller replays that region.
-    let is_load_global =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
+    let helper = call_descr.get_extra_info().pyre_helper;
+    let nargs = call_descr.arg_types().len();
     for (i, &ty) in call_descr.arg_types().iter().enumerate() {
         if ty != majit_ir::Type::Ref {
             continue;
         }
-        if is_call_fn && i == 1 {
-            continue;
-        }
-        if is_load_global && i == 0 {
-            continue;
-        }
-        if is_call_function_ex && (i == 1 || i == 3) {
-            continue;
-        }
-        if is_call_kw && i == 1 {
-            continue;
-        }
-        if is_raise_varargs && i + 1 == call_descr.arg_types().len() {
-            continue;
-        }
-        if is_store_deref && i == 1 {
-            continue;
-        }
-        if is_with_except_start && i == 1 {
+        // The checked-sentinel table, shared with
+        // `try_execute_residual_call_via_executor` so the two cannot drift.
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, nargs) {
             continue;
         }
         if let Some(&b) = allboxes.get(1 + i) {
@@ -2789,67 +2783,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `null_or_self` (arg index 1) is a checked sentinel — `PY_NULL`
     // means "no receiver" and is never dereferenced (`bh_call_fn_impl`
     // prepends it as arg0 only when non-null), so a concrete-NULL there
-    // is the normal plain-call shape.  These exemptions MUST match
-    // `walker_abort_if_mayforce_null_ref_arg`'s — otherwise a normal
-    // no-receiver keyword/star call is declined as symbolic
-    // (left symbolic), which drops the recording iteration's call
-    // exactly once (`g(i, d=4)` in a hot loop summed to n-1, callee
-    // ran n-1 times).
-    let is_call_fn = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFn;
-    // `bh_call_kw_N(callable, null_or_self, kwnames, args...)` — `null_or_self`
-    // (arg index 1) is the same checked `PY_NULL` sentinel.
-    let is_call_kw = call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    // `bh_call_function_ex_fn(callable, self_or_null, starargs, kwargs_or_null)`
-    // — `self_or_null` (arg 1) and `kwargs_or_null` (arg 3) are checked `PY_NULL`
-    // sentinels (never dereferenced when null), so a concrete-NULL there is the
-    // normal `f(*args)` / no-`**` shape.
-    let is_call_function_ex =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
-    // Same `RaiseVarargs` trailing-`cause` sentinel exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`.
-    let is_raise_varargs =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::RaiseVarargs;
-    // `bh_store_deref_value_fn(cell, value)` — `value` (arg index 1) is a
-    // checked `PY_NULL` sentinel: DELETE_DEREF lowers to
-    // `store_deref_value(cell, none)` after its own bound check
-    // (`codewriter.rs` `Instruction::DeleteDeref`), and the helper hands the
-    // NULL straight to `w_cell_set` without ever dereferencing it.  Declining
-    // it left the clear-the-cell half of every `del <cellvar>` and every
-    // `except E as e` handler cleanup recorded but UNEXECUTED, which marks the
-    // walk unjournaled — so the walk-end flush declines and the caller replays
-    // the region on top of the residuals the walk already ran concretely.
-    let is_store_deref =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::StoreDeref;
-    // Same `bh_with_except_start_fn` `exit_self` exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`: arg index 1 is the checked
-    // `PY_NULL` receiver slot `LOAD_SPECIAL` pushes beside a bound `__exit__`.
-    let is_with_except_start =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::WithExceptStart;
-    // Same `bh_load_global_fn` `namespace_ptr` exemption as
-    // `walker_abort_if_mayforce_null_ref_arg`: arg index 0 is discarded by the
-    // helper, so a concrete NULL there is the normal nested-function shape.
-    let is_load_global =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadGlobal;
+    // is the normal plain-call shape.  The exemptions are read out of the
+    // same `mayforce_null_ref_arg_is_checked_sentinel` table
+    // `walker_abort_if_mayforce_null_ref_arg` consults, because they MUST
+    // agree — a gate-only exemption leaves a normal no-receiver
+    // keyword/star call declined as symbolic here, which drops the
+    // recording iteration's call exactly once (`g(i, d=4)` in a hot loop
+    // summed to n-1, callee ran n-1 times).
+    let helper = call_descr.get_extra_info().pyre_helper;
     for (i, &arg) in args.iter().enumerate() {
-        if is_call_fn && i == 1 {
-            continue;
-        }
-        if is_load_global && i == 0 {
-            continue;
-        }
-        if is_call_kw && i == 1 {
-            continue;
-        }
-        if is_call_function_ex && (i == 1 || i == 3) {
-            continue;
-        }
-        if is_raise_varargs && i + 1 == args.len() {
-            continue;
-        }
-        if is_store_deref && i == 1 {
-            continue;
-        }
-        if is_with_except_start && i == 1 {
+        if mayforce_null_ref_arg_is_checked_sentinel(helper, i, args.len()) {
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {

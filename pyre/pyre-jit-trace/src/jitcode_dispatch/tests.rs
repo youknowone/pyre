@@ -12970,6 +12970,44 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
     ));
 }
 
+/// The checked-`PY_NULL` sentinel table is read by BOTH
+/// `walker_abort_if_mayforce_null_ref_arg` (which aborts the walk) and
+/// `try_execute_residual_call_via_executor` (which returns
+/// `declined_symbolic`), and the two must agree — a gate-only exemption leaves
+/// the executor dropping the recording iteration's call.  They share one
+/// function now, so this pins the table itself rather than either caller: the
+/// executor arm is otherwise unreachable from a unit test, since it runs the
+/// residual concretely through the funcbox.
+#[test]
+fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
+    use super::residual_call::mayforce_null_ref_arg_is_checked_sentinel as is_sentinel;
+    use majit_ir::PyreHelperKind as K;
+
+    // (helper, nargs, the exempt indices)
+    let table: &[(K, usize, &[usize])] = &[
+        (K::CallFn, 4, &[1]),
+        (K::CallKw, 5, &[1]),
+        (K::StoreDeref, 2, &[1]),
+        (K::WithExceptStart, 3, &[1]),
+        (K::CallFunctionEx, 4, &[1, 3]),
+        (K::LoadGlobal, 4, &[0]),
+        // `normalize_raise_varargs` puts `cause` last, whatever the arity.
+        (K::RaiseVarargs, 3, &[2]),
+        (K::RaiseVarargs, 2, &[1]),
+        // An untagged residual exempts nothing — the shape the gate exists for.
+        (K::None, 4, &[]),
+    ];
+    for &(helper, nargs, exempt) in table {
+        for i in 0..nargs {
+            assert_eq!(
+                is_sentinel(helper, i, nargs),
+                exempt.contains(&i),
+                "{helper:?} arg {i} of {nargs}"
+            );
+        }
+    }
+}
+
 #[test]
 fn traceback_journal_rollback_unwinds_every_walk_node() {
     // A recording walk attaches one node per frame it delivers the exception
