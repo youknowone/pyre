@@ -24,7 +24,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
     module_ns_store(ns, "CODESIZE", w_int_new(sre_engine::CODESIZE as i64));
     module_ns_store(ns, "MAXREPEAT", w_int_new(sre_engine::MAXREPEAT as i64));
-    module_ns_store(ns, "MAXGROUPS", w_int_new(sre_engine::MAXGROUPS as i64));
+    // `sre.h SRE_MAXGROUPS` halves `INT32_MAX`; the engine crate halves its own
+    // `MAXREPEAT`, which is unsigned, and lands one bit wide. `re/_parser.py`
+    // bounds a pattern's group count and two group references on this number,
+    // so it is the one a caller can reach.
+    module_ns_store(ns, "MAXGROUPS", w_int_new(i32::MAX as i64 / 2));
     // _sre module-level functions: PyPy mixedmodule.py:111-116 wraps these
     // as BuiltinFunction so storing them on a user class does not bind self.
     module_ns_store(
