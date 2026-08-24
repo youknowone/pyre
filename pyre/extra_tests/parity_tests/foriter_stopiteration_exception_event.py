@@ -18,13 +18,15 @@
 # what this pins: reporting always would fire on every `for` over a list, and
 # reporting never would lose the one case a debugger cares about.
 #
-# A generator ending is left unpinned, because 3.14 answers it two ways for
-# one code object.  The first execution runs the unspecialised `_FOR_ITER`,
-# whose exhaustion arm jumps past `END_FOR` without reporting; once the loop
-# specialises to `FOR_ITER_GEN` the generator's frame is pushed instead, the
-# end arrives at `INSTRUMENTED_END_FOR`, and `monitor_stop_iteration` mints
-# the event there.  A consumer called once therefore observes silence and a
-# consumer called twice observes the event, so neither is a rule to pin.
+# A generator's ending carries no traceback and is the other half of the rule:
+# an event is reported because the iterator is a generator.  3.14 answers a
+# cold loop differently -- the first execution runs the unspecialised
+# `_FOR_ITER`, whose exhaustion arm jumps past `END_FOR` without reporting,
+# and only once the loop specialises to `FOR_ITER_GEN` does the end arrive at
+# `INSTRUMENTED_END_FOR` where `monitor_stop_iteration` mints it.  So the
+# warm loop is what is pinned here: it is the answer 3.14 settles on, the
+# answer pypy3 gives from the first call, and the only one of the two that
+# does not depend on which tier is running.
 import sys
 
 
@@ -145,8 +147,24 @@ def the_loop_still_ends_normally():
     assert collected == [2, 1, 0], collected
 
 
+def a_warm_generator_loop_reports_its_end():
+    def empty():
+        return
+        yield
+
+    def consume():
+        for _ in empty():
+            raise AssertionError('the generator yields nothing')
+
+    # Repeated so the loop is warm on the last call, which is the one graded:
+    # 3.14 reports nothing on the first and reports from the second onwards.
+    rows = [exception_events_in(consume) for _ in range(8)]
+    assert rows[-1] == [('consume', 'StopIteration')], rows
+
+
 a_python_level_next_reports_to_the_consuming_frame()
 the_rule_is_the_traceback_and_not_the_iterator()
 a_natively_signalled_end_reports_nothing()
 the_loop_still_ends_normally()
+a_warm_generator_loop_reports_its_end()
 print('OK')

@@ -3033,11 +3033,10 @@ impl PyFrame {
     ///         self.space.getexecutioncontext().exception_trace(self, operr)
     /// ```
     ///
-    /// Only the traceback arm is ported, and `w_iterator` is unused as a
-    /// result.  Upstream calls its two generator arms "an approximative
-    /// rule" for a case it says it cannot emulate.  Counting `exception`
-    /// events in the consuming frame under `sys.settrace` on 3.14.6, each
-    /// row the same on the first call and on the tenth:
+    /// Upstream calls the three arms "an approximative rule" for a case it
+    /// says it cannot emulate.  Counting `exception` events in the consuming
+    /// frame under `sys.settrace` on 3.14.6, each row the same on the first
+    /// call and on the tenth:
     ///
     /// ```text
     /// for _ in CustomIter():   # Python-level __next__ raising StopIteration
@@ -3049,19 +3048,21 @@ impl PyFrame {
     /// for _ in iter(step, 3):  -> []
     /// ```
     ///
-    /// So the report fires when the StopIteration carries a traceback and
-    /// not otherwise.  The `map` row is what settles that the rule is about
-    /// the traceback rather than about the iterator's kind: its `__next__`
-    /// is native, and the event still fires, because the StopIteration
-    /// passed through a Python frame on the way out.
+    /// The traceback arm covers those rows: the report fires when the
+    /// StopIteration carries a traceback and not otherwise.  The `map` row is
+    /// what settles that this arm is about the traceback rather than about the
+    /// iterator's kind: its `__next__` is native, and the event still fires,
+    /// because the StopIteration passed through a Python frame on the way out.
     ///
-    /// A generator loop is not in the table, because 3.14 answers it two
-    /// ways for one code object: silence on the first execution, which runs
-    /// the unspecialised `_FOR_ITER` and jumps past `END_FOR`, and an event
-    /// once the loop specialises to `FOR_ITER_GEN` and the end arrives at
-    /// `INSTRUMENTED_END_FOR`, where `monitor_stop_iteration` mints it.
-    /// This arm answers with silence either way, which is the first of the
-    /// two, and whether it should follow the second is undecided.
+    /// A generator's ending carries no traceback and is the iterator arm's
+    /// own row.  3.14 answers it two ways for one code object -- silence on
+    /// the first execution, which runs the unspecialised `_FOR_ITER` and jumps
+    /// past `END_FOR`, then an event once the loop specialises to
+    /// `FOR_ITER_GEN` and the end arrives at `INSTRUMENTED_END_FOR`, where
+    /// `monitor_stop_iteration` mints it.  The event it mints is for a
+    /// traceback-less StopIteration, so the traceback arm alone cannot reach
+    /// it; the iterator arm answers a warm loop the way 3.14 does and a cold
+    /// one the way pypy3 does, which is to say the same way every time.
     ///
     /// `pyre/extra_tests/parity_tests/foriter_stopiteration_exception_event.py`
     /// pins the table.
@@ -3071,10 +3072,14 @@ impl PyFrame {
     /// off a null carrier and never reaches the tracer test.
     fn _report_stopiteration_sometimes(
         &mut self,
-        _w_iterator: PyObjectRef,
+        w_iterator: PyObjectRef,
         operr: &mut PyError,
     ) -> Result<(), PyError> {
-        if !operr.has_any_traceback() {
+        let generator = unsafe {
+            pyre_object::generator::is_generator_or_coroutine(w_iterator)
+                || pyre_object::generator::is_async_gen_asend(w_iterator)
+        };
+        if !generator && !operr.has_any_traceback() {
             return Ok(());
         }
         let ec = self.execution_context as *mut crate::PyExecutionContext;
