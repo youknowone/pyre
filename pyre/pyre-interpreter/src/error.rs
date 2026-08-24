@@ -3417,7 +3417,7 @@ fn write_traceback_chain_from_tb<W: Write>(
     let _roots = pyre_object::gc_roots::push_roots();
     // `StackSummary.format` dedup state: the previous frame's identity and how
     // many consecutive frames have carried it.
-    let mut last: Option<(Vec<u8>, i64, String)> = None;
+    let mut last: Option<(Vec<u8>, Option<i64>, String)> = None;
     let mut repeats: usize = 0;
     while !tb.is_null() {
         let tb_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3427,10 +3427,11 @@ fn write_traceback_chain_from_tb<W: Write>(
             break;
         }
         let w_code = unsafe { crate::pytraceback::w_pytraceback_get_w_code(current_tb) };
-        // `Py_DisplayTraceback` prints whatever `tb_get_lineno` gave it,
-        // negative included, rather than skipping a node it cannot place.
-        let lineno =
-            unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) }.unwrap_or(-1);
+        // `FrameSummary.lineno` is whatever `tb_lineno` answered, `None`
+        // included: the node is still printed, with `None` where the line
+        // would go and with no source line under it, because `_set_lines`
+        // returns early for a summary that has no line to read.
+        let lineno = unsafe { crate::pytraceback::w_pytraceback_get_lineno(current_tb) };
         let lasti = unsafe { crate::pytraceback::w_pytraceback_get_lasti(current_tb) };
         let (filename, funcname, location) = if w_code.is_null() {
             (b"<unknown>".to_vec(), String::from("<unknown>"), None)
@@ -3476,6 +3477,7 @@ fn write_traceback_chain_from_tb<W: Write>(
             continue;
         }
         let (filename, lineno, funcname) = key;
+        let shown_lineno = lineno.map_or_else(|| String::from("None"), |line| line.to_string());
         // The name is *reported* as the text it decodes to, with the same error
         // handler that read it off the filesystem, so a byte with no UTF-8
         // spelling reaches the stream as its escape.  Writing the raw bytes
@@ -3485,13 +3487,13 @@ fn write_traceback_chain_from_tb<W: Write>(
         let shown_filename = crate::gateway::fsdecode_filename_wtf8(&filename);
         writer.write_all(b"  File \"")?;
         writer.write_all(shown_filename.as_bytes())?;
-        writeln!(writer, "\", line {lineno}, in {funcname}")?;
+        writeln!(writer, "\", line {shown_lineno}, in {funcname}")?;
         // `FrameSummary._set_lines` collects every line the failing
         // instruction spans, so a statement written across several lines (a
         // class body, a multi-line call) shows all of them, dedented by the
         // indentation they share.
         if let Some((start_line, end_line, _, _)) = location
-            && usize::try_from(lineno).ok() == Some(start_line)
+            && lineno.and_then(|line| usize::try_from(line).ok()) == Some(start_line)
             && end_line > start_line
         {
             let span: Vec<String> = (start_line..=end_line)
@@ -3505,13 +3507,15 @@ fn write_traceback_chain_from_tb<W: Write>(
                     writeln!(writer, "    {line}")?;
                 }
             }
-        } else if let Some(line) = frame_source_line(tb_slot, &filename, lineno) {
+        } else if let Some(line) =
+            lineno.and_then(|line| frame_source_line(tb_slot, &filename, line))
+        {
             let raw_line = line.trim_end_matches(['\n', '\r']);
             let shown_line = raw_line.trim_start();
             writeln!(writer, "    {shown_line}")?;
 
             if let Some((start_line, end_line, start_col, end_col)) = location
-                && usize::try_from(lineno).ok() == Some(start_line)
+                && lineno.and_then(|line| usize::try_from(line).ok()) == Some(start_line)
                 && end_line == start_line
                 && end_col > start_col
                 && start_col <= raw_line.len()
