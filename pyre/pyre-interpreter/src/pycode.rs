@@ -3136,6 +3136,22 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
         // Only the slot table. The families themselves stay allocated: cells
         // created from this code may still be alive in a surviving closure,
         // and each holds an untraced `Cell.family` pointer into them.
+        //
+        // That is why freeing them here is wrong, not why never freeing them is
+        // right. One family is minted per cellvar per code-object construction
+        // and none is ever reclaimed, so a process that keeps compiling grows
+        // without bound -- measured at ~201 bytes retained per cellvar per
+        // compile. `pycode.py` `_initialize` and `nestedscope.py` `Cell.__init__`
+        // hold the family through two ordinary references and let the collector
+        // take it once the table and every surviving cell are gone; reaching
+        // that shape here means tracing both edges, which is deferred rather
+        // than done. Immortality is also what currently makes the untraced word
+        // safe for the recorder's `quasi_immut_descr` read, so the two move
+        // together.
+        //
+        // The code object this hangs off is already leaked whole and on purpose
+        // (`box_code_object`), at a far larger byte rate, so this does not
+        // change what a workload can do today.
         drop(unsafe { Box::from_raw(code.cell_families) });
         code.cell_families = std::ptr::null_mut();
     }
