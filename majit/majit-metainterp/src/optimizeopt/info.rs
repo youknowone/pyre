@@ -36,7 +36,7 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 ///
 /// A poisoned cache lock degrades to "unresolved", which declines; it must not
 /// abort.
-fn resolve_gc_tid(
+pub(crate) fn resolve_gc_tid(
     stamped_tid: u32,
     cache_key: u64,
     resolve: impl FnOnce(&majit_ir::descr::GcCache, u64) -> Option<u32>,

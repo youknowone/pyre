@@ -3217,6 +3217,19 @@ pub fn function_w_qualname_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_QUALNAME_OFFSET)
 }
 
+/// `Function.w_ann` — the eager `__annotations__` dict.  A plain mutable slot:
+/// it has no `function.py:34-42` twin, so no watcher pairs with it.
+pub fn function_w_ann_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_ANN_OFFSET)
+}
+
+/// `Function.w_annotate` — the PEP 649 `__annotate__` callable the runtime
+/// `__annotations__` getter evaluates lazily.  Plain and mutable, like its
+/// `w_ann` sibling.
+pub fn function_w_annotate_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_ANNOTATE_OFFSET)
+}
+
 /// `Function.w_kw_defs` — `w_kw_defs?`, the keyword-only defaults mapping.
 pub fn function_w_kw_defs_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_KW_DEFS_OFFSET)

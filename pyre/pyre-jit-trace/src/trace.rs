@@ -3555,9 +3555,9 @@ fn run_perfn_walk<Sym: WalkSym>(
     w_code: *const (),
     start_pc: usize,
     cf_addr: usize,
+    is_being_profiled: bool,
     authoritative: bool,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
-    let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
         is_being_profiled,
         ..Default::default()
@@ -5232,9 +5232,16 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     // Capture the trace position BEFORE the walk so `cut_trace` rolls back
     // every op the diagnostic recorded (the walk discards its trace).
     let pre_pos = ctx.get_trace_position();
-    let Some((entry, code_len, walk_result)) =
-        run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, authoritative)
-    else {
+    let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
+    let Some((entry, code_len, walk_result)) = run_perfn_walk(
+        ctx,
+        sym,
+        w_code,
+        start_pc,
+        cf_addr,
+        is_being_profiled,
+        authoritative,
+    ) else {
         return;
     };
     match &walk_result {
@@ -6038,7 +6045,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             start_pc,
         );
     }
-    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
+    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, is_being_profiled, true);
     // A guard snapshot emitted during the walk may have hit a resume
     // coordinate the jitcode resume markers cannot encode (#124/#130) and requested
     // an abort (`state::request_trace_abort`).  The walker does not poll the
