@@ -3745,13 +3745,19 @@ impl<'a> Transformer<'a> {
         // language fixes, so their tags can be spelled here. A user enum's
         // cannot, and its variant ctor keeps the residual shape.
         if args.is_empty()
-            && let Some((name, tag)) = sum_variant_ctor_tag(target)
+            && let Some(variant) = sum_variant_ctor(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
             let result_base = owner
-                .strip_suffix(format!("::{name}").as_str())
+                .strip_suffix(format!("::{}", variant.leaf).as_str())
                 .unwrap_or(owner)
                 .to_string();
+            let alloc_owner = if variant.carries_payload {
+                owner.clone()
+            } else {
+                result_base.clone()
+            };
+            let tag = variant.tag;
             let result = op
                 .result
                 .clone()
@@ -3759,9 +3765,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: Some(result.clone()),
-                    kind: OpKind::New {
-                        owner: owner.clone(),
-                    },
+                    kind: OpKind::New { owner: alloc_owner },
                 },
                 SpaceOperation {
                     result: None,
@@ -6320,18 +6324,42 @@ impl<'a> Transformer<'a> {
     }
 }
 
-/// The niladic sum-type variant ctors lowered to an allocation plus a tag
-/// write: `(variant leaf, discriminant)`.
+/// A niladic sum-type variant ctor lowered to an allocation plus a tag write.
+struct SumVariantCtor {
+    /// The variant leaf, as the ctor's result owner spells it.
+    leaf: &'static str,
+    /// The discriminant to stamp.
+    tag: i64,
+    /// Whether the variant carries a payload field of its own.
+    ///
+    /// A payload-less variant has no fields, so nothing registers a layout for
+    /// its variant class and `New` on it resolves to a zero-sized descr the
+    /// collector never issued a type id for — which the walker refuses
+    /// (`UnregisteredNewGcType`), after the descent has already run. The value
+    /// such a ctor builds is a bare tag, and the enum base's shell is what
+    /// carries one, so the allocation goes there instead.
+    carries_payload: bool,
+}
+
+/// The niladic sum-type variant ctors lowered to an allocation plus a tag.
 ///
 /// Both halves come from the front-side spelling rules
 /// ([`crate::front::result_exc::result_ctor_kind`],
 /// [`crate::front::option_ctor::option_variant_ctor_tag`]) so the recogniser
-/// here cannot drift from the one the frontend applies.
-fn sum_variant_ctor_tag(target: &CallTarget) -> Option<(&'static str, i64)> {
-    if let Some(is_err) = crate::front::result_exc::result_ctor_kind(target) {
-        return Some(if is_err { ("Err", 1) } else { ("Ok", 0) });
-    }
-    crate::front::option_ctor::option_variant_ctor_tag(target)
+/// here cannot drift from the one the frontend applies. Which variants carry a
+/// payload is fixed by the language for both enums: `Ok`, `Err` and `Some`
+/// each hold one, `None` holds none.
+fn sum_variant_ctor(target: &CallTarget) -> Option<SumVariantCtor> {
+    let (leaf, tag) = match crate::front::result_exc::result_ctor_kind(target) {
+        Some(true) => ("Err", 1),
+        Some(false) => ("Ok", 0),
+        None => crate::front::option_ctor::option_variant_ctor_tag(target)?,
+    };
+    Some(SumVariantCtor {
+        leaf,
+        tag,
+        carries_payload: leaf != "None",
+    })
 }
 
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a
