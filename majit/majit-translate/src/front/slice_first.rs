@@ -150,7 +150,7 @@ fn rewire_one_slice_first_site(
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__cast_instance_intrinsic"
+                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {
@@ -444,7 +444,10 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.into(),
+                            "PyObject".into(),
+                        ],
                     },
                     args: vec![opt.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -480,7 +483,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                        if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                        if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 )
             })
             .count();

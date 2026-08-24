@@ -241,13 +241,19 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // by the `__cast_instance_intrinsic` HOST_ENV singleton (same Arc the
         // adapter resolves the call's callable to), lowers to a
         // `cast_pointer` into the narrowed `InstanceRepr`.
-        ("__cast_instance_intrinsic", rtype_cast_instance_intrinsic),
+        (
+            crate::runtime_names::shims::CAST_INSTANCE,
+            rtype_cast_instance_intrinsic,
+        ),
         // The erasing twin (`p as *mut u8`).  Its annotator dropped the
         // pointee class, so `hop.r_result` is the classdef-less
         // `InstanceRepr` and the same `cast_pointer` body applies — this
         // time as the upcast direction of `pairtype(InstanceRepr,
         // InstanceRepr).convert_from_to`.
-        ("__cast_address_intrinsic", rtype_cast_instance_intrinsic),
+        (
+            crate::runtime_names::shims::CAST_ADDRESS,
+            rtype_cast_instance_intrinsic,
+        ),
     ];
     for (name, typer) in entries {
         if let Some(host) = HOST_ENV.lookup_builtin(name) {
@@ -487,7 +493,11 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // The GC sibling `malloc_typed` is fused into `NewWithVtable` by
         // the front-end and never reaches `findbltintyper`; the raw path
         // lowers to a residual external `direct_call` here.
-        ("pyre_object.lltype", "malloc_raw", rtype_malloc_raw),
+        (
+            crate::runtime_names::modules::OBJECT_LLTYPE,
+            "malloc_raw",
+            rtype_malloc_raw,
+        ),
     ];
     for (module_name, attr_name, typer) in module_entries {
         if let Some(host) = HOST_ENV

@@ -5467,7 +5467,7 @@ impl<'a> Lowering<'a> {
             result: Some(result.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__majit_stringbuilder_build".to_string()],
+                    segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
                 },
                 args: vec![builder],
                 result_ty: ValueType::Ref(None),
@@ -5542,13 +5542,16 @@ impl<'a> Lowering<'a> {
         let (segments, result_ty) =
             if src_root.is_some() && tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
                 (
-                    vec!["__cast_address_intrinsic".to_string()],
+                    vec![crate::runtime_names::shims::CAST_ADDRESS.to_string()],
                     ValueType::Ref(None),
                 )
             } else {
                 let root = tyref_class_root(dest_ty, self.llbc)?;
                 (
-                    vec!["__cast_instance_intrinsic".to_string(), root.clone()],
+                    vec![
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                        root.clone(),
+                    ],
                     ValueType::Ref(Some(root)),
                 )
             };
@@ -5819,7 +5822,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__cast_instance_intrinsic".to_string(),
+                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -6007,7 +6010,7 @@ impl<'a> Lowering<'a> {
                                 kind: OpKind::Call {
                                     target: CallTarget::FunctionPath {
                                         segments: vec![
-                                            "__cast_instance_intrinsic".to_string(),
+                                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                             owner.clone(),
                                         ],
                                     },
@@ -6115,7 +6118,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "__cast_instance_intrinsic".to_string(),
+                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                     root.clone(),
                                 ],
                             },
@@ -6157,7 +6160,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "__cast_instance_intrinsic".to_string(),
+                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                     root.clone(),
                                 ],
                             },
@@ -7938,7 +7941,9 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["__majit_stringbuilder_new".to_string()],
+                                segments: vec![
+                                    crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
+                                ],
                             },
                             args,
                             result_ty: ValueType::Ref(None),
@@ -8002,7 +8007,10 @@ impl<'a> Lowering<'a> {
                             result: Some(void),
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
-                                    segments: vec!["__majit_stringbuilder_append".to_string()],
+                                    segments: vec![
+                                        crate::runtime_names::shims::STRINGBUILDER_APPEND
+                                            .to_string(),
+                                    ],
                                 },
                                 args: vec![acc_val, args[piece_i].clone()],
                                 result_ty: ValueType::Void,
@@ -8048,7 +8056,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__cast_instance_intrinsic".to_string(),
+                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -8710,7 +8718,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "pyre_object".to_string(),
+                                    crate::runtime_names::crates::OBJECT.to_string(),
                                     "longobject".to_string(),
                                     "jit_bigint_from_i64".to_string(),
                                 ],
@@ -9435,7 +9443,7 @@ impl<'a> Lowering<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "__cast_instance_intrinsic".to_string(),
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                             "RBigInt".to_string(),
                         ],
                     },
@@ -10139,7 +10147,10 @@ impl<'a> Lowering<'a> {
                 result: Some(narrowed.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".to_string(), root.clone()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                            root.clone(),
+                        ],
                     },
                     args: vec![result_var.clone()],
                     result_ty: ValueType::Ref(Some(root)),
@@ -10495,7 +10506,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "__cast_instance_intrinsic".to_string(),
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                         "Constants".to_string(),
                     ],
                 },
@@ -13417,7 +13428,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".to_string(),
+                        crate::runtime_names::crates::OBJECT.to_string(),
                         "longobject".to_string(),
                         "jit_bigint_to_i64_value_or_zero".to_string(),
                     ],
@@ -13431,7 +13442,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".to_string(),
+                        crate::runtime_names::crates::OBJECT.to_string(),
                         "longobject".to_string(),
                         "jit_bigint_to_i64_fits".to_string(),
                     ],
@@ -14680,7 +14691,10 @@ fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usi
         // under `pyre_interpreter::display`; the `Wtf8Buf` impl resolves to the
         // `Wtf8Buf` owner.  Both append `self` (arg 0) onto the `&mut Wtf8Buf`
         // accumulator (arg 1).
-        "push_onto" => (np.split("::").take(2).eq(["pyre_interpreter", "display"])
+        "push_onto" => (np
+            .split("::")
+            .take(2)
+            .eq([crate::runtime_names::crates::INTERPRETER, "display"])
             || deref_impl_owner_leaf(llbc, fd).as_deref() == Some("Wtf8Buf"))
         .then_some((1, 0)),
         _ => None,
@@ -22920,10 +22934,7 @@ mod tests {
     fn random_genrand32_fixed_array_keeps_concrete_identity() {
         use crate::model::{OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let fd = llbc
             .iter_local_fns()
@@ -22969,10 +22980,7 @@ mod tests {
     fn random_wrapper_narrows_nullable_self_to_w_random() {
         use crate::model::{CallTarget, OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let fd = llbc
             .iter_local_fns()
@@ -23011,7 +23019,7 @@ mod tests {
                 target: CallTarget::FunctionPath { segments },
                 result_ty: ValueType::Ref(Some(root)),
                 ..
-            } if segments == &["__cast_instance_intrinsic".to_string(), "W_Random".to_string()]
+            } if segments == &[crate::runtime_names::shims::CAST_INSTANCE.to_string(), "W_Random".to_string()]
                 && root == "W_Random"
         ));
     }
@@ -24777,10 +24785,7 @@ mod tests {
     fn real_stack_underflow_fmt_chain_collapses_to_str_concat() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "stack_underflow_error")
             .expect("lower stack_underflow_error");
@@ -24852,10 +24857,7 @@ mod tests {
     fn arguments_from_str_nonconst_alias_real_constructor_args() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "constructor_args").expect("lower constructor_args");
@@ -24900,10 +24902,7 @@ mod tests {
     fn constants_wrapper_access_matches_real_interpreter_llbc() {
         use crate::model::{CallTarget, OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
         assert_eq!(
@@ -25235,10 +25234,7 @@ mod tests {
     fn fold_size_const_real_function_object_size() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "function_new_impl").expect("lower function_new_impl");
@@ -25284,10 +25280,7 @@ mod tests {
     fn iter_next_fold_real_call_function_impl_result() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
@@ -25353,10 +25346,7 @@ mod tests {
     fn is_some_fold_real_callable_w() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "callable_w").expect("lower callable_w");
 
@@ -25403,10 +25393,7 @@ mod tests {
     fn or_else_fold_real_space_int() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "space_int").expect("lower space_int");
 
@@ -25459,10 +25446,7 @@ mod tests {
     fn range_contains_fold_real_int_census_sites() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
 
         for fname in ["setitem_bytearray", "byte_w", "c_int_w"] {
@@ -25533,10 +25517,7 @@ mod tests {
     fn range_contains_fold_real_declines_float_range() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "complex_pow").expect("lower complex_pow");
 
@@ -25576,10 +25557,7 @@ mod tests {
     fn bigint_i64_try_from_real_declines_u32_result() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "char_arg").expect("lower char_arg");
 
@@ -26745,10 +26723,7 @@ mod tests {
     #[ignore]
     fn fmt_collapse_long_literal_real_space_int() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         for fname in ["space_int", "space_index"] {
             let graph = super::lower_function(&llbc, fname)
@@ -26795,10 +26770,7 @@ mod tests {
     #[ignore]
     fn option_try_recast_break_arm_real_lookup() {
         use crate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
         let branch_calls = graph
@@ -26860,10 +26832,7 @@ mod tests {
     #[ignore]
     fn vec_index_mut_fill_user_function_args_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "fill_user_function_args")
             .expect("lower fill_user_function_args");
@@ -26907,10 +26876,7 @@ mod tests {
     #[ignore]
     fn saturating_sub_generic_alias_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
             .expect("lower generic_alias_class_getitem");
@@ -26960,10 +26926,7 @@ mod tests {
     #[ignore]
     fn is_some_and_is_mmap_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
         let residual = graph
@@ -27002,10 +26965,7 @@ mod tests {
     #[ignore]
     fn set_ref_set_locals_w_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
         let residual = graph
@@ -27050,10 +27010,7 @@ mod tests {
     #[ignore]
     fn we_are_jitted_lookup_in_type_where_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "lookup_in_type_where")
             .expect("lower lookup_in_type_where");
@@ -27111,10 +27068,7 @@ mod tests {
     #[ignore]
     fn call_intrinsic_1_debug_enum_fmt_real() {
         use crate::model::{CallTarget, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "call_intrinsic_1").expect("lower call_intrinsic_1");
@@ -27185,7 +27139,7 @@ mod tests {
             }
         }
 
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        let path = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
         let bytes = std::fs::read(path).expect("read checked-in corpus LLBC");
         let mut file: serde_json::Value =
             serde_json::from_slice(&bytes).expect("parse checked-in corpus JSON");
@@ -27370,10 +27324,7 @@ mod tests {
     fn niche_option_gettypeobject_folds_to_ptr_null_test() {
         use crate::model::OpKind;
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "gettypeobject").expect("lower gettypeobject");
 
@@ -27440,10 +27391,7 @@ mod tests {
     #[ignore]
     fn niche_option_match_switch_closes_with_bool_exitcase() {
         use crate::model::{ExitCase, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "object_functionstr_type_name")
             .expect("lower object_functionstr_type_name");
@@ -27511,10 +27459,7 @@ mod tests {
     fn fieldless_enum_eq_fold_real_strategy_is() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_object::dictmultiobject::strategy_is")
             .expect("lower strategy_is");
@@ -27547,10 +27492,7 @@ mod tests {
     #[ignore]
     fn shared_ref_niche_option_get_w_locals_no_pos0_read() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "get_w_locals").expect("lower get_w_locals");
         let pos0_reads = graph
@@ -27575,10 +27517,7 @@ mod tests {
     #[ignore]
     fn mut_ref_niche_option_set_chunk_size_still_no_pos0_read() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         // Any &mut-self __majit_wrap setter; set__CHUNK_SIZE takes `&mut self`.
         let graph =
@@ -27607,10 +27546,7 @@ mod tests {
     #[ignore]
     fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph =
             super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
@@ -27641,10 +27577,7 @@ mod tests {
     #[ignore]
     fn rbigint_digits_still_folds_capacity_length_view() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
         let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
         let graph = super::lower_function(&llbc, "rbigint::<Impl>::digits")
             .or_else(|_| super::lower_function(&llbc, "digits"))
@@ -27732,10 +27665,7 @@ mod tests {
     #[test]
     #[ignore]
     fn sized_gate_rejects_unsized_wtf8_accepts_sized_wstruct() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let target = std::env::var("TARGET").unwrap_or_default();
 
@@ -27772,10 +27702,7 @@ mod tests {
     #[ignore]
     fn str_slice_args_option_wtf8_not_niche_folded() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
         // The niche discriminant fold emits `ne(base, null_mut())`; a declined
@@ -27809,10 +27736,7 @@ mod tests {
     #[ignore]
     fn call_function_impl_result_has_no_residual_array_index() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
@@ -27853,10 +27777,7 @@ mod tests {
     #[ignore]
     fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
             .expect("lower bind_kwargs_to_signature");

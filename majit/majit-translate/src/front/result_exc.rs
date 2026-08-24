@@ -628,9 +628,13 @@ fn lower_result_exc_returns_inner(
                         // calls would otherwise sit in this JitCode and refuse
                         // every descent that reaches it.
                         target: CallTarget::FunctionPath {
-                            segments: ["pyre_interpreter", "error", "pyerror_to_exc_object"]
-                                .map(str::to_string)
-                                .to_vec(),
+                            segments: [
+                                crate::runtime_names::crates::INTERPRETER,
+                                "error",
+                                "pyerror_to_exc_object",
+                            ]
+                            .map(str::to_string)
+                            .to_vec(),
                         },
                         args: vec![payload],
                         result_ty: ValueType::Ref(None),
@@ -2185,7 +2189,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             h_id,
             OpKind::Call {
                 target: CallTarget::function_path([
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "error",
                     "exception_object_matches_stop_iteration",
                 ]),
@@ -2619,7 +2623,7 @@ pub(crate) fn is_recast_narrow(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__cast_instance_intrinsic")
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == crate::runtime_names::shims::CAST_INSTANCE)
     )
 }
 
@@ -2971,7 +2975,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
     for &(pi, ctor_idx, helper, si, pos) in &fusions {
         if let OpKind::Call { target, .. } = &mut graph.blocks[pi].operations[ctor_idx].kind {
             *target = CallTarget::FunctionPath {
-                segments: ["pyre_interpreter", "error", helper]
+                segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
                     .map(str::to_string)
                     .to_vec(),
             };

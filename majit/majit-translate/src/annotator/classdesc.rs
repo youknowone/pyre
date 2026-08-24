@@ -3854,7 +3854,8 @@ mod tests {
     fn struct_force_key_projects_dotted_ctor_qualname() {
         // Constructor-minted spelling: dot-joined, crate-included.
         assert_eq!(
-            struct_force_key_from_dotted_qualname("pyre_interpreter.pyframe.FrameBlock").as_deref(),
+            struct_force_key_from_dotted_qualname(crate::runtime_names::symbols::FRAMEBLOCK)
+                .as_deref(),
             Some("pyframe::FrameBlock")
         );
         // Crate-root struct: projection lands on the bare convention.

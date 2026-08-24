@@ -1718,8 +1718,8 @@ impl HostEnv {
         // qualname and its typer (rtyper/rbuiltin.rs) keys on this same
         // singleton Arc, so the binding must live in HOST_ENV.
         self.insert_builtin(
-            "__cast_instance_intrinsic",
-            HostObject::new_builtin_callable("__cast_instance_intrinsic"),
+            crate::runtime_names::shims::CAST_INSTANCE,
+            HostObject::new_builtin_callable(crate::runtime_names::shims::CAST_INSTANCE),
         );
         // Pyre-internal front-end pointer-type ERASURE, the twin of the
         // narrow above: the frontend lowers `obj as *mut u8` to a
@@ -1731,8 +1731,8 @@ impl HostEnv {
         // for a pointee-less raw pointer.  Same three-way binding as the
         // narrow (analyzer keys the qualname, typer keys this Arc).
         self.insert_builtin(
-            "__cast_address_intrinsic",
-            HostObject::new_builtin_callable("__cast_address_intrinsic"),
+            crate::runtime_names::shims::CAST_ADDRESS,
+            HostObject::new_builtin_callable(crate::runtime_names::shims::CAST_ADDRESS),
         );
     }
 
@@ -2315,7 +2315,7 @@ impl HostEnv {
         // (`rbuiltin.rs lookup_typer`), so a fresh
         // `new_builtin_callable` with the same qualname would miss the
         // registered typer.
-        let object_module = HostObject::new_module("pyre_object.pyobject");
+        let object_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_PYOBJECT);
         object_module.module_set(
             "PY_NULL",
             core_ptr
@@ -2330,14 +2330,14 @@ impl HostEnv {
         // crate-qualified FunctionPath `["pyre_object","lltype","malloc_typed"]`,
         // which `translate_op`'s Layer-3b resolves via this module
         // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
-        let lltype_module = HostObject::new_module("pyre_object.lltype");
+        let lltype_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_LLTYPE);
         lltype_module.module_set(
             "malloc_typed",
-            HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed"),
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_TYPED),
         );
         lltype_module.module_set(
             "malloc_typed_managed",
-            HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed_managed"),
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_TYPED_MANAGED),
         );
         // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Exposed as a
@@ -2347,7 +2347,7 @@ impl HostEnv {
         // module (prefix `pyre_object.lltype`, leaf `malloc_raw`).
         lltype_module.module_set(
             "malloc_raw",
-            HostObject::new_builtin_callable("pyre_object.lltype.malloc_raw"),
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_RAW),
         );
 
         let mut mods = self.modules.lock().unwrap();
@@ -2389,8 +2389,14 @@ impl HostEnv {
         mods.insert("FrameDebugData".into(), frame_debug_data);
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
-        mods.insert("pyre_object.pyobject".into(), object_module);
-        mods.insert("pyre_object.lltype".into(), lltype_module);
+        mods.insert(
+            crate::runtime_names::modules::OBJECT_PYOBJECT.into(),
+            object_module,
+        );
+        mods.insert(
+            crate::runtime_names::modules::OBJECT_LLTYPE.into(),
+            lltype_module,
+        );
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.

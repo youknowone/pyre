@@ -256,7 +256,7 @@ fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments },
             ..
-        } if segments.len() == 1 && segments[0] == "__majit_range" => Some(()),
+        } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE => Some(()),
         _ => None,
     })
     .is_some()
@@ -370,7 +370,7 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__cast_instance_intrinsic")
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == crate::runtime_names::shims::CAST_INSTANCE)
     )
 }
 
@@ -768,7 +768,7 @@ mod tests {
         let mut g = FunctionGraph::new("test_iter_next_item_type");
         let n = g.startblock;
         let container_segments = if over_a_range {
-            vec!["__majit_range".to_string()]
+            vec![crate::runtime_names::shims::RANGE.to_string()]
         } else {
             vec![
                 "some".to_string(),

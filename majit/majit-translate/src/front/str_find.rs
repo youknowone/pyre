@@ -53,7 +53,7 @@ mod tests {
     fn recognizes_only_the_importing_compatibility_helper() {
         let path = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(is_rpython_str_find_char(&path(&[
-            "pyre_interpreter",
+            crate::runtime_names::crates::INTERPRETER,
             "importing",
             "rpython_str_find_char"
         ])));
@@ -61,7 +61,7 @@ mod tests {
             "core", "str", "<Impl>", "find"
         ])));
         assert!(is_rpython_str_slice_prefix(&path(&[
-            "pyre_interpreter",
+            crate::runtime_names::crates::INTERPRETER,
             "importing",
             "rpython_str_slice_prefix"
         ])));

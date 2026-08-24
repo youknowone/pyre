@@ -3293,7 +3293,8 @@ pub fn fuse_boxing_alloc(
             args,
             ..
         } = &producer.kind
-            && segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+            && segments.first().map(String::as_str)
+                == Some(crate::runtime_names::shims::CAST_INSTANCE)
             && args.len() == 1
         {
             return resolve_addr(graph, &args[0], depth - 1, terminal);
@@ -4055,7 +4056,8 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             // narrow (`front::mir`), always a single-operand reinterpret.
             // Pin the arity so an unrelated multi-arg path that happens to
             // share the synthetic marker leaf is never swept as a cast.
-            let is_cast = segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+            let is_cast = segments.first().map(String::as_str)
+                == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 && args.len() == 1;
             // The same single-argument runtime helper recognized by
             // `get_instantiate_arg_addr`; its result feeds only the class word
@@ -7604,7 +7606,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "runtime_object".into(),
+                            crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7754,7 +7756,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "runtime_object".into(),
+                            crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7821,7 +7823,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "runtime_object".into(),
+                            crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7958,7 +7960,11 @@ mod tests {
             let ret = call(
                 &mut graph,
                 entry,
-                &["runtime_object", "lltype", "malloc_typed"],
+                &[
+                    crate::runtime_names::crates::OBJECT,
+                    "lltype",
+                    "malloc_typed",
+                ],
                 vec![agg],
             );
             graph.set_return(entry, Some(ret));
@@ -7975,7 +7981,11 @@ mod tests {
             call(
                 graph,
                 blk,
-                &["runtime_object", "gc_roots", "shadow_stack_get"],
+                &[
+                    crate::runtime_names::crates::OBJECT,
+                    "gc_roots",
+                    "shadow_stack_get",
+                ],
                 vec![base],
             )
         };
@@ -8122,7 +8132,7 @@ mod tests {
             call(
                 graph,
                 entry,
-                &["__cast_instance_intrinsic", "PyType"],
+                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
                 vec![ty],
             )
         };
@@ -8168,7 +8178,11 @@ mod tests {
         let raw = call(
             &mut graph,
             probe,
-            &["runtime_object", "gc_hook", "try_gc_alloc_stable_raw"],
+            &[
+                crate::runtime_names::crates::OBJECT,
+                "gc_hook",
+                "try_gc_alloc_stable_raw",
+            ],
             vec![],
         );
         let (gc_arm, gc_args) = graph.create_block_with_arg_vars(2);
@@ -8213,7 +8227,11 @@ mod tests {
         let ret = call(
             &mut graph,
             plain_arm,
-            &["runtime_object", "lltype", "malloc_typed"],
+            &[
+                crate::runtime_names::crates::OBJECT,
+                "lltype",
+                "malloc_typed",
+            ],
             vec![plain_args[0].clone()],
         );
         graph.set_return(plain_arm, Some(ret));
@@ -8386,7 +8404,7 @@ mod tests {
                 call(
                     graph,
                     entry,
-                    &["__cast_instance_intrinsic", "PyType"],
+                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
                     vec![ty],
                 )
             };
@@ -8428,7 +8446,7 @@ mod tests {
             let cond = call(
                 &mut graph,
                 entry,
-                &["runtime_object", "gc_interp", "enabled"],
+                &[crate::runtime_names::crates::OBJECT, "gc_interp", "enabled"],
                 vec![],
             );
             let (arm, arm_args) = graph.create_block_with_arg_vars(1);
@@ -8459,7 +8477,11 @@ mod tests {
             let ret = call(
                 &mut graph,
                 join,
-                &["runtime_object", "lltype", "malloc_typed"],
+                &[
+                    crate::runtime_names::crates::OBJECT,
+                    "lltype",
+                    "malloc_typed",
+                ],
                 vec![join_args[0].clone()],
             );
             graph.set_return(join, Some(ret));
@@ -8505,7 +8527,7 @@ mod tests {
             let cast = call(
                 graph,
                 blk,
-                &["__cast_instance_intrinsic", "PyType"],
+                &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
                 vec![other],
             );
             graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
@@ -8604,7 +8626,7 @@ mod tests {
                 call(
                     graph,
                     blk,
-                    &["__cast_instance_intrinsic", "PyType"],
+                    &[crate::runtime_names::shims::CAST_INSTANCE, "PyType"],
                     vec![ty],
                 )
             };
@@ -8641,7 +8663,11 @@ mod tests {
             let ret = call(
                 graph,
                 blk,
-                &["runtime_object", "lltype", "malloc_typed"],
+                &[
+                    crate::runtime_names::crates::OBJECT,
+                    "lltype",
+                    "malloc_typed",
+                ],
                 vec![agg],
             );
             graph.set_return(blk, Some(ret));
@@ -8756,7 +8782,7 @@ mod tests {
         type Var = crate::flowspace::model::Variable;
         let cast_instance = |to: &str, arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__cast_instance_intrinsic".into(), to.into()],
+                segments: vec![crate::runtime_names::shims::CAST_INSTANCE.into(), to.into()],
             },
             args: vec![arg.clone()],
             result_ty: ValueType::Ref(Some(to.into())),
@@ -8860,7 +8886,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "runtime_object".into(),
+                            crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -8901,7 +8927,7 @@ mod tests {
             !ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                         && segments.get(1).map(String::as_str) == Some("PyType")
             )),
             "the dead ob_type/w_class header casts must be swept"
@@ -8930,7 +8956,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                         && segments.get(1).map(String::as_str) == Some("PyObject")
             )),
             "the live return cast must survive"
@@ -9011,7 +9037,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "runtime_object".into(),
+                            crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -9178,7 +9204,11 @@ mod tests {
                     Some(call(
                         &mut graph,
                         entry,
-                        &["runtime_object", "gc_roots", "shadow_stack_get"],
+                        &[
+                            crate::runtime_names::crates::OBJECT,
+                            "gc_roots",
+                            "shadow_stack_get",
+                        ],
                         vec![base],
                     ))
                 }
@@ -9210,7 +9240,11 @@ mod tests {
             let ret = call(
                 &mut graph,
                 entry,
-                &["runtime_object", "lltype", "malloc_typed"],
+                &[
+                    crate::runtime_names::crates::OBJECT,
+                    "lltype",
+                    "malloc_typed",
+                ],
                 vec![agg],
             );
             graph.set_return(entry, Some(ret));
@@ -9352,7 +9386,10 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "W_FloatObject".into()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.into(),
+                            "W_FloatObject".into(),
+                        ],
                     },
                     args: vec![obj.clone()],
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9411,7 +9448,10 @@ mod tests {
         type Var = crate::flowspace::model::Variable;
         let cast_pytype = |arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__cast_instance_intrinsic".into(), "PyType".into()],
+                segments: vec![
+                    crate::runtime_names::shims::CAST_INSTANCE.into(),
+                    "PyType".into(),
+                ],
             },
             args: vec![arg.clone()],
             result_ty: ValueType::Ref(Some("PyType".into())),
@@ -9522,7 +9562,10 @@ mod tests {
                 blk,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.into(),
+                            "PyObject".into(),
+                        ],
                     },
                     args: vec![boxed.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -9555,7 +9598,7 @@ mod tests {
             !kinds.iter().any(|k| matches!(
                 k,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                         && segments.get(1).map(String::as_str) == Some("PyType")
             )),
             "the dead PyType cast threaded across the block boundary must be swept"

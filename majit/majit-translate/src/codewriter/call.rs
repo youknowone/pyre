@@ -4974,7 +4974,7 @@ impl CallControl {
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
-                .is_some_and(|leaf| leaf.starts_with("__majit_wrap_"))
+                .is_some_and(|leaf| leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX))
         {
             return symbolic_fnaddr_for_path(path);
         }
@@ -5370,7 +5370,7 @@ impl CallControl {
             // a generated wrapper published an address but no graph, so it
             // cannot join the PBC family and every indirect site that would
             // have dispatched to it stays residual.
-            if !leaf.starts_with("__majit_wrap_") {
+            if !leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX) {
                 continue;
             }
             if !self.function_graphs.contains_key(path) {
@@ -9542,7 +9542,11 @@ mod tests {
     #[test]
     fn symbolic_fnaddr_for_segments_matches_known_box_str_constant_hash() {
         assert_eq!(
-            symbolic_fnaddr_for_segments(["pyre_object", "unicodeobject", "box_str_constant",]),
+            symbolic_fnaddr_for_segments([
+                crate::runtime_names::crates::OBJECT,
+                "unicodeobject",
+                "box_str_constant",
+            ]),
             0x7add_7d44_e51a_324c,
         );
     }
