@@ -649,6 +649,16 @@ pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
 /// the `extern`-free `fn` shape and the call in the body resolves each hole, so
 /// no argument type has to be spelled here. `arity` counts the receiver for a
 /// method path.
+///
+/// `extern`-free is also all this can be. A non-capturing closure coerces to
+/// `fn(..)` and not to `extern "C" fn(..)`, and an `extern "C"` fn item has to
+/// spell parameter types that only inference knows here — so the shim carries
+/// the Rust ABI, as the callee it stands in for does. The C ABI that both the
+/// dispatch and the compiled call name is answered where a helper's signature
+/// is in scope instead: `#[elidable]` and its siblings emit an
+/// `extern "C" fn(..) -> i64` call-target wrapper and register that. A
+/// `calls = { .. }` entry naming a function that carries no such attribute has
+/// no wrapper to reach for.
 pub(super) fn word_result_addr_tokens(func: &impl ToTokens, arity: usize) -> TokenStream {
     let params: Vec<Ident> = (0..arity).map(|i| format_ident!("__majit_a{i}")).collect();
     let holes: Vec<TokenStream> = (0..arity).map(|_| quote! { _ }).collect();
