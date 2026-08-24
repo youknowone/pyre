@@ -11,9 +11,17 @@
 # The discriminator is the SINGLE source line carrying both `f_lineno` reads.
 # Both name this frame, so the answers must agree; a values-only check would
 # accept a stale line number from either route, because each looks plausible
-# on its own.  Identity is asserted first -- the two routes must return the
-# same frame object, and a route answering with a copy would still report a
+# on its own.  Identity is asserted too -- the two routes must return the same
+# frame object, and a route answering with a copy would still report a
 # believable line.
+#
+# The roster's own read comes FIRST, and `sys._getframe()` -- the reference
+# route, which forces -- is only reached after it, on the same source line.
+# The two routes hand back ONE object, so a `_getframe()` evaluated ahead of
+# the roster read would force that object and repair a stale roster image
+# before it was ever inspected: `_current_frames` could stop forcing entirely
+# and this loop would still see agreeing line numbers.  The identity check
+# runs after both reads for the same reason.
 #
 # The roster is unpacked rather than indexed by thread id: the wasm guest ships
 # no `threading` module, so `get_ident` is unavailable there, and the roster's
@@ -38,12 +46,13 @@ def hot(n):
     bad_line = 0
     roster_sizes = set()
     for _ in range(n):
-        roster, frame_direct = sys._current_frames(), sys._getframe()
+        roster = sys._current_frames()
         roster_sizes.add(len(roster))
         (frame_roster,) = roster.values()
-        if frame_roster is not frame_direct:
+        line_roster, line_direct = frame_roster.f_lineno, sys._getframe().f_lineno
+        if frame_roster is not sys._getframe():
             bad_ident += 1
-        elif frame_roster.f_lineno != frame_direct.f_lineno:
+        elif line_roster != line_direct:
             bad_line += 1
     return bad_ident, bad_line, sorted(roster_sizes)
 

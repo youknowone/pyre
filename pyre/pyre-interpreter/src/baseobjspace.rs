@@ -17886,6 +17886,14 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// generator.py `frame_is_finished` plus Python 3.14's eager frame
 /// clearing on `close()`.  Dropping the generator's frame edge releases all
 /// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
+///
+/// Releasing them is where this ends.  A local left unreachable by the release
+/// is finalized on the collector's own schedule: the `rgc` FinalizerQueue hands
+/// it to `UserDelAction`, which runs `__del__` at a following dispatch
+/// boundary, which is where `generator.py descr_close` leaves it too.  Forcing
+/// a major collection here so that `__del__` lands before `close()` returns
+/// buys a refcount's promptness at the price of a whole-heap mark and sweep on
+/// every close of a live generator.
 pub(crate) unsafe fn generator_frame_is_finished(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
@@ -18543,16 +18551,11 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr);
             }
-            let ec = crate::call::getexecutioncontext()
-                as *mut crate::executioncontext::ExecutionContext;
-            if !ec.is_null() {
-                (*ec).finalize_explicitly_cleared_frame_references();
-            }
             return Ok(w_none());
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    let mut result = match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
+    match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -18582,29 +18585,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             Ok(w_none())
         }
         Err(e) => Err(e),
-    };
-    unsafe {
-        if w_generator_get_frame(gen_obj).is_null() {
-            // The result has left the cleared generator frame but has not yet
-            // reached the caller's value stack. Publish it while the
-            // compatibility collection below determines which former frame
-            // locals became unreachable.
-            let _roots = pyre_object::gc_roots::push_roots();
-            match &mut result {
-                Ok(value) => *value = pyre_object::gc_roots::pin_root(*value),
-                Err(error) => {
-                    let w_exc = error.to_exc_object();
-                    let _ = pyre_object::gc_roots::pin_root(w_exc);
-                }
-            }
-            let ec = crate::call::getexecutioncontext()
-                as *mut crate::executioncontext::ExecutionContext;
-            if !ec.is_null() {
-                (*ec).finalize_explicitly_cleared_frame_references();
-            }
-        }
     }
-    result
 }
 
 /// PyPy `Coroutine.descr__await__`: return a distinct iterator wrapper rather

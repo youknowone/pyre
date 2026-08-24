@@ -16,6 +16,17 @@
 # a stale `last_instr` -- a values-only check cannot see it, because each answer
 # on its own looks like a plausible line number.
 #
+# The ORDER of the two reads is what makes that discriminator reachable, and it
+# is why the hand-out is read into a name of its own first.  Both routes return
+# ONE frame object -- the identity check below asserts exactly that -- and
+# forcing is a property of the object, not of the reference it arrived through.
+# So any `sys._getframe()` evaluated ahead of the hand-out read refreshes the
+# image the hand-out route is supposed to be inspecting, and the comparison
+# becomes a frame against its own forced self.  `_getframe()` stays on the same
+# source line as the hand-out read (tuple right-hand sides evaluate left to
+# right, so the hand-out read still runs first) and the identity check follows
+# both, where its own force can no longer hide anything.
+#
 # The generator body carries an inner loop with no `yield` in it.  That is
 # load-bearing: a loop that yields re-enters through the driver every iteration
 # and never becomes a compiled loop, so the frame is never a traced
@@ -36,11 +47,11 @@ def gen(holder):
             if j == INNER - 1:
                 g = holder[0]
                 rounds += 1
-                f_handout, f_getframe = g.gi_frame, sys._getframe()
-                if f_handout is not f_getframe:
+                f_handout = g.gi_frame
+                a, b = f_handout.f_lineno, sys._getframe().f_lineno
+                if f_handout is not sys._getframe():
                     identity_breaks += 1
                     continue
-                a, b = f_handout.f_lineno, f_getframe.f_lineno
                 if a != b:
                     disagreements.append((rounds, a, b))
         yield None
@@ -65,11 +76,11 @@ async def coro_body(holder):
             if j == INNER - 1:
                 c = holder[0]
                 rounds += 1
-                f_handout, f_getframe = c.cr_frame, sys._getframe()
-                if f_handout is not f_getframe:
+                f_handout = c.cr_frame
+                a, b = f_handout.f_lineno, sys._getframe().f_lineno
+                if f_handout is not sys._getframe():
                     identity_breaks += 1
                     continue
-                a, b = f_handout.f_lineno, f_getframe.f_lineno
                 if a != b:
                     disagreements.append((rounds, a, b))
     return (rounds, identity_breaks, disagreements)

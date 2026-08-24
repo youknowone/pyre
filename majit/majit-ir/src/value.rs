@@ -1231,10 +1231,27 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// slot order and the `Ref` tag on the pycode from drifting apart — a
 /// swapped slot still hashes to something, just not to the same cell.
 ///
-/// `is_being_profiled` is a real green in the spec even though pyre's
-/// JIT path always passes `false`; it is a parameter and not a folded
-/// constant so a future profiled portal does not silently share cells
-/// with the unprofiled one.
+/// `is_being_profiled` is a real green, and pyre's callers pass a live value:
+/// both green-key construction sites read
+/// `executioncontext::current_is_being_profiled()`, so a profiled portal does
+/// not share cells with the unprofiled one.
+///
+/// What that separation buys a `setprofile` armed on an ALREADY-COMPILED loop
+/// is a re-warmup, and only that: the green flips, the cell the back edge
+/// looks up holds no compiled loop, and execution is interpreted and reporting
+/// until the new cell reaches `threshold` and compiles a loop of its own.
+/// Measured, a profiler armed mid-loop over a 100 000-iteration tail reports
+/// 1041 `call` events for a callee the walker INLINES and all 99 999 for one
+/// it leaves residual — the same reading with and without the `debugdata`
+/// guard, so the ceiling is the inlined callee's unrecorded `call_trace` /
+/// `return_trace` (see `walker_ec_enter`, `jitcode_dispatch/inline_call.rs`)
+/// and not the green.  It is also not what protects a profiler installed
+/// BEFORE the frame is entered — measured, such a frame never reaches a trace
+/// at all (`loops_compiled = 0`, `loops_aborted = 0`), because
+/// `eval_with_jit_inner` routes it to `execute_frame_plain`.  Tracing has no
+/// green of its own and so gets neither: the mid-loop case is answered instead
+/// by the `debugdata` guard `pyopcode.py dispatch_bytecode`'s
+/// `jit.we_are_jitted()` arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
     GreenKey::with_types(
         vec![pc as i64, is_being_profiled as i64, code_ptr as i64],

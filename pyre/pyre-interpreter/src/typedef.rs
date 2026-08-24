@@ -8129,6 +8129,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // `dis` / `code.co_positions()` consumers that do `f_lasti // 2`
     // recover the right instruction — the same adaptation `tb_lasti`
     // uses (`typedef.rs` tb_lasti getter).
+    //
+    // A negative `last_instr` is the not-yet-started sentinel, not a
+    // coordinate, so it is handed out as-is: `PyFrame_GetLasti` scales only
+    // the non-negative case (`lasti < 0 ? -1 : lasti * sizeof(_Py_CODEUNIT)`)
+    // and `pyframe.py fget_f_lasti` returns `last_instr` unscaled. Scaling it
+    // reported `-2`, a value neither reference produces.
     let lasti_getter = make_builtin_function_with_arity(
         "f_lasti",
         |args| {
@@ -8136,9 +8142,12 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            Ok(pyre_object::w_int_new(
-                unsafe { &*f }.fget_f_lasti() as i64 * 2,
-            ))
+            let lasti = unsafe { &*f }.fget_f_lasti() as i64;
+            Ok(pyre_object::w_int_new(if lasti < 0 {
+                -1
+            } else {
+                lasti * 2
+            }))
         },
         2,
     );

@@ -4459,7 +4459,7 @@ impl MiniMarkGC {
         }
 
         let mut visit_extra_area = |gcref: &mut GcRef| {
-            result.push((*gcref, "extra_area"));
+            result.push((*gcref, crate::shadow_stack::current_extra_area()));
         };
         if walk_all_mutators {
             crate::shadow_stack::walk_all_extra_areas(&mut visit_extra_area);

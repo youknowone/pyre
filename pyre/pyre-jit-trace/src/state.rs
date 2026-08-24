@@ -927,13 +927,64 @@ fn walk_jitcode_code_roots_in(
     sd: &MetaInterpStaticData,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    for jc in sd.jitcodes.iter() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let probe = probe14_enabled();
+    for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
         let wrapper =
             pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as usize;
-        if wrapper != 0 {
-            let mut root = majit_ir::GcRef(wrapper);
-            visitor(&mut root);
+        if wrapper == 0 {
+            continue;
         }
+        if probe {
+            PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
+            probe14_note_nursery(
+                "CODE WRAPPER",
+                wrapper,
+                jc.payload.jitcode.name(),
+                jitcode_index,
+            );
+        }
+        let mut root = majit_ir::GcRef(wrapper);
+        visitor(&mut root);
+        if probe && root.0 != wrapper {
+            let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+            if n <= 20 {
+                eprintln!(
+                    "[probe14] RELOCATION DISCARDED #{n}: code wrapper 0x{wrapper:x} -> 0x{:x} \
+                     (jitcode {jitcode_index}/{}) -- the `code_ptr -> wrapper` registry still \
+                     holds the old address",
+                    root.0,
+                    sd.jitcodes.len(),
+                );
+            }
+        }
+    }
+}
+
+/// Report a root that sits in the nursery at walk time.
+///
+/// Both halves of this area document an invariant that forbids it — the code
+/// wrappers because `malloc_typed_stable` places them outside the nursery, the
+/// constants because with tagged ints disabled they are old-gen or immortal —
+/// and the minor-collection skip is justified by exactly that.  One counter-
+/// example refutes the skip.
+fn probe14_note_nursery(kind: &str, addr: usize, name: &str, jitcode_index: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !majit_gc::gc_is_nursery_object(addr) {
+        return;
+    }
+    let n = PROBE14_NURSERY.fetch_add(1, Relaxed) + 1;
+    if n <= 20 {
+        // Address and header word only.  Reading the object's TYPE here is not
+        // sound: measured, on the run that aborts the slot is already invalid
+        // at walk time, and `type_name_of` returned a multi-kilobyte garbage
+        // string from unmapped bytes.  The header word says the same thing
+        // safely — a plausible type id means the corpse is still ahead.
+        let header = unsafe { (addr as *const usize).offset(-1).read_unaligned() };
+        eprintln!(
+            "[probe14] NURSERY ROOT #{n}: {kind} 0x{addr:x} header={header:#x} in jitcode \
+             {jitcode_index} {name:?}"
+        );
     }
 }
 
@@ -1394,6 +1445,17 @@ pub static PROBE14_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static PROBE14_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Companion witnesses for the OTHER half of this area, the `code_ptr ->
+/// wrapper` roots, and for the invariant a relocation count cannot test.
+///
+/// The constants half skips minor collections outright, so a movable object in
+/// the pool is never offered for relocation there — it simply dies.  A
+/// relocation counter therefore cannot refute "no movable object is in this
+/// pool"; membership of the nursery at walk time can, and it is the property
+/// both halves' documented invariants actually assert.
+pub static PROBE14_CODE_SLOTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn probe14_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1411,10 +1473,39 @@ fn walk_jitcode_constants_refs_in(
     }
     for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
         let pool_len = jc.payload.jitcode.constants_r.len();
-        for (pool_slot, &slot) in jc.payload.jitcode.constants_r.iter().enumerate() {
-            let mut gcref = majit_ir::GcRef(slot as usize);
+        // The pool cell, not a copy of it.  Upstream reaches a run-time write
+        // into a prebuilt structure through the write barrier —
+        // `_remember_young_pointer_inlined` puts the written-to object on
+        // `old_objects_pointing_to_young`, and the remembered set is scanned at
+        // every minor, so the entry is kept and forwarded.  `constants_r` is a
+        // bare Rust `Vec<i64>` with no GC header to carry
+        // GCFLAG_TRACK_YOUNG_PTRS, so this walker IS pyre's remembered set for
+        // it, and owes both halves: drag the object out, and store back where
+        // it went.
+        //
+        // Sound for the same reason the `RefCell::as_ptr` read above is: the
+        // walk runs on the collecting thread with the owning mutator quiesced.
+        // `METAINTERP_SD` is thread-local while `Arc<RuntimeJitCode>` is not,
+        // so two threads' areas can present the same slot; the second visit
+        // reads an address that is no longer a nursery start and is a no-op.
+        //
+        // The pool also carries words that are not gcrefs at all — patched
+        // host-static addresses and pre-patch STR sentinels.  `drag_out_root`
+        // and `seed_major_root` reject them before any deref, which is what
+        // makes handing them the whole pool safe; a fast path that pre-filtered
+        // the slots would have to reproduce those gates.
+        let pool = jc.payload.jitcode.constants_r.as_ptr() as *mut i64;
+        for pool_slot in 0..pool_len {
+            let cell = unsafe { pool.add(pool_slot) };
+            let mut gcref = majit_ir::GcRef(unsafe { *cell } as usize);
             let before = gcref.0;
+            if probe {
+                probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
+            }
             visitor(&mut gcref);
+            if gcref.0 != before {
+                unsafe { *cell = gcref.0 as i64 };
+            }
             if probe {
                 PROBE14_SLOTS.fetch_add(1, Relaxed);
                 if gcref.0 != before {
@@ -1431,7 +1522,7 @@ fn walk_jitcode_constants_refs_in(
                         // nothing here distinguishes a pool built by
                         // `add_const_r` from one built by `emit_const_r_bits`.
                         eprintln!(
-                            "[probe14] RELOCATION DISCARDED #{n}: constants_r slot \
+                            "[probe14] RELOCATION APPLIED #{n}: constants_r slot \
                              0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
                              jitcode {}/{}, pool_slot {}/{})",
                             gcref.0,
@@ -1467,11 +1558,13 @@ fn walk_jitcode_constants_refs_in(
         // out.  Cover every early walk, then thin out.
         if walks <= 50 || walks % 50 == 0 {
             eprintln!(
-                "[probe14] ARMED walk={} slots_cumulative={} relocated_cumulative={} \
-                 jitcodes={}",
+                "[probe14] ARMED walk={} slots_cumulative={} code_slots_cumulative={} \
+                 relocated_cumulative={} nursery_cumulative={} jitcodes={}",
                 walks,
                 PROBE14_SLOTS.load(Relaxed),
+                PROBE14_CODE_SLOTS.load(Relaxed),
                 PROBE14_RELOCATED.load(Relaxed),
+                PROBE14_NURSERY.load(Relaxed),
                 sd.jitcodes.len(),
             );
         }
@@ -2119,7 +2212,8 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
 /// physical frame's vsd must be corrected to that section's depth, else
 /// the interpreter resumes at the inner pc carrying the outer depth (an
 /// over-count that materializes a stray operand slot).  Returns `None`
-/// when the code or the liveness entry for `py_pc` is missing.
+/// when the code or the liveness entry for `py_pc` is missing, or when the
+/// forward analysis never reached `py_pc`.
 pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     if w_code == 0 {
         return None;
@@ -2133,11 +2227,17 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     }
     let code = unsafe { &*raw_code };
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let depth = crate::liveness::liveness_for(raw_code)
-        .depth_at_py_pc()
-        .get(py_pc)
-        .copied()?;
-    Some(stack_base + depth as usize)
+    // `depth_at_py_pc` collapses the forward pass's `usize::MAX` unreachable
+    // sentinel to `0`, which answers `stack_base` — a confidently empty operand
+    // stack — for a pc the analysis never reached.  `stack_depth_at` keeps the
+    // sentinel distinguishable; decline there instead, which every caller reads
+    // as "leave the frame's own `valuestackdepth` alone".  That table is one
+    // longer than the per-PC one, so keep the instruction-count bound.
+    if py_pc >= code.instructions.len() {
+        return None;
+    }
+    let depth = crate::liveness::liveness_for(raw_code).stack_depth_at(py_pc)?;
+    Some(stack_base + depth)
 }
 
 /// Inputs `setup_bridge_sym` needs to rebuild the slot-indexed semantic

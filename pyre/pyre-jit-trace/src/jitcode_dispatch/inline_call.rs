@@ -1461,6 +1461,23 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // when the CALL_ASSEMBLER forces the virtual. Uses `SetfieldGc` + a real
     // `FieldDescr` (the same field-set the builder uses), so
     // `optimize_setfield_gc` records it into the virtual's `vinfo.fields`.
+    //
+    // MEASURED INCONSISTENCY, no failing case known.  That seeded depth is the
+    // right one only for a header whose static operand-stack depth is zero,
+    // which is what "empty stack at the while-header" above assumes.  A `for`
+    // header is entered with the iterator on the stack.  Census over the 447
+    // `pyre/bench/synth` fixtures (a `stack_depth_at(target_pc)` probe on this
+    // arm, dynasm, 84131dc4da8): 36 emits reach here, 25 at depth 0 and 11 at
+    // depth 1 — all 11 in `str_search_index_bounds.py`, all with `ForIter` at
+    // `target_pc`, pinning `last_instr` beside an operand height one slot short
+    // of what that header executes against.  That fixture still passes its own
+    // asserts and its output comparison, and pinning the analysis depth here
+    // instead changed nothing on it, so no wrong answer is attributable to this
+    // and no gate is warranted yet.  Written down because a measured inconsistency nobody
+    // recorded is one somebody re-derives: see
+    // `pyre/bench/synth/_pending/loop_callee_for_header_resume.py` for the same
+    // "resume pc pinned without its operand height" shape that DOES produce a
+    // wrong answer, through a different writer.
     let last_instr = ctx.trace_ctx.const_int(target_pc as i64 - 1);
     let last_instr_descr = crate::descr::pyframe_next_instr_descr();
     let last_instr_idx = last_instr_descr.index();
@@ -2348,11 +2365,35 @@ fn walker_ec_enter(
 /// The profile-hook half (`if self.profilefunc: self._trace(frame,
 /// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
 /// [`pyre_interpreter::PyExecutionContext::leave`].  Omitting it here does not
-/// lose a leave event, because `is_being_profiled` is a portal-driver GREEN
-/// (`interp_jit.py greens = ['next_instr', 'is_being_profiled', 'pycode']`):
-/// a trace is keyed on it, so one recorded with profiling off is only ever
-/// entered with profiling off, and turning profiling on selects a different
-/// green key rather than reusing this trace.
+/// lose a PROFILE leave event, because `is_being_profiled` is a portal-driver
+/// GREEN (`interp_jit.py greens = ['next_instr', 'is_being_profiled',
+/// 'pycode']`): a trace is keyed on it, so one recorded with profiling off is
+/// only ever entered with profiling off, and turning profiling on selects a
+/// different green key rather than reusing this trace.
+///
+/// ⛔ That argument is sound for profiling and for nothing else, and it is not
+/// licence to omit another hook here.  TRACING has no green, so no key change
+/// separates a traced re-entry from an untraced one; and the events an inlined
+/// callee owes a tracer are `call_trace` / `return_trace`, which upstream runs
+/// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
+/// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
+/// upstream's trace carries a guard on them and a tracer installed later cannot
+/// be missed.  This walker inlines neither, so an inlined callee reports
+/// nothing for as long as the loop stays compiled.
+///
+/// Two things currently keep that from being observable, and neither is the
+/// green: `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routes any frame for
+/// which `frame_tracing_active` holds to `execute_frame_plain`, so a hooked
+/// frame never reaches the portal at all — measured, a profiled loop reads
+/// `loops_compiled = 0`, `loops_aborted = 0`; and a tracer armed mid-run on an
+/// already-compiled frame fails the portal frame's own `debugdata` guard
+/// (`record_portal_debugdata_guard`), which stops that frame running compiled
+/// at all.  Neither is a correctness argument for this omission.  The first is
+/// a compilation gate: the moment it is narrowed so a hooked frame can compile,
+/// this becomes a reporting bug for the profile half.  The second is about the
+/// CALLER's frame: it says nothing about a callee whose own `call_trace` /
+/// `return_trace` this walker declines to inline, and it does not fire at all
+/// for a global tracer that leaves the caller's `f_trace` unset.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as

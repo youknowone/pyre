@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins tb_lineno=-1 meaning "resolve from tb_lasti"; pypy3 answers -1 instead of the line
 # CPython-suite gap: `test_traceback` builds `TracebackType` objects, but every
 # one it builds passes a real line number.  A runtime that stored the fourth
 # argument and handed it straight back would pass the whole module.

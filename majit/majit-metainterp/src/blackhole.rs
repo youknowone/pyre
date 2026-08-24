@@ -279,7 +279,7 @@ pub struct BlackholeInterpreter {
     /// The vable bytecodes do NOT read this. `handler_getfield_vable_*` and
     /// `handler_setfield_vable_*` take the struct as their own `r` operand at
     /// their own pc, the shape `bhimpl_getfield_vable_r` has; correspondingly
-    /// `BlackholeInterpreter` carries no virtualizable field at all. This one
+    /// the vable handlers never consult this field. This pointer
     /// serves only readers that have no operand to read — `record_frame_traceback`
     /// and the `on_enter_level` / `on_leave_level` rooting callbacks — so a
     /// wrong value here corrupts a traceback or a root, never a vable access.

@@ -4771,49 +4771,77 @@ fn register_thread_root_areas() {
         register(
             pyframe_root_walker_area,
             pyre_interpreter::eval::capture_pyframe_root_area(),
+            "pyframe",
         );
         register(
             pyre_object_root_walker_area,
             pyre_object::gc_roots::capture_shadow_stack_area(),
+            "pyre_object_shadow_stack",
+        );
+        // Two registrations over one `data`, not one walker over two
+        // populations: the areas are what the collector names when a root
+        // fails validation, and `code wrappers` and `constants_r` have
+        // separate invariants, separate producers and separate fixes.  Fused,
+        // the report named neither.
+        register(
+            jitcode_code_root_walker_area,
+            pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+            "jitcode_code_wrappers",
         );
         register(
             jitcode_constants_root_walker_area,
             pyre_jit_trace::state::capture_jitcode_constants_root_area(),
+            "jitcode_constants",
         );
         register(
             fbw_store_journal_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
+            "fbw_store_journal",
         );
         register(
             fbw_finish_concrete_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_concrete_root_area(),
+            "fbw_finish_concrete",
         );
         register(
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
+            "walk_end",
         );
         register(
             mapdict_root_walker_area,
             pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
+            "mapdict",
         );
         register(
             repr_active_root_walker_area,
             pyre_interpreter::display::capture_repr_active_area(),
+            "repr_active",
         );
         #[cfg(not(target_arch = "wasm32"))]
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
+            "signal_handler",
         );
         register(
             jit_callee_frame_root_walker_area,
             crate::call_jit::capture_jit_callee_frame_root_area(),
+            "jit_callee_frame",
         );
-        register(rd_consts_root_walker_area, jit_driver);
-        register(partial_trace_root_walker_area, jit_driver);
-        register(active_trace_root_walker_area, jit_driver);
-        register(compile_snapshot_root_walker_area, jit_driver);
-        register(forced_virtuals_root_walker_area, jit_driver);
+        register(rd_consts_root_walker_area, jit_driver, "rd_consts");
+        register(partial_trace_root_walker_area, jit_driver, "partial_trace");
+        register(active_trace_root_walker_area, jit_driver, "active_trace");
+        register(
+            compile_snapshot_root_walker_area,
+            jit_driver,
+            "compile_snapshot",
+        );
+        register(
+            forced_virtuals_root_walker_area,
+            jit_driver,
+            "forced_virtuals",
+        );
         // The ephemeron half of the walker above, on the same `data` so the
         // prune reaches exactly the drivers the root walk reaches.
         majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
@@ -5575,32 +5603,44 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    // incminimark.py:355 `prebuilt_root_objects` parity.  The two populations
-    // owned by this area cannot point into the nursery:
+    // Every collection, minor included.  `jitcode.py JitCode` is an ordinary
+    // GC object upstream and `constants_r` an ordinary traced field of it, so
+    // the collector keeps and forwards its entries whatever generation they
+    // are in.  pyre owns the array in `Arc` memory, out of the object graph,
+    // so this walker IS that tracing and owes the same guarantee.
     //
-    // * PyCode wrappers are allocated through `try_gc_alloc_stable_raw`;
-    // * with tagged ints disabled, JitCode `constants_r` entries are either
-    //   stable old-generation int/float objects or immortal build-time
-    //   constants.
-    //
-    // A minor collection cannot reclaim either population, and there is no
-    // old-to-young edge here for its remembered-set pass to discover.  Walking
-    // every JitCode on every recursive CALL_ASSEMBLER nursery refill therefore
-    // only repeated `drag_out_root`'s non-nursery fast return.  Major marking
-    // still has to keep both populations alive, exactly like RPython's
-    // unconditional `prebuilt_root_objects` major scan.
-    // If tagged ints are enabled, codewriter normalization can materialize a
-    // moving `W_IntObject`; retain the conservative minor scan in that mode.
+    // This used to skip minor collections when tagged ints were disabled, on
+    // the claim that the entries were then "stable old-generation int/float
+    // objects or immortal build-time constants".  That claim is false, and its
+    // consequence was the fault it was meant to make impossible: upstream
+    // builds every jitcode at translation time, while pyre builds one per
+    // CodeObject at RUN time, so a trace's `Operand::ConstRef` reaches the pool
+    // straight off the heap.  Measured with `PYRE_PROBE14=1` on
+    // `_pending/exec_foreign_globals_gc_root.py`, one slot holds a NURSERY
+    // object on every walk; skipped by the minor pass, it was neither kept
+    // alive nor forwarded, and the next major seeded a corpse
+    // (`GC BUG: invalid type_id ... site=jitcode_constants`).
+    unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
+}
+
+/// The `code_ptr -> wrapper` half of the population the comment above
+/// describes, registered separately so a failing root names it.
+///
+/// Same minor-collection skip and the same justification for it: a wrapper is
+/// placed by `malloc_typed_stable`, so it is not a nursery object and a minor
+/// collection has nothing to do here.  `PYRE_PROBE14=1` tests that claim
+/// directly rather than by its relocation consequence.
+unsafe fn jitcode_code_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
     if !pyre_object::tagged_int::CAN_BE_TAGGED
         && majit_gc::shadow_stack::extra_root_walk_kind()
             == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
     {
         return;
     }
-    unsafe {
-        pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor);
-        pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor);
-    }
+    unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
@@ -6512,10 +6552,13 @@ pub(crate) fn call_depth() -> u32 {
 #[majit_macros::dont_look_inside]
 pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
     // Full `JitCell.get_uhash` over the pypyjit green tuple
-    // `[next_instr, is_being_profiled, pycode]` (warmstate.py:584-593),
-    // computed allocation-free. The caller supplies the same frame green used
-    // by the portal markers, so this and the typed marker-path key resolve to
-    // the same cell.
+    // `[next_instr, is_being_profiled, pycode]` (warmstate.py `JitCell`),
+    // computed allocation-free. The caller supplies the same live frame green
+    // the portal markers use -- `PyFrame.dispatch` (extended in `interp_jit.py`)
+    // hoists `self.get_is_being_profiled()` into a local and hands that one
+    // value to `jit_merge_point` -- so this and the typed marker-path key
+    // (`green_key_typed_from_pycode`) resolve to the same cell, and a profiled
+    // portal gets its own.
     majit_ir::pypyjit_greenkey_uhash(pc, is_being_profiled, code_ptr as u64)
 }
 
@@ -8892,6 +8935,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
+        //
+        // This is `dispatch_bytecode`'s NON-jitted arm only.  Its jitted arm
+        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) has no
+        // counterpart here because this body is never traced: pyre records
+        // from a per-CodeObject JitCode built by `jit/codewriter.rs` and walked
+        // by `pyre-jit-trace`'s `run_perfn_walk`, not from this Rust loop.  The
+        // port of that arm is `record_portal_debugdata_guard`
+        // (`pyre-jit-trace/src/jitcode_dispatch/mod.rs`), which runs at the
+        // portal merge point — the walker's counterpart of this loop's top.
+        // `we_are_jitted()` here would be a runtime thread-local set only while
+        // cranelift-compiled code is on the stack, not the folded compile-time
+        // constant upstream's translator sees, so splitting on it would strip
+        // the ticker from nested interpreted frames rather than from traced
+        // ones.
         let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with

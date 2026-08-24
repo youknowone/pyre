@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: spec-folds=for_iter_next,compare_op_int
 # Self-checking regression guard for `force_all_frames`
 # (`executioncontext.rs`), the only frame-materializing consumer in the tree
 # that no fixture reached.
@@ -11,15 +12,30 @@
 # stamps `is_being_profiled` on every frame it walks.
 #
 # The discriminator is a caller local read back through the forced frame.
-# `middle` is called from inside the compiled inner loop, so its frame is the
-# one an inline sub-walk keeps virtual; `witness` is computed in it and never
-# read by `middle` itself, so nothing but the force can put the current value
-# where `f_locals` finds it.  A stale materialization returns an earlier
-# round's number, and every round uses a different one.
+# `witness` is computed in `middle` and never read by `middle` itself, so a
+# stale materialization returns an earlier round's number, and every round uses
+# a different one.
 #
-# `entered` fails the fixture if the inner loop stops being entered, and
-# `hook_calls` fails it if the hook was never installed -- either would make
-# the check pass without the forced read ever happening.
+# What this fixture does NOT establish, stated plainly because the wording it
+# replaces claimed otherwise: `middle`'s frame is not an inlined virtual frame
+# here.  Measured on this shape -- `loops_compiled=1`, `loops_aborted=3`, and
+# `sys_getframe` / `builtin_locals` both `consulted=3 fired=0` -- the tracer
+# does walk into `leaf` three times, but every one of those walks aborts, and
+# the loop that does compile is the inner `for j` loop, which reaches `middle`
+# only through a guard failure into the interpreter.  Calling `middle` on every
+# iteration instead does not help: the `install` on the hot path drops the
+# workload to `loops_compiled=0`.  That is inherent to the subject rather than
+# a gap in the fixture -- installing a hook is precisely what stops a frame
+# being compiled -- so the value check below is a correctness guard on
+# `force_all_frames`, not evidence that a virtual frame was materialized.
+#
+# Three checks keep it from passing while nothing happened.  `entered` fails
+# the fixture if the inner loop stops being entered and `hook_calls` fails it
+# if the hook was never installed -- either would make the value check pass
+# without the forced read ever happening.  Neither looks at the JIT at all, so
+# the `spec-folds` header above adds the one signal that does: check.py censuses
+# the trace-time folds and fails the fixture unless both named folds fire, which
+# they cannot if the workload stops being traced.
 import sys
 
 OUTER = 400

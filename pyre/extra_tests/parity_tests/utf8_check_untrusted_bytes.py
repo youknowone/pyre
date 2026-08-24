@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins _json.scanstring indexed past the subject's length; pypy3 has no _json module
 # CPython-suite gap: no test feeds marshal/pickle a three-byte sequence that
 # holds no code point, and none indexes _json past the subject's length.
 # parity-tests reason: these reach pyre's own WTF-8 representation, where the

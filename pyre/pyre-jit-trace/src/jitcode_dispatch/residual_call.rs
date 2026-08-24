@@ -4288,7 +4288,10 @@ pub(crate) fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
 /// when this walk is not inside an inline callee.  A callee `jit_pc` has no
 /// meaning in the outer jitcode's py_pc tables, so every consumer that writes
 /// a pc onto the callee's frame has to go through the callee's own metadata.
-fn inline_callee_py_pc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, jit_pc: usize) -> Option<u32> {
+pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
@@ -4368,9 +4371,20 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
     // `fbw_publish_exit_last_instr` does for the portal frame; otherwise a
     // residual observer during this walk records the constructor's `-1`
     // sentinel and bakes that answer into the compiled trace.  Inline frames
-    // are owned by this walk (and may already have escaped), so this is the
-    // authentic per-opcode PyFrame transition, not a speculative write to the
-    // portal frame that must be rolled back for replay.
+    // are owned by this walk (and may already have escaped), so this write is
+    // not speculative — unlike the portal frame's, it is never rolled back for
+    // replay.
+    //
+    // It is still only half a coordinate.  A reader takes its next opcode from
+    // `last_instr + 1` and its operand stack from `valuestackdepth`; the walk
+    // keeps the operand stack symbolic, so `valuestackdepth` stays at whatever
+    // the frame was built with while `last_instr` advances per opcode.
+    // `capture_frame_scalars` and `correct_resume_vsd` move the two words
+    // together; this site moves one, and nothing downstream re-pairs them.
+    // Pairing it here with the forward analysis's depth at `callee_py_pc + 1`
+    // was measured and does not fix
+    // `bench/synth/_pending/loop_callee_for_header_resume.py`, so the split is
+    // a recorded gap rather than that fixture's cause.
     if let Some(ConcreteValue::Ref(frame_ptr)) = ctx.concrete_registers_r.get(frame_reg).copied() {
         if !frame_ptr.is_null() {
             unsafe {

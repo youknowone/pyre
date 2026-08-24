@@ -325,9 +325,8 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
     let mut graphs: Vec<FunctionGraph> = Vec::new();
     for fd in llbc.iter_local_fns() {
         let path = fd.item_meta.name_path();
-        if path.contains("frame_locals_proxy_snapshot")
-            && let Ok(g) = lower_fun_decl(&llbc, fd)
-        {
+        if path.contains("frame_locals_proxy_snapshot") {
+            let g = lower_fun_decl(&llbc, fd).unwrap_or_else(|e| panic!("lower {path}: {e:?}"));
             eprintln!("[vable-probe] lowered {path}");
             graphs.push(g);
         }
@@ -422,6 +421,15 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
         reads > 0,
         "no `locals_cells_stack_w` read found in any \
          `frame_locals_proxy_snapshot` graph — probe is inert"
+    );
+    // The escape list was collected and printed but never asserted on, so a
+    // read that rode a link out of its defining block would print and pass —
+    // and that is precisely what `_check_no_vable_array`'s `link argument`
+    // route refuses.
+    assert!(
+        escapes.is_empty(),
+        "`frame_locals_proxy_snapshot`'s virtualizable-array read escapes its \
+         defining block: {escapes:?}"
     );
 
     // Pin the measured shape rather than only reporting it.  Both reads now
