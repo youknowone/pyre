@@ -5728,15 +5728,24 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
 ///
 /// The opcode only ever runs on the function the preceding MAKE_FUNCTION just
 /// pushed, so the stores are constructor stores on an allocation this trace
-/// made: nothing has read the slots, the object's `mutate_slots` is still the
-/// allocation's null, and no compiled trace can hold a folded view of a field
-/// belonging to an object that did not exist when it was recorded.  That is
-/// the same footing `emit_make_function_inline` already writes `code`,
-/// `name`, `w_func_globals_obj` and `w_qualname` on — all `function.py:34-42`
-/// slots — so this adds no new class of write.  `heap_cache.is_unescaped`
-/// is what establishes it: the operand must still be an unescaped allocation
-/// of this trace, which a `Function` reaching the opcode from anywhere else
-/// cannot be.
+/// made: nothing has read the slots, and no compiled trace can hold a folded
+/// view of a field belonging to an object that did not exist when it was
+/// recorded.  That is the same footing `emit_make_function_inline` already
+/// writes `code`, `name`, `w_func_globals_obj` and `w_qualname` on — all
+/// `Function` quasi slots — so this adds no new class of write.
+/// `heap_cache.is_unescaped` is what establishes it: the operand must still be
+/// an unescaped allocation of this trace, which a `Function` reaching the
+/// opcode from anywhere else cannot be.
+///
+/// That gate is also what makes each emitted store *equivalent* to the setter
+/// it stands in for, not merely safe on top of it.  The three single-slot
+/// setters notify a watcher (`defs_w?`, `w_kw_defs?`, `closure`), and
+/// `function_notify_quasi_immut` resolves through
+/// `function_quasi_immut_field`, which answers `None` while `mutate_slots` is
+/// null — which a fresh unescaped allocation's still is, because only a
+/// recorded read installs the block.  So the notify the emit leaves out had
+/// nothing to invalidate.  The two annotation slots carry no watcher at all,
+/// so their setters have none to leave out.
 ///
 /// Passing `func` through as the result is the half that pays.  The residual's
 /// result is opaque, so the inline-call path that follows re-reads
@@ -5758,9 +5767,12 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
 /// allocation and the `defaults` store behind it then declines too, leaving
 /// the whole definition sequence residual.
 ///
-/// `TypeParams` names no slot at all — pyre has no PEP 695 surface, so the
-/// residual's arm is empty — and folds to the operand pass-through with no
-/// store emitted.
+/// `TypeParams` is not folded.  The codegen never sets that bit: a PEP 695
+/// generic `def` stamps its type parameters through
+/// `CALL_INTRINSIC_2 INTRINSIC_SET_FUNCTION_TYPE_PARAMS`, whose
+/// `set_function_typeparams` writes `Function.w_typeparams`.  An arm here
+/// would be unreachable, and leaving it out is what keeps this fold and the
+/// residual from being able to disagree about a flag neither is ever handed.
 pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5830,7 +5842,6 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
                 (crate::descr::function_w_ann_descr(), false),
             ]
         }
-        f if f == MakeFunctionFlag::TypeParams as i64 => Vec::new(),
         _ => return Ok(None),
     };
 
