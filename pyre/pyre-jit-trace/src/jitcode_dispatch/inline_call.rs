@@ -740,8 +740,13 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 ///
 /// [`summarize_descent_blockers`] therefore walks the body's control-flow graph
 /// carrying one fact — whether an effect has been executed on some path to this
-/// point — and reports the two kinds of blocker separately.  Only
+/// point — and reports the two kinds of blocker separately.  Of the two, only
 /// `blocker_after_effect` is a decline.
+///
+/// The other decline is the scan admitting it did not read the whole body.
+/// Everything the walk concludes rests on having seen every path, so a body it
+/// could not decode in full is refused for that alone, without a blocker to
+/// name.
 ///
 /// The scan follows `inline_call_*` into the callee bodies the descent would
 /// enter, because the abort propagates from any depth.  A body already on the
@@ -760,8 +765,32 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// body rather than once per call site.  Only this entry point memoizes: the
 /// summary a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`summarize_descent_blockers`] caches nothing.
-fn descent_unlowered_helper_blocker(jitcode_index: usize) -> Option<i64> {
-    descent_blocker_summary(jitcode_index).blocker_after_effect
+fn descent_decline(jitcode_index: usize) -> Option<DescentDecline> {
+    let summary = descent_blocker_summary(jitcode_index);
+    if summary.body_not_walked {
+        return Some(DescentDecline::BodyNotWalked);
+    }
+    summary.blocker_after_effect.map(DescentDecline::Helper)
+}
+
+/// Why a descent into a body is refused.
+enum DescentDecline {
+    /// An un-lowered helper the descent reaches with an effect already
+    /// executed, named by the symbolic hash standing in for its funcbox.
+    Helper(i64),
+    /// Part of the body could not be decoded, so what was walked is a subgraph
+    /// and the blockers it reports are only the ones that happened to be in
+    /// it.  Nothing is named because the unread region is what is objected to.
+    BodyNotWalked,
+}
+
+impl std::fmt::Display for DescentDecline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Helper(fnaddr) => write!(f, "un-lowered helper call in body blocker={fnaddr:#x}"),
+            Self::BodyNotWalked => f.write_str("body holds bytes the scan cannot decode"),
+        }
+    }
 }
 
 /// Memoizing entry point for [`summarize_descent_blockers`].
@@ -894,6 +923,20 @@ pub(crate) fn summarize_body_blockers(
             break;
         }
     }
+    if pc < code.len() {
+        // The decode stopped inside the body, so `starts` names a prefix of it
+        // and the `push!` gate below would drop every target past that point
+        // as "not a start".  A dropped successor removes a region from the
+        // graph, and a region the scan never enters reports no blocker, so
+        // walking a graph already known to be partial can only produce an
+        // answer that admits for the wrong reason.  Say what is actually
+        // known instead.
+        return DescentBlockerSummary {
+            may_execute_effect: true,
+            body_not_walked: true,
+            ..DescentBlockerSummary::default()
+        };
+    }
 
     let mut entry_known = vec![None; num_regs_i + constants_i.len()];
     for (slot, &value) in constants_i.iter().enumerate() {
@@ -948,6 +991,10 @@ pub(crate) fn summarize_body_blockers(
             continue;
         };
         let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            // Every queued point is one of `starts`, and the guard above
+            // established that those cover the body, so this does not happen.
+            // It is still the same missing-region shape if it ever does.
+            summary.body_not_walked = true;
             continue;
         };
         let mut effect = point.effect;
@@ -990,6 +1037,9 @@ pub(crate) fn summarize_body_blockers(
                 if callee.may_execute_effect {
                     effect = true;
                 }
+                // The descent enters this callee, so a region of it the callee's
+                // own scan could not read is a region of this descent.
+                summary.body_not_walked |= callee.body_not_walked;
             }
         }
         if descent_op_applies_effect(d.opname) {
@@ -3081,11 +3131,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if body.num_regs_r < 1 {
         return Ok(None);
     }
-    if let Some(blocker) = descent_unlowered_helper_blocker(jitcode.index()) {
-        builtin_inline_decline!(
-            format_args!("un-lowered helper call in body blocker={blocker:#x}"),
-            fnaddr
-        );
+    if let Some(decline) = descent_decline(jitcode.index()) {
+        builtin_inline_decline!(decline, fnaddr);
         return Ok(None);
     }
     let nested_helper = ctx.fbw_mode.inline_subwalk;

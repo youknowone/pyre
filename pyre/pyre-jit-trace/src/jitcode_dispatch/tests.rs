@@ -28,6 +28,17 @@ fn goto_if_not(cond: u8, target: u16) -> Vec<u8> {
     vec![byte, cond, target as u8, (target >> 8) as u8]
 }
 
+/// One `inline_call_r_v/dR` with an empty argument varlist, naming descriptor
+/// `descr`.  The callee is whatever the `callee_summary` closure answers for
+/// that index, which is how a callee's verdict is stated without a jitcode
+/// table.
+fn inline_call_with_descr(descr: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("inline_call_r_v/dR")
+        .expect("`inline_call_r_v/dR` must be in insns table");
+    vec![byte, descr as u8, (descr >> 8) as u8, 0]
+}
+
 fn void_return() -> Vec<u8> {
     vec![
         *insns_opname_to_byte()
@@ -79,7 +90,70 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
     let summary =
         super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
     assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "the blocker belongs to one leg, and recording it on both would let a \
+         decline read as a rewind"
+    );
     assert!(summary.may_execute_effect);
+    assert!(!summary.body_not_walked);
+}
+
+/// A callee's blocker is judged by what has run in the caller, not by what had
+/// run in the callee: the same body reached with an effect behind it holds a
+/// blocker no rollback covers.
+#[test]
+fn a_callees_rewindable_blocker_is_not_rewindable_behind_an_effect() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let callee = majit_translate::codewriter::jitcode::DescentBlockerSummary {
+        blocker_effect_free: Some(symbolic),
+        ..Default::default()
+    };
+
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+    let clean = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(clean.blocker_effect_free, Some(symbolic));
+    assert_eq!(
+        clean.blocker_after_effect, None,
+        "nothing ran before the descent entered the callee"
+    );
+
+    let mut code = residual_call_with_funcbox(0);
+    code.extend(inline_call_with_descr(7));
+    code.extend(void_return());
+    let behind = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(behind.blocker_after_effect, Some(symbolic));
+    assert_eq!(behind.blocker_effect_free, None);
+}
+
+/// A body the decoder cannot read to the end declines on that alone.  The
+/// instruction starts would otherwise name a prefix, and the `push!` gate drops
+/// targets that are not starts — so every path out of the undecodable byte
+/// would be missing from the graph, and a path the scan never walks reports no
+/// blocker.  Naming none is what an all-`None` summary already means, hence the
+/// separate flag.
+#[test]
+fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = residual_call_with_funcbox(0);
+    let goto = goto_if_not(0, 5);
+    code.extend(&goto[..goto.len() - 1]);
+    assert_eq!(code.len(), 9, "the branch is one byte short of its label");
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert!(summary.body_not_walked);
+    assert!(summary.may_execute_effect);
+    assert_eq!(summary.blocker_effect_free, None);
+    assert_eq!(
+        summary.blocker_after_effect, None,
+        "the decline is the unread region, so there is no blocker to name"
+    );
 }
 
 #[test]

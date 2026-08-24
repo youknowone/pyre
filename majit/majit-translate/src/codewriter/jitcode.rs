@@ -298,6 +298,14 @@ pub struct DescentBlockerSummary {
     pub blocker_effect_free: Option<i64>,
     /// A blocker reachable only after an effect has been executed, if any.
     pub blocker_after_effect: Option<i64>,
+    /// Whether part of the body could not be read: an opcode or argcode the
+    /// decoder does not know, which leaves the instruction starts naming a
+    /// prefix and every branch target past it dropped as "not a start".
+    ///
+    /// A dropped successor is a missing region of the graph, and a region the
+    /// scan never enters reports no blocker — so this cannot be expressed as
+    /// one of the two above and declines on its own.
+    pub body_not_walked: bool,
 }
 
 /// Answers computed on demand from an assembled [`JitCode`] body.
