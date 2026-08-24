@@ -1165,6 +1165,38 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
     w_str_new_managed(&int_str_text(v)) as i64
 }
 
+/// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
+/// arm of `descr_getitem` (`unicodeobject.py`), restricted to what it answers
+/// without running Python.
+///
+/// The receiver crosses as a boxed reference and the index as a raw machine
+/// integer.  A `PY_NULL` declines and resumes the subscript in the
+/// interpreter, which is where negative indices, `IndexError`, `__index__`
+/// coercion and every non-exact receiver belong.
+///
+/// Elidable despite `w_str_get_index_storage`: a non-ASCII payload memoizes
+/// its code-point index table on first read, and that write stores exactly
+/// what the next call would recompute — the same shape as the string hash
+/// `try_hash_value` memoizes, which `EffectInfo.__new__` already admits for
+/// an `EF_ELIDABLE_*` call.  A `str` is immutable, so the code point at an
+/// index is fixed for the life of the object.
+#[majit_macros::elidable]
+pub extern "C" fn jit_str_getitem(s: i64, index: i64) -> i64 {
+    let obj = s as PyObjectRef;
+    if obj.is_null() || index < 0 {
+        return PY_NULL as i64;
+    }
+    unsafe {
+        if !crate::pyobject::is_exact_type(obj, &crate::pyobject::STR_TYPE) {
+            return PY_NULL as i64;
+        }
+        match w_str_codepoint_at(obj, index as usize) {
+            Some(code_point) => w_str_from_codepoint(code_point.to_u32()) as i64,
+            None => PY_NULL as i64,
+        }
+    }
+}
+
 /// The text [`jit_int_str`] wraps.  Split out so a caller can check what the
 /// helper renders without allocating a `W_UnicodeObject` -- the walker's
 /// `str(int)` fold cross-checks the interpreter's answer against this before
