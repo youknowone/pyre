@@ -3035,30 +3035,36 @@ impl PyFrame {
     ///
     /// Only the traceback arm is ported, and `w_iterator` is unused as a
     /// result.  Upstream calls its two generator arms "an approximative
-    /// rule" for a case it says it cannot emulate; 3.14 turns out to be
-    /// exactly the third disjunct.  Counting `exception` events in the
-    /// consuming frame under `sys.settrace` on 3.14.2:
+    /// rule" for a case it says it cannot emulate.  Counting `exception`
+    /// events in the consuming frame under `sys.settrace` on 3.14.6, each
+    /// row the same on the first call and on the tenth:
     ///
     /// ```text
     /// for _ in CustomIter():   # Python-level __next__ raising StopIteration
     ///     -> [('__next__', 'StopIteration'), ('consume', 'StopIteration')]
     /// for _ in map(stop, [1]): # native __next__, Python-raised StopIteration
     ///     -> [('stop', 'StopIteration'), ('consume', 'StopIteration')]
-    /// for _ in gen():          -> []
     /// for _ in [1]:            -> []
     /// for _ in range(1):       -> []
     /// for _ in iter(step, 3):  -> []
     /// ```
     ///
     /// So the report fires when the StopIteration carries a traceback and
-    /// not otherwise; porting the generator arms would fire an event 3.14
-    /// does not.  The `map` row is what settles that the rule is about the
-    /// traceback rather than about the iterator's kind: its `__next__` is
-    /// native, and the event still fires, because the StopIteration passed
-    /// through a Python frame on the way out.
+    /// not otherwise.  The `map` row is what settles that the rule is about
+    /// the traceback rather than about the iterator's kind: its `__next__`
+    /// is native, and the event still fires, because the StopIteration
+    /// passed through a Python frame on the way out.
+    ///
+    /// A generator loop is not in the table, because 3.14 answers it two
+    /// ways for one code object: silence on the first execution, which runs
+    /// the unspecialised `_FOR_ITER` and jumps past `END_FOR`, and an event
+    /// once the loop specialises to `FOR_ITER_GEN` and the end arrives at
+    /// `INSTRUMENTED_END_FOR`, where `monitor_stop_iteration` mints it.
+    /// This arm answers with silence either way, which is the first of the
+    /// two, and whether it should follow the second is undecided.
     ///
     /// `pyre/extra_tests/parity_tests/foriter_stopiteration_exception_event.py`
-    /// pins all of it.
+    /// pins the table.
     ///
     /// The exhaustion an iterator signals from Rust never materialises an
     /// exception, so the common loop exit answers `has_any_traceback` false

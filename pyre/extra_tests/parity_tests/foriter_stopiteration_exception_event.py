@@ -1,4 +1,3 @@
-# pyre-check: pypy-diverges: pins that a StopIteration caught by FOR_ITER's exhaustion arm reports no `exception` event; pypy3 reports ('consume_generator', 'StopIteration')
 # CPython-suite gap: `test_sys_settrace` traces loops and it traces raising
 # code, but never a loop whose iterator ends by raising StopIteration from a
 # Python-level `__next__` while a tracer is installed.  A runtime that
@@ -14,16 +13,18 @@
 # The rule is not "always" and not "never".  3.14 reports the event exactly
 # when the StopIteration carries a traceback -- which is to say, when it was
 # raised by Python code rather than signalled by an iterator implemented
-# natively.  A generator ending, a list ending and a range ending all deliver
+# natively.  A list ending, a range ending and a dict ending all deliver
 # nothing; a class whose `__next__` raises delivers one.  That asymmetry is
 # what this pins: reporting always would fire on every `for` over a list, and
 # reporting never would lose the one case a debugger cares about.
 #
-# PyPy 7.3.20 fails `a_natively_signalled_end_reports_nothing` on the generator
-# case: it reports every generator-iterator unconditionally, which its own
-# comment calls "an approximative rule" for a case it says it cannot emulate.
-# The rule pinned here is 3.14's, so this file is a place the two references
-# disagree and CPython wins.
+# A generator ending is left unpinned, because 3.14 answers it two ways for
+# one code object.  The first execution runs the unspecialised `_FOR_ITER`,
+# whose exhaustion arm jumps past `END_FOR` without reporting; once the loop
+# specialises to `FOR_ITER_GEN` the generator's frame is pushed instead, the
+# end arrives at `INSTRUMENTED_END_FOR`, and `monitor_stop_iteration` mints
+# the event there.  A consumer called once therefore observes silence and a
+# consumer called twice observes the event, so neither is a rule to pin.
 import sys
 
 
@@ -82,14 +83,6 @@ def the_rule_is_the_traceback_and_not_the_iterator():
 
 
 def a_natively_signalled_end_reports_nothing():
-    def consume_generator():
-        def empty():
-            return
-            yield
-
-        for _ in empty():
-            raise AssertionError('the generator was not empty')
-
     def consume_list():
         for _ in [1, 2]:
             pass
@@ -115,7 +108,6 @@ def a_natively_signalled_end_reports_nothing():
             pass
 
     for consumer in (
-        consume_generator,
         consume_list,
         consume_range,
         consume_dict,
