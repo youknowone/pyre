@@ -3866,11 +3866,14 @@ unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
 /// `app_io.py print_` map `file is None` to `sys.stdout`, so a Python-level
 /// `sys.stdout = ...` redirects `print()`.
 enum DefaultPrintTarget {
-    /// Unmodified default stdout (`sys.stdout is sys.__stdout__`): keep pyre's
-    /// native `print_output` path (its strict-utf-8 `print_render` render and
-    /// direct write), leaving default output and surrogate handling unchanged.
+    /// Unmodified default stdout (`sys.stdout is sys.__stdout__`) still
+    /// configured for the codec the native path renders: keep pyre's
+    /// `print_output` path (its strict-utf-8 `print_render` render and direct
+    /// write), leaving default output and surrogate handling unchanged.
     Native,
-    /// A rebound `sys.stdout`; write through its `write` / `flush` methods.
+    /// A `sys.stdout` the native path cannot stand in for -- rebound, or the
+    /// default stream under a codec other than strict utf-8; write through its
+    /// `write` / `flush` methods.
     Rebound(PyObjectRef),
     /// `sys.stdout` is `None`; emit nothing (builtin_print returns `None`).
     Silent,
@@ -3878,9 +3881,11 @@ enum DefaultPrintTarget {
 
 /// Resolve `print()`'s default sink from the live `sys` module.
 ///
-/// Only a user redirect (`sys.stdout` rebound to some object other than the
-/// saved `sys.__stdout__`) is routed through Python `write` / `flush`; the
-/// unmodified default keeps the native path. A missing `sys.stdout` attribute
+/// A user redirect (`sys.stdout` rebound to some object other than the saved
+/// `sys.__stdout__`) is routed through Python `write` / `flush`, and so is a
+/// default stream whose codec is not the strict utf-8 the native path renders
+/// -- `PYTHONIOENCODING=cp424` makes `print(chr(0xa2))` a `b'J'` on the stream
+/// and a `b'Â¢'` on the native path. A missing `sys.stdout` attribute
 /// raises `RuntimeError("lost sys.stdout")` as builtin_print does.
 fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
     let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
@@ -3899,6 +3904,7 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
     }
     if let Ok(orig) = crate::baseobjspace::getattr_str(sys_mod, "__stdout__")
         && std::ptr::eq(orig, stdout)
+        && crate::module::_io::W_TextIOWrapper::stdio_renders_strict_utf8(stdout)
     {
         return Ok(DefaultPrintTarget::Native);
     }
