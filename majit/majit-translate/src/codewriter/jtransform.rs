@@ -3640,13 +3640,24 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `rtype_intmask` coerces its input to `lltype.Signed` and returns
-        // that value unchanged (`rpython/rtyper/rbuiltin.py:222-225`).  The
-        // frontend preserves the coercion as this call-shaped marker, so fold
-        // it through the same identity alias used for no-op coercions
-        // (`jtransform.py:399-401`).
+        // The two signedness markers `front::mir` emits for a same-width
+        // reinterpret.  Both coerce their input to the result's low-level type
+        // and hand it back unchanged: `rtype_intmask` to `lltype.Signed`, and
+        // `r_uint`'s `ForTypeEntry::specialize_call` to whatever
+        // `hop.r_result.lowleveltype` is, under an
+        // `exception_cannot_occur()`.  The frontend preserves the coercion as
+        // this call-shaped marker because it skips the rtyper step that would
+        // otherwise consume it, so fold both through the same identity alias
+        // used for no-op coercions (`jtransform.py::_noop_rewrite`).
+        //
+        // Aliasing loses the marker's Unsigned annotation, which is why this
+        // sits here and not earlier: the rtyper runs before jtransform and has
+        // already picked `uint_lt` over `int_lt` wherever the annotation
+        // mattered.  Both spellings name the same machine word.
         if let CallTarget::FunctionPath { segments } = target
-            && segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            && let [head @ .., leaf] = segments.as_slice()
+            && head == ["rpython", "rlib", "rarithmetic"]
+            && matches!(leaf.as_str(), "intmask" | "r_uint")
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
