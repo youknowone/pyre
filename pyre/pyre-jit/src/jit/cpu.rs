@@ -348,6 +348,8 @@ pub struct Cpu {
     /// because `pyopcode.py`'s `IMPORT_NAME` reads two independent things off the
     /// frame before the call.
     pub load_import_locals_fn: extern "C" fn(i64) -> i64,
+    /// IMPORT_NAME's globals argument — `self.get_w_globals()`.  (frame) → ref.
+    pub load_import_globals_fn: extern "C" fn(i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -550,6 +552,7 @@ impl Cpu {
             load_build_class_fn: crate::call_jit::bh_load_build_class_fn,
             load_import_fn: crate::call_jit::bh_load_import_fn,
             load_import_locals_fn: crate::call_jit::bh_load_import_locals_fn,
+            load_import_globals_fn: crate::call_jit::bh_load_import_globals_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,

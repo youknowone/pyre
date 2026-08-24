@@ -3573,6 +3573,7 @@ struct FnPtrIndices {
     load_build_class_fn: HelperHandle,
     load_import_fn: HelperHandle,
     load_import_locals_fn: HelperHandle,
+    load_import_globals_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -4316,6 +4317,15 @@ fn register_helper_fn_pointers(
         cpu.load_import_locals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // The globals half reads the same two fields the locals half does —
+    // `debugdata` then one of its refs — plus `promote(pycode).w_globals` on
+    // the frames that carry no payload, and reports no error either. Same
+    // pairing.
+    let load_import_globals_fn = bind(
+        assembler,
+        cpu.load_import_globals_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
     // The hand-written PUSH_EXC_INFO lowering must complete the interpreter's
     // caught-exception ownership transfer.  Bind last so every existing
     // helper index remains stable.
@@ -4420,6 +4430,7 @@ fn register_helper_fn_pointers(
         load_build_class_fn,
         load_import_fn,
         load_import_locals_fn,
+        load_import_globals_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
         call_kw_fn_0,
@@ -6439,6 +6450,11 @@ impl CodeWriter {
                     idx: load_import_locals_fn_idx,
                     flavor: _load_import_locals_fn_flavor,
                 },
+            load_import_globals_fn:
+                HelperHandle {
+                    idx: load_import_globals_fn_idx,
+                    flavor: _load_import_globals_fn_flavor,
+                },
             load_from_dict_or_globals_fn:
                 HelperHandle {
                     idx: load_from_dict_or_globals_fn_idx,
@@ -6717,6 +6733,7 @@ impl CodeWriter {
                 load_build_class_fn_idx,
                 load_import_fn_idx,
                 load_import_locals_fn_idx,
+                load_import_globals_fn_idx,
                 load_from_dict_or_globals_fn_idx,
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
@@ -12386,18 +12403,15 @@ impl CodeWriter {
                             // as PyPy's `self.get_w_globals()` does; an inlined
                             // callee must never inherit the caller's namespace
                             // or a code-wrapper constant in its place.
-                            let globals_value: super::flow::FlowValue = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "getfield_vable_r",
-                                vable_getfield_ref_graph_args(
+                            let globals_value: super::flow::FlowValue =
+                                emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import_globals",
                                     frame_var.into(),
-                                    VABLE_NAMESPACE_FIELD_IDX,
-                                ),
-                                Kind::Ref,
-                                py_pc as i64,
-                            )
-                            .into();
+                                    py_pc as i64,
+                                )
+                                .into();
                             // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
                             // locals and substitutes `None` only when the frame
                             // has none.  A baked `None` here would hide a

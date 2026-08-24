@@ -6641,6 +6641,23 @@ pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
     pyre_interpreter::importing::import_locals(frame) as i64
 }
 
+/// IMPORT_NAME's globals argument — `pyopcode.py`'s `self.get_w_globals()`.
+///
+/// `w_globals` stopped being a `PyFrame` field, so the namespace is no longer
+/// readable as a virtualizable slot: `get_w_globals` answers from
+/// `debugdata.w_globals` when the frame carries a payload and from
+/// `promote(pycode).w_globals` when it does not. Asking the live frame is what
+/// keeps an inlined callee on its own namespace.
+pub extern "C" fn bh_load_import_globals_fn(frame_ptr: i64) -> i64 {
+    assert!(
+        frame_ptr != 0,
+        "bh_load_import_globals_fn requires a non-null PyFrame; every IMPORT_NAME \
+         emit site must thread portal_frame_reg as its ref operand"
+    );
+    let frame = unsafe { &*(frame_ptr as *mut PyFrame) };
+    frame.get_w_globals() as i64
+}
+
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
 pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: i64) -> i64 {

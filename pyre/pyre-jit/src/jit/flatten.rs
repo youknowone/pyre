@@ -2642,6 +2642,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "load_build_class"
             | "load_import"
             | "load_import_locals"
+            | "load_import_globals"
             | "simple_call"
             | "getattr"
             | "load_special"
@@ -3338,6 +3339,10 @@ pub struct LoweringContext {
     /// argument lowers to the same one-Ref shape as
     /// [`Self::load_locals_fn_idx`].
     pub load_import_locals_fn_idx: u16,
+    /// `load_import_globals_fn` descrs-pool index. IMPORT_NAME's globals
+    /// argument lowers to the same one-Ref shape as
+    /// [`Self::load_import_locals_fn_idx`].
+    pub load_import_globals_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
     /// source.  BUILD_TUPLE records the rtyped `pyopcode.py`
@@ -4563,6 +4568,35 @@ where
     )
 }
 
+/// Lower IMPORT_NAME's globals argument to a one-Ref residual call.
+///
+/// `bh_load_import_globals_fn` is `get_w_globals()`: `debugdata.w_globals` on a
+/// frame carrying a payload, `promote(pycode).w_globals` otherwise. The first
+/// arm reads the same two fields as `load_import_locals` and the second reads a
+/// field of a promoted constant, so the `Plain` lowering is chosen for the same
+/// reason and with the same consequence -- no write set was computed for those
+/// fields, which is `EF_RANDOM_EFFECTS`, and a lazy set pending on
+/// `w_globals` is flushed before the helper reads it.
+pub fn lower_load_import_globals_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    lower_frame_only_ref_hlop_to_insn(
+        op,
+        "load_import_globals",
+        ctx.load_import_globals_fn_idx,
+        majit_ir::PyreHelperKind::LoadImportGlobals,
+        get_register,
+        lower_constant,
+    )
+}
+
 /// Lower pyopcode.py DELETE_GLOBAL to a void two-Ref residual call.
 pub fn lower_delete_global_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
@@ -5512,6 +5546,11 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_load_import_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) =
+        lower_load_import_globals_hlop_to_insn(op, ctx, get_register, lower_constant)
+    {
         return Some(insn);
     }
     if let Some(insn) = lower_load_import_locals_hlop_to_insn(op, ctx, get_register, lower_constant)

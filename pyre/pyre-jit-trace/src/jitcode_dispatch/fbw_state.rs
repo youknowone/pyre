@@ -3240,6 +3240,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::LoadGlobal
                     | majit_ir::RuntimeHelperKind::LoadImport
                     | majit_ir::RuntimeHelperKind::LoadImportLocals
+                    | majit_ir::RuntimeHelperKind::LoadImportGlobals
                     | majit_ir::RuntimeHelperKind::BoxInt
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray
