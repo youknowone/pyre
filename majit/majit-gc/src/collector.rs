@@ -2589,9 +2589,22 @@ impl MiniMarkGC {
     ///   forwarding header, and a non-moving object never forwards, so a young
     ///   rawmalloced member of either list would be read as dead while it is
     ///   alive. Upstream forbids the weakref half by contract —
-    ///   `malloc_fixedsize`'s large arm asserts `not contains_weakptr` — and
-    ///   pyre declines the destructor half rather than teach the survivor test
-    ///   a second witness.
+    ///   `malloc_fixedsize`'s large arm asserts `not contains_weakptr`.
+    ///
+    ///   The destructor half is *not* forbidden there, and that is the whole
+    ///   of the deviation: `malloc_fixedsize` refuses only the heavy arm
+    ///   (`needs_finalizer and not is_finalizer_light`), so a light destructor
+    ///   falls through to the large arm, takes `alloc_young=True`, and is
+    ///   appended to `young_objects_with_destructors`. pyre's `TypeInfo`
+    ///   destructor is that light kind. Following upstream literally would
+    ///   walk into a precondition upstream itself states: `is_forwarded` opens
+    ///   with `ll_assert(self.is_in_nursery(obj), "Can't forward an object
+    ///   outside the nursery.")`, which a rawmalloced address never satisfies.
+    ///   With that assertion compiled out the read returns false and the
+    ///   destructor runs on a reachable object. So the combination is
+    ///   undefined upstream rather than modelled, and pyre takes the arm that
+    ///   is defined; earning it back means giving the sweep a second witness,
+    ///   not relaxing this predicate.
     /// * `MAJIT_GC_YOUNG_RAWMALLOC=0` turns the whole path off, so a defect
     ///   that only appears once these objects can die at a minor can be
     ///   bisected against the born-old behaviour without rebuilding.
@@ -8522,6 +8535,38 @@ mod tests {
             gc.oldgen.rawmalloced_bytes(),
             baseline,
             "an unreached young rawmalloced object is freed by the minor"
+        );
+    }
+
+    /// The compiled-code entry point.  `dynasm_malloc_array` and
+    /// `dynasm_malloc_str` reach the collector through
+    /// `GcAllocator::alloc_varsize_typed`, so an oversized array built inside a
+    /// trace takes the same young birth `alloc_with_type` does.  Pinning it
+    /// here keeps the two arms from drifting: the varsize wrapper computes a
+    /// payload size and then defers, and a future short-circuit that skipped
+    /// the shared body would silently put compiled allocations back in the
+    /// old generation.
+    #[test]
+    fn an_oversized_varsize_allocation_is_born_young() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let item_size = std::mem::size_of::<usize>();
+        let length = gc.config.large_object_threshold / item_size + 8;
+        let baseline = gc.oldgen.rawmalloced_bytes();
+
+        let obj = GcAllocator::alloc_varsize_typed(&mut gc, tid, item_size, item_size, length);
+        assert!(!obj.is_null());
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "an oversized varsize allocation is born young"
+        );
+
+        gc.do_collect_nursery();
+
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            baseline,
+            "and dies at the next minor when nothing reached it"
         );
     }
 
