@@ -7773,6 +7773,62 @@ mod tests {
         }
         assert_eq!(raises, 1, "exactly one MemoryError raise edge");
 
+        // Data-flow guard (not just op-name counts): in block_d the mallocfn
+        // allocation size must be the SAME Variable written to `current_end`
+        // (allocated size == recorded buffer end, matching `rbuilder.py:104`
+        // `new_string = mallocfn(needed)` and `:113` `current_end = needed`),
+        // and `total_size` must be a distinct value (`total_new`, not the
+        // rounded `needed`). Swapping which variant feeds mallocfn / current_end
+        // / total_size is a buffer-size regression op-name counts cannot see.
+        let mut block_d = None;
+        let mut seen_d = std::collections::HashSet::new();
+        let mut stack_d = vec![inner.startblock.clone()];
+        while let Some(b) = stack_d.pop() {
+            if !seen_d.insert(std::rc::Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            if b.borrow().operations.iter().any(|o| o.opname == "direct_call") {
+                block_d = Some(b.clone());
+            }
+            let exits: Vec<_> = b.borrow().exits.clone();
+            for link in &exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack_d.push(t);
+                }
+            }
+        }
+        let block_d = block_d.expect("block_d holds the mallocfn direct_call");
+        let bd = block_d.borrow();
+        let malloc_size = bd
+            .operations
+            .iter()
+            .find(|o| o.opname == "direct_call")
+            .map(|o| o.args[1].clone())
+            .expect("mallocfn(size) direct_call");
+        let field_value = |field: &str| {
+            bd.operations
+                .iter()
+                .find(|o| o.opname == "setfield" && o.args[1] == super::void_field_const(field))
+                .map(|o| o.args[2].clone())
+                .unwrap_or_else(|| panic!("block_d setfield {field}"))
+        };
+        let current_end = field_value("current_end");
+        let total_size = field_value("total_size");
+        assert_eq!(
+            malloc_size, current_end,
+            "mallocfn size must be the same value written to current_end"
+        );
+        assert_ne!(
+            current_end, total_size,
+            "current_end (rounded needed) must differ from total_size (total_new)"
+        );
+        assert_eq!(
+            field_value("current_pos"),
+            super::constant_with_lltype(super::ConstValue::Int(0), LowLevelType::Signed),
+            "current_pos initialised to 0"
+        );
+        drop(bd);
+
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };
