@@ -942,6 +942,13 @@ pub(crate) fn summarize_body_blockers(
     for (slot, &value) in constants_i.iter().enumerate() {
         entry_known[num_regs_i + slot] = Some(value);
     }
+    // A handler runs with the join of every state in the region it protects, so
+    // its registers hold no known value -- but a constant slot is never a `>i`
+    // destination, so it holds the same value at every one of those points and
+    // survives the join exactly.  Blanking those too would drop the operand a
+    // `residual_call` in a handler reads its funcbox from, and a funcbox that
+    // reads unknown is a blocker the scan does not report.
+    let handler_known = entry_known.clone();
     let mut points: std::collections::HashMap<usize, DescentPoint> =
         std::collections::HashMap::new();
     points.insert(
@@ -1075,7 +1082,35 @@ pub(crate) fn summarize_body_blockers(
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
             // Frame exits: the walk leaves this body here.
-            "ref_return" | "int_return" | "float_return" | "void_return" | "raise" | "reraise" => {}
+            "ref_return" | "int_return" | "float_return" | "void_return" => {}
+            // A raise leaves the body only when nothing in it catches.
+            // `finishframe_lookahead_at` skips a `live/` and takes the
+            // `catch_exception/L` that follows, so the handler edge of a caught
+            // raise runs forward over bytes no fallthrough reaches — the walker
+            // routes `raise/r` and `reraise/` through exactly this lookahead
+            // (`mod.rs`, the current-frame arm).  Seeded like `catch_exception`
+            // below and for the same reason: the state at the raise is one of
+            // several the handler can be entered with.
+            //
+            // No body in the current build takes this edge — every one of the
+            // 1764 `catch_exception` ops sits after a call, which the
+            // fallthrough already reaches, and none of the 3473 `raise` /
+            // `reraise` ops has one behind it.
+            "raise" | "reraise" => {
+                if let Some(target) =
+                    crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
+                {
+                    push!(
+                        points,
+                        work,
+                        target,
+                        DescentPoint {
+                            effect: true,
+                            known_i: handler_known.clone(),
+                        }
+                    );
+                }
+            }
             "goto" => {
                 if let Some(target) = label {
                     push!(points, work, target, state);
@@ -1100,7 +1135,7 @@ pub(crate) fn summarize_body_blockers(
                         target,
                         DescentPoint {
                             effect: true,
-                            known_i: vec![None; state.known_i.len()],
+                            known_i: handler_known.clone(),
                         }
                     );
                 }

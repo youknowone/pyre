@@ -132,6 +132,94 @@ fn a_callees_rewindable_blocker_is_not_rewindable_behind_an_effect() {
     assert_eq!(behind.blocker_effect_free, None);
 }
 
+fn raise_r(reg: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    vec![byte, reg]
+}
+
+/// `live/` carries no argcodes but dispatch skips `liveness::OFFSET_SIZE`
+/// bytes of offset, so the encoding is one opcode plus that many zeroes.
+fn live() -> Vec<u8> {
+    let mut v = vec![
+        *insns_opname_to_byte()
+            .get("live/")
+            .expect("`live/` must be in insns table"),
+    ];
+    v.extend(std::iter::repeat_n(
+        0u8,
+        majit_translate::liveness::OFFSET_SIZE,
+    ));
+    v
+}
+
+fn catch_exception(target: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("catch_exception/L")
+        .expect("`catch_exception/L` must be in insns table");
+    vec![byte, target as u8, (target >> 8) as u8]
+}
+
+/// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
+/// skips the `live/` and takes the `catch_exception/L` behind it, so the handler
+/// runs forward over bytes no fallthrough reaches — treating the raise as
+/// terminal would leave that whole region, and any blocker in it, unwalked.
+#[test]
+fn a_raise_caught_in_this_frame_reaches_its_handler() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = raise_r(0);
+    code.extend(live());
+    let handler = (code.len() + 3 + 1) as u16;
+    code.extend(catch_exception(handler));
+    code.extend(void_return());
+    assert_eq!(code.len(), handler as usize, "the handler follows the exit");
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(
+        summary.blocker_after_effect,
+        Some(symbolic),
+        "the handler is entered with the join of every state in the region, so \
+         its blocker is one no rollback covers"
+    );
+    assert!(
+        !summary.may_execute_effect,
+        "the handler's seeded effect classifies the blocker behind it; the body \
+         itself still executes none"
+    );
+    assert!(!summary.body_not_walked);
+}
+
+/// The join a handler is entered with makes its registers unknown, but not the
+/// constant slots behind them: nothing writes those, so a funcbox read straight
+/// out of one holds at every point the handler can be entered from.  Blanking
+/// the whole Int bank instead would leave every blocker in every handler
+/// unnamed, which reads as a body that has none.
+#[test]
+fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let handler = 3 + 1;
+    let mut code = catch_exception(handler);
+    code.extend(void_return());
+    assert_eq!(
+        code.len(),
+        handler as usize,
+        "the handler follows the fallthrough"
+    );
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "the handler runs behind whatever raised into it"
+    );
+    assert!(!summary.body_not_walked);
+}
+
 /// A body the decoder cannot read to the end declines on that alone.  The
 /// instruction starts would otherwise name a prefix, and the `push!` gate drops
 /// targets that are not starts — so every path out of the undecodable byte
