@@ -276,9 +276,12 @@ pub struct SubJitCodeBody {
     /// `setposition` (RPython `pyjitpl.py copy_constants`)
     /// pre-populates those slots with `ConstClass(constants_i[i])`.
     pub constants_i: &'static [i64],
-    /// Callee's Ref-bank constant pool (`JitCode.constants_r`). Each
-    /// `i64` is the erased `PyObjectRef` of a const object resolved
-    /// at codewriter time.
+    /// Callee's Ref-bank constant pool (`JitCode.constants_r`). Each slot
+    /// holds, behind `ConstSlotR::get`, the erased `PyObjectRef` of a const
+    /// object resolved at codewriter time. The slot is interior-mutable
+    /// because the GC walker forwards it in place once a collection moves the
+    /// object it names, and by then the pool is reachable only through an
+    /// `Arc`.
     pub constants_r: &'static [majit_translate::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
