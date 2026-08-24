@@ -2910,6 +2910,33 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
+    // Class attribute that object.__getattribute__ returns unchanged
+    // (`typeobject.py:822` / `class_attr_fast_path`).  The instance-slot
+    // fold above needs a mapdict storage index; a name that lives only on
+    // the type has none and would otherwise residualize `space.getattr`.
+    if let Some((w_type, version_tag, map, w_value)) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::class_attr_fast_path(concrete_obj, name)
+    } {
+        if !majit_gc::can_move(majit_ir::GcRef(w_value as usize)) {
+            walker_guard_mapdict_instance_shape(
+                ctx,
+                op_pc,
+                obj,
+                concrete_obj,
+                w_type,
+                version_tag,
+                map,
+            )?;
+            let value = ctx.trace_ctx.const_ref(w_value as i64);
+            ctx.trace_ctx.set_opref_concrete(
+                value,
+                majit_ir::Value::Ref(majit_ir::GcRef(w_value as usize)),
+            );
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+            return Ok(Some(()));
+        }
+    }
+
     if let Some(walk_field) = traceback_walk_field(concrete_obj, name) {
         if let Some(()) = walker_specialize_traceback_walk_field(
             ctx,

@@ -1766,6 +1766,59 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// A class attribute that `object.__getattribute__` returns unchanged:
+/// present on the type, not a descriptor, and not shadowed by this
+/// instance's map.  The JIT LOAD_ATTR fold bakes the value under the same
+/// `w_class` / `version_tag` / `map` pins [`load_attr_fast_path`] uses for
+/// an instance slot.
+///
+/// `type_attr_value_fast_path` is the type-receiver twin
+/// (`typeobject.py:822`); this is the instance-receiver arm of the same
+/// "no descriptor protocol" answer.  A `__get__` or a heap-type value
+/// declines — those bind or could gain a `__get__` without bumping the
+/// type version.  A devolved map declines because `find_map_attr` cannot
+/// prove the instance does not shadow the name.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn class_attr_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    if unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+        return None;
+    }
+    let value_type = crate::typedef::r#type(w_descr)?.as_ptr();
+    if unsafe { crate::baseobjspace::lookup_in_type(value_type, "__get__") }.is_some()
+        || unsafe { pyre_object::w_type_is_heaptype(value_type) }
+    {
+        return None;
+    }
+    if unsafe { find_map_attr(map, Wtf8::new(name), DICT) }.is_some() {
+        return None;
+    }
+    Some((w_type, version_tag, map, w_descr))
+}
+
 /// The miss twin of [`load_attr_fast_path`]: return the ingredients for
 /// inlining the receiver type's `__getattr__` hook when `name` resolves
 /// nowhere.
