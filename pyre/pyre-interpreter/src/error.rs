@@ -2045,12 +2045,15 @@ impl PyError {
     /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
     /// is one and on the host's stream when there is not.
     pub(crate) fn write_report_line(buf: &[u8]) {
-        if !Self::write_unraisable_to_sys_stderr(buf) {
+        if !Self::write_to_sys_stderr(buf) {
             emit_report_to_host_stderr(buf);
         }
     }
 
-    fn write_unraisable_to_sys_stderr(buf: &[u8]) -> bool {
+    /// Write WTF-8 `buf` through the live `sys.stderr`, so the text spends that
+    /// stream's codec and error handler. False for a stream that is missing,
+    /// `None` or refuses the write, leaving the caller its own descriptor sink.
+    fn write_to_sys_stderr(buf: &[u8]) -> bool {
         let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
             return false;
         };
@@ -2118,7 +2121,7 @@ impl PyError {
             let err = unsafe { PyError::from_exc_object(w_value) };
             let _ = write_exception(&mut buf, &err, true);
         }
-        if !Self::write_unraisable_to_sys_stderr(&buf) {
+        if !Self::write_to_sys_stderr(&buf) {
             emit_report_to_host_stderr(&buf);
         }
     }
@@ -3845,8 +3848,21 @@ pub fn system_exit_code(err: &PyError) -> i32 {
         // and `SystemExit(-1)` both exit 255.
         return crate::baseobjspace::int_w(code).unwrap_or(-1) as i32;
     }
-    // Straight to the host's stderr, which has no codec behind it, so the
-    // text spends the `backslashreplace` encode here.
+    // `pylifecycle.c _Py_HandleSystemExit` writes the code object through
+    // `sys.stderr`, so the message spends that stream's codec and its
+    // `backslashreplace` handler: under `PYTHONIOENCODING=latin-1`,
+    // `sys.exit("h\xe9")` reaches the descriptor as `h\xe9` rather than as the
+    // utf-8 spelling of it.
+    if let Ok(text) = unsafe { crate::py_str_wtf8(code) } {
+        let mut buf = text.as_bytes().to_vec();
+        buf.push(b'\n');
+        if PyError::write_to_sys_stderr(&buf) {
+            return 1;
+        }
+    }
+    // The host's stderr has no codec behind it, so a stream that is missing or
+    // refuses the write leaves the text to spend a `backslashreplace` encode
+    // here instead.
     let text = unsafe { crate::display::py_str_display(code) };
     crate::host_seam::emit_stderr(format!("{text}\n").as_bytes());
     1
