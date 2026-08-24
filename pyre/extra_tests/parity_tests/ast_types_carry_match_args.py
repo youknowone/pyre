@@ -13,9 +13,13 @@
 # `TypeError: Expr() accepts 0 positional sub-patterns` and every traceback
 # rendered through `traceback.py` loses its `~`/`^` anchor row.
 #
-# PyPy 7.3.20 binds `__match_args__` on the concrete node types the same
-# way, `Pass` and its empty tuple included, but leaves the base `ast.AST`
-# without one, so the last line of the surface check cannot hold there.
+# PyPy binds `__match_args__` the same way, `Pass` and its empty tuple
+# included, but only in `State.make_new_type`, which runs over `AST_TYPES`.
+# The base is `space.gettypeobject(W_AST.typedef)` and never goes through it,
+# and that typedef lists `_fields` and `_attributes` alone -- so `ast.AST`
+# carries no `__match_args__` and the last line of the surface check cannot
+# hold there.  Structural, not a version gap: unchanged from 7.3.20 through
+# the 7.3.24 checkout under this repository.
 
 import ast
 import sys
