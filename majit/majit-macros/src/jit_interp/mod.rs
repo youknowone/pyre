@@ -197,11 +197,15 @@ pub struct JitInterpConfig {
     pub native_tag_small: Vec<Path>,
     /// Pure function → its own argument.  `native_identity = { unwrap_word }`.
     /// A call whose path matches one of these is replaced by the binding of
-    /// its single argument, so the trace never sees a call at all.  RPython
-    /// needs no such declaration: `backendopt/inline.py` opens a helper this
-    /// small before the codewriter runs, and `jtransform.py`
-    /// `rewrite_op_same_as` drops the identity residue it leaves behind.  The
-    /// LLBC tracer still sees the Rust call, so the drop is declared here.
+    /// its single argument, so the trace never sees a call at all.  What opens
+    /// a helper this small upstream is the inliner, not `same_as` handling:
+    /// `warmspot.WarmRunnerDesc.__init__` runs `prejit_optimizations` →
+    /// `inline.auto_inline_graphs` → `BaseInliner.do_inline`, then
+    /// `BaseInliner.cleanup` → `simplify.cleanup_graph`, all before
+    /// `make_jitcodes()`, and that leaves no residue for the codewriter to
+    /// drop.  This front end lowers a `syn` AST straight to a `JitCode` with
+    /// no flow-graph stage for an inliner to run in, so the declaration is
+    /// that pass relocated to the only stage there is.
     /// Declaring a function whose argument and result do not share a register
     /// class is a miscompile — the argument's binding is handed straight to
     /// the consumer.
@@ -363,6 +367,60 @@ pub enum StateFieldKind {
     /// int bank.
     #[allow(dead_code)]
     Ref(syn::Path),
+}
+
+/// Reject a path declared in two of the mutually exclusive call vocabularies.
+///
+/// `lower_value.rs`'s call arm tries `native_int_binops`, `native_tag_small`
+/// and `native_identity` in that order and only then the `calls` policy
+/// machinery, and each match returns immediately. A path in two of them
+/// therefore takes the earlier route and the later declaration is dead — with
+/// nothing downstream able to say so, because by that point only the winning
+/// route survives. The declaration order below is the lowerer's, so the
+/// vocabulary reported first is the one that actually applies.
+///
+/// Two entries inside a single vocabulary are left alone: `calls` is filled
+/// from both `calls = { ... }` and `helpers = [ ... ]`, where naming a
+/// function in both is how a policy is attached to a discovered helper.
+pub(crate) fn reject_overlapping_call_vocabularies(
+    calls: &[CallEntry],
+    native_int_binops: &[(Path, Ident)],
+    native_tag_small: &[Path],
+    native_identity: &[Path],
+) -> syn::Result<()> {
+    let vocabularies: [(&str, Vec<&Path>); 4] = [
+        (
+            "native_int_binops",
+            native_int_binops.iter().map(|(path, _)| path).collect(),
+        ),
+        ("native_tag_small", native_tag_small.iter().collect()),
+        ("native_identity", native_identity.iter().collect()),
+        ("calls", calls.iter().map(|entry| &entry.path).collect()),
+    ];
+
+    let mut declared: Vec<(Vec<String>, &str)> = Vec::new();
+    for (vocabulary, paths) in &vocabularies {
+        for path in paths {
+            let segments = jitcode_lower::canonical_path_segments(path);
+            if let Some((_, winner)) = declared
+                .iter()
+                .find(|(other, owner)| *other == segments && owner != vocabulary)
+            {
+                return Err(syn::Error::new_spanned(
+                    path,
+                    format!(
+                        "`{name}` is declared in both `{winner}` and `{vocabulary}`; \
+                         the lowering takes the `{winner}` route and the \
+                         `{vocabulary}` declaration never applies. Declare it in \
+                         exactly one.",
+                        name = segments.join("::"),
+                    ),
+                ));
+            }
+            declared.push((segments, vocabulary));
+        }
+    }
+    Ok(())
 }
 
 /// One entry in the `calls = { ... }` / `helpers = [ ... ]` map.
@@ -838,6 +896,13 @@ impl Parse for JitInterpConfig {
                 .into_iter()
                 .map(|spec| (spec.expr, spec.type_tag))
                 .unzip();
+
+        reject_overlapping_call_vocabularies(
+            &calls,
+            &native_int_binops,
+            &native_tag_small,
+            &native_identity,
+        )?;
 
         Ok(JitInterpConfig {
             state_type,
@@ -3193,6 +3258,47 @@ fn rewrite_body(
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    /// A path in two vocabularies is rejected at parse time, naming the route
+    /// that wins. Without the check the `calls` policy is simply never
+    /// consulted and nothing downstream can tell the author.
+    #[test]
+    fn a_path_in_two_call_vocabularies_is_rejected() {
+        let calls = vec![CallEntry {
+            path: parse_quote!(unwrap_word),
+            policy: Some(CallPolicyKind::ElidableIntCannotRaise),
+        }];
+        let native_identity: Vec<Path> = vec![parse_quote!(unwrap_word)];
+
+        let err = reject_overlapping_call_vocabularies(&calls, &[], &[], &native_identity)
+            .expect_err("a path in both `native_identity` and `calls` must not parse");
+        let message = err.to_string();
+        assert!(
+            message.contains("`unwrap_word`")
+                && message.contains("`native_identity`")
+                && message.contains("`calls`"),
+            "the diagnostic must name the path and both vocabularies: {message}"
+        );
+    }
+
+    /// Two entries under one key stay legal: `calls` is filled from `calls`
+    /// and `helpers` both, and naming a discovered helper there is how it
+    /// gets its policy.
+    #[test]
+    fn a_path_declared_twice_in_one_vocabulary_is_accepted() {
+        let calls = vec![
+            CallEntry {
+                path: parse_quote!(helper),
+                policy: None,
+            },
+            CallEntry {
+                path: parse_quote!(helper),
+                policy: Some(CallPolicyKind::ResidualInt),
+            },
+        ];
+        reject_overlapping_call_vocabularies(&calls, &[], &[], &[])
+            .expect("a repeated `calls` entry is how `helpers` gets its policy");
+    }
 
     #[test]
     fn an_unambiguous_imported_leaf_resolves_its_inlined_base() {

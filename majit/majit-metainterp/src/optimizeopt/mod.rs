@@ -6651,8 +6651,12 @@ impl OptContext {
 
         // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
-            memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref());
+        let Ok((rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)) =
+            memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref())
+        else {
+            self.signal_invalid_loop("resume numbering: TagOverflow");
+            return;
+        };
 
         if crate::callee_rca_enabled() {
             let vable_items = if rd_numb.len() >= 3 {

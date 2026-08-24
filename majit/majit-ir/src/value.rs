@@ -1330,6 +1330,64 @@ impl<T: ?Sized> GreenAsI64 for &mut T {
     }
 }
 
+/// Widens a registered call target's result to the machine word a trace
+/// register holds it in.
+///
+/// A target registered through `#[jit_interp]`'s `calls = { ... }` is
+/// dispatched by `majit_backend::call_stub::bh_call_i_dispatch`, which
+/// transmutes the recorded address to `extern "C" fn(..) -> i64` and reads the
+/// whole return register. Neither the System V AMD64 nor the AAPCS procedure
+/// call standard defines the bits above a result narrower than a word, and
+/// compilers use that freedom: an x86-64 callee returning `u8` from an array
+/// read compiles to `mov al, [rax + rcx]`, leaving the element's own address in
+/// the rest of `rax`. Read as an `i64` the result is then an address wearing
+/// the returned byte as its low bits, so the damage surfaces far from the call
+/// as an out-of-range index rather than as a crash at the call itself.
+/// AArch64's `ldrb` zero-extends, which is why the same build is correct
+/// there.
+///
+/// So the macro does not read a callee's return register directly. It routes
+/// every int-result target through a shim returning `i64`, and the register is
+/// defined by construction. A result that is not one of the types below — a
+/// `#[repr(transparent)]` wrapper over a word, say — has to implement this
+/// before it can be registered; the widening it wants is not something the
+/// macro can guess.
+pub trait CallResultWord {
+    fn into_call_word(self) -> i64;
+}
+
+macro_rules! impl_call_result_word_int {
+    ($($ty:ty),*) => {
+        $(
+            impl CallResultWord for $ty {
+                #[inline(always)]
+                fn into_call_word(self) -> i64 {
+                    self as i64
+                }
+            }
+        )*
+    };
+}
+
+// `as i64` per type, so each width extends the way the language says it does:
+// signed types sign-extend, unsigned types zero-extend, and the word-width
+// types are the identity.
+impl_call_result_word_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool);
+
+impl<T: ?Sized> CallResultWord for *const T {
+    #[inline(always)]
+    fn into_call_word(self) -> i64 {
+        self as *const () as usize as i64
+    }
+}
+
+impl<T: ?Sized> CallResultWord for *mut T {
+    #[inline(always)]
+    fn into_call_word(self) -> i64 {
+        self as *const () as usize as i64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1568,5 +1626,27 @@ mod tests {
                 "greenkey types mismatch for (pc={pc}, profiled={profiled}, code={code:#x})"
             );
         }
+    }
+
+    /// Each width extends the way the language says it does, so a caller
+    /// reading the whole register recovers the value the callee returned and
+    /// not a sign-flipped or truncated one.
+    #[test]
+    fn call_result_words_extend_by_signedness() {
+        assert_eq!((-1i8).into_call_word(), -1);
+        assert_eq!(0xffu8.into_call_word(), 255);
+        assert_eq!((-1i32).into_call_word(), -1);
+        assert_eq!(u32::MAX.into_call_word(), 4_294_967_295);
+        assert_eq!(i64::MIN.into_call_word(), i64::MIN);
+        assert_eq!(usize::MAX.into_call_word(), -1);
+        assert_eq!(true.into_call_word(), 1);
+        assert_eq!(false.into_call_word(), 0);
+    }
+
+    #[test]
+    fn call_result_words_carry_a_pointer_whole() {
+        let x = 7u32;
+        let p: *const u32 = &x;
+        assert_eq!(p.into_call_word() as usize, p as usize);
     }
 }

@@ -2448,6 +2448,13 @@ impl<M: Clone> MetaInterp<M> {
                 visitor(gcref);
             }
         }
+        // The per-guard snapshot side table copies inline gcrefs out of the
+        // `ref_regs` slots walked above into words of its own; see
+        // `recorder::Snapshot::walk_const_ptr_refs` for why nothing else
+        // forwards them.
+        for snapshot in trace_ctx.snapshots.iter_mut() {
+            snapshot.walk_const_ptr_refs(&mut visitor);
+        }
         // pyjitpl.py:3290-3306 `self.virtualizable_boxes` stores ordinary
         // BoxPtr objects whose concrete refs are traced by RPython's object
         // graph.  Pyre keeps their concrete half in `virtualizable_values`;
@@ -5492,10 +5499,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_int requires active tracing")
-            .vable_getfield_int(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_r(box, fielddescr, pc)`.
@@ -5506,10 +5514,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_ref requires active tracing")
-            .vable_getfield_ref(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -5520,10 +5529,11 @@ impl<M: Clone> MetaInterp<M> {
         vable_struct_ptr: i64,
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_getfield_vable_float requires active tracing")
-            .vable_getfield_float(pc, vable_opref, vable_struct_ptr, fielddescr)
+            .vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
@@ -5748,10 +5758,18 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
+        let cpu = self.cpu.clone();
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
+            .vable_arraylen_vable(
+                cpu.as_ref(),
+                pc,
+                vable_opref,
+                vable_struct_ptr,
+                fdescr,
+                adescr,
+            )
     }
 
     /// pyjitpl.py `opimpl_hint_force_virtualizable(box)`.
@@ -15010,12 +15028,15 @@ impl<M: Clone> MetaInterp<M> {
         self.count_ops(opnum, counters::OPS);
         // pyjitpl.py: resvalue = executor.execute_varargs(self.cpu, self, ...)
         let resvalue = crate::executor::execute_varargs(self, opnum, argboxes, descr_view);
-        // pyjitpl.py:2649-2650: assert not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST
+        // `MetaInterp.execute_and_record_varargs` asserts
+        // `not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST`;
+        // the predicate below is the narrower call-only slice of that range.
         debug_assert!(
             !opnum.is_call_pure(),
-            "execute_and_record_varargs: pure calls go through _record_helper_pure_varargs",
+            "execute_and_record_varargs: pure calls go through \
+             MIFrame.execute_varargs(pure=True) → record_result_of_call_pure",
         );
-        // pyjitpl.py: return self._record_helper_varargs(...)
+        // `MetaInterp._record_helper_varargs`
         let opref_args: Vec<OpRef> = argboxes.iter().map(|(_, opref, _)| *opref).collect();
         self._record_helper_varargs(opnum, resvalue, descr, &opref_args)
     }
@@ -17098,10 +17119,23 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             0
         };
+        // Two distinct `ConstPtr`s cannot be equal at runtime either, so the
+        // funnel's fold is sound here and collapses the pair to `ConstInt(0)`;
+        // `promote_int` then short-circuits on it and no GUARD_VALUE is
+        // recorded. `PTR_EQ` reads no memory, so the fold does not depend on
+        // which backend `self.cpu` is.
+        let cpu = self.cpu.clone();
+        let last_exc_value = self.last_exc_value;
         let eqbox_opref = {
             let ctx = self.tracing.as_mut()?;
-            ctx.recorder
-                .record_op(OpCode::PtrEq, &[vref_box, standard_box])
+            ctx.execute_and_record(
+                Some(cpu.as_ref()),
+                OpCode::PtrEq,
+                None,
+                &[vref_box, standard_box],
+                Some(majit_ir::Value::Int(isstandard_int)),
+                last_exc_value,
+            )
         };
         // pyjitpl.py: eqbox = self.implement_guard_value(eqbox, pc)
         // — pyre's `promote_int` records GUARD_VALUE on the result and
@@ -22907,6 +22941,61 @@ mod tests {
             inputargs[0].get_value(),
             Some(Value::Ref(GcRef(0x8000)))
         ));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_snapshot_const_ptr() {
+        // `get_list_of_active_snapshot_boxes` copies a constant ref register's
+        // gcref into a raw `SnapshotTagged::Const` word, and the vable / vref
+        // lists can hold an inline `ConstPtr` operand. Both accumulate across
+        // the whole trace, so a collection during tracing must forward them.
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.snapshots.push(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 4,
+                py_pc: 4,
+                boxes: vec![
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Ref),
+                    // Same bits, non-Ref type: an integer, not an address.
+                    crate::recorder::SnapshotTagged::Const(0xA000, Type::Int),
+                ],
+            }],
+            vable_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::const_ptr(GcRef(0xA000)),
+                Type::Ref,
+            )],
+            vref_boxes: vec![crate::recorder::SnapshotTagged::Box(
+                OpRef::input_arg_ref(0),
+                Type::Ref,
+            )],
+        });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0xA000 {
+                slot.0 = 0xB000;
+            }
+        });
+
+        let snapshot = &meta.tracing.as_ref().unwrap().snapshots[0];
+        assert_eq!(
+            snapshot.frames[0].boxes[0],
+            crate::recorder::SnapshotTagged::Const(0xB000, Type::Ref)
+        );
+        assert_eq!(
+            snapshot.frames[0].boxes[1],
+            crate::recorder::SnapshotTagged::Const(0xA000, Type::Int)
+        );
+        assert_eq!(
+            snapshot.vable_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::const_ptr(GcRef(0xB000)), Type::Ref)
+        );
+        assert_eq!(
+            snapshot.vref_boxes[0],
+            crate::recorder::SnapshotTagged::Box(OpRef::input_arg_ref(0), Type::Ref)
+        );
     }
 
     #[test]

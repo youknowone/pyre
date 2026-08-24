@@ -478,7 +478,13 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             }
             (
                 *offset,
-                majit_ir::descr::make_field_descr(*offset, *field_size, *field_type, *field_flag),
+                majit_ir::descr::make_field_descr_with_immutability(
+                    *offset,
+                    *field_size,
+                    *field_type,
+                    *field_flag,
+                    *is_immutable,
+                ),
             )
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
@@ -1863,16 +1869,14 @@ where
     /// survives optimization then deopts into a frame with no live registers
     /// and a zero-length vable section.
     ///
-    /// `replace_box` has no whole-metainterp equivalent here; writing the
-    /// promoted constant back into the source register is the same stand-in
-    /// the `BC_SWITCH` arm in this file already uses for it, and it is what
-    /// keeps a second read of the same register from emitting a redundant
-    /// `GUARD_VALUE`.
+    /// The promoted constant goes out through [`Self::replace_box`], so a
+    /// later read of any slot naming the box folds rather than re-guarding —
+    /// including one in a caller frame that `MIFrame::setup_call` copied the
+    /// same box into.
     fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        reg: usize,
         box_: OpRef,
         runtime_value: i64,
         resume_pc: usize,
@@ -1893,9 +1897,142 @@ where
             false,
         );
         // pyjitpl.py `replace_box`.
-        self.set_int_reg(reg, Some(promoted_box), Some(runtime_value));
+        self.replace_box(ctx, box_, promoted_box, Type::Int);
         // pyjitpl.py:1927
         promoted_box
+    }
+
+    /// `pyjitpl.py MetaInterp.replace_box(oldbox, newbox)`.
+    ///
+    /// The box has just been proven constant, so every record of it made
+    /// during tracing has to name the constant instead: each frame's active
+    /// boxes, and the virtualref, virtualizable and heapcache records
+    /// `TraceCtx::replace_box` owns. Writing back the one register the
+    /// opcode read leaves an alias in another register still naming the
+    /// non-constant box.
+    ///
+    /// The concrete-value banks are not touched: the constant stands for the
+    /// value the box already had, so every slot that named it already carries
+    /// that value.
+    fn replace_box(&mut self, ctx: &mut TraceCtx, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
+        for frame in self.frames.frames.iter_mut() {
+            frame.replace_active_box_in_frame(oldbox, newbox, oldbox_type);
+        }
+        ctx.replace_box(oldbox, newbox);
+    }
+
+    /// `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — returns
+    /// `box.nonnull()`, guarding it into the trace on the way.
+    ///
+    /// ```python
+    /// value = box.nonnull()
+    /// if heapcache.is_nullity_known(box):
+    ///     profiler.count_ops(rop.GUARD_NONNULL, Counters.HEAPCACHED_OPS)
+    ///     return value
+    /// if value:
+    ///     if not self.metainterp.heapcache.is_class_known(box):
+    ///         self.metainterp.generate_guard(rop.GUARD_NONNULL, box, resumepc=orgpc)
+    /// else:
+    ///     if not isinstance(box, Const):
+    ///         self.metainterp.generate_guard(rop.GUARD_ISNULL, box, resumepc=orgpc)
+    ///         promoted_box = executor.constant_from_op(box)
+    ///         self.metainterp.replace_box(box, promoted_box)
+    /// heapcache.nullity_now_known(box)
+    /// return value
+    /// ```
+    ///
+    /// The nullity question is asked of the box directly — there is no
+    /// comparison operation, and none of `GUARD_NONNULL` / `GUARD_ISNULL` /
+    /// the two heapcache updates has an analogue in a `PTR_EQ` against null
+    /// under a `GUARD_TRUE`.
+    fn establish_nullity(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        src: OpRef,
+        src_value: i64,
+        opcode_pc: usize,
+    ) -> bool {
+        let value = src_value != 0;
+        if ctx.heapcache_nullity_answered(src) {
+            ctx.profiler().count_ops(
+                OpCode::GuardNonnull,
+                crate::pyjitpl::counters::HEAPCACHED_OPS,
+            );
+            return value;
+        }
+        if value {
+            // A known class already implies non-null, so the guard would be
+            // redundant.
+            if !ctx.heap_cache().is_class_known(src) {
+                self.record_state_guard(ctx, sym, OpCode::GuardNonnull, &[src], opcode_pc, false);
+            }
+        } else if !src.is_constant() {
+            self.record_state_guard(ctx, sym, OpCode::GuardIsnull, &[src], opcode_pc, false);
+            let null = ctx.const_null();
+            self.replace_box(ctx, src, null, Type::Ref);
+        }
+        // majit's `nullity_now_known` also records WHICH nullity, where
+        // upstream only sets the flag; `is_nullity_known` then answers
+        // `Some(false)` for a known-null box rather than conflating it with
+        // unknown.
+        ctx.heap_cache_mut().nullity_now_known(src, value);
+        value
+    }
+
+    /// `pyjitpl.py MIFrame.opimpl_goto_if_not(box, target, orgpc, replace)`.
+    ///
+    /// ```python
+    /// switchcase = box.getint()
+    /// if switchcase:
+    ///     assert switchcase == 1
+    ///     opnum = rop.GUARD_TRUE
+    ///     promoted_box = CONST_1
+    /// else:
+    ///     opnum = rop.GUARD_FALSE
+    ///     promoted_box = CONST_0
+    /// self.metainterp.generate_guard(opnum, box, resumepc=orgpc)
+    /// if not switchcase:
+    ///     self.pc = target
+    /// if isinstance(box, Const):
+    ///     return
+    /// if replace:
+    ///     self.metainterp.replace_box(box, promoted_box)
+    /// ```
+    ///
+    /// `replace=false` is the `goto_if_not_int_is_true` caller's, whose
+    /// condbox "does not appear anywhere in any register" because the arm
+    /// just made it.
+    fn goto_if_not(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        opcode_pc: usize,
+        cond: OpRef,
+        cond_value: i64,
+        target: usize,
+        replace: bool,
+    ) {
+        let (guard, promoted_value) = if cond_value != 0 {
+            // `assert switchcase == 1`. Every producer of this bytecode passes
+            // a Rust `bool`, so the operand is 0 or 1 by construction — and
+            // the `CONST_1` rebind below is only sound while that holds.
+            debug_assert_eq!(cond_value, 1, "goto_if_not: operand is not a bool");
+            (OpCode::GuardTrue, 1)
+        } else {
+            (OpCode::GuardFalse, 0)
+        };
+        self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
+        if cond_value == 0 {
+            self.frames.current_mut().code_cursor = target;
+        }
+        if cond.is_constant() {
+            return;
+        }
+        if replace {
+            let promoted_box = ctx.const_int(promoted_value);
+            self.replace_box(ctx, cond, promoted_box, Type::Int);
+        }
     }
 
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
@@ -2748,14 +2885,23 @@ where
                 | OpCode::FloatGe
         );
         let same_box = !is_float && lhs.same_box(rhs);
-        if !(same_box || lhs.is_constant() && rhs.is_constant()) {
-            let cond = ctx.record_op(opcode, &[lhs, rhs]);
-            ctx.set_opref_concrete(cond, majit_ir::Value::Int(taken as i64));
+        if !same_box {
+            let cond = ctx.execute_and_record(
+                Some(self.cpu.as_ref()),
+                opcode,
+                None,
+                &[lhs, rhs],
+                Some(majit_ir::Value::Int(taken as i64)),
+                self.last_exception_value,
+            );
             let guard = if taken {
                 OpCode::GuardTrue
             } else {
                 OpCode::GuardFalse
             };
+            // `generate_guard`'s `if isinstance(box, Const): return` is
+            // `record_state_guard`'s own first gate, so a folded `cond`
+            // suppresses the guard without a second test here.
             self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
         }
         if !taken {
@@ -3668,8 +3814,13 @@ where
                 // wires the check itself).
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_int(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_int(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_int_reg(dest, Some(opref), value.map(value_as_int_bits));
             }
@@ -3687,8 +3838,13 @@ where
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_ref(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_ref(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_ref_reg(dest, Some(opref), value.map(value_as_ref_bits));
             }
@@ -3706,8 +3862,13 @@ where
                 };
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
-                let (opref, value) =
-                    ctx.vable_getfield_float(opcode_pc, vable_opref, vable_struct_ptr, fielddescr);
+                let (opref, value) = ctx.vable_getfield_float(
+                    self.cpu.as_ref(),
+                    opcode_pc,
+                    vable_opref,
+                    vable_struct_ptr,
+                    fielddescr,
+                );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
                 self.set_float_reg(dest, Some(opref), value.map(value_as_float_bits));
             }
@@ -3954,9 +4115,9 @@ where
                 };
                 let (base_opref, base_addr) = self.read_int_reg(base_reg);
                 let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                let opref =
-                    ctx.record_op_with_descr(OpCode::RawLoadI, &[base_opref, ea_opref], descr);
-                // Concrete eval: descriptor-sized read at `base + ea`.
+                // Concrete eval: descriptor-sized read at `base + ea`. It runs
+                // before the record because `execute_and_record` takes the
+                // value rather than computing it.
                 //
                 // SAFETY: the kernel clamps `ea` to an in-bounds byte offset
                 // (0 when the access would trap), so `base_addr + ea_value`
@@ -3979,6 +4140,21 @@ where
                         }
                     }
                 };
+                // `RawLoadI` is outside `is_pure_with_descr` at every descr —
+                // `test_raw_load_i_stays_non_pure_for_eval_breaker_poll` pins
+                // it there, because a pure raw load lets `optimize_guard_false`
+                // delete the back-edge eval-breaker poll — so the funnel always
+                // records. What it adds over a bare `record_op_with_descr` is
+                // the op counters and the concrete stamp every sibling read
+                // already carries.
+                let opref = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::RawLoadI,
+                    Some(descr),
+                    &[base_opref, ea_opref],
+                    Some(Value::Int(concrete)),
+                    self.last_exception_value,
+                );
                 self.set_int_reg(dst, Some(opref), Some(concrete));
             }
             jitcode::insns::BC_RAW_LOAD_F => {
@@ -4007,8 +4183,6 @@ where
                 };
                 let (base_opref, base_addr) = self.read_int_reg(base_reg);
                 let (ea_opref, ea_value) = self.read_int_reg(ea_reg);
-                let opref =
-                    ctx.record_op_with_descr(OpCode::RawLoadF, &[base_opref, ea_opref], descr);
                 // Concrete eval: an 8-byte f64 read at `base + ea`, carried as
                 // raw bits in the float bank (set_float_reg takes i64 bits).
                 //
@@ -4019,6 +4193,15 @@ where
                     8 => unsafe { core::ptr::read_unaligned(item_addr as *const i64) },
                     other => panic!("BC_RAW_LOAD_F: unsupported itemsize = {other}"),
                 };
+                // Never folds, for the reason given in the `BC_RAW_LOAD_I` arm.
+                let opref = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::RawLoadF,
+                    Some(descr),
+                    &[base_opref, ea_opref],
+                    Some(Value::Float(f64::from_bits(concrete_bits as u64))),
+                    self.last_exception_value,
+                );
                 self.set_float_reg(dst, Some(opref), Some(concrete_bits));
             }
             jitcode::insns::BC_GETFIELD_GC_I
@@ -4098,13 +4281,26 @@ where
                 } else {
                     OpCode::GetfieldGcI
                 };
-                let op = ctx.record_op_with_descr(kind, &[struct_opref], fielddescr);
                 let value = if is_ref {
                     Value::Ref(majit_ir::GcRef(loaded as usize))
                 } else {
                     Value::Int(loaded)
                 };
-                ctx.set_opref_concrete(op, value);
+                // `is_pure_with_descr` admits GETFIELD_GC_{I,R} only for a
+                // descr that answers `is_always_pure`, so only an immutable
+                // field off a constant struct folds. The null case hands the
+                // funnel no concrete: `loaded` is a fabricated 0 rather than a
+                // real load, and `llmodel.py protect_speculative_field` rejects
+                // a null gcptr before any fold — the executor row would
+                // dereference it.
+                let op = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    kind,
+                    Some(fielddescr),
+                    &[struct_opref],
+                    (struct_ptr != 0).then_some(value),
+                    self.last_exception_value,
+                );
                 if is_ref {
                     self.set_ref_reg(dest, Some(op), Some(loaded));
                 } else {
@@ -4132,8 +4328,16 @@ where
                 } else {
                     0
                 };
-                let op = ctx.record_op_with_descr(OpCode::GetfieldGcF, &[struct_opref], fielddescr);
-                ctx.set_opref_concrete(op, Value::Float(f64::from_bits(loaded as u64)));
+                // See the `BC_GETFIELD_GC_I` arm on the descr gate and the
+                // null case.
+                let op = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::GetfieldGcF,
+                    Some(fielddescr),
+                    &[struct_opref],
+                    (struct_ptr != 0).then_some(Value::Float(f64::from_bits(loaded as u64))),
+                    self.last_exception_value,
+                );
                 self.set_float_reg(dest, Some(op), Some(loaded));
             }
             jitcode::insns::BC_SETFIELD_VABLE_I => {
@@ -4238,7 +4442,13 @@ where
                     Some(majit_ir::Value::Int(n)) => Some(*n),
                     _ => None,
                 };
-                let opref = ctx.opimpl_arraylen_gc(array_opref, descr, concrete);
+                let opref = ctx.opimpl_arraylen_gc(
+                    self.cpu.as_ref(),
+                    array_opref,
+                    descr,
+                    concrete,
+                    self.last_exception_value,
+                );
                 self.set_int_reg(dst, Some(opref), reg_concrete);
             }
             // ── BC_GETARRAYITEM_GC_I ──
@@ -4262,7 +4472,7 @@ where
             // `add_gc_byte_array_descr`).  Concrete eval reads byte at
             // `array_addr + index` and zero-extends to i64 (matching
             // CPython `ord()` 0..=255 semantics).
-            jitcode::insns::BC_GETARRAYITEM_GC_I => {
+            jitcode::insns::BC_GETARRAYITEM_GC_I | jitcode::insns::BC_GETARRAYITEM_GC_I_PURE => {
                 let (array_reg, index_reg, descr_idx, dst) = {
                     let frame = self.frames.current_mut();
                     let array_reg = frame.next_reg() as usize;
@@ -4281,6 +4491,22 @@ where
                 };
                 let (array_opref, array_addr) = self.read_ref_reg(array_reg);
                 let (index_opref, index_value) = self.read_int_reg(index_reg);
+                // `getarrayitem_gc_i_pure` shares this body: the load, the
+                // heapcache handling and the register write are identical, and
+                // only the recorded opcode differs — the same reason
+                // `blackhole.py` aliases `bhimpl_getarrayitem_gc_i_pure` onto
+                // the plain impl.  The distinction that does matter is which
+                // opcode reaches the optimizer: `GetarrayitemGcPureI` is inside
+                // the always-pure range, so `OpHelpers.is_pure_with_descr`
+                // admits it, while the plain read is admitted by no descr.
+                // The codewriter has already made that choice —
+                // `OpKind::ArrayRead { pure }` picks the spelling from whether
+                // the list is ever mutated (`ll_getitem_foldable_nonneg`).
+                let opcode = if bytecode == jitcode::insns::BC_GETARRAYITEM_GC_I_PURE {
+                    OpCode::GetarrayitemGcPureI
+                } else {
+                    OpCode::GetarrayitemGcI
+                };
                 let descr_index = descr.index();
                 // pyjitpl.py `_do_getarrayitem_gc_any`: check
                 // `heapcache.getarrayitem(arraybox, indexbox, arraydescr)`
@@ -4323,123 +4549,127 @@ where
                         (4, false) => *(item_addr as *const u32) as i64,
                         (8, _) => *(item_addr as *const i64),
                         other => panic!(
-                            "BC_GETARRAYITEM_GC_I: unsupported (itemsize, signed) = {:?}",
+                            "getarrayitem_gc_i: unsupported (itemsize, signed) = {:?}",
                             other,
                         ),
                     }
                 };
-                let (opref, reg_concrete) =
-                    if array_opref.is_constant() && index_opref.is_constant() {
-                        // pyjitpl.py `execute_varargs(pure=True)` →
-                        // `record_result_of_call_pure`: a read of the immutable
-                        // bytecode array at a green index has all-constant args, so
-                        // it folds to a ConstInt and is not recorded — the same
-                        // record-time fold PyPy applies to `strgetitem(green_str,
-                        // green_pc)` (strings/immutable arrays lower to the pure
-                        // read variant). BC_GETARRAYITEM_GC_I is emitted only for
-                        // the green-pc dispatch's `program` fetch (the sole caller,
-                        // `add_gc_byte_array_descr`; comment above), whose array is
-                        // a green ref and index a green int, so folding here
-                        // collapses the per-pc opcode-dispatch guard ladder instead
-                        // of leaving a residual load. Done at record time, the read
-                        // hits the live array directly, so the optimizer's
-                        // `protect_speculative_array` typeid check (which a raw
-                        // `&[u8]` data pointer, having no GC type header, would fail)
-                        // never applies.
-                        (ctx.const_int(concrete), concrete)
-                    } else if let Some(cached) = cached {
-                        // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
-                        // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
-                        ctx.profiler().count_ops(
-                            OpCode::GetarrayitemGcI,
-                            crate::pyjitpl::counters::HEAPCACHED_OPS,
-                        );
-                        // pyjitpl.py:644-668 sanity check: compare the
-                        // freshly executed load (`resvalue`) against the
-                        // cached box's `tobox.getint()`.  On mismatch
-                        // `_record_helper` records a fallback op whose
-                        // return value is discarded; `assert 0` fires in
-                        // debug mode; the function still returns the
-                        // (stale) cached box.  `_record_helper` routes
-                        // through `heapcache.invalidate_caches`, but that
-                        // call short-circuits on GETARRAYITEM_GC_I
-                        // (`mark_escaped` does not escape the read,
-                        // `clear_caches_not_necessary` returns True), so
-                        // the heapcache state is intentionally left
-                        // untouched.  The cached Box's intrinsic value is
-                        // the upstream `tobox.getint()` payload — fetched
-                        // through `box_value(cached)` which composes the
-                        // const pool, standard-virtualizable shadow, and
-                        // the frontend object's `value` field (RPython
-                        // `currfieldbox.getint()` dispatch parity).
-                        // `None` payload (entry seeded without a live
-                        // concrete) skips the check.
-                        let expected = match ctx.box_value(cached) {
-                            Some(majit_ir::Value::Int(n)) => Some(n),
-                            _ => None,
-                        };
-                        // Cache hit propagates the stale `tobox.getint()`
-                        // into the destination on mismatch — pyjitpl.py:669
-                        // returns `tobox` so the caller sees the cached
-                        // box's int, not `resvalue`.  Match that by
-                        // selecting `expected` (stale) when the assertion
-                        // fires, else the freshly executed int (which
-                        // equals expected in the no-mismatch arm).
-                        let stale = matches!(expected, Some(exp) if exp != concrete);
-                        if stale {
-                            // pyjitpl.py `_record_helper` invalidates
-                            // before recording.  `clear_caches_not_necessary`
-                            // short-circuits for GETARRAYITEM_GC_I (no-side-
-                            // effect read), so the only remaining side effect
-                            // is `mark_escaped` escaping `array_opref` and
-                            // `index_opref` — match that structure here.
-                            ctx.heapcache_invalidate_caches_varargs(
-                                OpCode::GetarrayitemGcI,
-                                None,
-                                &[array_opref, index_opref],
-                            );
-                            let _ = ctx.record_op_with_descr(
-                                OpCode::GetarrayitemGcI,
-                                &[array_opref, index_opref],
-                                descr,
-                            );
-                            debug_assert!(
-                                false,
-                                "BC_GETARRAYITEM_GC_I sanity check failed: \
-                             cached={:?} concrete={}",
-                                expected, concrete,
-                            );
-                        }
-                        let reg_concrete = if stale {
-                            expected.expect("stale only set when expected is Some")
-                        } else {
-                            concrete
-                        };
-                        (cached, reg_concrete)
-                    } else {
-                        let opref = ctx.record_op_with_descr(
-                            OpCode::GetarrayitemGcI,
-                            &[array_opref, index_opref],
-                            descr,
-                        );
-                        // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
-                        // Pair the recorded opref with the live `concrete`
-                        // payload — mirrors RPython's `resbox` Box carrying
-                        // both identity and value from `executor.execute`.
-                        // `Box.value` parity: stamp the result OpRef's
-                        // frontend value slot so `lookup_opref_concrete(opref)`
-                        // returns the runtime concrete (RPython
-                        // `IntFrontendOp(pos, intval)` construction-time
-                        // field assignment).
-                        ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
-                        ctx.heapcache_getarrayitem_now_known(
-                            array_opref,
-                            index_opref,
-                            descr_index,
-                            opref,
-                        );
-                        (opref, concrete)
+                // `execute_varargs(pure=True)` → `record_result_of_call_pure`:
+                // an all-constant read of an array the opcode itself declares
+                // immutable folds to a ConstInt and is not recorded — the same
+                // record-time fold `strgetitem(green_str, green_pc)` gets, and
+                // for the same reason, that the pure spelling is what licenses
+                // it. `is_pure_with_descr` admits `GetarrayitemGcPureI` and no
+                // descr admits the plain read, so the plain read is recorded
+                // even with two constant arguments; whether an array qualifies
+                // is the emitter's call (`OpKind::ArrayRead { pure }`,
+                // `jitcode/assembler.rs`'s `getarrayitem_gc_i_pure`), not this
+                // site's. Done at record time the read hits the live array
+                // directly, so the optimizer's `protect_speculative_array`
+                // typeid check — which a raw `&[u8]` data pointer, having no GC
+                // type header, would fail — never applies.
+                let foldable = opcode == OpCode::GetarrayitemGcPureI
+                    && array_opref.is_constant()
+                    && index_opref.is_constant();
+                let (opref, reg_concrete) = if foldable {
+                    // `execute_and_record` counts the operation *before* it
+                    // decides to fold, so a hand-built constant that skips the
+                    // funnel under-reports OPS on green pure-array reads.
+                    //
+                    // The fold itself stays here rather than routing: the
+                    // funnel would re-read the item through
+                    // `Cpu::bh_getarrayitem_gc_i`, a second reader of an array
+                    // this site has already read directly with the descr's own
+                    // geometry — and of a raw data pointer carrying no GC type
+                    // header, which is why the record-time fold is licensed at
+                    // all (see above).
+                    ctx.profiler().count_ops(opcode, crate::counters::OPS);
+                    (ctx.const_int(concrete), concrete)
+                } else if let Some(cached) = cached {
+                    // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
+                    // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
+                    ctx.profiler()
+                        .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                    // pyjitpl.py:644-668 sanity check: compare the
+                    // freshly executed load (`resvalue`) against the
+                    // cached box's `tobox.getint()`.  On mismatch
+                    // `_record_helper` records a fallback op whose
+                    // return value is discarded; `assert 0` fires in
+                    // debug mode; the function still returns the
+                    // (stale) cached box.  `_record_helper` routes
+                    // through `heapcache.invalidate_caches`, but that
+                    // call short-circuits on GETARRAYITEM_GC_I
+                    // (`mark_escaped` does not escape the read,
+                    // `clear_caches_not_necessary` returns True), so
+                    // the heapcache state is intentionally left
+                    // untouched.  The cached Box's intrinsic value is
+                    // the upstream `tobox.getint()` payload — fetched
+                    // through `box_value(cached)` which composes the
+                    // const pool, standard-virtualizable shadow, and
+                    // the frontend object's `value` field (RPython
+                    // `currfieldbox.getint()` dispatch parity).
+                    // `None` payload (entry seeded without a live
+                    // concrete) skips the check.
+                    let expected = match ctx.box_value(cached) {
+                        Some(majit_ir::Value::Int(n)) => Some(n),
+                        _ => None,
                     };
+                    // Cache hit propagates the stale `tobox.getint()`
+                    // into the destination on mismatch — pyjitpl.py:669
+                    // returns `tobox` so the caller sees the cached
+                    // box's int, not `resvalue`.  Match that by
+                    // selecting `expected` (stale) when the assertion
+                    // fires, else the freshly executed int (which
+                    // equals expected in the no-mismatch arm).
+                    let stale = matches!(expected, Some(exp) if exp != concrete);
+                    if stale {
+                        // pyjitpl.py `_record_helper` invalidates
+                        // before recording.  `clear_caches_not_necessary`
+                        // short-circuits for GETARRAYITEM_GC_I (no-side-
+                        // effect read), so the only remaining side effect
+                        // is `mark_escaped` escaping `array_opref` and
+                        // `index_opref` — match that structure here.
+                        ctx.heapcache_invalidate_caches_varargs(
+                            opcode,
+                            None,
+                            &[array_opref, index_opref],
+                        );
+                        let _ =
+                            ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                        debug_assert!(
+                            false,
+                            "{:?} sanity check failed: \
+                             cached={:?} concrete={}",
+                            opcode, expected, concrete,
+                        );
+                    }
+                    let reg_concrete = if stale {
+                        expected.expect("stale only set when expected is Some")
+                    } else {
+                        concrete
+                    };
+                    (cached, reg_concrete)
+                } else {
+                    let opref =
+                        ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
+                    // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
+                    // Pair the recorded opref with the live `concrete`
+                    // payload — mirrors RPython's `resbox` Box carrying
+                    // both identity and value from `executor.execute`.
+                    // `Box.value` parity: stamp the result OpRef's
+                    // frontend value slot so `lookup_opref_concrete(opref)`
+                    // returns the runtime concrete (RPython
+                    // `IntFrontendOp(pos, intval)` construction-time
+                    // field assignment).
+                    ctx.set_opref_concrete(opref, majit_ir::Value::Int(concrete));
+                    ctx.heapcache_getarrayitem_now_known(
+                        array_opref,
+                        index_opref,
+                        descr_index,
+                        opref,
+                    );
+                    (opref, concrete)
+                };
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
             }
             // ── BC_GETARRAYITEM_GC_R ──
@@ -4626,7 +4856,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_int_checked(
@@ -4678,7 +4908,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_ref_checked(
@@ -4730,7 +4960,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_float_checked(
@@ -4782,7 +5012,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
@@ -4843,7 +5073,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
@@ -4901,7 +5131,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
@@ -4937,6 +5167,7 @@ where
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
                 let guards_before = ctx.num_guards();
                 let result = ctx.vable_arraylen_vable(
+                    self.cpu.as_ref(),
                     opcode_pc,
                     vable_opref,
                     vable_struct_ptr,
@@ -5015,7 +5246,7 @@ where
             }
             jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
             jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
-            jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+            jitcode::insns::BC_GOTO_IF_NOT => {
                 // Canonical `iL` encoding (`assembler.py:165-174`):
                 // [cond:u8][target:u16].
                 let (opcode_pc, cond_idx, target) = {
@@ -5036,16 +5267,39 @@ where
                     )
                 };
                 let (cond, cond_value) = self.read_int_reg(cond_idx);
-                let branch_taken = cond_value == 0;
-                let opcode = if branch_taken {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
+                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
+            }
+            // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
+            //   condbox = self.execute(rop.INT_IS_TRUE, box)
+            //   self.opimpl_goto_if_not(condbox, target, ..., replace=False)
+            //
+            // `jtransform.py optimize_goto_if_not` admits `int_is_true` into
+            // the folded-exitswitch set and `flatten.py` then emits
+            // `goto_if_not_int_is_true`, so this is a distinct opname with its
+            // own byte — only `blackhole.py:913` aliases the two, and only on
+            // the blackhole side, where there is no operation to re-record.
+            jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
+                // Canonical `iL` encoding: [src:u8][target:u16].
+                let (opcode_pc, src_idx, target) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    (
+                        opcode_pc,
+                        frame.next_reg() as usize,
+                        frame.next_u16() as usize,
+                    )
                 };
-                self.record_state_guard(ctx, sym, opcode, &[cond], opcode_pc, false);
-                if branch_taken {
-                    self.frames.current_mut().code_cursor = target;
-                }
+                let (src, src_value) = self.read_int_reg(src_idx);
+                let cond_value = (src_value != 0) as i64;
+                let cond = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::IntIsTrue,
+                    None,
+                    &[src],
+                    Some(majit_ir::Value::Int(cond_value)),
+                    self.last_exception_value,
+                );
+                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
             //   condbox = execute(rop.INT_IS_ZERO, box)
@@ -5065,8 +5319,14 @@ where
                 };
                 let (src, src_value) = self.read_int_reg(src_idx);
                 let cond_value = if src_value == 0 { 1 } else { 0 };
-                let cond = ctx.record_op(OpCode::IntIsZero, &[src]);
-                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
+                let cond = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::IntIsZero,
+                    None,
+                    &[src],
+                    Some(majit_ir::Value::Int(cond_value)),
+                    self.last_exception_value,
+                );
                 let guard = if cond_value == 0 {
                     OpCode::GuardFalse
                 } else {
@@ -5218,8 +5478,26 @@ where
                 } else {
                     for &key in descr.switch_const_keys_in_order() {
                         let key_ref = ctx.const_int(key);
-                        let cond = ctx.record_op(OpCode::IntEq, &[value_box, key_ref]);
-                        ctx.set_opref_concrete(cond, majit_ir::Value::Int(0));
+                        // `SwitchDictDescr.attach` builds `const_keys_in_order`
+                        // as `sorted(dict.keys())`, so a `switch_lookup` miss
+                        // means no key equals the switched value. Evaluate the
+                        // comparison rather than assume that: the funnel folds
+                        // this value into the trace when `value_box` is
+                        // constant, and a constant that disagrees with the
+                        // guard beside it is a miscompile with no diagnostic.
+                        let cond_value = (concrete_value == key) as i64;
+                        debug_assert_eq!(
+                            cond_value, 0,
+                            "BC_SWITCH miss chain: key {key} equals the switched value",
+                        );
+                        let cond = ctx.execute_and_record(
+                            Some(self.cpu.as_ref()),
+                            OpCode::IntEq,
+                            None,
+                            &[value_box, key_ref],
+                            Some(majit_ir::Value::Int(cond_value)),
+                            self.last_exception_value,
+                        );
                         self.record_state_guard(
                             ctx,
                             sym,
@@ -5244,25 +5522,16 @@ where
                     )
                 };
                 let (src, src_value) = self.read_ref_reg(src_idx);
-                let null = ctx.const_null();
-                let (opcode, cond_value) = match bytecode {
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO => {
-                        (OpCode::PtrEq, (src_value == 0) as i64)
-                    }
-                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => {
-                        (OpCode::PtrNe, (src_value != 0) as i64)
-                    }
+                let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
+                // pyjitpl.py:
+                //   opimpl_goto_if_not_ptr_nonzero: if not nonnull: self.pc = target
+                //   opimpl_goto_if_not_ptr_iszero:  if     nonnull: self.pc = target
+                let branch_taken = match bytecode {
+                    jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO => nonnull,
+                    jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO => !nonnull,
                     _ => unreachable!(),
                 };
-                let cond = ctx.record_op(opcode, &[src, null]);
-                ctx.set_opref_concrete(cond, majit_ir::Value::Int(cond_value));
-                let guard = if cond_value == 0 {
-                    OpCode::GuardFalse
-                } else {
-                    OpCode::GuardTrue
-                };
-                self.record_state_guard(ctx, sym, guard, &[cond], opcode_pc, false);
-                if cond_value == 0 {
+                if branch_taken {
                     self.frames.current_mut().code_cursor = target;
                 }
             }
@@ -8444,7 +8713,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_int_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Int);
+                }
             }
             // pyjitpl.py opimpl_assert_not_none.  Blackhole:
             // asserts the concrete ref is non-null and advances past
@@ -8489,7 +8761,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_ref_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Ref);
+                }
             }
             // pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
             jitcode::insns::BC_FLOAT_GUARD_VALUE => {
@@ -8508,7 +8783,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_float_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Float);
+                }
             }
             jitcode::insns::BC_RAISE => {
                 // pyjitpl.py opimpl_raise:
@@ -9093,18 +9371,18 @@ where
             return (ctx.const_int(fast), fast);
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
-        // pyjitpl.py `_record_helper_pure`: a pure op whose args are all
-        // constants folds to its constant result at trace time and records
-        // nothing.  Every opcode routed here is a pure int/uint arithmetic or
-        // comparison, so an all-constant pair yields a constant destination.
-        if lhs.is_constant() && rhs.is_constant() {
-            return (ctx.const_int(value), value);
-        }
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        // `Box(value)` parity: stamp the result OpRef with its
-        // runtime concrete so downstream `box_value(opref)` consumers
-        // see the value (matches PyPy `BoxInt(value)` carrier).
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        // The returned `value` stays `eval_binop_i`'s, not the funnel's: on
+        // the fold path the two agree, and where the constant evaluator
+        // declines — an out-of-range shift, a zero divisor — the funnel
+        // records instead of folding and stamps the op with exactly this value.
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         (opref, value)
     }
 
@@ -9164,27 +9442,43 @@ where
             OpCode::IntMulOvf => lhs_value.overflowing_mul(rhs_value),
             _ => unreachable!("trace_int_binop_jump_if_ovf: {opcode:?}"),
         };
-        // All-constant operands fold at trace time (pyjitpl `_record_helper_pure`):
-        // no resop, no guard.  A constant pair that overflows unconditionally
-        // takes the overflow branch.
-        if lhs.is_constant() && rhs.is_constant() {
-            if overflowed {
-                self.frames.current_mut().code_cursor = target;
-            } else {
-                self.set_int_reg(dst, Some(ctx.const_int(wrapped)), Some(wrapped));
-            }
+        // `elif self.metainterp.ovf_flag: self.pc = lbl; return None # but
+        // don't emit GUARD_OVERFLOW`. Upstream folds the constant pair either
+        // way — `do_int_add_ovf` answers 0 and raises the flag when the
+        // arithmetic leaves range — and takes the branch with neither the
+        // operation nor its guard recorded. `execute_binary_int_const` spells
+        // these with `checked_*` and declines instead, because the optimizer
+        // shares it and there the operation and its guard are what carry the
+        // overflow, so the overflowing-constant case is decided here. The
+        // funnel's own fold gate is the condition mirrored.
+        if overflowed && lhs.is_constant() && rhs.is_constant() && self.last_exception_value == 0 {
+            // `execute_and_record` counts the operation before it decides to
+            // fold, and this returns in its place.
+            ctx.profiler().count_ops(opcode, crate::counters::OPS);
+            self.frames.current_mut().code_cursor = target;
             return;
         }
         // `int_*_ovf` produces the wrapping result and sets the overflow flag;
-        // the following box-less guard checks that flag.
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(wrapped));
-        let guard = if overflowed {
-            OpCode::GuardOverflow
-        } else {
-            OpCode::GuardNoOverflow
-        };
-        self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+        // the box-less guard below checks that flag.  An all-constant pair in
+        // range folds and needs neither.
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(wrapped)),
+            self.last_exception_value,
+        );
+        if !opref.is_constant() {
+            let guard = if overflowed {
+                OpCode::GuardOverflow
+            } else {
+                OpCode::GuardNoOverflow
+            };
+            // The guard is box-less, so `record_state_guard`'s Const gate —
+            // which reads `args[0]` — cannot see that the operation folded.
+            self.record_state_guard(ctx, sym, guard, &[], opcode_pc, false);
+        }
         if overflowed {
             // Overflow branch taken: the result register is not written; follow
             // the label (matches `bhimpl_int_*_jump_if_ovf` returning `None`).
@@ -9207,13 +9501,14 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let value = eval_unary_i(opcode, src_value);
-        // `_record_helper_pure`: a constant source folds to a constant result.
-        if src.is_constant() {
-            self.set_int_reg(dst, Some(ctx.const_int(value)), Some(value));
-            return;
-        }
-        let opref = ctx.record_op(opcode, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9241,8 +9536,14 @@ where
             OpCode::PtrNe | OpCode::InstancePtrNe => (lhs_value != rhs_value) as i64,
             other => panic!("trace_binop_r_to_i: unsupported opcode {other:?}"),
         };
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9268,8 +9569,14 @@ where
         } else {
             (src_value == 0) as i64
         };
-        let opref = ctx.record_op(opcode, &[src, null]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[src, null],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9287,8 +9594,14 @@ where
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_binop_f(opcode, lhs_value, rhs_value);
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(value));
     }
 
@@ -9306,8 +9619,14 @@ where
         let (lhs, lhs_value) = self.read_float_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_float_reg(rhs_idx);
         let value = eval_float_cmp(opcode, lhs_value, rhs_value);
-        let opref = ctx.record_op(opcode, &[lhs, rhs]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(value));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[lhs, rhs],
+            Some(majit_ir::Value::Int(value)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -9322,8 +9641,14 @@ where
         };
         let (src, src_value) = self.read_float_reg(src_idx);
         let value = eval_unary_f(opcode, src_value);
-        let opref = ctx.record_op(opcode, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(value as u64)));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            opcode,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(f64::from_bits(value as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(value));
     }
 
@@ -9339,8 +9664,14 @@ where
         };
         let (src, src_value) = self.read_int_reg(src_idx);
         let fvalue = src_value as f64;
-        let opref = ctx.record_op(OpCode::CastIntToFloat, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(fvalue));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastIntToFloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(fvalue)),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
     }
 
@@ -9361,8 +9692,14 @@ where
         };
         let (src, bits) = self.read_float_reg(src_idx);
         let ivalue = f64::from_bits(bits as u64) as i64;
-        let opref = ctx.record_op(OpCode::CastFloatToInt, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(ivalue));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastFloatToInt,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(ivalue)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(ivalue));
     }
 
@@ -9377,8 +9714,14 @@ where
             (src_idx, dst)
         };
         let (src, bits) = self.read_float_reg(src_idx);
-        let opref = ctx.record_op(OpCode::ConvertFloatBytesToLonglong, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Int(bits));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::ConvertFloatBytesToLonglong,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(bits)),
+            self.last_exception_value,
+        );
         self.set_int_reg(dst, Some(opref), Some(bits));
     }
 
@@ -9392,8 +9735,14 @@ where
             (src_idx, dst)
         };
         let (src, bits) = self.read_int_reg(src_idx);
-        let opref = ctx.record_op(OpCode::ConvertLonglongBytesToFloat, &[src]);
-        ctx.set_opref_concrete(opref, majit_ir::Value::Float(f64::from_bits(bits as u64)));
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::ConvertLonglongBytesToFloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(f64::from_bits(bits as u64))),
+            self.last_exception_value,
+        );
         self.set_float_reg(dst, Some(opref), Some(bits));
     }
 }
@@ -12870,6 +13219,618 @@ mod tests {
                 .any(|op| op.opcode == OpCode::GuardFalse),
             "non-constant false branch must guard on the comparison",
         );
+    }
+
+    /// Opcodes the tracer recorded for `jitcode`, run from pc 0 with
+    /// `argboxes` bound as the frame's arguments.
+    ///
+    /// The always-pure arms below each need the same two runs — every operand
+    /// a `load_const_*` (the funnel's `_all_constants` holds, so the op folds
+    /// and nothing is recorded) and every operand an input arg (it does not,
+    /// so the op is recorded) — and differ only in the jitcode.
+    fn traced_opcodes(
+        types: &[majit_ir::Type],
+        jitcode: &JitCode,
+        argboxes: &[(JitArgKind, OpRef, i64)],
+    ) -> Vec<OpCode> {
+        let mut ctx = TraceCtx::for_test_types(types);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, jitcode, 0, |_pc| 0, argboxes);
+        assert!(matches!(action, TraceAction::Continue));
+        ctx.into_recorder()
+            .ops()
+            .iter()
+            .map(|op| op.opcode)
+            .collect()
+    }
+
+    /// `_establish_nullity` asks the nullity question of the box itself:
+    /// `GUARD_NONNULL` / `GUARD_ISNULL`, never a comparison against null under
+    /// a `GUARD_TRUE`. Both bytecodes share it and differ only in which answer
+    /// takes the branch.
+    #[test]
+    fn a_ptr_nullity_branch_guards_the_box_itself() {
+        // (bytecode-emitting closure, traced pointer, expected guard)
+        let cases: [(fn(&mut JitCodeBuilder, u16), i64, OpCode); 4] = [
+            (
+                |b, t| b.goto_if_not_ptr_nonzero(0, t),
+                0x40,
+                OpCode::GuardNonnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_nonzero(0, t),
+                0,
+                OpCode::GuardIsnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_iszero(0, t),
+                0x40,
+                OpCode::GuardNonnull,
+            ),
+            (
+                |b, t| b.goto_if_not_ptr_iszero(0, t),
+                0,
+                OpCode::GuardIsnull,
+            ),
+        ];
+        for (emit, ptr, want) in cases {
+            let mut builder = JitCodeBuilder::new();
+            let target = builder.new_label();
+            emit(&mut builder, target);
+            builder.mark_label(target);
+            let recorded = traced_opcodes(
+                &[majit_ir::Type::Ref],
+                &builder.finish(),
+                &[(JitArgKind::Ref, OpRef::input_arg_ref(0), ptr)],
+            );
+            assert_eq!(recorded, vec![want], "ptr={ptr:#x}");
+        }
+    }
+
+    /// `heapcache.nullity_now_known(box)` closes the question, so a second
+    /// nullity branch on the same box takes the `is_nullity_known`
+    /// short-circuit and guards nothing.
+    #[test]
+    fn a_second_nullity_branch_on_one_box_is_answered_by_the_heapcache() {
+        let mut builder = JitCodeBuilder::new();
+        let first = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(0, first);
+        builder.mark_label(first);
+        let second = builder.new_label();
+        builder.goto_if_not_ptr_nonzero(0, second);
+        builder.mark_label(second);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x40)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardNonnull], "{recorded:?}");
+    }
+
+    /// The null arm's `replace_box(box, constant_from_op(box))`: the source
+    /// register comes out of the branch holding `CONST_NULL`, so a following
+    /// nullity read of it folds instead of recording a `PTR_NE`.
+    ///
+    /// The probe is `ptr_nonzero` rather than a `PTR_EQ` against the register
+    /// itself, because `trace_binop_r_to_i` short-circuits identical operands
+    /// through `FASTPATHS_SAME_BOXES` and would answer the same either way.
+    #[test]
+    fn a_null_ptr_nullity_branch_rebinds_its_source_register() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_ptr_iszero(0, target);
+        builder.ptr_nonzero(1, 0);
+        builder.mark_label(target);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
+    }
+
+    /// `opimpl_int_*_jump_if_ovf`'s `elif self.metainterp.ovf_flag` arm: a
+    /// constant pair whose arithmetic leaves range takes the branch with
+    /// nothing recorded — neither the operation nor the guard that would
+    /// stand for an overflow both operands already decide.
+    #[test]
+    fn a_constant_pair_that_overflows_takes_the_branch_without_recording() {
+        let mut builder = JitCodeBuilder::new();
+        let overflow = builder.new_label();
+        builder.int_add_jump_if_ovf(2, 0, 1, overflow);
+        builder.mark_label(overflow);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            &builder.finish(),
+            &[
+                (JitArgKind::Int, OpRef::const_int(i64::MAX), i64::MAX),
+                (JitArgKind::Int, OpRef::const_int(1), 1),
+            ],
+        );
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+
+    /// `replace_box` rewrites every frame's active boxes, not just the
+    /// register the branch was handed. An alias of the same box in another
+    /// register comes out of the null arm naming `CONST_NULL` too, so a read
+    /// through the alias folds.
+    #[test]
+    fn a_null_ptr_nullity_branch_replaces_the_box_in_an_aliasing_register() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_ptr_iszero(0, target);
+        // Read the ALIAS, not the register the branch resolved.
+        builder.ptr_nonzero(0, 1);
+        builder.mark_label(target);
+        let aliased = OpRef::input_arg_ref(0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
+    }
+
+    /// `implement_guard_value` ends in `replace_box`, so the constant the
+    /// guard proved reaches every register naming the box — a promote inside
+    /// an inlined helper leaves the caller's copy folded too, rather than
+    /// recording arithmetic against a box already pinned to a value.
+    #[test]
+    fn a_guard_value_promote_replaces_the_box_in_an_aliasing_register() {
+        let mut builder = JitCodeBuilder::new();
+        builder.int_guard_value(0);
+        // Read the ALIAS, not the register the guard named.
+        builder.record_binop_i(2, OpCode::IntAdd, 1, 1);
+        let aliased = OpRef::input_arg_int(0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, aliased, 3), (JitArgKind::Int, aliased, 3)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardValue], "{recorded:?}");
+    }
+
+    /// `opimpl_goto_if_not`'s tail — `if replace: replace_box(box,
+    /// promoted_box)` — rebinds the condition register to the constant the
+    /// guard just proved, so a second read of it folds instead of re-guarding.
+    #[test]
+    fn goto_if_not_rebinds_its_condition_register_to_the_proved_constant() {
+        // `cond` is an input arg, so the guard cannot be elided; reading it
+        // again after the branch is what shows the rebind.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_true(0, target);
+        builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
+        builder.mark_label(target);
+        let jitcode = builder.finish();
+
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &jitcode,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 1)],
+        );
+        assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
+        assert!(
+            !recorded.contains(&OpCode::IntAdd),
+            "the rebound CONST_1 must let the following IntAdd fold: {recorded:?}",
+        );
+    }
+
+    /// `MIFrame.opimpl_goto_if_not_int_is_true` re-executes the `INT_IS_TRUE`
+    /// that `jtransform.py optimize_goto_if_not` folded into the exitswitch,
+    /// then branches with `replace=False`. No majit front end emits this byte
+    /// today — every condition it lowers is already a Rust `bool` — so the
+    /// jitcode is patched to it directly.
+    #[test]
+    fn goto_if_not_int_is_true_records_the_folded_int_is_true() {
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_true(0, target);
+        builder.record_binop_i(1, OpCode::IntAdd, 0, 0);
+        builder.mark_label(target);
+        let mut jitcode = builder.finish();
+        let code = &mut jitcode.core_mut().body_mut().code;
+        let at = code
+            .iter()
+            .position(|&b| b == jitcode::insns::BC_GOTO_IF_NOT)
+            .expect("the builder writes the canonical goto_if_not byte");
+        code[at] = jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE;
+
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &jitcode,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+        );
+        assert!(recorded.contains(&OpCode::IntIsTrue), "{recorded:?}");
+        assert!(recorded.contains(&OpCode::GuardTrue), "{recorded:?}");
+        assert!(
+            recorded.contains(&OpCode::IntAdd),
+            "replace=False leaves the source register alone: {recorded:?}",
+        );
+    }
+
+    /// `BC_RAW_LOAD_I` / `_F` advanced their register bank with the traced
+    /// concrete but left the recorded op unstamped — the one read family that
+    /// did. `RawLoad*` is outside `is_pure_with_descr` at every descr, so the
+    /// op is still recorded; only the stamp and the counters are new.
+    #[test]
+    fn a_raw_load_records_and_stamps_its_concrete() {
+        let ipayload: i64 = 0x0123_4567_89ab_cdef;
+        let fpayload: f64 = 1.5;
+
+        for (want_op, want_value, base, jitcode) in [
+            (
+                OpCode::RawLoadI,
+                Value::Int(ipayload),
+                &ipayload as *const i64 as i64,
+                {
+                    let mut b = JitCodeBuilder::new();
+                    let descr = b.add_raw_int_array_descr(8);
+                    b.raw_load_i(2, 0, 1, descr);
+                    b.finish()
+                },
+            ),
+            (
+                OpCode::RawLoadF,
+                Value::Float(fpayload),
+                &fpayload as *const f64 as i64,
+                {
+                    let mut b = JitCodeBuilder::new();
+                    let descr = b.add_raw_float_array_descr();
+                    b.raw_load_f(0, 0, 1, descr);
+                    b.finish()
+                },
+            ),
+        ] {
+            let mut ctx = TraceCtx::for_test_types(&[majit_ir::Type::Int, majit_ir::Type::Int]);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[
+                    (JitArgKind::Int, OpRef::input_arg_int(0), base),
+                    (JitArgKind::Int, OpRef::input_arg_int(1), 0),
+                ],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+
+            let recorder = ctx.into_recorder();
+            let op = recorder
+                .ops()
+                .iter()
+                .find(|op| op.opcode == want_op)
+                .unwrap_or_else(|| panic!("{want_op:?} must be recorded, never folded"));
+            assert_eq!(op.get_value(), Some(want_value), "{want_op:?}");
+        }
+    }
+
+    #[test]
+    fn ptr_compare_folds_two_constant_refs() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0x30);
+        builder.load_const_r_value(1, 0x40);
+        builder.record_binop_r(2, OpCode::PtrEq, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::PtrEq));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_binop_r(2, OpCode::PtrEq, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            &builder.finish(),
+            &[
+                (JitArgKind::Ref, OpRef::input_arg_ref(0), 0x30),
+                (JitArgKind::Ref, OpRef::input_arg_ref(1), 0x40),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::PtrEq));
+    }
+
+    #[test]
+    fn ptr_nullity_folds_a_constant_ref() {
+        // The `CONST_NULL` operand is constant by construction, so the fold
+        // turns on the source alone.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0x30);
+        builder.ptr_nonzero(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::PtrNe));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.ptr_nonzero(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0x30)],
+        );
+        assert!(recorded.contains(&OpCode::PtrNe));
+    }
+
+    #[test]
+    fn float_binop_folds_two_constant_floats() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.load_const_f_value(1, 2.5f64.to_bits() as i64);
+        builder.record_binop_f(2, OpCode::FloatAdd, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatAdd));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_binop_f(2, OpCode::FloatAdd, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float, majit_ir::Type::Float],
+            &builder.finish(),
+            &[
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(0),
+                    1.5f64.to_bits() as i64,
+                ),
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(1),
+                    2.5f64.to_bits() as i64,
+                ),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::FloatAdd));
+    }
+
+    #[test]
+    fn float_truediv_by_zero_records_instead_of_folding() {
+        // `execute_binary_float_const_row` declines this operand pair, and a
+        // decline records — the tracer and the optimizer then agree about
+        // what is constant.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.0f64.to_bits() as i64);
+        builder.load_const_f_value(1, 0.0f64.to_bits() as i64);
+        builder.record_binop_f(2, OpCode::FloatTrueDiv, 0, 1);
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::FloatTrueDiv));
+    }
+
+    #[test]
+    fn float_compare_folds_two_constant_floats() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.load_const_f_value(1, 2.5f64.to_bits() as i64);
+        builder.record_compare_f(2, OpCode::FloatLt, 0, 1);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatLt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_compare_f(2, OpCode::FloatLt, 0, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float, majit_ir::Type::Float],
+            &builder.finish(),
+            &[
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(0),
+                    1.5f64.to_bits() as i64,
+                ),
+                (
+                    JitArgKind::Float,
+                    OpRef::input_arg_float(1),
+                    2.5f64.to_bits() as i64,
+                ),
+            ],
+        );
+        assert!(recorded.contains(&OpCode::FloatLt));
+    }
+
+    #[test]
+    fn float_unary_folds_a_constant_float() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, (-1.5f64).to_bits() as i64);
+        builder.record_unary_f(1, OpCode::FloatAbs, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::FloatAbs));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_unary_f(1, OpCode::FloatAbs, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                (-1.5f64).to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::FloatAbs));
+    }
+
+    #[test]
+    fn cast_int_to_float_folds_a_constant_int() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 7);
+        builder.record_cast_int_to_float(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastIntToFloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_int_to_float(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 7)],
+        );
+        assert!(recorded.contains(&OpCode::CastIntToFloat));
+    }
+
+    #[test]
+    fn cast_float_to_int_folds_in_range_and_records_out_of_range() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 7.5f64.to_bits() as i64);
+        builder.record_cast_float_to_int(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastFloatToInt));
+
+        // `execute_cast_const_row` declines a non-finite source rather than
+        // freeze the runtime's saturation as a constant.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, f64::INFINITY.to_bits() as i64);
+        builder.record_cast_float_to_int(1, 0);
+        let declined = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(declined.contains(&OpCode::CastFloatToInt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_float_to_int(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                7.5f64.to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::CastFloatToInt));
+    }
+
+    #[test]
+    fn float_bits_conversions_fold_a_constant_operand() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.record_convert_float_bytes_to_longlong(1, 0);
+        builder.load_const_i_value(2, 1.5f64.to_bits() as i64);
+        builder.record_convert_longlong_bytes_to_float(3, 2);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::ConvertFloatBytesToLonglong));
+        assert!(!folded.contains(&OpCode::ConvertLonglongBytesToFloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_convert_float_bytes_to_longlong(1, 0);
+        builder.record_convert_longlong_bytes_to_float(2, 1);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                1.5f64.to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::ConvertFloatBytesToLonglong));
+        assert!(recorded.contains(&OpCode::ConvertLonglongBytesToFloat));
+    }
+
+    #[test]
+    fn goto_if_not_int_is_zero_folds_a_constant_source() {
+        // The fused compare folds and `record_state_guard`'s Const gate then
+        // drops the guard too, so both ops disappear.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 5);
+        builder.goto_if_not_int_is_zero(0, target);
+        builder.mark_label(target);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::IntIsZero));
+        assert!(!folded.contains(&OpCode::GuardFalse));
+
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.goto_if_not_int_is_zero(0, target);
+        builder.mark_label(target);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 5)],
+        );
+        assert!(recorded.contains(&OpCode::IntIsZero));
+        assert!(recorded.contains(&OpCode::GuardFalse));
+    }
+
+    #[test]
+    fn switch_miss_chain_folds_a_constant_switched_value() {
+        // One IntEq + one GuardFalse per key on the miss path; a constant
+        // switched value collapses the whole chain to nothing.
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        builder.load_const_i_value(0, 99);
+        builder.switch(0, &[(-3, case_a), (7, case_b)]);
+        builder.mark_label(case_a);
+        builder.mark_label(case_b);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::IntEq));
+        assert!(!folded.contains(&OpCode::GuardFalse));
+
+        let mut builder = JitCodeBuilder::new();
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        builder.switch(0, &[(-3, case_a), (7, case_b)]);
+        builder.mark_label(case_a);
+        builder.mark_label(case_b);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 99)],
+        );
+        assert_eq!(
+            recorded.iter().filter(|&&o| o == OpCode::IntEq).count(),
+            2,
+            "one comparison per switch key",
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|&&o| o == OpCode::GuardFalse)
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn pure_getfield_folds_off_a_constant_struct() {
+        // One-word header + an i64 payload at offset 8, the layout
+        // `getfield_gc_fold_accepts_plain_spelling` (`executor.rs`) uses.
+        let storage: Box<[i64; 2]> = Box::new([0, 42]);
+        let base = storage.as_ref().as_ptr() as i64;
+
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, base);
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::GetfieldGcI));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), base)],
+        );
+        assert!(recorded.contains(&OpCode::GetfieldGcI));
+    }
+
+    #[test]
+    fn a_pure_getfield_off_a_null_struct_records() {
+        // `loaded` is a fabricated 0 on this leg, and the executor row would
+        // dereference the null; the arm hands the funnel no concrete so it
+        // records.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0);
+        builder.getfield_gc_i_pure(1, 0, 8);
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::GetfieldGcI));
+    }
+
+    #[test]
+    fn a_mutable_getfield_records_off_a_constant_struct() {
+        // `getfield_gc_i` builds a mutable descr, so `is_pure_with_descr`
+        // answers false and the read records however constant the struct is.
+        let storage: Box<[i64; 2]> = Box::new([0, 42]);
+        let base = storage.as_ref().as_ptr() as i64;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, base);
+        builder.getfield_gc_i(1, 0, 8, 0, "payload");
+        let ops = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(ops.contains(&OpCode::GetfieldGcI));
     }
 
     fn switch_return_jitcode() -> JitCode {

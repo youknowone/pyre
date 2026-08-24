@@ -2036,7 +2036,7 @@ pub(crate) fn select_residual_call_opcode(
     }
 }
 
-/// `pyjitpl.py _record_helper_pure` parity for the
+/// `MIFrame.execute_varargs(pure=True)` parity for the
 /// walker layer: when a residual_call routes to `CallPure*` (elidable +
 /// cannot-raise EI per [`select_residual_call_opcode`]) AND every
 /// argument in `allboxes` has a known concrete value
@@ -2054,7 +2054,7 @@ pub(crate) fn select_residual_call_opcode(
 /// with raised exceptions surfaced through `BH_LAST_EXC_VALUE` so
 /// `eval_loop_jit` can route them into the bytecode exception handler.
 ///
-/// RPython upstream `_record_helper_pure` invokes
+/// RPython upstream `MIFrame.execute_varargs` invokes
 /// `executor.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
 /// which dispatches to `cpu.bh_call_*` and stores the result on
 /// `result_box.value` (`pyjitpl.py`).  Pyre's walker observes the
@@ -2091,7 +2091,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     ) {
         return;
     }
-    // pyjitpl.py — `_record_helper_pure` only fires for
+    // `MIFrame.execute_varargs(pure=True)` only fires for
     // `EF_ELIDABLE_CANNOT_RAISE`. `select_residual_call_opcode` returns
     // `CallPure*` whenever `check_is_elidable()` is true (including
     // `EF_ELIDABLE_CAN_RAISE`), so re-check the can-raise predicate here
@@ -2110,7 +2110,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
     // [`build_allboxes`] preserves the same layout.
     //
-    // pyjitpl.py invariant: `_record_helper_pure` requires
+    // `MIFrame.execute_varargs(pure=True)` invariant: it requires
     // `funcbox` to be a Const so its `getint()` is the actual fn
     // pointer.  Non-constant funcboxes carry a stale-stamped Int
     // (from `cast_ptr_to_int` of a Ref-bank receiver, etc.) and
@@ -2189,7 +2189,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(result_i64 as u64)),
         // void callees discard the result upstream too (`bh_call_v` has
         // no return value); `CallPureN` is included in the matched set
-        // only to mirror PyPy's `_record_helper_pure` handling of all
+        // only to mirror `MIFrame.execute_varargs(pure=True)`'s handling of all
         // pure shapes — skip the stamp for void.
         majit_ir::Type::Void => return,
     };
@@ -6458,7 +6458,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity: for
+        // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
         // execute the helper now and stamp `recorded` with the result so
         // downstream walker chain (sub-jitcode bodies that consume the
@@ -7651,7 +7651,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity — see
+        // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
@@ -7890,7 +7890,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
-        // pyjitpl.py `_record_helper_pure` parity — see
+        // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
         // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):

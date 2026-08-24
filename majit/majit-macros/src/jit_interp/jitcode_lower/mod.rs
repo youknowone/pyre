@@ -44,6 +44,7 @@ mod reexports {
         is_supported_float_type, is_supported_int_cast, is_supported_ref_type, is_word_width_int,
         opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop, opcode_for_binop_f,
         opcode_for_compare_f, stmt_has_loop_control, typed_call_arg_tokens,
+        word_result_addr_for_kind, word_result_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -58,7 +59,7 @@ use reexports::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 
 use super::call_policy_byte::{
     INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
@@ -3197,5 +3198,77 @@ mod tests {
             dispatch::InlineArmOutcome::Rejected,
         );
         assert!(lowerer.inline_liveness_prebuild.is_empty());
+    }
+
+    /// A registered int-result target is dispatched by
+    /// `bh_call_i_dispatch`, which reads the whole return register; a callee
+    /// whose result is narrower than a word does not define it.  So the
+    /// address that reaches `add_fn_ptr` must be the widening shim's, never
+    /// the callee's own.
+    #[test]
+    fn int_result_call_registers_the_widening_shim() {
+        let call = parse_call("helper(1)");
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualInt);
+        lowerer
+            .lower_call_value(&call)
+            .expect("residual int call should lower");
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("into_call_word"));
+        assert!(!body.contains("add_fn_ptr (helper as * const ())"));
+    }
+
+    /// A ref result is a pointer and a void result is never read, so neither
+    /// has anything to widen and both register the callee's own address.
+    #[test]
+    fn non_int_result_calls_register_the_callee_address() {
+        let call = parse_call("helper(1)");
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualRef);
+        lowerer
+            .lower_call_value(&call)
+            .expect("residual ref call should lower");
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("add_fn_ptr (helper as * const ())"));
+        assert!(!body.contains("into_call_word"));
+
+        let expr: syn::Expr = syn::parse_quote! { helper(1) };
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualVoid);
+        lowerer
+            .lower_config_call_stmt(&expr)
+            .expect("residual void call should lower");
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("add_fn_ptr (helper as * const ())"));
+        assert!(!body.contains("into_call_word"));
+    }
+
+    /// `record_known_result!` registers through `add_fn_ptr_with_slot`, which
+    /// takes the same shim for an int result.
+    #[test]
+    fn record_known_result_int_registers_the_widening_shim() {
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ElidableInt);
+        lowerer
+            .bindings
+            .insert("known".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("record_known_result!(known, helper, arg)").expect("parse macro expr");
+        lowerer
+            .lower_record_known_result(&expr)
+            .expect("record_known_result should lower");
+        let body = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(body.contains("into_call_word"));
+        assert!(!body.contains("add_fn_ptr_with_slot (helper as * const ()"));
     }
 }

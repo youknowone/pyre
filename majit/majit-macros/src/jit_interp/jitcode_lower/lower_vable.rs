@@ -235,8 +235,8 @@ struct ArrayFieldBase {
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
     /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
-    /// (`try_lower_opcode_fetch_stmt`) so the same `getarrayitem_gc_i` is
-    /// emitted for operand reads inside opcode arm bodies.  RPython
+    /// (`try_lower_opcode_fetch_stmt`) so the same `getarrayitem_gc_i_pure`
+    /// is emitted for operand reads inside opcode arm bodies.  RPython
     /// `pyopcode.py:171 ord(co_code[next_instr])`: the bytecode array and
     /// `pc` are green, so the optimizer constant-folds the load.
     ///
@@ -247,7 +247,7 @@ impl<'c> Lowerer<'c> {
         // `pyopcode.py:171 ord(co_code[next_instr])`) only holds when `pc` is
         // a declared green — PyPy `tl.py greens=['pc','code']` makes both the
         // bytecode array and the instruction pointer green, so the load folds
-        // away.  With a red `pc` the `getarrayitem_gc_i` does not fold and the
+        // away.  With a red `pc` the read does not fold and the
         // surrounding state-field dispatch loop cannot close on it; leave the
         // operand read unlowered so the arm aborts and the interpreter handles
         // that opcode (the pre-green-pc behaviour).
@@ -285,7 +285,9 @@ impl<'c> Lowerer<'c> {
             ),
             quote! {
                 let __descr_idx = #descr_tok;
-                __builder.getarrayitem_gc_i(
+                // Same array and same immutability as the dispatch-top fetch,
+                // so the same always-pure spelling.
+                __builder.getarrayitem_gc_i_pure(
                     #result_reg as u16,
                     #program_reg as u16,
                     #index_reg as u16,

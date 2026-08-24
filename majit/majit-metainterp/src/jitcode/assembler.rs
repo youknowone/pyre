@@ -846,6 +846,18 @@ impl JitCodeBuilder {
     /// resolves the `d` argcode to a FieldDescr carrying the byte
     /// offset; the flag/sign follow the field kind.
     fn add_scalar_field_descr(&mut self, offset: usize, field_type: majit_ir::value::Type) -> u16 {
+        self.add_scalar_field_descr_with_immutability(offset, field_type, false)
+    }
+
+    /// [`Self::add_scalar_field_descr`] for a field the codewriter declared in
+    /// `_immutable_fields_`, so `SimpleFieldDescr::is_always_pure` answers
+    /// true and the read is foldable.
+    fn add_scalar_field_descr_with_immutability(
+        &mut self,
+        offset: usize,
+        field_type: majit_ir::value::Type,
+        is_immutable: bool,
+    ) -> u16 {
         let (field_flag, is_field_signed) = match field_type {
             majit_ir::value::Type::Ref => (majit_ir::descr::ArrayFlag::Pointer, false),
             majit_ir::value::Type::Float => (majit_ir::descr::ArrayFlag::Float, false),
@@ -857,7 +869,7 @@ impl JitCodeBuilder {
             field_type,
             field_flag,
             is_field_signed,
-            is_immutable: false,
+            is_immutable,
             is_quasi_immutable: false,
             // Same as the vable synthesizers: no parent, so no slot claim.
             index_in_parent: None,
@@ -1055,6 +1067,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(struct_reg, "getfield_gc_i struct");
         self.push_u16(descr);
         self.push_reg_u8(dest, "getfield_gc_i result");
+    }
+
+    /// Emit `getfield_gc_i_pure/rd>i` (`blackhole.py
+    /// bhimpl_getfield_gc_i_pure`): the same load as
+    /// [`Self::getfield_gc_i`], off a field declared immutable. The bytecode
+    /// pair carries no separate op-kind — the recorded `GetfieldGcI` carries
+    /// the immutable descr, and that descr is what licenses the fold.
+    pub fn getfield_gc_i_pure(&mut self, dest: u16, struct_reg: u16, offset: usize) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_reg(dest);
+        let descr =
+            self.add_scalar_field_descr_with_immutability(offset, majit_ir::value::Type::Int, true);
+        self.write_insn("getfield_gc_i_pure/rd>i");
+        self.push_reg_u8(struct_reg, "getfield_gc_i_pure struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_i_pure result");
     }
 
     /// Emit `getfield_gc_r/rd>r` (`blackhole.py bhimpl_getfield_gc_r`):
@@ -1688,6 +1716,36 @@ impl JitCodeBuilder {
         self.push_reg_u8(index_reg, "getarrayitem_gc_i index");
         self.push_u16(descr_idx);
         self.push_reg_u8(dst, "getarrayitem_gc_i dst");
+    }
+
+    /// The always-pure spelling of [`Self::getarrayitem_gc_i`], for an array
+    /// whose elements never change after it is built.
+    ///
+    /// `blackhole.py` aliases `bhimpl_getarrayitem_gc_i_pure` onto the plain
+    /// impl, so the two run the same handler; what differs is the opcode the
+    /// tracer records. `GetarrayitemGcPureI` is inside the always-pure range
+    /// that `OpHelpers.is_pure_with_descr` admits, which is what licenses the
+    /// record-time constant fold of a read at a green index — the same fold
+    /// `rlist.py ll_getitem_foldable_nonneg` earns by spelling the read this
+    /// way. Emitting the plain opcode and folding it anyway would fold on the
+    /// accident of who the caller happens to be.
+    ///
+    /// Encoding is [`Self::getarrayitem_gc_i`]'s.
+    pub fn getarrayitem_gc_i_pure(
+        &mut self,
+        dst: u16,
+        array_reg: u16,
+        index_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(dst);
+        self.write_insn("getarrayitem_gc_i_pure/rid>i");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_i_pure array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_i_pure index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_i_pure dst");
     }
 
     /// Ref-result array read: `dst = array[index]` where the element is a
@@ -2411,15 +2469,19 @@ impl JitCodeBuilder {
         *slot = Some(self.code.len());
     }
 
-    /// RPython `flatten.py:247` emits the bool exitswitch as opname
-    /// `goto_if_not` (not `goto_if_not_int_is_true`).  The `_int_is_true`
-    /// suffix in upstream is a Python class-attribute alias on
-    /// `BlackholeInterpreter` (`blackhole.py`
-    /// `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) that
-    /// shares the handler function under two attribute names — it is
-    /// NOT a second opname registered in `Assembler.insns`.  The Rust
-    /// method name preserves the longer attribute spelling for
-    /// readability; the bytecode key matches upstream's single opname.
+    /// RPython `flatten.py` emits a plain `Bool` exitswitch as opname
+    /// `goto_if_not`, which is what this writes.
+    ///
+    /// `goto_if_not_int_is_true` is a real second opname upstream —
+    /// `jtransform.py optimize_goto_if_not` admits `int_is_true` into the set
+    /// of operations it folds into the exitswitch tuple, and `flatten.py` then
+    /// spells the opname `'goto_if_not_' + exitswitch[0]`. It reaches
+    /// `MIFrame.opimpl_goto_if_not_int_is_true`, which re-executes the folded
+    /// `INT_IS_TRUE` before branching. Nothing here performs that fold: every
+    /// caller's condition is a Rust `bool`, already the `0|1` the canonical
+    /// opname wants, so there is no `int_is_true` to fold away and no
+    /// operation to re-materialise. The Rust method keeps the longer name for
+    /// readability at the call site.
     pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
         self.write_insn("goto_if_not/iL");

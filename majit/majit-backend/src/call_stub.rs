@@ -1089,6 +1089,12 @@ macro_rules! dispatch_classes_body {
 /// `extern "C" fn(...) -> i64` whose parameter list is the same ordered
 /// Int/Float sequence and whose float slots are carried in `args` as
 /// `f64::to_bits`.
+///
+/// The `-> i64` is a requirement on the target, not a convenience of the
+/// transmute: this reads the whole return register, and a callee whose result
+/// is narrower leaves the bits above it undefined. `#[jit_interp]` meets it by
+/// registering a widening shim in place of such a target — see
+/// `majit_ir::CallResultWord`.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

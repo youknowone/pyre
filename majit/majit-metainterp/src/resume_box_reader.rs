@@ -134,6 +134,23 @@ fn emit_stroruni_oopspec_call(
 /// resume.py decode_box parity for fieldnums (i16 tagged): decode one
 /// tagged array/field value into its bridge `OpRef` (typed InputArg for TAGBOX,
 /// const for TAGINT/TAGCONST, recursively materialized virtual for TAGVIRTUAL).
+/// The concrete `executor.execute(INT_ADD, a, b)` would have produced for the
+/// two `INT_ADD`s a resume decode synthesizes.
+///
+/// Neither has a live execution behind it, so the sum exists exactly when both
+/// operands decoded to constants — which is also the only case
+/// `TraceCtx::execute_and_record` folds in. It is evaluated through the same
+/// executor row the funnel folds with, so the two cannot disagree.
+fn int_add_concrete(a: OpRef, b: OpRef) -> Option<majit_ir::Value> {
+    let (majit_ir::Value::Int(x), majit_ir::Value::Int(y)) =
+        (a.inline_const_to_value()?, b.inline_const_to_value()?)
+    else {
+        return None;
+    };
+    crate::executor::execute_binary_int_const(majit_ir::OpCode::IntAdd, x, y)
+        .map(majit_ir::Value::Int)
+}
+
 pub fn decode_fieldnum(
     ctx: &mut crate::TraceCtx,
     tagged: i16,
@@ -650,19 +667,23 @@ pub fn materialize_bridge_virtual(
             let base_buffer = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
             // resume.py: buffer = decoder.int_add_const(base_buffer, self.offset)
             let offset_ref = ctx.const_int(*offset);
-            ctx.profiler()
-                .count_ops(OpCode::IntAdd, crate::counters::OPS);
-            ctx.profiler()
-                .count_ops(OpCode::IntAdd, crate::counters::RECORDED_OPS);
-            let buffer = ctx.record_op(OpCode::IntAdd, &[base_buffer, offset_ref]);
+            // `INT_ADD` is always-pure, so the funnel neither reads
+            // `last_exc_value` nor consults the cpu — the integer row folds
+            // from the operands alone.
+            let cpu = crate::cpu::default_cpu();
+            let buffer = ctx.execute_and_record(
+                Some(cpu.as_ref()),
+                OpCode::IntAdd,
+                None,
+                &[base_buffer, offset_ref],
+                int_add_concrete(base_buffer, offset_ref),
+                0,
+            );
             // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VRawSliceInfo(offset={}) → OpRef::from_raw({})",
-                    vidx,
-                    offset,
-                    buffer.raw(),
+                    "[jit][bridge-virtual] vidx={vidx} VRawSliceInfo(offset={offset}) → {buffer:?}",
                 );
             }
             buffer
@@ -806,11 +827,17 @@ pub fn materialize_bridge_virtual(
             let start = decode_fieldnum(ctx, fieldnums[1], rd_virtuals, resume_data, cache);
             let length = decode_fieldnum(ctx, fieldnums[2], rd_virtuals, resume_data, cache);
             // resume.py:1157-1158 / :1185-1186: stopbox = INT_ADD(startbox, lengthbox)
-            ctx.profiler()
-                .count_ops(OpCode::IntAdd, crate::counters::OPS);
-            ctx.profiler()
-                .count_ops(OpCode::IntAdd, crate::counters::RECORDED_OPS);
-            let stop = ctx.record_op(OpCode::IntAdd, &[start, length]);
+            // See the `VRawSliceInfo` arm on the cpu and `last_exc_value`
+            // arguments an always-pure opcode does not reach.
+            let cpu = crate::cpu::default_cpu();
+            let stop = ctx.execute_and_record(
+                Some(cpu.as_ref()),
+                OpCode::IntAdd,
+                None,
+                &[start, length],
+                int_add_concrete(start, length),
+                0,
+            );
             let oopspec = if is_unicode {
                 majit_ir::effectinfo::OopSpecIndex::UniSlice
             } else {
@@ -1122,4 +1149,81 @@ pub fn seed_bridge_virtualizable_boxes(
     values.push(identity_value);
     ctx.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::{OpCode, Type};
+
+    fn empty_resume_data(fail_arg_types: Vec<Type>) -> crate::jit_state::ResumeDataResult {
+        let num_failargs = fail_arg_types.len() as i32;
+        crate::jit_state::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs,
+            fail_arg_types,
+        }
+    }
+
+    fn tag_int(value: i32) -> i16 {
+        ((value << 2) | majit_ir::resumedata::TAGINT as i32) as i16
+    }
+
+    fn tag_box(index: i32) -> i16 {
+        ((index << 2) | majit_ir::resumedata::TAGBOX as i32) as i16
+    }
+
+    /// `VRawSliceInfo` is `base_buffer + offset`; the base decodes to a
+    /// constant whenever the guard captured a TAGINT, which is the common case
+    /// for a resume decode.
+    fn materialize_raw_slice(base: i16, fail_arg_types: Vec<Type>) -> (OpRef, Vec<OpCode>) {
+        let mut ctx = crate::TraceCtx::for_test_types(&fail_arg_types);
+        let resume_data = empty_resume_data(fail_arg_types);
+        let mut cache = BridgeVirtualCache::new(1, default_bridge_array_descr);
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawSliceInfo {
+            offset: 7,
+            fieldnums: vec![base],
+        })];
+        let buffer =
+            materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
+        let ops = ctx
+            .into_recorder()
+            .ops()
+            .iter()
+            .map(|op| op.opcode)
+            .collect();
+        (buffer, ops)
+    }
+
+    #[test]
+    fn a_raw_slice_off_a_constant_base_folds_its_int_add() {
+        let (buffer, ops) = materialize_raw_slice(tag_int(5), Vec::new());
+        assert_eq!(buffer, OpRef::const_int(12));
+        assert!(!ops.contains(&OpCode::IntAdd));
+
+        let (buffer, ops) = materialize_raw_slice(tag_box(0), vec![Type::Int]);
+        assert!(!buffer.is_constant());
+        assert!(ops.contains(&OpCode::IntAdd));
+    }
+
+    /// The funnel folds through the executor row, so the concrete this helper
+    /// supplies has to come from the same one.
+    #[test]
+    fn int_add_concrete_answers_only_for_two_constant_operands() {
+        assert_eq!(
+            int_add_concrete(OpRef::const_int(5), OpRef::const_int(7)),
+            Some(majit_ir::Value::Int(12))
+        );
+        assert_eq!(
+            int_add_concrete(OpRef::input_arg_int(0), OpRef::const_int(7)),
+            None
+        );
+        assert_eq!(
+            int_add_concrete(OpRef::const_int(5), OpRef::const_ptr(majit_ir::GcRef(8))),
+            None
+        );
+    }
 }
