@@ -17910,6 +17910,10 @@ pub(crate) unsafe fn generator_frame_is_finished(
     frame.f_backref = std::ptr::null_mut();
     frame.f_generator_nowref = PY_NULL;
     unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
+    // generator.py `frame_is_finished`: the frame edge is what `_finalize_`
+    // reads, and it is gone, so nothing is left for the queue to deliver this
+    // object for.
+    crate::executioncontext::may_ignore_finalizer(gen_obj);
 }
 
 /// generator.py `_invoke_execute_frame`: install the generator's
@@ -18033,6 +18037,25 @@ fn generator_send_ex(
                 "can't send non-None value to a just-started {}",
                 generator_kind(gen_obj)
             )));
+        }
+        if !already_started
+            && is_coroutine(gen_obj)
+            && !crate::pycode::w_code_yields_inside_try(w_generator_get_pycode(gen_obj))
+        {
+            // generator.py `_invoke_execute_frame`: "after we've started a
+            // Coroutine without CO_YIELD_INSIDE_TRY, then
+            // Coroutine._finalize_() will be a no-op".  Such a coroutine is on
+            // the queue for the never-awaited warning alone
+            // (`into_generator_named` registers it for being a Coroutine, not
+            // for its flags), and starting it is what settles that question.
+            //
+            // Behind the just-started check, where upstream puts it ahead: the
+            // hint says the coroutine has been started, and one that reports
+            // that error has not been.  Upstream's order suppresses the
+            // never-awaited warning for it — 3.14 emits it, and
+            // `extra_tests/snippets/coroutine_never_awaited_survives_a_send_typeerror.py`
+            // pins that.
+            crate::executioncontext::may_ignore_finalizer(gen_obj);
         }
         w_generator_set_started(gen_obj);
         // generator.py `_invoke_execute_frame` delegates the complete

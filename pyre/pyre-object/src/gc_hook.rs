@@ -394,21 +394,38 @@ pub fn try_gc_isenabled() -> bool {
 pub type GcFinalizerTriggerFn = fn();
 pub type GcRegisterFinalizerHookFn = fn(usize, PyObjectRef, GcFinalizerTriggerFn);
 pub type GcFinalizerNextDeadHookFn = fn(usize) -> PyObjectRef;
+/// `gc_ignore_finalizer` — the third of the finalizer operations
+/// `gctransform/framework.py` binds, and the only one that carries no queue
+/// index: the hint is a property of the object, not of the queue holding it.
+pub type GcIgnoreFinalizerHookFn = fn(PyObjectRef);
 
 majit_gc::global_hook!(static GC_REGISTER_FINALIZER_HOOK: GcRegisterFinalizerHookFn);
 majit_gc::global_hook!(static GC_FINALIZER_NEXT_DEAD_HOOK: GcFinalizerNextDeadHookFn);
+majit_gc::global_hook!(static GC_IGNORE_FINALIZER_HOOK: GcIgnoreFinalizerHookFn);
 
 pub fn register_gc_finalizer_hooks(
     register: GcRegisterFinalizerHookFn,
     next_dead: GcFinalizerNextDeadHookFn,
+    ignore: GcIgnoreFinalizerHookFn,
 ) {
     GC_REGISTER_FINALIZER_HOOK.set(Some(register));
     GC_FINALIZER_NEXT_DEAD_HOOK.set(Some(next_dead));
+    GC_IGNORE_FINALIZER_HOOK.set(Some(ignore));
 }
 
 pub fn try_gc_register_finalizer(fq_index: usize, obj: PyObjectRef, trigger: GcFinalizerTriggerFn) {
     if let Some(register) = GC_REGISTER_FINALIZER_HOOK.get() {
         register(fq_index, obj, trigger);
+    }
+}
+
+/// `rgc.may_ignore_finalizer(obj)` — "says that it is valid for any finalizer
+/// for 'obj' to be ignored, depending on the GC".  Nothing at all when no
+/// collector is installed, which is the same answer a collector that keeps no
+/// such flag gives: the finalizer runs.
+pub fn try_gc_ignore_finalizer(obj: PyObjectRef) {
+    if let Some(ignore) = GC_IGNORE_FINALIZER_HOOK.get() {
+        ignore(obj);
     }
 }
 

@@ -867,6 +867,9 @@ impl W_BufferedReader {
         if let Some(error) = flush_error {
             return Err(error);
         }
+        // interp_bufferedio.py `close_w`, after `self.buffer = None`: the
+        // object is closed, so `iobase_del` has nothing left to do for it.
+        super::maybe_unregister_rpython_finalizer_io(self.self_obj());
         Ok(())
     }
 

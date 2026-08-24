@@ -170,6 +170,10 @@ fn pyre_object_gc_register_finalizer_trampoline(
     majit_gc::gc_register_finalizer(fq_index, majit_ir::GcRef(obj as usize), trigger);
 }
 
+fn pyre_object_gc_ignore_finalizer_trampoline(obj: pyre_object::PyObjectRef) {
+    majit_gc::gc_ignore_finalizer(majit_ir::GcRef(obj as usize));
+}
+
 fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object::PyObjectRef {
     majit_gc::gc_fq_next_dead(fq_index)
         .map(|obj| obj.0 as pyre_object::PyObjectRef)
@@ -4875,6 +4879,7 @@ fn install_pyre_object_hooks() {
     pyre_object::gc_hook::register_gc_finalizer_hooks(
         pyre_object_gc_register_finalizer_trampoline,
         pyre_object_gc_finalizer_next_dead_trampoline,
+        pyre_object_gc_ignore_finalizer_trampoline,
     );
     pyre_object::register_gc_root_hooks(
         pyre_object_gc_add_root_trampoline,
