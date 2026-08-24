@@ -1134,9 +1134,13 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
             &mut allocation_root,
             &mut needs_write_barrier,
         )
-    }
-    .filter(|p| !p.is_null())
-    .unwrap_or(std::ptr::null_mut());
+    };
+    // The `std::alloc` header below is the answer for a missing hook, not for
+    // a GC that owns the heap and refused: that one would leave the list's
+    // managed edges untraced behind a header the collector never walks.
+    let raw = crate::gc_hook::GcAllocOutcome::from_hook(raw)
+        .allocated_or_abort(W_LIST_OBJECT_SIZE)
+        .unwrap_or(std::ptr::null_mut());
     // `pop_roots` for the two typed blocks: this was the last allocation they
     // had to survive, and both take their heap edge from the struct built below.
     storage.reload_typed_blocks();

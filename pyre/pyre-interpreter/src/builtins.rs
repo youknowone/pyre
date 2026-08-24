@@ -13879,6 +13879,10 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // emit and read the answer back out of its slot.
         let _roots = pyre_object::gc_roots::push_roots();
         let res_slot = pyre_object::gc_roots::pin_roots(&[w_res]);
+        // The pin normalizes, and its query is itself a safepoint, so `w_res`
+        // is dead from here on: what the hooks are handed has to come out of
+        // the slot, not out of the copy that named the object beforehand.
+        let w_res = pyre_object::gc_roots::shadow_stack_get(res_slot);
         crate::module::sys::vm::audit("builtins.id", &[w_res])?;
         return Ok(pyre_object::gc_roots::shadow_stack_get(res_slot));
     }

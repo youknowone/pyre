@@ -1313,6 +1313,11 @@ impl W_TextIOWrapper {
         if let Some(error) = flush_error {
             return Err(error);
         }
+        // interp_textio.py `close_w`: the wrapper is closed, so `iobase_del`'s
+        // own work is done.  On the success path only — a close that raised
+        // leaves the object in a state its finalizer still has something to
+        // say about.
+        super::maybe_unregister_rpython_finalizer_io(self.self_obj());
         Ok(())
     }
 

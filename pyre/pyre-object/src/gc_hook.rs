@@ -169,18 +169,26 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
     GC_ALLOC_STABLE_HOOK.get().map(|f| f(type_id, payload_size))
 }
 
-/// Null-collapsing view of [`try_gc_alloc_stable`] for JIT-traced callers.
+/// [`try_gc_alloc_stable`] narrowed to the one answer its callers can act on.
 ///
-/// Returns `null` both when no hook is installed and when the hook itself
-/// returned `null`; every traced caller already treats those two cases
-/// identically (fall back to `malloc_typed`), so the `Option` discriminant
-/// carries no information the caller reads.  Residualising this primitive
-/// (`@dont_look_inside`, `rlib/jit.py`) keeps the process-global hook
-/// dispatch out of the trace — a `*mut u8` return has no discriminant to
-/// erase, unlike the `Option<*mut u8>` accessor.
+/// `null` means [`GcAllocOutcome::NoRoute`] alone: no hook is installed, so
+/// the caller's own `malloc_raw` path is the whole heap and taking it keeps
+/// the object graph consistent.  A [`Failed`](GcAllocOutcome::Failed) does not
+/// come back — a GC owns the heap and could not satisfy the request, and every
+/// caller here answers a null by allocating outside that heap, which is the
+/// one thing it must not do: the object would hold managed references the
+/// collector never traces or forwards, and its missing header lets a type-id
+/// witness misread the words before it.  So the two are told apart here rather
+/// than at each call site, and the failure aborts (see [`gc_alloc_failed`]).
+///
+/// Residualising this primitive (`@dont_look_inside`, `rlib/jit.py`) keeps the
+/// process-global hook dispatch out of the trace — a `*mut u8` return has no
+/// discriminant to erase, unlike the `Option<*mut u8>` accessor.
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
-    try_gc_alloc_stable(type_id, payload_size).unwrap_or(core::ptr::null_mut())
+    GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
 }
 
 majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
@@ -394,21 +402,38 @@ pub fn try_gc_isenabled() -> bool {
 pub type GcFinalizerTriggerFn = fn();
 pub type GcRegisterFinalizerHookFn = fn(usize, PyObjectRef, GcFinalizerTriggerFn);
 pub type GcFinalizerNextDeadHookFn = fn(usize) -> PyObjectRef;
+/// `gc_ignore_finalizer` — the third of the finalizer operations
+/// `gctransform/framework.py` binds, and the only one that carries no queue
+/// index: the hint is a property of the object, not of the queue holding it.
+pub type GcIgnoreFinalizerHookFn = fn(PyObjectRef);
 
 majit_gc::global_hook!(static GC_REGISTER_FINALIZER_HOOK: GcRegisterFinalizerHookFn);
 majit_gc::global_hook!(static GC_FINALIZER_NEXT_DEAD_HOOK: GcFinalizerNextDeadHookFn);
+majit_gc::global_hook!(static GC_IGNORE_FINALIZER_HOOK: GcIgnoreFinalizerHookFn);
 
 pub fn register_gc_finalizer_hooks(
     register: GcRegisterFinalizerHookFn,
     next_dead: GcFinalizerNextDeadHookFn,
+    ignore: GcIgnoreFinalizerHookFn,
 ) {
     GC_REGISTER_FINALIZER_HOOK.set(Some(register));
     GC_FINALIZER_NEXT_DEAD_HOOK.set(Some(next_dead));
+    GC_IGNORE_FINALIZER_HOOK.set(Some(ignore));
 }
 
 pub fn try_gc_register_finalizer(fq_index: usize, obj: PyObjectRef, trigger: GcFinalizerTriggerFn) {
     if let Some(register) = GC_REGISTER_FINALIZER_HOOK.get() {
         register(fq_index, obj, trigger);
+    }
+}
+
+/// `rgc.may_ignore_finalizer(obj)` — "says that it is valid for any finalizer
+/// for 'obj' to be ignored, depending on the GC".  Nothing at all when no
+/// collector is installed, which is the same answer a collector that keeps no
+/// such flag gives: the finalizer runs.
+pub fn try_gc_ignore_finalizer(obj: PyObjectRef) {
+    if let Some(ignore) = GC_IGNORE_FINALIZER_HOOK.get() {
+        ignore(obj);
     }
 }
 
@@ -891,6 +916,19 @@ mod tests {
         let outcome = GcAllocOutcome::from_hook(try_gc_alloc(1, 8));
         clear_gc_alloc_hook();
         assert_eq!(outcome, GcAllocOutcome::Failed);
+    }
+
+    #[test]
+    fn a_stable_allocation_with_no_hook_installed_still_answers_null() {
+        // `NoRoute` is the one answer `try_gc_alloc_stable_raw` still hands
+        // back: nothing owns the heap, so each caller's own `malloc_raw` path
+        // is the whole heap and taking it is correct. The `Failed` it now
+        // separates out cannot be asserted from here — that one does not
+        // return.
+        let _hook_lock = hook_test_guard();
+        clear_gc_alloc_stable_hook();
+        assert!(try_gc_alloc_stable(1, 8).is_none());
+        assert!(try_gc_alloc_stable_raw(1, 8).is_null());
     }
 
     // Per-thread for the same reason the allocation record is: while these

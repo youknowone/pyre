@@ -1496,9 +1496,16 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
     let raw = if stable {
         crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
     } else {
-        crate::gc_hook::try_gc_alloc(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
-            .filter(|p| !p.is_null())
-            .unwrap_or(std::ptr::null_mut())
+        // The `malloc_typed` box below answers a missing hook. It cannot
+        // answer a GC that owns the heap and refused: the dict's strategy and
+        // storage edges would sit outside the object graph, behind a header
+        // the collector never walks.
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(
+            W_DICT_GC_TYPE_ID,
+            W_DICT_OBJECT_SIZE,
+        ))
+        .allocated_or_abort(W_DICT_OBJECT_SIZE)
+        .unwrap_or(std::ptr::null_mut())
     };
     value.dstorage = crate::gc_roots::shadow_stack_get(save_point) as *mut u8;
     if !raw.is_null() {

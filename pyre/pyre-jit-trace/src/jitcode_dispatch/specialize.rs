@@ -9413,12 +9413,12 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
             .iter()
             .map(|&(_, _, value)| {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
-                pyre_object::gc_roots::pin_root(value);
+                let _ = pyre_object::gc_roots::pin_root(value);
                 slot
             })
             .collect();
         let locals_root = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
+        let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
         let mut result = pyre_object::PY_NULL;
         let mut slot_failed = false;
         for (&(index, _, _), &value_root) in slots.iter().zip(&value_roots) {

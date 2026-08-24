@@ -178,7 +178,31 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
         &[],
     );
     iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
-    flushed.map(|_| w_none())
+    flushed?;
+    // `close_w` reaches its `maybe_unregister_rpython_finalizer_io` only past
+    // the `try`, so a flush that raised does not get the hint even though the
+    // `finally` above has already marked the object closed.
+    maybe_unregister_rpython_finalizer_io(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    Ok(w_none())
+}
+
+/// `interp_iobase.py W_IOBase.maybe_unregister_rpython_finalizer_io`: once
+/// `closed` is set, `iobase_del`'s own work is a no-op, so the object may be
+/// collected without being delivered.
+///
+/// Withheld from an app-level subclass — upstream's `user_overridden_class`
+/// guard.  Its `close` may do anything, and `iobase_del` reaches it through
+/// the ordinary lookup.  `is_heaptype` is that predicate here: every
+/// interp-level `_io` type is a builtin one, so a heap type in this position
+/// is a class written in Python.
+pub(crate) fn maybe_unregister_rpython_finalizer_io(self_obj: PyObjectRef) {
+    let Some(w_type) = crate::typedef::r#type(self_obj) else {
+        return;
+    };
+    if unsafe { pyre_object::w_type_is_heaptype(w_type.as_ptr()) } {
+        return;
+    }
+    crate::executioncontext::may_ignore_finalizer(self_obj);
 }
 
 fn iobase_flush(args: &[PyObjectRef]) -> crate::PyResult {

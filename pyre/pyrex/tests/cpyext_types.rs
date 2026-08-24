@@ -566,6 +566,25 @@ assert after > before, f'the last Owner was not deallocated: {before} -> {after}
 gc.collect()
 assert ref() is None, 'releasing the C reference did not let the object go'
 
+# ── and gc.collect() runs the deallocators before it returns ───────────
+# Read from C, so no bytecode runs between the collection and the count: a
+# drain left to the async action would not have happened yet.  Automatic
+# collection is off across the setup and the count is read again once it is
+# built, so a collection nobody asked for cannot be what moves the number.
+was_enabled = gc.isenabled()
+gc.disable()
+try:
+    before = m.owner_deallocs()
+    for _ in range(16):
+        m.Owner()
+    settled = m.owner_deallocs()
+    assert settled == before, f'an Owner was deallocated before the explicit collect: {before} -> {settled}'
+    during = m.collect_then_owner_deallocs()
+finally:
+    if was_enabled:
+        gc.enable()
+assert during > settled, f'gc.collect() returned before tp_dealloc ran: {settled} -> {during}'
+
 print('cpyext-lifetime-ok')
 "#;
 

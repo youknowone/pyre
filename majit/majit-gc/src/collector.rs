@@ -1059,6 +1059,9 @@ pub struct MiniMarkGC {
     /// minor left at least one pinned object in the nursery.
     any_pinned_object_kept: bool,
     old_objects_pointing_to_pinned: Vec<usize>,
+    /// incminimark.py `updated_old_objects_pointing_to_pinned`: set whenever
+    /// the list above changes, and read by `writebarrier_before_copy` alone.
+    updated_old_objects_pointing_to_pinned: bool,
     /// incminimark.py:311,430 `max_number_of_pinned_objects` and
     /// `pinned_objects_in_nursery`.
     max_number_of_pinned_objects: usize,
@@ -1203,6 +1206,7 @@ impl MiniMarkGC {
             surviving_pinned_objects: Vec::new(),
             any_pinned_object_kept: false,
             old_objects_pointing_to_pinned: Vec::new(),
+            updated_old_objects_pointing_to_pinned: false,
             max_number_of_pinned_objects,
             pinned_objects_in_nursery: 0,
             nursery_objects_shadows: AddressMap::default(),
@@ -1268,6 +1272,14 @@ impl MiniMarkGC {
     ///
     /// `has_gc_ptrs_in_var` should be true for arrays containing GC pointers
     /// (i.e. `has_gcptr_in_varsize(typeid)` in RPython).
+    ///
+    /// Every caller today is a test, so no card array exists in a running
+    /// heap.  A production one arrives owing two things that the per-item
+    /// barrier does not supply, because a card records a *position*: a bulk
+    /// copy into it owes [`Self::writebarrier_before_copy`], and any move of
+    /// items within it — a list insert, remove, splice or reverse — owes
+    /// [`Self::writebarrier_before_move`], which is what generalizes the cards
+    /// back to "any item may be young" before the positions change.
     pub fn alloc_in_oldgen_with_cards(
         &mut self,
         type_id: u32,
@@ -3669,6 +3681,36 @@ impl MiniMarkGC {
         self.allocate_shadow(obj_addr)
     }
 
+    /// incminimark.py `move_out_of_nursery`: "called twice, it should return
+    /// the same shadow object, and not creating another shadow object.  As a
+    /// safety feature, when called on a non-nursery object, do nothing."
+    ///
+    /// `rgc.move_out_of_nursery`'s contract is what makes the eager copy sound:
+    /// "Only use for immutable objects!"  The shadow is filled once and the
+    /// nursery original may still be written to afterwards, so a mutable object
+    /// would have the two copies disagree until the next minor.
+    pub fn move_out_of_nursery(&mut self, obj_addr: usize) -> usize {
+        if !self.is_in_nursery(obj_addr) {
+            return obj_addr;
+        }
+        let shadow = self.find_shadow(obj_addr);
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).has_flag(flags::SHADOW_INITIALIZED) } {
+            return shadow;
+        }
+        unsafe { (*hdr).set_flag(flags::SHADOW_INITIALIZED) };
+        let type_id = unsafe { (*hdr).type_id() };
+        let payload_size = self.size_for_typeid(obj_addr, type_id, "move_out_of_nursery");
+        // Payload only: `allocate_shadow` already wrote the shadow's own header
+        // and the flags the old generation needs, and the copy must not undo
+        // them.  The next minor reads SHADOW_INITIALIZED and skips its own copy
+        // for the same reason.
+        unsafe {
+            std::ptr::copy_nonoverlapping(obj_addr as *const u8, shadow as *mut u8, payload_size)
+        };
+        shadow
+    }
+
     /// minimark.py `id_or_identityhash(gcobj)`.
     /// Return a stable address usable as identity hash.  For nursery
     /// objects, returns the shadow's address (which is where the object
@@ -3841,6 +3883,7 @@ impl MiniMarkGC {
                 let holder_hdr = unsafe { header_of(holder_addr) };
                 if unsafe { !(*holder_hdr).has_flag(flags::PINNED) } {
                     self.old_objects_pointing_to_pinned.push(holder_addr);
+                    self.updated_old_objects_pointing_to_pinned = true;
                     unsafe { (*holder_hdr).set_flag(flags::PINNED) };
                 }
             }
@@ -3946,11 +3989,21 @@ impl MiniMarkGC {
             // Remember VISITED and re-apply it after the copy.
             let shadow_was_visited =
                 unsafe { (*(shadow_hdr as *const GcHeader)).has_flag(flags::VISITED) };
+            // incminimark.py `_trace_drag_out`: `if (tid &
+            // GCFLAG_SHADOW_INITIALIZED) != 0: copy = False`.
+            // `move_out_of_nursery` has already filled this shadow, and its
+            // caller has been reading it ever since.  Copying again is not
+            // merely redundant: HAS_SHADOW and SHADOW_INITIALIZED "have no
+            // meaning in non-nursery objects", so the second copy is what would
+            // carry the nursery flag word onto an object that has the right one.
+            let shadow_initialized = unsafe { (*hdr_ptr).has_flag(flags::SHADOW_INITIALIZED) };
             // minimark.py:1518-1520: clear HAS_SHADOW before copy so the
             // flag does not propagate to the shadow object itself.
             unsafe { (*hdr_ptr).clear_flag(flags::HAS_SHADOW) };
-            unsafe {
-                std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
+            if !shadow_initialized {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
+                }
             }
             if shadow_was_visited {
                 unsafe { (*(shadow_hdr as *mut GcHeader)).set_flag(flags::VISITED) };
@@ -5816,6 +5869,7 @@ impl MiniMarkGC {
         // VISITED set at this point; the oldgen sweep clears it later.
         self.old_objects_pointing_to_pinned
             .retain(|&obj_addr| unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED) });
+        self.updated_old_objects_pointing_to_pinned = true;
         // incminimark.py:2528-2529 — VISITED still distinguishes survivors, so
         // this is where each mirror learns whether its object made it.
         if self.rrc.enabled {
@@ -6234,6 +6288,79 @@ impl MiniMarkGC {
         self.rrc_invoke_callback();
     }
 
+    /// incminimark.py `minor_collection_with_major_progress`: "Do a minor
+    /// collection.  Then, if the GC is enabled and there is already a major GC
+    /// in progress, run at least one major collection step.  If there is no
+    /// major GC but the threshold is reached, start a major GC."
+    ///
+    /// `do_collect_nursery` is that function with `force_enabled=False` baked
+    /// in, because its tail `run_major_progress_after_minor` reads
+    /// `self.enabled`.  The forced form lends the flag for the call, which is
+    /// what `force_enabled` means: an explicit collection makes major progress
+    /// even while automatic progress is switched off.
+    fn minor_collection_with_major_progress(&mut self, force_enabled: bool) {
+        if !force_enabled {
+            self.do_collect_nursery();
+            return;
+        }
+        let was_enabled = std::mem::replace(&mut self.enabled, true);
+        self.do_collect_nursery();
+        self.enabled = was_enabled;
+    }
+
+    /// incminimark.py `collect(gen=2)`: "Do a minor (gen=0), start a major
+    /// (gen=1), or do a full major (gen>=2) collection."
+    ///
+    /// The app-level `gc.collect(n)` does not reach this — `interp_gc.py
+    /// collect` unwraps its generation and then asks for a full collection
+    /// whatever it was.  This is the internal `rgc.collect(gen)` entry, whose
+    /// callers want a named amount of work rather than all of it.
+    pub fn do_collect(&mut self, generation: i64) {
+        if generation >= 2 {
+            // `minor_and_major_collection`, which ends with the same callback.
+            self.do_collect_full();
+            return;
+        }
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        if generation < 0 {
+            // "Dangerous! this makes no progress on the major GC cycle.  If
+            // called too often, the memory usage will keep increasing, because
+            // we'll never completely fill the nursery (and so never run
+            // anything about the major collection)."
+            let was_enabled = std::mem::replace(&mut self.enabled, false);
+            self.do_collect_nursery();
+            self.enabled = was_enabled;
+        } else {
+            self.minor_collection_with_major_progress(true);
+            // gen == 1 is gen == 0 plus "if no major collection is running,
+            // then it forces one to start now".
+            if generation == 1 && self.gc_state == GcState::Scanning {
+                self.major_collection_step();
+            }
+        }
+        self.rrc_invoke_callback();
+    }
+
+    /// incminimark.py `set_max_heap_size`.  `PYPY_GC_MAX` is read once at
+    /// startup; this is the same limit set from inside a running process, and
+    /// it pulls the pending major-collection thresholds down with it so a limit
+    /// lowered below them takes effect before the next major rather than after.
+    pub fn set_max_heap_size(&mut self, size: usize) {
+        self.max_heap_size = size as f64;
+        if self.max_heap_size > 0.0 {
+            if self.max_heap_size < self.next_major_collection_initial {
+                self.next_major_collection_initial = self.max_heap_size;
+            }
+            if self.max_heap_size < self.next_major_collection_threshold {
+                self.next_major_collection_threshold = self.max_heap_size;
+            }
+        }
+    }
+
     /// incminimark.py `collect_step`.
     pub fn collect_step(&mut self) -> crate::GcStepTransition {
         let _stw = if crate::gc_sync::stw_required() {
@@ -6510,6 +6637,140 @@ impl MiniMarkGC {
             // No cards: the JIT already passed the inline flag test, so use
             // the corresponding remember_young_pointer path.
             self.jit_remember_young_pointer(obj);
+        }
+    }
+
+    /// incminimark.py `writebarrier_before_copy`: "This has the same effect as
+    /// calling writebarrier over each element in dest copied from source,
+    /// except it might reset one of the following flags a bit too eagerly,
+    /// which means we'll have a bit more objects to track, but being on the
+    /// safe side."
+    ///
+    /// `false` is the answer "do it manually in ll_arraycopy" — the bulk form
+    /// cannot express this copy and the caller owes a per-item barrier.
+    /// Addresses are payload addresses, and `length` counts items.
+    pub fn writebarrier_before_copy(
+        &mut self,
+        source_addr: usize,
+        dest_addr: usize,
+        source_start: usize,
+        dest_start: usize,
+        length: usize,
+    ) -> bool {
+        // "obscuuuure" upstream, and for the same reason here: entering a
+        // parent on `old_objects_pointing_to_pinned` does not itself put that
+        // parent through the barrier, so the flags this function reads below
+        // are only trustworthy once every such entry has been.  Upstream notes
+        // there should only be a small number of them.
+        if self.updated_old_objects_pointing_to_pinned {
+            let mut parents = std::mem::take(&mut self.old_objects_pointing_to_pinned);
+            for &obj_addr in &parents {
+                self.do_write_barrier(GcRef(obj_addr));
+            }
+            parents.append(&mut self.old_objects_pointing_to_pinned);
+            self.old_objects_pointing_to_pinned = parents;
+            self.updated_old_objects_pointing_to_pinned = false;
+        }
+
+        let source_hdr = unsafe { header_of(source_addr) };
+        let dest_hdr = unsafe { header_of(dest_addr) };
+        // The fast path of the write barrier: a destination already on the
+        // remembered set needs nothing more.
+        if unsafe { !(*dest_hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            return true;
+        }
+
+        if self.config.card_page_indices > 0 && unsafe { (*source_hdr).has_flag(flags::HAS_CARDS) }
+        {
+            if unsafe { !(*source_hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+                // "The source object may have random young pointers."
+                return false;
+            }
+            if unsafe { !(*dest_hdr).has_flag(flags::HAS_CARDS) } {
+                // "The dest object doesn't have cards.  Do it manually."
+                return false;
+            }
+            debug_assert!(
+                unsafe { !(*dest_hdr).has_flag(flags::NO_HEAP_PTRS) },
+                "prebuilt object with cards is not supported"
+            );
+            if unsafe { !(*source_hdr).has_flag(flags::CARDS_SET) } {
+                // The source has no young pointers at all, so no card needs
+                // marking.  A black destination still has to go gray and be
+                // rescanned, which is what `collect_cardrefs_to_nursery` reads
+                // CARDS_SET for at the end of a marking step.
+                if self.gc_state == GcState::Marking
+                    && unsafe { !(*dest_hdr).has_flag(flags::CARDS_SET) }
+                {
+                    self.old_objects_with_cards_set.push(dest_addr);
+                    unsafe { (*dest_hdr).set_flag(flags::CARDS_SET) };
+                }
+                return true;
+            }
+            if source_start != 0 || dest_start != 0 {
+                // Misaligned: the card index of an item differs between the
+                // two objects, so the bits cannot be copied across.
+                return false;
+            }
+            self.manually_copy_card_bits(source_addr, dest_addr, length);
+            return true;
+        }
+
+        // While marking, the source's TRACK_YOUNG_PTRS says nothing: the
+        // barrier is also what turns a black object gray again, so a source
+        // that already lost the flag can still hold pointers this copy must
+        // report.
+        if unsafe { !(*source_hdr).has_flag(flags::TRACK_YOUNG_PTRS) }
+            || self.gc_state == GcState::Marking
+        {
+            self.remember_young_pointer(GcRef(dest_addr));
+        }
+
+        if unsafe { (*dest_hdr).has_flag(flags::NO_HEAP_PTRS) }
+            && unsafe { !(*source_hdr).has_flag(flags::NO_HEAP_PTRS) }
+        {
+            unsafe { (*dest_hdr).clear_flag(flags::NO_HEAP_PTRS) };
+            self.prebuilt_root_objects.push(dest_addr);
+        }
+        true
+    }
+
+    /// incminimark.py `writebarrier_before_move`: "If 'array_addr' uses cards,
+    /// then this has the same effect as a call to the generic writebarrier,
+    /// effectively generalizing the cards to 'any item may be young'."
+    ///
+    /// A move within one object carries its items across card boundaries while
+    /// the card bits stay where they are, so the per-card record is no longer
+    /// true of the object and only the whole-object record is.
+    pub fn writebarrier_before_move(&mut self, array_addr: usize) {
+        if self.config.card_page_indices == 0 {
+            return;
+        }
+        let hdr = unsafe { header_of(array_addr) };
+        if unsafe { (*hdr).has_flag(flags::CARDS_SET) } {
+            self.do_write_barrier(GcRef(array_addr));
+        }
+    }
+
+    /// incminimark.py `manually_copy_card_bits`.
+    fn manually_copy_card_bits(&mut self, source_addr: usize, dest_addr: usize, length: usize) {
+        debug_assert!(
+            self.config.card_page_indices > 0,
+            "non-positive card_page_indices"
+        );
+        let bytes = self.card_marking_bytes_for_length(length);
+        let mut anybyte = 0u8;
+        for i in 0..bytes {
+            let byte = unsafe { *Self::get_card_ptr(source_addr, i) };
+            anybyte |= byte;
+            unsafe { *Self::get_card_ptr(dest_addr, i) |= byte };
+        }
+        if anybyte != 0 {
+            let dest_hdr = unsafe { header_of(dest_addr) };
+            if unsafe { !(*dest_hdr).has_flag(flags::CARDS_SET) } {
+                self.old_objects_with_cards_set.push(dest_addr);
+                unsafe { (*dest_hdr).set_flag(flags::CARDS_SET) };
+            }
         }
     }
 
@@ -7354,6 +7615,19 @@ impl GcAllocator for MiniMarkGC {
             self.probably_young_objects_with_finalizers
                 .push_back((obj.0, fq_index));
         }
+    }
+
+    fn ignore_finalizer(&mut self, obj: GcRef) {
+        // The same admission the finalizer queues apply
+        // (`deal_with_young_objects_with_finalizers` drops an entry whose
+        // object is outside both generations): an address the collector does
+        // not own has no header to stamp, and dropping the hint only costs the
+        // finalizer that would have run anyway.
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        let hdr = unsafe { header_of(obj.0) };
+        unsafe { (*hdr).set_flag(flags::IGNORE_FINALIZER) };
     }
 
     fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
@@ -12469,6 +12743,292 @@ cache size\t: 8192 kB\n";
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
         assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+    }
+
+    /// incminimark.py `ignore_finalizer`: the object stays on the queue, and
+    /// `deal_with_objects_with_finalizers` is what passes over it.
+    #[test]
+    fn ignore_finalizer_withholds_a_registered_object_from_its_queue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TRIGGERS: AtomicUsize = AtomicUsize::new(0);
+        fn trigger() {
+            TRIGGERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TRIGGERS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        assert_eq!(gc.old_objects_with_finalizers.len(), 1);
+
+        GcAllocator::ignore_finalizer(&mut gc, obj);
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::IGNORE_FINALIZER) });
+
+        gc.roots.remove(&mut root);
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(TRIGGERS.load(Ordering::Relaxed), 0);
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+    }
+
+    /// An address the collector does not own has no header to stamp, so the
+    /// hint is dropped rather than written into whatever precedes it.
+    #[test]
+    fn ignore_finalizer_drops_an_unmanaged_address() {
+        let mut gc = test_gc(4096);
+        let outside = Box::into_raw(Box::new([0usize; 4])) as usize;
+        GcAllocator::ignore_finalizer(&mut gc, GcRef(outside));
+        GcAllocator::ignore_finalizer(&mut gc, GcRef::NULL);
+        unsafe { drop(Box::from_raw(outside as *mut [usize; 4])) };
+    }
+
+    /// incminimark.py `writebarrier_before_copy`: with no cards involved, a
+    /// source that has already lost TRACK_YOUNG_PTRS may hold young pointers,
+    /// so the destination joins the remembered set.
+    #[test]
+    fn writebarrier_before_copy_remembers_dest_when_source_is_untracked() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { (*header_of(source.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        let before = gc.remembered_set.len();
+
+        assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
+
+        assert_eq!(gc.remembered_set.len(), before + 1);
+        assert!(gc.remembered_set.contains(&dest.0));
+        assert!(unsafe { !(*header_of(dest.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+    }
+
+    /// A source that still carries TRACK_YOUNG_PTRS has no young pointers to
+    /// hand over, so outside the marking phase the copy needs nothing.
+    #[test]
+    fn writebarrier_before_copy_is_a_noop_for_a_tracked_source() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        let before = gc.remembered_set.len();
+
+        assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
+
+        assert_eq!(gc.remembered_set.len(), before);
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+    }
+
+    /// A destination already on the remembered set is the fast path: nothing
+    /// below it runs, and the answer is still "handled".
+    #[test]
+    fn writebarrier_before_copy_fast_paths_an_untracked_dest() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { (*header_of(source.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        unsafe { (*header_of(dest.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        let before = gc.remembered_set.len();
+
+        assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
+
+        assert_eq!(gc.remembered_set.len(), before);
+    }
+
+    /// The card arms: a source with cards and a destination without cannot be
+    /// served in bulk, and the caller is told to do it per item.
+    #[test]
+    fn writebarrier_before_copy_declines_a_card_source_with_a_plain_dest() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { (*header_of(source.0)).set_flag(flags::HAS_CARDS) };
+        assert!(gc.config.card_page_indices > 0);
+
+        assert!(!gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
+    }
+
+    /// Two card arrays whose copy is misaligned: the card index of an item
+    /// differs between them, so the bits cannot be carried across.
+    #[test]
+    fn writebarrier_before_copy_declines_a_misaligned_card_copy() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+        let source = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        let dest = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        unsafe { (*header_of(source.0)).set_flag(flags::CARDS_SET) };
+
+        assert!(!gc.writebarrier_before_copy(source.0, dest.0, 1, 0, 64));
+    }
+
+    /// `manually_copy_card_bits`: an aligned copy between two card arrays
+    /// carries the source's marks onto the destination and enters it on
+    /// `old_objects_with_cards_set`.
+    #[test]
+    fn writebarrier_before_copy_copies_card_bits_across() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+        let source = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        let dest = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        assert!(unsafe { (*header_of(source.0)).has_flag(flags::HAS_CARDS) });
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::HAS_CARDS) });
+        unsafe { *MiniMarkGC::get_card_ptr(source.0, 0) = 0b0000_0101 };
+        unsafe { (*header_of(source.0)).set_flag(flags::CARDS_SET) };
+        gc.old_objects_with_cards_set.clear();
+
+        assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 64));
+
+        assert_eq!(unsafe { *MiniMarkGC::get_card_ptr(dest.0, 0) }, 0b0000_0101);
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::CARDS_SET) });
+        assert_eq!(gc.old_objects_with_cards_set, vec![dest.0]);
+    }
+
+    /// incminimark.py `writebarrier_before_move`: the card bits stay put while
+    /// the items move past them, so the per-card record is replaced by the
+    /// whole-object one.
+    #[test]
+    fn writebarrier_before_move_generalizes_a_marked_card_array() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+        let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        unsafe { (*header_of(array.0)).set_flag(flags::CARDS_SET) };
+        let before = gc.remembered_set.len();
+
+        gc.writebarrier_before_move(array.0);
+
+        assert_eq!(gc.remembered_set.len(), before + 1);
+        assert!(gc.remembered_set.contains(&array.0));
+    }
+
+    /// An array with no card marked has nothing the move could invalidate.
+    #[test]
+    fn writebarrier_before_move_is_a_noop_without_cards_set() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+        let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        let before = gc.remembered_set.len();
+
+        gc.writebarrier_before_move(array.0);
+
+        assert_eq!(gc.remembered_set.len(), before);
+    }
+
+    /// incminimark.py `move_out_of_nursery`: "called twice, it should return
+    /// the same shadow object, and not creating another shadow object.  As a
+    /// safety feature, when called on a non-nursery object, do nothing."
+    #[test]
+    fn move_out_of_nursery_fills_one_shadow_and_the_minor_keeps_it() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(obj.0));
+        unsafe { *(obj.0 as *mut u64) = 0xfeed_face };
+
+        let shadow = gc.move_out_of_nursery(obj.0);
+        assert_ne!(shadow, obj.0);
+        assert!(!gc.is_in_nursery(shadow));
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::SHADOW_INITIALIZED) });
+        assert_eq!(unsafe { *(shadow as *const u64) }, 0xfeed_face);
+        assert_eq!(gc.move_out_of_nursery(obj.0), shadow);
+
+        // The nursery original may be written after the shadow was filled;
+        // upstream's contract ("Only use for immutable objects!") is what makes
+        // the promotion's skipped copy sound, so the shadow keeps what it had.
+        unsafe { *(obj.0 as *mut u64) = 0xdead_beef };
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        assert_eq!(root.0, shadow);
+        assert_eq!(unsafe { *(shadow as *const u64) }, 0xfeed_face);
+        gc.roots.clear();
+    }
+
+    /// An old-gen object is already where a shadow would put it.
+    #[test]
+    fn move_out_of_nursery_answers_a_non_nursery_object_unchanged() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        assert_eq!(gc.move_out_of_nursery(obj.0), obj.0);
+        assert!(unsafe { !(*header_of(obj.0)).has_flag(flags::SHADOW_INITIALIZED) });
+    }
+
+    /// incminimark.py `collect(gen)`: a negative generation is the minor that
+    /// deliberately makes no major progress.
+    #[test]
+    fn do_collect_with_a_negative_generation_runs_a_minor_only() {
+        let mut gc = test_gc(4096);
+        let minors = gc.minor_collections;
+        let majors = gc.major_collections;
+
+        gc.do_collect(-1);
+
+        assert_eq!(gc.minor_collections, minors + 1);
+        assert_eq!(gc.major_collections, majors);
+        assert_eq!(gc.gc_state, GcState::Scanning);
+    }
+
+    /// `gen == 1` "is like gen == 0, but if no major collection is running,
+    /// then it forces one to start now".
+    #[test]
+    fn do_collect_with_generation_one_starts_a_major_cycle() {
+        let mut gc = test_gc(4096);
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        let minors = gc.minor_collections;
+
+        gc.do_collect(1);
+
+        assert_eq!(gc.minor_collections, minors + 1);
+        assert_ne!(
+            gc.gc_state,
+            GcState::Scanning,
+            "gen == 1 forces a cycle to start"
+        );
+    }
+
+    /// `gen >= 2` is the complete collection, and it leaves no cycle running.
+    #[test]
+    fn do_collect_with_generation_two_completes_a_cycle() {
+        let mut gc = test_gc(4096);
+        let majors = gc.major_collections;
+
+        gc.do_collect(2);
+
+        assert!(gc.major_collections > majors);
+        assert_eq!(gc.gc_state, GcState::Scanning);
+    }
+
+    /// incminimark.py `set_max_heap_size`: a limit below the pending
+    /// thresholds pulls them down with it.
+    #[test]
+    fn set_max_heap_size_pulls_the_pending_thresholds_down() {
+        let mut gc = test_gc(4096);
+        gc.next_major_collection_initial = 8192.0;
+        gc.next_major_collection_threshold = 8192.0;
+
+        gc.set_max_heap_size(1024);
+
+        assert_eq!(gc.max_heap_size, 1024.0);
+        assert_eq!(gc.next_major_collection_initial, 1024.0);
+        assert_eq!(gc.next_major_collection_threshold, 1024.0);
+
+        // A larger limit does not raise a threshold that is already lower.
+        gc.set_max_heap_size(65536);
+        assert_eq!(gc.max_heap_size, 65536.0);
+        assert_eq!(gc.next_major_collection_threshold, 1024.0);
+
+        // Unbounded leaves them alone entirely.
+        gc.set_max_heap_size(0);
+        assert_eq!(gc.max_heap_size, 0.0);
+        assert_eq!(gc.next_major_collection_threshold, 1024.0);
     }
 
     // ── rawrefcount (incminimark.py:3157-3409) ──────────────────────

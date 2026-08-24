@@ -1146,6 +1146,29 @@ static PyObject *m_owner_deallocs(PyObject *self, PyObject *unused)
     return PyLong_FromLong(owner_deallocs);
 }
 
+/* Call gc.collect() and answer the deallocation count as it stands when that
+   call returns.  No bytecode runs in between, so a drain left to the next
+   async action has not happened yet and this reads the count from before it. */
+static PyObject *m_collect_then_owner_deallocs(PyObject *self, PyObject *unused)
+{
+    PyObject *module = PyImport_ImportModule("gc");
+    if (module == NULL) {
+        return NULL;
+    }
+    PyObject *collect = PyObject_GetAttrString(module, "collect");
+    Py_DECREF(module);
+    if (collect == NULL) {
+        return NULL;
+    }
+    PyObject *collected = PyObject_CallNoArgs(collect);
+    Py_DECREF(collect);
+    if (collected == NULL) {
+        return NULL;
+    }
+    Py_DECREF(collected);
+    return PyLong_FromLong(owner_deallocs);
+}
+
 static PyTypeObject OwnerType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "cpyext_types.Owner",                       /* tp_name */
@@ -1807,6 +1830,8 @@ static PyMethodDef methods[] = {
     {"subclass_flags", m_subclass_flags, METH_NOARGS, "fast-subclass flags"},
     {"is_subtype", m_is_subtype, METH_NOARGS, "PyType_IsSubtype both ways"},
     {"owner_deallocs", m_owner_deallocs, METH_NOARGS, "how often Owner.tp_dealloc ran"},
+    {"collect_then_owner_deallocs", m_collect_then_owner_deallocs, METH_NOARGS,
+     "gc.collect(), then the count as it stands on return"},
     {NULL, NULL, 0, NULL},
 };
 
