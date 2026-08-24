@@ -328,3 +328,71 @@ pub fn host_registry_dispatch_optional(reg: &HostRegistry, x: i64) -> i64 {
         None => 0,
     }
 }
+
+// 9. An array whose element is a by-value aggregate.
+//
+// `v[i]` on a `Vec<T>` with a scalar subscript resolves to
+// `<Vec<T> as Index<usize>>::index`, which `front::mir`'s
+// `is_vec_index_call` (`vec_index_regular_leaf`) intercepts: the call site
+// lowers eagerly to an `ArrayRead` and records an `IndexElemAlias` for the
+// paired write and for the projections off the element, leaving no residual
+// call. That arm gates on the *index* type and never on the *element* type —
+// `item_ty` is whatever `tyref_deref_value_type(call.dest.ty)` answers — so
+// the element bank it produces for a multi-word by-value ADT is decided by
+// `tyref_to_value_type`'s fallback rather than by a deliberate arm.
+//
+// `SlotValue` carries an integer variant, a raw-pointer variant and a
+// two-field variant. None of the three leaves a niche free, so the enum is a
+// genuine tag-plus-payload aggregate several words wide and not a wrapper the
+// front end can collapse to its inner bank (`tyref_transparent_inner_value_type`,
+// `tyref_is_fieldless_enum_free`).
+pub enum SlotValue {
+    Int(i64),
+    Object(*const ObjectHeader),
+    Pair { lhs: i64, rhs: i64 },
+}
+
+/// The treatment: read one element by scalar index and match it. The
+/// discriminant read and the per-variant payload reads all land on the
+/// `ArrayRead` result, so this is the shape that says whether the alias
+/// projections carry an aggregate element.
+#[inline(never)]
+pub fn aggregate_slot_index(v: &Vec<SlotValue>, i: usize) -> i64 {
+    match &v[i] {
+        SlotValue::Int(x) => *x,
+        SlotValue::Object(h) => unsafe { (*(**h).ob_type).kind as i64 },
+        SlotValue::Pair { lhs, rhs } => *lhs + *rhs,
+    }
+}
+
+/// The control: the same body over `<[T]>::get`, reached by deref coercion
+/// from the `Vec`. Its `Option<&SlotValue>` destination is what
+/// `recognize_slice_get_site` accepts or declines, so the call either becomes
+/// `front::slice_get`'s bounds-checked diamond or stays residual — either way
+/// it is a different lowering from the index arm. If it is not, the pair
+/// discriminates nothing and neither function grades the index arm.
+#[inline(never)]
+pub fn aggregate_slot_get(v: &Vec<SlotValue>, i: usize) -> i64 {
+    match v.get(i) {
+        Some(SlotValue::Int(x)) => *x,
+        Some(SlotValue::Object(h)) => unsafe { (*(**h).ob_type).kind as i64 },
+        Some(SlotValue::Pair { lhs, rhs }) => *lhs + *rhs,
+        None => 0,
+    }
+}
+
+/// The same two spellings over an element bank the index arm is already
+/// known to serve, so a difference between the two pairs is attributable to
+/// the element kind and not to the fixture.
+#[inline(never)]
+pub fn scalar_slot_index(v: &Vec<i64>, i: usize) -> i64 {
+    v[i]
+}
+
+#[inline(never)]
+pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
+    match v.get(i) {
+        Some(x) => *x,
+        None => 0,
+    }
+}

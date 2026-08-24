@@ -39,7 +39,11 @@ fn loads_fixture_corpus() {
     //
     // + 2 for the iterator element-kind pair, `slice_of_refs_sum` and
     // `array_of_refs_sum`.
-    assert_eq!(local_count, 26, "26 local fns expected");
+    //
+    // + 4 for the aggregate-element array read and its controls:
+    // `aggregate_slot_index`, `aggregate_slot_get`, `scalar_slot_index` and
+    // `scalar_slot_get`. `SlotValue` is a type, so it contributes no body.
+    assert_eq!(local_count, 30, "30 local fns expected");
 }
 
 #[test]

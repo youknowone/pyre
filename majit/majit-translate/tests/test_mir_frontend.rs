@@ -1188,3 +1188,133 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
         "type(a) is type(b), then the per-class shortcut",
     );
 }
+
+/// Counts of the two lowerings a scalar `v[i]` can end in — the eager
+/// `ArrayRead` `front::mir`'s `is_vec_index_call` emits, or a residual
+/// `<[T]>::get` — plus the element-bank and classdef facts that say whether
+/// the projections off the element resolved.
+struct SlotReadShape {
+    array_reads: Vec<majit_translate::model::ValueType>,
+    residual_gets: usize,
+    typed_discriminant_reads: usize,
+    classdefless_discriminant_reads: usize,
+}
+
+fn slot_read_shape(name: &str) -> SlotReadShape {
+    use majit_translate::model::{CallTarget, OpKind};
+    let graph = lower_function(load_corpus(), name).expect("lowering");
+    let mut shape = SlotReadShape {
+        array_reads: Vec::new(),
+        residual_gets: 0,
+        typed_discriminant_reads: 0,
+        classdefless_discriminant_reads: 0,
+    };
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::ArrayRead { item_ty, .. } => shape.array_reads.push(item_ty.clone()),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("get") => shape.residual_gets += 1,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "get" => shape.residual_gets += 1,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                    if field.owner_root.is_some() && field.owner_id.is_some() {
+                        shape.typed_discriminant_reads += 1;
+                    } else {
+                        shape.classdefless_discriminant_reads += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    shape
+}
+
+/// `v[i]` on a `Vec<T>` with a scalar subscript is lowered eagerly to an
+/// `ArrayRead` by `front::mir`'s `is_vec_index_call`, and that arm gates on
+/// the index type alone — the element bank it produces is whatever
+/// `tyref_deref_value_type` answers. `aggregate_slot_index` reads a
+/// multi-word by-value enum and matches it, so the discriminant read and the
+/// per-variant payload reads all land on the `ArrayRead` result: the shape
+/// that says whether the element alias carries an aggregate or is silently
+/// mis-shaped.
+///
+/// `aggregate_slot_get` is the control, and it is load-bearing. It is the
+/// same body spelled with `<[T]>::get`, whose `Option<&SlotValue>`
+/// destination `recognize_slice_get_site` either lifts to
+/// `front::slice_get`'s diamond or declines. If the two functions lowered
+/// alike the pair would discriminate nothing, and no conclusion about the
+/// index arm could be drawn from either one.
+#[test]
+fn an_aggregate_element_indexes_to_an_array_read_where_get_stays_residual() {
+    use majit_translate::model::ValueType;
+
+    let indexed = slot_read_shape("aggregate_slot_index");
+    // The element read is the eager `ArrayRead`, not a residual
+    // `Index::index` and not a residual `get`.
+    assert_eq!(
+        indexed.array_reads,
+        vec![ValueType::Ref(None)],
+        "the aggregate element reads as one ArrayRead in the ref bank",
+    );
+    assert_eq!(
+        indexed.residual_gets, 0,
+        "the index spelling reaches no `get`",
+    );
+    // The discriminant read downstream of the element resolves against
+    // `SlotValue`'s own classdef rather than arriving as a bare pointer.
+    assert_eq!(
+        indexed.typed_discriminant_reads, 1,
+        "the match reads __discriminant once, against a resolved owner",
+    );
+    assert_eq!(
+        indexed.classdefless_discriminant_reads, 0,
+        "no classdef-less discriminant read survives the element alias",
+    );
+
+    // The control lowers differently, so the contrast above is real.
+    let got = slot_read_shape("aggregate_slot_get");
+    assert_eq!(
+        got.residual_gets, 1,
+        "the `get` spelling leaves its call residual",
+    );
+    assert!(
+        got.array_reads.is_empty(),
+        "the `get` spelling emits no ArrayRead, got {:?}",
+        got.array_reads,
+    );
+}
+
+/// The same pair over `Vec<i64>`, an element bank the index arm is already
+/// known to serve. It separates the two ways the sibling test could read: an
+/// aggregate element that failed to lower would differ from this baseline,
+/// while a fixture that failed to reach the index arm at all would match it
+/// in the `get` column and miss the `ArrayRead` in both.
+#[test]
+fn a_scalar_element_indexes_to_an_int_banked_array_read() {
+    use majit_translate::model::ValueType;
+
+    let indexed = slot_read_shape("scalar_slot_index");
+    assert_eq!(
+        indexed.array_reads,
+        vec![ValueType::Int],
+        "an i64 element reads as one ArrayRead in the int bank",
+    );
+    assert_eq!(indexed.residual_gets, 0, "the index spelling has no `get`");
+
+    let got = slot_read_shape("scalar_slot_get");
+    assert_eq!(
+        got.residual_gets, 1,
+        "the `get` spelling leaves its call residual for a scalar element too",
+    );
+    assert!(
+        got.array_reads.is_empty(),
+        "the `get` spelling emits no ArrayRead, got {:?}",
+        got.array_reads,
+    );
+}
