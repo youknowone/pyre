@@ -99,13 +99,18 @@ pub struct OptRewrite {
     /// present at `pure.rs`) keyed off the pure-op table — coupled to the
     /// pure-optimizer subsystem.
     ///
-    /// `comparison_producing` reads the map the other way round. That
-    /// direction has no index because the reverse question is asked only for
-    /// the operands of an `IntMul`, whereas the forward one is asked up to
-    /// three times per comparison; a second map would buy the rare lookup a
-    /// constant factor at the price of a parallel record of box identity to
-    /// keep in step.
+    /// A repeated comparison overwrites its key, which is why the reverse
+    /// question gets its own map below rather than a backwards scan of this
+    /// one.
     comparison_results: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
+    /// The same records keyed by the result, for `comparison_producing`.
+    ///
+    /// Results are unique per operation, so every comparison that passes
+    /// through keeps an entry here even when a later duplicate takes over its
+    /// forward key. A consumer asks under the result CSE left live, which is
+    /// the *earlier* of a duplicate pair — the one the forward map no longer
+    /// names.
+    comparison_by_result: indexmap::IndexMap<OpRef, (OpCode, OpRef, OpRef)>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
@@ -119,6 +124,7 @@ impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
             comparison_results: indexmap::IndexMap::new(),
+            comparison_by_result: indexmap::IndexMap::new(),
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
         }
@@ -658,12 +664,13 @@ impl OptRewrite {
         let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
         self.comparison_results
             .insert((op.opcode, arg0, arg1), op.pos.get());
+        self.comparison_by_result
+            .insert(op.pos.get(), (op.opcode, arg0, arg1));
 
         OptimizationResult::PassOn
     }
 
-    /// The comparison whose result is `result`, read out of
-    /// `comparison_results` backwards.
+    /// The comparison whose result is `result`.
     ///
     /// A fold that reaches back from a consumer to its comparison operands
     /// cannot use `get_producing_op`: that reports a producer only once it is
@@ -674,15 +681,8 @@ impl OptRewrite {
     /// written as the comparison passes through this pass, so nothing
     /// downstream can hide it.
     ///
-    /// The last matching entry wins: keys are inserted in trace order and a
-    /// repeated key overwrites, so scanning backwards reports the record that
-    /// is still live.
     fn comparison_producing(&self, result: OpRef) -> Option<(OpCode, OpRef, OpRef)> {
-        self.comparison_results
-            .iter()
-            .rev()
-            .find(|(_, produced)| **produced == result)
-            .map(|(&(opcode, arg0, arg1), _)| (opcode, arg0, arg1))
+        self.comparison_by_result.get(&result).copied()
     }
 
     /// One side of a range test: the value compared, its bound, and whether
@@ -2451,6 +2451,7 @@ impl Optimization for OptRewrite {
         // maintained cross-pass by propagate_from_pass_range +
         // emit_operation — no per-pass setup needed.
         self.comparison_results.clear();
+        self.comparison_by_result.clear();
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();
     }
@@ -2935,6 +2936,44 @@ mod tests {
             2,
             "both bound comparisons must survive the fold"
         );
+    }
+
+    /// A guest that spells the same bound twice leaves two comparisons with
+    /// one forward key, and CSE forwards the multiply's operand to the first
+    /// result. The reverse lookup has to answer for that first result, which
+    /// is the one the forward key no longer names.
+    #[test]
+    fn a_repeated_bound_comparison_still_fuses_its_range_test() {
+        let specs = vec![
+            same_i(),                    // 0: v
+            same_i(),                    // 1: LO
+            same_i(),                    // 2: HI
+            bin_i(OpCode::IntGe, 0, 1),  // 3: v >= LO
+            bin_i(OpCode::IntGe, 2, 0),  // 4: HI >= v
+            bin_i(OpCode::IntGe, 0, 1),  // 5: v >= LO, again
+            bin_i(OpCode::IntMul, 5, 4), // 6: both, reading the repeat
+        ];
+        let constants = vec![
+            (OpRef::int_op(1), Value::Int(2025)),
+            (OpRef::int_op(2), Value::Int(5625)),
+        ];
+        let (ops, queued) = run_rewrite_after_inputs(&specs, 3, &constants);
+        let opcodes = opcodes_of(&ops);
+
+        assert!(
+            !opcodes.contains(&OpCode::IntMul),
+            "the repeat must not hide the range test, got {opcodes:?}"
+        );
+        let sub = queued
+            .iter()
+            .find(|op| op.opcode == OpCode::IntSub)
+            .unwrap_or_else(|| panic!("the offset subtraction must be queued, got {queued:?}"));
+        assert_eq!(sub.arg(1).const_int(), Some(2025), "offset is `v - LO`");
+        let cmp = ops
+            .iter()
+            .find(|op| op.opcode == OpCode::UintLt)
+            .expect("the fused compare must be emitted");
+        assert_eq!(cmp.arg(1).const_int(), Some(3601));
     }
 
     /// opimpl_int_between collapses `a <= b < a+1` to `b == a`; a range whose
