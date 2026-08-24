@@ -2178,23 +2178,43 @@ fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
 
 /// `frameobject.c marklines` — the source line that starts at each
 /// instruction-unit index (`-1` where no line change begins).
-fn mark_lines(code: &CodeObject, len: usize) -> Vec<i32> {
-    let mut lines = vec![-1i32; len];
-    let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
-    let locations = crate::pycode::code_locations(code);
+///
+/// ```c
+/// while (_PyLineTable_NextAddressRange(&bounds)) {
+///     assert(bounds.ar_start / (int)sizeof(_Py_CODEUNIT) < len);
+///     if (bounds.ar_line != last_line && bounds.ar_line != -1) {
+///         linestarts[bounds.ar_start / (int)sizeof(_Py_CODEUNIT)] = bounds.ar_line;
+///         last_line = bounds.ar_line;
+///     }
+/// }
+/// ```
+///
+/// Only the **start** unit of a range is a jump target, and a `NO_LOCATION`
+/// range contributes none: `ar_line` is `-1` there and the second test drops
+/// it.  `code_locations` cannot express either — it holds one `SourceLocation`
+/// per unit whose `line` is a `OneIndexed`, so a range carrying line `0` or no
+/// line at all reads back as `1` and turns the module `RESUME` into a legal
+/// target for `f_lineno = 1`.
+///
+/// `firstlineno` is `co->co_firstlineno` as app-level set it; the assert is a
+/// bounds check here because a replaced `co_linetable` can describe ranges past
+/// `len`, which upstream would write out of bounds in a release build.
+fn mark_lines(code: &CodeObject, firstlineno: i32, len: usize) -> Vec<i32> {
+    let mut linestarts = vec![-1i32; len];
+    let mut bounds = crate::pycode::PyCodeAddressRange::new(&code.linetable, firstlineno);
     let mut last_line = -1i32;
-    for i in 0..len {
-        // `locations[i].0` is the start SourceLocation of unit `i`.
-        let line = locations
-            .get(i)
-            .map(|(start, _)| start.line.get() as i32)
-            .unwrap_or(first);
-        if line != last_line && line != -1 {
-            lines[i] = line;
-            last_line = line;
+    while bounds.advance() {
+        if bounds.ar_line != last_line && bounds.ar_line != -1 {
+            if let Some(slot) = usize::try_from(bounds.ar_start / 2)
+                .ok()
+                .and_then(|index| linestarts.get_mut(index))
+            {
+                *slot = bounds.ar_line;
+            }
+            last_line = bounds.ar_line;
         }
     }
-    lines
+    linestarts
 }
 
 /// `frameobject.c first_line_not_before` — the smallest line `>= line`
@@ -4391,7 +4411,11 @@ impl PyFrame {
 
         let code = self.code();
         let len = code.instructions.len();
-        let first_line = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+        // `if (new_lineno < f->f_frame->f_code->co_firstlineno)` — the bound
+        // is the code object's own first line, which app-level can set to
+        // zero or below, not a `OneIndexed` floor of 1.
+        let first_line =
+            unsafe { crate::pycode::w_code_firstlineno_raw(self.pycode as PyObjectRef) };
 
         let mut new_lineno = new_f_lineno as i32;
         if new_lineno < first_line {
@@ -4400,7 +4424,7 @@ impl PyFrame {
             )));
         }
 
-        let lines = mark_lines(code, len);
+        let lines = mark_lines(code, first_line, len);
         new_lineno = mark_first_line_not_before(&lines, new_lineno);
         if new_lineno < 0 {
             return Err(crate::PyError::value_error(format!(
@@ -4453,11 +4477,17 @@ impl PyFrame {
             cur_stack = mark_pop_value(cur_stack);
         }
         while cur_stack > best_stack {
-            let popped = self.popvalue();
             if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
                 // The popped value is the saved previous exception; make
                 // it current again.
-                crate::eval::set_current_exception(popped);
+                crate::eval::set_current_exception(self.popvalue());
+            } else {
+                // `PyStackRef_XCLOSE(_PyFrame_StackPop(f->f_frame))` — the
+                // `X` is load-bearing.  A slot below the jump target can be
+                // unbound, which is what a jump out of the body of a `with`
+                // pops: the block's `__exit__` slot is NULL until the
+                // cleanup runs.
+                self.popvalue_maybe_none();
             }
             cur_stack = mark_pop_value(cur_stack);
         }
@@ -5694,10 +5724,13 @@ mod tests {
     fn mark_lines_and_first_line_not_before() {
         let code = crate::compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile");
         let len = code.instructions.len();
-        let lines = mark_lines(&code, len);
         let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
-        // The earliest recorded line is the first source line.
-        let min_line = lines.iter().copied().filter(|&l| l >= 0).min().unwrap();
+        let lines = mark_lines(&code, first, len);
+        // A module body opens with a `RESUME` whose range carries line 0,
+        // below `co_firstlineno`; it is a range start, so it is marked.
+        assert_eq!(lines[0], 0);
+        // The earliest recorded statement line is the first source line.
+        let min_line = lines.iter().copied().filter(|&l| l > 0).min().unwrap();
         assert_eq!(min_line, first);
         // A request before the code resolves to the first line.
         assert_eq!(mark_first_line_not_before(&lines, first), first);
