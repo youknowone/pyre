@@ -1166,6 +1166,18 @@ pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 /// Positional frame slots required for a token's inputs and guard spills.
 /// Slot zero is the fail index; the returned count therefore also gives the
 /// first free slot for the call trampoline.
+///
+/// The GUARD_VALUE counter slot is reserved unconditionally, including for a
+/// trace whose own guards spill nothing. A bridge runs in its source token's
+/// frame, whose offsets froze when that token was compiled, and `compile_bridge`
+/// refuses a bridge whose `frame_value_slots` exceeds `source_frame.value_slots`
+/// — a refusal `declined_bridge_guards` makes permanent, so the guard blackholes
+/// for the rest of the run. Reserving only when THIS trace spills would let a
+/// loop with no GUARD_VALUE freeze a frame one slot too narrow for the first
+/// bridge that promotes a value, which is the ordinary way a bridge acquires
+/// one. Upstream never faces the question: `regalloc.py prepare_op_guard_value`
+/// names a slot in the register save area `_push_all_regs_to_frame` writes at
+/// every exit, so a slot always exists and no frame is ever sized for it.
 fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
@@ -1174,7 +1186,7 @@ fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         .max()
         .unwrap_or(0);
     let value_area = max_fail_args.max(inputargs.len());
-    1 + value_area + usize::from(guards.iter().any(|g| g.counter_value_spill.is_some()))
+    1 + value_area + 1
 }
 
 /// The trace-wide GUARD_VALUE counter slot, or `None` when no guard needs one.
