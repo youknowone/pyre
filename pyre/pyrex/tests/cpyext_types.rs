@@ -116,7 +116,9 @@ assert (origin.x, origin.y) == (0, 0), (origin.x, origin.y)
 assert (m.Point(1, 2).origin().x, m.Point(1, 2).origin().y) == (0, 0)
 assert m.Point.units(21) == 42
 assert m.Point(1, 2).units(3) == 6
-assert repr(m.Point.__dict__['origin']).startswith("<classmethod 'origin' of ")
+# `PyClassMethodDescr_Type` names `method_repr`, so a classmethod descriptor
+# reports itself the way a method descriptor does.
+assert repr(m.Point.__dict__['origin']).startswith("<method 'origin' of ")
 assert m.Point.__dict__['norm'].__doc__ == 'squared length'
 assert m.Point.__dict__['norm'].__objclass__ is m.Point
 # An unbound descriptor takes the receiver as its first argument.
