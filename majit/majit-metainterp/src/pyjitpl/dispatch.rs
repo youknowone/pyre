@@ -1869,18 +1869,14 @@ where
     /// survives optimization then deopts into a frame with no live registers
     /// and a zero-length vable section.
     ///
-    /// The promoted constant is written back into the source register rather
-    /// than fanned out through [`Self::replace_box`] — the same stand-in the
-    /// `BC_SWITCH` arm uses. A second read of that register then folds instead
-    /// of emitting a redundant `GUARD_VALUE`, but a slot in another frame that
-    /// `MIFrame::setup_call` copied the same box into keeps naming it.
-    /// Widening this to the full walk changes what every promote records, so
-    /// it wants a recorded-operation measurement of its own.
+    /// The promoted constant goes out through [`Self::replace_box`], so a
+    /// later read of any slot naming the box folds rather than re-guarding —
+    /// including one in a caller frame that `MIFrame::setup_call` copied the
+    /// same box into.
     fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        reg: usize,
         box_: OpRef,
         runtime_value: i64,
         resume_pc: usize,
@@ -1901,7 +1897,7 @@ where
             false,
         );
         // pyjitpl.py `replace_box`.
-        self.set_int_reg(reg, Some(promoted_box), Some(runtime_value));
+        self.replace_box(ctx, box_, promoted_box, Type::Int);
         // pyjitpl.py:1927
         promoted_box
     }
@@ -2004,13 +2000,9 @@ where
     ///     self.metainterp.replace_box(box, promoted_box)
     /// ```
     ///
-    /// `replace_reg` carries upstream's `replace` flag *and* the register the
-    /// rebind lands in: `Some(reg)` is `replace=True`, `None` is the
-    /// `goto_if_not_int_is_true` caller's `replace=False`, whose condbox "does
-    /// not appear anywhere in any register" because the arm just made it.
-    /// The rebind is that register write-back and not [`Self::replace_box`];
-    /// see [`Self::implement_guard_value`] for what the stand-in leaves
-    /// behind.
+    /// `replace=false` is the `goto_if_not_int_is_true` caller's, whose
+    /// condbox "does not appear anywhere in any register" because the arm
+    /// just made it.
     fn goto_if_not(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2019,7 +2011,7 @@ where
         cond: OpRef,
         cond_value: i64,
         target: usize,
-        replace_reg: Option<usize>,
+        replace: bool,
     ) {
         let (guard, promoted_value) = if cond_value != 0 {
             // `assert switchcase == 1`. Every producer of this bytecode passes
@@ -2037,9 +2029,9 @@ where
         if cond.is_constant() {
             return;
         }
-        if let Some(reg) = replace_reg {
+        if replace {
             let promoted_box = ctx.const_int(promoted_value);
-            self.set_int_reg(reg, Some(promoted_box), Some(promoted_value));
+            self.replace_box(ctx, cond, promoted_box, Type::Int);
         }
     }
 
@@ -4864,7 +4856,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_int_checked(
@@ -4916,7 +4908,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_ref_checked(
@@ -4968,7 +4960,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let guards_before = ctx.num_guards();
                 let (opref, value) = ctx.vable_getarrayitem_float_checked(
@@ -5020,7 +5012,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
@@ -5081,7 +5073,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
@@ -5139,7 +5131,7 @@ where
                 let index = if nonstandard {
                     index
                 } else {
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                    self.implement_guard_value(ctx, sym, index, index_value, opcode_pc)
                 };
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
@@ -5275,15 +5267,7 @@ where
                     )
                 };
                 let (cond, cond_value) = self.read_int_reg(cond_idx);
-                self.goto_if_not(
-                    ctx,
-                    sym,
-                    opcode_pc,
-                    cond,
-                    cond_value,
-                    target,
-                    Some(cond_idx),
-                );
+                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
             //   condbox = self.execute(rop.INT_IS_TRUE, box)
@@ -5315,7 +5299,7 @@ where
                     Some(majit_ir::Value::Int(cond_value)),
                     self.last_exception_value,
                 );
-                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, None);
+                self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
             //   condbox = execute(rop.INT_IS_ZERO, box)
@@ -8729,7 +8713,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_int_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Int);
+                }
             }
             // pyjitpl.py opimpl_assert_not_none.  Blackhole:
             // asserts the concrete ref is non-null and advances past
@@ -8774,7 +8761,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_ref_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Ref);
+                }
             }
             // pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
             jitcode::insns::BC_FLOAT_GUARD_VALUE => {
@@ -8793,7 +8783,10 @@ where
                     opcode_pc,
                     false,
                 );
-                self.set_float_reg(src, Some(const_ref), Some(concrete));
+                // `implement_guard_value`'s `if isinstance(box, Const): return box`.
+                if !opref.is_constant() {
+                    self.replace_box(ctx, opref, const_ref, Type::Float);
+                }
             }
             jitcode::insns::BC_RAISE => {
                 // pyjitpl.py opimpl_raise:
@@ -13405,6 +13398,25 @@ mod tests {
             &[(JitArgKind::Ref, aliased, 0), (JitArgKind::Ref, aliased, 0)],
         );
         assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
+    }
+
+    /// `implement_guard_value` ends in `replace_box`, so the constant the
+    /// guard proved reaches every register naming the box — a promote inside
+    /// an inlined helper leaves the caller's copy folded too, rather than
+    /// recording arithmetic against a box already pinned to a value.
+    #[test]
+    fn a_guard_value_promote_replaces_the_box_in_an_aliasing_register() {
+        let mut builder = JitCodeBuilder::new();
+        builder.int_guard_value(0);
+        // Read the ALIAS, not the register the guard named.
+        builder.record_binop_i(2, OpCode::IntAdd, 1, 1);
+        let aliased = OpRef::input_arg_int(0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, aliased, 3), (JitArgKind::Int, aliased, 3)],
+        );
+        assert_eq!(recorded, vec![OpCode::GuardValue], "{recorded:?}");
     }
 
     /// `opimpl_goto_if_not`'s tail — `if replace: replace_box(box,
