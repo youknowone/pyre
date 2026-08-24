@@ -1114,7 +1114,21 @@ pub(crate) fn summarize_body_blockers(
                     push!(points, work, target, state.clone());
                 }
             }
-            _ => push!(points, work, d.next_pc, state),
+            _ => {
+                // An opcode this match does not name but that carries an `L`
+                // operand is a branch nobody modelled here.  The codewriter
+                // emits `int_{add,sub,mul}_jump_if_ovf` (`flatten.rs`), none of
+                // which reaches an assembled body in this build — every `L`
+                // carrier in the insns table is claimed above.  Following the
+                // target as well as the fallthrough over-approximates the
+                // graph, which can only add blockers; dropping the edge would
+                // remove a region, and a region the scan never enters reports
+                // no blocker.
+                if let Some(target) = label {
+                    push!(points, work, target, state.clone());
+                }
+                push!(points, work, d.next_pc, state);
+            }
         }
     }
 
