@@ -1005,7 +1005,15 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
     });
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
 
+    // `_PyErr_PrintEx`'s `else` arm: the caller asked to have the exception
+    // printed, so a hook that cannot be reached is said so and the exception is
+    // printed by the one `sys.__excepthook__` names.
+    let without_hook = || {
+        crate::PyError::write_report_line(b"sys.excepthook is missing\n");
+        let _ = crate::builtins::sys_excepthook(&[reload(1), reload(0), reload(2)]);
+    };
     let Some(sys_module) = crate::importing::get_sys_module("sys") else {
+        without_hook();
         return;
     };
     let sys_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1028,14 +1036,27 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
             drop(stored);
         }
     }
-    let hook = crate::baseobjspace::getattr_str(
+    // `_PySys_GetOptionalAttr(&_Py_ID(excepthook), &hook)`: a miss arrives as
+    // an `AttributeError` and is a hook that is not there, while any other
+    // failure is reported before the fallback runs.  `None` is a hook that is
+    // there, and calling it is what reports it.
+    let w_hook = match crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(sys_slot),
         "excepthook",
-    );
-    let Ok(w_hook) = hook else {
-        return;
+    ) {
+        Ok(w_hook) => w_hook,
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => pyre_object::PY_NULL,
+        Err(mut failure) => {
+            failure.write_unraisable(
+                space,
+                rustpython_wtf8::Wtf8::new("Exception ignored when trying to fetch sys.excepthook"),
+                pyre_object::PY_NULL,
+            );
+            pyre_object::PY_NULL
+        }
     };
-    if w_hook.is_null() || unsafe { pyre_object::is_none(w_hook) } {
+    if w_hook.is_null() {
+        without_hook();
         return;
     }
     let hook_slot = pyre_object::gc_roots::shadow_stack_len();

@@ -157,7 +157,7 @@ static PyObject *point_declared_in(PyObject *self, PyTypeObject *cls,
     PointObject *point = (PointObject *)self;
     Py_ssize_t named = kwnames == NULL ? 0 : PyTuple_GET_SIZE(kwnames);
     (void)args;
-    return Py_BuildValue("sinn", cls->tp_name, point->x, nargs, named);
+    return Py_BuildValue("slnn", cls->tp_name, point->x, nargs, named);
 }
 
 /* A row that reads nothing off its receiver, so the same definition answers
@@ -1733,10 +1733,23 @@ static PyMethodDef extra_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+/* `Py_RELATIVE_OFFSET` counts from the extra data rather than from the block,
+   so the same `offsetof` the accessors above use serves the descriptors.
+   `weight` also asks to be audited on every read. */
+static PyMemberDef extra_members[] = {
+    {"tag", Py_T_LONG, offsetof(extra_data, tag), Py_RELATIVE_OFFSET,
+     "the tag, through a descriptor"},
+    {"weight", Py_T_DOUBLE, offsetof(extra_data, weight),
+     Py_READONLY | Py_RELATIVE_OFFSET | Py_AUDIT_READ,
+     "the weight, through a descriptor"},
+    {NULL, 0, 0, 0, NULL},
+};
+
 static char extra_token;
 
 static PyType_Slot extra_slots[] = {
     {Py_tp_methods, extra_methods},
+    {Py_tp_members, extra_members},
     {Py_tp_token, &extra_token},
     {0, NULL},
 };

@@ -9,12 +9,20 @@
 /* Whether the table was bound, and whether each of its type slots is the class
    of the same name.  Everything below reaches through it, so a failure here is
    the first thing to look at. */
+static int table_bound(void)
+{
+    if (PyDateTimeAPI != NULL) {
+        return 1;
+    }
+    PyErr_SetString(PyExc_AssertionError, "PyDateTimeAPI is NULL");
+    return 0;
+}
+
 static PyObject *table(PyObject *self, PyObject *module)
 {
     (void)self;
     (void)module;
-    if (PyDateTimeAPI == NULL) {
-        PyErr_SetString(PyExc_AssertionError, "PyDateTimeAPI is NULL");
+    if (!table_bound()) {
         return NULL;
     }
     return Py_BuildValue(
@@ -34,6 +42,9 @@ static PyObject *sizes(PyObject *self, PyObject *module)
 {
     (void)self;
     (void)module;
+    if (!table_bound()) {
+        return NULL;
+    }
     return Py_BuildValue(
         "{s:n,s:n,s:n,s:n}",
         "date", PyDateTimeAPI->DateType->tp_basicsize,

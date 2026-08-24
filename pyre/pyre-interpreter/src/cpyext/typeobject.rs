@@ -3025,6 +3025,25 @@ pub const T_PYSSIZET: c_int = 19;
 pub const T_NONE: c_int = 20;
 /// `READONLY`.
 pub const MEMBER_READONLY: c_int = 1;
+/// `Py_AUDIT_READ` -- reading the member emits `object.__getattr__`.
+pub const MEMBER_AUDIT_READ: c_int = 2;
+/// `Py_RELATIVE_OFFSET` -- `offset` counts from the extra data a negative
+/// `basicsize` asked for, not from the block.  [`from_spec`] resolves it.
+pub const MEMBER_RELATIVE_OFFSET: c_int = 8;
+
+/// A member still carrying [`MEMBER_RELATIVE_OFFSET`] has an `offset` its
+/// reader cannot use: nothing but the type it was built for knows where the
+/// extra data starts.  A table declared statically has no extra data at all,
+/// so one that sets the flag is a declaration error.
+fn reject_relative_offset(member: *mut CPyMemberDef, entry: &str) -> Result<(), crate::PyError> {
+    if unsafe { (*member).flags } & MEMBER_RELATIVE_OFFSET == 0 {
+        return Ok(());
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::SystemError,
+        format!("{entry} used with Py_RELATIVE_OFFSET"),
+    ))
+}
 
 fn member_address(w_self: PyObjectRef, member: *mut CPyMemberDef) -> *mut u8 {
     let block = instance_block(w_self);
@@ -3038,6 +3057,7 @@ fn read_member(
     w_self: PyObjectRef,
     member: *mut CPyMemberDef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    reject_relative_offset(member, "PyMember_GetOne")?;
     let address = member_address(w_self, member);
     if address.is_null() {
         return Err(crate::PyError::new(
@@ -3109,6 +3129,7 @@ fn write_member(
     member: *mut CPyMemberDef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    reject_relative_offset(member, "PyMember_SetOne")?;
     let name = || {
         unsafe { std::ffi::CStr::from_ptr((*member).name) }
             .to_string_lossy()
@@ -3219,7 +3240,32 @@ fn member_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "cpyext member descriptor lost its definition",
         ));
     }
-    read_member(instance, member)
+    read_member(audit_member_read(instance, member)?, member)
+}
+
+/// `member_get`'s `object.__getattr__` event, which a `Py_AUDIT_READ` member
+/// owes before its value is read.
+///
+/// The hooks are app code and so is the wrap of the member name, which makes
+/// both collection points; the instance reaches them only as a copied pointer,
+/// so it is rooted across them and read back out of its slot.
+fn audit_member_read(
+    instance: PyObjectRef,
+    member: *mut CPyMemberDef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { (*member).flags } & MEMBER_AUDIT_READ == 0
+        || !crate::module::sys::vm::audit_hooks_armed()
+    {
+        return Ok(instance);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[instance]);
+    let w_name = text_or_none(unsafe { (*member).name });
+    crate::module::sys::vm::audit(
+        "object.__getattr__",
+        &[pyre_object::gc_roots::shadow_stack_get(slot), w_name],
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(slot))
 }
 
 fn member_descr_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5530,23 +5576,108 @@ fn apply_slot(tp: *mut CPyTypeObject, id: c_int, value: *mut c_void) -> Result<(
 ///
 /// # Safety
 /// `tp` must be a valid type block.
-unsafe fn adopt_offset_members(tp: *mut CPyTypeObject) {
+unsafe fn adopt_offset_members(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
     let members = unsafe { (*tp).tp_members };
     if members.is_null() {
-        return;
+        return Ok(());
     }
     let mut index = 0isize;
     while !unsafe { (*members.offset(index)).name }.is_null() {
         let member = unsafe { members.offset(index) };
         index += 1;
-        let offset = unsafe { (*member).offset };
-        match unsafe { std::ffi::CStr::from_ptr((*member).name) }.to_bytes() {
-            b"__vectorcalloffset__" => unsafe { (*tp).tp_vectorcall_offset = offset },
-            b"__dictoffset__" => unsafe { (*tp).tp_dictoffset = offset },
-            b"__weaklistoffset__" => unsafe { (*tp).tp_weaklistoffset = offset },
-            _ => {}
-        }
+        let destination = match unsafe { std::ffi::CStr::from_ptr((*member).name) }.to_bytes() {
+            b"__vectorcalloffset__" => unsafe { &raw mut (*tp).tp_vectorcall_offset },
+            b"__dictoffset__" => unsafe { &raw mut (*tp).tp_dictoffset },
+            b"__weaklistoffset__" => unsafe { &raw mut (*tp).tp_weaklistoffset },
+            _ => continue,
+        };
+        unsafe { *destination = special_offset(member)? };
     }
+    Ok(())
+}
+
+/// `special_offset_from_member`.  Its relative arm is spent by the time this
+/// runs: [`resolve_relative_members`] has already added the type data offset
+/// and cleared the flag, which leaves the pair of flag sets it accepts spelled
+/// the same way.
+fn special_offset(member: *mut CPyMemberDef) -> Result<isize, crate::PyError> {
+    let name = || {
+        unsafe { std::ffi::CStr::from_ptr((*member).name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let complaint = if unsafe { (*member).type_code } != T_PYSSIZET {
+        format!("type of {} must be Py_T_PYSSIZET", name())
+    } else if unsafe { (*member).flags } != MEMBER_READONLY {
+        format!(
+            "flags for {} must be Py_READONLY or (Py_READONLY | Py_RELATIVE_OFFSET)",
+            name()
+        )
+    } else {
+        return Ok(unsafe { (*member).offset });
+    };
+    Err(crate::PyError::new(
+        crate::PyErrorKind::SystemError,
+        complaint,
+    ))
+}
+
+/// `_PyType_FromMetaclass_impl`'s rewrite of the `Py_RELATIVE_OFFSET` members
+/// it copies into the type it is building: the offset is counted from the
+/// extra data a negative `basicsize` asked for, and every reader below counts
+/// from the block.
+///
+/// The rewrite lands on a copy because the table belongs to the extension: the
+/// same static table can be named by a second spec, which would otherwise read
+/// the offsets this call already resolved.
+///
+/// # Safety
+/// `tp` must be a valid type block whose `tp_members`, when it is set, is a
+/// name-terminated table.
+unsafe fn resolve_relative_members(
+    tp: *mut CPyTypeObject,
+    declared: isize,
+    type_data_offset: isize,
+) -> Result<(), crate::PyError> {
+    let members = unsafe { (*tp).tp_members };
+    if members.is_null() {
+        return Ok(());
+    }
+    let mut table: Vec<CPyMemberDef> = Vec::new();
+    let mut index = 0isize;
+    while !unsafe { (*members.offset(index)).name }.is_null() {
+        let mut member = unsafe { std::ptr::read(members.offset(index)) };
+        index += 1;
+        if member.flags & MEMBER_RELATIVE_OFFSET != 0 {
+            let complaint = if declared > 0 {
+                "With Py_RELATIVE_OFFSET, basicsize must be negative."
+            } else if member.offset < 0 || member.offset >= -declared {
+                "Member offset out of range (0..-basicsize)"
+            } else {
+                member.flags &= !MEMBER_RELATIVE_OFFSET;
+                member.offset += type_data_offset;
+                ""
+            };
+            if !complaint.is_empty() {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::SystemError,
+                    complaint,
+                ));
+            }
+        }
+        table.push(member);
+    }
+    // The table is name-terminated, and it outlives the call for the same
+    // reason the type does.
+    table.push(CPyMemberDef {
+        name: std::ptr::null(),
+        type_code: 0,
+        offset: 0,
+        flags: 0,
+        doc: std::ptr::null(),
+    });
+    unsafe { (*tp).tp_members = Box::leak(table.into_boxed_slice()).as_mut_ptr() };
+    Ok(())
 }
 
 /// The one base pyre can build a type on.
@@ -5654,11 +5785,6 @@ fn from_spec(
         index += 1;
     }
 
-    // The three offsets a spec has no slot id for, which a type therefore
-    // declares as members instead.  Read before the size below, which
-    // `tp_dictoffset` and `tp_weaklistoffset` are measured against.
-    unsafe { adopt_offset_members(tp) };
-
     // The base's own size is what a relative or inherited `basicsize` is
     // measured against, so it has to be final before either is resolved.
     let base = unsafe { (*tp).tp_base };
@@ -5674,6 +5800,12 @@ fn from_spec(
         unsafe { (*base).tp_basicsize }
     };
     let declared = unsafe { (*spec).basicsize } as isize;
+    // Where the extra data starts, which is what a `Py_RELATIVE_OFFSET` member
+    // counts from.  Only the extending spelling has any.
+    let type_data_offset = match declared {
+        negative if negative < 0 => align_up(base_basicsize),
+        other => other,
+    };
     unsafe {
         (*tp).tp_basicsize = match declared {
             // Inherit: an extension that declares no storage of its own gets
@@ -5681,10 +5813,16 @@ fn from_spec(
             0 => base_basicsize,
             // Extend: the magnitude is the extra data appended after the base,
             // which is what `PyType_GetTypeDataSize` reports back.
-            negative if negative < 0 => align_up(base_basicsize) + align_up(-negative),
+            negative if negative < 0 => type_data_offset + align_up(-negative),
             absolute => absolute,
         };
     }
+    // Both of these read `tp_members` and the second reads what the first
+    // resolved, and the sizes above are what they are resolved against.
+    unsafe { resolve_relative_members(tp, declared, type_data_offset)? };
+    // The three offsets a spec has no slot id for, which a type therefore
+    // declares as members instead.
+    unsafe { adopt_offset_members(tp)? };
 
     ready(tp, w_metaclass)?;
     if !token.is_null() {

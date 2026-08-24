@@ -58,7 +58,8 @@ static PyType_Slot caller_slots[] = {
 
 static PyType_Spec caller_spec = {
     "cpyext_cython_shapes.Caller", sizeof(Caller), 0,
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, caller_slots};
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_VECTORCALL,
+    caller_slots};
 
 /* ── the ancestry a `cdef class` is laid out against ─────────────────────
    `__Pyx_MergeVtables` takes `PyTuple_GET_SIZE(type->tp_bases)`, so a null

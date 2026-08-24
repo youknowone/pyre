@@ -24,6 +24,12 @@ pub struct CPyComplexObject {
     pub cval: CPyComplex,
 }
 
+const _: () = {
+    assert!(std::mem::offset_of!(CPyComplexObject, ob_base) == 0);
+    assert!(std::mem::offset_of!(CPyComplexObject, cval) == 3 * size_of::<usize>());
+    assert!(std::mem::offset_of!(CPyComplex, imag) == size_of::<c_double>());
+};
+
 /// The `complex` class, or null before it is built.
 fn complex_type() -> PyObjectRef {
     match crate::typedef::gettypefor(&pyre_object::COMPLEX_TYPE) {

@@ -429,6 +429,19 @@ assert e.get() == (3, 0.5, 9), e.get()
 e.code = 11
 assert e.get() == (3, 0.5, 11), e.get()
 
+# The same words through descriptors whose offsets were declared relative to
+# the extra data and resolved when the type was built.
+assert e.tag == 3, e.tag
+assert e.weight == 0.5, e.weight
+e.tag = 4
+assert e.get() == (4, 0.5, 11), e.get()
+try:
+    e.weight = 1.0
+except AttributeError:
+    pass
+else:
+    raise AssertionError('a readonly member was written')
+
 module, by_def_is_module, module_name, qualified = m.type_owner(m.Extra)
 assert module is m
 assert qualified == 'cpyext_types.Extra', qualified
@@ -841,6 +854,21 @@ finally:
     if was_enabled:
         gc.enable()
 assert during > settled, f'gc.collect() returned before tp_dealloc ran: {settled} -> {during}'
+
+# ── a member declaring Py_AUDIT_READ reports every read ────────────────
+# Last, because a hook can never be removed once it is installed.
+import sys
+
+seen = []
+sys.addaudithook(
+    lambda event, args: seen.append(args[1]) if event == 'object.__getattr__' else None
+)
+audited = m.Extra(1)
+audited.set(5, 2.5)
+assert audited.tag == 5, audited.tag
+assert seen == [], seen
+assert audited.weight == 2.5, audited.weight
+assert seen == ['weight'], seen
 
 print('cpyext-lifetime-ok')
 "#;

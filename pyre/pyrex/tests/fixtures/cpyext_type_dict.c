@@ -47,15 +47,26 @@ static PyTypeObject StaticType = {
 
 /* The type's own namespace, handed back so Python can compare it against what
    `type.__dict__` reports. */
-static PyObject *type_dict(PyObject *self, PyObject *type)
+/* Every entry point below reads `tp_dict` straight out of the block, so the
+   argument has to be a type before the read rather than after it. */
+static PyTypeObject *as_type(PyObject *object)
 {
+    if (PyType_Check(object)) {
+        return (PyTypeObject *)object;
+    }
+    PyErr_SetString(PyExc_TypeError, "not a type");
+    return NULL;
+}
+
+static PyObject *type_dict(PyObject *self, PyObject *object)
+{
+    PyTypeObject *type = as_type(object);
     PyObject *dict;
     (void)self;
-    if (!PyType_Check(type)) {
-        PyErr_SetString(PyExc_TypeError, "not a type");
+    if (type == NULL) {
         return NULL;
     }
-    dict = ((PyTypeObject *)type)->tp_dict;
+    dict = type->tp_dict;
     if (dict == NULL) {
         PyErr_SetString(PyExc_AssertionError, "tp_dict is NULL");
         return NULL;
@@ -67,18 +78,23 @@ static PyObject *type_dict(PyObject *self, PyObject *type)
    -- the read `__Pyx_setup_reduce` makes before it writes. */
 static PyObject *declares(PyObject *self, PyObject *args)
 {
-    PyObject *type;
+    PyObject *object;
+    PyTypeObject *type;
     const char *name;
     PyObject *found;
     (void)self;
-    if (!PyArg_ParseTuple(args, "Os", &type, &name)) {
+    if (!PyArg_ParseTuple(args, "Os", &object, &name)) {
         return NULL;
     }
-    if (!PyDict_Check(((PyTypeObject *)type)->tp_dict)) {
+    type = as_type(object);
+    if (type == NULL) {
+        return NULL;
+    }
+    if (!PyDict_Check(type->tp_dict)) {
         PyErr_SetString(PyExc_AssertionError, "tp_dict is not a dict");
         return NULL;
     }
-    found = PyDict_GetItemString(((PyTypeObject *)type)->tp_dict, name);
+    found = PyDict_GetItemString(type->tp_dict, name);
     if (found == NULL && PyErr_Occurred()) {
         return NULL;
     }
@@ -89,33 +105,43 @@ static PyObject *declares(PyObject *self, PyObject *args)
    namespace changed. */
 static PyObject *set_on_type_dict(PyObject *self, PyObject *args)
 {
-    PyObject *type;
+    PyObject *object;
+    PyTypeObject *type;
     PyObject *key;
     PyObject *value;
     (void)self;
-    if (!PyArg_ParseTuple(args, "OOO", &type, &key, &value)) {
+    if (!PyArg_ParseTuple(args, "OOO", &object, &key, &value)) {
         return NULL;
     }
-    if (PyDict_SetItem(((PyTypeObject *)type)->tp_dict, key, value) < 0) {
+    type = as_type(object);
+    if (type == NULL) {
         return NULL;
     }
-    PyType_Modified((PyTypeObject *)type);
+    if (PyDict_SetItem(type->tp_dict, key, value) < 0) {
+        return NULL;
+    }
+    PyType_Modified(type);
     Py_RETURN_NONE;
 }
 
 /* `__Pyx__DelItemOnTypeDict` verbatim. */
 static PyObject *del_from_type_dict(PyObject *self, PyObject *args)
 {
-    PyObject *type;
+    PyObject *object;
+    PyTypeObject *type;
     PyObject *key;
     (void)self;
-    if (!PyArg_ParseTuple(args, "OO", &type, &key)) {
+    if (!PyArg_ParseTuple(args, "OO", &object, &key)) {
         return NULL;
     }
-    if (PyDict_DelItem(((PyTypeObject *)type)->tp_dict, key) < 0) {
+    type = as_type(object);
+    if (type == NULL) {
         return NULL;
     }
-    PyType_Modified((PyTypeObject *)type);
+    if (PyDict_DelItem(type->tp_dict, key) < 0) {
+        return NULL;
+    }
+    PyType_Modified(type);
     Py_RETURN_NONE;
 }
 
@@ -123,27 +149,32 @@ static PyObject *del_from_type_dict(PyObject *self, PyObject *args)
    extension types before the module finishes loading. */
 static PyObject *rename_on_type_dict(PyObject *self, PyObject *args)
 {
-    PyObject *type;
+    PyObject *object;
+    PyTypeObject *type;
     PyObject *from;
     PyObject *to;
     PyObject *value;
     (void)self;
-    if (!PyArg_ParseTuple(args, "OOO", &type, &from, &to)) {
+    if (!PyArg_ParseTuple(args, "OOO", &object, &from, &to)) {
         return NULL;
     }
-    value = PyObject_GetAttr(type, from);
+    type = as_type(object);
+    if (type == NULL) {
+        return NULL;
+    }
+    value = PyObject_GetAttr(object, from);
     if (value == NULL) {
         return NULL;
     }
-    if (PyDict_SetItem(((PyTypeObject *)type)->tp_dict, to, value) < 0) {
+    if (PyDict_SetItem(type->tp_dict, to, value) < 0) {
         Py_DECREF(value);
         return NULL;
     }
     Py_DECREF(value);
-    if (PyDict_DelItem(((PyTypeObject *)type)->tp_dict, from) < 0) {
+    if (PyDict_DelItem(type->tp_dict, from) < 0) {
         return NULL;
     }
-    PyType_Modified((PyTypeObject *)type);
+    PyType_Modified(type);
     Py_RETURN_NONE;
 }
 

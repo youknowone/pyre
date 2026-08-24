@@ -1969,6 +1969,14 @@ impl PyError {
         Self::write_unraisable_default(space, w_type, w_value, w_tb, &first_line, w_object, "");
     }
 
+    /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
+    /// is one and on the host's stream when there is not.
+    pub(crate) fn write_report_line(buf: &[u8]) {
+        if !Self::write_unraisable_to_sys_stderr(buf) {
+            emit_report_to_host_stderr(buf);
+        }
+    }
+
     fn write_unraisable_to_sys_stderr(buf: &[u8]) -> bool {
         let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
             return false;

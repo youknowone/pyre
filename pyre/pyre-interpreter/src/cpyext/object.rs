@@ -6,30 +6,42 @@ use super::typeobject::{CPyTypeObject, CPyVarObject};
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-/// Call `callable` with `arguments` and one keyword.
+/// Call `callable` with `arguments` and the keywords `names` spells.
 ///
-/// The keyword forms an `Arguments(..., keyword_names_w=[name])`, which needs
+/// The keywords form an `Arguments(..., keyword_names_w=names)`, which needs
 /// the running frame: an entry point reached with none is being called from
 /// outside any interpreter and reports that rather than guessing one.
+pub(super) fn call_named(
+    callable: PyObjectRef,
+    arguments: &[PyObjectRef],
+    names: &[(rustpython_wtf8::Wtf8Buf, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "a cpyext keyword call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, names)
+    })
+}
+
+/// [`call_named`] for the single keyword an entry point names itself.
 pub(super) fn call_keyword(
     callable: PyObjectRef,
     arguments: &[PyObjectRef],
     name: &str,
     value: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let names = [(
-        rustpython_wtf8::Wtf8Buf::from_string(name.to_string()),
-        value,
-    )];
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "a cpyext entry point passed a keyword with no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, arguments, &names)
-    })
+    call_named(
+        callable,
+        arguments,
+        &[(
+            rustpython_wtf8::Wtf8Buf::from_string(name.to_string()),
+            value,
+        )],
+    )
 }
 
 /// The interpreter object behind an argument, or a recorded `SystemError`.
@@ -906,20 +918,11 @@ fn call_with_keywords(
         .iter()
         .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from_string(name.clone()), *value))
         .collect();
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "cpyext keyword call has no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(
-            unsafe { &mut *frame },
-            pyre_object::gc_roots::shadow_stack_get(callable_slot),
-            &arguments,
-            &names,
-        )
-    })
+    call_named(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &arguments,
+        &names,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -1518,20 +1521,11 @@ unsafe fn call_vector(
         .enumerate()
         .map(|(index, name)| (name, value_at(nargs + index)))
         .collect();
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "cpyext keyword call has no current frame",
-            ));
-        }
-        crate::call::call_with_kwargs(
-            unsafe { &mut *frame },
-            pyre_object::gc_roots::shadow_stack_get(callable_slot),
-            &positional,
-            &keywords,
-        )
-    })
+    call_named(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &positional,
+        &keywords,
+    )
 }
 
 /// `PyObject_Vectorcall(callable, args, nargsf, kwnames)`.
@@ -1611,6 +1605,21 @@ pub unsafe extern "C" fn PyVectorcall_Call(
 ) -> *mut CPyObject {
     realize_all([callable, tuple, dict]);
     if callable.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    // `_PyVectorcall_Call` asserts both of these before it unpacks them.  An
+    // assertion is a crash in one build and a wild read in every other, so a
+    // caller that broke the contract is told so instead.
+    let mismatched = |object: *mut CPyObject, wanted_tuple: bool| unsafe {
+        let value = pyobject::from_ref(object);
+        !value.is_null()
+            && !match wanted_tuple {
+                true => pyre_object::is_tuple(value),
+                false => pyre_object::is_dict(value),
+            }
+    };
+    if mismatched(tuple, true) || mismatched(dict, false) {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }

@@ -9,6 +9,17 @@
 static PyTypeObject *dict_type;
 static PyTypeObject *list_type;
 
+/* Every slot below was read off a fixed type and reads a block laid out that
+   way, so an argument of another type is refused here rather than at the read. */
+static int is_a(PyObject *o, PyTypeObject *type)
+{
+    if (PyObject_TypeCheck(o, type)) {
+        return 1;
+    }
+    PyErr_Format(PyExc_TypeError, "expected a %s", type->tp_name);
+    return 0;
+}
+
 /* `type->tp_repr(o)`, for a `type` the caller names rather than `Py_TYPE(o)`. */
 static PyObject *repr_through(PyObject *self, PyObject *o)
 {
@@ -16,6 +27,9 @@ static PyObject *repr_through(PyObject *self, PyObject *o)
     (void)self;
     if (slot == NULL) {
         PyErr_SetString(PyExc_AssertionError, "dict carries no tp_repr");
+        return NULL;
+    }
+    if (!is_a(o, dict_type)) {
         return NULL;
     }
     return slot(o);
@@ -28,6 +42,9 @@ static PyObject *length_through(PyObject *self, PyObject *o)
     (void)self;
     if (slot == NULL) {
         PyErr_SetString(PyExc_AssertionError, "dict carries no mp_length");
+        return NULL;
+    }
+    if (!is_a(o, dict_type)) {
         return NULL;
     }
     counted = slot(o);
@@ -48,6 +65,9 @@ static PyObject *item_through(PyObject *self, PyObject *args)
     }
     if (slot == NULL) {
         PyErr_SetString(PyExc_AssertionError, "list carries no sq_item");
+        return NULL;
+    }
+    if (!is_a(o, list_type)) {
         return NULL;
     }
     return slot(o, at);

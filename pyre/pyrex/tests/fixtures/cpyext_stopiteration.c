@@ -59,7 +59,18 @@ static PyObject *fetch_returned(PyObject *self, PyObject *iterator)
     }
     PyErr_Fetch(&type, &value, &traceback);
     PyErr_NormalizeException(&type, &value, &traceback);
-    returned = Py_NewRef(((PyStopIterationObject *)value)->value);
+    /* The normalize is what makes the block readable, and the read is a field
+       that a `StopIteration` raised bare leaves unset. */
+    returned = NULL;
+    if (value != NULL
+        && PyObject_TypeCheck(value, (PyTypeObject *)PyExc_StopIteration)) {
+        returned = ((PyStopIterationObject *)value)->value;
+    }
+    if (returned == NULL) {
+        PyErr_SetString(PyExc_AssertionError, "the fetch carried no value");
+    } else {
+        Py_INCREF(returned);
+    }
     Py_XDECREF(type);
     Py_XDECREF(value);
     Py_XDECREF(traceback);
