@@ -1690,6 +1690,20 @@ impl GcRewriterImpl {
     /// `gc_malloc_big_fixedsize_helper` → `alloc_nursery_typed`, which is
     /// `MiniMarkGC::alloc_with_type`), so the stamp is applied.
     ///
+    /// "This is always true because it's a fixed-size object" is the load-bearing
+    /// half of upstream's comment, and it is about cards, not about size.
+    /// Fixed-size means `external_malloc(typeid, 0, ...)`: length zero, so no
+    /// `GCFLAG_HAS_CARDS` and `extra_flags = 0`, so no
+    /// `GCFLAG_TRACK_YOUNG_PTRS`.  A young rawmalloced object without that flag
+    /// is appended to `old_objects_pointing_to_young` the moment
+    /// `_visit_young_rawmalloced_object` promotes it, so its slots are traced
+    /// without any barrier ever having run; unreached, it is freed and its slots
+    /// never mattered.  `MiniMarkGC::finish_alloc_young_nonmoving` births the
+    /// header the same way.  This is also why `gen_call_malloc_gc` must *not*
+    /// stamp in general — "v_result might be a large young array", and a
+    /// card-marked array is born carrying `GCFLAG_TRACK_YOUNG_PTRS`, which puts
+    /// its writes back under the barrier.
+    ///
     /// It is applied *conditionally*, because upstream's large arm has one
     /// outcome and pyre's has a rollback gate: under
     /// `MAJIT_GC_YOUNG_RAWMALLOC=0` the same helper births the object in the old
