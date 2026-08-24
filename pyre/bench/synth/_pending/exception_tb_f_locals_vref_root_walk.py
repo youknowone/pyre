@@ -22,6 +22,21 @@
 # promoting this would spend a run on three backends to gate nothing.  Find what
 # closed it first; the reproduction below is only worth what it still catches.
 #
+# WHY, measured the same day with a counter compiled into the walker: the
+# guard's arm NEVER FIRES.  `walk_frame_value_slot` runs -- the call counter
+# reaches 3 within the first collection and the arm is reached on 26 of 40
+# fixtures that read `f_locals`, `tb_frame` or `__traceback__` -- and across all
+# 26 `forward_virtual_ref_forced` returned true exactly 0 times.  No
+# `locals_cells_stack_w` slot holds a `JitVirtualRef` any more, on this fixture
+# or on any of them, so there is nothing left for the arm to catch and removing
+# it cannot fault.  `walk_raw_exception_roots` is still unguarded and
+# `is_exception` still dereferences `ob_type`, so the arm is not redundant --
+# its input has disappeared.
+#
+# That is worth a look on its own: a vref that stops reaching a frame slot is
+# either a deliberate earlier force or the virtualizable optimisation quietly
+# not applying where it used to.
+#
 # When it is promoted, `# pyre-check: selfcheck` is the shape, and the baseline
 # blocker above dissolves rather than needing an overlay: `run_selfcheck` takes
 # no jit-stats snapshot at all (0 of the 25 selfcheck fixtures carry a
