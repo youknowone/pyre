@@ -1869,11 +1869,13 @@ where
     /// survives optimization then deopts into a frame with no live registers
     /// and a zero-length vable section.
     ///
-    /// `replace_box` has no whole-metainterp equivalent here; writing the
-    /// promoted constant back into the source register is the same stand-in
-    /// the `BC_SWITCH` arm in this file already uses for it, and it is what
-    /// keeps a second read of the same register from emitting a redundant
-    /// `GUARD_VALUE`.
+    /// The promoted constant is written back into the source register rather
+    /// than fanned out through [`Self::replace_box`] — the same stand-in the
+    /// `BC_SWITCH` arm uses. A second read of that register then folds instead
+    /// of emitting a redundant `GUARD_VALUE`, but a slot in another frame that
+    /// `MIFrame::setup_call` copied the same box into keeps naming it.
+    /// Widening this to the full walk changes what every promote records, so
+    /// it wants a recorded-operation measurement of its own.
     fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
@@ -2006,8 +2008,9 @@ where
     /// rebind lands in: `Some(reg)` is `replace=True`, `None` is the
     /// `goto_if_not_int_is_true` caller's `replace=False`, whose condbox "does
     /// not appear anywhere in any register" because the arm just made it.
-    /// `replace_box` has no whole-metainterp equivalent at this layer — see
-    /// [`Self::implement_guard_value`] for the same stand-in.
+    /// The rebind is that register write-back and not [`Self::replace_box`];
+    /// see [`Self::implement_guard_value`] for what the stand-in leaves
+    /// behind.
     fn goto_if_not(
         &mut self,
         ctx: &mut TraceCtx,
