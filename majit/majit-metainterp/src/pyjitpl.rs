@@ -5762,7 +5762,14 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fdescr, adescr)
+            .vable_arraylen_vable(
+                cpu.as_ref(),
+                pc,
+                vable_opref,
+                vable_struct_ptr,
+                fdescr,
+                adescr,
+            )
     }
 
     /// pyjitpl.py `opimpl_hint_force_virtualizable(box)`.

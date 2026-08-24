@@ -172,16 +172,20 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
         ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => 0,
     };
     let guards_before = ctx.trace_ctx.num_guards();
+    // The cpu the read folds through has to be the one the MetaInterp stamps
+    // with, or the trace and the optimizer could disagree about the constant;
+    // `trace.rs` installs this same `shared()` handle via `set_cpu`.
+    let cpu = crate::pyre_cpu::shared();
     let (result, shadow_value) = match dst_bank {
         'i' => ctx
             .trace_ctx
-            .vable_getfield_int(pc, obj, vable_struct_ptr, descr),
+            .vable_getfield_int(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         'r' => ctx
             .trace_ctx
-            .vable_getfield_ref(pc, obj, vable_struct_ptr, descr),
+            .vable_getfield_ref(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         'f' => ctx
             .trace_ctx
-            .vable_getfield_float(pc, obj, vable_struct_ptr, descr),
+            .vable_getfield_float(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
@@ -1001,9 +1005,15 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
-    let result = ctx
-        .trace_ctx
-        .vable_arraylen_vable(op.pc, vable, vable_struct_ptr, fdescr, adescr);
+    let cpu = crate::pyre_cpu::shared();
+    let result = ctx.trace_ctx.vable_arraylen_vable(
+        cpu.as_ref(),
+        op.pc,
+        vable,
+        vable_struct_ptr,
+        fdescr,
+        adescr,
+    );
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
