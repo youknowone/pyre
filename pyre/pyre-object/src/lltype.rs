@@ -348,8 +348,12 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
         TypeIdCell::UNASSIGNED => 0,
         id => id,
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc(type_id, T::SIZE)
-        && !raw.is_null()
+    // `Some(null)` is a GC that owns the heap and could not satisfy the
+    // request, which the fallback below must not answer; only a missing hook
+    // leaves this path free to take it.
+    if let Some(raw) =
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(type_id, T::SIZE))
+            .allocated_or_abort(T::SIZE)
     {
         unsafe {
             std::ptr::write(raw as *mut T, value);
