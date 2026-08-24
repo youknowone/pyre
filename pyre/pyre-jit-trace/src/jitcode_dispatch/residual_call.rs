@@ -1698,6 +1698,18 @@ pub(crate) fn restore_escape_flush_undo() {
             let arr_ptr = pf.locals_cells_stack_w;
             let dst = locals_w_mut!(pf);
             let n = undo.slots.len().min(dst.as_slice().len());
+            // Report-only: count the slots this restore is about to put back
+            // to a value the live frame no longer holds.  The capture is taken
+            // before the flush, but the residual runs user Python after it, so
+            // a non-zero count is that user code's write being discarded.
+            // Gated, so a production build pays nothing.
+            if fbw_debug_abort_enabled() {
+                let live = dst.as_slice();
+                let clobbered = (0..n).filter(|&i| live[i] != undo.slots[i]).count();
+                if clobbered != 0 {
+                    eprintln!("[fbw-undo-clobber] frame={frame:#x} slots={clobbered}/{n}");
+                }
+            }
             for (i, &v) in undo.slots.iter().take(n).enumerate() {
                 dst[i] = v;
             }
