@@ -12354,7 +12354,7 @@ impl CodeWriter {
                                 py_pc as i64,
                             )
                             .into();
-                            // `pyopcode.py:1119-1125` reads the frame's debug
+                            // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
                             // locals and substitutes `None` only when the frame
                             // has none.  A baked `None` here would hide a
                             // materialized mapping from a custom `__import__`.

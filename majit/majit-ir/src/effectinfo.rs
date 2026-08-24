@@ -906,7 +906,7 @@ pub enum PyreHelperKind {
     /// so gateway builtins retain their ordinary meta-traceable call shape.
     LoadImport,
     /// `bh_load_import_locals_fn(frame)` — IMPORT_NAME's locals argument
-    /// (`pyopcode.py:1119-1125`).  Infallible, same standing as
+    /// (`pyopcode.py`'s `IMPORT_NAME`).  Infallible, same standing as
     /// [`PyreHelperKind::LoadLocals`].
     LoadImportLocals,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family

@@ -4587,7 +4587,7 @@ pub fn lookup_dunder_import(frame: &PyFrame) -> Result<PyObjectRef, crate::PyErr
         .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))
 }
 
-/// IMPORT_NAME's third argument (`pyopcode.py:1119-1125`).  `getdebug()`
+/// IMPORT_NAME's third argument (`pyopcode.py`).  `getdebug()`
 /// peeks: a frame that never materialized its locals mapping passes `None`
 /// instead of creating one, which is what separates this from LOAD_LOCALS'
 /// `getorcreatedebug()`.  Split out so the JIT's `LoadImportLocals` residual

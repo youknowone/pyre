@@ -49,7 +49,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // No upstream counterpart by name; the loop is a bounded scan of a
     // fixed-size argument slice.
     ("leading_non_null_count", "flat builtin-keyword ABI scan"),
-    // `argument.py:172` carries `@jit.unroll_safe` on `_match_signature`, the
+    // `argument.py` carries `@jit.unroll_safe` on `_match_signature`, the
     // keyword-binding loop this one mirrors; both are bounded by a signature
     // fixed at the callee rather than by the call's arguments.
     ("bind_builtin_kwargs", "argument.py _match_signature"),

@@ -13581,7 +13581,7 @@ mod tests {
 
     #[test]
     fn lower_load_import_locals_hlop_keeps_the_unanalyzed_boundary() {
-        // `pyopcode.py:1119-1125` reads the frame's debug locals before the
+        // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug locals before the
         // call, and the helper that answers it dereferences
         // `PyFrame.debugdata` -- virtualizable field 3 -- and then
         // `FrameDebugData.w_locals`, which the `f_locals` fold caches and

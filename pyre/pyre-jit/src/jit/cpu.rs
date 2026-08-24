@@ -344,7 +344,7 @@ pub struct Cpu {
     /// call boundary as PyPy's `IMPORT_NAME` implementation.
     pub load_import_fn: extern "C" fn(i64) -> i64,
     /// Load IMPORT_NAME's locals argument.  Separate from `load_import_fn`
-    /// because `pyopcode.py:1119-1125` reads two independent things off the
+    /// because `pyopcode.py`'s `IMPORT_NAME` reads two independent things off the
     /// frame before the call.
     pub load_import_locals_fn: extern "C" fn(i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.

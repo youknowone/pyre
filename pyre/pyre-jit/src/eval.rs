@@ -4421,7 +4421,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
         });
 
-    // `bytes` `data` block — `rstr.py:1226-1228`'s `STR.chars`, an
+    // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
     // registers with the shape `get_array_token` reads off that one ARRAY and
     // no destructor: the payload is inside the block, so the sweep reclaims it

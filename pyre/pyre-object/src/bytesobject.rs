@@ -32,7 +32,7 @@ pub fn bytes_data_gc_type_id() -> u32 {
     BYTES_DATA_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `rstr.py:1226-1228` — `STR.become(GcStruct('rpy_string', ('hash', Signed),
+/// `rstr.py` — `STR.become(GcStruct('rpy_string', ('hash', Signed),
 /// ('chars', Array(Char, ...))))`: the byte payload is a varsize `GcArray`
 /// inside the managed heap, not a pointer to memory the collector cannot see.
 ///
@@ -175,7 +175,7 @@ pub unsafe fn bytes_block_chars(block: *const BytesBlock) -> &'static [u8] {
 /// Python bytes object — immutable byte sequence.
 ///
 /// `W_BytesObject._value` is an RPython string, whose `chars` array
-/// (`rstr.py:1226-1228`) lives in the managed heap; [`BytesBlock`] is that
+/// (`rstr.py`'s `STR`) lives in the managed heap; [`BytesBlock`] is that
 /// array. Same layout as W_BytearrayObject but without setitem/extend.
 #[repr(C)]
 pub struct W_BytesObject {
