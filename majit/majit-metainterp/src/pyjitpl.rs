@@ -9613,6 +9613,24 @@ impl<M: Clone> MetaInterp<M> {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abort the trace and fall back to the blackhole interpreter.
+            //
+            // The abort is NOT permanent.  `compile.py compile_trace` answers
+            // an `InvalidLoop` out of `optimize_trace` with
+            // `debug_print('InvalidLoop in compile_new_bridge'); return None`,
+            // and the `giveup()` its caller then raises reaches
+            // `pyjitpl.py aborted_tracing`, which counts the reason and stops.
+            // `disable_noninlinable_function` — the call that sets
+            // `JC_DONT_TRACE_HERE` — is reached from exactly one place
+            // upstream, the `ABORT_TOO_LONG` arm of
+            // `blackhole_if_trace_too_long`.  Banning here instead retired the
+            // location on its FIRST InvalidLoop, and `JC_DONT_TRACE_HERE` is
+            // also what `can_inline_callable` reads, so one rejected
+            // function-entry trace made the function permanently
+            // non-inlinable everywhere else.  The sibling arm in
+            // `compile_loop_body` already spells this out as
+            // `abort_tracing(green_key, !is_invalid_loop)`; pyre's own abort
+            // ceiling (`MAX_TRACE_ABORT_COUNT`) is what retires a location
+            // that keeps failing.
             Err(_invalid_loop) => {
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -9620,14 +9638,14 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("abort finish: InvalidLoop at key={green_key}"),
                     );
                 }
-                self.warm_state.abort_tracing(green_key, true);
+                self.warm_state.abort_tracing(green_key, false);
                 // pyjitpl.py aborted_tracing() reads greenkey from
                 // `current_merge_points`; pyre's analog reads it from
                 // pending_abort_{green_key,permanent} staged here so the
                 // caller-side `aborted_tracing(stb.reason)` hook payload
                 // carries the real trace key instead of 0.
                 self.pending_abort_green_key = Some(green_key);
-                self.pending_abort_permanent = true;
+                self.pending_abort_permanent = false;
                 crate::mc_diag_bump(47);
                 return Err(SwitchToBlackhole::giveup());
             }
@@ -25546,6 +25564,53 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, 99);
         assert_eq!(events[0].1, "test error");
+    }
+
+    /// `compile.py compile_trace` answers an `InvalidLoop` out of
+    /// `optimize_trace` with `debug_print('InvalidLoop in compile_new_bridge')`
+    /// followed by `return None` — the location is not retired.  The only
+    /// upstream caller of `disable_noninlinable_function`, which is what sets
+    /// `JC_DONT_TRACE_HERE`, is the `ABORT_TOO_LONG` arm of
+    /// `blackhole_if_trace_too_long` (`pyjitpl.py`).  That flag is also what
+    /// `can_inline_callable` reads, so banning here would additionally make the
+    /// function permanently non-inlinable into every other trace.
+    ///
+    /// `GUARD_OVERFLOW` behind a non-overflowing op is the optimizer's own
+    /// `InvalidLoop` (`intbounds.py:236-238`), which makes it the cheapest way
+    /// to reach the arm without building a trace the rest of the pipeline
+    /// would reject for some other reason.
+    #[test]
+    fn a_finish_trace_the_optimizer_rejects_does_not_retire_the_location() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 4242;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        let mut sum = OpRef::input_arg_int(0);
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardOverflow, &[], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+
+        let outcome = meta.finish_and_compile(&[sum], vec![Type::Int], (), false);
+        assert!(
+            outcome.is_err(),
+            "GUARD_OVERFLOW behind IntAdd must reach the optimizer's InvalidLoop"
+        );
+        assert_eq!(
+            meta.warm_state
+                .get_stats()
+                .num_disable_noninlinable_function,
+            0,
+            "an InvalidLoop must not stamp JC_DONT_TRACE_HERE — that flag is \
+             the ABORT_TOO_LONG arm's, and it also disables inlining"
+        );
     }
 
     #[test]
