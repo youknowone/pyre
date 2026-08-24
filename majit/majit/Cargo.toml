@@ -8,7 +8,7 @@ description = "Meta-tracing JIT compiler framework"
 
 [features]
 cranelift = ["majit-metainterp/cranelift", "dep:majit-backend-cranelift"]
-dynasm = ["majit-metainterp/dynasm"]
+dynasm = ["majit-metainterp/dynasm", "dep:majit-backend-dynasm"]
 
 [dependencies]
 majit-ir = { workspace = true }
@@ -20,5 +20,6 @@ majit-backend = { workspace = true }
 # other backend, and feature unification carried the cranelift arms of
 # majit-metainterp and its dependents along with it.
 majit-backend-cranelift = { workspace = true, optional = true }
+majit-backend-dynasm = { workspace = true, optional = true }
 majit-gc = { workspace = true }
 majit-macros = { workspace = true }
