@@ -9446,12 +9446,25 @@ where
             OpCode::IntMulOvf => lhs_value.overflowing_mul(rhs_value),
             _ => unreachable!("trace_int_binop_jump_if_ovf: {opcode:?}"),
         };
+        // `elif self.metainterp.ovf_flag: self.pc = lbl; return None # but
+        // don't emit GUARD_OVERFLOW`. Upstream folds the constant pair either
+        // way — `do_int_add_ovf` answers 0 and raises the flag when the
+        // arithmetic leaves range — and takes the branch with neither the
+        // operation nor its guard recorded. `execute_binary_int_const` spells
+        // these with `checked_*` and declines instead, because the optimizer
+        // shares it and there the operation and its guard are what carry the
+        // overflow, so the overflowing-constant case is decided here. The
+        // funnel's own fold gate is the condition mirrored.
+        if overflowed && lhs.is_constant() && rhs.is_constant() && self.last_exception_value == 0 {
+            // `execute_and_record` counts the operation before it decides to
+            // fold, and this returns in its place.
+            ctx.profiler().count_ops(opcode, crate::counters::OPS);
+            self.frames.current_mut().code_cursor = target;
+            return;
+        }
         // `int_*_ovf` produces the wrapping result and sets the overflow flag;
-        // the box-less guard below checks that flag.  An all-constant pair
-        // folds and needs neither, but only while the arithmetic stays in
-        // range: `execute_binary_int_const` spells the OVF opcodes with
-        // `checked_*`, so a constant pair that really overflows declines the
-        // fold and is recorded with its guard instead.
+        // the box-less guard below checks that flag.  An all-constant pair in
+        // range folds and needs neither.
         let opref = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
             opcode,
@@ -13347,6 +13360,27 @@ mod tests {
             &[(JitArgKind::Ref, OpRef::input_arg_ref(0), 0)],
         );
         assert_eq!(recorded, vec![OpCode::GuardIsnull], "{recorded:?}");
+    }
+
+    /// `opimpl_int_*_jump_if_ovf`'s `elif self.metainterp.ovf_flag` arm: a
+    /// constant pair whose arithmetic leaves range takes the branch with
+    /// nothing recorded — neither the operation nor the guard that would
+    /// stand for an overflow both operands already decide.
+    #[test]
+    fn a_constant_pair_that_overflows_takes_the_branch_without_recording() {
+        let mut builder = JitCodeBuilder::new();
+        let overflow = builder.new_label();
+        builder.int_add_jump_if_ovf(2, 0, 1, overflow);
+        builder.mark_label(overflow);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int, majit_ir::Type::Int],
+            &builder.finish(),
+            &[
+                (JitArgKind::Int, OpRef::const_int(i64::MAX), i64::MAX),
+                (JitArgKind::Int, OpRef::const_int(1), 1),
+            ],
+        );
+        assert!(recorded.is_empty(), "{recorded:?}");
     }
 
     /// `replace_box` rewrites every frame's active boxes, not just the
