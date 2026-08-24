@@ -369,6 +369,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             cst!("F_SETPIPE_SZ", libc::F_SETPIPE_SZ);
             cst!("F_GETPIPE_SZ", libc::F_GETPIPE_SZ);
         }
+        // The darwin half of the same list.  `F_SETLEASE`/`F_GETLEASE` carry
+        // different numbers here than under linux, so they are spelled per
+        // platform rather than shared.
+        #[cfg(target_vendor = "apple")]
+        {
+            cst!("FASYNC", 64);
+            cst!("F_FULLFSYNC", libc::F_FULLFSYNC);
+            cst!("F_GETLEASE", 107);
+            cst!("F_SETLEASE", 106);
+            cst!("F_GETNOSIGPIPE", 74);
+            cst!("F_SETNOSIGPIPE", 73);
+            cst!("F_GETPATH", libc::F_GETPATH);
+            cst!("F_NOCACHE", libc::F_NOCACHE);
+            cst!("F_RDAHEAD", libc::F_RDAHEAD);
+            cst!("F_OFD_GETLK", libc::F_OFD_GETLK);
+            cst!("F_OFD_SETLK", libc::F_OFD_SETLK);
+            cst!("F_OFD_SETLKW", libc::F_OFD_SETLKW);
+        }
     }
 }
 

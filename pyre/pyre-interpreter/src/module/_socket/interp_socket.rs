@@ -428,12 +428,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IP_DROP_MEMBERSHIP", libc::IP_DROP_MEMBERSHIP);
         cst!("IP_HDRINCL", libc::IP_HDRINCL);
         // IP_OPTIONS / IP_RECVOPTS / IP_RECVRETOPTS / IP_RETOPTS are
-        // POSIX but not exposed by the libc crate on linux/macos;
-        // `_rsocket_rffi.py:170-172` lists them, but
-        // `platform.DefinedConstantInteger` drops them when the header
-        // does not define them.  Same behaviour here — not exposed.
+        // POSIX but the libc crate does not expose them; `_rsocket_rffi.py`
+        // lists them in `constant_names`, and
+        // `platform.DefinedConstantInteger` drops them when the header does
+        // not define them.  The darwin values are spelled out below; on the
+        // other unices they stay unexposed.
         cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
         cst!("IP_DEFAULT_MULTICAST_TTL", 1);
+        // `<netinet/in.h>` sizes the membership table per platform: 4095 on
+        // darwin, 20 on linux.
+        #[cfg(target_vendor = "apple")]
+        cst!("IP_MAX_MEMBERSHIPS", 4095);
+        #[cfg(not(target_vendor = "apple"))]
         cst!("IP_MAX_MEMBERSHIPS", 20);
         // ── IPv6 ──
         cst!("IPV6_V6ONLY", libc::IPV6_V6ONLY);
@@ -544,6 +550,78 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("SCM_CREDENTIALS", libc::SCM_CREDENTIALS);
         // ── socket-level cap ──
         cst!("SOMAXCONN", libc::SOMAXCONN);
+
+        // Names `<sys/socket.h>`, `<netinet/in.h>`, `<netinet/tcp.h>`,
+        // `<net/ethernet.h>` and `<sys/sys_domain.h>` define only on darwin,
+        // or define there with a different value than on linux.  Every value
+        // was read back from the headers themselves.  `socketmodule.c` guards
+        // the RFC 3542 half with `#define __APPLE_USE_RFC_3542 1`, which is
+        // why those names exist on this platform at all.
+        #[cfg(target_vendor = "apple")]
+        {
+            // ── Address / protocol families ──
+            cst!("AF_APPLETALK", libc::AF_APPLETALK);
+            cst!("AF_DECnet", libc::AF_DECnet);
+            cst!("AF_IPX", libc::AF_IPX);
+            cst!("AF_LINK", libc::AF_LINK);
+            cst!("AF_SNA", libc::AF_SNA);
+            cst!("AF_SYSTEM", libc::AF_SYSTEM);
+            cst!("PF_SYSTEM", libc::PF_SYSTEM);
+            cst!("SYSPROTO_CONTROL", libc::SYSPROTO_CONTROL);
+            // ── IPPROTO_* ──
+            cst!("IPPROTO_EON", libc::IPPROTO_EON);
+            cst!("IPPROTO_GGP", libc::IPPROTO_GGP);
+            cst!("IPPROTO_HELLO", libc::IPPROTO_HELLO);
+            cst!("IPPROTO_IPCOMP", libc::IPPROTO_IPCOMP);
+            cst!("IPPROTO_IPV4", 4);
+            cst!("IPPROTO_ND", libc::IPPROTO_ND);
+            cst!("IPPROTO_XTP", libc::IPPROTO_XTP);
+            // ── IPv4 socket options ──
+            cst!("IP_ADD_SOURCE_MEMBERSHIP", libc::IP_ADD_SOURCE_MEMBERSHIP);
+            cst!("IP_BLOCK_SOURCE", libc::IP_BLOCK_SOURCE);
+            cst!("IP_DROP_SOURCE_MEMBERSHIP", libc::IP_DROP_SOURCE_MEMBERSHIP);
+            cst!("IP_UNBLOCK_SOURCE", libc::IP_UNBLOCK_SOURCE);
+            cst!("IP_OPTIONS", 1);
+            cst!("IP_RECVOPTS", 5);
+            cst!("IP_RECVRETOPTS", 6);
+            cst!("IP_RETOPTS", 8);
+            cst!("IP_PKTINFO", libc::IP_PKTINFO);
+            cst!("IP_RECVDSTADDR", libc::IP_RECVDSTADDR);
+            cst!("IP_RECVTOS", libc::IP_RECVTOS);
+            cst!("IP_RECVTTL", libc::IP_RECVTTL);
+            // ── IPv6 socket options ──
+            cst!("IPV6_DONTFRAG", libc::IPV6_DONTFRAG);
+            cst!("IPV6_DSTOPTS", 50);
+            cst!("IPV6_HOPOPTS", 49);
+            cst!("IPV6_NEXTHOP", 48);
+            cst!("IPV6_PATHMTU", 44);
+            cst!("IPV6_RECVDSTOPTS", 40);
+            cst!("IPV6_RECVHOPOPTS", 39);
+            cst!("IPV6_RECVPATHMTU", 43);
+            cst!("IPV6_RECVRTHDR", 38);
+            cst!("IPV6_RTHDR", 51);
+            cst!("IPV6_RTHDRDSTOPTS", 57);
+            cst!("IPV6_RTHDR_TYPE_0", 0);
+            cst!("IPV6_USE_MIN_MTU", 42);
+            // ── TCP ──
+            cst!("TCP_CONNECTION_INFO", libc::TCP_CONNECTION_INFO);
+            cst!("TCP_FASTOPEN", libc::TCP_FASTOPEN);
+            cst!("TCP_KEEPCNT", libc::TCP_KEEPCNT);
+            cst!("TCP_KEEPINTVL", libc::TCP_KEEPINTVL);
+            cst!("TCP_NOTSENT_LOWAT", 513);
+            // ── SO_* / MSG_* / SCM_* ──
+            cst!("SO_BINDTODEVICE", 4404);
+            cst!("SO_USELOOPBACK", libc::SO_USELOOPBACK);
+            cst!("LOCAL_PEERCRED", libc::LOCAL_PEERCRED);
+            cst!("MSG_EOF", libc::MSG_EOF);
+            cst!("MSG_NOSIGNAL", libc::MSG_NOSIGNAL);
+            cst!("SCM_CREDS", libc::SCM_CREDS);
+            // ── `<net/ethernet.h>` ──
+            cst!("ETHERTYPE_ARP", 2054);
+            cst!("ETHERTYPE_IP", 2048);
+            cst!("ETHERTYPE_IPV6", 34525);
+            cst!("ETHERTYPE_VLAN", 33024);
+        }
     }
 
     // `_rsocket_rffi.py` keeps a separate `_MSVC` constant list because the

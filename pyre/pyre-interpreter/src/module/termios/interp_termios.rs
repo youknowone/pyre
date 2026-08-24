@@ -880,6 +880,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         tc!("FIOASYNC", libc::FIOASYNC);
         tc!("FIOCLEX", libc::FIOCLEX);
         tc!("FIONCLEX", libc::FIONCLEX);
+
+        // The `c_cc` value that switches a control character off.  It is
+        // `0xff` on the BSDs and `'\0'` on linux, so it is answered here
+        // rather than beside the `V*` indices above.
+        tc!("_POSIX_VDISABLE", libc::_POSIX_VDISABLE);
     }
 
     // `interp_termios.py Cache.__init__`:

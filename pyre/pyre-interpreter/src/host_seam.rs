@@ -81,6 +81,23 @@ pub mod sys {
         S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
         WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
     };
+    // `posix`'s darwin-only names: the `setpriority` scopes, the `copyfile`
+    // flags `_fcopyfile` takes, and `<stdio.h>`'s own `TMP_MAX`.
+    #[cfg(target_vendor = "apple")]
+    pub use ::libc::{
+        COPYFILE_ACL, COPYFILE_DATA, COPYFILE_STAT, COPYFILE_XATTR, PRIO_DARWIN_BG,
+        PRIO_DARWIN_NONUI, PRIO_DARWIN_PROCESS, PRIO_DARWIN_THREAD, TMP_MAX,
+    };
+    // The `<langinfo.h>` items beside `CODESET`, which `_locale` publishes as
+    // the keys `nl_langinfo` takes.
+    pub use ::libc::{
+        ABDAY_1, ABDAY_2, ABDAY_3, ABDAY_4, ABDAY_5, ABDAY_6, ABDAY_7, ABMON_1, ABMON_2, ABMON_3,
+        ABMON_4, ABMON_5, ABMON_6, ABMON_7, ABMON_8, ABMON_9, ABMON_10, ABMON_11, ABMON_12,
+        ALT_DIGITS, AM_STR, CRNCYSTR, D_FMT, D_T_FMT, DAY_1, DAY_2, DAY_3, DAY_4, DAY_5, DAY_6,
+        DAY_7, ERA, ERA_D_FMT, ERA_D_T_FMT, ERA_T_FMT, MON_1, MON_2, MON_3, MON_4, MON_5, MON_6,
+        MON_7, MON_8, MON_9, MON_10, MON_11, MON_12, NOEXPR, PM_STR, RADIXCHAR, T_FMT, T_FMT_AMPM,
+        THOUSEP, YESEXPR,
+    };
     // The `<fcntl.h>` flags only one platform declares, carrying the same gates
     // as the table that publishes them.
     #[cfg(any(target_os = "linux", target_os = "android"))]

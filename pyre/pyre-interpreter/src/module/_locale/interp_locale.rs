@@ -309,6 +309,69 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     ))]
     {
         crate::module_ns_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
+        // The rest of `_localemodule.c langinfo_constants` — the `nl_item`
+        // keys `nl_langinfo` takes.  Each host numbers them for itself: the
+        // BSD headers count from 0 while glibc packs a category into the high
+        // bits, so the values come from `libc` rather than a shared table.
+        // `YESSTR`/`NOSTR` are left out, as they are upstream.
+        for (name, val) in [
+            ("D_T_FMT", libc::D_T_FMT as i64),
+            ("D_FMT", libc::D_FMT as i64),
+            ("T_FMT", libc::T_FMT as i64),
+            ("T_FMT_AMPM", libc::T_FMT_AMPM as i64),
+            ("AM_STR", libc::AM_STR as i64),
+            ("PM_STR", libc::PM_STR as i64),
+            ("DAY_1", libc::DAY_1 as i64),
+            ("DAY_2", libc::DAY_2 as i64),
+            ("DAY_3", libc::DAY_3 as i64),
+            ("DAY_4", libc::DAY_4 as i64),
+            ("DAY_5", libc::DAY_5 as i64),
+            ("DAY_6", libc::DAY_6 as i64),
+            ("DAY_7", libc::DAY_7 as i64),
+            ("ABDAY_1", libc::ABDAY_1 as i64),
+            ("ABDAY_2", libc::ABDAY_2 as i64),
+            ("ABDAY_3", libc::ABDAY_3 as i64),
+            ("ABDAY_4", libc::ABDAY_4 as i64),
+            ("ABDAY_5", libc::ABDAY_5 as i64),
+            ("ABDAY_6", libc::ABDAY_6 as i64),
+            ("ABDAY_7", libc::ABDAY_7 as i64),
+            ("MON_1", libc::MON_1 as i64),
+            ("MON_2", libc::MON_2 as i64),
+            ("MON_3", libc::MON_3 as i64),
+            ("MON_4", libc::MON_4 as i64),
+            ("MON_5", libc::MON_5 as i64),
+            ("MON_6", libc::MON_6 as i64),
+            ("MON_7", libc::MON_7 as i64),
+            ("MON_8", libc::MON_8 as i64),
+            ("MON_9", libc::MON_9 as i64),
+            ("MON_10", libc::MON_10 as i64),
+            ("MON_11", libc::MON_11 as i64),
+            ("MON_12", libc::MON_12 as i64),
+            ("ABMON_1", libc::ABMON_1 as i64),
+            ("ABMON_2", libc::ABMON_2 as i64),
+            ("ABMON_3", libc::ABMON_3 as i64),
+            ("ABMON_4", libc::ABMON_4 as i64),
+            ("ABMON_5", libc::ABMON_5 as i64),
+            ("ABMON_6", libc::ABMON_6 as i64),
+            ("ABMON_7", libc::ABMON_7 as i64),
+            ("ABMON_8", libc::ABMON_8 as i64),
+            ("ABMON_9", libc::ABMON_9 as i64),
+            ("ABMON_10", libc::ABMON_10 as i64),
+            ("ABMON_11", libc::ABMON_11 as i64),
+            ("ABMON_12", libc::ABMON_12 as i64),
+            ("ERA", libc::ERA as i64),
+            ("ERA_D_FMT", libc::ERA_D_FMT as i64),
+            ("ERA_D_T_FMT", libc::ERA_D_T_FMT as i64),
+            ("ERA_T_FMT", libc::ERA_T_FMT as i64),
+            ("ALT_DIGITS", libc::ALT_DIGITS as i64),
+            ("RADIXCHAR", libc::RADIXCHAR as i64),
+            ("THOUSEP", libc::THOUSEP as i64),
+            ("YESEXPR", libc::YESEXPR as i64),
+            ("NOEXPR", libc::NOEXPR as i64),
+            ("CRNCYSTR", libc::CRNCYSTR as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
     }
     // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
