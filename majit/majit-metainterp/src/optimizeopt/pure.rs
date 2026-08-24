@@ -2294,13 +2294,15 @@ mod tests {
             true,
         );
 
-        let ovf_count = result
+        let opcodes: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        let ovf_at = opcodes
             .iter()
-            .filter(|o| o.opcode == OpCode::IntAddOvf)
-            .count();
+            .position(|opcode| *opcode == OpCode::IntAddOvf)
+            .unwrap_or_else(|| panic!("the OVF op must survive the fold, got {opcodes:?}"));
         assert_eq!(
-            ovf_count, 1,
-            "an overflowing OVF pair must survive the fold"
+            opcodes.get(ovf_at + 1),
+            Some(&OpCode::GuardNoOverflow),
+            "the guard that catches the overflow must still follow it, got {opcodes:?}"
         );
     }
 
