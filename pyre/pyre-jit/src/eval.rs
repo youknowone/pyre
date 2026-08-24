@@ -4824,6 +4824,11 @@ fn register_thread_root_areas() {
             "jitcode_constants",
         );
         register(
+            build_const_refs_root_walker_area,
+            pyre_jit_trace::state::capture_build_const_refs_area(),
+            "jitcode_build_const_refs",
+        );
+        register(
             fbw_store_journal_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
             "fbw_store_journal",
@@ -5676,6 +5681,15 @@ unsafe fn jitcode_code_root_walker_area(
         return;
     }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
+}
+
+/// Ref constants baked into a pool that `install_jitcodes` has not published
+/// yet — see `pyre_jit_trace::state::note_build_const_ref`.
+unsafe fn build_const_refs_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::state::walk_build_const_refs_area(data, visitor) };
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
