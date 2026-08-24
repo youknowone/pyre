@@ -342,10 +342,16 @@ fn take_heapsize_option(
     }
     // `int(argv[2])` — the controller has already resolved any suffix, so a
     // value that is not a plain byte count came from somewhere that does not
-    // speak this protocol.
-    let Some(Ok(size)) = argv[2].to_str().map(str::parse::<u64>) else {
-        eprintln!("{binary_name}: --heapsize: not a byte count");
-        std::process::exit(2);
+    // speak this protocol.  `sys.maxsize` bounds it on this side too: the
+    // controller refuses a larger count rather than write one here, and a
+    // value the limit cannot hold would otherwise be taken and then silently
+    // clamped.
+    let size = match argv[2].to_str().map(str::parse::<u64>) {
+        Some(Ok(size)) if size <= i64::MAX as u64 => size,
+        _ => {
+            eprintln!("{binary_name}: --heapsize: not a byte count");
+            std::process::exit(2);
+        }
     };
     argv.drain(1..3);
     (argv, Some(size))
