@@ -979,12 +979,24 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
     frame: *mut pyre_interpreter::PyFrame,
     frame_reg: u16,
 ) -> bool {
-    if frame.is_null() {
-        return false;
-    }
     let Some(shadow) = ctx.callee_shadow.as_ref() else {
         return false;
     };
+    flush_callee_locals_region(shadow, frame, frame_reg)
+}
+
+/// [`flush_callee_locals_region_to_frame`] against a shadow reached without a
+/// `WalkContext`.  The escape force runs from `force_pyframe`, which only has
+/// the `TraceCtx`, so the level's shadow is published for the duration of the
+/// residual instead (`residual_call.rs`).
+pub(crate) fn flush_callee_locals_region(
+    shadow: &CalleeLocalsShadow,
+    frame: *mut pyre_interpreter::PyFrame,
+    frame_reg: u16,
+) -> bool {
+    if frame.is_null() {
+        return false;
+    }
     let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) else {
         return false;
     };
