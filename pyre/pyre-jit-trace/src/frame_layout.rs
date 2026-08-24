@@ -102,33 +102,52 @@ const _: () = {
 /// `emit_force_virtualizable` records, built out of `clear_vable_token`:
 /// force the virtualizable when the token is set, then leave TOKEN_NONE.
 ///
-/// `force_now` has two arms and only one of them is a bare write.  On
-/// TOKEN_TRACING_RESCALL it clears the marker, which is what the post-residual
-/// probe reads as "the callee escaped".  On a machine-frame token it runs
+/// ```python
+/// def clear_vable_token(virtualizable):
+///     virtualizable = cast_gcref_to_vtype(virtualizable)
+///     if virtualizable.vable_token:
+///         force_now(virtualizable)
+///         assert not virtualizable.vable_token
+/// ```
+///
+/// Upstream never writes the slot itself: a set token is cleared by the force
+/// it triggers, and a clear one is left alone.  `force_now` has two arms and
+/// only one of them is a bare write.  On TOKEN_TRACING_RESCALL it clears the
+/// marker, which is what the post-residual probe reads as "the callee
+/// escaped".  On a machine-frame token it runs
 /// `ResumeGuardForcedDescr.force_now`, writing the compiled activation's
 /// registers back into the frame — a step this helper used to skip, on the
 /// evidence that the call was recorded 183 times and invoked 0 times over 462
 /// fixtures.  That measurement no longer holds: the call fires on the corpus
 /// today, so the arm is reachable and the frame it hands back has to carry the
-/// compiled values.  `force_frame` selects whichever arm the token names.
+/// compiled values.  `executioncontext.rs force_frame` dispatches to whichever
+/// arm the token names — the same split `force_virtualizable_if_necessary`
+/// runs.
 ///
-/// The trailing write is a backstop, not the port: `force_pyframe` declines a
-/// token the metainterp does not recognise as armed, and zeroing it anyway is
-/// what this helper did unconditionally before.  Upstream asserts there
-/// instead; a panic reached from compiled code is the worse failure.
+/// The trailing write is pyre's and has no upstream counterpart: `force_frame`
+/// goes through a `OnceLock` hook a JIT-less embedding never fills, and
+/// `force_pyframe` declines a token the metainterp does not recognise as
+/// armed, so a token left behind would fault later in `JitFrame::resolve`
+/// rather than here.  Upstream asserts at that point; the debug assertion
+/// below is that assert, and since a panic reached from compiled code is the
+/// worse failure in a release build, the write stays as its backstop.
 unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
     unsafe {
         let ptr = obj_ptr as *mut u8;
         if ptr.is_null() {
             return;
         }
-        // `vable_token` is `usize` (pointer-width: 4 on wasm32). Writing
-        // 8 bytes would clobber the following field.
+        // `vable_token` is `usize` (pointer-width: 4 on wasm32). Reading or
+        // writing 8 bytes would reach the following field.
         let token_ptr = ptr.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize;
         if *token_ptr == 0 {
             return;
         }
         pyre_interpreter::executioncontext::force_frame(ptr as *mut pyre_interpreter::PyFrame);
+        debug_assert_eq!(
+            *token_ptr, 0,
+            "clear_vable_token: force_now must leave TOKEN_NONE behind"
+        );
         if *token_ptr != 0 {
             if majit_metainterp::majit_log_enabled() {
                 let token = *token_ptr;
@@ -172,6 +191,74 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
 #[cfg(test)]
 mod tests {
     use super::build_pyframe_virtualizable_info;
+    use super::{PYFRAME_VABLE_TOKEN_OFFSET, pyre_clear_vable_token};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Token value the stand-in force hook was handed, or `usize::MAX` while it
+    /// has not run.  `usize::MAX` rather than 0 so "not called" and "called on a
+    /// cleared slot" stay distinguishable.
+    static FORCED_WITH_TOKEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// Stand-in for `eval.rs force_pyframe`.  Upstream's `force_now` leaves
+    /// TOKEN_NONE behind (`virtualizable.py force_now`), so this does too —
+    /// `pyre_clear_vable_token`'s own debug assertion checks exactly that.
+    unsafe extern "C" fn recording_force_hook(frame: *mut pyre_interpreter::PyFrame) {
+        unsafe {
+            let token_ptr = (frame as *mut u8).add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize;
+            FORCED_WITH_TOKEN.store(*token_ptr, Ordering::SeqCst);
+            *token_ptr = 0;
+        }
+    }
+
+    /// virtualizable.py `clear_vable_token`:
+    ///
+    /// ```python
+    /// if virtualizable.vable_token:
+    ///     force_now(virtualizable)
+    ///     assert not virtualizable.vable_token
+    /// ```
+    ///
+    /// A live token is FORCED, not overwritten — overwriting it drops the
+    /// compiled activation's write-back.  A clear one calls nothing at all.
+    ///
+    /// Both halves share one test because the force hook is a process-wide
+    /// `OnceLock` (`executioncontext.rs register_force_frame_hook`): a second
+    /// test registering its own would be silently ignored.
+    #[test]
+    fn clear_vable_token_forces_a_live_token_and_leaves_a_clear_one_alone() {
+        pyre_interpreter::executioncontext::register_force_frame_hook(recording_force_hook);
+
+        // Only the token slot is read or written, by the helper and by the
+        // hook alike, so a buffer that reaches past it stands in for a frame.
+        let mut frame = vec![0u8; PYFRAME_VABLE_TOKEN_OFFSET + 64];
+        let base = frame.as_mut_ptr();
+        let token_ptr = unsafe { base.add(PYFRAME_VABLE_TOKEN_OFFSET) as *mut usize };
+
+        // A cleared slot: upstream's `if virtualizable.vable_token` is false and
+        // nothing runs.
+        FORCED_WITH_TOKEN.store(usize::MAX, Ordering::SeqCst);
+        unsafe { pyre_clear_vable_token(base as i64) };
+        assert_eq!(
+            FORCED_WITH_TOKEN.load(Ordering::SeqCst),
+            usize::MAX,
+            "TOKEN_NONE must not force"
+        );
+
+        // A live token: forced first, and the force is what clears it.
+        unsafe { *token_ptr = 0xF00D_1000 };
+        unsafe { pyre_clear_vable_token(base as i64) };
+        assert_eq!(
+            FORCED_WITH_TOKEN.load(Ordering::SeqCst),
+            0xF00D_1000,
+            "the force must see the token still live"
+        );
+        assert_eq!(unsafe { *token_ptr }, 0, "the slot ends at TOKEN_NONE");
+
+        // A null frame is a no-op, not a fault.
+        FORCED_WITH_TOKEN.store(usize::MAX, Ordering::SeqCst);
+        unsafe { pyre_clear_vable_token(0) };
+        assert_eq!(FORCED_WITH_TOKEN.load(Ordering::SeqCst), usize::MAX);
+    }
 
     #[test]
     fn pyframe_token_descr_parent_survives_vinfo_drop() {
