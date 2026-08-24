@@ -484,7 +484,12 @@ impl Drop for TraceContinuationSuspendGuard {
 /// Diagnostic env gates read once and cached — these are checked on the hot
 /// back-edge / guard-failure paths that run every loop iteration, so re-reading
 /// the environment per call would add a syscall to each iteration.
-pub(crate) fn spdiag_enabled() -> bool {
+///
+/// `MAJIT_SPDIAG`: trace the stack-pointer bookkeeping. Public for the same
+/// reason [`no_bridge_enabled`] is — a frontend that owns state the diagnostic
+/// is about has to report it from its own side, and a variable that only the
+/// metainterp honours reads as broken when a frontend's half stays silent.
+pub fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
 }
