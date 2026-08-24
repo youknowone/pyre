@@ -12160,6 +12160,144 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `str(i)` on an exact `int`: emit the guarded unbox plus one elidable
+/// `jit_int_str` call instead of the opaque `bh_call_fn(str_type, NULL, i)`
+/// residual.  `rint.py rtype_str` / `rstr.py ll_int2dec` lower an unboxed
+/// `str(int)` to a `direct_call` of the decimal-render helper, which the
+/// optimized trace carries as one `call_r(ll_str__IntegerR_SignedConst_Signed,
+/// i, EF=3)` + `guard_no_exception`.  `jtransform` already lowers the
+/// graph-level `UnaryOp { op: "str" }` over an Int operand to that same
+/// `jit_int_str`; this is the Python-level call site taking the same channel.
+///
+/// The residual it replaces is a `CallMayForce`, so it also clears the heap
+/// cache and forces virtualizables across itself — the reason a `str(i)` loop
+/// costs far more than the one allocation it performs.
+///
+/// The callable must be the canonical `str` type object: a rebound name or a
+/// `str` subclass reboxes through `__new__` instead. The argument must be an
+/// exact `int`, because `bool` renders `True`/`False`, an `int` subclass may
+/// override `__str__`, and a `W_LongObject`'s payload is a pointer where
+/// `intval` would be. Any other shape falls through to the generic residual
+/// (SAFE).
+pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
+    // as arg0 — not a plain `str(i)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    let str_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    if !std::ptr::eq(concrete_callable, str_type_obj) {
+        return Ok(None);
+    }
+    // A tagged immediate has no header for the `w_class` and unbox guards to
+    // read, and this emit is not tag-aware.
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(arg_obj) {
+        return Ok(None);
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let int_value = unsafe {
+        if !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*arg_obj).w_class, int_typeobj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(arg_obj)
+    };
+    // Authentic boxed result, produced on the plain eval loop exactly as the
+    // skipped residual would, then cross-checked against what `jit_int_str`
+    // renders.  A disagreement declines rather than compiling itself in.
+    //
+    // The check reads `int_str_text` rather than calling the helper, because
+    // the helper allocates: a nursery collection under it could move
+    // `arg_obj` and `boxed_result`, which this frame still holds as raw
+    // pointers, and there is no root scope around them.
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    let renders_the_same = unsafe {
+        pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(boxed_result)
+                == Some(pyre_object::unicodeobject::int_str_text(int_value).as_str())
+    };
+    if !renders_the_same {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    let arg_op = r_args[2];
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op.pc, arg_op, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, arg_op, int_typeobj)?;
+    let int_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        arg_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    let helper = pyre_object::unicodeobject::jit_int_str as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+        OpCode::CallR,
+        helper,
+        &[int_raw],
+        &[majit_ir::Type::Int],
+        majit_ir::Type::Ref,
+        // The effect the `jtransform` channel already records for this same
+        // address: `#[majit_macros::elidable]` on the helper, so pure but
+        // allocating, and the trailing `GuardNoException` below is what makes
+        // the raise leg observable.  `ll_str__IntegerR_SignedConst_Signed`
+        // carries `EF_ELIDABLE_OR_MEMORYERROR`, one step narrower; keeping the
+        // helper's own annotation costs nothing and stops one address from
+        // meaning two different things in two channels.
+        //
+        // Recording it pure lets the optimizer share one call between two
+        // `str(i)` sites on the same operand, so a compiled loop can hand back
+        // the same object where the interpreter allocates twice.  Which object
+        // a fresh render returns is not a guarantee anything may read, and it
+        // is the same trade the upstream descr makes.
+        majit_metainterp::ELIDABLE_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as usize as i64),
+            majit_ir::Value::Int(int_value),
+        ],
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    // Concrete before the guard: the guard captures a resume snapshot, and a
+    // `raw` with no value yet is recorded into it without one.
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    }
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    Ok(Some(()))
+}
+
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
 /// shape the meta-tracer produces upstream (intobject.py `_divmod` →
 /// `space.newtuple2(space.newint(z), space.newint(m))`) instead of the opaque

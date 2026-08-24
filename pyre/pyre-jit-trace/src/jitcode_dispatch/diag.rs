@@ -330,6 +330,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 71] = [
     ("math_trunc",                "residual_call", "-"),
     ("int_call",                  "residual_call", "-"),
     ("float_call",                "residual_call", "-"),
+    ("str_call",                  "residual_call", "-"),
     ("builtin_divmod",            "residual_call", "-"),
     ("store_attr_direct",         "residual_call", "-"),
     ("store_attr_residual",       "residual_call", "store_attr_direct"),

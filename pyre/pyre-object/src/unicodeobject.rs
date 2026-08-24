@@ -1162,7 +1162,16 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 /// identity, mirroring `ll_str` on a string).
 #[majit_macros::elidable]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
-    w_str_new_managed(&v.to_string()) as i64
+    w_str_new_managed(&int_str_text(v)) as i64
+}
+
+/// The text [`jit_int_str`] wraps.  Split out so a caller can check what the
+/// helper renders without allocating a `W_UnicodeObject` -- the walker's
+/// `str(int)` fold cross-checks the interpreter's answer against this before
+/// it records the call, and an allocation there could move the very objects
+/// it still holds by raw pointer.
+pub fn int_str_text(v: i64) -> String {
+    v.to_string()
 }
 
 #[cfg(test)]
