@@ -7793,6 +7793,25 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
 /// traceback constructor.  `args[0]` is the class; the four positional
 /// arguments follow.  `tb_next` is a traceback or `None`; `tb_frame`
 /// must be a `frame`; `tb_lasti` / `tb_lineno` are ints, stored as given.
+/// `PyLong_AsInt` — the argument converter behind a clinic `int` parameter.
+///
+/// It goes through `__index__`, so the TypeError for anything else is
+/// `'X' object cannot be interpreted as an integer` rather than a
+/// signature-shaped one, and a value outside the C `int` range raises
+/// instead of being truncated into the slot.
+///
+/// A value past `i64` reaches this as `space_index_w`'s own OverflowError,
+/// whose message names `int` rather than `C int`.
+fn traceback_c_int_arg(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let value = crate::builtins::space_index_w(obj)?;
+    if i32::try_from(value).is_err() {
+        return Err(crate::PyError::overflow_error(
+            "Python int too large to convert to C int",
+        ));
+    }
+    Ok(value)
+}
+
 fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
         return Err(crate::PyError::type_error(format!(
@@ -7828,22 +7847,11 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let frame = w_frame as *mut crate::pyframe::PyFrame;
 
-    // tb_lasti / tb_lineno: integers, stored as given
-    // (`pytraceback.py descr_new`).
-    if !unsafe { pyre_object::is_int(w_lasti) } {
-        return Err(crate::PyError::type_error(format!(
-            "an integer is required (got type {})",
-            type_name_of(w_lasti)
-        )));
-    }
-    if !unsafe { pyre_object::is_int(w_lineno) } {
-        return Err(crate::PyError::type_error(format!(
-            "an integer is required (got type {})",
-            type_name_of(w_lineno)
-        )));
-    }
-    let lasti = unsafe { pyre_object::w_int_get_value(w_lasti) };
-    let lineno = unsafe { pyre_object::w_int_get_value(w_lineno) };
+    // tb_lasti / tb_lineno: both are declared `int` in the signature, so the
+    // converter Argument Clinic emits is `PyLong_AsInt` — it reduces through
+    // `__index__` and refuses a value the C `int` cannot hold.
+    let lasti = traceback_c_int_arg(w_lasti)?;
+    let lineno = traceback_c_int_arg(w_lineno)?;
     let w_code = unsafe { (*frame).fget_f_code() };
 
     Ok(crate::pytraceback::w_pytraceback_new(
