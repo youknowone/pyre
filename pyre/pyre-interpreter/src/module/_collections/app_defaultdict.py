@@ -36,7 +36,9 @@ class defaultdict(dict):
                 raise TypeError("first argument must be callable or None")
         else:
             default_factory = None
-        self.default_factory = default_factory
+        # PyPy app_defaultdict.defaultdict.__init__ writes through the slot
+        # descriptor so a subclass __setattr__ cannot intercept initialization.
+        defaultdict.default_factory.__set__(self, default_factory)
         dict.__init__(self, *args, **kwds)
 
     def __missing__(self, key):
