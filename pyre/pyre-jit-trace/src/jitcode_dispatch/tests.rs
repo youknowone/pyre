@@ -1036,7 +1036,16 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
         );
         // A different frame: `_nonstandard_virtualizable` reaches its Step 4
         // PTR_EQ, reads unequal, and takes the non-standard branch.
-        let vable = tc.const_ref(2);
+        //
+        // It must NOT be a `ConstPtr`. Step 4 runs its PTR_EQ through
+        // `execute_and_record`, so a constant on both sides folds the
+        // comparison away and mints no guard — which would leave the
+        // `num_guards() > guards_before` line below measuring nothing. A
+        // virtualizable in a register is a recorded box in production anyway;
+        // the concrete pointer arrives from the frame's ref values, not from
+        // the box being constant.
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
         // A non-constant index carrying a recording-time concrete — the only
         // shape for which the promote is not already a no-op.
         let zero = tc.const_int(0);
