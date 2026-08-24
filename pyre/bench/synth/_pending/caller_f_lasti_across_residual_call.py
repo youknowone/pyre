@@ -84,6 +84,42 @@
 #     caller-frame-read-from-inside-a-callee receiver, so it is not in play.
 #   * OptHeap eliding the publish: it keeps and hoists the store.
 #
+# ===== 2026-08-25: THE WRONG VALUE IS NOT AN INSTRUCTION AT ALL =====
+#
+# Re-measured after the rebase onto `b9c76982bd6`; the defect is unchanged on
+# both backends, and CPython names the correct answer:
+#
+#   pyre     f_lasti values: [(52, 11074), (58, 8926)]   FAIL
+#   cpython  f_lasti values: [(52, 20000)]               PASS
+#
+# `dis` on `main()` places `CALL` at offset 52 and the next real instruction,
+# `STORE_FAST`, at 60.  So the CALL owns 52..59 -- three cache entries at 54,
+# 56, 58 -- and the wrong answer 58 is the CALL's LAST CACHE SLOT.  It is not a
+# rival instruction offset; it is not an instruction boundary at all.
+#
+# That reframes where the fix can go.  Every refuted line above targets the
+# WRITER or the record ORDER.  The reader was never examined, and CPython holds
+# an invariant the reader currently breaks: `f_lasti` always names an
+# instruction (`_PyInterpreterFrame_LASTI` is derived from `instr_ptr`), never a
+# cache slot.  Snapping a stored `last_instr` that lands inside an instruction's
+# cache region back to its owning instruction turns 58 into 52 -- the measured
+# correct answer -- and touches no resume consumer, because the blackhole and
+# the vable sync read the field directly, not through the getset.
+#
+# The getter is `pyframe.rs` `fget_f_lasti` (returns `self.last_instr` bare,
+# mirroring `pyframe.py fget_f_lasti`), scaled by 2 at `typedef.rs:8222`.
+#
+# !! The open design question is WHICH side owns the conversion, and it is a
+# real one, not a formality.  The stored value is deliberately a RESUME
+# coordinate (`resume_snapshot.rs:680` and `:2624`, both `pc - 1`, with a
+# comment saying a stale one makes a guard resume at the loop header).  Upstream
+# PyPy has no adaptive caches, so its one convention is unambiguous; 3.14's
+# adaptive bytecode is what splits it.  A reader-side snap keeps every resume
+# consumer untouched but leaves two conventions in one slot; a writer-side fix
+# has to satisfy the resume path first and is what the eight refutations above
+# kept failing to do.  Measure before choosing -- and note the snap has NOT been
+# implemented or tested, only shown to produce the right number by hand.
+#
 # NOT the same defect as `_pending/loop_callee_for_header_resume.py`, though it
 # is the same field: there the triple `(last_instr, valuestackdepth, cells)` is
 # torn at a resume; here nothing resumes, a live reader just reads the field.
