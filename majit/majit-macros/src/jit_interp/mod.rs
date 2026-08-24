@@ -1785,13 +1785,144 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
+    let green_key_fn = generate_green_key_fn(&config, &func);
     let transformed_fn = transform_function(&config, &func);
 
     quote! {
         #state_impl
         #trace_fn
         #merge_wrapper
+        #green_key_fn
         #transformed_fn
+    }
+}
+
+/// Emit `__majit_green_key_<fn>`, which builds the key a merge point of this
+/// interpreter files under, for a caller OUTSIDE the mainloop.
+///
+/// A door that wants to ask whether some position is already compiled has to
+/// name that position the way the merge point names it, and until this existed
+/// the only way to do that was to write the layout out again by hand: seed,
+/// one `green_uhash_step` per slot, in the order `[target, ..greens]` with the
+/// pc substituted into the greens. `majit_ir::pypyjit_greenkey` is the same
+/// function hard-coded for one consumer's three greens, and its own
+/// documentation says why open-coding it is a hazard — "a swapped slot still
+/// hashes to something, just not to the same cell". A second consumer with a
+/// different green list could not use it and wrote the layout out again.
+///
+/// The failure is silent and total: the door files under a key nothing else
+/// can name, so its probe answers no forever and the artifact it was guarding
+/// is never entered. Nothing counts it, because a tier that never enters
+/// compiled code still returns the right answers.
+///
+/// Emitted only where it can be spelled without guessing:
+///
+/// * Every green must be a plain identifier. The helper's parameters ARE those
+///   identifiers, so an expression green has no name to take, and passing the
+///   expression's value positionally would reintroduce the ordering hazard this
+///   exists to remove.
+/// * No green may carry a type tag. A tagged green lowers through an explicit
+///   cast (`(#expr) as i64`), which does not compile against the generic
+///   parameter the untagged path takes.
+///
+/// Where either does not hold, no helper appears and a consumer keeps whatever
+/// it does today — this adds a way to be right, it does not take one away.
+///
+/// The greens are the attribute's, so this describes the DEFAULT layout. A
+/// merge point that overrides `greens` in its own marker args is not described
+/// by it.
+fn generate_green_key_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+    if !config.greens_declared || config.greens.is_empty() {
+        return quote! {};
+    }
+    if config.green_type_tags.iter().any(Option::is_some) {
+        return quote! {};
+    }
+    let ident_of = |expr: &Expr| -> Option<Ident> {
+        match expr {
+            Expr::Path(path)
+                if path.qself.is_none()
+                    && path.attrs.is_empty()
+                    && path.path.segments.len() == 1
+                    && path.path.segments[0].arguments.is_none() =>
+            {
+                Some(path.path.segments[0].ident.clone())
+            }
+            _ => None,
+        }
+    };
+    let Some(greens) = config
+        .greens
+        .iter()
+        .map(&ident_of)
+        .collect::<Option<Vec<Ident>>>()
+    else {
+        return quote! {};
+    };
+
+    // The marker's own position argument leads, then each declared green with
+    // the arming position substituted for `pc` — the same list
+    // `green_key_expr` folds at the merge point, and in the same order. Here
+    // the target IS the pc, so the substitution is the identity and a green
+    // spelled `pc` simply names the leading parameter a second time.
+    let pc: Ident = syn::parse_quote!(pc);
+    let slots: Vec<Ident> = std::iter::once(pc.clone()).chain(greens).collect();
+
+    // One parameter per DISTINCT slot, in first-appearance order. A green that
+    // repeats — `greens = [pc, program]` is the common case, and its slot list
+    // is `[pc, pc, program]` — is read twice from one argument rather than
+    // asked for twice, which is what `Copy` is for.
+    let mut params: Vec<Ident> = Vec::new();
+    for slot in &slots {
+        if !params.contains(slot) {
+            params.push(slot.clone());
+        }
+    }
+
+    // A green that names one of the mainloop's own parameters is typed as that
+    // parameter, not generically. It matters most for the case it was written
+    // for: a `Ref` green keys on POINTER IDENTITY, so a door holding the same
+    // bytes under a different reference type — `&Vec<u8>` where the mainloop
+    // took `&[u8]` — hashes to a different cell and probes forever for a key
+    // nothing files under. A concrete parameter makes that a type error at the
+    // door instead. Greens that name a local (`pc`, usually) have no declared
+    // type to take and stay generic.
+    let declared_ty = |name: &Ident| -> Option<syn::Type> {
+        func.sig.inputs.iter().find_map(|arg| match arg {
+            syn::FnArg::Typed(pat) => match &*pat.pat {
+                syn::Pat::Ident(id) if id.ident == *name => Some((*pat.ty).clone()),
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+    };
+    let param_decls: Vec<TokenStream> = params
+        .iter()
+        .map(|name| match declared_ty(name) {
+            Some(ty) => quote! { #name: #ty },
+            None => quote! { #name: impl majit_ir::GreenAsI64 + ::core::marker::Copy },
+        })
+        .collect();
+
+    let fn_name = quote::format_ident!("__majit_green_key_{}", func.sig.ident);
+    let n = slots.len();
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        pub fn #fn_name(
+            #(#param_decls),*
+        ) -> (u64, [(i64, majit_ir::GreenType); #n]) {
+            let __slots = [
+                #(<_ as majit_ir::GreenAsI64>::__green_repr(#slots)),*
+            ];
+            let mut __hash: u64 = majit_ir::GREEN_UHASH_SEED;
+            let mut __i = 0usize;
+            while __i < #n {
+                __hash = majit_ir::green_uhash_step(__hash, __slots[__i].1, __slots[__i].0);
+                __i += 1;
+            }
+            (__hash, __slots)
+        }
     }
 }
 
