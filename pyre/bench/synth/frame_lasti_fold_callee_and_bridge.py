@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=2
 # pyre-check: spec-folds=frame_lasti
 # Self-checking guard for the `f_lasti` coordinate on the two frames a walk
 # owns that are NOT the loop's own portal: the frame of an inlined callee, and

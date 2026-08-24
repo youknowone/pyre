@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=2
 # pyre-check: spec-folds=builtin_locals
 # A key written through `frame.f_locals` that names no writable fast local must
 # survive into the mapping `locals()` / `vars()` / `dir()` hand back, including

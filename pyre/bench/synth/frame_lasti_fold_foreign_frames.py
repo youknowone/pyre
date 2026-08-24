@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-loops=1
 # Self-checking guard that a foreign frame's `f_lasti` keeps its residual.
 #
 # The fold's whole licence is that the walk KNOWS the coordinate of the frame
