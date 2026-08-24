@@ -77,6 +77,18 @@ jobs:
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    # Every expensive job in this workflow hangs off one of the three prepare
+    # jobs, so naming `cargo fmt --check` here is what holds a whole run behind
+    # a 33 s check. Waiting costs no runner-seconds of its own -- a queued job
+    # occupies no runner -- only the wall time fmt spends queued, which on a
+    # saturated pool is already the larger half of every job's latency.
+    #
+    # Measured over the 95 finished runs of 2026-08-24: `cargo fmt --check` was
+    # the first job to go red in 5 of the 20 failures, and those five runs spent
+    # 97751 runner-seconds after it had already failed, against 1545805 for the
+    # day. `cpyext ABI` is the other job cheap enough to gate on and is left
+    # ungated: it went red in none of the 95.
+    needs: cargo-fmt
     env: &charon-llbc-env
       # Redirect the shared charon/ullbc build dir INTO the workspace so
       # actions/cache can reach it. Locally PYRE_SHARED_BUILD is unset and
@@ -274,6 +286,9 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
+    # See prepare-charon-llbc-linux: the gate has to name every prepare job,
+    # because each platform's consumers wait on their own.
+    needs: cargo-fmt
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -282,6 +297,8 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
+    # See prepare-charon-llbc-linux.
+    needs: cargo-fmt
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
