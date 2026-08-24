@@ -136,7 +136,13 @@ pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
     {
         imports::jit_execute_wasm(func_id, frame_ptr)
     }
-    #[cfg(not(feature = "web"))]
+    // `host-import`, not `not(feature = "web")`: `imports` has a third arm —
+    // neither binding — and the direct call below belongs to this one. The
+    // other functions here delegate to `imports::` on both of their arms, so
+    // that arm's stubs trap for them without being named; this one bypasses
+    // `imports` entirely, and under `not(web)` it would answer "no host
+    // binding" with a jump to an arbitrary address instead of the trap.
+    #[cfg(feature = "host-import")]
     unsafe {
         JIT_EXECUTE_COUNT.fetch_add(1, Ordering::Relaxed);
         // `func_id` is the shared-table (`__indirect_function_table`, exported as
@@ -152,6 +158,10 @@ pub fn execute(func_id: u32, frame_ptr: u32) -> u32 {
         }
         let trace: extern "C" fn(u32) -> u32 = core::mem::transmute(func_id as usize);
         trace(frame_ptr)
+    }
+    #[cfg(not(any(feature = "web", feature = "host-import")))]
+    unsafe {
+        imports::jit_execute_wasm(func_id, frame_ptr)
     }
 }
 

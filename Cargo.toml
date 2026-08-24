@@ -85,6 +85,9 @@ sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/Rust
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
+# Defaults off although that manifest declares none: backend selection there is
+# mandatory, so a `default` added to it later would otherwise arrive through
+# every inheriting edge at once instead of being named per consumer.
 majit-metainterp = { version = "0.0.2", path = "majit/majit-metainterp", default-features = false }
 majit-ir = { version = "0.0.2", path = "majit/majit-ir" }
 majit-trace = { version = "0.0.2", path = "majit/majit-trace" }
@@ -165,8 +168,8 @@ md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
-blake2b_simd = { version = "1.0.4", default-features = false }
-blake2s_simd = { version = "1.0.4", default-features = false }
+blake2b_simd = { version = "1.0.4" }
+blake2s_simd = { version = "1.0.4" }
 scrypt = { version = "0.11", default-features = false }
 # zlib backend (pyre-native only): zlib-rs is a pure-Rust zlib port whose
 # DEFLATE output is byte-identical to the reference C zlib.
@@ -186,7 +189,13 @@ crc32fast = "1.4"
 
 # TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
 # entry points so rustls and its crypto provider stay outside Charon/LLBC.
-rustls = { version = "0.23.39", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+# `prefer-post-quantum` is named because defaults are off, and it is the only
+# thing that puts X25519MLKEM768 first in `DEFAULT_KX_GROUPS` instead of last;
+# `_ssl` installs that provider process-wide and hands the list to every
+# handshake that does not call `set_ecdh_curve`, so last means a server
+# supporting both picks the classical group every time. `logging` stays off:
+# it only feeds the `log` crate, which nothing here consumes.
+rustls = { version = "0.23.39", default-features = false, features = ["std", "tls12", "aws_lc_rs", "prefer-post-quantum"] }
 rustls-webpki = { version = "0.103.5", default-features = false, features = ["alloc"] }
 rustls-pemfile = "2.2"
 x509-parser = "0.18"
