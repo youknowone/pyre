@@ -2136,6 +2136,7 @@ impl UnrollOptimizer {
         }
 
         // ── Assembly (compile.py:310-338) ──
+        let mut appended_label_args: Vec<OpRef> = Vec::new();
         let sp_used_boxes: Vec<OpRef> = sp.used_boxes.clone();
         let sp_jump_args: Vec<OpRef> = sp.jump_args.clone();
         let mut combined = assemble_peeled_trace_with_jump_args(
@@ -2158,6 +2159,7 @@ impl UnrollOptimizer {
                 .last()
                 .map(|target| target.as_jump_target_descr()),
             &exported_end_args,
+            &mut appended_label_args,
             opt_p2
                 .final_ctx
                 .as_mut()
@@ -2189,6 +2191,50 @@ impl UnrollOptimizer {
             sorted_consts.sort_by_key(|(k, _)| *k);
             crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
         }
+        // A LABEL arg the fallthrough scan appended is carried by the loop but
+        // not by the short preamble, so `inline_short_preamble` cannot rebuild
+        // it and every bridge closing onto this LABEL arrives one arg short.
+        // Record the reconstruction recipe for the appends that have one: the
+        // vable input layout is `[frame, static scalars.., array items..]`, so
+        // an appended static-scalar slot is exactly `GetfieldGc*(frame, descr)`
+        // — the load the preamble itself performed before the optimizer folded
+        // it onto the seeded slot. Appends outside that window record nothing
+        // and keep reaching `compile_bridge`'s arity giveup.
+        //
+        // The list is all-or-nothing: the recipes rebuild a contiguous LABEL
+        // tail, so one append with no recipe leaves the close short anyway and
+        // a partial list would make it overshoot. It is also written on every
+        // assembly, empty included, because this token can be recompiled with
+        // a different body and a stale list would append args the LABEL no
+        // longer has.
+        if let Some(target) = self.target_tokens.last_mut() {
+            let recipes = vable_config
+                .as_ref()
+                .filter(|_| !appended_label_args.is_empty())
+                .map(|config| {
+                    let first = 1 + config.vable_input_offset;
+                    appended_label_args
+                        .iter()
+                        .map(|&arg| {
+                            let slot = arg
+                                .is_input_arg()
+                                .then(|| arg.raw() as usize)
+                                .filter(|&raw| raw >= first)
+                                .map(|raw| raw - first)
+                                .filter(|&slot| slot < config.static_field_offsets.len())?;
+                            let descr = config.static_field_descrs.get(slot).cloned()?;
+                            Some((majit_ir::OpCode::getfield_for_type(arg.ty()?), descr))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !target.vable_label_arg_recipes.is_empty() || !recipes.is_empty() {
+                target.vable_label_arg_recipes = recipes;
+                target.mark_minor_scan_pending();
+            }
+        }
+
         *constants = consts_p2;
         Ok((combined, p2_ni))
     }
@@ -3978,6 +4024,30 @@ impl OptUnroll {
             // unroll.py:357-359: emit JUMP to target
             let mut jump_args = target_args;
             jump_args.extend(extra);
+            // The target's LABEL carries one arg per recorded recipe beyond
+            // `target_args + extra`; rebuild each from the frame this close
+            // already carries (LABEL arg 0 and JUMP arg 0 are the standard
+            // virtualizable) so the JUMP matches the LABEL the backend
+            // regalloc asserts against. Without this the close lands short and
+            // `compile_bridge` gives the bridge up.
+            if !target_token.vable_label_arg_recipes.is_empty()
+                && let Some(&frame_arg) = jump_args.first()
+            {
+                let recipes = target_token.vable_label_arg_recipes.clone();
+                for (opcode, descr) in recipes {
+                    let tp = opcode.result_type();
+                    let frame_operand = ctx.materialize_operand_at(frame_arg);
+                    let mut load = Op::new(opcode, std::slice::from_ref(&frame_operand));
+                    load.setdescr(descr);
+                    load.pos.set(ctx.reserve_pos_typed(tp));
+                    let loaded = load.pos.get();
+                    if let Err(e) = optimizer.send_extra_operation(&load, ctx) {
+                        ctx.signal_invalid_loop(e.0);
+                        return None;
+                    }
+                    jump_args.push(ctx.get_replacement_opref(loaded));
+                }
+            }
             let mut jump_args_box_operand: Vec<majit_ir::operand::Operand> =
                 Vec::with_capacity(jump_args.len());
             for a in &jump_args {
@@ -5130,6 +5200,7 @@ fn assemble_peeled_trace(
         start_label_descr,
         loop_label_descr,
         &[], // no p1_end_args for simple assembly
+        &mut Vec::new(),
         &mut ctx,
     )
 }
@@ -5187,6 +5258,7 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     _p1_end_args: &[OpRef],
+    appended_label_args: &mut Vec<OpRef>,
     ctx: &mut crate::optimizeopt::OptContext,
 ) -> Vec<majit_ir::OpRc> {
     let mut result =
@@ -5451,6 +5523,7 @@ fn assemble_peeled_trace_with_jump_args(
                     }
                 }
                 full_label_args.push(arg);
+                appended_label_args.push(arg);
                 label_set.insert(arg);
             }
             if op.result_type() != Type::Void && !op.pos.get().is_none() {
@@ -8634,6 +8707,7 @@ mod tests {
             None,
             None,
             &[],
+            &mut Vec::new(),
             &mut ctx,
         );
 

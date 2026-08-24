@@ -53,6 +53,19 @@ pub struct TargetToken {
     pub virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
     /// Short preamble: ops to replay when entering from a bridge.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
+    /// Loop-header values the assembled LABEL carries beyond the short
+    /// preamble's contract, each with the recipe that rebuilds it from the
+    /// virtualizable frame the LABEL's first arg holds.
+    ///
+    /// `assemble_peeled_trace_with_jump_args` appends a body-live,
+    /// preamble-defined box to the LABEL without a matching `used_boxes`
+    /// entry, so `inline_short_preamble` cannot produce it and a bridge
+    /// closing onto this LABEL lands one arg short. A virtualizable static
+    /// field is reconstructible from the frame at any point, so record the
+    /// `(opcode, field descr)` pair and let the close emit the load.
+    /// Non-reconstructible appends record nothing and still reach
+    /// `compile_bridge`'s arity giveup.
+    pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
     jump_target_descr: Arc<LoopTargetDescr>,
     /// `IncrementalMiniMarkGC.old_objects_pointing_to_young` state for the
     /// off-GC `TargetToken.virtual_state` / `short_preamble` graph.  Upstream
@@ -75,6 +88,7 @@ impl TargetToken {
             is_preamble_target: false,
             virtual_state: None,
             short_preamble: None,
+            vable_label_arg_recipes: Vec::new(),
             jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
             minor_scan_pending: true,
         }
