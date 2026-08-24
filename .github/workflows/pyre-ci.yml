@@ -540,7 +540,7 @@ jobs:
           --test test_make_jitcodes_produces_graph_keyed_output
 
   pyre-check-linux:
-    name: pyre/check.py ${{ matrix.backend }} (ubuntu-24.04)
+    name: pyre/check.py ${{ matrix.label }} (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
@@ -550,16 +550,28 @@ jobs:
     # the work.
     timeout-minutes: 90
     strategy: &pyre-check-backends
-      # One job per backend rather than one job running both in sequence.
-      # `check.py` builds each backend's release binary itself and the two
-      # builds share almost nothing: measured on run 32611112376 they were
-      # 866s + 692s on Linux, 1239s + 768s on Windows and 1247s + 828s on
-      # macOS, so over three quarters of each leg's wall time was a serial
-      # build. `fail-fast: false` because one backend going red says nothing
-      # about the other, and cancelling it would hide a second failure.
+      # Linux runs one job per backend; macOS and Windows run both backends in
+      # one job. `check.py` builds each backend's release binary itself, and
+      # splitting the two builds across jobs only pays off where the second
+      # build is cheap. Runner-seconds spent on check.py, one backend per job
+      # (run 32657938846) against both in one (run 32647581403):
+      # ubuntu 3990s vs 4243s, windows 5449s vs 4170s, macos 3704s vs 3136s.
+      # Only Linux comes out ahead: on the other two the second job pays for a
+      # full release build over a target directory the first job never warmed,
+      # and that costs more than the two backends cost in sequence. Collapsing
+      # the two back into one job on macOS and Windows is worth 1847 runner-
+      # seconds a run against the 253 the Linux split saves.
+      # `fail-fast: false` because one backend going red says nothing about the
+      # other, and cancelling it would hide a second failure.
       fail-fast: false
       matrix:
-        backend: [dynasm, cranelift]
+        include:
+        - backend: dynasm
+          label: dynasm
+          only: --dynasm-only
+        - backend: cranelift
+          label: cranelift
+          only: --cranelift-only
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
@@ -686,7 +698,7 @@ jobs:
       if: ${{ !cancelled() }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py --${{ matrix.backend }}-only
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py ${{ matrix.only }}
     - name: Run pyre/extra_tests/snippets (gated subset)
       # The snippet corpus is mostly imported from RustPython and is not all
       # green, so only the scripts declaring `# pyre-check: gate=1` run here —
@@ -700,7 +712,7 @@ jobs:
       if: ${{ !cancelled() }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only --${{ matrix.backend }}-only
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only ${{ matrix.only }}
     - name: Run the vendored root extra_tests
       # PyPy's own `extra_tests/` tree, run in place through a driver that
       # supplies the pytest names those files use. Only `run.py`'s ENABLED list
@@ -709,7 +721,7 @@ jobs:
       # the runner exits 0 saying so.
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py --${{ matrix.backend }}-only
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py ${{ matrix.only }}
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
@@ -817,22 +829,40 @@ jobs:
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
 
   pyre-check-macos:
-    name: pyre/check.py ${{ matrix.backend }} (macos-latest)
+    name: pyre/check.py ${{ matrix.label }} (macos-latest)
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
-    strategy: *pyre-check-backends
+    strategy:
+      # Both backends in one job rather than one job each: see the runner-second
+      # measurements on `&pyre-check-backends`. The single entry keeps
+      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
+      # steps, and the steps that name one backend are gated on Linux anyway.
+      matrix:
+        include:
+        - backend: dynasm,cranelift
+          label: dynasm+cranelift
+          only: ""
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
     steps: *pyre-check-steps
 
   pyre-check-windows:
-    name: pyre/check.py ${{ matrix.backend }} (windows-latest)
+    name: pyre/check.py ${{ matrix.label }} (windows-latest)
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
-    strategy: *pyre-check-backends
+    strategy:
+      # Both backends in one job rather than one job each: see the runner-second
+      # measurements on `&pyre-check-backends`. The single entry keeps
+      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
+      # steps, and the steps that name one backend are gated on Linux anyway.
+      matrix:
+        include:
+        - backend: dynasm,cranelift
+          label: dynasm+cranelift
+          only: ""
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
