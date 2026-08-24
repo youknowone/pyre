@@ -3217,7 +3217,21 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // tuple, or another nonnumeric immutable value, while the typed
             // jitcode constant pool was classified exactly above.
             let dst_boxed_int = ei.runtime_helper == majit_ir::RuntimeHelperKind::BoxInt;
+            // `clear_in_flight_exception` is not a read, so it stays out of the
+            // list above, but it reaches the same verdict from the other side.
+            // It writes `PY_NULL` into the propagation carrier -- a slot that
+            // exists only to keep a raised exception rooted for the collector,
+            // which nothing reads back as a value -- and `push_exc_info`
+            // performs the same clear at the same point, so re-running this
+            // body reaches the same state rather than doubling anything.
+            // `residual_call.rs` already spells that judgement for this exact
+            // helper, as `writes_gc_liveness_root_only` in the in-flight
+            // FOR_ITER accounting; the question this scan asks of a replay is
+            // the one that comment answers.
+            let clears_gc_liveness_root =
+                ei.runtime_helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
             let provably_side_effect_free = replay_safe_read
+                || clears_gc_liveness_root
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             let accepted_numeric_op = if provably_side_effect_free {
