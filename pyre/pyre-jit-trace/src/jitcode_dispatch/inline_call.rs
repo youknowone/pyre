@@ -4436,11 +4436,26 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .map(|&cell| ctx.trace_ctx.const_ref(cell as i64))
         .collect();
 
+    // The `__call__` arm dispatches on the instance itself, and the receiver
+    // guard above already pinned THAT operand by class and type version --
+    // which is exactly what `space.lookup` promotes to select the resolved
+    // `__call__`.  Pinning its identity on top specializes the body on one
+    // instance, so a loop over several instances of one callable class
+    // side-exits per instance.  Measured over 200000 calls: one instance reads
+    // 0 bridges and 1 guard failure, 64 instances read 87424 failures with the
+    // bridge count saturated at 29 -- 17.3x CPython against 3.0x for the same
+    // loop on one instance.  `self` reaches the callee as the red operand
+    // `r_args[0]` (the concrete is only the walk's shadow), so the class and
+    // version guard is the whole requirement.  The other user of this guard,
+    // the `str(e)` specializer, pins a different operand than its receiver, so
+    // it keeps the identity guard.
+    let receiver_pinned_by_class =
+        exception_receiver_guard.is_some_and(|(receiver, ..)| receiver == callable_guard_op);
     if !guards_the_callee_function {
         // Those sites resolve the callee through their own guarded path (a
         // type version tag, a receiver class guard); all this has to pin is
         // the operand they dispatched on.
-        if !callable_guard_op.is_constant() {
+        if !callable_guard_op.is_constant() && !receiver_pinned_by_class {
             let expected = ctx
                 .trace_ctx
                 .const_ref(callable_guard_value as usize as i64);
