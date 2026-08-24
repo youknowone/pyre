@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins that a StopIteration caught by FOR_ITER's exhaustion arm reports no `exception` event; pypy3 reports ('consume_generator', 'StopIteration')
 # CPython-suite gap: `test_sys_settrace` traces loops and it traces raising
 # code, but never a loop whose iterator ends by raising StopIteration from a
 # Python-level `__next__` while a tracer is installed.  A runtime that

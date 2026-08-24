@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: pins the one-byte span of a surrogate the surrogatepass decoders cannot complete; pypy3 reports (0, 2)
 # CPython-suite gap: test_codeccallbacks exercises surrogatepass round-trips
 # but never the span of a truncated surrogate, and neither entry point is
 # compared against the other anywhere.
