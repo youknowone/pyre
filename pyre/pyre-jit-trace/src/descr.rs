@@ -5099,6 +5099,18 @@ pub fn ec_topframeref_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_TOPFRAMEREF_OFFSET)
 }
 
+/// Field descr for `ExecutionContext::w_tracefunc`, the slot
+/// `executioncontext.py gettrace` reads (`jit.promote(self.w_tracefunc)`).
+///
+/// Recorded at the portal merge point by `record_portal_tracefunc_guard`
+/// (`jitcode_dispatch/mod.rs`) so a loop compiled with no global trace
+/// function carries a `GuardIsnull` on the slot.  Same group as the two
+/// accessors above, so the read shares their struct identity and the
+/// heapcache collapses a run of merge points to one.
+pub fn ec_w_tracefunc_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
+}
+
 /// Resolve one `EC_DESCR_GROUP` field by byte offset.  The group stamps
 /// `index_in_parent` as the field's rank by offset, so the positional order of
 /// `field_descrs` follows the offsets rather than the declaration order; look
@@ -5110,10 +5122,11 @@ fn ec_field_descr(offset: usize) -> DescrRef {
 
 /// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
 /// `SimpleSizeDescr::is_object() == false`, so the optimizer builds a
-/// StructPtrInfo for the (non-GC) EC pointer.  Both fields are Ref-typed
+/// StructPtrInfo for the (non-GC) EC pointer.  Every field is Ref-typed
 /// (ref value tracking) but Unsigned-flagged (`is_pointer_field()` is false →
 /// no write barrier), which is correct because each slot is forwarded
-/// directly as a GC root every collection (`eval::walk_pyframe_roots`), so the
+/// directly as a GC root every collection (`eval::walk_pyframe_roots` for the
+/// running context, `module::thread`'s per-context walk for the rest), so the
 /// generational remembered-set barrier is unnecessary.
 ///
 /// The group is minted with `is_gc_managed = false`: `ExecutionContext` is a
@@ -5153,6 +5166,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
             pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
         ),
         field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
+        field(2, "w_tracefunc", pyre_interpreter::EC_W_TRACEFUNC_OFFSET),
     ];
     // `index_in_parent` is the field's rank by byte offset
     // (`jitcode/assembler.rs`'s `field_specs_from_layout`), and once a parent

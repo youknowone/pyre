@@ -434,6 +434,13 @@ pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext
 /// then store the callee's `jit.virtual_ref` back into it.
 pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, topframeref);
 
+/// Byte offset of `w_tracefunc` within `ExecutionContext`, for the JIT's
+/// GETFIELD_GC_R lowering of `gettrace()` (`executioncontext.py`, a
+/// `jit.promote` of this slot).  A trace recorded while the slot is NULL pins
+/// that with a guard, so installing a global trace function leaves compiled
+/// code instead of running on past the events it now owes.
+pub const EC_W_TRACEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, w_tracefunc);
+
 /// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
 /// describing the (non-GC) EC struct.  The EC is never JIT-allocated;
 /// this size only backs the field-tracking SizeDescr.

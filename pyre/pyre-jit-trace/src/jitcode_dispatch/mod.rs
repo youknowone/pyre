@@ -10391,6 +10391,112 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
     Ok(())
 }
 
+/// True while a trace function or a profiler is installed on the running
+/// ExecutionContext — `executioncontext.py call_trace`'s own test,
+/// `self.gettrace() is not None or self.profilefunc is not None`.
+///
+/// Every door this walker has into a Python callee — the inline, the direct
+/// `CALL_ASSEMBLER` into the callee's own compiled trace — enters the callee
+/// past `pyframe.py execute_frame`, and `execute_frame` is what runs
+/// `ec.call_trace` / `ec.return_trace` around the eval loop.  So while this
+/// holds, none of those doors can report what the callee owes and the call has
+/// to stay a residual, which reaches `execute_frame` and runs both.  Upstream
+/// needs no such test: it traces THROUGH `execute_frame`, so the reads become
+/// guards in the compiled loop and the events are recorded with the callee.
+///
+/// Read live off the running context rather than from a recorded box.  The
+/// answer only decides whether to record a door at all, and every caller bails
+/// before recording any IR; the other half — a hook installed after the trace
+/// was recorded — is `record_portal_tracefunc_guard` for a trace function and
+/// the `is_being_profiled` green (`interp_jit.py greens`) for a profiler.
+pub(crate) fn ec_hook_installed() -> bool {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
+}
+
+/// The global trace function `executioncontext.py gettrace` reads —
+/// `jit.promote(self.w_tracefunc)` — pinned NULL at the portal merge point.
+///
+/// The events an inlined callee owes a trace function are `call_trace` /
+/// `return_trace`, which `pyframe.py execute_frame` runs around the eval loop.
+/// Upstream traces through both, so whatever inlines the callee inlines their
+/// `gettrace()` reads with it and the compiled loop carries a guard; this
+/// walker synthesizes the call instead (`walker_ec_enter`, `inline_call.rs`)
+/// and records neither, so without a guard a loop compiled with no tracer goes
+/// on inlining — and silencing — its callees after one is installed.  Measured
+/// over a 100 000-iteration tail with `sys.settrace` armed from inside the
+/// loop: 1 043 `call` events for a callee the walker inlines, against 100 000
+/// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
+///
+/// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
+/// read goes through the portal frame's `execution_context`.  Both reads are
+/// registered with the heapcache, so a run of merge points with no intervening
+/// call collapses to one pair, and both are loop-invariant.
+///
+/// A trace recorded while the slot is ALREADY non-NULL records nothing: there
+/// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
+/// declines every Python-callee inline in that state, so the events come from
+/// the interpreter's own `execute_frame`.  `sys.setprofile` needs no guard
+/// here at all — `is_being_profiled` is a portal-driver green
+/// (`interp_jit.py greens`), so arming a profiler mints a different cell whose
+/// own recording sees the hook and declines the same inlines.
+fn record_portal_tracefunc_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    // An inlined callee's own header is not the portal loop the compiled code
+    // re-enters, and the sub-walk's boxes describe the callee frame.
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(());
+    }
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() || !unsafe { (*ec).w_tracefunc }.is_null() {
+        return Ok(());
+    }
+    let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return Ok(());
+    };
+    let ec_descr = crate::descr::pyframe_execution_context_descr();
+    let ec_descr_index = ec_descr.index();
+    let ec_box = match ctx
+        .trace_ctx
+        .heapcache_getfield_cached(frame_box, ec_descr_index)
+    {
+        Some(cached) => cached,
+        None => {
+            let read =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], ec_descr);
+            ctx.trace_ctx
+                .heapcache_getfield_now_known(frame_box, ec_descr_index, read);
+            ctx.trace_ctx
+                .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(ec as usize)));
+            read
+        }
+    };
+    let descr = crate::descr::ec_w_tracefunc_descr();
+    let descr_index = descr.index();
+    if ctx
+        .trace_ctx
+        .heapcache_getfield_cached(ec_box, descr_index)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let read = ctx
+        .trace_ctx
+        .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
+    ctx.trace_ctx
+        .heapcache_getfield_now_known(ec_box, descr_index, read);
+    ctx.trace_ctx
+        .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .nullity_now_known(read, false);
+    Ok(())
+}
+
 /// RPython `pyjitpl.py _establish_nullity(box, orgpc)` — the shared body
 /// behind `opimpl_goto_if_not_ptr_nonzero` / `opimpl_goto_if_not_ptr_iszero`:
 ///
@@ -11959,6 +12065,11 @@ fn handle<Sym: WalkSym>(
             // frame's `debugdata` at the top of every opcode (pyopcode.py).
             // The merge point is the trace's counterpart of that loop top.
             record_portal_debugdata_guard(ctx, op.pc)?;
+            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
+            // (pyframe.py) read the global trace function on every call the
+            // loop makes.  The walker records neither for an inlined callee,
+            // so the loop pins the slot instead.
+            record_portal_tracefunc_guard(ctx, op.pc)?;
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
