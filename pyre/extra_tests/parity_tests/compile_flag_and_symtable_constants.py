@@ -21,9 +21,7 @@ assert ast.PyCF_OPTIMIZED_AST == 0x8000 | ast.PyCF_ONLY_AST, hex(ast.PyCF_OPTIMI
 
 # The number has to keep working as the flag it names: `compile()` takes it,
 # and rejects the one it used to be.  What the flag then *collects* is a
-# separate and still-open gap — pyre's parser does not surface type comments,
-# so `ast.parse(type_comments=True)` leaves `type_ignores` empty and every
-# `type_comment` None where 3.14 fills both — and nothing here asserts it.
+# separate question, and `ast_type_comments.py` is where it is asserted.
 tree = compile(
     "x = 1  # type: int\n",
     "<s>",
