@@ -54,6 +54,47 @@ fn raise_invalid_loop(msg: &'static str, op: &Op, ctx: &OptContext) -> Optimizat
     OptimizationResult::InvalidLoop(msg)
 }
 
+/// optimizer.py `_check_subclass`: whether `vtable1` is a subclass of
+/// `vtable2`.
+///
+/// The preorder numbering makes a subclass test a range test — every subclass
+/// of a class numbers inside that class's own span.  The span includes its
+/// `max`, which no real class is ever numbered with.
+///
+/// Answers `None` when either class has no recorded range, which decides
+/// nothing: a caller must keep its guard rather than read that as a pass.
+fn check_subclass(vtable1: i64, vtable2: i64) -> Option<bool> {
+    let (known_min, _) = majit_gc::subclass_range(vtable1 as usize)?;
+    let (expected_min, expected_max) = majit_gc::subclass_range(vtable2 as usize)?;
+    Some(expected_min <= known_min && known_min <= expected_max)
+}
+
+/// The GC type id a `PtrInfo` descr names, or `None` when it names none.
+///
+/// Raw and headerless layouts carry no header word and so no id at all.  A
+/// stamped `0` means "not resolved yet", not type zero, so it is recovered
+/// through the structural cache key the same way the short preamble's guard
+/// builder recovers it.
+fn descr_gc_type_id(descr: &majit_ir::DescrRef) -> Option<u32> {
+    if let Some(size) = descr.as_size_descr() {
+        if !size.is_gc_managed() || size.headerless() {
+            return None;
+        }
+        return crate::optimizeopt::info::resolve_gc_tid(
+            size.type_id(),
+            size.cache_key(),
+            |cache, key| cache.resolve_struct_tid(key),
+        );
+    }
+    let array = descr.as_array_descr()?;
+    if !array.is_gc_managed() {
+        return None;
+    }
+    crate::optimizeopt::info::resolve_gc_tid(array.type_id(), array.cache_key(), |cache, key| {
+        cache.resolve_array_tid(key)
+    })
+}
+
 /// info.py: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
 /// optimizer.py: getnullness()
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2011,34 +2052,136 @@ impl Optimization for OptRewrite {
                 }
                 self.optimize_guard_class(op, ctx)
             }
-            // rewrite.py: GUARD_IS_OBJECT — if arg is a known constant, the guard
-            // was already checked at recording time and can be removed.
             OpCode::GuardIsObject => {
-                if ctx
-                    .get_constant_box(&op.arg(0).get_box_replacement(false))
-                    .is_some()
-                {
-                    return OptimizationResult::Remove;
+                // rewrite.py optimize_GUARD_IS_OBJECT.
+                let arg0 = op.arg(0).get_box_replacement(false);
+                if let Some(info) = ctx.getptrinfo(&arg0) {
+                    if info.is_constant() {
+                        let Some(constant) = ctx.get_constant_box(&arg0) else {
+                            return OptimizationResult::PassOn;
+                        };
+                        let gcref = constant.as_ref();
+                        if gcref.is_null() {
+                            return raise_invalid_loop("A GUARD_IS_OBJECT(NULL) found", op, ctx);
+                        }
+                        if majit_gc::check_is_object(gcref) {
+                            return OptimizationResult::Remove;
+                        }
+                        return raise_invalid_loop(
+                            "A GUARD_IS_OBJECT(not-an-object) found",
+                            op,
+                            ctx,
+                        );
+                    }
+                    // An info that is about an object has already established
+                    // what this guard tests; one that is precise and is not
+                    // about an object never can.
+                    if info.is_about_object() {
+                        return OptimizationResult::Remove;
+                    }
+                    if info.is_precise() {
+                        return raise_invalid_loop(
+                            "GUARD_IS_OBJECT proven to always fail",
+                            op,
+                            ctx,
+                        );
+                    }
                 }
                 OptimizationResult::PassOn
             }
-            // rewrite.py: GUARD_GC_TYPE — if arg is a known constant, remove.
             OpCode::GuardGcType => {
-                if ctx
-                    .get_constant_box(&op.arg(0).get_box_replacement(false))
-                    .is_some()
-                {
-                    return OptimizationResult::Remove;
+                // rewrite.py optimize_GUARD_GC_TYPE.
+                let arg0 = op.arg(0).get_box_replacement(false);
+                let Some(expected) = ctx.get_constant_int_box(&op.arg(1)) else {
+                    return OptimizationResult::PassOn;
+                };
+                if let Some(info) = ctx.getptrinfo(&arg0) {
+                    if info.is_constant() {
+                        let Some(constant) = ctx.get_constant_box(&arg0) else {
+                            return OptimizationResult::PassOn;
+                        };
+                        let Some(type_id) = majit_gc::get_actual_typeid(constant.as_ref()) else {
+                            return OptimizationResult::PassOn;
+                        };
+                        if i64::from(type_id) != expected {
+                            return raise_invalid_loop(
+                                "wrong GC type ID found on a constant",
+                                op,
+                                ctx,
+                            );
+                        }
+                        return OptimizationResult::Remove;
+                    }
+                    // The descr names the layout the value is already known to
+                    // carry, so the tid it resolves to settles the guard either
+                    // way.  Take the resolved tid, never the stamped one: a
+                    // deserialized descr carries only its structural cache key,
+                    // and reading the 0 that stands for "not yet resolved" as a
+                    // tid would report a type conflict against every real one.
+                    if let Some(type_id) =
+                        info.get_descr().and_then(|descr| descr_gc_type_id(descr))
+                    {
+                        if i64::from(type_id) != expected {
+                            return raise_invalid_loop("wrong GC types passed around!", op, ctx);
+                        }
+                        return OptimizationResult::Remove;
+                    }
                 }
                 OptimizationResult::PassOn
             }
-            // rewrite.py: GUARD_SUBCLASS — if arg is a known constant, remove.
             OpCode::GuardSubclass => {
-                if ctx
-                    .get_constant_box(&op.arg(0).get_box_replacement(false))
-                    .is_some()
+                // rewrite.py optimize_GUARD_SUBCLASS.
+                let arg0 = op.arg(0).get_box_replacement(false);
+                let Some(expected) = ctx.get_constant_int_box(&op.arg(1)) else {
+                    return OptimizationResult::PassOn;
+                };
+                let Some(info) = ctx.getptrinfo(&arg0) else {
+                    return OptimizationResult::PassOn;
+                };
+                // A constant's class is read off the value itself; an info that
+                // is about an object may name the class exactly.  Both settle
+                // the guard, so they share the verdict below.
+                let known_class = if info.is_constant() {
+                    ctx.cls_of_box(&arg0)
+                } else if info.is_about_object() {
+                    info.get_known_class(ctx.cpu.as_ref())
+                } else {
+                    None
+                };
+                if let Some(known_class) = known_class {
+                    let msg = if info.is_constant() {
+                        "GUARD_SUBCLASS(const) proven to always fail"
+                    } else {
+                        "GUARD_SUBCLASS(known_class) proven to always fail"
+                    };
+                    return match check_subclass(known_class, expected) {
+                        Some(true) => OptimizationResult::Remove,
+                        Some(false) => raise_invalid_loop(msg, op, ctx),
+                        None => OptimizationResult::PassOn,
+                    };
+                }
+                // Without an exact class the descr still bounds the value: it is
+                // that class or a subclass of it.  The guard always passes when
+                // the whole bound is inside the tested class, and can only be
+                // decided at runtime when the tested class is inside the bound.
+                if info.is_about_object()
+                    && let Some(base) = info
+                        .get_descr()
+                        .and_then(|descr| descr.as_size_descr())
+                        .map(|descr| descr.vtable() as i64)
                 {
-                    return OptimizationResult::Remove;
+                    return match check_subclass(base, expected) {
+                        Some(true) => OptimizationResult::Remove,
+                        Some(false) => match check_subclass(expected, base) {
+                            Some(false) => raise_invalid_loop(
+                                "GUARD_SUBCLASS(base_class) proven to always fail",
+                                op,
+                                ctx,
+                            ),
+                            _ => OptimizationResult::PassOn,
+                        },
+                        None => OptimizationResult::PassOn,
+                    };
                 }
                 OptimizationResult::PassOn
             }
