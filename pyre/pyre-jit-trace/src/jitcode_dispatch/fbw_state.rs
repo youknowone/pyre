@@ -2886,10 +2886,21 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // `PyreHelperKind`, so `ei.pyre_helper` is `None` and every closure
             // body that reads a free variable declines here.  Admitting it is a
             // tag away, not a proof away.
+            // `load_import` is `load_global`'s narrower half: both resolve a
+            // name through `finditem_str`, but that one reads the frame's
+            // globals first -- which may be an arbitrary mapping, so it can
+            // reach a user `__getitem__` -- while this one reads only the
+            // builtins module's own dict, and only after `lookup_dunder_import`
+            // has checked `is_module`.  What is left is the collision `__eq__`
+            // `finditem_str` documents, which `load_global` already carries
+            // here, and an ImportError when the name is absent, which replays
+            // as the same error the same way `load_global`'s NameError does.
+            // It writes nothing, so re-running it commits nothing.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
                     | majit_ir::PyreHelperKind::LoadGlobal
+                    | majit_ir::PyreHelperKind::LoadImport
                     | majit_ir::PyreHelperKind::BoxInt
                     | majit_ir::PyreHelperKind::NewtupleFromArray
                     | majit_ir::PyreHelperKind::NewlistFromArray
