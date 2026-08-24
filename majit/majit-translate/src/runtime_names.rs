@@ -23,6 +23,45 @@
 //! these the way [`crate::local_crates`] already seeds crate roots from the
 //! loaded LLBC set — there is no second consumer today, so that machinery is
 //! not written, and the list below is what it would take.
+//!
+//! # What deliberately stays outside this module
+//!
+//! The crate still says "pyre" elsewhere, in three kinds. None of them stays
+//! because the name is upstream: a case-insensitive `pyre` over an RPython
+//! checkout matches nothing at all. Each kind stays for its own reason.
+//!
+//! **Path matchers under [`crate::front`].** Thirty literals matching a
+//! `pyre_object::` / `pyre_interpreter::` MIR path directly. That module's doc
+//! states that every file under it is Rust-specific lowering with no RPython
+//! structural match, and its maintenance rule is to justify the deviation
+//! rather than avoid it. Naming such a path is what the layer is for; a
+//! `front/` that named none would not be doing its job.
+//!
+//! **Diagnostic text.** The error and panic messages that spell a shim or a
+//! crate, plus two skip labels (`callee-pyre-class-ctor`,
+//! `skip-pyre-class-allocate-ctor`). These are not the failure this module
+//! exists to prevent. The lookup sites moved because a lookup that misses is
+//! SILENT — the operation falls back and nothing counts it. A message is read
+//! by whoever hits it, so a stale one announces itself; routing it through a
+//! constant would buy consistency, not detection.
+//!
+//! **Environment gate names.** `PYRE_MIR_FRONTEND_DEBUG`, read by
+//! [`crate::decline`]. This kind must not move, for a mechanical reason rather
+//! than a stylistic one. `gate_triage_complete`'s `NAMESPACES` maps the
+//! `PYRE_` prefix to `pyre/gate-triage.md` and checks both directions by
+//! scanning source for the name as a quoted literal inside the `env::var` call
+//! itself; its `gates_read_by` says outright that a gate held in a Rust const
+//! does not count as live. Routing one through a constant here would not
+//! rename anything — it would drop the gate out of the completeness check
+//! while leaving it live, the same silent direction the shim names moved here
+//! to escape.
+//!
+//! Rust item names are not on that list because they are no longer this
+//! crate's to police. `scripts/check-majit-boundary.py` rejects a
+//! `pyre`-spelled identifier or path component anywhere under `majit/`, which
+//! is a check rather than a convention — the jitcode keys this module once
+//! argued to leave alone were renamed `*_ext/P` on both sides of the wire
+//! format under it.
 
 /// LLBC artefacts the fixtures load.
 ///
