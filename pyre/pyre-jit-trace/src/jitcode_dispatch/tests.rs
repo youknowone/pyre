@@ -220,6 +220,30 @@ fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
     assert!(!summary.body_not_walked);
 }
 
+/// An `inline_call` whose descr does not resolve to a JitCode is the same
+/// condition one level down: a callee the scan holds nothing about.  Falling
+/// through would read it as executing no effect and holding no blocker — the
+/// most permissive answer there is, reached by not looking — and would let the
+/// blocker behind it be classified as effect-free, which says a rewind covers
+/// it.
+#[test]
+fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = inline_call_with_descr(7);
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert!(summary.body_not_walked);
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "an unresolved callee may have executed an effect, so nothing behind \
+         it is rewindable"
+    );
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(summary.may_execute_effect);
+}
+
 /// A body the decoder cannot read to the end declines on that alone.  The
 /// instruction starts would otherwise name a prefix, and the `push!` gate drops
 /// targets that are not starts — so every path out of the undecodable byte

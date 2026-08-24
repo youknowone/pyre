@@ -1047,6 +1047,16 @@ pub(crate) fn summarize_body_blockers(
                 // The descent enters this callee, so a region of it the callee's
                 // own scan could not read is a region of this descent.
                 summary.body_not_walked |= callee.body_not_walked;
+            } else {
+                // The `d` operand did not resolve to a JitCode descr, so this
+                // op's callee is a body the scan holds nothing about.  Falling
+                // through silently would read it as a callee that executes no
+                // effect and holds no blocker — the most permissive answer
+                // available, arrived at by not looking.  It is the same
+                // condition `body_not_walked` already names one level down: a
+                // region of this descent the scan did not walk.
+                summary.body_not_walked = true;
+                effect = true;
             }
         }
         if descent_op_applies_effect(d.opname) {
