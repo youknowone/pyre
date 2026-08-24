@@ -13031,6 +13031,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 mode,
                 opts,
                 syntax_check_only,
+                flags & PYCF_TYPE_COMMENTS != 0,
             )
         };
         return result.map_err(|error| {

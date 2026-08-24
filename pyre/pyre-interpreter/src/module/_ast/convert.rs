@@ -28,6 +28,7 @@ pub fn compile_object(
     let mut converter = ObjectConverter {
         ast_module,
         depth: 0,
+        carried_ignores: Vec::new(),
         line_len: 0,
     };
     // The compiler reads a node's position out of the source text the range
@@ -95,6 +96,7 @@ pub fn preprocess_object_to_object(
     let mut converter = ObjectConverter {
         ast_module,
         depth: 0,
+        carried_ignores: Vec::new(),
         line_len: 0,
     };
     // Both directions have to read positions out of the same text, and a tree
@@ -110,12 +112,15 @@ pub fn preprocess_object_to_object(
     } else {
         source
     };
-    module_to_object(module, source, mode, ast_module)
+    module_to_object(module, source, mode, ast_module, &converter.carried_ignores)
 }
 
 struct ObjectConverter {
     ast_module: PyObjectRef,
     depth: usize,
+    /// The `TypeIgnore`s the incoming `Module` carried. The compiler AST has
+    /// no field for them, so they ride here and are republished unchanged.
+    carried_ignores: Vec<super::type_comments::TypeComment>,
     /// Characters on each line of the synthetic source, excluding the newline.
     /// Zero until `synthetic_source` has measured the tree.
     line_len: usize,
@@ -304,16 +309,21 @@ impl ObjectConverter {
         Ok(ruff_text_size::TextRange::new(start.into(), end.into()))
     }
 
-    /// `Module.type_ignores` (ast.py) holds the `# type: ignore` comments
-    /// a `type_comments=True` parse collected.  The compiler AST has nowhere
-    /// to keep them and never reads them back, but the field is still walked
-    /// so that a list holding something else is reported here.
-    fn type_ignores(&self, object: PyObjectRef) -> AstResult<()> {
+    /// `Module.type_ignores` (ast.py) holds the `# type: ignore` comments a
+    /// `type_comments=True` parse collected.  The compiler AST has nowhere to
+    /// keep them, so they are carried beside it and handed back unchanged; a
+    /// list holding anything but a `TypeIgnore` is reported here.
+    fn type_ignores(
+        &self,
+        object: PyObjectRef,
+    ) -> AstResult<Vec<super::type_comments::TypeComment>> {
         let value = match crate::baseobjspace::getattr_str(object, "type_ignores") {
             Ok(value) => value,
             // An unset field stands for the empty list a parse without type
             // comments produces.
-            Err(error) if error.kind == crate::PyErrorKind::AttributeError => return Ok(()),
+            Err(error) if error.kind == crate::PyErrorKind::AttributeError => {
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         };
         if !unsafe { pyre_object::is_list(value) } {
@@ -322,8 +332,16 @@ impl ObjectConverter {
                 class_name(value)
             )));
         }
+        let mut out = Vec::new();
         for item in unsafe { pyre_object::w_list_items_copy_as_vec(value) } {
-            if unsafe { pyre_object::is_none(item) } || self.is_node(item, "TypeIgnore")? {
+            if unsafe { pyre_object::is_none(item) } {
+                continue;
+            }
+            if self.is_node(item, "TypeIgnore")? {
+                out.push(super::type_comments::TypeComment::new(
+                    self.int_field(item, "lineno", "TypeIgnore")? as u32,
+                    self.string(item, "tag", "TypeIgnore")?,
+                ));
                 continue;
             }
             return Err(crate::PyError::type_error(crate::display::wtf8_format!(
@@ -331,12 +349,12 @@ impl ObjectConverter {
                 self.repr(item)?
             )));
         }
-        Ok(())
+        Ok(out)
     }
 
     fn module(&mut self, object: PyObjectRef) -> AstResult<ast::Mod> {
         let node = if self.is_node(object, "Module")? {
-            self.type_ignores(object)?;
+            self.carried_ignores = self.type_ignores(object)?;
             "Module"
         } else if self.is_node(object, "Interactive")? {
             "Interactive"
@@ -388,7 +406,7 @@ impl ObjectConverter {
                 returns,
                 body,
                 runtime_decorator_list: None,
-                runtime_type_comment: None,
+                runtime_type_comment: self.opt_type_comment(object)?,
                 runtime_type_comment_bytes: None,
                 runtime_body: None,
             }))
@@ -429,7 +447,7 @@ impl ObjectConverter {
                 targets,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
                 runtime_targets: None,
-                runtime_type_comment: None,
+                runtime_type_comment: self.opt_type_comment(object)?,
                 runtime_type_comment_bytes: None,
             }))
         } else if self.is_node(object, "ClassDef")? {
@@ -526,7 +544,7 @@ impl ObjectConverter {
                 iter,
                 body,
                 orelse,
-                runtime_type_comment: None,
+                runtime_type_comment: self.opt_type_comment(object)?,
                 runtime_type_comment_bytes: None,
                 runtime_body: None,
                 runtime_orelse: None,
@@ -609,7 +627,7 @@ impl ObjectConverter {
                 is_async,
                 items,
                 body,
-                runtime_type_comment: None,
+                runtime_type_comment: self.opt_type_comment(object)?,
                 runtime_type_comment_bytes: None,
                 runtime_body: None,
             }))
@@ -824,7 +842,7 @@ impl ObjectConverter {
             node_index: Default::default(),
             name: self.identifier(object, "arg", "arg")?,
             annotation: self.opt_expr(object, "annotation")?,
-            runtime_type_comment: None,
+            runtime_type_comment: self.opt_type_comment(object)?,
             runtime_type_comment_bytes: None,
         })
     }
@@ -1202,6 +1220,22 @@ impl ObjectConverter {
             unsafe { pyre_object::w_str_get_value(value).to_string() },
             Default::default(),
         )))
+    }
+
+    /// A node's `type_comment`, which every ASDL kind that has one spells the
+    /// same way: an optional plain string.
+    fn opt_type_comment(&self, object: PyObjectRef) -> AstResult<Option<Box<str>>> {
+        let Some(value) = self.optional_field(object, "type_comment")? else {
+            return Ok(None);
+        };
+        if !unsafe { pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(
+                "AST type_comment must be of type str",
+            ));
+        }
+        Ok(Some(
+            unsafe { pyre_object::w_str_get_value(value).to_string() }.into(),
+        ))
     }
 
     fn identifiers(
@@ -1809,7 +1843,13 @@ fn fstring(
 }
 
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
-    parse_to_object_with_opts(source, mode, crate::compile::CompileOpts::default(), true)
+    parse_to_object_with_opts(
+        source,
+        mode,
+        crate::compile::CompileOpts::default(),
+        true,
+        false,
+    )
 }
 
 /// CPython 3.14 `Py_CompileStringObject` AST-returning branch: parse, run
@@ -1819,21 +1859,31 @@ pub fn parse_to_object_with_opts(
     mode: crate::compile::Mode,
     opts: crate::compile::CompileOpts,
     syntax_check_only: bool,
+    type_comments: bool,
 ) -> crate::PyResult {
     // The tokenizer sees a source whose line terminators are all `\n`
     // (`pytokenizer.py:654-662`), so the same rewrite runs here; the nodes and
     // the text `module_to_object` slices segments out of then agree.
     let source = &*crate::compile::universal_newline(source);
+    // A comment leaves no node behind, so a `type_comments=True` parse reads
+    // the token list the parser hands back beside the tree.
+    let mut collected = super::type_comments::TypeComments::default();
     let mut module = match mode {
         crate::compile::Mode::Eval => parser::parse_expression(source)
             .map(|parsed| ast::Mod::Expression(parsed.into_syntax())),
         crate::compile::Mode::Exec
         | crate::compile::Mode::Single
-        | crate::compile::Mode::BlockExpr => {
-            parser::parse_module(source).map(|parsed| ast::Mod::Module(parsed.into_syntax()))
-        }
+        | crate::compile::Mode::BlockExpr => parser::parse_module(source).map(|parsed| {
+            if type_comments {
+                collected = super::type_comments::collect(parsed.tokens(), source);
+            }
+            ast::Mod::Module(parsed.into_syntax())
+        }),
     }
     .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    if type_comments {
+        collected.attach(&mut module);
+    }
     preprocess_module(&mut module, mode, opts, syntax_check_only);
 
     let ast_module = crate::importing::importhook(
@@ -1843,7 +1893,7 @@ pub fn parse_to_object_with_opts(
         0,
         crate::call::take_last_exec_ctx(),
     )?;
-    module_to_object(module, source, mode, ast_module)
+    module_to_object(module, source, mode, ast_module, &collected.ignores)
 }
 
 fn module_to_object(
@@ -1851,6 +1901,7 @@ fn module_to_object(
     source: &str,
     mode: crate::compile::Mode,
     module_object: PyObjectRef,
+    ignores: &[super::type_comments::TypeComment],
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
@@ -1870,7 +1921,23 @@ fn module_to_object(
             };
             let body = converter.stmt_list(&module.body)?;
             if root_name == "Module" {
-                let type_ignores = converter.list(Vec::new());
+                let type_ignores = ignores
+                    .iter()
+                    .map(|ignore| {
+                        converter.node(
+                            "TypeIgnore",
+                            None,
+                            &[
+                                (
+                                    "lineno",
+                                    converter.pin(pyre_object::w_int_new(ignore.lineno as i64)),
+                                ),
+                                ("tag", converter.string(&ignore.text)),
+                            ],
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let type_ignores = converter.list(type_ignores);
                 converter.node(
                     root_name,
                     None,
@@ -3033,7 +3100,10 @@ impl Converter<'_> {
                     "annotation",
                     self.optional(p.annotation.as_deref().map(|v| self.expr(v)).transpose()?),
                 ),
-                ("type_comment", self.none()),
+                (
+                    "type_comment",
+                    self.optional(p.runtime_type_comment.as_deref().map(|v| self.string(v))),
+                ),
             ],
         )
     }

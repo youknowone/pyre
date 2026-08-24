@@ -6,3 +6,4 @@
 crate::pyre_module_init!(moduledef);
 
 pub mod convert;
+pub mod type_comments;
