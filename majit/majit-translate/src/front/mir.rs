@@ -2457,6 +2457,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_first_sites,
             )
         };
+        // The `<[T]>::get(slice, i)` bounds-checked `Option<&T>` diamond
+        // rewrite (`front::slice_get`) splits the residual `get` call block
+        // into a guarded `Some`/`None` diamond (`if i < len(slice)`), same
+        // post-lowering shape and fail-safe contract as `slice_first`, of
+        // which it is the general case; gate the reachability sweep on an
+        // actual rewrite.
+        let slice_get_rewritten = if lo.slice_get_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_get::rewire_slice_get_call_sites(&mut lo.graph, &lo.slice_get_sites)
+        };
         // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
         // the residual `saturating_sub` call block into an `if a < b { 0 } else
         // { a - b }` diamond, same post-lowering shape and fail-safe contract as
@@ -2571,6 +2582,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
+            || slice_get_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
@@ -3157,6 +3169,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `<[T]>::get(slice, i)` call sites recorded for the bounds-checked
+    /// `Option<&T>` diamond the `front::slice_get` post-pass synthesizes
+    /// after the body lowering completes (see
+    /// [`crate::front::slice_get::SliceGetSite`]).
+    slice_get_sites: Vec<crate::front::slice_get::SliceGetSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -3414,6 +3431,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            slice_get_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -9908,6 +9926,26 @@ impl<'a> Lowering<'a> {
         {
             self.slice_first_sites.push(site);
         }
+        // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
+        // `Option<&T>` diamond `front::slice_get` synthesizes.  `get` is the
+        // general case of `first` — the same foreign leaf, the same raw
+        // `FunctionPath` segments and the same unregistered-callee census Skip
+        // — with the subscript in `args[1]`.  `recognize_slice_get_site` pins
+        // the scalar `SliceIndex` instantiation off that operand's type, so a
+        // range instantiation (whose payload is a sub-slice) and any other
+        // resolution miss both leave the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && let Some(site) =
+                self.recognize_slice_get_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
+        {
+            self.slice_get_sites.push(site);
+        }
         // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
         // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
         // foreign leaf (its `Self` is a primitive integer, so `lower_call`
@@ -12361,6 +12399,49 @@ impl<'a> Lowering<'a> {
         self.option_residual_narrow_root(dest_ty)?;
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
         Some(crate::front::slice_first::SliceFirstSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
+    /// Resolve a recognized `<[T]>::get(slice, i)` call into a
+    /// [`crate::front::slice_get::SliceGetSite`] — the same `Option` enum root
+    /// + `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
+    /// plus the `SliceIndex` instantiation gate `first` has no need of.
+    ///
+    /// `<[T]>::get` is generic over `SliceIndex`, and only its scalar
+    /// instantiation returns `Option<&T>`.  Every range one (`Range`,
+    /// `RangeTo`, `RangeFrom`, `RangeFull`, `RangeInclusive`,
+    /// `RangeToInclusive`) returns `Option<&[T]>`, whose payload is a
+    /// SUB-SLICE: an element read at the range's start would hand the consumer
+    /// a `T` where a `[T]` is expected.  Pin the scalar one by the index
+    /// operand's declared `usize` — the same discriminator
+    /// [`Self::is_slice_scalar_index_call`] uses to separate `<[T]>::index`'s
+    /// scalar impl from its range ones.  A literal subscript arrives as an
+    /// `Operand::Const`, for which no `index_ty` is captured, so it declines
+    /// too: the residual call and its census Skip both survive.
+    ///
+    /// [`Self::option_residual_narrow_root`] refuses the range forms a second
+    /// time — a `[T]` payload is the `Slice` builtin, which has no ADT def-id
+    /// and so no registered narrow root — and is load-bearing for `get` for
+    /// the reason it is for `first`: it is exactly the shape `lower_call`
+    /// appends a trailing `__pyre_cast_instance` narrowing to, the cast the
+    /// post-pass absorbs and re-applies per arm.  It also declines a
+    /// value-slice `Option<u8>` / `Option<i64>` cleanly.
+    fn recognize_slice_get_site(
+        &self,
+        dest_ty: &TyRef,
+        index_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::slice_get::SliceGetSite> {
+        if index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) != Some("Usize") {
+            return None;
+        }
+        self.option_residual_narrow_root(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        Some(crate::front::slice_get::SliceGetSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
