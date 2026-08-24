@@ -12781,7 +12781,11 @@ const PYCF_ONLY_AST: i64 = 0x0400;
 const PYCF_DONT_IMPLY_DEDENT: i64 = 0x0200;
 const PYCF_SOURCE_IS_UTF8: i64 = 0x0100;
 const PYCF_IGNORE_COOKIE: i64 = 0x0800;
-const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
+/// `Include/cpython/compile.h` numbers this one `0x1000`, and `_ast`
+/// publishes it, so the value is observable.  `consts.py` moved it out to
+/// `0x40000000` because it kept `PyCF_ASYNC_HACKS` on `0x1000`; that flag is
+/// gone from 3.14 and the bit is free.
+const PYCF_TYPE_COMMENTS: i64 = 0x1000;
 const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
 const PYCF_OPTIMIZED_AST: i64 = 0x8000 | PYCF_ONLY_AST;

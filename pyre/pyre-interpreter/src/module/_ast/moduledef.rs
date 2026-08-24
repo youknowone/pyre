@@ -285,12 +285,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
-    // (`flags = PyCF_ONLY_AST; flags |= PyCF_TYPE_COMMENTS`). Values mirror
-    // `pypy/interpreter/astcompiler/consts.py:33-42`.
+    // (`flags = PyCF_ONLY_AST; flags |= PyCF_TYPE_COMMENTS`). Values are
+    // `Include/cpython/compile.h`'s, which `consts.py` matches everywhere but
+    // `PyCF_TYPE_COMMENTS`: it kept `PyCF_ASYNC_HACKS` on `0x1000` and moved
+    // this one out to `0x40000000`.  3.14 has no `PyCF_ASYNC_HACKS`.
     for (name, value) in &[
         ("PyCF_ONLY_AST", 0x0400i64),
         ("PyCF_ALLOW_TOP_LEVEL_AWAIT", 0x2000),
-        ("PyCF_TYPE_COMMENTS", 0x4000_0000),
+        ("PyCF_TYPE_COMMENTS", 0x1000),
         // CPython 3.14 Include/cpython/compile.h: requesting an optimized
         // tree necessarily requests an AST result as well.
         ("PyCF_OPTIMIZED_AST", 0x8000 | 0x0400),
