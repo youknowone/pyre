@@ -2886,6 +2886,7 @@ class Check:
         # applied. Reported in the summary: an unevaluated gate otherwise
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
+        self.pypy_ratio_ungated = []
         # (bench name, ceiling, measured ratio or None) for fixtures whose
         # header raised the ratio above WASM_MAX_DYNASM_RATIO, for the same
         # reason as the line above: a gate widened for a fixture and a gate the
@@ -4012,6 +4013,18 @@ class Check:
                 ratio = _ratio(elapsed, t_pypy)
 
         if vs_pypy and t_pypy not in (None, "-"):
+            # A clamped baseline declines BOTH bounds in `_performance_gate_passed`,
+            # so a fixture can carry a `max-pypy-ratio` that no run has ever
+            # applied. The comparison table already prints `~` on the row, but a
+            # marker per row is not a set anyone can review, and absence of the
+            # directive exempts a fixture entirely -- so a ceiling that never
+            # arms reads exactly like one that holds. Named for the same reason
+            # the wasm ratio is.
+            if (
+                self._baseline_exec_time_clamped("pypy", float(t_pypy))
+                and name not in self.pypy_ratio_ungated
+            ):
+                self.pypy_ratio_ungated.append(name)
             minimum = perf_gate_floor(vs_pypy)
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
@@ -4664,6 +4677,18 @@ class Check:
                 dim(
                     f"cpython reference skipped (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s) "
                     f"for {len(self.cpython_reference_skips)}: {names}"
+                )
+            )
+        # A `max-pypy-ratio` whose baseline was pinned to the floor every time
+        # it ran is a recorded number nobody checked.
+        if self.pypy_ratio_ungated:
+            names = ", ".join(self.pypy_ratio_ungated)
+            print(
+                dim(
+                    "max-pypy-ratio not evaluated for "
+                    f"{len(self.pypy_ratio_ungated)} fixture(s): pypy's "
+                    "execution-only time was clamped to the floor, so no ratio "
+                    f"gate was applied to them: {names}"
                 )
             )
         # A wasm run with no usable dynasm denominator beside it leaves
