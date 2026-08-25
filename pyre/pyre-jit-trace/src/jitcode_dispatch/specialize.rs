@@ -7214,11 +7214,17 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
         // The body reached a helper this build did not lower.  Nothing is
         // committed yet -- the read has no effect to undo -- so cut the
         // tentative IR and let the generic residual serve the subscript.
+        //
+        // The snapshots go with it: the class guard and the `GuardValue` on
+        // the frozen key are both emitted above with snapshots attached, and
+        // those name the discarded operation namespace, so leaving them in
+        // the side table exposes stale boxes once a later optimizer remaps
+        // every published snapshot.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] SUBSCR-TUPLE-SUBWALK pc={pc}");
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
         }
