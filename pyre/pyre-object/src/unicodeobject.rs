@@ -1187,8 +1187,8 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
 /// `try_hash_value` memoizes, which `EffectInfo.__new__` already admits for
 /// an `EF_ELIDABLE_*` call.  A `str` is immutable, so the code point at an
 /// index is fixed for the life of the object.  Its only failure is the
-/// allocation, which is `getcalldescr`'s `cr == "mem"` branch
-/// (`call.py:292-299`) rather than the conservative can-raise one.
+/// allocation, so `call.py getcalldescr` picks its `cr == "mem"` branch
+/// rather than the conservative can-raise one.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_str_getitem(s: i64, index: i64) -> i64 {
     let obj = s as PyObjectRef;
