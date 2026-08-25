@@ -1720,11 +1720,14 @@ fn report_post_residual_shadow<Sym: WalkSym>(
         None => return,
     };
     let heap = ctx.trace_ctx.diag_virtualizable_heap_ptr();
-    // Baseline for "what the residual wrote".  A force inside the call rewrote
-    // the locals region from the shadow, so once there is a flush image that is
-    // the only sound baseline: measuring from before the call would report the
-    // flush's own stores as the residual's.  With no flush the frame was never
-    // rewritten, so the pre-call image is exact.
+    // Baseline for "what the residual wrote".  A flush rewrote the locals region
+    // from the shadow, so once there is a flush image that is the only sound
+    // baseline: measuring from before the call would report the flush's own
+    // stores as the residual's.  Measured, that difference is the loop
+    // variable -- the flush writes it, the residual does not -- and adopting it
+    // makes the compiled loop re-read its counter out of the array, one
+    // iteration ahead.  With no flush the frame was never rewritten, so the
+    // pre-call image is exact.
     let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref()
@@ -1795,11 +1798,13 @@ fn report_post_residual_shadow<Sym: WalkSym>(
 /// leaves every later read, and the values the loop closes on, holding what the
 /// local was before the call.
 ///
-/// The array is authoritative at exactly this point and nowhere else: the force
-/// inside the call wrote the whole locals region out of the shadow just before
-/// the callee ran, and the callee's write landed on top of it.  That is why the
-/// standing objection to re-reading a standard virtualizable mid-trace -- the
-/// array holds values the trace never wrote -- does not apply here.
+/// The standing objection to re-reading a standard virtualizable mid-trace is
+/// that the array holds values the trace never wrote.  What answers it is not
+/// the force but *`moved`*: the caller diffs the region against the image it
+/// took before the call, so only the slots the call itself changed are adopted,
+/// and a slot the walk is ahead on -- unchanged during the call -- is not in the
+/// set.  That holds on both arms, the one where the residual forced the region
+/// out of the shadow first and the one where nothing forced at all.
 ///
 /// The re-read is RECORDED, not folded to the value seen now: compiled code has
 /// to perform the same load after its own force, so this emits
@@ -3733,7 +3738,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // every moved slot as a write, and the adoption below would then put the
     // array's value over a box the walk holds and the frame was never told
     // about.
-    let residual_locals_roots = ((fbw_debug_abort_enabled()
+    let mut residual_locals_roots = ((fbw_debug_abort_enabled()
         || fbw_import_residual_locals_enabled())
         && is_may_force
         && live_frame != 0)
@@ -4136,12 +4141,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // Read the pre-call image back out of the root slots: a collection
             // inside the residual forwarded them alongside the frame's array,
             // so these words and `locals_w!` name the same objects.
-            let residual_locals_before =
-                residual_locals_roots.as_ref().map(|(roots, base, len)| {
-                    (0..*len)
-                        .map(|k| roots.get(*base + k))
-                        .collect::<Vec<pyre_object::PyObjectRef>>()
-                });
+            let residual_locals_before = residual_locals_roots.take().map(|(roots, base, len)| {
+                (0..len)
+                    .map(|k| roots.get(base + k))
+                    .collect::<Vec<pyre_object::PyObjectRef>>()
+            });
             report_post_residual_shadow(ctx, live_frame, residual_locals_before.as_deref());
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
@@ -4194,6 +4198,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             crate::state::note_vable_escape_abort();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
+    }
+    // Not forced, so nothing above consumed the pre-call image.  The reachable
+    // shape is the same `f_locals` write-through as the forced arm, one
+    // recording later: with the callee inlined the store IS the residual, and
+    // `framelocalsproxy_setitem`'s own force is gated on the live frame's
+    // `vable_token` -- which the walk arms on its snapshot instead -- so the
+    // store lands on the array with no escape raised and no shadow reload.
+    // The walk would otherwise carry the box it held before the call all the
+    // way into the jump arguments the loop closes on.
+    //
+    // This runs BEFORE the restore below: the residual's write is still in the
+    // live frame here, and the restore keeps it anyway (it holds back exactly
+    // the slots the flush did not write).
+    if let Some((roots, base, len)) = residual_locals_roots.take() {
+        let before: Vec<pyre_object::PyObjectRef> = (0..len).map(|k| roots.get(base + k)).collect();
+        report_post_residual_shadow(ctx, live_frame, Some(&before));
     }
     // A flush that ran without a forced abort (an unarmed token or a missing
     // vable root) must not leak the moved frame into the continuing walk.

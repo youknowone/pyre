@@ -17,16 +17,20 @@ that frame and holds each local as a box, so unless it reads the stored slot
 back out of the array, the value it carries -- and the value its loop closes on
 -- is the one the local held before the call.
 
-The bound matters.  The write is lost only on an iteration where the loop is
-being recorded, so a loop that never gets that far cannot witness it, and the
-first recording is what this pins.  A second recording, reached much later,
-inlines ``setter`` instead of calling it; the store is then a residual that
-forces nothing at all, and that arm is a separate defect this does not cover.
+The bound matters, and it has to clear TWO recordings.  The write is lost only
+on an iteration where the loop is being recorded, so a loop that stops short
+witnesses nothing.  The first recording calls ``setter`` for real: that call
+forces the caller's virtualizable, and the store lands on the frame the force
+just wrote.  The second, reached much later, inlines ``setter`` instead, so the
+store itself is the residual and nothing forces at all -- the proxy's own force
+is gated on the live frame's ``vable_token``, which is zero while the walk is
+tracing.  The two lose the write through different paths and are pinned here at
+iterations 1040 and 2105, so the bound sits well past the later of them.
 """
 
 import sys
 
-ROUNDS = 1500
+ROUNDS = 4000
 
 
 def run(rounds):
