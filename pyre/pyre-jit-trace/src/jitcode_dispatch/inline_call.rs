@@ -6677,30 +6677,44 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         let prologue_cannot_call_assembler = fbw_executed_effect_count() != prologue_effects_before
             || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect());
-        let midbody_abort = match &result {
-            Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
-                Some((*pc, MidBodyAbortKind::Marker))
+        // `descr_call` is a level of its own upstream: it discards `__init__`'s
+        // result, checks it is None, and returns the instance. The mid-body leg
+        // resumes INSIDE the rebuilt callee and hands its return to the caller
+        // PAST the CALL, and the tail (`crate::ctor_continuation`) carries no
+        // Python code object, so the interpreter cannot run it as a frame
+        // between the two -- the caller would take `__init__`'s None as the
+        // instantiation's result. Leave the carrier to the entry leg, which
+        // replays the CALL: the half-built instance is unreachable, so the
+        // residual re-does the whole instantiation, the same answer the fold's
+        // own decline path gives.
+        let midbody_abort = if constructor_result.is_some() {
+            None
+        } else {
+            match &result {
+                Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
+                    Some((*pc, MidBodyAbortKind::Marker))
+                }
+                Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc, .. })
+                    if fbw_structural_abort_opcode_is_effect_free(*pc) =>
+                {
+                    Some((*pc, MidBodyAbortKind::Structural))
+                }
+                // `run_blackhole_interp_to_cancel_tracing` keeps the live callee
+                // MIFrame and continues it at its own merge point.  When a callee
+                // prologue has already acquired a lock or committed another
+                // effect, rejecting CALL_ASSEMBLER below must use that same
+                // mid-body handoff.  Falling through without a carrier replays the
+                // callee from its entry and, for `_pyio.BufferedReader.read`, tries
+                // to acquire its non-reentrant `_read_lock` a second time.
+                Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
+                    if prologue_cannot_call_assembler =>
+                {
+                    crate::state::pyjitcode_for_code(w_code)
+                        .and_then(|pjc| pjc.merge_entry_for(*target_pc))
+                        .map(|pc| (pc, MidBodyAbortKind::Structural))
+                }
+                _ => None,
             }
-            Err(DispatchError::LoopBearingCalleeInlineUnsupported { pc, .. })
-                if fbw_structural_abort_opcode_is_effect_free(*pc) =>
-            {
-                Some((*pc, MidBodyAbortKind::Structural))
-            }
-            // `run_blackhole_interp_to_cancel_tracing` keeps the live callee
-            // MIFrame and continues it at its own merge point.  When a callee
-            // prologue has already acquired a lock or committed another
-            // effect, rejecting CALL_ASSEMBLER below must use that same
-            // mid-body handoff.  Falling through without a carrier replays the
-            // callee from its entry and, for `_pyio.BufferedReader.read`, tries
-            // to acquire its non-reentrant `_read_lock` a second time.
-            Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
-                if prologue_cannot_call_assembler =>
-            {
-                crate::state::pyjitcode_for_code(w_code)
-                    .and_then(|pjc| pjc.merge_entry_for(*target_pc))
-                    .map(|pc| (pc, MidBodyAbortKind::Structural))
-            }
-            _ => None,
         };
         if let Some((abort_pc, abort_kind)) = midbody_abort {
             if is_top_inline && !unjournaled_before_subwalk {
