@@ -4042,7 +4042,7 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
 
 /// Fold `LOAD_ATTR` on a type receiver when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
-/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// `typeobject.py` `getattribute` returns the class-MRO value unchanged.  The exact
 /// receiver and its version tag are pinned before the value is written as a
 /// green constant.  [`pyre_interpreter::mutated`] recursively invalidates
 /// subclasses, so the one receiver pin covers reassignment or deletion on any
@@ -8023,7 +8023,7 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
 
 /// Fold plain `getattr(type, name)` when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
-/// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
+/// `typeobject.py` `getattribute` returns the class-MRO value unchanged.  The exact
 /// callable, exact receiver, exact name object, and receiver version are pinned
 /// before the value is written as a green constant.  Pinning the callable makes
 /// a rebound `getattr` side-exit instead of continuing to use the folded value.
