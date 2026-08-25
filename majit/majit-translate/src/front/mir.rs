@@ -8623,6 +8623,24 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `bytes_block_chars` is the Rust storage adapter for
+                // RPython's `STR.chars`: its `BytesBlock.length` is exactly
+                // the gcarray descr's `len_offset`, and `chars` begins at the
+                // descr's `base_size`.  Recover the owning block from the
+                // address-taken `chars` FieldRead and alias the returned slice
+                // to that header.  This is deliberately function-scoped;
+                // arbitrary `from_raw_parts(p, n)` cannot discard `n` (for
+                // example a list's logical length may be below capacity).
+                if args.len() == 2
+                    && let Some(block) =
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                {
+                    self.local_var[dest_local] = Some(block);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `RBigInt::digits{,_mut}` is a Rust view adapter around a
                 // typed-items GcArray:
                 // `slice::from_raw_parts(items_base(block), capacity)`.  The
@@ -11366,6 +11384,49 @@ impl<'a> Lowering<'a> {
                 "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
             )
         })
+    }
+
+    /// Return the owning `BytesBlock` for the exact
+    /// `bytes_block_chars(block)` raw-slice constructor.
+    ///
+    /// RPython's `STR` is a length-prefixed GC struct with a variable-sized
+    /// `chars` array (`rpython/rtyper/lltypesystem/rstr.py`).  pyre's
+    /// `BytesBlock` deliberately has the same descr-visible shape: `length`
+    /// is the array length and the address-taken `chars` field is item zero.
+    /// The lifted value is therefore the block header, not the interior
+    /// `chars` address.  Matching the defining FieldRead also proves this is
+    /// that layout adapter rather than an unrelated raw slice in the helper.
+    fn bytes_block_header_from_raw_parts(
+        &self,
+        bb_id: BlockId,
+        reg: &RegularCall,
+        chars: &Variable,
+    ) -> Option<Variable> {
+        if self.graph.name != "pyre_object::bytesobject::bytes_block_chars" {
+            return None;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+            return None;
+        }
+        self.graph
+            .block(bb_id)
+            .operations
+            .iter()
+            .rev()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::FieldRead { base, field, .. })
+                    if result == chars
+                        && field.name == "chars"
+                        && field.owner_root.as_deref() == Some("BytesBlock")
+                        && field.taken_by_address =>
+                {
+                    Some(base.clone())
+                }
+                _ => None,
+            })
     }
 
     /// `*items_block_items_base(block).add(idx)` — a list / tuple
@@ -29264,6 +29325,60 @@ mod tests {
             from_raw_parts_calls, 0,
             "rbigint digits (capacity-length view) must still fold to the \
              items-block header, leaving no residual from_raw_parts"
+        );
+    }
+
+    /// `bytes_block_chars` exposes the variable-sized `chars` array whose
+    /// length is the same `BytesBlock.length` consumed by the gcarray descr.
+    /// It is therefore the bytes-string twin of RPython `STR.chars`: the
+    /// `from_raw_parts(chars, length)` view must fold to the managed block
+    /// instead of surviving as an opaque Rust call. Loads the real
+    /// pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn bytes_block_chars_folds_header_length_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "bytes_block_chars").expect("lower bytes_block_chars");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residual.is_empty(),
+            "bytes_block_chars must lower to the managed bytes-block array; \
+             residual calls: {residual:#?}; graph: {graph:#?}"
+        );
+        let dead_storage_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.owner_root.as_deref() == Some("BytesBlock")
+                            && matches!(field.name.as_str(), "chars" | "length")
+                )
+            })
+            .count();
+        assert_eq!(
+            dead_storage_reads, 0,
+            "the owner alias must let the ordinary dead-op pass remove the \
+             interior chars/length shell; graph: {graph:#?}"
         );
     }
 

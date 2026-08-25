@@ -2659,7 +2659,14 @@ impl Bookkeeper {
             // exact annotation too.  Leaving the dependency-opaque name to
             // the registered-struct arm below produces `Impossible` and
             // blocks `ConstantData::Str.value`.
-            "String" | "str" | "Wtf8" | "Wtf8Buf" => return super::model::s_str0(),
+            // `BytesBlock` is pyre's concrete storage port of RPython `STR`:
+            // a length header followed by the variable-sized `chars` array.
+            // `bytes_block_chars` folds the Rust raw-slice view back to this
+            // owner, so the owner must carry the same `SomeString` annotation
+            // as the slice it represents, not a nominal Rust-struct class.
+            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" => {
+                return super::model::s_str0();
+            }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque
             // to translation.  Its sanctioned conversion seam is a residual
             // call, but the value occupying `ConstantData::Integer.value`
@@ -4508,6 +4515,27 @@ mod tests {
         assert!(
             Rc::ptr_eq(&code_cd, &template),
             "RPython has one CodeObject class, not per-generic classdefs"
+        );
+    }
+
+    #[test]
+    fn bytes_block_projects_to_rpython_string_storage() {
+        use crate::annotator::model::SomeValue;
+
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_pyre_field_type("BytesBlock"),
+                SomeValue::String(_)
+            ),
+            "BytesBlock is the owner of RPython STR.chars, not a nominal instance"
+        );
+        assert!(
+            matches!(
+                bk.project_pyre_field_type("*const BytesBlock"),
+                SomeValue::String(_)
+            ),
+            "a BytesBlock pointer must keep the same string annotation"
         );
     }
 

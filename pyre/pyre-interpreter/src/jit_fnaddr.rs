@@ -3895,6 +3895,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             &crate::function::SLOT_WRAPPER_TYPE as *const _ as i64,
         ),
         (
+            "function::METHOD_WRAPPER_TYPE",
+            &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64,
+        ),
+        (
             "function::METHOD_DESCRIPTOR_TYPE",
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64,
         ),
@@ -3998,13 +4002,55 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "dictmultiobject::INT_DICT_STRATEGY",
             dictmultiobject::INT_DICT_STRATEGY
         ),
+        // A translated `W_DictObject.dstrategy` holds the address of the
+        // non-zero-sized holder, not the zero-sized strategy implementation.
+        // These are the concrete prebuilt instances corresponding to PyPy's
+        // `space.fromcache(StrategyClass)` results and are therefore GCREF
+        // constants in the translated graph, exactly like the implementation
+        // rows above but with the identity the live dict slot actually reads.
+        ref_addr!(
+            "dictmultiobject::OBJECT_DICT_STRATEGY_REF",
+            dictmultiobject::OBJECT_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::EMPTY_DICT_STRATEGY_REF",
+            dictmultiobject::EMPTY_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF",
+            dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::BYTES_DICT_STRATEGY_REF",
+            dictmultiobject::BYTES_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::UNICODE_DICT_STRATEGY_REF",
+            dictmultiobject::UNICODE_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::INT_DICT_STRATEGY_REF",
+            dictmultiobject::INT_DICT_STRATEGY_REF
+        ),
         ref_addr!(
             "identitydict::IDENTITY_DICT_STRATEGY",
             identitydict::IDENTITY_DICT_STRATEGY
         ),
         ref_addr!(
+            "identitydict::IDENTITY_DICT_STRATEGY_REF",
+            identitydict::IDENTITY_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
             "kwargsdict::KWARGS_DICT_STRATEGY",
             kwargsdict::KWARGS_DICT_STRATEGY
+        ),
+        ref_addr!(
+            "kwargsdict::KWARGS_DICT_STRATEGY_REF",
+            kwargsdict::KWARGS_DICT_STRATEGY_REF
+        ),
+        (
+            "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
+            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         ),
         // Prebuilt object singletons (`None` / `NotImplemented` /
         // `Ellipsis` / `True` / `False`).  The accessors `w_none`,
@@ -4112,7 +4158,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         is_list_write_barrier, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_trace_fnaddrs,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs,
     };
     use std::collections::HashMap;
 
@@ -4290,6 +4337,32 @@ mod tests {
         assert_eq!(
             bindings["function::METHOD_DESCRIPTOR_TYPE"],
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64
+        );
+        assert_eq!(
+            bindings["function::METHOD_WRAPPER_TYPE"],
+            &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
+        );
+    }
+
+    #[test]
+    fn jit_static_ref_addrs_covers_live_dict_strategy_holders() {
+        let bindings: HashMap<&'static str, i64> = jit_static_ref_addrs().into_iter().collect();
+
+        assert_eq!(
+            bindings["dictmultiobject::OBJECT_DICT_STRATEGY_REF"],
+            &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["identitydict::IDENTITY_DICT_STRATEGY_REF"],
+            &pyre_object::identitydict::IDENTITY_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["kwargsdict::KWARGS_DICT_STRATEGY_REF"],
+            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
+            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64
         );
     }
 

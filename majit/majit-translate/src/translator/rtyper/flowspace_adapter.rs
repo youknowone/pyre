@@ -3486,6 +3486,17 @@ pub(crate) fn derive_subject_inputcells(
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
+                // `BytesBlock` is the low-level owner of Python bytes'
+                // RPython-shaped `STR.chars` storage, not a user-visible
+                // nominal instance.  The MIR front folds
+                // `bytes_block_chars`'s exact `(chars, length)` raw-slice
+                // view back to this header, so seed the header with the same
+                // `SomeString` cell that `project_pyre_field_type` assigns it.
+                // A generic raw-slice owner does not take this path.
+                if class_root.as_deref() == Some("BytesBlock") {
+                    cells.push(crate::annotator::model::s_str0());
+                    continue;
+                }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
                     // A registered receiver-driven dispatch family (issue
                     // #346): a `dyn Trait` receiver whose bound-trait
