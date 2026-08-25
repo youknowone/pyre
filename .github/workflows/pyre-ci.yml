@@ -286,9 +286,33 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
-    # See prepare-charon-llbc-linux: the gate has to name every prepare job,
-    # because each platform's consumers wait on their own.
-    needs: cargo-fmt
+    # The two non-Linux platforms wait for the Linux `check.py` legs to pass.
+    # Measured over the 596 finished runs of 2026-08-19..24, which cost 9695645
+    # runner-seconds with 55.4% of them on macOS and Windows:
+    #
+    #   137 failure runs never reached a green Linux check.py, and their macOS
+    #       and Windows legs spent 1634383 runner-seconds re-proving it;
+    #   297 cancelled runs were superseded before Linux check.py finished --
+    #       the median cancelled run lives 2567 s and Linux check.py completes
+    #       at +5727 s -- and spent 1600008 runner-seconds on the two;
+    #   9 further cancelled runs got past a green Linux check.py, for 77635 s.
+    #
+    # 3312026 runner-seconds, 34.2% of the six days, on legs that either
+    # re-proved a failure Linux had already found or were thrown away.
+    #
+    # This defers a platform answer, it does not drop one: 31 of the 168
+    # failure runs had a green Linux check.py and 19 of those went red on a
+    # platform leg, so every one of them still runs. What a red Linux costs is
+    # the round trip -- the platform answer arrives on the push that turns
+    # Linux green rather than beside it. Restricting the two platforms to
+    # `main` instead saves more and does drop coverage: over the same window 10
+    # runs went red on macOS or Windows while Linux stayed green, 8 of them on
+    # a branch, and under that rule all 10 would have landed first.
+    #
+    # `cargo-fmt` is named as well as reached through `pyre-check-linux`, so
+    # the gate below survives that job's own dependencies being rearranged.
+    needs: [cargo-fmt, pyre-check-linux]
+    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -297,8 +321,9 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
-    # See prepare-charon-llbc-linux.
-    needs: cargo-fmt
+    # See prepare-charon-llbc-macos for the measurement behind the Linux gate.
+    needs: [cargo-fmt, pyre-check-linux]
+    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
