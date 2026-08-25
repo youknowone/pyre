@@ -3440,6 +3440,37 @@ fn code_addr2line(code: &crate::CodeObject, firstlineno: i32, addrq: i64) -> i32
     bounds.check_line_number(lasti)
 }
 
+/// Specialization rewrites the opcode byte in place (`RESUME` becomes
+/// `RESUME_CHECK`), so every read asks about the family.
+fn base_op(code: &crate::CodeObject, index: usize) -> Option<crate::bytecode::Instruction> {
+    let op = code.instructions.get(index)?.op;
+    Some(op.to_base().unwrap_or(op))
+}
+
+/// `code->_co_firsttraceable` — the index of the first `RESUME`, which is where
+/// a frame that has not run an instruction is reported to be.
+///
+/// `init_code` (`Objects/codeobject.c`) scans for it once and stores it; this
+/// walks instead, which costs the prologue's length because it stops at that
+/// `RESUME` — within a handful of units of the start for every code object the
+/// compiler produces.  Everything ahead of it is what the compiler inserts:
+/// `COPY_FREE_VARS`, `MAKE_CELL`, and a generator's `RETURN_GENERATOR` /
+/// `POP_TOP` pair.  A code object with no `RESUME` at all leaves the index past
+/// the end, so it starts no line anywhere — what `init_code`'s scan does with
+/// one too.
+pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
+    use crate::bytecode::Instruction;
+
+    let mut index = 0;
+    while let Some(op) = base_op(code, index) {
+        if matches!(op, Instruction::Resume { .. }) {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
 /// Whether the instruction at `pc` may be reported to a trace function as the
 /// start of a source line.
 ///
@@ -3466,28 +3497,8 @@ fn code_addr2line(code: &crate::CodeObject, firstlineno: i32, addrq: i64) -> i32
 pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool {
     use crate::bytecode::Instruction;
 
-    // Specialization rewrites the opcode byte in place (`RESUME` becomes
-    // `RESUME_CHECK`), so every read below asks about the family.
-    fn base_op(code: &crate::CodeObject, index: usize) -> Option<Instruction> {
-        let op = code.instructions.get(index)?.op;
-        Some(op.to_base().unwrap_or(op))
-    }
-
-    // `i < code->_co_firsttraceable`, resolved by walking to the first
-    // `RESUME`.  This costs the prologue's length rather than `pc`, because it
-    // stops at that `RESUME` — which sits within a handful of units of the
-    // start for every code object the compiler produces.  A code object with no
-    // `RESUME` at all leaves `_co_firsttraceable` past the end and so traces no
-    // lines, which is what `init_code`'s scan does with one too.
-    let mut index = 0;
-    while index <= pc {
-        match base_op(code, index) {
-            Some(Instruction::Resume { .. }) => break,
-            Some(_) => index += 1,
-            None => return false,
-        }
-    }
-    if index > pc {
+    // `i < code->_co_firsttraceable`.
+    if pc < first_traceable_index(code) {
         return false;
     }
 
