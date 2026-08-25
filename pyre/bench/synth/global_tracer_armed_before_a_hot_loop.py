@@ -144,9 +144,14 @@ def main():
                 at_least(counts, ('line', 'callee'), tail, arm, failures)
                 at_least(counts, ('line', 'hot'), 2 * tail, arm, failures)
             else:
-                # A hook that returns None arms no frame, so nothing but `call`.
+                # A hook that returns None arms no frame, so nothing but
+                # `call` — for the callee as much as for the loop frame, and
+                # the callee is the one a compiled trace reports through a
+                # different path.
                 exact(counts, ('return', 'hot'), 0, arm, failures)
                 exact(counts, ('line', 'hot'), 0, arm, failures)
+                exact(counts, ('return', 'callee'), 0, arm, failures)
+                exact(counts, ('line', 'callee'), 0, arm, failures)
         keys = [('call', 'callee')]
         if local:
             keys += [('return', 'callee'), ('line', 'callee'), ('line', 'hot')]
