@@ -4003,6 +4003,17 @@ where
                     }
                     _ => self.read_int_reg(value_reg),
                 };
+                let field_index = fielddescr.index();
+                // `_record_helper` runs `heapcache.invalidate_caches` before it
+                // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
+                // only the mark-escaped half runs: a ref written into an
+                // already-escaped struct escapes with it. Same shape as
+                // BC_SETARRAYITEM_GC below.
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetfieldGc,
+                    None,
+                    &[struct_opref, value_opref],
+                );
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
@@ -4012,6 +4023,10 @@ where
                     &[struct_opref, value_opref],
                     fielddescr,
                 );
+                // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
+                // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
+                // The cache stores the Box identity, not the value word.
+                ctx.heapcache_setfield_cached(struct_opref, field_index, value_opref);
                 if struct_ptr != 0 {
                     // blackhole.py:1471-1483 stores through the fielddescr,
                     // which carries the field's byte width, and the getfield
