@@ -19136,7 +19136,16 @@ fn init_complex_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__complex__",
                 |args| {
-                    // Return a plain `complex` with the same components.
+                    // PyPy `W_ComplexObject.descr_complex` creates a base
+                    // complex, while `W_ComplexObject.is_w` makes that result
+                    // identical-by-value to an exact receiver.  Pyre follows
+                    // CPython 3.14 `ComplexTest.test___complex__` for complex
+                    // identity, so preserve the same observable result by
+                    // returning an exact receiver itself.  A strict subclass
+                    // still has to shed its class through a fresh base value.
+                    if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::COMPLEX_TYPE) } {
+                        return Ok(args[0]);
+                    }
                     let (re, im) = unsafe {
                         (
                             pyre_object::w_complex_get_real(args[0]),
