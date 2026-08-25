@@ -208,8 +208,56 @@ pub unsafe extern "C" fn PyThread_get_thread_ident() -> c_ulong {
     crate::module::thread::current_ident() as c_ulong
 }
 
+/// The two words a caller embeds for a critical section, which it allocates
+/// and pyre fills in.
+///
+/// `Py_BEGIN_CRITICAL_SECTION` in the header opens a plain block, so nothing
+/// pyre compiles ever names one; an extension that declares the struct itself
+/// still passes the address of two words, and both fields are written so that
+/// the block is defined storage rather than whatever the stack held.
+#[repr(C)]
+pub struct CPyCriticalSection {
+    pub _cs_prev: usize,
+    pub _cs_mutex: *mut CPyMutex,
+}
+
+/// `PyCriticalSection_Begin(section, op)` — serialize against whoever else
+/// operates on `op`.
+///
+/// Every thread that runs Python here does so under one global lock, which
+/// already orders these against each other, so there is nothing to take: the
+/// section records that it holds no mutex and `PyCriticalSection_End` has
+/// nothing to release. That is the same answer the header gives an extension
+/// that spells the block with the macros instead.
+///
+/// # Safety
+/// `section` must address two writable words that outlive the section.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCriticalSection_Begin(
+    section: *mut CPyCriticalSection,
+    _op: *mut super::pyobject::CPyObject,
+) {
+    if section.is_null() {
+        return;
+    }
+    unsafe {
+        (*section)._cs_prev = 0;
+        (*section)._cs_mutex = std::ptr::null_mut();
+    }
+}
+
+/// `PyCriticalSection_End(section)` — the release half of
+/// [`PyCriticalSection_Begin`], which took nothing.
+///
+/// # Safety
+/// `section` must be one [`PyCriticalSection_Begin`] was handed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCriticalSection_End(_section: *mut CPyCriticalSection) {}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyMutex_Lock as *const ());
+    std::hint::black_box(PyCriticalSection_Begin as *const ());
+    std::hint::black_box(PyCriticalSection_End as *const ());
     std::hint::black_box(PyMutex_Unlock as *const ());
     std::hint::black_box(PyMutex_IsLocked as *const ());
     std::hint::black_box(PyThread_allocate_lock as *const ());

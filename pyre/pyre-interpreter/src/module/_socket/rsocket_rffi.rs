@@ -80,6 +80,10 @@ pub const NI_MAXHOST: usize = libc::NI_MAXHOST as usize;
 pub const INADDR_ANY: u32 = libc::INADDR_ANY;
 #[cfg(unix)]
 pub const AI_NUMERICHOST: libc::c_int = libc::AI_NUMERICHOST;
+#[cfg(unix)]
+pub const AI_PASSIVE: libc::c_int = libc::AI_PASSIVE;
+#[cfg(unix)]
+pub const INADDR_BROADCAST: u32 = libc::INADDR_BROADCAST;
 
 #[cfg(windows)]
 pub const AF_UNSPEC: libc::c_int = ws::AF_UNSPEC as libc::c_int;
@@ -114,6 +118,12 @@ pub const NI_MAXHOST: usize = ws::NI_MAXHOST as usize;
 pub const INADDR_ANY: u32 = ws::INADDR_ANY;
 #[cfg(windows)]
 pub const AI_NUMERICHOST: libc::c_int = ws::AI_NUMERICHOST as libc::c_int;
+#[cfg(windows)]
+pub const AI_PASSIVE: libc::c_int = ws::AI_PASSIVE as libc::c_int;
+/// WinSock declares it as a preprocessor macro, which the generated bindings
+/// do not carry.  It is all ones, so it reads the same in either byte order.
+#[cfg(windows)]
+pub const INADDR_BROADCAST: u32 = 0xffff_ffff;
 
 // ── WinSock initialisation ──
 
@@ -539,6 +549,15 @@ pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
 #[cfg(windows)]
 pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
     sin.sin_addr.S_un.S_addr = addr;
+}
+
+#[cfg(unix)]
+pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
+    sin6.sin6_addr.s6_addr
+}
+#[cfg(windows)]
+pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
+    unsafe { sin6.sin6_addr.u.Byte }
 }
 
 #[cfg(unix)]
@@ -1070,6 +1089,50 @@ pub unsafe fn host_by_addr(
         init();
         unsafe { ws::gethostbyaddr(addr as *const u8, len, family) }
     }
+}
+
+/// The code the resolver reports a failed name or address lookup with, and the
+/// platform's message for it.
+///
+/// `gethostbyname` / `gethostbyaddr` leave it in `h_errno` rather than `errno`,
+/// and `set_herror` raises `herror(code, hstrerror(code))` from the pair.  The
+/// variable is spelled three ways: glibc and musl make it a thread-local behind
+/// `__h_errno_location`, the BSDs export the plain global `<netdb.h>` declares,
+/// and winsock defines it as `WSAGetLastError()`.
+pub fn host_error() -> (libc::c_int, String) {
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    let code = {
+        unsafe extern "C" {
+            fn __h_errno_location() -> *mut libc::c_int;
+        }
+        unsafe { *__h_errno_location() }
+    };
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    let code = {
+        unsafe extern "C" {
+            static h_errno: libc::c_int;
+        }
+        unsafe { h_errno }
+    };
+    #[cfg(windows)]
+    let code = last_error_code();
+
+    #[cfg(unix)]
+    let message = {
+        let p = unsafe { libc::hstrerror(code) };
+        if p.is_null() {
+            "host not found".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    // No `hstrerror` on Windows, where `set_herror` falls back to the literal.
+    #[cfg(windows)]
+    let message = "host not found".to_string();
+
+    (code, message)
 }
 
 /// # Safety

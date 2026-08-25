@@ -1153,7 +1153,7 @@ pub unsafe extern "C" fn PyObject_VectorcallDict(
         return unsafe { PyObject_Vectorcall(callable, args, nargsf, std::ptr::null_mut()) };
     }
     let nargs = vectorcall_nargs(nargsf);
-    let positional = unsafe { PyTuple_from_vector(args, nargs) };
+    let positional = unsafe { tuple_from_vector(args, nargs) };
     if positional.is_null() {
         return std::ptr::null_mut();
     }
@@ -1163,8 +1163,10 @@ pub unsafe extern "C" fn PyObject_VectorcallDict(
 }
 
 /// The `tuple` a vector's first `count` entries make, as a new reference.
-#[allow(non_snake_case)]
-unsafe fn PyTuple_from_vector(args: *const *mut CPyObject, count: usize) -> *mut CPyObject {
+pub(super) unsafe fn tuple_from_vector(
+    args: *const *mut CPyObject,
+    count: usize,
+) -> *mut CPyObject {
     let tuple = unsafe { super::tupleobject::PyTuple_New(count as isize) };
     if tuple.is_null() {
         return std::ptr::null_mut();
@@ -1226,6 +1228,29 @@ pub unsafe extern "C" fn PyObject_Realloc(block: *mut c_void, size: usize) -> *m
         return PyObject_Malloc(size);
     }
     unsafe { pyobject::reallocate_raw(block, size) }
+}
+
+/// `Py_TYPE(object)` as a call, which is what an extension reaches when it
+/// declares the prototype itself instead of expanding the header's macro.
+///
+/// The answer is the field, not [`crate::typedef::r#type`]: the macro reads
+/// `ob_type` and hands the block back borrowed, so a mirror whose type is not
+/// linked yet must answer NULL here exactly as it does there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_TYPE(object: *mut CPyObject) -> *mut CPyTypeObject {
+    if object.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*object).ob_type }
+}
+
+/// `Py_IS_TYPE(object, tp)` as a call, for the reason [`Py_TYPE`] is one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_IS_TYPE(object: *mut CPyObject, tp: *mut CPyTypeObject) -> c_int {
+    if object.is_null() {
+        return 0;
+    }
+    (unsafe { (*object).ob_type } == tp) as c_int
 }
 
 /// `Py_TYPE(object)`, borrowed — the mirror a type mirror is.
@@ -1389,6 +1414,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyCallable_Check as *const ());
     std::hint::black_box(PyObject_IsInstance as *const ());
     std::hint::black_box(PyObject_Type as *const ());
+    std::hint::black_box(Py_TYPE as *const ());
     std::hint::black_box(PyObject_GenericGetAttr as *const ());
     std::hint::black_box(PyObject_GenericSetAttr as *const ());
     std::hint::black_box(PyObject_GenericGetDict as *const ());

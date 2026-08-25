@@ -305,6 +305,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "LOG_LOCAL7",
             pyre_object::w_int_new(libc::LOG_LOCAL7 as i64),
         );
+        // `LOG_ODELAY` and `LOG_AUTHPRIV`/`LOG_FTP` are `<syslog.h>` names
+        // every BSD-derived host carries; the four `LOG_NETINFO`-onwards
+        // facilities are darwin's own. Only the darwin numbering has been
+        // read back from a header, so the whole set is answered there.
+        #[cfg(target_vendor = "apple")]
+        for (name, val) in [
+            ("LOG_ODELAY", libc::LOG_ODELAY as i64),
+            ("LOG_AUTHPRIV", libc::LOG_AUTHPRIV as i64),
+            ("LOG_FTP", libc::LOG_FTP as i64),
+            ("LOG_NETINFO", libc::LOG_NETINFO as i64),
+            ("LOG_REMOTEAUTH", libc::LOG_REMOTEAUTH as i64),
+            ("LOG_INSTALL", libc::LOG_INSTALL as i64),
+            ("LOG_RAS", libc::LOG_RAS as i64),
+            ("LOG_LAUNCHD", libc::LOG_LAUNCHD as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
     }
     // `Modules/syslogmodule.c syslog_log_mask / syslog_log_upto` —
     // helpers for building setlogmask() arguments.

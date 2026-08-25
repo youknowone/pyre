@@ -2131,11 +2131,6 @@ fn register_posix_constants(ns: pyre_object::PyObjectRef) {
         );
         crate::module_ns_store(
             ns,
-            "PROT_NONE",
-            pyre_object::w_int_new(libc::PROT_NONE as i64),
-        );
-        crate::module_ns_store(
-            ns,
             "MADV_NORMAL",
             pyre_object::w_int_new(host_mmap::MADV_NORMAL as i64),
         );
@@ -2159,5 +2154,31 @@ fn register_posix_constants(ns: pyre_object::PyObjectRef) {
             "MADV_DONTNEED",
             pyre_object::w_int_new(host_mmap::MADV_DONTNEED as i64),
         );
+        // The `MAP_*` / `MADV_*` names `<sys/mman.h>` defines only on darwin.
+        // `rmmap.py` reaches them through `DefinedConstantInteger`, which
+        // yields None wherever the header is silent; the cfg does the same
+        // job.
+        #[cfg(target_vendor = "apple")]
+        {
+            macro_rules! cst {
+                ($name:literal, $val:expr) => {
+                    crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                };
+            }
+            cst!("MADV_FREE", libc::MADV_FREE);
+            cst!("MADV_FREE_REUSABLE", libc::MADV_FREE_REUSABLE);
+            cst!("MADV_FREE_REUSE", libc::MADV_FREE_REUSE);
+            cst!("MAP_32BIT", 32768);
+            cst!("MAP_HASSEMAPHORE", libc::MAP_HASSEMAPHORE);
+            cst!("MAP_JIT", libc::MAP_JIT);
+            cst!("MAP_NOCACHE", libc::MAP_NOCACHE);
+            cst!("MAP_NOEXTEND", libc::MAP_NOEXTEND);
+            cst!("MAP_NORESERVE", libc::MAP_NORESERVE);
+            cst!("MAP_RESILIENT_CODESIGN", 8192);
+            cst!("MAP_RESILIENT_MEDIA", 16384);
+            cst!("MAP_TPRO", 524288);
+            cst!("MAP_TRANSLATED_ALLOW_EXECUTE", 131072);
+            cst!("MAP_UNIX03", 262144);
+        }
     }
 }

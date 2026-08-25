@@ -72,6 +72,18 @@ crate::py_module! {
                 pyre_object::w_int_new(libc::CLOCK_REALTIME as i64));
             crate::module_ns_store(ns, "CLOCK_MONOTONIC",
                 pyre_object::w_int_new(libc::CLOCK_MONOTONIC as i64));
+            // The two darwin clocks that keep counting across sleep, and the
+            // `_APPROX` pair that read a cached value instead of taking the
+            // timebase lock.
+            #[cfg(target_vendor = "apple")]
+            for (name, val) in [
+                ("CLOCK_MONOTONIC_RAW", libc::CLOCK_MONOTONIC_RAW as i64),
+                ("CLOCK_MONOTONIC_RAW_APPROX", libc::CLOCK_MONOTONIC_RAW_APPROX as i64),
+                ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW as i64),
+                ("CLOCK_UPTIME_RAW_APPROX", libc::CLOCK_UPTIME_RAW_APPROX as i64),
+            ] {
+                crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            }
             #[cfg(not(any(
                 target_os = "illumos",
                 target_os = "netbsd",

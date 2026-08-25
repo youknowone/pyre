@@ -13,8 +13,12 @@
 /// registered `termios.error` class (falling back to `OSError` before
 /// the module finishes installing) and stamp it onto the `PyError`.
 #[cfg(all(unix, feature = "host_env"))]
-fn termios_converted_error(errno: i32, message: impl Into<String>) -> crate::PyError {
-    let message = message.into();
+fn termios_converted_error(errno: i32) -> crate::PyError {
+    // `wrap_oserror` spells the message with the platform's `strerror` alone;
+    // `PyErr_SetFromErrno` does the same.  Neither names the syscall that
+    // failed, and neither carries Rust's `(os error N)` tail, which would
+    // repeat the code the first argument already holds.
+    let message = crate::PyError::clean_strerror(errno);
     let cls = crate::builtins::lookup_exc_class("termios.error")
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
         .expect("OSError must be installed");
@@ -64,10 +68,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let t = host_termios::tcgetattr(fd).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcgetattr: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 let ispeed = host_termios::cfgetispeed(&t);
                 let ospeed = host_termios::cfgetospeed(&t);
@@ -137,26 +138,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
             // Start from the current settings so we preserve any platform-private fields.
             let mut t = host_termios::tcgetattr(fd).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("tcsetattr: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             t.c_iflag = iflag;
             t.c_oflag = oflag;
             t.c_cflag = cflag;
             t.c_lflag = lflag;
             host_termios::cfsetispeed(&mut t, ispeed).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("cfsetispeed: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             host_termios::cfsetospeed(&mut t, ospeed).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("cfsetospeed: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
 
             // interp_termios.py:30-33 — c_cc is any iterable; an int element
@@ -193,10 +185,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 t.c_cc[i] = byte;
             }
             host_termios::tcsetattr(fd, when, &t).map_err(|e| {
-                termios_converted_error(
-                    e.raw_os_error().unwrap_or(0),
-                    format!("tcsetattr: {e}"),
-                )
+                termios_converted_error(e.raw_os_error().unwrap_or(0))
             })?;
             Ok(pyre_object::w_none())
         }),
@@ -217,10 +206,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(duration=int)`.
                 let dur = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcsendbreak(fd, dur).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsendbreak: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -239,10 +225,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 host_termios::tcdrain(fd).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcdrain: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -263,10 +246,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(queue=int)`.
                 let q = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflush(fd, q).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcflush: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -287,10 +267,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `@unwrap_spec(action=int)`.
                 let action = crate::baseobjspace::int_w(args[1])? as i32;
                 host_termios::tcflow(fd, action).map_err(|e| {
-                    termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcflow: {e}"),
-                    )
+                    termios_converted_error(e.raw_os_error().unwrap_or(0))
                 })?;
                 Ok(pyre_object::w_none())
             },
@@ -314,10 +291,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcgetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 // `interp_termios.py:99-101` returns `(ws_row, ws_col)`.
                 Ok(pyre_object::w_tuple_new(vec![
@@ -361,10 +335,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 ws.ws_row = rows as libc::c_ushort;
                 ws.ws_col = cols as libc::c_ushort;
@@ -377,10 +348,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut ws) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
-                    return Err(termios_converted_error(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("tcsetwinsize: {e}"),
-                    ));
+                    return Err(termios_converted_error(e.raw_os_error().unwrap_or(0)));
                 }
                 Ok(pyre_object::w_none())
             },
@@ -750,14 +718,186 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pyre_object::w_int_new(host_termios::VTIME as i64),
     );
 
-    // `interp_termios.py:18 class W_TermiosError(OperationError)` —
-    // wraps OSError so `except termios.error` catches tcsetattr failures.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
-        .expect("OSError must be installed before termios init");
+    // `rtermios.CONSTANT_NAMES` names most of these and `rffi_platform`
+    // keeps whichever the platform defines, but `host_env::termios`
+    // re-exports only a subset of them.  `Modules/termios.c` publishes
+    // every one darwin defines, so they are read straight from `libc`
+    // here; the twenty-five `libc` has no constant for are spelled out
+    // with the value `<sys/termios.h>` / `<sys/ttydefaults.h>` /
+    // `<sys/ttycom.h>` gives.
+    #[cfg(target_vendor = "apple")]
+    {
+        macro_rules! tc {
+            ($name:literal, $val:expr) => {
+                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        // `c_iflag` bits.
+        tc!("IMAXBEL", libc::IMAXBEL);
+        tc!("IUTF8", libc::IUTF8);
+
+        // `c_oflag` bits and the delay masks they select with.
+        tc!("OFILL", libc::OFILL);
+        tc!("OFDEL", libc::OFDEL);
+        tc!("ONOEOT", libc::ONOEOT);
+        tc!("OXTABS", libc::OXTABS);
+        tc!("NLDLY", libc::NLDLY);
+        tc!("CRDLY", libc::CRDLY);
+        tc!("TABDLY", libc::TABDLY);
+        tc!("BSDLY", libc::BSDLY);
+        tc!("VTDLY", libc::VTDLY);
+        tc!("FFDLY", libc::FFDLY);
+
+        // Delay values.  `<sys/termios.h>` defines `NL2` / `NL3` without a
+        // matching `libc` constant.
+        tc!("NL0", libc::NL0);
+        tc!("NL1", libc::NL1);
+        tc!("NL2", 0x200);
+        tc!("NL3", 0x300);
+        tc!("CR0", libc::CR0);
+        tc!("CR1", libc::CR1);
+        tc!("CR2", libc::CR2);
+        tc!("CR3", libc::CR3);
+        tc!("TAB0", libc::TAB0);
+        tc!("TAB1", libc::TAB1);
+        tc!("TAB2", libc::TAB2);
+        tc!("TAB3", libc::TAB3);
+        tc!("BS0", libc::BS0);
+        tc!("BS1", libc::BS1);
+        tc!("VT0", libc::VT0);
+        tc!("VT1", libc::VT1);
+        tc!("FF0", libc::FF0);
+        tc!("FF1", libc::FF1);
+
+        // `c_cflag` bits.  The `_OFLOW` / `_IFLOW` spellings name the same bits
+        // as `CRTSCTS` and its two halves.
+        tc!("CRTSCTS", libc::CRTSCTS);
+        tc!("CCTS_OFLOW", 0x10000);
+        tc!("CRTS_IFLOW", 0x20000);
+        tc!("CDTR_IFLOW", 0x40000);
+        tc!("CDSR_OFLOW", 0x80000);
+        tc!("CCAR_OFLOW", 0x100000);
+        tc!("MDMBUF", libc::MDMBUF);
+        tc!("CIGNORE", libc::CIGNORE);
+
+        // `c_lflag` bits.
+        tc!("ECHOCTL", libc::ECHOCTL);
+        tc!("ECHOPRT", libc::ECHOPRT);
+        tc!("ECHOKE", libc::ECHOKE);
+        tc!("FLUSHO", libc::FLUSHO);
+        tc!("PENDIN", libc::PENDIN);
+        tc!("ALTWERASE", libc::ALTWERASE);
+        tc!("EXTPROC", libc::EXTPROC);
+        tc!("NOKERNINFO", libc::NOKERNINFO);
+
+        // `c_cc` length and the indices `rtermios` does not name.
+        tc!("NCCS", libc::NCCS);
+        tc!("VEOL2", libc::VEOL2);
+        tc!("VWERASE", libc::VWERASE);
+        tc!("VREPRINT", libc::VREPRINT);
+        tc!("VDISCARD", libc::VDISCARD);
+        tc!("VLNEXT", libc::VLNEXT);
+        tc!("VSTATUS", libc::VSTATUS);
+        tc!("VDSUSP", libc::VDSUSP);
+
+        // `<sys/ttydefaults.h>` — the default `c_cc` values, each a `CTRL()`
+        // of its letter, so `libc` carries none of them.
+        tc!("CEOF", 4);
+        tc!("CEOL", 255);
+        tc!("CEOT", 4);
+        tc!("CERASE", 127);
+        tc!("CINTR", 3);
+        tc!("CKILL", 21);
+        tc!("CQUIT", 28);
+        tc!("CSUSP", 26);
+        tc!("CDSUSP", 25);
+        tc!("CSTART", 17);
+        tc!("CSTOP", 19);
+        tc!("CWERASE", 23);
+        tc!("CLNEXT", 22);
+        tc!("CRPRNT", 18);
+        tc!("CFLUSH", 15);
+
+        // Baud rates.
+        tc!("B7200", libc::B7200);
+        tc!("B14400", libc::B14400);
+        tc!("B28800", libc::B28800);
+        tc!("B76800", libc::B76800);
+        tc!("EXTA", libc::EXTA);
+        tc!("EXTB", libc::EXTB);
+
+        // `tcsetattr` action flag.
+        tc!("TCSASOFT", 16);
+
+        // Terminal ioctls.  `TIOCGSIZE` / `TIOCSSIZE` are the `<sys/ttycom.h>`
+        // aliases for the winsize pair.
+        tc!("TIOCSTI", libc::TIOCSTI);
+        tc!("TIOCGWINSZ", libc::TIOCGWINSZ);
+        tc!("TIOCSWINSZ", libc::TIOCSWINSZ);
+        tc!("TIOCGSIZE", 0x40087468);
+        tc!("TIOCSSIZE", 0x80087467);
+        tc!("TIOCGPGRP", libc::TIOCGPGRP);
+        tc!("TIOCSPGRP", libc::TIOCSPGRP);
+        tc!("TIOCGETD", libc::TIOCGETD);
+        tc!("TIOCSETD", libc::TIOCSETD);
+        tc!("TIOCNOTTY", libc::TIOCNOTTY);
+        tc!("TIOCSCTTY", libc::TIOCSCTTY);
+        tc!("TIOCEXCL", libc::TIOCEXCL);
+        tc!("TIOCNXCL", libc::TIOCNXCL);
+        tc!("TIOCCONS", libc::TIOCCONS);
+        tc!("TIOCOUTQ", libc::TIOCOUTQ);
+        tc!("TIOCPKT", libc::TIOCPKT);
+
+        // Modem-line bits for `TIOCMGET` / `TIOCMSET`.
+        tc!("TIOCMGET", libc::TIOCMGET);
+        tc!("TIOCMSET", libc::TIOCMSET);
+        tc!("TIOCMBIS", libc::TIOCMBIS);
+        tc!("TIOCMBIC", libc::TIOCMBIC);
+        tc!("TIOCM_LE", libc::TIOCM_LE);
+        tc!("TIOCM_DTR", libc::TIOCM_DTR);
+        tc!("TIOCM_RTS", libc::TIOCM_RTS);
+        tc!("TIOCM_ST", libc::TIOCM_ST);
+        tc!("TIOCM_SR", libc::TIOCM_SR);
+        tc!("TIOCM_CTS", libc::TIOCM_CTS);
+        tc!("TIOCM_CAR", libc::TIOCM_CAR);
+        tc!("TIOCM_CD", libc::TIOCM_CD);
+        tc!("TIOCM_RNG", libc::TIOCM_RNG);
+        tc!("TIOCM_RI", libc::TIOCM_RI);
+        tc!("TIOCM_DSR", libc::TIOCM_DSR);
+
+        // `TIOCPKT` mode bits.
+        tc!("TIOCPKT_DATA", libc::TIOCPKT_DATA);
+        tc!("TIOCPKT_FLUSHREAD", libc::TIOCPKT_FLUSHREAD);
+        tc!("TIOCPKT_FLUSHWRITE", libc::TIOCPKT_FLUSHWRITE);
+        tc!("TIOCPKT_STOP", libc::TIOCPKT_STOP);
+        tc!("TIOCPKT_START", libc::TIOCPKT_START);
+        tc!("TIOCPKT_NOSTOP", libc::TIOCPKT_NOSTOP);
+        tc!("TIOCPKT_DOSTOP", libc::TIOCPKT_DOSTOP);
+
+        // File ioctls `Modules/termios.c` publishes beside the terminal ones.
+        tc!("FIONREAD", libc::FIONREAD);
+        tc!("FIONBIO", libc::FIONBIO);
+        tc!("FIOASYNC", libc::FIOASYNC);
+        tc!("FIOCLEX", libc::FIOCLEX);
+        tc!("FIONCLEX", libc::FIONCLEX);
+
+        // The `c_cc` value that switches a control character off.  It is
+        // `0xff` on the BSDs and `'\0'` on linux, so it is answered here
+        // rather than beside the `V*` indices above.
+        tc!("_POSIX_VDISABLE", libc::_POSIX_VDISABLE);
+    }
+
+    // `interp_termios.py Cache.__init__`:
+    //   self.w_error = space.new_exception_class("termios.error")
+    // `new_exception_class` with no bases derives from `Exception`, so
+    // `termios.error` is not an OSError subclass; `convert_error` still names
+    // it as the class to raise, which is what `except termios.error` catches.
+    let w_exception = crate::builtins::lookup_exc_class("Exception")
+        .expect("Exception must be installed before termios init");
     let w_error = crate::builtins::make_exc_type(
         "termios.error",
         crate::builtins::exc_exception_new,
-        w_os_error,
+        w_exception,
     );
     crate::module_ns_store(ns, "error", w_error);
 }

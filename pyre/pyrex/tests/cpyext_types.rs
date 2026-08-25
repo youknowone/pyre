@@ -106,6 +106,19 @@ else:
     raise AssertionError('METH_NOARGS took an argument')
 
 assert type(m.Point.__dict__['norm']).__name__ == 'method_descriptor'
+
+# METH_CLASS binds the class, METH_STATIC binds nothing, and each is a
+# different kind of attribute on the type.
+assert type(m.Point.__dict__['origin']).__name__ == 'classmethod_descriptor'
+assert type(m.Point.__dict__['units']).__name__ == 'staticmethod'
+origin = m.Point.origin()
+assert (origin.x, origin.y) == (0, 0), (origin.x, origin.y)
+assert (m.Point(1, 2).origin().x, m.Point(1, 2).origin().y) == (0, 0)
+assert m.Point.units(21) == 42
+assert m.Point(1, 2).units(3) == 6
+# `PyClassMethodDescr_Type` names `method_repr`, so a classmethod descriptor
+# reports itself the way a method descriptor does.
+assert repr(m.Point.__dict__['origin']).startswith("<method 'origin' of ")
 assert m.Point.__dict__['norm'].__doc__ == 'squared length'
 assert m.Point.__dict__['norm'].__objclass__ is m.Point
 # An unbound descriptor takes the receiver as its first argument.
@@ -418,7 +431,8 @@ else:
 # ── a spec declaring storage relative to its base's ────────────────────
 assert issubclass(m.Extra, m.Spec)
 assert m.type_data_size(m.Extra) >= 16, m.type_data_size(m.Extra)
-# Spec declares a whole block, so it extends its base by nothing.
+# Spec declares a whole block, and its own `long` falls inside the padding
+# the header is already aligned up to, so it extends its base by nothing.
 assert m.type_data_size(m.Spec) == 0, m.type_data_size(m.Spec)
 
 e = m.Extra(9)

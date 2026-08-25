@@ -4589,13 +4589,47 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         let name = unsafe { std::ffi::CStr::from_ptr((*method).ml_name) }
             .to_string_lossy()
             .into_owned();
+        // `typeobject.c:type_add_method` — the flags decide the descriptor,
+        // each naming a different receiver.  A row carrying both is refused
+        // before the type is built.
+        let flags = unsafe { (*method).ml_flags };
+        let carrier_type = match flags & super::methodobject::METH_CLASS {
+            0 => method_descriptor_type(),
+            _ => classmethod_descriptor_type(),
+        };
         let descriptor = new_carrier(
-            method_descriptor_type(),
+            carrier_type,
             method as usize,
             unsafe { (*method).ml_name },
             unsafe { (*method).ml_doc },
             pyre_object::PY_NULL,
         );
+        let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(descriptor);
+        // A static row is a function bound to the type, wrapped so that
+        // reading it through the class or an instance yields the function
+        // itself rather than binding a receiver a second time.
+        let descriptor = match flags & super::methodobject::METH_STATIC {
+            0 => pyre_object::gc_roots::shadow_stack_get(descriptor_slot),
+            _ => {
+                let owner = reload();
+                match super::methodobject::new_pycfunction(method, owner, owner) {
+                    Ok(function) => {
+                        let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = roots.pin_root(function);
+                        pyre_object::function::w_staticmethod_new(
+                            pyre_object::gc_roots::shadow_stack_get(function_slot),
+                        )
+                    }
+                    // The name is left unbound rather than bound to something
+                    // that would take its first argument as a receiver.
+                    Err(error) => {
+                        super::pyerrors::set_pending_error(error);
+                        continue;
+                    }
+                }
+            }
+        };
         let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(descriptor);
         store(
@@ -5050,6 +5084,29 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // where `tp_name`'s prefix is meant to end up.
 
     let w_metatype = resolve_metatype(tp, w_metaclass, w_base)?;
+
+    // `typeobject.c:type_add_method` refuses a row declaring both, because
+    // each of the two names a different receiver.
+    let mut index = 0isize;
+    while unsafe {
+        !(*tp).tp_methods.is_null() && !(*(*tp).tp_methods.offset(index)).ml_name.is_null()
+    } {
+        let method = unsafe { (*tp).tp_methods.offset(index) };
+        index += 1;
+        let flags = unsafe { (*method).ml_flags };
+        if flags & super::methodobject::METH_CLASS == 0
+            || flags & super::methodobject::METH_STATIC == 0
+        {
+            continue;
+        }
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "method cannot be both class and static: {}",
+                unsafe { std::ffi::CStr::from_ptr((*method).ml_name) }.to_string_lossy()
+            ),
+        ));
+    }
 
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5843,6 +5900,97 @@ fn from_spec(
 pub unsafe extern "C" fn PyType_FromSpec(spec: *mut CPyTypeSpec) -> *mut CPyObject {
     super::object::result(from_spec(
         spec,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ))
+}
+
+/// `PySlot` — one entry of the identifier-keyed array `PyType_FromSlots`
+/// reads, which supersedes `PyType_Spec`'s fixed fields.  The value is a
+/// union of a pointer, a function, and the integer widths; every arm is
+/// eight bytes wide, so one of them stands for all.
+#[repr(C)]
+pub struct CPySlot {
+    pub sl_id: u16,
+    pub sl_flags: u16,
+    pub sl_reserved: u32,
+    pub sl_value: u64,
+}
+
+/// `PySlot.sl_flags`: an entry the reader may skip rather than refuse.
+pub(super) const SLOT_OPTIONAL: u16 = 0x01;
+
+/// The identifiers `PyType_FromSlots` reads for itself; every other one is
+/// left to the `Py_tp_slots` array, which is the `PyType_Spec` vocabulary.
+mod from_slots_id {
+    pub const TP_SLOTS: u16 = 93;
+    pub const TP_NAME: u16 = 95;
+    pub const TP_BASICSIZE: u16 = 96;
+    pub const TP_EXTRA_BASICSIZE: u16 = 97;
+    pub const TP_ITEMSIZE: u16 = 98;
+    pub const TP_FLAGS: u16 = 99;
+}
+
+/// `PyType_FromSlots(slots)` — a heap type described by one array rather than
+/// by a `PyType_Spec` beside one.
+///
+/// The array is read into the spec the rest of this layer already builds a
+/// type from: the identifiers below carry what the spec's own fields carry,
+/// and `Py_tp_slots` carries the array the spec would have pointed at.  A
+/// zero identifier ends the array.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromSlots(slots: *mut CPySlot) -> *mut CPyObject {
+    if slots.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let mut spec = CPyTypeSpec {
+        name: std::ptr::null(),
+        basicsize: 0,
+        itemsize: 0,
+        flags: 0,
+        slots: std::ptr::null_mut(),
+    };
+    let mut entry = slots;
+    loop {
+        let slot = unsafe { &*entry };
+        if slot.sl_id == 0 {
+            break;
+        }
+        let value = slot.sl_value;
+        match slot.sl_id {
+            from_slots_id::TP_NAME => spec.name = value as *const c_char,
+            from_slots_id::TP_FLAGS => spec.flags = value as c_uint,
+            from_slots_id::TP_BASICSIZE => spec.basicsize = value as isize as c_int,
+            // A size relative to the base's, which the spec spells as the
+            // negative of the same number.
+            from_slots_id::TP_EXTRA_BASICSIZE => {
+                spec.basicsize = -(value as isize as c_int);
+            }
+            from_slots_id::TP_ITEMSIZE => spec.itemsize = value as isize as c_int,
+            from_slots_id::TP_SLOTS => spec.slots = value as *mut CPyTypeSlot,
+            unknown => {
+                if slot.sl_flags & SLOT_OPTIONAL == 0 {
+                    super::pyerrors::set_pending_error(crate::PyError::new(
+                        crate::PyErrorKind::SystemError,
+                        format!("PyType_FromSlots(): unrecognised slot {unknown}"),
+                    ));
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        entry = unsafe { entry.add(1) };
+    }
+    if spec.name.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyType_FromSlots(): the slot array has no Py_tp_name",
+        ));
+        return std::ptr::null_mut();
+    }
+    super::object::result(from_spec(
+        &raw mut spec,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),

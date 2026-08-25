@@ -35,6 +35,7 @@ typedef struct PyMemberDef PyMemberDef;
 typedef struct PyGetSetDef PyGetSetDef;
 typedef struct PyType_Slot PyType_Slot;
 typedef struct PyType_Spec PyType_Spec;
+typedef struct PySlot PySlot;
 typedef struct Py_buffer Py_buffer;
 /* Neither an `int` nor a `str` is a distinct object here, so the reference
    header's `PyLongObject` and `PyUnicodeObject` are the ordinary mirror under

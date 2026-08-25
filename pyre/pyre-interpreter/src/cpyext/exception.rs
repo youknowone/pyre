@@ -9,7 +9,7 @@
 
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
-use std::ffi::{c_char, c_int};
+use std::ffi::{CStr, c_char, c_int};
 
 /// The exception instance an accessor was handed, or `None` after recording
 /// the `AttributeError` a foreign object deserves.
@@ -200,6 +200,76 @@ pub unsafe extern "C" fn PyExceptionClass_Name(object: *mut CPyObject) -> *const
     unsafe { (*(object as *mut super::typeobject::CPyTypeObject)).tp_name }
 }
 
+/// `PyUnicodeDecodeError_Create(encoding, object, length, start, end, reason)`
+/// — the exception a decoder raises, built from what it was decoding.
+///
+/// `object` is the bytes being decoded and `length` how many of them there
+/// are, so it is read as a slice rather than as a C string: a decoder reaches
+/// here precisely because those bytes are not text, and an embedded NUL is one
+/// of the things that makes them not text.
+///
+/// # Safety
+/// `encoding` and `reason` must be NUL-terminated; `object` must address
+/// `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicodeDecodeError_Create(
+    encoding: *const c_char,
+    object: *const c_char,
+    length: isize,
+    start: isize,
+    end: isize,
+    reason: *const c_char,
+) -> *mut CPyObject {
+    if encoding.is_null() || object.is_null() || reason.is_null() || length < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let Some(class) = crate::builtins::lookup_exc_class("UnicodeDecodeError") else {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "UnicodeDecodeError is not registered",
+        ));
+        return std::ptr::null_mut();
+    };
+    let encoding = unsafe { CStr::from_ptr(encoding) }
+        .to_string_lossy()
+        .into_owned();
+    let reason = unsafe { CStr::from_ptr(reason) }
+        .to_string_lossy()
+        .into_owned();
+    let bytes = unsafe { std::slice::from_raw_parts(object as *const u8, length as usize) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(class);
+    // Each argument is pinned as it is made: the next one allocates, and a
+    // collection there moves whatever is only held in a local.
+    let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_str_new(&encoding));
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
+    let start_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_int_new(start as i64));
+    let end_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_int_new(end as i64));
+    let reason_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_str_new(&reason));
+    let reload = pyre_object::gc_roots::shadow_stack_get;
+    let made = crate::call::call_function_impl_result(
+        reload(class_slot),
+        &[
+            reload(encoding_slot),
+            reload(object_slot),
+            reload(start_slot),
+            reload(end_slot),
+            reload(reason_slot),
+        ],
+    );
+    match super::pyerrors::trap(made) {
+        Some(instance) => pyobject::make_ref(instance),
+        None => std::ptr::null_mut(),
+    }
+}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyException_GetTraceback as *const ());
     std::hint::black_box(PyException_SetTraceback as *const ());
@@ -212,4 +282,5 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyExceptionClass_Check as *const ());
     std::hint::black_box(PyExceptionInstance_Check as *const ());
     std::hint::black_box(PyExceptionClass_Name as *const ());
+    std::hint::black_box(PyUnicodeDecodeError_Create as *const ());
 }

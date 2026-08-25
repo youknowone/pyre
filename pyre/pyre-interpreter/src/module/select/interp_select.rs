@@ -579,6 +579,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         kq!("KQ_EV_CLEAR", libc::EV_CLEAR);
         kq!("KQ_EV_EOF", libc::EV_EOF);
         kq!("KQ_EV_ERROR", libc::EV_ERROR);
+        // `symbol_map` stops here — it comments out the two internal
+        // `EV_` flags as "not defined on FreeBSD" and never names the
+        // `NOTE_*` family at all.  `selectmodule.c` publishes both under
+        // `#ifdef`, and darwin defines every one of them.
+        kq!("KQ_EV_SYSFLAGS", libc::EV_SYSFLAGS);
+        kq!("KQ_EV_FLAG1", libc::EV_FLAG1);
+        // READ / WRITE filter flag.
+        kq!("KQ_NOTE_LOWAT", libc::NOTE_LOWAT);
+        // VNODE filter flags.
+        kq!("KQ_NOTE_DELETE", libc::NOTE_DELETE);
+        kq!("KQ_NOTE_WRITE", libc::NOTE_WRITE);
+        kq!("KQ_NOTE_EXTEND", libc::NOTE_EXTEND);
+        kq!("KQ_NOTE_ATTRIB", libc::NOTE_ATTRIB);
+        kq!("KQ_NOTE_LINK", libc::NOTE_LINK);
+        kq!("KQ_NOTE_RENAME", libc::NOTE_RENAME);
+        kq!("KQ_NOTE_REVOKE", libc::NOTE_REVOKE);
+        // PROC filter flags.  `NOTE_PCTRLMASK` is `~NOTE_PDATAMASK` over a
+        // signed `int` in `<sys/event.h>`, so it publishes negative; the rest
+        // are unsigned literals and publish as written.
+        kq!("KQ_NOTE_EXIT", libc::NOTE_EXIT);
+        kq!("KQ_NOTE_FORK", libc::NOTE_FORK);
+        kq!("KQ_NOTE_EXEC", libc::NOTE_EXEC);
+        kq!("KQ_NOTE_PCTRLMASK", libc::NOTE_PCTRLMASK as i32);
+        kq!("KQ_NOTE_PDATAMASK", libc::NOTE_PDATAMASK);
+        kq!("KQ_NOTE_TRACK", libc::NOTE_TRACK);
+        kq!("KQ_NOTE_CHILD", libc::NOTE_CHILD);
+        kq!("KQ_NOTE_TRACKERR", libc::NOTE_TRACKERR);
     }
 
     // `interp_select.py:35 W_Error = OSError` — expose the real type so

@@ -112,6 +112,20 @@ impl W_Kevent {
         newint_from_u64(self.udata)
     }
 
+    /// `kqueue_event_repr` — all six fields, `ident` unsigned decimal,
+    /// `filter` signed decimal, `flags` / `fflags` / `data` hex, and `udata`
+    /// through `%p`, whose leading `0x` `PyUnicode_FromFormat` guarantees.
+    /// `data` is formatted as `long long`, so a negative one reads as its
+    /// two's complement.  `interp_kqueue.py W_Kevent` registers no `__repr__`
+    /// at all.
+    fn __repr__(&self) -> String {
+        format!(
+            "<select.kevent ident={} filter={} flags=0x{:x} fflags=0x{:x} \
+             data=0x{:x} udata=0x{:x}>",
+            self.ident, self.filter, self.flags, self.fflags, self.data, self.udata,
+        )
+    }
+
     /// `interp_kqueue.py descr__eq__` and friends — two kevents
     /// compare by all six fields lexicographically.  A non-kevent other
     /// yields `NotImplemented`.

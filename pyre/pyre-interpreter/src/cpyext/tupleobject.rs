@@ -51,6 +51,20 @@ fn is_array_backed(value: PyObjectRef) -> bool {
     }
 }
 
+/// `PyTuple_FromArray(array, size)` — the tuple a C array of references
+/// makes, as a new reference.  The array's own references are left alone.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyTuple_FromArray(
+    array: *const *mut CPyObject,
+    size: isize,
+) -> *mut CPyObject {
+    if size < 0 || (array.is_null() && size != 0) {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    unsafe { super::object::tuple_from_vector(array, size as usize) }
+}
+
 fn tuple_argument(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     let value = argument(object)?;
     if !unsafe { pyre_object::is_tuple(value) } {

@@ -2,6 +2,7 @@
 
 use super::object::argument;
 use super::pyobject::{self, CPyObject};
+use super::typeobject::CPyVarObject;
 use pyre_object::PyObjectRef;
 use std::collections::HashSet;
 use std::ffi::{CStr, c_char, c_int};
@@ -89,7 +90,11 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
     }
     data.resize(size as usize, 0);
     let ob_type = pyobject::borrow_mirror(w_bytes_type) as *mut super::typeobject::CPyTypeObject;
-    let raw = pyobject::allocate_raw(size_of::<CPyObject>(), true) as *mut CPyObject;
+    // Wide enough for `ob_size`: this block becomes the `bytes`'s own mirror
+    // when `realize_pending` links it, and from then on every `make_ref` of
+    // that `bytes` republishes the length into this field.  A block that
+    // stopped at the header would take that write past its own end.
+    let raw = pyobject::allocate_raw(size_of::<CPyVarObject>(), true) as *mut CPyObject;
     if raw.is_null() {
         return unsafe { super::pyerrors::PyErr_NoMemory() };
     }
@@ -99,6 +104,9 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
         (*raw).ob_refcnt = 1;
         (*raw).ob_pyre_link = pyre_object::PY_NULL;
         (*raw).ob_type = ob_type;
+        // `pyobject.py:108` sets `c_ob_size` as it allocates, so `Py_SIZE`
+        // answers the requested length while C is still writing the buffer.
+        (*(raw as *mut CPyVarObject)).ob_size = size;
     }
     PENDING.lock().insert(raw as usize);
     // The terminator `cached_bytes` appends is the NUL upstream's `ob_sval`
@@ -207,6 +215,7 @@ pub unsafe extern "C" fn _PyBytes_Resize(pv: *mut *mut CPyObject, newsize: isize
             }
             return -1;
         }
+        unsafe { (*(raw as *mut CPyVarObject)).ob_size = newsize as isize };
         return 0;
     }
     let Some(value) = argument(raw) else {

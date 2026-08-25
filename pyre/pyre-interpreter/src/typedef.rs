@@ -9290,7 +9290,9 @@ fn init_tuple_type(ns: PyObjectRef) {
                 |args| {
                     let tuple =
                         crate::type_methods::require_tuple_receiver(args, "__hash__", false)?;
-                    Ok(w_int_new(crate::builtins::try_hash_value(tuple)?))
+                    // The structural hash, not `hash()`: this *is* the base
+                    // implementation, so a subclass override must not run here.
+                    Ok(w_int_new(crate::builtins::tuple_structural_hash(tuple)?))
                 },
                 1,
             ),
@@ -27512,9 +27514,10 @@ fn init_frozenset_type(ns: PyObjectRef) {
                 "__hash__",
                 |args| {
                     crate::type_methods::require_frozenset_receiver(args, "__hash__", false)?;
-                    Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
-                        args[0],
-                    )?))
+                    // As for `tuple.__hash__`: the base implementation itself.
+                    Ok(pyre_object::w_int_new(
+                        crate::builtins::frozenset_structural_hash(args[0]),
+                    ))
                 },
                 1,
                 "($self, /)",

@@ -53,6 +53,15 @@ _PyMutex_IsLocked(PyMutex *m)
 }
 #define PyMutex_IsLocked _PyMutex_IsLocked
 
+/* The two words a critical section occupies, which the caller embeds.  Nothing
+   the macros below expand to names one -- they open a plain block -- but an
+   extension that calls `PyCriticalSection_Begin` directly allocates the struct
+   itself, so its size has to be the reference one. */
+typedef struct PyCriticalSection {
+    uintptr_t _cs_prev;   /* (private) */
+    PyMutex *_cs_mutex;   /* (private) */
+} PyCriticalSection;
+
 /* A critical section serializes the operations that name the same object.
    Here every Python thread runs under one global lock, which already gives
    that ordering, so entering one costs nothing and the macros are the braces

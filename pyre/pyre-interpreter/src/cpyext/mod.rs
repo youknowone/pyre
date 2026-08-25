@@ -47,6 +47,7 @@ pub mod pymem;
 pub mod pyobject;
 pub mod pystate;
 pub mod pystrtod;
+pub mod pythonrun;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
@@ -321,7 +322,25 @@ fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) 
     EXTENSIONS_ACTIVE.store(true, Ordering::Release);
 }
 
-fn init_symbol(name: &str) -> Result<String, crate::PyError> {
+/// Which entry point an extension published, and under which protocol.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitProtocol {
+    /// `PyModExport_*`, answering with a slot array.
+    Export,
+    /// `PyInit_*`, answering with a module or a module definition.
+    Init,
+}
+
+impl InitProtocol {
+    fn symbol(self, basename: &str) -> String {
+        match self {
+            InitProtocol::Export => format!("PyModExport_{basename}"),
+            InitProtocol::Init => format!("PyInit_{basename}"),
+        }
+    }
+}
+
+fn init_basename(name: &str) -> Result<&str, crate::PyError> {
     let basename = name.rsplit('.').next().unwrap_or(name);
     if !basename.is_ascii() {
         return Err(crate::PyError::new(
@@ -329,7 +348,36 @@ fn init_symbol(name: &str) -> Result<String, crate::PyError> {
             format!("non-ASCII cpyext init names are not implemented yet: {basename}"),
         ));
     }
-    Ok(format!("PyInit_{basename}"))
+    Ok(basename)
+}
+
+/// The entry point an open library publishes.
+///
+/// `PyModExport_*` is looked for first, so an extension that publishes both
+/// is read under the protocol that describes itself rather than the one that
+/// hands back a struct this interpreter would have to agree on the layout of.
+fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)>, crate::PyError> {
+    let basename = init_basename(name)?;
+    for protocol in [InitProtocol::Export, InitProtocol::Init] {
+        if let Some(address) = lookup_init_address(handle, &protocol.symbol(basename)) {
+            return Ok(Some((protocol, address)));
+        }
+    }
+    Ok(None)
+}
+
+/// What the lookup reports when neither entry point is there.
+fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
+    let basename = name.rsplit('.').next().unwrap_or(name);
+    extension_import_error(
+        format!(
+            "function {} not found in library '{}'",
+            InitProtocol::Init.symbol(basename),
+            path.display()
+        ),
+        name,
+        path,
+    )
 }
 
 fn extension_import_error(message: String, name: &str, path: &Path) -> crate::PyError {
@@ -372,16 +420,8 @@ pub fn load_extension_module(
     // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
     // opening on this host abstraction.
     if let Some(handle) = cached_extension_handle(path) {
-        let symbol = init_symbol(name)?;
-        if lookup_init_address(handle, &symbol).is_none() {
-            return Err(extension_import_error(
-                format!(
-                    "function {symbol} not found in library '{}'",
-                    path.display()
-                ),
-                name,
-                path,
-            ));
+        if lookup_init(handle, name)?.is_none() {
+            return Err(missing_init_error(name, path));
         }
         if let Some(module) = cached_extension(name, path) {
             let roots = pyre_object::gc_roots::push_roots();
@@ -401,39 +441,52 @@ pub fn load_extension_module(
     let handle =
         rustpython_host_env::ctypes::open_library_with_mode(path, mode).map_err(|error| {
             extension_import_error(
-                format!("cannot load extension '{}': {error}", path.display()),
+                format!(
+                    "cannot load extension '{}': {}",
+                    path.display(),
+                    crate::with_causes(&error)
+                ),
                 name,
                 path,
             )
         })?;
 
-    let symbol = match init_symbol(name) {
-        Ok(symbol) => symbol,
+    let found = match lookup_init(handle, name) {
+        Ok(found) => found,
         Err(error) => {
             rustpython_host_env::ctypes::drop_library(handle);
             return Err(error);
         }
     };
-    let Some(address) = lookup_init_address(handle, &symbol) else {
+    let Some((protocol, address)) = found else {
         rustpython_host_env::ctypes::drop_library(handle);
-        return Err(extension_import_error(
-            format!(
-                "function {symbol} not found in library '{}'",
-                path.display()
-            ),
-            name,
-            path,
-        ));
+        return Err(missing_init_error(name, path));
     };
 
     let old_context = PACKAGE_CONTEXT
         .lock()
         .replace((name.to_string(), path.to_path_buf()));
-    let init: unsafe extern "C" fn() -> *mut CPyObject = unsafe { std::mem::transmute(address) };
-    let result = unsafe { init() };
-    *PACKAGE_CONTEXT.lock() = old_context;
+    let answer = match protocol {
+        InitProtocol::Export => {
+            let export: unsafe extern "C" fn() -> *mut typeobject::CPySlot =
+                unsafe { std::mem::transmute(address) };
+            let slots = unsafe { export() };
+            // The export protocol names the module itself, so the context the
+            // single-phase path reads is not this path's to leave set.
+            *PACKAGE_CONTEXT.lock() = old_context;
+            modsupport::create_module_from_export_slots(slots, spec, name, Some(path))
+                .map(InitResult::MultiPhase)
+        }
+        InitProtocol::Init => {
+            let init: unsafe extern "C" fn() -> *mut CPyObject =
+                unsafe { std::mem::transmute(address) };
+            let result = unsafe { init() };
+            *PACKAGE_CONTEXT.lock() = old_context;
+            finish_init(name, path, spec, result)
+        }
+    };
 
-    let init_result = match finish_init(name, path, spec, result) {
+    let init_result = match answer {
         Ok(module) => module,
         Err(error) => {
             rustpython_host_env::ctypes::drop_library(handle);
@@ -796,6 +849,7 @@ pub fn ensure_linked() {
     pyobject::ensure_linked();
     pystate::ensure_linked();
     pystrtod::ensure_linked();
+    pythonrun::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
     cdatetime::ensure_linked();

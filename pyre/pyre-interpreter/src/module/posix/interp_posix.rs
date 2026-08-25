@@ -2093,6 +2093,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ] {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
+        // Darwin-only names. `NGROUPS_MAX` (`<sys/syslimits.h>`) and `TMP_MAX`
+        // (`<stdio.h>`) exist on linux too but with the glibc numbering, so
+        // they are answered per platform rather than shared. The `PRIO_DARWIN_*`
+        // family is what `setpriority` takes there instead of a nice value, and
+        // the `_COPYFILE_*` bits are the `flags` word `shutil` hands
+        // `copyfile()` through `posix._fcopyfile`.
+        #[cfg(target_vendor = "apple")]
+        for (name, val) in [
+            ("NGROUPS_MAX", 16i64),
+            ("TMP_MAX", libc::TMP_MAX as i64),
+            ("PRIO_DARWIN_BG", libc::PRIO_DARWIN_BG as i64),
+            ("PRIO_DARWIN_NONUI", libc::PRIO_DARWIN_NONUI as i64),
+            ("PRIO_DARWIN_PROCESS", libc::PRIO_DARWIN_PROCESS as i64),
+            ("PRIO_DARWIN_THREAD", libc::PRIO_DARWIN_THREAD as i64),
+            ("_COPYFILE_ACL", libc::COPYFILE_ACL as i64),
+            ("_COPYFILE_DATA", libc::COPYFILE_DATA as i64),
+            ("_COPYFILE_STAT", libc::COPYFILE_STAT as i64),
+            ("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
     }
     // Remaining noop stubs — functions os.py references at module level.
     // Functions with real implementations are registered individually below.

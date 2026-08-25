@@ -3180,8 +3180,16 @@ fn call_with_kwargs_in_ctx_impl(
         // types are non-acceptable-as-base too, but their `tp_new` functions
         // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
         // exposes `memoryview(object=...)`, the deque iterator constructors
-        // accept (and ignore) `index=...`, and both `_lzma` constructors take
-        // `format=`/`preset=`/`filters=`.  Route them through `__new__`.
+        // accept (and ignore) `index=...`, both `_lzma` constructors take
+        // `format=`/`preset=`/`filters=`, and `select.kevent` takes the six
+        // `ident=`/`filter=`/`flags=`/`fflags=`/`data=`/`udata=` names.
+        // Route them through `__new__`.
+        // `select` is not built under the sandbox feature, so the kevent arm
+        // is answered before the chain rather than inside it.
+        #[cfg(not(feature = "sandbox"))]
+        let is_kevent = std::ptr::eq(current_type(), crate::module::select::kevent_type());
+        #[cfg(feature = "sandbox")]
+        let is_kevent = false;
         let accepts_keywords_despite_nonbase =
             std::ptr::eq(
                 current_type(),
@@ -3200,6 +3208,7 @@ fn call_with_kwargs_in_ctx_impl(
                 crate::module::_contextvars::context_var_type(),
             ) || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
                 || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
+                || is_kevent
                 || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase

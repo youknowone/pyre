@@ -132,7 +132,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             let h = rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
                 let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
                 msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
-                msg.push_str(&format!("): {e}"));
+                msg.push_str(&format!("): {}", crate::with_causes(&e)));
                 crate::PyError::os_error(msg)
             })?;
             Ok(pyre_object::w_int_new(h as i64))

@@ -1539,35 +1539,7 @@ pub fn is_unpack_iter(obj: PyObjectRef) -> bool {
 
 /// `space.readbuf_w` — a read-only byte slice from a bytes-like object.
 unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
-    unsafe {
-        if bytesobject::is_bytes_like(obj) {
-            return Ok(bytesobject::bytes_like_data(obj));
-        }
-        // `W_MMap.readbuf_w` — the live mapping.
-        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, _readonly) = view?;
-            return Ok(std::slice::from_raw_parts(address as *const u8, length));
-        }
-        if interp_array::is_array(obj) {
-            return Ok(interp_array::w_array_bytes(obj));
-        }
-        if memoryview::is_w_memoryview(obj) {
-            crate::builtins::memoryview_check_released(obj)?;
-            if crate::builtins::memoryview_contiguity(obj).0 {
-                let view = memoryview::w_memoryview_view(obj);
-                let full = view.backing().as_bytes();
-                let off = view.offset() as usize;
-                let len = memoryview::w_memoryview_length(obj) as usize;
-                if off <= full.len() && len <= full.len() - off {
-                    return Ok(&full[off..off + len]);
-                }
-            }
-        }
-        Err(crate::PyError::type_error(
-            "a bytes-like object is required",
-        ))
-    }
+    unsafe { crate::builtins::acquire_readbuf(obj) }
 }
 
 crate::py_module! {

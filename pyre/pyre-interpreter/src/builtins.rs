@@ -11473,10 +11473,10 @@ pub fn compile_err_to_syntax_error(
 ///
 /// CPython's tokenizer keeps byte offsets internally too, but
 /// ``_PyPegen_byte_offset_to_character_offset`` converts them before the
-/// exception is materialised.  RustPython's `SourceLocation` is deliberately
-/// built with `PositionEncoding::Utf8`, so its `character_offset` is still a
-/// byte column despite the field name.  Preserve the parser's selected line
-/// and span and port only that final conversion here.
+/// exception is materialised.  This is that conversion, for the spans this
+/// module locates itself by scanning `source`; a location the compiler reports
+/// for a parser diagnostic already counts characters and must not be passed
+/// through here.  The line and the span are the caller's to choose.
 fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize) -> usize {
     if lineno == 0 || byte_offset == 0 {
         return byte_offset;
@@ -11507,6 +11507,24 @@ fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
         .count()
         + 1;
     (lineno, byte_index - line_start + 1)
+}
+
+/// Byte index of the one-based character column a parser diagnostic reports,
+/// which is what indexes back into the source it was parsed from.  A column
+/// past the end of its line lands on the line's end.
+fn source_character_index(source: &str, lineno: usize, char_offset: usize) -> Option<usize> {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(lineno.checked_sub(1)?)
+        .map(str::len)
+        .sum::<usize>();
+    let line = source.get(line_start..)?.split('\n').next()?;
+    let column = char_offset.checked_sub(1)?;
+    let index = line
+        .char_indices()
+        .nth(column)
+        .map_or(line.len(), |(index, _)| index);
+    Some(line_start + index)
 }
 
 fn source_byte_index(source: &str, lineno: usize, byte_offset: usize) -> Option<usize> {
@@ -11570,8 +11588,8 @@ fn fstring_missing_comma_span(source: &str, raw_index: usize) -> Option<(usize, 
     }
     let (start_line, start_offset) = inner_error.python_location();
     let (end_line, end_offset) = inner_error.python_end_location()?;
-    let start = source_byte_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
-    let end = source_byte_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
+    let start = source_character_index(&wrapped, start_line, start_offset)?.checked_sub(1)?;
+    let end = source_character_index(&wrapped, end_line, end_offset)?.checked_sub(1)?;
     Some((open + 1 + start, open + 1 + end))
 }
 
@@ -12420,11 +12438,13 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         (e.python_location(), None)
     };
-    // Parser diagnostics are converted by pegen before exposure, while
-    // compiler/symtable diagnostics retain the UTF-8 byte columns used by AST
-    // locations (for example `return "ä"` ends at offset 12, not 11).
+    // A parser diagnostic arrives already counted in characters, and a
+    // compiler/symtable one retains the UTF-8 byte columns used by AST
+    // locations (for example `return "ä"` ends at offset 12, not 11).  Neither
+    // is converted here.  A span located above is a byte index into `source`
+    // whichever kind produced it, so only that one is.
     let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
-    let offset = if parser_error {
+    let offset = if parser_error && diagnostic_span.is_some() {
         syntax_error_character_offset(source, lineno, byte_offset)
     } else {
         byte_offset
@@ -12436,7 +12456,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
-        let end_offset = if parser_error && parser_end.is_some() {
+        let end_offset = if parser_error && diagnostic_end.is_some() {
             syntax_error_character_offset(source, end_lineno, end_byte_offset)
         } else {
             end_byte_offset
@@ -12761,7 +12781,11 @@ const PYCF_ONLY_AST: i64 = 0x0400;
 const PYCF_DONT_IMPLY_DEDENT: i64 = 0x0200;
 const PYCF_SOURCE_IS_UTF8: i64 = 0x0100;
 const PYCF_IGNORE_COOKIE: i64 = 0x0800;
-const PYCF_TYPE_COMMENTS: i64 = 0x4000_0000;
+/// `Include/cpython/compile.h` numbers this one `0x1000`, and `_ast`
+/// publishes it, so the value is observable.  `consts.py` moved it out to
+/// `0x40000000` because it kept `PyCF_ASYNC_HACKS` on `0x1000`; that flag is
+/// gone from 3.14 and the bit is free.
+const PYCF_TYPE_COMMENTS: i64 = 0x1000;
 const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
 const PYCF_OPTIMIZED_AST: i64 = 0x8000 | PYCF_ONLY_AST;
@@ -13007,6 +13031,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 mode,
                 opts,
                 syntax_check_only,
+                flags & PYCF_TYPE_COMMENTS != 0,
             )
         };
         return result.map_err(|error| {
@@ -14013,6 +14038,61 @@ pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_int_new(try_hash_value(args[0])?))
 }
 
+/// `tupleobject.py W_AbstractTupleObject.descr_hash` — the hash a tuple has by
+/// virtue of its contents, with no `__hash__` lookup on the receiver.
+///
+/// Separate from [`try_hash_value`] because the two answer different
+/// questions.  `hash(x)` must honour whatever `type(x)` says, override
+/// included; `tuple.__hash__(x)` names the base implementation, and running
+/// the override there would return the subclass's answer for a call that
+/// asked for the base's — and loop outright when the override calls back, as
+/// the memoising `def __hash__(self, hash=tuple.__hash__)` idiom does.
+pub(crate) fn tuple_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        // CPython 3.14 `tuple_hash`: a successful aggregate hash is
+        // retained on the tuple.  Check before the recursive stack guard
+        // so repeated dict probes do not touch the elements at all.
+        if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+            return Ok(hash);
+        }
+        // The element walk is the one recursive step here, and the scalar
+        // fast path in `try_hash_value` no longer reaches the call protocol's
+        // own guard, so a nest deep enough to exhaust the C stack has to be
+        // caught on the way down.
+        crate::stack_check::stack_check()?;
+        if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
+            return Ok(hash);
+        }
+        // `try_hash_value` runs each element's `__hash__`, which may
+        // collect; `obj` is a raw local re-read in the loop and after it, so
+        // pin it on the shadow stack.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let mut hashes = Vec::with_capacity(n);
+        for i in 0..(n as i64) {
+            if let Some(item) =
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
+            {
+                hashes.push(try_hash_value(item)?);
+            }
+        }
+        let hash = _hash_tuple_xx(&hashes);
+        pyre_object::w_tuple_set_cached_hash(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            hash,
+        );
+        Ok(hash)
+    }
+}
+
+/// `setobject.py W_FrozensetObject.descr_hash` — the frozenset counterpart of
+/// [`tuple_structural_hash`], and separate for the same reason.
+pub(crate) fn frozenset_structural_hash(obj: PyObjectRef) -> i64 {
+    frozenset_hash_from_storage(obj)
+}
+
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
@@ -14103,41 +14183,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             }
         }
         if is_tuple(obj) {
-            // CPython 3.14 `tuple_hash`: a successful aggregate hash is
-            // retained on the tuple.  Check before the recursive stack guard
-            // so repeated dict probes do not touch the elements at all.
-            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
-                return Ok(hash);
-            }
-            // The element walk is the one recursive step here, and the scalar
-            // fast path above no longer reaches the call protocol's own
-            // guard, so a nest deep enough to exhaust the C stack has to be
-            // caught on the way down.
-            crate::stack_check::stack_check()?;
-            if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
-                return Ok(hash);
-            }
-            // `try_hash_value` runs each element's `__hash__`, which may
-            // collect; `obj` is a raw local re-read in the loop and after it, so
-            // pin it on the shadow stack.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..(n as i64) {
-                if let Some(item) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
-                {
-                    hashes.push(try_hash_value(item)?);
-                }
-            }
-            let hash = _hash_tuple_xx(&hashes);
-            pyre_object::w_tuple_set_cached_hash(
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                hash,
-            );
-            return Ok(hash);
+            return tuple_structural_hash(obj);
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
@@ -16313,9 +16359,45 @@ impl Drop for WritableBuffer {
     }
 }
 
+/// `space.readbuf_w` — a read-only byte slice from a bytes-like object.
+///
+/// Every readable exporter pyre has: bytes / bytearray, a live mmap, an
+/// `array.array`'s element bytes, and a contiguous memoryview's window.
+pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            return Ok(pyre_object::bytesobject::bytes_like_data(obj));
+        }
+        // `W_MMap.readbuf_w` — the live mapping.
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
+            let (address, length, _readonly) = view?;
+            return Ok(std::slice::from_raw_parts(address as *const u8, length));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            return Ok(pyre_object::interp_array::w_array_bytes(obj));
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if memoryview_contiguity(obj).0 {
+                let view = pyre_object::memoryview::w_memoryview_view(obj);
+                let full = view.backing().as_bytes();
+                let off = view.offset() as usize;
+                let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+                if off <= full.len() && len <= full.len() - off {
+                    return Ok(&full[off..off + len]);
+                }
+            }
+        }
+        Err(crate::PyError::type_error(
+            "a bytes-like object is required",
+        ))
+    }
+}
+
 /// `space.acquire_writebuf` for FileIO.readinto.  These are pyre's native
 /// writable exporters; a memoryview contributes its exact contiguous window.
-unsafe fn fileio_writebuf(
+pub(crate) unsafe fn fileio_writebuf(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
@@ -19565,9 +19647,14 @@ mod tests {
     #[test]
     fn fstring_missing_comma_uses_recursive_expression_range() {
         assert_eq!(fstring_missing_comma_span("f'{6 0}'", 5), Some((3, 6)));
-        // Ruff's normalized range can end in the middle of a UTF-8 scalar;
-        // never project such a range into the outer SyntaxError.
-        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), None);
+        // A range whose end falls inside a multi-byte character is reported
+        // one character short, because `character_offset` counts the
+        // characters up to the byte the range ends at and a byte inside a
+        // scalar counts as the character before it.  The span is still worth
+        // projecting: `4, 6` under the message the recursive parse found
+        // beats `6, 7` under `f-string: expecting '}'`, which is what
+        // refusing it leaves behind.  3.14 answers `4, 7`.
+        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), Some((3, 6)));
         assert_eq!(
             fstring_missing_comma_span(
                 "f\"\"\"\n\n\n            {\n            6\n            0=\"\"\"",

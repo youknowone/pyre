@@ -324,6 +324,130 @@ pub unsafe extern "C" fn PyModule_Create2(
     pyobject::make_ref(module)
 }
 
+/// The `PySlot` identifiers a module export array carries.  They are a
+/// separate range from the `PyModuleDef_Slot` numbers the create phase reads,
+/// and the four they overlap in meaning are renumbered on the way in.
+mod export_id {
+    pub const MOD_CREATE: u16 = 84;
+    pub const MOD_EXEC: u16 = 85;
+    pub const MOD_MULTIPLE_INTERPRETERS: u16 = 86;
+    pub const MOD_GIL: u16 = 87;
+    pub const MOD_NAME: u16 = 100;
+    pub const MOD_DOC: u16 = 101;
+    pub const MOD_STATE_SIZE: u16 = 102;
+    pub const MOD_METHODS: u16 = 103;
+    pub const MOD_STATE_TRAVERSE: u16 = 104;
+    pub const MOD_STATE_CLEAR: u16 = 105;
+    pub const MOD_STATE_FREE: u16 = 106;
+    pub const MOD_ABI: u16 = 109;
+    pub const MOD_TOKEN: u16 = 110;
+}
+
+/// `PyModExport_*`'s answer, read into the definition the create phase takes.
+///
+/// The export protocol says the same things a `PyModuleDef` says, as an array
+/// rather than as a struct: an extension that never names the struct cannot be
+/// laid out against the wrong one.  The definition built here is this layer's
+/// own, and lives as long as the module does.
+pub(super) fn create_module_from_export_slots(
+    slots: *mut super::typeobject::CPySlot,
+    spec: PyObjectRef,
+    name: &str,
+    path: Option<&std::path::Path>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let refuse = |message: String| {
+        Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            message,
+        ))
+    };
+    if slots.is_null() {
+        return refuse(format!("module {name}: PyModExport_* returned NULL"));
+    }
+    let mut def = Box::new(CPyModuleDef {
+        m_base: CPyModuleDefBase {
+            ob_base: CPyObject {
+                ob_refcnt: 0,
+                ob_pyre_link: PY_NULL,
+                ob_type: std::ptr::null_mut(),
+            },
+            m_init: None,
+            m_index: 0,
+            m_copy: std::ptr::null_mut(),
+        },
+        m_name: std::ptr::null(),
+        m_doc: std::ptr::null(),
+        m_size: 0,
+        m_methods: std::ptr::null_mut(),
+        m_slots: std::ptr::null_mut(),
+        m_traverse: std::ptr::null(),
+        m_clear: std::ptr::null(),
+        m_free: std::ptr::null(),
+    });
+    let mut def_slots: Vec<CPyModuleDefSlot> = Vec::new();
+    let mut entry = slots;
+    loop {
+        let slot = unsafe { &*entry };
+        if slot.sl_id == 0 {
+            break;
+        }
+        let value = slot.sl_value as *mut c_void;
+        match slot.sl_id {
+            export_id::MOD_NAME => def.m_name = value as *const c_char,
+            export_id::MOD_DOC => def.m_doc = value as *const c_char,
+            export_id::MOD_STATE_SIZE => def.m_size = slot.sl_value as isize,
+            export_id::MOD_METHODS => def.m_methods = value as *mut CPyMethodDef,
+            export_id::MOD_STATE_TRAVERSE => def.m_traverse = value as *const c_void,
+            export_id::MOD_STATE_CLEAR => def.m_clear = value as *const c_void,
+            export_id::MOD_STATE_FREE => def.m_free = value as *const c_void,
+            // Reported for the host to check the extension against itself.
+            // Every ABI this interpreter offers is the one it just handed the
+            // extension, so there is nothing here to reject.
+            export_id::MOD_ABI | export_id::MOD_TOKEN => {}
+            export_id::MOD_CREATE => def_slots.push(CPyModuleDefSlot {
+                slot: PY_MOD_CREATE,
+                value,
+            }),
+            export_id::MOD_EXEC => def_slots.push(CPyModuleDefSlot {
+                slot: PY_MOD_EXEC,
+                value,
+            }),
+            export_id::MOD_MULTIPLE_INTERPRETERS => def_slots.push(CPyModuleDefSlot {
+                slot: PY_MOD_MULTIPLE_INTERPRETERS,
+                value,
+            }),
+            export_id::MOD_GIL => def_slots.push(CPyModuleDefSlot {
+                slot: PY_MOD_GIL,
+                value,
+            }),
+            unknown => {
+                if slot.sl_flags & super::typeobject::SLOT_OPTIONAL == 0 {
+                    return refuse(format!(
+                        "module {name}: PyModExport_* returned an unrecognised slot {unknown}"
+                    ));
+                }
+            }
+        }
+        entry = unsafe { entry.add(1) };
+    }
+    if def.m_name.is_null() {
+        return refuse(format!(
+            "module {name}: PyModExport_* returned no Py_mod_name"
+        ));
+    }
+    // The create phase reads the array until a zero, and takes both arrays by
+    // pointer rather than copying them, so both outlive this call.
+    def_slots.push(CPyModuleDefSlot {
+        slot: 0,
+        value: std::ptr::null_mut(),
+    });
+    def.m_slots = Box::leak(def_slots.into_boxed_slice()).as_mut_ptr();
+    let def = Box::leak(def);
+    // Stamps the header the create phase reads the definition back through.
+    unsafe { PyModuleDef_Init(def) };
+    create_module_from_def_and_spec(def, spec, name, path)
+}
+
 /// `modsupport.py:create_module_from_def_and_spec` — the PEP 489 create phase.
 pub(super) fn create_module_from_def_and_spec(
     def: *mut CPyModuleDef,
@@ -331,6 +455,28 @@ pub(super) fn create_module_from_def_and_spec(
     name: &str,
     path: Option<&std::path::Path>,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // Every module definition names itself, so a NULL here is not a definition
+    // read at the offsets it was written at.  It is the one field that says so
+    // before anything else goes wrong: a definition laid out against a larger
+    // `PyObject` header -- CPython 3.14's free-threaded one is 32 bytes where
+    // this is 24 -- puts its `m_copy` where `m_name` is read, its `m_name`
+    // where `m_doc` is, and its `m_methods` where `m_slots` is.  Reading it
+    // that way is not an error anywhere: the module is created, `__doc__`
+    // holds the name, no execution slot is found, and the module an extension
+    // spent its whole init filling comes back empty.
+    if unsafe { (*def).m_name.is_null() } {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "module {name}: its PyModuleDef has no m_name, so it was not \
+                 laid out against this interpreter's headers -- an extension \
+                 that declares CPython's structs itself reads every field of \
+                 this one at the wrong offset, since a PyObject here is {} \
+                 bytes",
+                std::mem::size_of::<CPyObject>()
+            ),
+        ));
+    }
     if unsafe { (*def).m_size } < 0 {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,

@@ -11,13 +11,29 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
 /// `signals.c:34` — one past the highest signal number the platform has,
 /// which is what `Py_NSIG` names and what every range check answers from.
-/// The libc crate does not surface it portably; the POSIX cap is the
-/// reasonable default and fits a single `i64` bitmask, and the MSVC runtime
-/// defines its own, smaller, count.
+/// The libc crate does not surface it, so `<signal.h>`'s own number is
+/// spelled per platform: 32 on darwin, `_NSIG` = 65 under glibc, 23 from the
+/// MSVC runtime.  A host outside that set falls back to the 64 `signals.c`
+/// uses when the header is silent.
 #[cfg(windows)]
 pub const NSIG: i32 = 23;
-#[cfg(not(windows))]
+#[cfg(target_vendor = "apple")]
+pub const NSIG: i32 = 32;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const NSIG: i32 = 65;
+#[cfg(not(any(
+    windows,
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+)))]
 pub const NSIG: i32 = 64;
+
+/// `signals.c:38-39 N_LONGBITS / N_LONGSIG` — the pending bits live in an
+/// array of words rather than one word, because `NSIG` exceeds a word's
+/// width wherever `_NSIG` is 65.
+const N_LONGBITS: i32 = i64::BITS as i32;
+const N_LONGSIG: usize = ((NSIG - 1) / N_LONGBITS + 1) as usize;
 
 /// Identity of the signal-driving `ActionFlag` ticker cell (`signals.c:45-49
 /// pypysig_counter`).  The pointer is compared by the interpreter but never
@@ -28,7 +44,7 @@ pub const NSIG: i32 = 64;
 static TICKER_PTR: AtomicPtr<isize> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `signals.c:51 pypysig_flags_bits` — one bit per pending signal.
-static SIG_PENDING: AtomicI64 = AtomicI64::new(0);
+static SIG_PENDING: [AtomicI64; N_LONGSIG] = [const { AtomicI64::new(0) }; N_LONGSIG];
 
 /// `signals.c:52 wakeup_fd` — fd to write a byte to on each signal, or
 /// -1 when disabled (`signal.set_wakeup_fd`).
@@ -93,8 +109,9 @@ pub(crate) fn rearm_ticker() {
 /// handler call it.  `set_interrupt` reaches signal delivery through here too.
 pub fn signal_pushback(signum: i32) {
     if (0..NSIG).contains(&signum) {
-        let bitmask = 1i64 << signum;
-        SIG_PENDING.fetch_or(bitmask, Ordering::SeqCst);
+        let index = (signum / N_LONGBITS) as usize;
+        let bitmask = 1i64 << (signum % N_LONGBITS);
+        SIG_PENDING[index].fetch_or(bitmask, Ordering::SeqCst);
         rearm_ticker();
     }
 }
@@ -102,14 +119,15 @@ pub fn signal_pushback(signum: i32) {
 /// `signals.c:205-223 pypysig_poll` — return the lowest-numbered pending
 /// signal, clearing its bit, or -1 when none are pending.
 pub fn signal_poll() -> i32 {
-    let mut value = SIG_PENDING.load(Ordering::SeqCst);
-    while value != 0 {
-        let j = value.trailing_zeros() as i32;
-        let bit = 1i64 << j;
-        match SIG_PENDING.compare_exchange(value, value & !bit, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return j,
-            Err(current) => value = current,
+    for (index, word) in SIG_PENDING.iter().enumerate() {
+        let mut value = word.load(Ordering::SeqCst);
+        while value != 0 {
+            let j = value.trailing_zeros() as i32;
+            let bit = 1i64 << j;
+            match word.compare_exchange(value, value & !bit, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return index as i32 * N_LONGBITS + j,
+                Err(current) => value = current,
+            }
         }
     }
     -1
@@ -120,7 +138,9 @@ pub fn signal_poll() -> i32 {
 /// eval-breaker bit, closing the race where a signal arrives immediately
 /// before that clear.
 pub(crate) fn has_pending_signals() -> bool {
-    SIG_PENDING.load(Ordering::SeqCst) != 0
+    SIG_PENDING
+        .iter()
+        .any(|word| word.load(Ordering::SeqCst) != 0)
 }
 
 // ── wakeup fd (signals.c:246-272 pypysig_set_wakeup_fd) ──

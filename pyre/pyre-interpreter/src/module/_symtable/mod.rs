@@ -32,11 +32,12 @@ const PUBLIC_SYMBOL_FLAGS: SymbolFlags = SymbolFlags::from_bits_retain(
         | SymbolFlags::DEF_TYPE_PARAM.bits()
         | SymbolFlags::DEF_COMP_CELL.bits(),
 );
+/// `pycore_symtable.h DEF_BOUND` — the three bits and no more.  `symtable.py`
+/// reads it in `is_global` and `is_local` alone, and in both only for a symbol
+/// in the module block; `DEF_TYPE_PARAM` is set only on names inside a `type
+/// parameters` block, so the wider mask never reached a reader.
 const DEF_BOUND: SymbolFlags = SymbolFlags::from_bits_retain(
-    SymbolFlags::DEF_LOCAL.bits()
-        | SymbolFlags::DEF_PARAM.bits()
-        | SymbolFlags::DEF_IMPORT.bits()
-        | SymbolFlags::DEF_TYPE_PARAM.bits(),
+    SymbolFlags::DEF_LOCAL.bits() | SymbolFlags::DEF_PARAM.bits() | SymbolFlags::DEF_IMPORT.bits(),
 );
 
 fn table_type(table: &SymbolTable) -> i32 {

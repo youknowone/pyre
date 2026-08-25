@@ -2866,6 +2866,9 @@ fn format_spec_err(
         E::StringAlignmentFlag => {
             crate::PyError::value_error("'=' alignment not allowed in string format specifier")
         }
+        E::StringSpecNotAllowed(s) => {
+            crate::PyError::value_error(format!("{s} not allowed in string format specifier"))
+        }
         E::NotImplemented(c, s) => crate::PyError::value_error(format!(
             "Format code '{c}' for object of type '{s}' not implemented yet"
         )),

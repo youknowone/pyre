@@ -549,15 +549,28 @@ pub unsafe extern "C" fn PyErr_Fetch(
 
 /// An exception instance's `__traceback__` as a new reference, or NULL.
 fn traceback_reference(instance: PyObjectRef) -> *mut CPyObject {
-    if instance.is_null() || !unsafe { pyre_object::is_exception(instance) } {
-        return std::ptr::null_mut();
-    }
-    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(instance) };
+    let stored = escaping_traceback(instance);
     if stored.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
     pyobject::make_ref(stored)
+}
+
+/// The traceback `instance` carries, marked as having left the frame it names.
+///
+/// A traceback holds the frame it was taken from, and a frame outlives its own
+/// execution only once something says so; handing one to a caller is that
+/// something, so the mark goes here rather than at each use.
+fn escaping_traceback(instance: PyObjectRef) -> PyObjectRef {
+    if instance.is_null() || !unsafe { pyre_object::is_exception(instance) } {
+        return PY_NULL;
+    }
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(instance) };
+    if stored.is_null() {
+        return PY_NULL;
+    }
+    unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
+    stored
 }
 
 /// Detach the indicator and hand it to the caller, which is fetch-and-clear
@@ -945,6 +958,68 @@ pub unsafe extern "C" fn _PyErr_ChainExceptions1(exception: *mut CPyObject) {
     unsafe { PyErr_SetRaisedException(pending) };
 }
 
+/// `pyerrors.py PyTraceBack_Print(tb, file)` — write `tb` to `file` the way a
+/// report does, header line included.
+///
+/// The entries themselves are `traceback.print_tb`'s work rather than this
+/// one's, so what is written matches what the module writes everywhere else.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyTraceBack_Print(tb: *mut CPyObject, file: *mut CPyObject) -> c_int {
+    if tb.is_null() {
+        return 0;
+    }
+    let Some([traceback, file]) = super::object::arguments([tb, file]) else {
+        return -1;
+    };
+    if !unsafe { crate::pytraceback::is_pytraceback(traceback) } {
+        unsafe { PyErr_BadInternalCall() };
+        return -1;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let traceback_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(traceback);
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(file);
+    let reload = pyre_object::gc_roots::shadow_stack_get;
+    let header = crate::baseobjspace::call_method(
+        reload(file_slot),
+        "write",
+        &[pyre_object::w_str_new(
+            "Traceback (most recent call last):\n",
+        )],
+    );
+    if header.is_null() {
+        return report_call_failure();
+    }
+    let Some(module) = trap(super::import_::import_module("traceback")) else {
+        return -1;
+    };
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(module);
+    let printed = crate::baseobjspace::call_method(
+        reload(module_slot),
+        "print_tb",
+        &[
+            reload(traceback_slot),
+            pyre_object::w_none(),
+            reload(file_slot),
+        ],
+    );
+    if printed.is_null() {
+        return report_call_failure();
+    }
+    0
+}
+
+/// Move the error a NULL-answering call left behind onto the indicator, and
+/// answer -1 for the entry point that is giving up on it.
+fn report_call_failure() -> c_int {
+    if let Some(error) = crate::call::take_call_error() {
+        set_pending_error(error);
+    }
+    -1
+}
+
 /// `write_unraisable` over whatever the indicator holds, which the two
 /// entry points below share.
 ///
@@ -1290,4 +1365,6 @@ pub(super) fn ensure_linked() {
 
     std::hint::black_box(PyErr_Restore as *const ());
     std::hint::black_box(PyErr_NormalizeException as *const ());
+    std::hint::black_box(PyErr_PrintEx as *const ());
+    std::hint::black_box(PyTraceBack_Print as *const ());
 }

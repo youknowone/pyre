@@ -133,11 +133,12 @@ first:
    fails when `support` isn't already an attribute; IMPORT_FROM must fall back
    to importing the submodule. Also `from unittest import mock`
    (`unittest.mock` submodule).
-2. **Compiler gap (external `rustpython-codegen`): `class_decorator` symbol
-   missing from the symbol table** — `compile error: the symbol
-   'class_decorator' must be present in the symbol table` (hit by
-   `test_grammar`). Lives in the git-pinned compiler dependency, not pyre's
-   tree.
+2. **Compile-time `SyntaxWarning` is never raised.** `test_grammar` fails 16
+   assertions across `test_assert_syntax_warnings`,
+   `test_assert_warning_promotes_to_syntax_error`,
+   `test_comparison_is_literal`, `test_end_of_numerical_literals`,
+   `test_former_statements_refer_to_builtins` and `test_warn_missed_comma` —
+   every one of them waits for a warning the compiler does not emit.
 3. **Assorted stdlib-compat gaps** surfaced per module (e.g. `datetime.date`,
    `genericpath._splitext`, `typing`'s `_idfunc`, complex `re` patterns). Run
    `--full --report` to enumerate the current set.
