@@ -132,6 +132,11 @@ pub(crate) struct EscapeFlushUndo {
     last_instr: isize,
     valuestackdepth: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+    /// The region as the flush left it.  The restore compares against this to
+    /// tell a slot the flush wrote from one the residual's user Python wrote
+    /// after the capture; empty means no flush image was recorded, and the
+    /// restore then puts every captured slot back as it always did.
+    pub(crate) flush_image: Vec<pyre_object::PyObjectRef>,
 }
 
 /// The operand stack an abort image publishes, resolved from the walker's
@@ -1601,6 +1606,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 }
             }
             if flushed {
+                record_escape_flush_image(expected);
                 let kind = if latched {
                     EscapeResumeKind::Exact
                 } else {
@@ -1609,7 +1615,9 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 if let Some(py_pc) = portal_py_pc {
                     COMMITTED_FRAME_ESCAPE_PC.with(|committed| committed.set(Some((py_pc, kind))));
                 }
-            } else if !crate::state::flush_locals_region_to_frame(ctx, expected) {
+            } else if crate::state::flush_locals_region_to_frame(ctx, expected) {
+                record_escape_flush_image(expected);
+            } else {
                 // All-or-nothing decline: nothing was written, nothing to undo.
                 discard_escape_flush_undo();
             }
@@ -1673,7 +1681,173 @@ fn capture_escape_flush_undo(frame: usize) {
             last_instr,
             valuestackdepth: pf.valuestackdepth,
             slots: locals_w!(pf).as_slice().to_vec(),
+            flush_image: Vec::new(),
         });
+    });
+}
+
+/// Record the locals region as the flush just left it, for the frame the
+/// pending capture holds.  Runs after the flush and before the residual's
+/// user Python can touch the region, so any later difference from this image
+/// is that user code's own write.  A second flush for the same frame supersedes
+/// the image: the restore must undo the flush that is actually standing.
+/// Report what the post-residual shadow refresh left behind, and optionally
+/// import the residual's own fastlocals writes into the shadow.
+///
+/// Every point that publishes walk state to the frame -- the escape flush, the
+/// walk-end flush, the resume image, the undo restore -- writes the shadow over
+/// the locals region.  So a fastlocals write made by the residual survives only
+/// if the shadow learned about it first.  `flush_image` is the region as the
+/// flush left it, so a slot that has moved since is exactly one the residual
+/// wrote.
+///
+/// The import is gated on [`fbw_import_residual_locals_enabled`] because it
+/// updates the concrete half alone: the recorded IR still names the box the
+/// walk was holding, which is wrong for anything but this one recording.  It is
+/// here to answer whether the shadow is the channel, not to ship.
+fn report_post_residual_shadow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    live_frame: usize,
+    before: Option<&[pyre_object::PyObjectRef]>,
+) {
+    let diag = fbw_debug_abort_enabled();
+    let import = fbw_import_residual_locals_enabled();
+    if !diag && !import {
+        return;
+    }
+    let base = match ctx.trace_ctx.virtualizable_info() {
+        Some(info) => info.num_static_extra_boxes,
+        None => return,
+    };
+    let heap = ctx.trace_ctx.diag_virtualizable_heap_ptr();
+    // Baseline for "what the residual wrote".  A flush rewrote the locals region
+    // from the shadow, so once there is a flush image that is the only sound
+    // baseline: measuring from before the call would report the flush's own
+    // stores as the residual's.  Measured, that difference is the loop
+    // variable -- the flush writes it, the residual does not -- and adopting it
+    // makes the compiled loop re-read its counter out of the array, one
+    // iteration ahead.  With no flush the frame was never rewritten, so the
+    // pre-call image is exact.
+    let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .filter(|undo| undo.frame == live_frame && !undo.flush_image.is_empty())
+            .map(|undo| undo.flush_image.clone())
+    });
+    let baseline: &[pyre_object::PyObjectRef] = match (flushed.as_deref(), before) {
+        (Some(image), _) => image,
+        (None, Some(image)) => image,
+        (None, None) => {
+            if diag {
+                eprintln!("[fbw-post-residual] skip=no-baseline frame={live_frame:#x}");
+            }
+            return;
+        }
+    };
+    let origin = if flushed.is_some() {
+        "flush"
+    } else {
+        "pre-call"
+    };
+    if live_frame == 0 {
+        if diag {
+            eprintln!("[fbw-post-residual] skip=no-live-frame origin={origin}");
+        }
+        return;
+    }
+    let frame = live_frame;
+    let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+    let live = locals_w!(pf).as_slice();
+    let n = live.len().min(baseline.len());
+    let moved: Vec<(usize, pyre_object::PyObjectRef)> = (0..n)
+        .filter(|&i| live[i] != baseline[i])
+        .map(|i| (i, live[i]))
+        .collect();
+    if moved.is_empty() {
+        return;
+    }
+    if diag {
+        let stale: Vec<usize> = moved
+            .iter()
+            .filter(|(abs, live)| {
+                ctx.trace_ctx
+                    .virtualizable_entry_at(base + abs)
+                    .is_none_or(|(_, v)| {
+                        crate::state::boxed_slot_value_for_type(majit_ir::Type::Ref, &v) != *live
+                    })
+            })
+            .map(|(abs, _)| *abs)
+            .collect();
+        eprintln!(
+            "[fbw-post-residual] origin={origin} heap={heap:#x} frame={frame:#x} same={} moved={:?} shadow_stale={stale:?}",
+            heap == frame,
+            moved.iter().map(|(abs, _)| *abs).collect::<Vec<_>>(),
+        );
+    }
+    if import {
+        adopt_residual_locals_writes(ctx, base, &moved);
+    }
+}
+
+/// Adopt into the walk the fastlocals a residual wrote to the live frame.
+///
+/// The walk holds each local as a box and reads it straight out of the
+/// virtualizable shadow (`pyjitpl.py _opimpl_getarrayitem_vable`, standard
+/// leg), so a residual that writes the frame's fastlocals behind the walk's
+/// back -- an `f_locals` write-through from the callee is the reachable case --
+/// leaves every later read, and the values the loop closes on, holding what the
+/// local was before the call.
+///
+/// The standing objection to re-reading a standard virtualizable mid-trace is
+/// that the array holds values the trace never wrote.  What answers it is not
+/// the force but *`moved`*: the caller diffs the region against the image it
+/// took before the call, so only the slots the call itself changed are adopted,
+/// and a slot the walk is ahead on -- unchanged during the call -- is not in the
+/// set.  That holds on both arms, the one where the residual forced the region
+/// out of the shadow first and the one where nothing forced at all.
+///
+/// The re-read is RECORDED, not folded to the value seen now: compiled code has
+/// to perform the same load after its own force, so this emits
+/// `GETARRAYITEM_GC_R` off the frame's `locals_cells_stack_w` and hands the
+/// shadow that OpRef.  Folding the concrete value in would bake one recording's
+/// answer into every execution.
+fn adopt_residual_locals_writes<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    base: usize,
+    moved: &[(usize, pyre_object::PyObjectRef)],
+) {
+    if moved.is_empty() || ctx.fbw_mode.snapshot_sym.is_null() {
+        return;
+    }
+    let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).frame() };
+    if frame.is_none() {
+        return;
+    }
+    let array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame);
+    for &(abs, live) in moved {
+        if ctx.trace_ctx.virtualizable_entry_at(base + abs).is_none() {
+            continue;
+        }
+        let index = ctx.trace_ctx.const_int(abs as i64);
+        let item = crate::state::trace_array_getitem_value(ctx.trace_ctx, array, index);
+        let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
+        ctx.trace_ctx.set_opref_concrete(item, value);
+        ctx.trace_ctx
+            .set_virtualizable_entry_at(base + abs, item, value);
+    }
+}
+
+fn record_escape_flush_image(frame: usize) {
+    ESCAPE_FLUSH_UNDO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(undo) = slot.as_mut() else {
+            return;
+        };
+        if undo.frame != frame {
+            return;
+        }
+        let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        undo.flush_image = locals_w!(pf).as_slice().to_vec();
     });
 }
 
@@ -1698,7 +1872,46 @@ pub(crate) fn restore_escape_flush_undo() {
             let arr_ptr = pf.locals_cells_stack_w;
             let dst = locals_w_mut!(pf);
             let n = undo.slots.len().min(dst.as_slice().len());
+            // Three-way merge: pre-flush capture, the image the flush left,
+            // and what the frame holds now.  A slot the residual did not touch
+            // still reads as the flush left it, and only those go back to their
+            // pre-flush value.  A slot that moved since carries a write made
+            // after the capture -- `f_locals` write-through from the callee is
+            // the reachable case -- and putting the capture back over it would
+            // discard that write.  The force-#2 arm above already refuses to
+            // re-flush for this reason; this is the same refusal on the way out.
+            //
+            // With no image (the flush declined, or an arm that never records
+            // one) `merge` is false and every captured slot goes back, as before.
+            let merge = undo.flush_image.len() >= n;
+            // Report-only: `differs` counts the slots that moved since the
+            // capture, `kept` those the merge leaves alone.  Gated, so a
+            // production build pays nothing.
+            if fbw_debug_abort_enabled() {
+                let live = dst.as_slice();
+                let differs = (0..n).filter(|&i| live[i] != undo.slots[i]).count();
+                let kept = if merge {
+                    (0..n).filter(|&i| live[i] != undo.flush_image[i]).count()
+                } else {
+                    0
+                };
+                if differs != 0 {
+                    let moved: Vec<usize> =
+                        (0..n).filter(|&i| live[i] != undo.slots[i]).collect();
+                    let held: Vec<usize> = if merge {
+                        (0..n).filter(|&i| live[i] != undo.flush_image[i]).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    eprintln!(
+                        "[fbw-undo-clobber] frame={frame:#x} n={n} differs={differs} moved={moved:?} kept={kept} held={held:?}"
+                    );
+                }
+            }
             for (i, &v) in undo.slots.iter().take(n).enumerate() {
+                if merge && dst.as_slice()[i] != undo.flush_image[i] {
+                    continue;
+                }
                 dst[i] = v;
             }
             pf.last_instr = undo.last_instr;
@@ -3516,6 +3729,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // same user-frame signal Finding #1 uses, generalized past FOR_ITER.
     let heap_write_odometer_before =
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
+    // The live frame's locals as they stood before the residual ran.  A
+    // residual that writes fastlocals writes THIS object while the walk reads
+    // its own copy, so the diff taken afterwards names exactly the slots the
+    // shadow has to learn about.
+    //
+    // The copies live in real shadow-stack slots rather than in a plain `Vec`
+    // (`gctransform/framework.py` push_roots/pop_roots around a collection
+    // point).  The residual IS a collection point, and a minor collection
+    // forwards the frame's own array in place while copies taken outside the
+    // root stack keep their pre-collection words.  Diffing against those reads
+    // every moved slot as a write, and the adoption below would then put the
+    // array's value over a box the walk holds and the frame was never told
+    // about.
+    let mut residual_locals_roots = ((fbw_debug_abort_enabled()
+        || fbw_import_residual_locals_enabled())
+        && is_may_force
+        && live_frame != 0)
+        .then(|| unsafe {
+            let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
+            let snapshot = locals_w!(pf).as_slice().to_vec();
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&snapshot);
+            roots.normalize(base, snapshot.len());
+            (roots, base, snapshot.len())
+        });
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
@@ -3904,6 +4142,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // state after a cancelled commit has to re-read it after the
             // walk-end restore, not here.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            // Read the pre-call image back out of the root slots: a collection
+            // inside the residual forwarded them alongside the frame's array,
+            // so these words and `locals_w!` name the same objects.
+            let residual_locals_before = residual_locals_roots.take().map(|(roots, base, len)| {
+                (0..len)
+                    .map(|k| roots.get(base + k))
+                    .collect::<Vec<pyre_object::PyObjectRef>>()
+            });
+            report_post_residual_shadow(ctx, live_frame, residual_locals_before.as_deref());
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
                 // `debug_print('vable escaped during a call in %s')`: name the
@@ -3955,6 +4202,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             crate::state::note_vable_escape_abort();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
+    }
+    // Not forced, so nothing above consumed the pre-call image.  The reachable
+    // shape is the same `f_locals` write-through as the forced arm, one
+    // recording later: with the callee inlined the store IS the residual, and
+    // `framelocalsproxy_setitem`'s own force is gated on the live frame's
+    // `vable_token` -- which the walk arms on its snapshot instead -- so the
+    // store lands on the array with no escape raised and no shadow reload.
+    // The walk would otherwise carry the box it held before the call all the
+    // way into the jump arguments the loop closes on.
+    //
+    // This runs BEFORE the restore below: the residual's write is still in the
+    // live frame here, and the restore keeps it anyway (it holds back exactly
+    // the slots the flush did not write).
+    if let Some((roots, base, len)) = residual_locals_roots.take() {
+        let before: Vec<pyre_object::PyObjectRef> = (0..len).map(|k| roots.get(base + k)).collect();
+        report_post_residual_shadow(ctx, live_frame, Some(&before));
     }
     // A flush that ran without a forced abort (an unarmed token or a missing
     // vable root) must not leak the moved frame into the continuing walk.

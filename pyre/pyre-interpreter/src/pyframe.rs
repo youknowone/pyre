@@ -88,6 +88,18 @@ pub mod frame_locals_proxy {
 
         /// Materialize the viewed frame's `locals_cells_stack_w`.
         ///
+        /// There is a write to materialize for at all because the proxy
+        /// implements PEP 667: a `FrameLocalsProxy` store updates the fast
+        /// local, so this force is what gives that store somewhere real to
+        /// land.  Upstream has no such store to serve -- `pyframe.py
+        /// getdictscope` hands out the `fast2locals` snapshot dict, and only
+        /// `setdictscope` pushes a dict back through `locals2fast`, so
+        /// mutating what `f_locals` returned reaches no fast local there.
+        /// That is a version difference, not a porting gap: PEP 667 postdates
+        /// the language version upstream implements.  The parity corpus
+        /// declares it on `framelocalsproxy_write_coherence` and
+        /// `framelocalsproxy_gc_roots` rather than carrying it as a defect.
+        ///
         /// `rvirtualizable.py hook_access_field` puts the force at the field
         /// access.  The `f_locals` getter forces once, when it builds the
         /// proxy, and a proxy is a live view that outlives that force: bind one
