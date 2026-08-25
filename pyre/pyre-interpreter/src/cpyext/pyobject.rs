@@ -140,7 +140,7 @@ pub(super) fn entered_blocks() -> Vec<usize> {
 /// Only such a block arrives with a header worth reading: [`allocate_raw`]
 /// clears one.  An extension that allocates its own does not have to --
 /// `_cffi_backend.c allocate_owning_object` takes its blocks from plain
-/// `malloc` -- so what sits in the three header words of one of those means
+/// `malloc` -- so what sits in the header words of one of those means
 /// nothing until it is stamped.
 pub(super) fn is_own_block(address: usize) -> bool {
     block_at(address).is_some()
@@ -659,8 +659,8 @@ unsafe fn dealloc(raw: *mut CPyObject) {
 ///
 /// The header is cleared even when the caller did not ask for zeroed memory:
 /// `PyObject_Init` reads `ob_pyre_link` to tell a block that is already an
-/// object from one that is still bytes, so those three words have to mean
-/// something before anything is stamped into them.
+/// object from one that is still bytes, so the header has to mean something
+/// before anything is stamped into it.
 pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
     if size > isize::MAX as usize {
         return std::ptr::null_mut();

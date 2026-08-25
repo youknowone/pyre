@@ -614,13 +614,13 @@ pub(super) fn create_module_from_def_and_spec(
 ) -> Result<PyObjectRef, crate::PyError> {
     // Every module definition names itself, so a NULL here is not a definition
     // read at the offsets it was written at.  It is the one field that says so
-    // before anything else goes wrong: a definition laid out against a larger
-    // `PyObject` header -- CPython 3.14's free-threaded one is 32 bytes where
-    // this is 24 -- puts its `m_copy` where `m_name` is read, its `m_name`
-    // where `m_doc` is, and its `m_methods` where `m_slots` is.  Reading it
-    // that way is not an error anywhere: the module is created, `__doc__`
-    // holds the name, no execution slot is found, and the module an extension
-    // spent its whole init filling comes back empty.
+    // before anything else goes wrong: a definition laid out against a
+    // `PyObject` header one word wider than this interpreter's puts its
+    // `m_copy` where `m_name` is read, its `m_name` where `m_doc` is, and its
+    // `m_methods` where `m_slots` is.  Reading it that way is not an error
+    // anywhere: the module is created, `__doc__` holds the name, no execution
+    // slot is found, and the module an extension spent its whole init filling
+    // comes back empty.
     if unsafe { (*def).m_name.is_null() } {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,

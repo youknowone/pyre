@@ -166,6 +166,9 @@ class B2(bytes):
     pass
 
 
+# `object` counts no items, so its block is exactly the header.
+header = m.block_size(object())[1]
+
 for name, made in [('an empty list', []), ('a list', [1, 2, 3]),
                    ('an empty tuple', ()), ('a tuple', (1, 2, 3)),
                    ('empty bytes', b''), ('bytes', b'abc'),
@@ -175,7 +178,7 @@ for name, made in [('an empty list', []), ('a list', [1, 2, 3]),
     size, basic, item = m.block_size(made)
     eq('the length of %s' % name, size, len(made))
     # The word sits past the header, so the block has to be wider than one.
-    eq('the block of %s holds the word' % name, basic >= 32, True)
+    eq('the block of %s holds the word' % name, basic > header, True)
 
 # The item size is what a caller sizing an allocation of its own multiplies
 # by; a list has none and is counted all the same.
