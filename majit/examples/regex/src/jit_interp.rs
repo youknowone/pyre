@@ -36,15 +36,13 @@
 //! Association is free, as it should be: the depth-26 left-associated tree
 //! produces the same 194-op body as the depth-8 balanced one.
 
-use crate::regex::NodeRec;
+use crate::regex::{KIND_ALTERNATIVE, KIND_CHAR, KIND_REPETITION, KIND_SEQUENCE, NodeRec};
 use majit_metainterp::JitDriver;
 
 /// Shift one mark through the tree for character `c`.
 ///
-/// `interp::shift` with the same body: the kinds are spelled as literals
-/// because a value-position comparison against a `const` path is not part of
-/// the lowerable vocabulary, and the arms are ordered so the two recursive
-/// shapes sit together.
+/// `interp::shift`, arm for arm — the kind tags are the same constants and
+/// the arms are in the same order, so the two bodies diff cleanly.
 #[majit_macros::jit_inline(
     ref_params = { n: ref(NodeRec) },
     ref_fields = {
@@ -59,29 +57,26 @@ use majit_metainterp::JitDriver;
     },
 )]
 fn shift(n: usize, c: i64, mark: i64) -> i64 {
-    let k = n.kind as i64;
-    let m = if k == 0i64 {
-        // Char
-        let ch = n.ch as i64;
-        mark & ((ch == c) as i64)
-    } else if k == 2i64 {
-        // Alternative
-        shift(n.left, c, mark) | shift(n.right, c, mark)
-    } else if k == 3i64 {
-        // Sequence. The left mark from the PREVIOUS character is what enters
-        // the right side, so read it before `shift` overwrites it.
-        let l = n.left;
-        let r = n.right;
-        let old_left = l.marked as i64;
-        let marked_left = shift(l, c, mark);
-        let marked_right = shift(r, c, old_left | (mark & l.empty as i64));
-        (marked_left & r.empty as i64) | marked_right
-    } else if k == 4i64 {
-        // Repetition
-        shift(n.left, c, mark | n.marked as i64)
-    } else {
+    let k = n.kind;
+    let m = match k {
+        KIND_CHAR => {
+            let ch = n.ch as i64;
+            mark & ((ch == c) as i64)
+        }
+        KIND_ALTERNATIVE => shift(n.left, c, mark) | shift(n.right, c, mark),
+        KIND_REPETITION => shift(n.left, c, mark | n.marked as i64),
+        KIND_SEQUENCE => {
+            // The left mark from the PREVIOUS character is what enters the
+            // right side, so read it before `shift` overwrites it.
+            let l = n.left;
+            let r = n.right;
+            let old_left = l.marked as i64;
+            let marked_left = shift(l, c, mark);
+            let marked_right = shift(r, c, old_left | (mark & l.empty as i64));
+            (marked_left & r.empty as i64) | marked_right
+        }
         // Epsilon, and anything else: no mark ever comes out.
-        0i64
+        _ => 0i64,
     };
     n.marked = m as u8;
     m

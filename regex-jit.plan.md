@@ -1440,12 +1440,21 @@ the `#[jit_interp]` portal, 5 tests, and `main.rs`'s benchmark.
   real width (`NodeRec::kind => u8`), and the concrete path keeps the Rust type,
   so a read is `n.kind as i64` and the store is `n.marked = m as u8`. Both cast
   forms lower.
-* The kinds are spelled as integer literals inside `shift`. A value-position
-  `match` runs through `extract_pat_literals`, which takes only int literals —
-  and a constant path parses as `Pat::Ident`, which that function's caller reads
-  as the *catch-all binding*. `if` chains on literals sidestep it. Filed as a
-  finding: `lower_match_value` should refuse a `Pat::Ident` arm rather than
-  silently treat a `KIND_CHAR`-style constant as a default.
+* **A value-position `match` on constants was silently mis-lowered, and it is
+  fixed rather than worked around.** `lower_match_value` read its arms with
+  `extract_pat_literals`, which takes int literals only; a constant path parses
+  as `Pat::Ident`, and the classifier read every such arm as the *catch-all
+  binding*. Four constant arms therefore produced no guarded arms and a
+  `default_arm` set to the last of them, so the jitcode computed that one arm
+  for every discriminant while the concrete interpreter — real Rust — stayed
+  right. Only a warm-versus-cold answer could see it.
+
+  The fix reads arms with `extract_pat_value_tokens`, the same function the
+  sibling `lower_dispatch_chain` already used, and treats a `Pat::Ident` as a
+  binding only when its name holds a lower-case letter — `non_upper_case_globals`
+  is what makes that decidable at proc-macro time. `shift` now spells its arms
+  `KIND_CHAR` / `KIND_SEQUENCE` / … and traces to the same 194-op body.
+  `tests/jit_interp_match_const_patterns.rs` is the gate.
 * **The input must not be an `[int; virt]` state field.** It was, and at
   `1 << 20` characters the run died in `resumecode.py Writer.append_int` —
   `append_int: value 1048577 out of i16 range`. A virtualizable array's elements
