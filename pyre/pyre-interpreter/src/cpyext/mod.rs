@@ -581,6 +581,15 @@ fn finish_init(
             )
         }));
     }
+    // `importdl.c _Py_ext_module_loader_result_from_module`: this is checked
+    // before the uninitialized-object one, so a module that both left an
+    // exception set and came back untyped is reported as the raise.
+    if let Some(pending) = pyerrors::take_pending_error() {
+        return Err(system_error_from_cause(
+            format!("initialization of {name} raised unreported exception"),
+            pending,
+        ));
+    }
     if unsafe { (*result).ob_type.is_null() } {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
@@ -832,6 +841,33 @@ pub(super) fn from_c_result(result: *mut CPyObject) -> Result<PyObjectRef, crate
     let value = unsafe { pyobject::from_ref(result) };
     unsafe { pyobject::decref(result) };
     Ok(value)
+}
+
+/// `_PyErr_FormatFromCause`: a `SystemError` carrying `cause` as both its
+/// `__context__` and its `__cause__`.
+///
+/// An extension that reported success while leaving an exception set has
+/// already lost the raise site, so the exception it left behind is the only
+/// description of what went wrong and is chained onto the report rather than
+/// discarded.
+pub(super) fn system_error_from_cause(
+    message: String,
+    mut cause: crate::PyError,
+) -> crate::PyError {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(cause.to_exc_object());
+    let mut error = crate::PyError::new(crate::PyErrorKind::SystemError, message);
+    let error_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(error.to_exc_object());
+    let w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+    let w_error = pyre_object::gc_roots::shadow_stack_get(error_slot);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_context(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_cause(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_suppress_context(w_error, true);
+    }
+    unsafe { crate::PyError::from_exc_object(w_error) }
 }
 
 /// `_imp.exec_dynamic` — PyPy `cpyext/api.py:exec_extension_module`.

@@ -669,6 +669,19 @@ pub(super) fn create_module_from_def_and_spec(
             call(spec_ref, def)
         };
         unsafe { pyobject::decref(spec_ref) };
+        // `moduleobject.c PyModule_FromDefAndSpec2`: a create slot that answered
+        // a module while leaving an exception set reported a success it did not
+        // have.  `from_c_result` would report that as an anonymous
+        // `SystemError`, so the module's name and the raise are kept here.
+        if !result.is_null()
+            && let Some(pending) = pyerrors::take_pending_error()
+        {
+            unsafe { pyobject::decref(result) };
+            return Err(super::system_error_from_cause(
+                format!("creation of module {name} raised unreported exception"),
+                pending,
+            ));
+        }
         super::from_c_result(result)?
     };
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -758,13 +771,13 @@ fn exec_def_of(module: PyObjectRef, def: *mut CPyModuleDef) -> Result<(), crate:
                     )
                 }));
             }
-            if pyerrors::take_pending_error().is_some() {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::SystemError,
+            if let Some(pending) = pyerrors::take_pending_error() {
+                return Err(super::system_error_from_cause(
                     format!(
                         "execution of module {} raised unreported exception",
                         text_or_empty(unsafe { (*def).m_name })
                     ),
+                    pending,
                 ));
             }
         }
