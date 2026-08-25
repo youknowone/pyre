@@ -2291,6 +2291,16 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         }
                     }
                 }
+                // `let x = state.<ref_scalar>` → the local carries the
+                // `ref(T)` declaration's own pointee. The arm above answers
+                // the field-of-a-ref shape; this one is the ref itself, and
+                // without it `state.sel.value` compiles while the same read
+                // split across two statements does not.
+                if let Some(struct_path) = self.ref_struct_of_base(&init.expr)
+                    && let syn::Pat::Ident(pat_ident) = &local.pat
+                {
+                    self.record_local_ref(&pat_ident.ident.to_string(), struct_path);
+                }
                 // `let x = func(...)` where func is in `call_returns` →
                 // record x as a local ref binding with the declared type.
                 if let Expr::Call(call) = &*init.expr

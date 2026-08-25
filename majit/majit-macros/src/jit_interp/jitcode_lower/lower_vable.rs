@@ -1036,7 +1036,7 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: read into the ref register bank so a subsequent
         // getfield_gc reads its struct base from a real ref value.
-        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+        if let Some((field_index, struct_path)) = config.state_ref_scalars.get(&member_name) {
             let fi = *field_index as u16;
             let reg = self.alloc_reg();
             // Declare the ref identity slot as a read so the backward
@@ -1059,7 +1059,11 @@ impl<'c> Lowerer<'c> {
                 reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
-                struct_type: None,
+                // The `ref(T)` declaration's own `T`. `state.<ref>.<member>`
+                // resolves it from this same map one level up, so leaving it
+                // off here is what made the read stop lowering as soon as the
+                // ref was bound to a local first.
+                struct_type: Some(struct_path.clone()),
             });
         }
         if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
