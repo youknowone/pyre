@@ -100,7 +100,8 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # (System_Environment), and the OVERLAPPED record `_winapi.Overlapped` owns
 # with the CancelIoEx/GetOverlappedResult pair that drives it (System_IO), and
 # the UuidFromStringW/UuidToStringW pair an AF_HYPERV address is spelled with
-# (System_Rpc).
+# (System_Rpc), and `GetVersionExW` for `sys.getwindowsversion`
+# (System_SystemInformation).
 # Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
@@ -121,6 +122,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Rpc",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

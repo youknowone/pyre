@@ -1730,12 +1730,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // carries its `st_*_ns` extras in. `test.support.os_helper` reads
     // `.platform` at import, so every `test.support` consumer needs it.
     //
-    // `major`/`minor`/`build` are kernel32's own file version rather than
-    // `GetVersionEx`'s answer: that call reports the version an unmanifested
-    // binary is shimmed to, and only an application manifest declaring
-    // compatibility makes it report the running one. `platform_version` — the
-    // field that exists because of exactly that shimming — therefore agrees
-    // with them here instead of correcting them.
+    // `major`/`minor`/`build` are `GetVersionEx`'s answer, which is the running
+    // version because the executable carries `python.manifest`; without one the
+    // call reports the version the process is shimmed to.  `platform_version`
+    // is kernel32's own file version
+    // (`_sys_getwindowsversion_from_kernel32`), which is a different number on
+    // a release shipped as an enablement package over the previous build.
     #[cfg(windows)]
     module_ns_store(
         ns,
@@ -1774,12 +1774,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ),
                     ) as usize
                 }) as PyObjectRef;
+                let (major, minor, build) =
+                    version_ex_triple().unwrap_or((info.major, info.minor, info.build));
                 Ok(crate::_structseq::new_instance_with_extra(
                     cls,
                     vec![
-                        w_int_new(info.major as i64),
-                        w_int_new(info.minor as i64),
-                        w_int_new(info.build as i64),
+                        w_int_new(major as i64),
+                        w_int_new(minor as i64),
+                        w_int_new(build as i64),
                         w_int_new(info.platform as i64),
                         w_str_new(&info.service_pack),
                     ],
@@ -2057,6 +2059,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             w_int_new(implementation_hexversion),
         );
         crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre314"));
+        // PEP 734. pyre runs one interpreter per process, so the answer is
+        // false; `sys.implementation` carries the name either way from 3.14 on.
+        crate::baseobjspace::setdictvalue_native(
+            impl_obj,
+            "supports_isolated_interpreters",
+            w_bool_from(false),
+        );
         crate::baseobjspace::setdictvalue_native(
             impl_obj,
             "_multiarch",
@@ -2754,12 +2763,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             },
             0,
         ),
-    );
-    // sys.exc_clear — no-op
-    module_ns_store(
-        ns,
-        "exc_clear",
-        make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
     );
     module_ns_store(
         ns,
@@ -3621,27 +3624,100 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// real W_File-backed `TextIOWrapper`; pyre routes writes through Rust's
 /// stdout/stderr (the same sink as `print`) so output ordering is preserved,
 /// storing the read/write surface as instance attributes.
+/// `initstdio`'s test for the default error handler: UTF-8 mode, or the legacy
+/// C/POSIX locale, asks for `surrogateescape`; every other locale settles for
+/// the `strict` that `TextIOWrapper(errors=None)` takes.
+///
+/// Windows answers yes outright. `initstdio` reaches that through UTF-8 mode,
+/// which PyPy runs the whole platform in -- `sys.flags.utf8_mode` reads 1 there
+/// -- and pyre does not, because 3.14 reports 0 unless `-X utf8` asked for it;
+/// `config_get_stdio_errors` states the same answer as its own `MS_WINDOWS`
+/// arm instead of deriving it. Measured, both interpreters answer
+/// `surrogateescape` on this platform. The locale test could not stand in for
+/// it either: the MSVC runtime's `setlocale(LC_CTYPE, "")` reads the user's
+/// ANSI locale and ignores `LC_ALL`, so it never sees C there.
+fn locale_asks_for_surrogateescape() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        if crate::importing::utf8_mode_flag() != 0 {
+            return true;
+        }
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        {
+            // `initstdio` installs the locale the environment names before
+            // reading it back, so what is tested is the locale the C library
+            // took rather than the variables that asked for it.
+            rustpython_host_env::locale::setlocale(libc::LC_CTYPE, Some(c""));
+            let effective = rustpython_host_env::locale::setlocale(libc::LC_CTYPE, None);
+            matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"))
+        }
+        // No locale database at all -- wasm32, and the sandbox, whose
+        // `_locale.setlocale` answers `C` for every category.
+        #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+        {
+            true
+        }
+    }
+}
+
+/// `app_main.py initstdio`: the encoding and error handler the standard streams
+/// open with.
+///
+/// PYTHONIOENCODING is `encoding[:errors]`, and which half the user filled in
+/// decides what an empty handler half means. A non-empty encoding is explicit
+/// and settles for `strict`; an omitted one leaves the handler to
+/// [`locale_asks_for_surrogateescape`]. So `iso8859-1` and `iso8859-1:` both
+/// answer `strict`, while `:`, the empty value and no value at all answer
+/// whatever the locale asks for. stderr replaces the handler with
+/// `backslashreplace` separately.
+///
+/// `_WIN32 and not encoding` fixes the encoding at utf-8 rather than the ANSI
+/// code page; pyre takes that on every platform rather than resolving
+/// `initstdio`'s `"locale"`, which agrees with it wherever the locale encoding
+/// is utf-8.
+///
+/// Resolved once: `initstdio` runs once, and a later `locale.setlocale` must
+/// not change the answer a stream is already open with.
 fn stdio_encoding_and_errors() -> (String, String) {
-    // PyPy app_main.py `initstdio`: a non-empty encoding before ':' is
-    // explicit; an omitted encoding defaults to UTF-8 here, while a non-empty
-    // errors suffix overrides the normal strict policy. stderr replaces its
-    // error policy separately below.
-    let Some(raw) = crate::importing::stdio_encoding() else {
-        return ("utf-8".to_string(), "strict".to_string());
-    };
-    let (encoding, errors) = match raw.split_once(':') {
-        Some((encoding, errors)) => (
-            if encoding.is_empty() {
-                "utf-8"
-            } else {
-                encoding
-            },
-            if errors.is_empty() { "strict" } else { errors },
-        ),
-        None if raw.is_empty() => ("utf-8", "strict"),
-        None => (raw.as_str(), "strict"),
-    };
-    (encoding.to_string(), errors.to_string())
+    static RESOLVED: OnceLock<(String, String)> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let raw = crate::importing::stdio_encoding();
+            let (encoding, errors, user_set_encoding) = match raw.as_deref() {
+                Some(value) if value.contains(':') => {
+                    let (encoding, errors) = value.split_once(':').expect("value holds a ':'");
+                    let user_set_encoding = !encoding.is_empty();
+                    let errors = if !errors.is_empty() {
+                        Some(errors)
+                    } else if user_set_encoding {
+                        Some("strict")
+                    } else {
+                        None
+                    };
+                    let encoding = if encoding.is_empty() {
+                        "utf-8"
+                    } else {
+                        encoding
+                    };
+                    (encoding, errors, user_set_encoding)
+                }
+                Some(value) if !value.is_empty() => (value, None, true),
+                _ => ("utf-8", None, false),
+            };
+            let errors = match errors {
+                Some(errors) => errors.to_string(),
+                None if !user_set_encoding && locale_asks_for_surrogateescape() => {
+                    "surrogateescape".to_string()
+                }
+                None => "strict".to_string(),
+            };
+            (encoding.to_string(), errors)
+        })
+        .clone()
 }
 
 fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
@@ -3665,38 +3741,6 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
     )
 }
 
-fn stdio_stdin_readline(args: &[PyObjectRef]) -> crate::PyResult {
-    if args.len() > 1 {
-        return Err(crate::PyError::type_error(format!(
-            "readline() takes at most one argument ({} given)",
-            args.len()
-        )));
-    }
-    let sys = crate::importing::get_sys_module("sys")
-        .ok_or_else(|| crate::PyError::runtime_error("lost sys.stdin"))?;
-    let stdin = crate::baseobjspace::getattr_str(sys, "stdin")?;
-    let buffer = crate::baseobjspace::getattr_str(stdin, "buffer")?;
-    let bytes = crate::baseobjspace::call_method(buffer, "readline", args);
-    if bytes.is_null() {
-        return Err(crate::call::take_call_error()
-            .unwrap_or_else(|| crate::PyError::runtime_error("readline failed")));
-    }
-    if !unsafe { pyre_object::is_bytes(bytes) } {
-        return Err(crate::PyError::type_error(
-            "underlying readline() should have returned a bytes-like object",
-        ));
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(bytes);
-    let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let (encoding, errors) = live_stdio_encoding_errors("stdin", "strict");
-    crate::typedef::bytes_method_decode(&[
-        pyre_object::gc_roots::shadow_stack_get(bytes_slot),
-        w_str_new(&encoding),
-        w_str_new(&errors),
-    ])
-}
-
 /// `pylifecycle.c init_sys_streams` builds the standard streams after the
 /// import system, so a text codec is reachable by the time they need one.
 /// Pyre builds them from `sys` module creation instead, where the codec lookup
@@ -3716,6 +3760,22 @@ pub fn init_stream_codecs() -> Result<(), crate::PyError> {
         }
     }
     Ok(())
+}
+
+/// The version `GetVersionEx` reports, which the manifest the executable
+/// carries makes the running one rather than the one an unmanifested process is
+/// shimmed to.  `None` where the call fails, leaving the caller its own answer.
+#[cfg(windows)]
+fn version_ex_triple() -> Option<(u32, u32, u32)> {
+    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    (unsafe { GetVersionExW(&mut info) } != 0).then_some((
+        info.dwMajorVersion,
+        info.dwMinorVersion,
+        info.dwBuildNumber,
+    ))
 }
 
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
@@ -3926,13 +3986,6 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         })
     };
     crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
-    if fd == 0 {
-        crate::baseobjspace::setdictvalue_native(
-            stream,
-            "readline",
-            crate::make_builtin_function("readline", stdio_stdin_readline),
-        );
-    }
     crate::baseobjspace::setdictvalue_native(
         stream,
         "flush",

@@ -301,6 +301,11 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         pyre_object::w_int_new(rustpython_host_env::ctypes::SIZEOF_TIME_T as i64),
     );
 
+    // The callable `_CData.__reduce__` names.  It has to be reachable by name
+    // for a pickle of a ctypes value to load at all, since that is what the
+    // stream carries.
+    crate::module_ns_store(ns, "_unpickle", super::cdata::unpickle_function());
+
     // ── import-time constants ──
     crate::module_ns_store(ns, "__version__", pyre_object::w_str_new("1.1.0"));
     // `crates/vm/src/stdlib/_ctypes.rs`: CDECL=0x1, PYTHONAPI=0x4,

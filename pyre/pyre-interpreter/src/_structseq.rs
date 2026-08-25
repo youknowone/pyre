@@ -492,12 +492,12 @@ pub fn new_instance(cls: PyObjectRef, items: Vec<PyObjectRef>) -> PyObjectRef {
 }
 
 /// Allocate a structseq instance carrying both the positional tuple body
-/// (`items`) and named-only extras (`extras`).  The extras are written
-/// into the instance `__dict__` so the per-field getter can resolve them
-/// (`_structseq.py:31-37`); the owning type must have been built with a
-/// matching `extra_fields` list via [`make_struct_seq_with_extra`] (which
-/// sets `hasdict`).  `os.stat_result` uses this for the float time fields
-/// and the `st_*_ns` extras.
+/// (`items`) and named-only extras (`extras`).  Each extra is stored under
+/// its own name so the per-field getter can resolve it (`_structseq.py`
+/// extra-field arm); the owning type must have been built with a matching
+/// `extra_fields` list via [`make_struct_seq_with_extra`] (which sets
+/// `hasdict`).  `os.stat_result` uses this for the float time fields and the
+/// `st_*_ns` extras.
 pub fn new_instance_with_extra(
     cls: PyObjectRef,
     items: Vec<PyObjectRef>,
@@ -540,25 +540,26 @@ pub fn new_instance_with_extra(
             (*pyre_object::gc_roots::shadow_stack_get(obj_slot)).w_class = rooted_cls;
         }
     }
-    if !extras.is_empty() {
-        let w_dict = pyre_object::w_dict_new();
-        let _ = pyre_object::gc_roots::pin_root(w_dict);
-        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        for (index, (key, _)) in extras.iter().enumerate() {
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                    key,
-                    pyre_object::gc_roots::shadow_stack_get(extras_slot + index),
-                )
-            };
-        }
-        crate::baseobjspace::setdict(
+    // `build_stat_result` stores each named-only field with
+    // `w_result.setdictvalue(space, name, w_value)` and never builds a dict:
+    // its comment names that as the point -- "circumvent the huge mess of
+    // structseq_new and a dict argument and just build the object ourselves.
+    // then it stays nicely virtual". On a mapdict carrier each store is a map
+    // transition, and every later instance of the same structseq reuses the
+    // shape those transitions built. Assembling a dict and installing it
+    // instead materialises the `("dict", SPECIAL)` wrapper on the instance's
+    // map, which moves the whole instance to dict storage -- one hashed insert
+    // per extra on every allocation, for `os.stat_result` thirteen of them.
+    for (index, (key, _)) in extras.iter().enumerate() {
+        let stored = crate::baseobjspace::setdictvalue(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(extras_slot + index),
         )
-        .expect(
-            "structseq extras: setdict on a fresh hasdict tuple subclass with a fresh dict cannot fail",
+        .expect("structseq extras: a name store on a fresh tuple subclass cannot raise");
+        assert!(
+            stored,
+            "structseq extras: the owning type must carry a dict (make_struct_seq_with_extra)"
         );
     }
     pyre_object::gc_roots::shadow_stack_get(obj_slot)

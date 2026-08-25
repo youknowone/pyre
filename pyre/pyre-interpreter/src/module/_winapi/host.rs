@@ -28,7 +28,7 @@ fn win32_err_named(error: std::io::Error, w_name: PyObjectRef) -> crate::PyError
 /// How a call names a wide-string argument in the `TypeError` it raises for a
 /// non-`str`.  Most of them do not name it at all; the two path calls name it,
 /// and two more give its position.
-enum WideArg<'a> {
+pub(super) enum WideArg<'a> {
     Unnamed,
     Named {
         function: &'a str,
@@ -44,35 +44,50 @@ enum WideArg<'a> {
 ///
 /// The text goes to the host as spelled, unpaired surrogates included: these
 /// calls take UTF-16, and a lossy re-encode would name a different object.
-fn wide(w_text: PyObjectRef, argument: WideArg<'_>) -> Result<WideCString, crate::PyError> {
+pub(super) fn wide(
+    w_text: PyObjectRef,
+    argument: WideArg<'_>,
+) -> Result<WideCString, crate::PyError> {
     if !unsafe { pyre_object::is_str(w_text) } {
-        let got = crate::gateway::short_type_name(w_text);
-        return Err(crate::PyError::type_error(match argument {
-            WideArg::Unnamed => format!("argument must be str, not {got}"),
-            WideArg::Named { function, argument } => {
-                format!("{function}() argument '{argument}' must be str, not {got}")
-            }
-            WideArg::Numbered { function, position } => {
-                format!("{function}() argument {position} must be str, not {got}")
-            }
-        }));
+        return Err(wide_type_error(&argument, "str", w_text));
     }
-    WideCString::from_vec(wide_units(w_text))
-        .map_err(|_| crate::PyError::value_error("embedded null character"))
+    // `PyUnicode_AsWideCharString` refuses every NUL the text holds, the last
+    // character included; `WideCString::from_vec` would read that one as the
+    // terminator it appends itself and accept the string.
+    let units = wide_units(w_text);
+    if units.contains(&0) {
+        return Err(crate::PyError::value_error("embedded null character"));
+    }
+    WideCString::from_vec(units).map_err(|_| crate::PyError::value_error("embedded null character"))
 }
 
-/// [`wide`] where `None` names the Win32 default instead of a string.
-fn wide_or_none(w_text: PyObjectRef) -> Result<Option<WideCString>, crate::PyError> {
-    if unsafe { pyre_object::is_none(w_text) } {
+/// The `TypeError` a wide-string argument raises for a value it cannot take.
+fn wide_type_error(argument: &WideArg<'_>, accepted: &str, w_text: PyObjectRef) -> crate::PyError {
+    let got = crate::gateway::short_type_name(w_text);
+    crate::PyError::type_error(match argument {
+        WideArg::Unnamed => format!("argument must be {accepted}, not {got}"),
+        WideArg::Named { function, argument } => {
+            format!("{function}() argument '{argument}' must be {accepted}, not {got}")
+        }
+        WideArg::Numbered { function, position } => {
+            format!("{function}() argument {position} must be {accepted}, not {got}")
+        }
+    })
+}
+
+/// [`wide`] where `None` — or an argument that is not there at all — names the
+/// Win32 default instead of a string.
+pub(super) fn wide_or_none(
+    w_text: PyObjectRef,
+    argument: WideArg<'_>,
+) -> Result<Option<WideCString>, crate::PyError> {
+    if w_text.is_null() || unsafe { pyre_object::is_none(w_text) } {
         return Ok(None);
     }
     if !unsafe { pyre_object::is_str(w_text) } {
-        return Err(crate::PyError::type_error(format!(
-            "argument must be str or None, not {}",
-            crate::gateway::short_type_name(w_text)
-        )));
+        return Err(wide_type_error(&argument, "str or None", w_text));
     }
-    wide(w_text, WideArg::Unnamed).map(Some)
+    wide(w_text, argument).map(Some)
 }
 
 /// The UTF-16 units of a `str`, without a terminator.
@@ -288,7 +303,7 @@ pub fn CreateEventW(
             position: 1,
         },
     )?;
-    let name = wide_or_none(name)?;
+    let name = wide_or_none(name, WideArg::Unnamed)?;
     host_winapi::create_event_w(manual_reset != 0, initial_state != 0, name.as_deref())
         .map(w_handle)
         .map_err(super::win32_err)
@@ -351,7 +366,7 @@ pub fn CreateMutexW(
             position: 1,
         },
     )?;
-    let name = wide_or_none(name)?;
+    let name = wide_or_none(name, WideArg::Unnamed)?;
     host_winapi::create_mutex_w(initial_owner != 0, name.as_deref())
         .map(w_handle)
         .map_err(super::win32_err)

@@ -3465,6 +3465,11 @@ pub fn trace_and_compile_from_bridge(
         // the caller into `resume_in_blackhole` (pyjitpl.py:711).
         return BridgeResolution::ResumeBlackhole;
     };
+    // `MAJIT_MAX_BRIDGES` counts bridges actually attempted, so it is spent
+    // after the bails above rather than alongside `no_bridge_enabled`.
+    if !majit_metainterp::bridge_fuel_take() {
+        return BridgeResolution::ResumeBlackhole;
+    }
 
     let info = {
         let (_, info) = crate::eval::driver_pair();

@@ -466,7 +466,7 @@ macro_rules! py_class {
         $name:literal
         $(, methods: {
             $(
-                $(#[doc = $mdoc:literal])?
+                $(#[doc = $mdoc:literal] $(#[doc = $mdoc_cont:literal])*)?
                 fn $mname:ident ( $($margs:tt)* ) $(-> $mret:ty)? $mbody:block
             )*
         })?
@@ -499,7 +499,9 @@ macro_rules! py_class {
                                     stringify!($mname),
                                     $mname,
                                     ::core::option::Option::<&'static str>::None
-                                        $(.or(::core::option::Option::Some($mdoc)))?,
+                                        $(.or(::core::option::Option::Some(
+                                            ::core::concat!($mdoc $(, "\n", $mdoc_cont)*),
+                                        )))?,
                                 ),
                             ) };
                         }
@@ -1410,6 +1412,29 @@ pub fn stdio_newline(stream_name: &str) -> Option<&'static str> {
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, stream_name).ok())
         .and_then(crate::module::_io::W_TextIOWrapper::stdio_write_newline);
     stated.unwrap_or(platform_default)
+}
+
+/// Write already-encoded bytes through the print hook (if set) or stdout.
+///
+/// The bytes are what `sys.stdout`'s own encoder would have produced, which the
+/// native `print()` path stands in for only while that encoding is utf-8 --
+/// [`stdio_line_endings_bytes`] substitutes at the byte level, which no wider
+/// encoding survives. Only a string holding a surrogate reaches here: every
+/// other render is a `str` and takes [`print_output`].
+pub fn print_output_bytes(bytes: &[u8]) {
+    let bytes = stdio_line_endings_bytes(bytes, "stdout");
+    let bytes = bytes.as_ref();
+    if print_hook_emit_bytes(bytes) {
+        return;
+    }
+    #[cfg(all(unix, feature = "sandbox"))]
+    let _ = crate::host_seam::ops::write(1, bytes);
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().lock().write_all(bytes);
+    }
+    crate::host_seam::flush_stdout_when_unbuffered();
 }
 
 /// Write a string through the print hook (if set) or stdout.

@@ -3832,18 +3832,24 @@ fn print_sep_check(
     )))
 }
 
-/// Render `str(obj)` for writing to the (utf-8, strict) stdout stream.  The
-/// common all-UTF-8 result is returned directly; a lone surrogate is routed
-/// through `encode_object`'s strict handler, raising `UnicodeEncodeError`
-/// rather than panicking in `w_str_get_value`.
-unsafe fn print_render(obj: PyObjectRef) -> Result<String, crate::PyError> {
+/// Write `str(obj)` to the native stdout path under the stream's own error
+/// handler.
+///
+/// The common all-UTF-8 result goes out as it stands, which is what either
+/// handler produces for it.  A lone surrogate is routed through
+/// `encode_object` rather than panicking in `w_str_get_value`: `strict` raises
+/// `UnicodeEncodeError` there, and `surrogateescape` spells the escape as the
+/// byte it stands for, which is no longer a `str`.
+unsafe fn print_emit_native(obj: PyObjectRef, errors: &str) -> Result<(), crate::PyError> {
     let w = unsafe { crate::py_str_wtf8(obj)? };
     if let Ok(s) = w.as_str() {
-        return Ok(s.to_owned());
+        crate::print_output(s);
+        return Ok(());
     }
     let s_obj = pyre_object::w_str_from_wtf8(w);
-    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", "strict")?;
-    Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"))
+    let bytes = crate::type_methods::encode_object(s_obj, "utf-8", errors)?;
+    crate::print_output_bytes(&bytes);
+    Ok(())
 }
 
 /// A text stream's `encoding`/`errors` (defaults `utf-8`/`strict`), read so a
@@ -3866,11 +3872,14 @@ unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
 /// `app_io.py print_` map `file is None` to `sys.stdout`, so a Python-level
 /// `sys.stdout = ...` redirects `print()`.
 enum DefaultPrintTarget {
-    /// Unmodified default stdout (`sys.stdout is sys.__stdout__`): keep pyre's
-    /// native `print_output` path (its strict-utf-8 `print_render` render and
-    /// direct write), leaving default output and surrogate handling unchanged.
-    Native,
-    /// A rebound `sys.stdout`; write through its `write` / `flush` methods.
+    /// Unmodified default stdout (`sys.stdout is sys.__stdout__`) still
+    /// configured for a codec the native path renders: keep pyre's
+    /// `print_output` path (its `print_emit_native` render and direct write),
+    /// carrying the stream's own error handler for the surrogate case.
+    Native(&'static str),
+    /// A `sys.stdout` the native path cannot stand in for -- rebound, or the
+    /// default stream under a codec other than strict utf-8; write through its
+    /// `write` / `flush` methods.
     Rebound(PyObjectRef),
     /// `sys.stdout` is `None`; emit nothing (builtin_print returns `None`).
     Silent,
@@ -3878,14 +3887,16 @@ enum DefaultPrintTarget {
 
 /// Resolve `print()`'s default sink from the live `sys` module.
 ///
-/// Only a user redirect (`sys.stdout` rebound to some object other than the
-/// saved `sys.__stdout__`) is routed through Python `write` / `flush`; the
-/// unmodified default keeps the native path. A missing `sys.stdout` attribute
+/// A user redirect (`sys.stdout` rebound to some object other than the saved
+/// `sys.__stdout__`) is routed through Python `write` / `flush`, and so is a
+/// default stream whose codec is not the strict utf-8 the native path renders
+/// -- `PYTHONIOENCODING=cp424` makes `print(chr(0xa2))` a `b'J'` on the stream
+/// and a `b'Â¢'` on the native path. A missing `sys.stdout` attribute
 /// raises `RuntimeError("lost sys.stdout")` as builtin_print does.
 fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
     let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
         // No `sys` yet (very early bootstrap) — native path.
-        return Ok(DefaultPrintTarget::Native);
+        return Ok(DefaultPrintTarget::Native("strict"));
     };
     let stdout = match crate::baseobjspace::getattr_str(sys_mod, "stdout") {
         Ok(w) => w,
@@ -3899,8 +3910,9 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
     }
     if let Ok(orig) = crate::baseobjspace::getattr_str(sys_mod, "__stdout__")
         && std::ptr::eq(orig, stdout)
+        && let Some(errors) = crate::module::_io::W_TextIOWrapper::stdio_native_print_errors(stdout)
     {
-        return Ok(DefaultPrintTarget::Native);
+        return Ok(DefaultPrintTarget::Native(errors));
     }
     Ok(DefaultPrintTarget::Rebound(stdout))
 }
@@ -4118,11 +4130,13 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // With no explicit `file` (absent or `file=None`), the sink is the live
     // `sys.stdout`, resolved per call so a Python-level rebinding redirects
     // `print()`.  The unmodified default keeps the native path (`file = None`).
-    let file = match file {
-        Some(f) => Some(f),
+    // `native_errors` is read only on the native path, i.e. only where `file`
+    // came back `None`; an explicit `file=` never reaches it.
+    let (file, native_errors) = match file {
+        Some(f) => (Some(f), "strict"),
         None => match resolve_default_print_target()? {
-            DefaultPrintTarget::Native => None,
-            DefaultPrintTarget::Rebound(fp) => Some(fp),
+            DefaultPrintTarget::Native(errors) => (None, errors),
+            DefaultPrintTarget::Rebound(fp) => (Some(fp), "strict"),
             DefaultPrintTarget::Silent => return Ok(w_none()),
         },
     };
@@ -4151,9 +4165,7 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `print_render`.
     let emit = |source: PyObjectRef| -> Result<(), crate::PyError> {
         let Some(file_slot) = file_slot else {
-            let s = unsafe { print_render(source)? };
-            crate::print_output(&s);
-            return Ok(());
+            return unsafe { print_emit_native(source, native_errors) };
         };
         let s_obj = pyre_object::w_str_from_wtf8_managed(unsafe { crate::py_str_wtf8(source)? });
         // `s_obj` is a fresh managed str reachable only through this Rust local.
@@ -4264,9 +4276,8 @@ fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
     let part_slot = roots.base();
     let _ = roots.pin_root(part);
     match resolve_default_print_target()? {
-        DefaultPrintTarget::Native => {
-            let s = unsafe { print_render(roots.get(part_slot))? };
-            crate::print_output(&s);
+        DefaultPrintTarget::Native(errors) => {
+            unsafe { print_emit_native(roots.get(part_slot), errors)? };
         }
         DefaultPrintTarget::Rebound(fp) => {
             let r = crate::baseobjspace::call_method(fp, "write", &[roots.get(part_slot)]);
@@ -7208,9 +7219,10 @@ pub(crate) fn crt_errno() -> i32 {
 /// matches the libc constants the subclass table keys on; translate the common
 /// kinds to their POSIX errno through `ErrorKind` (which the standard library
 /// normalises per platform), the way `winerror_to_errno` fills `OSError.errno`
-/// alongside `.winerror`.  Unrecognised kinds keep the raw code, and an error
-/// carrying no OS code at all falls back to `default` (the errno each call site
-/// used before the translation existed).
+/// alongside `.winerror`.  A C runtime call reports its errno as the error's
+/// payload instead, which `posix_errno` reads.  Unrecognised kinds keep the raw
+/// code, and an error carrying no code of either kind falls back to `default`
+/// (the errno each call site used before the translation existed).
 pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
     #[cfg(windows)]
     {
@@ -7230,6 +7242,19 @@ pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
         };
         if let Some(errno) = mapped {
             return errno;
+        }
+        // A C runtime call carries its exact errno as the error's payload and
+        // leaves `raw_os_error()` empty (`io_error_from_errno`), so the
+        // fallback below would answer `default` for every one of them --
+        // `_wopen` refusing at the descriptor limit read back as the `open`
+        // call site's EACCES rather than as EMFILE.  Only a payload-carrying
+        // error is asked, since `posix_errno` answers EINVAL for an error that
+        // holds neither a payload nor a code.
+        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+        if e.raw_os_error().is_none() && e.get_ref().is_some() {
+            use rustpython_host_env::os::ErrorExt;
+
+            return e.posix_errno();
         }
     }
     e.raw_os_error().unwrap_or(default)
@@ -11940,18 +11965,32 @@ fn incompatible_string_prefix_error(
     ))
 }
 
-/// CPython 3.14 `Parser/string_parser.c:decode_unicode_with_escapes` sends
-/// non-raw Unicode literals through the `unicode_escape` decoder before the
-/// f-string parser interprets replacement fields.  Ruff instead diagnoses an
-/// incomplete `\N{...` as either its own escape error or an unclosed f-string
-/// field.  Recover the decoder-first error, including the byte range relative
-/// to the literal contents used by the codec error message.
-/// The message a malformed `\N` escape produces, with the byte offset of the
-/// literal that carries it.
+/// A string literal's escape-decode failure.
+struct EscapeError {
+    /// What the decoder would have said.
+    message: String,
+    /// Byte offset of the literal, its prefix included.  The caller needs it
+    /// because [`string_escape_error`] walks the whole source: the escape is
+    /// only what gets reported when nothing earlier in the file already
+    /// failed.
+    literal_start: usize,
+    /// Byte range the diagnostic points at.
+    span: (usize, usize),
+}
+
+/// The escape-decode failure a string literal in `source` carries, if any.
 ///
-/// The caller needs the offset because this walks the whole source: the escape
-/// is only what gets reported when nothing earlier in the file already failed.
-fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
+/// `decode_unicode_with_escapes` runs a non-raw literal through the
+/// `unicode_escape` decoder, and `decode_bytes_with_escapes` runs a bytes
+/// literal through its own, both before the parser interprets anything inside
+/// the literal.  The parser pyre delegates to reports every one of those
+/// failures as a single `Got unexpected unicode`, so the literal is re-scanned
+/// here to recover which escape failed and what the decoder would have said.
+///
+/// The positions the message carries are byte offsets into the literal's
+/// contents, spanning the backslash through the last character the decoder
+/// consumed.
+fn string_escape_error(source: &str) -> Option<EscapeError> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -11983,13 +12022,22 @@ fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
         if !prefix
             .iter()
             .all(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'f' | b'r' | b't' | b'u'))
-            || prefix
-                .iter()
-                .any(|byte| matches!(byte.to_ascii_lowercase(), b'b' | b'r'))
         {
             cursor += 1;
             continue;
         }
+        let has = |wanted: u8| {
+            prefix
+                .iter()
+                .any(|byte| byte.to_ascii_lowercase() == wanted)
+        };
+        // A raw literal keeps its backslashes, so no decoder runs over it.
+        if has(b'r') {
+            cursor += 1;
+            continue;
+        }
+        let bytes_literal = has(b'b');
+        let replacement_fields = has(b'f') || has(b't');
 
         let quote = bytes[quote_start];
         let triple = bytes[quote_start..].starts_with(&[quote, quote, quote]);
@@ -12010,39 +12058,154 @@ fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
             }
         }
 
-        let mut escape = content_start;
-        while escape < content_end {
-            if bytes[escape] != b'\\' {
-                escape += 1;
-                continue;
-            }
-            if bytes.get(escape + 1) != Some(&b'N') {
-                escape = (escape + 2).min(content_end);
-                continue;
-            }
-            let malformed_end = if bytes.get(escape + 2) != Some(&b'{') {
-                Some(escape + 1)
-            } else if bytes[escape + 3..content_end]
-                .iter()
-                .all(|byte| *byte != b'}')
-            {
-                Some(content_end.saturating_sub(1))
+        let token_end = (content_end + quote_len).min(bytes.len());
+        if let Some(message) = escape_decode_error(
+            &bytes[content_start..content_end],
+            bytes_literal,
+            replacement_fields,
+        ) {
+            // A literal that holds replacement fields is several tokens, and
+            // the one the report points at is the closing quote; a literal
+            // that is one token is pointed at whole.
+            let span = if replacement_fields {
+                (token_end.saturating_sub(quote_len), token_end)
             } else {
-                None
+                (token_start, token_end)
             };
-            if let Some(malformed_end) = malformed_end {
-                return Some((
-                    format!(
-                        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
-                        escape - content_start,
-                        malformed_end - content_start,
-                    ),
-                    token_start,
+            return Some(EscapeError {
+                message,
+                literal_start: token_start,
+                span,
+            });
+        }
+        cursor = token_end;
+    }
+    None
+}
+
+/// The decoder's complaint about a literal's `contents`.
+///
+/// A literal holding replacement fields reaches the decoder one piece at a
+/// time -- the run of text between two fields -- and the positions the message
+/// carries are relative to the piece the escape sits in.
+fn escape_decode_error(
+    contents: &[u8],
+    bytes_literal: bool,
+    replacement_fields: bool,
+) -> Option<String> {
+    /// `'unicodeescape' codec can't decode bytes in position ...`, whose range
+    /// runs from the backslash through the last character consumed.
+    fn unicode_error(start: usize, end: usize, reason: &str) -> String {
+        format!(
+            "(unicode error) 'unicodeescape' codec can't decode bytes in position {start}-{end}: {reason}"
+        )
+    }
+
+    let mut piece_start = 0;
+    let mut cursor = 0;
+    while cursor < contents.len() {
+        // A replacement field is not text the decoder ever sees, and the piece
+        // after it starts over at position 0.  A doubled brace is not one: it
+        // stays in the piece it is written in.
+        if replacement_fields && contents[cursor] == b'{' && contents.get(cursor + 1) != Some(&b'{')
+        {
+            let mut depth = 1usize;
+            cursor += 1;
+            while cursor < contents.len() && depth > 0 {
+                match contents[cursor] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            piece_start = cursor;
+            continue;
+        }
+        if contents[cursor] != b'\\' {
+            cursor += 1;
+            continue;
+        }
+        let Some(&kind) = contents.get(cursor + 1) else {
+            return None;
+        };
+        // `\N{...}` names a character; a bytes literal has no such escape.  The
+        // brace here belongs to the escape, which is why the field skip above
+        // runs only where no backslash precedes it.
+        if kind == b'N' && !bytes_literal {
+            if contents.get(cursor + 2) != Some(&b'{') {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    cursor + 1 - piece_start,
+                    r"malformed \N character escape",
                 ));
             }
-            escape += 2;
+            let Some(close) = contents[cursor + 3..].iter().position(|byte| *byte == b'}') else {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    contents.len().saturating_sub(1) - piece_start,
+                    r"malformed \N character escape",
+                ));
+            };
+            let close = cursor + 3 + close;
+            let name = std::str::from_utf8(&contents[cursor + 3..close]).ok();
+            if name
+                .and_then(rustpython_unicode::lookup_character)
+                .is_none()
+            {
+                return Some(unicode_error(
+                    cursor - piece_start,
+                    close - piece_start,
+                    "unknown Unicode character name",
+                ));
+            }
+            cursor = close + 1;
+            continue;
         }
-        cursor = content_end.saturating_add(quote_len);
+        // `\u` and `\U` are ordinary characters in a bytes literal too.
+        let (width, form) = match kind {
+            b'x' => (2, r"\xXX"),
+            b'u' if !bytes_literal => (4, r"\uXXXX"),
+            b'U' if !bytes_literal => (8, r"\UXXXXXXXX"),
+            _ => {
+                cursor += 2;
+                continue;
+            }
+        };
+        let digits_start = cursor + 2;
+        let digits = contents[digits_start.min(contents.len())..]
+            .iter()
+            .take(width)
+            .take_while(|byte| byte.is_ascii_hexdigit())
+            .count();
+        if digits < width {
+            // `decode_bytes_with_escapes` reports its own failure, and names
+            // only where the escape began.
+            return Some(if bytes_literal {
+                let position = cursor - piece_start;
+                format!(r"(value error) invalid \x escape at position {position}")
+            } else {
+                unicode_error(
+                    cursor - piece_start,
+                    digits_start + digits - 1 - piece_start,
+                    &format!("truncated {form} escape"),
+                )
+            });
+        }
+        let end = digits_start + width;
+        if kind == b'U'
+            && std::str::from_utf8(&contents[digits_start..end])
+                .ok()
+                .and_then(|text| u32::from_str_radix(text, 16).ok())
+                .is_none_or(|value| value > 0x10_FFFF)
+        {
+            return Some(unicode_error(
+                cursor - piece_start,
+                end - 1 - piece_start,
+                "illegal Unicode character",
+            ));
+        }
+        cursor = end;
     }
     None
 }
@@ -12331,20 +12494,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             );
         }
     }
-    if let Some((unicode_error, literal_start)) = malformed_unicode_name_escape(source) {
+    let escape_error = string_escape_error(source).filter(|escape| {
         // Both the decode and the parse are failures of the same compile, and
         // the one reported is whichever comes first in the source. A literal
         // that sits after the parser's own error keeps that error, so
         // `1 +\nx = "\N"\n` still reports the incomplete expression on line 1.
-        let parser_start = match &e {
+        match &e {
             crate::compile::CompileError::Parse(parse_error) => {
-                Some(parse_error.raw_location.start().to_usize())
+                parse_error.raw_location.start().to_usize() >= escape.literal_start
             }
-            _ => None,
-        };
-        if parser_start.is_none_or(|start| start >= literal_start) {
-            msg = unicode_error;
+            _ => true,
         }
+    });
+    if let Some(escape) = &escape_error {
+        msg = escape.message.clone();
     }
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
@@ -12423,7 +12586,14 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     }
     let prefix_span = prefix_error.map(|(_, start, end)| (start, end));
     let delimiter_span = delimiter_error.map(|(_, index)| (index, index));
-    let diagnostic_span = literal_span
+    // Only where the decoder's complaint is still the one being reported: a
+    // literal can carry both a bad escape and one of the errors above, and
+    // that one names its own span.
+    let escape_span = escape_error
+        .filter(|escape| escape.message == msg)
+        .map(|escape| escape.span);
+    let diagnostic_span = escape_span
+        .or(literal_span)
         .or(fstring_span)
         .or(scope_span)
         .or(generator_span)
@@ -19570,23 +19740,60 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unicode_name_escape_precedes_fstring_parsing() {
-        for (source, range) in [
-            (r"f'\N'", "0-1"),
-            (r"f'\N{'", "0-2"),
-            (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
+    fn string_escape_errors_precede_parsing() {
+        for (source, range, reason) in [
+            (r"f'\N'", "0-1", r"malformed \N character escape"),
+            (r"f'\N{'", "0-2", r"malformed \N character escape"),
+            (
+                r"'\N{GREEK CAPITAL LETTER DELTA'",
+                "0-28",
+                r"malformed \N character escape",
+            ),
+            (r"'\N{DELTA}'", "0-8", "unknown Unicode character name"),
+            (r"'\x'", "0-1", r"truncated \xXX escape"),
+            (r"'ab\x1'", "2-4", r"truncated \xXX escape"),
+            (r"'\u12'", "0-3", r"truncated \uXXXX escape"),
+            (r"'\U0001'", "0-5", r"truncated \UXXXXXXXX escape"),
+            (r"'\U00110000'", "0-9", "illegal Unicode character"),
         ] {
-            let (message, literal_start) = malformed_unicode_name_escape(source).unwrap();
-            assert!(message.contains(&format!("position {range}:")), "{message}");
-            assert!(message.ends_with(r"malformed \N character escape"));
-            assert_eq!(literal_start, 0);
+            let escape = string_escape_error(source).unwrap();
+            assert!(
+                escape
+                    .message
+                    .contains(&format!("position {range}: {reason}")),
+                "{}",
+                escape.message
+            );
+            assert_eq!(escape.literal_start, 0);
         }
-        assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
-        assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
-        assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+        // A bytes literal has its own decoder, and no `\N`/`\u`/`\U` escape.
+        let escape = string_escape_error(r"b'ab\x1'").unwrap();
+        assert_eq!(
+            escape.message,
+            r"(value error) invalid \x escape at position 2"
+        );
+        assert!(string_escape_error(r"b'\N'").is_none());
+        assert!(string_escape_error(r"b'\u12'").is_none());
+
+        assert!(string_escape_error(r"r'\N'").is_none());
+        assert!(string_escape_error(r"'\N{GREEK CAPITAL LETTER DELTA}'").is_none());
+        assert!(string_escape_error(r"'\x41'").is_none());
+        assert!(string_escape_error(r"'\\N'").is_none());
+        // The whole literal is what a report without replacement fields points
+        // at; one with them points at the escape.
+        assert_eq!(string_escape_error(r"'\x'").unwrap().span, (0, 4));
+        assert_eq!(string_escape_error(r"f'\x'").unwrap().span, (4, 5));
+        // Each piece between two replacement fields is decoded on its own, so
+        // the position starts over after every one.
+        assert!(
+            string_escape_error(r"f'{1}\x'")
+                .unwrap()
+                .message
+                .contains("position 0-1:")
+        );
         // The offset is what lets an earlier parse error keep the report.
         assert_eq!(
-            malformed_unicode_name_escape("1 +\nx = \"\\N\"\n").map(|(_, start)| start),
+            string_escape_error("1 +\nx = \"\\N\"\n").map(|escape| escape.literal_start),
             Some(8)
         );
     }

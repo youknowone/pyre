@@ -973,6 +973,54 @@ impl W_TextIOWrapper {
         Some(unsafe { &*(stream as *const Self) }.write_newline())
     }
 
+    /// The error handler the native `print()` path has to render with, for a
+    /// `stream` whose codec that path can spell at all.
+    ///
+    /// `print()` short-circuits the unmodified `sys.stdout` to `print_output`,
+    /// which writes utf-8 bytes straight to the descriptor, so the
+    /// short-circuit stands in for the stream's own `write` only while the
+    /// stream's codec is utf-8: under `PYTHONIOENCODING=cp424`,
+    /// `sys.stdout.write(chr(0xa2))` writes `b'J'` where the native path writes
+    /// `b'\xc2\xa2'`. Both handlers pyre's own standard streams take -- `strict`
+    /// and the `surrogateescape` a C/POSIX locale asks for -- are spelled by
+    /// `encode_object`, and they part company only for a string holding a
+    /// surrogate. `reconfigure` rewrites both fields, so this follows it.
+    ///
+    /// `None` for every other stream, including one this did not build: it
+    /// states no codec here, and the caller has to go through `write`.
+    pub fn stdio_native_print_errors(stream: PyObjectRef) -> Option<&'static str> {
+        if stream.is_null()
+            || !std::ptr::eq(
+                unsafe { pyre_object::ll_type(stream) },
+                <Self as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            )
+        {
+            return None;
+        }
+        let payload = unsafe { &*(stream as *const Self) };
+        let (Some(encoding), Some(errors)) = (
+            unsafe { pyre_object::w_str_get_value_opt(payload.w_encoding) },
+            unsafe { pyre_object::w_str_get_value_opt(payload.w_errors) },
+        ) else {
+            return None;
+        };
+        // `encodings.normalize_encoding` folds case and separators, so the
+        // aliases `utf8`, `utf-8` and `UTF_8` all name the same codec.
+        let normalized: String = encoding
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect();
+        if normalized != "utf8" {
+            return None;
+        }
+        match errors {
+            "strict" => Some("strict"),
+            "surrogateescape" => Some("surrogateescape"),
+            _ => None,
+        }
+    }
+
     /// Give a stream [`allocate_stdio`] built the encoder and decoder it had to
     /// go without.  Every read path needs the decoder: without it the stream
     /// reports itself unreadable however readable its buffer is, and only the

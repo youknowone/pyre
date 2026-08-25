@@ -181,8 +181,9 @@ pub use jitcode::{
 pub use jitdriver::{
     DeclarativeJitDriver, FlatEntryContract, JitDriver, JitDriverStaticData,
     MultiFrameBlackholeResult, PendingAbortBlackhole, SingleFrameBlackholeResult,
-    TraceContinuationSuspendGuard, current_state_field_fvc_epoch, drive_multi_frame_blackhole,
-    drive_single_frame_blackhole, no_bridge_enabled, trace_continuation_suspended,
+    TraceContinuationSuspendGuard, bridge_fuel_take, current_state_field_fvc_epoch,
+    drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled,
+    trace_continuation_suspended,
 };
 pub use majit_backend::CompiledTraceInfo;
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};

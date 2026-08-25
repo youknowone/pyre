@@ -247,6 +247,26 @@ xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5
 # this: `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
 debug = "line-tables-only"
 
+# The LLBC artefacts the `majit-translate` integration tests read are large --
+# `pyre-interpreter.ullbc` alone is around 800 MB of JSON -- and at the dev
+# profile's `opt-level = 0` the two passes `Llbc::from_slice` makes over those
+# bytes dominate the whole `cargo test` run: six of the 166 test binaries spend
+# 211s of its 268s of test time. Optimizing the three crates that do that work
+# leaves the tests themselves unoptimized, so a failing assertion still reports
+# from line-table debuginfo with `debug_assertions` on.
+#
+# Measured over the same 166 binaries: those six go 211s -> 42s and the whole
+# run 268s -> 97s. The compile side barely moves -- a clean `cargo build -p
+# majit-translate --tests` measured 92s at `opt-level = 0`, 87s at 1 and 104s
+# at 2, because the front end rather than codegen is what that crate spends its
+# build on.
+[profile.dev.package.serde_json]
+opt-level = 2
+[profile.dev.package.majit-charon-reader]
+opt-level = 2
+[profile.dev.package.majit-translate]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -77,6 +77,18 @@ jobs:
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    # Every expensive job in this workflow hangs off one of the three prepare
+    # jobs, so naming `cargo fmt --check` here is what holds a whole run behind
+    # a 33 s check. Waiting costs no runner-seconds of its own -- a queued job
+    # occupies no runner -- only the wall time fmt spends queued, which on a
+    # saturated pool is already the larger half of every job's latency.
+    #
+    # Measured over the 95 finished runs of 2026-08-24: `cargo fmt --check` was
+    # the first job to go red in 5 of the 20 failures, and those five runs spent
+    # 97751 runner-seconds after it had already failed, against 1545805 for the
+    # day. `cpyext ABI` is the other job cheap enough to gate on and is left
+    # ungated: it went red in none of the 95.
+    needs: cargo-fmt
     env: &charon-llbc-env
       # Redirect the shared charon/ullbc build dir INTO the workspace so
       # actions/cache can reach it. Locally PYRE_SHARED_BUILD is unset and
@@ -274,6 +286,33 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
+    # The two non-Linux platforms wait for the Linux `check.py` legs to pass.
+    # Measured over the 596 finished runs of 2026-08-19..24, which cost 9695645
+    # runner-seconds with 55.4% of them on macOS and Windows:
+    #
+    #   137 failure runs never reached a green Linux check.py, and their macOS
+    #       and Windows legs spent 1634383 runner-seconds re-proving it;
+    #   297 cancelled runs were superseded before Linux check.py finished --
+    #       the median cancelled run lives 2567 s and Linux check.py completes
+    #       at +5727 s -- and spent 1600008 runner-seconds on the two;
+    #   9 further cancelled runs got past a green Linux check.py, for 77635 s.
+    #
+    # 3312026 runner-seconds, 34.2% of the six days, on legs that either
+    # re-proved a failure Linux had already found or were thrown away.
+    #
+    # This defers a platform answer, it does not drop one: 31 of the 168
+    # failure runs had a green Linux check.py and 19 of those went red on a
+    # platform leg, so every one of them still runs. What a red Linux costs is
+    # the round trip -- the platform answer arrives on the push that turns
+    # Linux green rather than beside it. Restricting the two platforms to
+    # `main` instead saves more and does drop coverage: over the same window 10
+    # runs went red on macOS or Windows while Linux stayed green, 8 of them on
+    # a branch, and under that rule all 10 would have landed first.
+    #
+    # `cargo-fmt` is named as well as reached through `pyre-check-linux`, so
+    # the gate below survives that job's own dependencies being rearranged.
+    needs: [cargo-fmt, pyre-check-linux]
+    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -282,6 +321,9 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
+    # See prepare-charon-llbc-macos for the measurement behind the Linux gate.
+    needs: [cargo-fmt, pyre-check-linux]
+    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -290,10 +332,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    # Two cargo passes plus the release build and run of the CPython suite.
-    # The cap carries over from the suite's former job; the passes above it
-    # measured ~34 min together, so it bounds a hang without bounding the work.
-    timeout-minutes: 90
+    # Two cargo passes, one per backend. They measured ~27 min together, so
+    # the cap bounds a hang without bounding the work.
+    timeout-minutes: 60
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
@@ -305,15 +346,6 @@ jobs:
       with:
         persist-credentials: false
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-    - name: Set up CPython
-      # Only the Linux copy of this job runs the CPython suite, which needs an
-      # interpreter to drive its runner. The other two copies share these steps
-      # through the anchor, so the condition keeps the install off them.
-      id: cpython
-      if: runner.os == 'Linux'
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-      with:
-        python-version: "3.14"
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
@@ -417,12 +449,18 @@ jobs:
       # the format cannot silently turn every consumer into "not checked". It
       # is `#[ignore]`d because it spawns `python3`, which is why it is pinned
       # to Linux: `python3` is not a name that resolves on the windows runner.
-      # `prepass` is named because `--no-default-features` applies to the
-      # selected package: without it the build script writes placeholders and
-      # refuses outside an LLBC extraction.
+      # The test target is named under the same `--all` feature set as the
+      # two steps above so it reuses what they compiled: `-p pyre-jit-trace`
+      # resolves `pyre-interpreter` differently and rebuilt 61 crates, and
+      # `pyre-jit-trace` cannot name `cpyext` itself -- the feature belongs
+      # to `pyre-interpreter`. `prepass` need not be named either: the
+      # workspace selection enables it through `pyrex`, where naming it
+      # beside `-p pyre-jit-trace` was what kept the build script off its
+      # placeholder path. Measured locally, 139s and 281s for those two
+      # forms against 3s for this one, with 0 crates compiled.
       run: |
-        cargo test --no-default-features --features dynasm,prepass \
-          -p pyre-jit-trace --test llbc_fingerprint_format_test -- --ignored
+        cargo test --all --no-default-features --features dynasm,cpyext \
+          --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)
       shell: bash
@@ -457,46 +495,6 @@ jobs:
           --lib -- --ignored --test-threads=1 \
           compiler::tests::test_host_loop_external_jump_to
 
-    # The CPython suite rides this job's Linux copy rather than a job of its
-    # own: it needs the same checkout, toolchain, Cargo cache and prepared
-    # Charon/LLBC set, and those cost a job's worth of setup to assemble a
-    # second time. `!cancelled()` keeps the suite reporting even when a cargo
-    # pass above it fails — as separate jobs neither could hide the other, and
-    # a plain step order would.
-    - name: Build pyre-dynasm
-      if: ${{ !cancelled() && runner.os == 'Linux' }}
-      shell: bash
-      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
-    - name: Run pyre/extra_tests/pip (hermetic pip end-to-end)
-      # Drives the binary built above through venv, ensurepip, a wheel
-      # install, a PEP 517 build under real isolation, and an uninstall.
-      # Everything it resolves is a wheel already in the checkout, so it never
-      # reaches an index — and one of its checks asserts that, by requiring a
-      # plain `pip download` to fail.
-      #
-      # It rides this job's Linux copy for the same reason the suite below
-      # does: the release binary and the interpreter to drive it are already
-      # here. Ahead of the suite so its verdict lands early rather than after
-      # the suite's wall time, and `--dynasm-only` because the restored target
-      # directory can hold a `pyre-cranelift` this job never built.
-      if: ${{ !cancelled() && runner.os == 'Linux' }}
-      shell: bash
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/pip/run.py --dynasm-only
-    - name: Run CPython suite (gate regressions, JIT on)
-      # This is the only place CI runs the suite — `pyre/check.py` keeps the
-      # stage behind `--cpython-suite`, which no job passes, so its wall time is
-      # paid once. The runner gates against the shared baseline plus its own
-      # `baseline.linux-x86_64.json` overlay; `PLATFORM_GATED` only handles
-      # modules CPython skips wholesale on this host.
-      #
-      # The runner has 3 cores, so `--jobs 4` oversubscribes them and stretches
-      # the wall time of whichever module is running when the extra job lands.
-      # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
-      # and ~2m47s of wall time, which does not fit the former 120s limit.
-      if: ${{ !cancelled() && runner.os == 'Linux' }}
-      shell: bash
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
-
   cargo-test-macos:
     name: cargo test (macos-latest)
     runs-on: macos-latest
@@ -517,11 +515,113 @@ jobs:
       CHARON_VERSION: nightly-2026.05.29
     steps: *cargo-test-steps
 
-  pyre-check-linux:
-    name: pyre/check.py (ubuntu-24.04)
+  dispatcher-graph-linux:
+    name: dispatcher-graph acceptance (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
+    # `slow_generated_jitcodes_preserve_complete_dispatcher_graph` self-ignores
+    # under `debug_assertions`, so the `cargo test --all` job never runs it: it
+    # translates the full LLBC set, which is far too slow unoptimized. Left
+    # unrun it rots — its dispatcher arm counts drifted stale once and masked a
+    # live lowering defect.
+    #
+    # It rode the `pyre/check.py` job on the premise that check.py leaves a warm
+    # release profile behind. It does not: the test harness pulls dev
+    # dependencies that are outside pyrex's graph, so the step recompiles 66
+    # crates either way — 628s on the longest job in the workflow. The only
+    # thing it needs from the rest of CI is the extracted LLBC, which is an
+    # artifact download.
+    timeout-minutes: 45
+    env:
+      # See prepare-charon-llbc: downstream jobs download the prepared Charon
+      # artifact into this workspace path.
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+        shared-key: ${{ runner.arch }}
+        # Restore-only on PRs (they pull main's cache via restore-keys); save
+        # only on main so per-PR target caches don't multiply across refs past
+        # GitHub's 10 GB cache budget and trigger LRU eviction.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Download Charon artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: charon-${{ runner.os }}-${{ runner.arch }}
+        path: .pyre-build/charon
+    - name: Restore Charon executable permissions
+      shell: bash
+      run: chmod +x .pyre-build/charon/*/charon .pyre-build/charon/*/charon-driver
+    - name: Download LLBC artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: llbc-${{ runner.os }}-${{ runner.arch }}
+        path: build/llbc
+    - name: Verify prepared Charon/LLBC
+      shell: bash
+      run: |
+        test -d .pyre-build/charon
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          test -s "build/llbc/${crate}.ullbc"
+          # The sidecar carries the artefact's own file table, which is what
+          # `source=` hashes. Without it the fingerprint falls back to the whole
+          # cargo closure and every consumer reports LLBC STALE, so fail here
+          # where the cause is still visible.
+          test -s "build/llbc/${crate}.ullbc.readfiles"
+        done
+    - name: Run release-only dispatcher-graph acceptance test
+      run: |
+        cargo test --release -p majit-translate \
+          --test test_make_jitcodes_produces_graph_keyed_output
+
+  pyre-check-linux:
+    name: pyre/check.py ${{ matrix.label }} (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    needs: prepare-charon-llbc-linux
+    if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
+    # The dynasm leg carries the pip end-to-end and the CPython suite as well,
+    # and measured 48 min without them against the 11 min they take. The cap
+    # comes from the job they used to be, and still bounds a hang rather than
+    # the work.
+    timeout-minutes: 90
+    strategy: &pyre-check-backends
+      # Linux runs one job per backend; macOS and Windows run both backends in
+      # one job. `check.py` builds each backend's release binary itself, and
+      # splitting the two builds across jobs only pays off where the second
+      # build is cheap. Runner-seconds spent on check.py, one backend per job
+      # (run 32657938846) against both in one (run 32647581403):
+      # ubuntu 3990s vs 4243s, windows 5449s vs 4170s, macos 3704s vs 3136s.
+      # Only Linux comes out ahead: on the other two the second job pays for a
+      # full release build over a target directory the first job never warmed,
+      # and that costs more than the two backends cost in sequence. Collapsing
+      # the two back into one job on macOS and Windows is worth 1847 runner-
+      # seconds a run against the 253 the Linux split saves.
+      # Re-measured on run 32712894722, where both collapsed jobs are green.
+      # Windows confirms it at 3957s against the 5449s it split into. macOS read
+      # 4089s and confirms nothing either way: `cargo test (macos-latest)`, which
+      # nothing here touches, went 1516s to 2757s across the same pair of runs,
+      # so that runner was about 1.8x slower and the two macOS figures are not
+      # comparable. The mechanism is the same on all three -- the split builds
+      # the shared release workspace twice and the collapsed job builds it once
+      # -- and macOS has the slowest build of the three.
+      # `fail-fast: false` because one backend going red says nothing about the
+      # other, and cancelling it would hide a second failure.
+      fail-fast: false
+      matrix:
+        include:
+        - backend: dynasm
+          label: dynasm
+          only: --dynasm-only
+        - backend: cranelift
+          label: cranelift
+          only: --cranelift-only
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.
@@ -603,8 +703,10 @@ jobs:
       # `&pyre-check-steps`, which the macOS and Windows legs alias, so it is
       # copied into all three jobs; the census resolves charon per platform and
       # has no Windows mapping, and would hard-fail that leg ungated. Running
-      # once is also sufficient — the property is platform-independent.
-      if: runner.os == 'Linux'
+      # once is also sufficient — the property is platform-independent, and
+      # so is the LLBC it reads, so it rides the dynasm leg of the backend
+      # matrix instead of running once per backend.
+      if: runner.os == 'Linux' && matrix.backend == 'dynasm'
       shell: bash
       run: python3 pyre/scripts/vable-projection-census.py build/llbc/pyre-object.ullbc build/llbc/pyre-interpreter.ullbc build/llbc/pyre-jit.ullbc
     - name: Add wasm32 target (Linux only)
@@ -612,20 +714,29 @@ jobs:
       # installed, so this is what makes the Linux leg build and run the wasm
       # backend too. wasm output is platform-independent, so exercising it on
       # one OS is enough — macOS/Windows keep no wasm32 target and stay on the
-      # native backends.
-      if: runner.os == 'Linux'
+      # native backends. It rides the dynasm leg of the backend matrix
+      # because the wasm codegen tests below compare a bench run on wasm
+      # against the same bench run on dynasm.
+      if: runner.os == 'Linux' && matrix.backend == 'dynasm'
       run: rustup target add wasm32-unknown-unknown
     - name: Run pyre/check.py
+      # Naming the backend is what makes the matrix legs disjoint: left to
+      # its default each leg runs every backend it finds a target for. The
+      # Linux dynasm leg carries wasm too, because it is the leg that
+      # installed the wasm32 target and the one whose release `pyre-dynasm`
+      # the wasm codegen tests below need.
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py
+      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }}
     - name: Run pyre/extra_tests/parity_tests
       # Every script must exit 0 and print "OK" as its last line under CPython
       # AND under each pyre backend, so a divergence from CPython observable
-      # semantics fails here. check.py has just built the release pyre-dynasm
-      # and pyre-cranelift binaries the runner drives, so this costs only the
-      # per-script process spawns.
+      # semantics fails here. check.py has just built this leg's release
+      # binary, so this costs only the per-script process spawns. The `-only`
+      # flag is what holds the leg to that binary: the runner drives whatever
+      # it finds in `target/release`, and a restored Cargo cache can hold the
+      # other backend's binary from a build this job never ran.
       #
       # Run it even when check.py above failed. The two gates answer different
       # questions and check.py is the one that goes red on a jitstats drift
@@ -637,7 +748,7 @@ jobs:
       if: ${{ !cancelled() }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py ${{ matrix.only }}
     - name: Run pyre/extra_tests/snippets (gated subset)
       # The snippet corpus is mostly imported from RustPython and is not all
       # green, so only the scripts declaring `# pyre-check: gate=1` run here —
@@ -651,7 +762,7 @@ jobs:
       if: ${{ !cancelled() }}
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only ${{ matrix.only }}
     - name: Run the vendored root extra_tests
       # PyPy's own `extra_tests/` tree, run in place through a driver that
       # supplies the pytest names those files use. Only `run.py`'s ENABLED list
@@ -660,7 +771,7 @@ jobs:
       # the runner exits 0 saying so.
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/upstream/run.py ${{ matrix.only }}
     - name: JIT structural stats vs committed baseline (Linux, informational)
       # Diff each benchmark's [jit-stats] counters against the committed
       # pyre/bench/<name>.<backend>.jitstats baselines. The counters are decided
@@ -692,16 +803,14 @@ jobs:
         set -uo pipefail
         {
           echo '### JIT structural stats vs committed baseline'
-          for backend in dynasm cranelift; do
-            echo "#### $backend"
-            echo '```'
-            out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
-              --backend "$backend" --no-build --no-synthetic \
-              --snapshot-diff 2>&1 || true)
-            echo "$out" | grep -Ei 'jit-stats diff|snapshot diff' \
-              || echo '(no jit-stats output)'
-            echo '```'
-          done
+          echo '#### ${{ matrix.backend }}'
+          echo '```'
+          out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
+            --backend '${{ matrix.backend }}' --no-build --no-synthetic \
+            --snapshot-diff 2>&1 || true)
+          echo "$out" | grep -Ei 'jit-stats diff|snapshot diff' \
+            || echo '(no jit-stats output)'
+          echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Run wasm runtime codegen regression tests (Linux only)
       # majit-backend-wasm/tests/codegen_test.rs holds six #[ignore]d runtime
@@ -722,35 +831,88 @@ jobs:
       # previously left a runner here exiting non-zero having written nothing
       # at all, in a different test each time; run_runtime_program now names
       # the signal when a child dies on one.
-      if: runner.os == 'Linux'
+      #
+      # The dynasm leg of the backend matrix is the one holding both halves:
+      # it is where check.py builds wasm alongside the native backend.
+      if: runner.os == 'Linux' && matrix.backend == 'dynasm'
       run: cargo test -p majit-backend-wasm --test codegen_test -- --ignored
-    - name: Run release-only dispatcher-graph acceptance test (Linux only)
-      # `slow_generated_jitcodes_preserve_complete_dispatcher_graph` self-ignores
-      # under `debug_assertions`, so the `cargo test --all` job never runs it: it
-      # translates the full LLBC set, which is far too slow unoptimized. This job
-      # has both halves it needs — the downloaded build/llbc/*.ullbc and a warm
-      # release profile from check.py — so run it here. Left unrun it rots: its
-      # dispatcher arm counts drifted stale and masked a live lowering defect.
-      if: runner.os == 'Linux'
-      run: |
-        cargo test --release -p majit-translate \
-          --test test_make_jitcodes_produces_graph_keyed_output
+    - name: Run pyre/extra_tests/pip (hermetic pip end-to-end, Linux only)
+      # Drives the release `pyre-dynasm` through venv, ensurepip, a wheel
+      # install, a PEP 517 build under real isolation, and an uninstall.
+      # Everything it resolves is a wheel already in the checkout, so it never
+      # reaches an index -- and one of its checks asserts that, by requiring a
+      # plain `pip download` to fail.
+      #
+      # This and the suite below had a job of their own, which opened by
+      # running `cargo build --release -p pyrex --bin pyre-dynasm
+      # --no-default-features --features dynasm` -- the identical command
+      # `check.py` runs here, 894s in each of the two jobs. The dynasm leg of
+      # this matrix is the one place in the workflow where that binary already
+      # exists. It is also the longest Linux job, so appending 11 minutes to it
+      # is the whole cost: the run is bounded by `cargo test (windows-latest)`
+      # at 4153s against this leg's 3490s.
+      #
+      # `--dynasm-only` because a restored target directory can hold a
+      # `pyre-cranelift` this leg never built. Ahead of the suite so its verdict
+      # lands early rather than after the suite's wall time.
+      if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
+      shell: bash
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/pip/run.py --dynasm-only
+    - name: Run CPython suite (gate regressions, JIT on, Linux only)
+      # This is the only place CI runs the suite -- `pyre/check.py` keeps the
+      # stage behind `--cpython-suite`, which no job passes, so its wall time is
+      # paid once. The runner gates against the shared baseline plus its own
+      # `baseline.linux-x86_64.json` overlay; `PLATFORM_GATED` only handles
+      # modules CPython skips wholesale on this host.
+      #
+      # The runner has 3 cores, so `--jobs 4` oversubscribes them and stretches
+      # the wall time of whichever module is running when the extra job lands.
+      # `--timeout` is per module: `test.test_asyncio` alone takes ~117s of CPU
+      # and ~2m47s of wall time, which does not fit the former 120s limit.
+      #
+      # Last, as the longest step here, so every other verdict in this job lands
+      # before it. It reports whatever check.py and the pip run above did; the
+      # one case it cannot report on is check.py failing to build the binary,
+      # where it goes red naming the same cause a second time.
+      if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
+      shell: bash
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
 
   pyre-check-macos:
-    name: pyre/check.py (macos-latest)
+    name: pyre/check.py ${{ matrix.label }} (macos-latest)
     runs-on: macos-latest
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
+    strategy:
+      # Both backends in one job rather than one job each: see the runner-second
+      # measurements on `&pyre-check-backends`. The single entry keeps
+      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
+      # steps, and the steps that name one backend are gated on Linux anyway.
+      matrix:
+        include:
+        - backend: dynasm,cranelift
+          label: dynasm+cranelift
+          only: ""
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
     steps: *pyre-check-steps
 
   pyre-check-windows:
-    name: pyre/check.py (windows-latest)
+    name: pyre/check.py ${{ matrix.label }} (windows-latest)
     runs-on: windows-latest
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
+    strategy:
+      # Both backends in one job rather than one job each: see the runner-second
+      # measurements on `&pyre-check-backends`. The single entry keeps
+      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
+      # steps, and the steps that name one backend are gated on Linux anyway.
+      matrix:
+        include:
+        - backend: dynasm,cranelift
+          label: dynasm+cranelift
+          only: ""
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
