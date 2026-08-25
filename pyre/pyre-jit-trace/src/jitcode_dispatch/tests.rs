@@ -13045,6 +13045,7 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
     let wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
+        inline_poison_pcs: None,
         fbw_mode: test_fbw_mode(),
         session: &session,
         registers_r: &mut regs_r,
