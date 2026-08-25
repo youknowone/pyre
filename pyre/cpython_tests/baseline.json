@@ -106,7 +106,7 @@
       "dynasm": "PASS"
     },
     "test.test_buffer": {
-      "cranelift": "PASS",
+      "cranelift": "FAIL",
       "dynasm": "FAIL"
     },
     "test.test_bufio": {

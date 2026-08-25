@@ -4848,9 +4848,8 @@ fn slot_delattro(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRe
 /// `PyObject_GetAttr` and `PyObject_SetAttr` raise before the call.
 fn legacy_attribute_name(name: PyObjectRef) -> Result<std::ffi::CString, crate::PyError> {
     let text = crate::baseobjspace::text_w(name)?;
-    std::ffi::CString::new(text).map_err(|_| {
-        crate::PyError::value_error("attribute name must not contain null characters")
-    })
+    std::ffi::CString::new(text)
+        .map_err(|_| crate::PyError::value_error("attribute name must not contain null characters"))
 }
 
 fn slot_getattr(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

@@ -412,7 +412,10 @@ fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
         Err(_) => format!("PyInit_{}", name.rsplit('.').next().unwrap_or(name)),
     };
     extension_import_error(
-        format!("function {symbol} not found in library '{}'", path.display()),
+        format!(
+            "function {symbol} not found in library '{}'",
+            path.display()
+        ),
         name,
         path,
     )
