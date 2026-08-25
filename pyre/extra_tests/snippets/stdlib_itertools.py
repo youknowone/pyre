@@ -1,4 +1,5 @@
 import itertools
+import pickle
 
 from testutils import assert_raises
 
@@ -61,6 +62,15 @@ with assert_raises(TypeError):
     next(x)
 with assert_raises(StopIteration):
     next(x)
+
+# Python 3.14 deliberately omits PyPy's historical chain pickle state
+# methods.  The inherited object reducer rejects this native iterator, and no
+# instance-only fallback may make __setstate__ appear outside the TypeDef.
+x = chain([1], [2])
+with assert_raises(TypeError):
+    pickle.dumps(x)
+with assert_raises(AttributeError):
+    x.__setstate__
 
 # itertools.count tests
 
@@ -142,6 +152,44 @@ with assert_raises(TypeError):
 
 with assert_raises(TypeError):
     itertools.cycle(10)
+
+# Same 3.14 TypeDef decision as chain: cycle is not picklable and exposes no
+# __setstate__, even after iteration has populated its saved-value buffer.
+r = itertools.cycle([1, 2])
+assert next(r) == 1
+with assert_raises(TypeError):
+    pickle.dumps(r)
+with assert_raises(AttributeError):
+    r.__setstate__
+
+# None of the 3.14 itertools native layouts supplies enough state to the
+# inherited object reducer.  Constructors which have an explicit TypeDef
+# reducer are handled before this path; every remaining common family must be
+# rejected here instead of producing a superficially valid empty __newobj__.
+unpickleable_native_iterators = [
+    itertools.accumulate([1]),
+    itertools.combinations([1], 1),
+    itertools.combinations_with_replacement([1], 1),
+    itertools.compress([1], [1]),
+    itertools.count(),
+    itertools.dropwhile(bool, [1]),
+    itertools.filterfalse(bool, [1]),
+    itertools.groupby([1]),
+    itertools.islice([1], 1),
+    itertools.pairwise([1]),
+    itertools.permutations([1]),
+    itertools.product([1]),
+    itertools.repeat(1, 1),
+    itertools.starmap(lambda: 1, [()]),
+    itertools.takewhile(bool, [1]),
+    itertools.tee([1])[0],
+    itertools.zip_longest([1]),
+]
+for native_iterator in unpickleable_native_iterators:
+    with assert_raises(TypeError):
+        native_iterator.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+    with assert_raises(TypeError):
+        pickle.dumps(native_iterator)
 
 # itertools.repeat tests
 
