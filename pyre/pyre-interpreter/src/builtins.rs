@@ -975,18 +975,29 @@ fn memoryview_pack_value(
 }
 
 /// Element-value list of a 1-D view (format-aware per `value_from_bytes`).
-unsafe fn memoryview_values(mv: PyObjectRef) -> Vec<PyObjectRef> {
+/// Each element is pinned as built and read back inside the scope
+/// `w_list_new` runs in, so neither a later element's allocation nor the
+/// list's own can strand an earlier one (`build_list_storage`).
+unsafe fn memoryview_value_list(mv: PyObjectRef) -> PyObjectRef {
     unsafe {
         let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
         let data = memoryview_gather_bytes(mv);
-        let mut items = Vec::new();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        let mut count = 0;
         let mut base = 0;
         while itemsize > 0 && base + itemsize <= data.len() {
-            items.push(memoryview_unpack_element(fmt, &data, base, itemsize));
+            let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                fmt, &data, base, itemsize,
+            ));
             base += itemsize;
+            count += 1;
         }
-        items
+        let items = (0..count)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(sp + i))
+            .collect();
+        w_list_new(items)
     }
 }
 
@@ -1453,7 +1464,7 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         memoryview_check_released(mv)?;
         memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
-        crate::baseobjspace::iter(w_list_new(memoryview_values(mv)))
+        crate::baseobjspace::iter(memoryview_value_list(mv))
     }
 }
 
@@ -1600,27 +1611,25 @@ unsafe fn memoryview_tolist_rec(
             .get(idim as usize)
             .copied()
             .unwrap_or(0);
-        let mut items = Vec::with_capacity(dimshape.max(0) as usize);
+        // Every element is pinned as built, the sublists included, and read
+        // back inside the scope `w_list_new` runs in (`build_list_storage`).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        let mut count = 0;
         let mut pos = start;
-        if idim == ndim - 1 {
-            for _ in 0..dimshape {
-                items.push(memoryview_unpack_element(fmt, full, pos as usize, isz));
-                pos += dimstride;
-            }
-        } else {
-            for _ in 0..dimshape {
-                items.push(memoryview_tolist_rec(
-                    mv,
-                    fmt,
-                    full,
-                    isz,
-                    ndim,
-                    idim + 1,
-                    pos,
-                ));
-                pos += dimstride;
-            }
+        for _ in 0..dimshape {
+            let element = if idim == ndim - 1 {
+                memoryview_unpack_element(fmt, full, pos as usize, isz)
+            } else {
+                memoryview_tolist_rec(mv, fmt, full, isz, ndim, idim + 1, pos)
+            };
+            let _ = pyre_object::gc_roots::pin_root(element);
+            pos += dimstride;
+            count += 1;
         }
+        let items = (0..count)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(sp + i))
+            .collect();
         w_list_new(items)
     }
 }
@@ -1635,7 +1644,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if ndim == 1 {
-            return Ok(w_list_new(memoryview_values(mv)));
+            return Ok(memoryview_value_list(mv));
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
