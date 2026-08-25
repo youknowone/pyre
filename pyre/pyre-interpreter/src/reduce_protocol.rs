@@ -418,8 +418,30 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
                 &pyre_object::INSTANCE_TYPE as *const pyre_object::PyType,
             )
         };
+        // `object_getstate` hands the call to an overriding `__getstate__`
+        // and only falls through to `object_getstate_default(required)` when
+        // the type still uses `object.__getstate__`; `descr__reduce_ex__`
+        // spells the same gate as a `space.lookup` of the hook.  A native
+        // layout that publishes its own hook is rebuilt from the state that
+        // hook returns, so the refusal below must not see it: `_io.BytesIO`
+        // and `_io.StringIO` hold a native buffer and pickle for exactly this
+        // reason.  `getnewargs` above can collect, so the type is read back
+        // rather than reused.
+        let w_type = crate::typedef::r#type(current_obj())
+            .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
+        let supplies_getstate = unsafe {
+            let w_cls_getstate =
+                crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__getstate__");
+            let w_obj_getstate =
+                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__getstate__");
+            match (w_cls_getstate, w_obj_getstate) {
+                (Some(w_cls), Some(w_obj)) => !crate::baseobjspace::is_w(w_cls, w_obj),
+                (w_cls, _) => w_cls.is_some(),
+            }
+        };
         if !hasargs
             && native_layout
+            && !supplies_getstate
             && !unsafe { pyre_object::is_list(current_obj()) }
             && !unsafe { pyre_object::is_dict(current_obj()) }
         {
