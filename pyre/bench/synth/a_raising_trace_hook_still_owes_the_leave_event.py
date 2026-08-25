@@ -17,11 +17,23 @@
 #
 # Both arms are exact and both are checked, because they fail separately -- the
 # first drops the leave event from a path that never ran the body, the second
-# from a path that did.  cpython 3.14.6 and pypy3 agree on both.
+# from a path that did.
+#
+# The ARGUMENT is checked too, and it is a second defect: `w_exitvalue` is
+# `execute_frame`'s own local, so it holds whatever the body returned and keeps
+# holding it across a `return_trace` that raises.  Reading it back off the
+# bracket's result word instead hands the leave hook `None`, which is what the
+# failure -- not the body -- produced.  cpython 3.14.6 and pypy3 disagree here
+# and pypy3 is the reference: on the `return` arm it reports the loop's value,
+# cpython reports None.
 import sys
 
 WARM = 20000  # past the loop threshold (1039) many times over
-EXPECTED = {'call': ['return'], 'return': ['call', 'return']}
+TAIL = 100  # `hot` returns this, and the leave hook is owed it by name
+EXPECTED = {
+    'call': [('return', None)],
+    'return': [('call', None), ('return', TAIL)],
+}
 
 
 def hot(n):
@@ -36,7 +48,7 @@ def run(raise_at):
 
     def profiler(frame, event, arg):
         if frame.f_code.co_name == 'hot':
-            seen.append(event)
+            seen.append((event, arg))
 
     def tracer(frame, event, arg):
         if event == raise_at and frame.f_code.co_name == 'hot':
@@ -52,7 +64,7 @@ def run(raise_at):
     sys.settrace(tracer)
     raised = None
     try:
-        hot(100)
+        hot(TAIL)
     except RuntimeError as exc:
         raised = str(exc)
     finally:
@@ -70,8 +82,8 @@ def main():
         if seen != expected:
             failures.append(
                 '%s: profile events for the loop frame were %r, expected %r — a '
-                'hook that raised took the leave event down with it'
-                % (where, seen, expected)
+                'hook that raised took the leave event, or the value the body '
+                'returned, down with it' % (where, seen, expected)
             )
     if failures:
         for line in failures:

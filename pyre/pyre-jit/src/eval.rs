@@ -8538,17 +8538,27 @@ fn eval_with_jit_inner(
         // No execution context is no hook to owe, and no `leave` either.
         return portal_body(&mut frame_root);
     }
+    // `w_exitvalue` is `execute_frame`'s own local, not a re-read of the result
+    // word: it opens as the `None` the bracket opened with, takes the body's
+    // value if the body produced one, and KEEPS that value across a
+    // `return_trace` that raises — so the leave hook is handed what the body
+    // returned rather than the `None` a failed hook would otherwise imply.
+    // Same shape, and the same assign-only-what-came-back-live rule, as
+    // `eval::eval_frame_plain_with_resume`.
+    let mut w_exitvalue = w_none();
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
             let result = portal_body(&mut frame_root);
-            let w_exitvalue = match &result {
-                Ok(value) => *value,
-                Err(_) => w_none(),
-            };
+            if let Ok(value) = &result {
+                w_exitvalue = *value;
+            }
             match unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) } {
                 Err(err) => Err(err),
-                Ok(live) => result.map(|_| live),
+                Ok(live) => {
+                    w_exitvalue = live;
+                    result.map(|_| live)
+                }
             }
         }
     };
@@ -8557,10 +8567,6 @@ fn eval_with_jit_inner(
     // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
     // this arm never reaches `leave`: the declining paths above return through
     // `execute_frame_plain`, which does, and these two do not.
-    let w_exitvalue = match &outer_result {
-        Ok(value) => *value,
-        Err(_) => w_none(),
-    };
     let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
     outer_result.map(|_| live)
 }
