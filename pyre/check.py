@@ -1020,6 +1020,12 @@ def _first_stderr_line(stderr):
     return f"  {reason}"
 
 
+# Characters of a Rust panic's message body to keep. Wide enough for the
+# collector's longest `GC BUG` diagnostic, whose trailing fields are the ones
+# that attribute a crash nobody can reproduce on demand.
+PANIC_BODY_CHARS = 2000
+
+
 def _jit_panic_reason(stderr):
     """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
     nonzero internal_compile_panics stat, else None.
@@ -1051,11 +1057,14 @@ def _jit_panic_reason(stderr):
                 # crash with no way to attribute it. At 400 the two
                 # `invalid type_id` diagnostics, which reach about 800
                 # characters once their eight-word holder and child dumps are
-                # in, are cut inside the first dump.
+                # in, are cut inside the first dump, and at 1200 the major
+                # collector's own is cut at `site=` — dropping both
+                # generations, the remembered-set membership and the enclosing
+                # container.
                 for follow in lines[idx + 1 :]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:1200]}"
+                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
                         break
                 return reason
         return "rust panic"

@@ -194,6 +194,13 @@ STATS_STDERR_INCOMPATIBLE = {
 
 # ── classification ───────────────────────────────────────────────────
 
+# The collector's `GC BUG` panics carry the holder and child words, both
+# generations, the remembered-set membership and the enclosing container after
+# the `site=` field. At 200 characters every one of them is cut, which leaves a
+# rare crash unattributable from the run it appeared in.
+PANIC_BODY_CHARS = 2000
+
+
 def jit_panic_reason(stderr: str) -> str | None:
     """A JIT-level rust panic or nonzero internal_compile_panics, else None.
 
@@ -217,7 +224,7 @@ def jit_panic_reason(stderr: str) -> str | None:
                 for follow in lines[idx + 1:]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:1200]}"
+                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
                         break
                 return reason
         return "rust panic"
