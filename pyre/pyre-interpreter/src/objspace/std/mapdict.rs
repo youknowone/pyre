@@ -1146,12 +1146,90 @@ impl MapNode {
         }
     }
 
+    /// `mapdict.py AbstractAttribute.repr` and concrete overrides.
+    ///
+    /// The result stays WTF-8 because attribute names may contain lone
+    /// surrogates.  PyPy builds the same recursive spelling from the live map
+    /// chain for `__pypy__.strategy(instance)`.
+    pub unsafe fn repr_wtf8(&self) -> rustpython_wtf8::Wtf8Buf {
+        match self {
+            MapNode::Terminator(t) => {
+                let class_name = match t.kind {
+                    TerminatorKind::Dict => "DictTerminator",
+                    TerminatorKind::NoDict => "NoDictTerminator",
+                    TerminatorKind::Devolved => "DevolvedDictTerminator",
+                };
+                let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!(
+                    "<{class_name} w_cls=<W_TypeObject '"
+                ));
+                if !t.w_cls.is_null() && unsafe { pyre_object::is_type(t.w_cls) } {
+                    out.push_str(unsafe { pyre_object::w_type_get_name(t.w_cls) });
+                } else {
+                    out.push_str("?");
+                }
+                out.push_str("'>>");
+                out
+            }
+            MapNode::Plain(p) => {
+                let mut out = rustpython_wtf8::Wtf8Buf::new();
+                if let Some(unboxed) = &p.unboxed {
+                    out.push_str("<UnboxedPlainAttribute ");
+                    out.push_wtf8(&p.name);
+                    out.push_str(&format!(
+                        " {} {} {}{} ",
+                        attrkind_name(p.attrkind),
+                        p.storageindex,
+                        unboxed.listindex,
+                        if p.ever_mutated.get() {
+                            ""
+                        } else {
+                            " immutable"
+                        },
+                    ));
+                } else {
+                    out.push_str("<PlainAttribute ");
+                    out.push_wtf8(&p.name);
+                    out.push_str(&format!(
+                        " {} {}{} ",
+                        attrkind_name(p.attrkind),
+                        p.storageindex,
+                        if p.ever_mutated.get() {
+                            ""
+                        } else {
+                            " immutable"
+                        },
+                    ));
+                }
+                out.push_wtf8(&unsafe { (*p.back).repr_wtf8() });
+                out.push_str(">");
+                out
+            }
+        }
+    }
+
     /// mapdict.py `AbstractAttribute.cache_attrs`.
     pub fn cache_attrs(&self) -> &Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
         match self {
             MapNode::Terminator(t) => &t.cache_attrs,
             MapNode::Plain(p) => &p.cache_attrs,
         }
+    }
+}
+
+/// `interp_magic.py strategy` fallback — return the live map's recursive
+/// representation for an object carrying `MapdictStorageMixin`.
+///
+/// # Safety
+/// `obj` must be null or a live Python object.
+pub unsafe fn mapdict_strategy_repr(obj: PyObjectRef) -> Option<rustpython_wtf8::Wtf8Buf> {
+    if !unsafe { has_mapdict_layout(obj) } {
+        return None;
+    }
+    let map = unsafe { mapdict_carrier(obj) }._get_mapdict_map();
+    if map.is_null() {
+        None
+    } else {
+        Some(unsafe { (*map).repr_wtf8() })
     }
 }
 
@@ -6057,6 +6135,18 @@ mod tests {
             assert_eq!((*a).terminator(), term);
             assert_eq!((*b).terminator(), term);
             assert_eq!((*b).as_plain().back, a);
+        }
+    }
+
+    #[test]
+    fn map_repr_follows_recursive_pypy_strategy_spelling() {
+        unsafe {
+            let (_, _, b) = build_chain();
+            let repr = (*b).repr_wtf8();
+            assert_eq!(
+                repr.as_bytes(),
+                b"<PlainAttribute b DICT 1 immutable <PlainAttribute a DICT 0 immutable <DictTerminator w_cls=<W_TypeObject '?'>>>>"
+            );
         }
     }
 

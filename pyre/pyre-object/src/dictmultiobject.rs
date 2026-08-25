@@ -2037,6 +2037,38 @@ pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
     d.dstrategy as *const DictStrategyRef as usize
 }
 
+/// `interp_magic.py strategy` — concrete dict strategy class name.
+///
+/// Module dictionaries currently retain their per-dict
+/// `ModuleDictStrategy` allocation after promotion, so consult the live
+/// storage mode before the trait object.  This reports the same strategy
+/// transition PyPy exposes while the remaining single-`dstorage` structural
+/// refactor is carried out.
+///
+/// # Safety
+/// `obj` must point to a live `W_DictObject` or `W_ModuleDictObject`.
+pub unsafe fn w_dict_strategy_name(obj: PyObjectRef) -> &'static str {
+    if is_module_dict(obj) {
+        return if w_module_dict_is_object_strategy(obj) {
+            "ObjectDictStrategy"
+        } else {
+            "ModuleDictStrategy"
+        };
+    }
+    match w_dict_get_strategy(obj).strategy_kind() {
+        StrategyKind::Empty => "EmptyDictStrategy",
+        StrategyKind::EmptyKwargs => "EmptyKwargsDictStrategy",
+        StrategyKind::Object => "ObjectDictStrategy",
+        StrategyKind::Bytes => "BytesDictStrategy",
+        StrategyKind::Unicode => "UnicodeDictStrategy",
+        StrategyKind::Int => "IntDictStrategy",
+        StrategyKind::Identity => "IdentityDictStrategy",
+        StrategyKind::Kwargs => "KwargsDictStrategy",
+        StrategyKind::Module => "ModuleDictStrategy",
+        StrategyKind::Map => "MapDictStrategy",
+    }
+}
+
 /// Key-set mutation state captured by dict iterators.
 ///
 /// PyPy's `BaseIteratorImplementation` owns a live iterator over the
@@ -7666,6 +7698,22 @@ mod tests {
     fn install_test_hash_hook() {
         crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
         crate::dict_eq_hook::register_hash_str_hook(builtin_structural_str_hash);
+    }
+
+    #[test]
+    fn strategy_class_name_tracks_regular_and_module_transitions() {
+        install_test_hash_hook();
+        let dict = w_dict_new();
+        let module = w_module_dict_new();
+        unsafe {
+            assert_eq!(w_dict_strategy_name(dict), "EmptyDictStrategy");
+            w_dict_setitem(dict, 1, crate::w_none());
+            assert_eq!(w_dict_strategy_name(dict), "IntDictStrategy");
+
+            assert_eq!(w_dict_strategy_name(module), "ModuleDictStrategy");
+            w_dict_setitem(module, 1, crate::w_none());
+            assert_eq!(w_dict_strategy_name(module), "ObjectDictStrategy");
+        }
     }
 
     #[test]

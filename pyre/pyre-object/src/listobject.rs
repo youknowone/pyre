@@ -95,6 +95,22 @@ pub enum ListStrategy {
     IntOrFloat = 4,
 }
 
+impl ListStrategy {
+    /// `interp_magic.py strategy` reads the concrete strategy class name.
+    /// Keep the spelling beside the representation discriminant so adding a
+    /// PyPy list strategy cannot silently leave the diagnostic surface stale.
+    #[inline]
+    pub const fn class_name(self) -> &'static str {
+        match self {
+            Self::Object => "ObjectListStrategy",
+            Self::Integer => "IntegerListStrategy",
+            Self::Float => "FloatListStrategy",
+            Self::Empty => "EmptyListStrategy",
+            Self::IntOrFloat => "IntOrFloatListStrategy",
+        }
+    }
+}
+
 /// Python list object.
 ///
 /// Layout matches upstream `rpython/rtyper/lltypesystem/rlist.py:116`
@@ -473,6 +489,15 @@ impl W_ListObject {
         self.items = std::ptr::null_mut();
         self.length = 0;
     }
+}
+
+/// `interp_magic.py strategy` — concrete list strategy class name.
+///
+/// # Safety
+/// `obj` must point to a live `W_ListObject`.
+#[inline]
+pub unsafe fn w_list_strategy_name(obj: PyObjectRef) -> &'static str {
+    unsafe { (*(obj as *const W_ListObject)).strategy.class_name() }
 }
 
 /// Grow the Object-strategy backing of `obj` to hold at least one more
@@ -3027,6 +3052,18 @@ pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::intobject::w_int_new;
+
+    #[test]
+    fn strategy_class_names_follow_interp_magic_spellings() {
+        assert_eq!(ListStrategy::Empty.class_name(), "EmptyListStrategy");
+        assert_eq!(ListStrategy::Object.class_name(), "ObjectListStrategy");
+        assert_eq!(ListStrategy::Integer.class_name(), "IntegerListStrategy");
+        assert_eq!(ListStrategy::Float.class_name(), "FloatListStrategy");
+        assert_eq!(
+            ListStrategy::IntOrFloat.class_name(),
+            "IntOrFloatListStrategy"
+        );
+    }
 
     #[test]
     fn test_list_create_and_access() {
