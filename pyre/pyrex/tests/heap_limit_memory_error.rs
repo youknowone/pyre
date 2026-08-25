@@ -16,34 +16,33 @@
 //! unit test can assert the raise, and both can pass while nothing joins them.
 //!
 //! What is asserted, and what is deliberately not. The middle rung's promise is
-//! that the limit *becomes a Python exception the program can act on*; it is
-//! not a promise that the program survives one. After the first breach the live
-//! set is by definition at the limit, so a handler that allocates before it
-//! frees can reach the rung below — upstream says as much where it raises, and
-//! aborts on the second arrival for exactly that reason. Whether any particular
-//! handler fits in the remaining headroom is a question about collection
-//! scheduling, not about the raise, and it is not stable enough to gate.
+//! that the limit *becomes a Python exception*; it is not a promise that the
+//! program survives one. After the first breach the live set is by definition
+//! at the limit, so anything the program does next can reach the rung below —
+//! upstream says as much where it raises, and aborts on the second arrival for
+//! exactly that reason. So the exception itself is the observable, and nothing
+//! downstream of it is: no `except` clause, no marker the program prints, no
+//! particular exit status.
 //!
-//! The interpreter's own traceback printer is such a handler, which is why the
-//! scripts below carry an `except MemoryError` and report through it rather
-//! than leaving the exception to unwind and be printed. `eprint_exception`
-//! renders the whole report into a buffer and writes nothing until it is
-//! complete, and for a `-c` program the filename is `<string>`, so
-//! `read_registered_source_line` fetches each frame's line by calling
-//! app-level `linecache` — a nested dispatch loop whose first safepoint drives
-//! `do_collect_oldgen_nonmoving`, a whole major cycle, over a heap the breach
-//! left at its limit. The abort unwinds out of the half-built buffer and stderr
-//! receives nothing at all. Measured: the same program read from a file prints
-//! its traceback (the filesystem branch runs no Python), and a `-c` run of it
-//! prints nothing — while both raise, deliver and reach the top-level handler
-//! identically.
+//! That rules out running the program as `-c`, and the reason is worth
+//! recording because two CI rounds were spent on it. The exception reaches the
+//! interpreter's own traceback printer, which is a handler like any other:
+//! `eprint_exception` renders the whole report into a buffer and writes nothing
+//! until it is complete. For a `-c` program the filename is `<string>`, so
+//! `frame_source_line` falls past its filesystem branch into
+//! `read_registered_source_line`, which calls app-level `linecache` — a nested
+//! dispatch loop whose first safepoint drives a whole major cycle over a heap
+//! the breach left at its limit. The abort unwinds out of the half-built buffer
+//! and stderr receives nothing at all. Read from a real file the same program
+//! prints its report, because `read_source_line` answers from the filesystem
+//! and no Python runs between the raise and the write. Measured on both, while
+//! both raise, deliver, and reach the printer identically.
 //!
-//! Freeing the live set before reporting is not enough either, and that cost a
-//! CI round to learn: dropping it only makes it collectable, and an in-flight
-//! cycle that already marked it sweeps nothing, so the completion still breaches
-//! and the abort still discards a `print` that a pipe had block buffered. The
-//! only report that cannot be lost is one that writes nothing and allocates
-//! nothing — the exit status, via `os._exit`.
+//! An `except MemoryError` in the program is no better, and that is what the
+//! second round established: `os._exit` is about as small as a handler gets,
+//! and it still lost the race on two of three hosts, because the exception
+//! object's own allocation re-arms the collection request and the next
+//! safepoint breaches again before the handler's first call returns.
 //!
 //! `--heapsize` rather than `PYPY_GC_MAX` because it also covers the launcher
 //! plumbing (`take_heapsize_option` -> `gc_set_max_heap_size`), which the env
@@ -59,6 +58,7 @@
 // to nothing in that configuration instead.
 #![cfg(feature = "dynasm")]
 
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 /// The dynasm-backend `pyre` binary cargo built for this test.
@@ -88,28 +88,15 @@ const ROUNDS_LARGE: usize = 2_000;
 /// Keeps every object reachable, so the live set really does grow — a dead one
 /// would be reclaimed and the limit never reached.
 ///
-/// The handler reports by exiting, and `os._exit` rather than a `print` or a
-/// `raise`, because every other way of reporting is itself an allocation on a
-/// heap that is still at its limit. A `print` reaches a pipe, so it is block
-/// buffered and the buffer is discarded if anything later aborts; dropping the
-/// live set first does not help, because the in-flight cycle may already have
-/// marked it and so sweeps nothing. `os._exit` writes nothing, allocates
-/// nothing beyond the call, and skips finalization, which is precisely the
-/// "quit cleanly" the rung exists to offer. The status is the evidence.
+/// Nothing catches the `MemoryError`: the traceback the runtime prints for it
+/// is the report, and it is written by the runtime before any further Python
+/// runs. See the module docs for why a handler cannot be relied on here.
 const GROW: &str = "\
-import os
 data = []
-try:
-    for _ in range(ROUNDS):
-        data.append([0] * WORDS)
-except MemoryError:
-    os._exit(CAUGHT)
+for _ in range(ROUNDS):
+    data.append([0] * WORDS)
 print('completed')
 ";
-
-/// The exit status the handler reports with. Distinct from anything the
-/// runtime itself exits with, so a bounded arm cannot pass by dying.
-const CAUGHT: i32 = 17;
 
 /// [`run_shape`] at the small shape, which is what every arm but the
 /// large-object one wants.
@@ -117,18 +104,29 @@ fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
     run_shape(env, args, ROUNDS, WORDS)
 }
 
-/// Run [`GROW`] at the given shape, as `-c` source, and collect the child's
-/// output. `env` and `args` select the dispatch loop and the heap limit.
+/// Run [`GROW`] at the given shape and collect the child's output. `env` and
+/// `args` select the dispatch loop and the heap limit.
+///
+/// The program is written to a file and named by path rather than passed with
+/// `-c`, because a `<string>` filename sends the traceback printer through
+/// app-level `linecache` — see the module docs. `CARGO_TARGET_TMPDIR` is
+/// Cargo's own scratch directory for integration tests, and each call takes a
+/// fresh name: the arms run concurrently and several share a shape, so a
+/// shared name would let one arm read a file another is still writing.
 fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -> Output {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     let src = GROW
         .replace("ROUNDS", &rounds.to_string())
-        .replace("WORDS", &words.to_string())
-        .replace("CAUGHT", &CAUGHT.to_string());
-    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    argv.push("-c".to_string());
-    argv.push(src);
+        .replace("WORDS", &words.to_string());
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    path.push(format!("heap_limit_{rounds}_{words}_{serial}.py"));
+    std::fs::write(&path, &src).expect("write the program under test");
+
     let mut cmd = Command::new(PYRE);
-    cmd.args(&argv);
+    cmd.args(args);
+    cmd.arg(&path);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -153,7 +151,8 @@ fn report(what: &str, out: &Output) -> String {
 }
 
 /// Assert a `--heapsize` arm reached the middle rung: the loop did not finish,
-/// and the handler ran.
+/// and the limit was reported as a Python exception rather than only as the
+/// fatal rung below it.
 fn assert_caught(what: &str, out: &Output) {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("completed"),
@@ -163,9 +162,13 @@ fn assert_caught(what: &str, out: &Output) {
             out
         )
     );
-    assert_eq!(
-        out.status.code(),
-        Some(CAUGHT),
+    // `MemoryError` and not merely `Traceback`: the fatal rung below prints
+    // `using too much memory, aborting`, and a run that reaches only that one
+    // has skipped the rung this test is about. The two can both appear — the
+    // report is written first, and whatever the process does afterwards on a
+    // heap still at its limit is not this test's business.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("MemoryError"),
         "{}",
         report(
             &format!("{what}: the limit never became a Python exception"),
@@ -190,8 +193,8 @@ fn the_same_program_completes_when_the_heap_is_unbounded() {
 
 /// The middle rung, on the JIT dispatch loop (the default).
 ///
-/// Reaching the handler is the whole point: before the breach was routed to a
-/// dispatch loop, this run's only sign of the limit was
+/// Reaching it is the whole point: before the breach was routed to a dispatch
+/// loop, this run's only sign of the limit was
 /// `out_of_memory("using too much memory, aborting")` on the *second* breach,
 /// with the rung that names a Python exception skipped entirely.
 #[test]
