@@ -7684,7 +7684,30 @@ impl<'a> Lowering<'a> {
                         // same array — which is what lets the width travel.
                         // A thin-pointer element stays unnamed: it is the one
                         // shape the identity-less mint already sizes right.
-                        element_scalar.as_deref().map(|elem| format!("[{elem}]"))
+                        //
+                        // The element spelling is the authority wherever it
+                        // resolves, so only one name reaches the cache key for
+                        // a given element.  Where it does not resolve, an
+                        // int-banked receiver can still say what it holds:
+                        // `arraydescrof_concrete`'s identity-less arm has no
+                        // element name to hand `get_type_flag` and banks every
+                        // non-`Ref` element at 8 bytes, so a narrow int read
+                        // through such a receiver would stride past its
+                        // neighbours.
+                        element_scalar
+                            .as_deref()
+                            .map(|elem| format!("[{elem}]"))
+                            .or_else(|| {
+                                if !matches!(
+                                    item_ty,
+                                    ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                                ) {
+                                    return None;
+                                }
+                                first_arg_ty
+                                    .as_ref()
+                                    .and_then(|ty| narrow_item_array_type_id(ty, self.llbc))
+                            })
                     };
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
@@ -18765,6 +18788,42 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
     }
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()));
     (Some(identity), nolength)
+}
+
+/// ARRAY identity for a scalar element read whose element is an integer
+/// narrower than the 8 bytes the identity-less descr arm assumes.
+///
+/// `ValueType` banks `u8` / `u16` / `u32` / `bool` together with the
+/// word-wide integers as one width-less `Unsigned`, so an `ArrayRead` that
+/// carries no identity reaches `arraydescrof_concrete`'s third arm and
+/// strides every int-banked element by 8.  `get_type_flag` already returns
+/// the real width, but it is keyed on the element spelling and that arm has
+/// none — recovering the spelling from the receiver is what routes the read
+/// onto it.  Same identity role as [`array_projection_metadata`], reached
+/// from a `Index::index` callsite instead of a `ProjectionElem::Index`.
+///
+/// Declines unless the spelling round-trips:
+///
+/// * `nolength_from_array_type_id` must read `false` on it, agreeing with
+///   the `nolength: false` the callers stamp.  `get_array_descr` answers a
+///   cache hit with the descr the first mint built and drops the later
+///   `base_size`/`nolength`, so an identity shared with a header-less mint
+///   would hand one of the two the other's base.
+/// * `get_type_flag` must bank the named element as an integer narrower
+///   than 8 bytes.  Everything else — pointers, floats, structs, `String`,
+///   and the unknown-name fallback — keeps `None` and the third arm, whose
+///   answer is already right for them or whose element is a multi-word
+///   aggregate no `getarrayitem` can load.
+fn narrow_item_array_type_id(receiver: &TyRef, llbc: &Llbc) -> Option<String> {
+    let identity = tyref_to_ast_string(receiver, llbc);
+    if identity.starts_with("??")
+        || crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()))
+    {
+        return None;
+    }
+    let elem = crate::codewriter::call::extract_element_type_from_str(&identity)?;
+    let (_, item_type, item_size) = crate::codewriter::call::get_type_flag(&elem);
+    (item_type == majit_ir::value::Type::Int && item_size < 8).then_some(identity)
 }
 
 /// Recursive worker for [`tyref_to_ast_string`] operating on a raw
