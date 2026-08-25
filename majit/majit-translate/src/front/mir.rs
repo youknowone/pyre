@@ -2212,7 +2212,8 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
 }
 
 /// The MIR locals that can be a fresh string-builder accumulator: the
-/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` CALL
+/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` /
+/// `from_string` CALL
 /// terminator in the accumulator range `(arg_count+1..n_locals)`.
 ///
 /// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
@@ -2232,7 +2233,7 @@ fn builder_ctor_dest_locals<'a>(
             && (arg_count + 1..n_locals).contains(&(i as usize))
             && matches!(
                 wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity")
+                Some("new") | Some("with_capacity") | Some("from_string")
             )
         {
             Some(i as usize)
@@ -2652,6 +2653,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         let mut fmt_collapsed = collapse_fmt_chains(&mut lo.graph);
+        // The bytearray repr's sole non-default format is `\\x{c:02x}`.
+        // PyPy spells it as two nibble lookups in a constant hex table; lower
+        // the proven-u8 Rust fmt shell to that same source-level shape.
+        fmt_collapsed += collapse_lower_hex_byte_fmt_chains(&mut lo.graph);
         // Constant `format!("literal")` — a zero-placeholder format charon has
         // already folded to the fully-rendered constant string, so the format
         // op's argument is a bare `__str_const` with no pieces/args chain.
@@ -3104,7 +3109,7 @@ struct Lowering<'a> {
     binop_result_locals: std::collections::HashSet<usize>,
     /// Whether this function contains a builder-form accumulator. The canonical
     /// lowering sets it directly from [`graph_has_builder_accumulator`]; ctor /
-    /// append / terminal-`move` sites then emit the
+    /// append / terminal-materialisation sites then emit the
     /// `__majit_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
     /// `newstringbuilder` / `append` / `build`) instead of a parallel
     /// `ll_strconcat` graph. Whether a given local *is* such an
@@ -3513,7 +3518,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Switch this lowering to builder form so the ctor / append /
-    /// terminal-`move` sites of a builder-mode accumulator
+    /// terminal materialisation sites of a builder-mode accumulator
     /// ([`is_builder_mode_accumulator`]) emit the `StringBuilder` markers
     /// instead of `ll_strconcat`. The canonical frontend selects this before
     /// lowering whenever [`graph_has_builder_accumulator`] succeeds.
@@ -5600,8 +5605,9 @@ impl<'a> Lowering<'a> {
             Operand::Copy(place) => self.resolve_place(mir_bb, place),
             Operand::Move(place) => {
                 // A `move c` of a builder-mode accumulator is its single
-                // `ll_build` materialisation point (`accumulator_move_site_count
-                // == 1`).  Emit the `__majit_stringbuilder_build` marker
+                // `ll_build` materialisation point
+                // (`accumulator_materialization_site_count == 1`). Emit the
+                // `__majit_stringbuilder_build` marker
                 // (`flowspace_adapter` → getattr("build") + simple_call →
                 // `SomeString`) instead of moving the concat accumulator out.
                 // Only a bare `Local(c)` move qualifies; a projection falls
@@ -6977,7 +6983,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// Fold a `NamedConst` global whose initializer builds a fixed-size
-    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`)
+    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`),
+    /// or borrows that literal (`HEX: &[u8; N] = b"..."`),
     /// into the synthetic prebuilt-constant-array define-op the adapter
     /// re-folds to `Constant(list)`
     /// (`flowspace_adapter.rs::is_const_int_array_define`).  A
@@ -6987,13 +6994,21 @@ impl<'a> Lowering<'a> {
     /// literals here lets that read resolve against a constant base
     /// instead of a residual accessor `Call` no registry can bind.
     ///
-    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape: a single
-    /// `Array` aggregate assigned to `_0` whose operands are all integer
-    /// literals, over linear `Goto`s to a `Return`.  Anything richer
-    /// (computed elements, non-integer items, a `Repeat` fill, a second
-    /// `_0` write) returns `None` and keeps the residual accessor path;
-    /// so does a foreign const whose init body Charon left opaque (no
-    /// readable body to bake).
+    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape, or the
+    /// borrow spelling Charon emits for a byte string:
+    ///
+    /// ```text
+    /// _array = [c0, c1, …]
+    /// _borrow = &_array
+    /// _0 = move _borrow
+    /// return
+    /// ```
+    ///
+    /// The array operands must all be integer literals and control flow may
+    /// contain only linear `Goto`s to a `Return`.  Anything richer (computed
+    /// elements, non-integer items, a `Repeat` fill, an extra assignment)
+    /// returns `None` and keeps the residual accessor path; so does a foreign
+    /// const whose init body Charon left opaque (no readable body to bake).
     fn fold_named_const_int_array_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -7006,20 +7021,23 @@ impl<'a> Lowering<'a> {
         }
         let init_id = gd.rest.get("init")?.as_u64()?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
-        let mut items: Option<Vec<i64>> = None;
+        let mut array: Option<(u64, Vec<i64>)> = None;
+        let mut borrow: Option<(u64, u64)> = None;
+        let mut return_alias: Option<u64> = None;
         for block in &body.body {
             for stmt in &block.statements {
                 match stmt.stmt_kind() {
                     Ok(StmtKind::StorageLive(_))
                     | Ok(StmtKind::StorageDead(_))
                     | Ok(StmtKind::PlaceMention(_)) => {}
-                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
-                        if matches!(place.kind, PlaceKind::Local(0)) =>
-                    {
+                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands))) => {
                         // Only a fixed-size `Array` aggregate of integer
                         // literals; a `Repeat` fill or an Adt aggregate is
-                        // out of scope, as is a second `_0`-defining assign.
-                        if aggregate_ctor_name(&kind) != "Array" || items.is_some() {
+                        // out of scope, as is a second array definition.
+                        let PlaceKind::Local(dst) = place.kind else {
+                            return None;
+                        };
+                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -7033,11 +7051,34 @@ impl<'a> Lowering<'a> {
                             };
                             vals.push(n);
                         }
-                        items = Some(vals);
+                        array = Some((dst, vals));
                     }
-                    // Any other statement (a write to a temporary or a
-                    // richer `_0` definition) means the array is computed,
-                    // not a literal aggregate.
+                    Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) => {
+                        let (PlaceKind::Local(dst), PlaceKind::Local(source)) =
+                            (place.kind, source.kind)
+                        else {
+                            return None;
+                        };
+                        if borrow.replace((dst, source)).is_some() {
+                            return None;
+                        }
+                    }
+                    Ok(StmtKind::Assign(place, Rvalue::Use(operand)))
+                        if matches!(place.kind, PlaceKind::Local(0)) =>
+                    {
+                        let source = match operand {
+                            Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                                PlaceKind::Local(source) => source,
+                                _ => return None,
+                            },
+                            Operand::Const(_) => return None,
+                        };
+                        if return_alias.replace(source).is_some() {
+                            return None;
+                        }
+                    }
+                    // Any other statement means the array is computed, or
+                    // the borrow escapes through a shape we cannot prove.
                     _ => return None,
                 }
             }
@@ -7046,7 +7087,15 @@ impl<'a> Lowering<'a> {
                 _ => return None,
             }
         }
-        let items = items?;
+        let (array_local, items) = array?;
+        match (borrow, return_alias) {
+            // Direct fixed-size array constant: `_0 = [..]`.
+            (None, None) if array_local == 0 => {}
+            // Borrowed byte-string constant: `_borrow = &_array; _0 = _borrow`.
+            (Some((borrow_local, borrowed_local)), Some(returned_local))
+                if borrowed_local == array_local && returned_local == borrow_local => {}
+            _ => return None,
+        }
         // The annotator infers the list's element type from the baked
         // literals, so an empty array carries no element type; leave it
         // to the residual path.
@@ -8261,7 +8310,8 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Builder-mode ctor. In the canonical builder-form lowering, the
-                // single `Wtf8Buf`/`String` `new`/`with_capacity` def of a
+                // single `Wtf8Buf`/`String` `new`/`with_capacity`/`from_string`
+                // def of a
                 // builder-mode accumulator (its dest local, proven single-def
                 // by that ctor in [`is_fresh_str_builder`]) mints the
                 // `StringBuilder` once via the `__majit_stringbuilder_new`
@@ -8278,6 +8328,7 @@ impl<'a> Lowering<'a> {
                 // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py) —
                 // no arg selects `ll_new(INIT_SIZE)`, the size arg threads
                 // `ll_new(n)`.
+                let builder_ctor_leaf = str_builder_ctor_leaf(self.llbc, &reg);
                 if self.builder_mode
                     && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
                 {
@@ -8292,19 +8343,44 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
                             },
-                            args,
+                            args: if builder_ctor_leaf == Some("with_capacity") {
+                                args.clone()
+                            } else {
+                                Vec::new()
+                            },
                             result_ty: ValueType::Ref(None),
                         },
                     });
+                    // `Wtf8Buf::from_string(initial)` is the Rust ownership
+                    // spelling of an RPython builder followed by its first
+                    // append.  Keep the initial value as an append operand;
+                    // passing it to `new` would misread it as the optional
+                    // integer capacity argument.
+                    if builder_ctor_leaf == Some("from_string") {
+                        let void = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(void),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__majit_stringbuilder_append".to_string()],
+                                },
+                                args: vec![res.clone(), args[0].clone()],
+                                result_ty: ValueType::Void,
+                            },
+                        });
+                    }
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Wtf8Buf` / `String`::push_str(&mut buf, s) / push_wtf8(&mut
-                // buf, w) — and the argument-swapped `Wtf8Piece::push_onto(&s,
-                // &mut buf)` — an accumulator append.  A `Wtf8Buf` / `String`
+                // `String::push(&mut buf, ch)`, `Wtf8Buf` /
+                // `String`::push_str(&mut buf, s), or push_wtf8(&mut buf, w) —
+                // and the argument-swapped `Wtf8Piece::push_onto(&s, &mut
+                // buf)` — an accumulator append.  A `Wtf8Buf` / `String`
                 // lifts to the single immutable `ValueType::Str`, so there is
                 // no builder to mutate in place; model the append functionally
                 // as `buf = ll_strconcat(buf, piece)` (the `add` BinOp the
@@ -8312,7 +8388,7 @@ impl<'a> Lowering<'a> {
                 // MIR local so its later reads — and the loop-header phi that
                 // threads it across the back-edge — observe the concatenated
                 // string.  `str_builder_append_args` gives the accumulator and
-                // piece arg positions (push_str / push_wtf8: acc 0, piece 1;
+                // piece arg positions (push / push_str / push_wtf8: acc 0, piece 1;
                 // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
                 // arrives as a per-site ref-temp; `append_accumulator_of_arg_temp`
                 // traces it back to `buf` on demand from the MIR body, resolving
@@ -8339,6 +8415,15 @@ impl<'a> Lowering<'a> {
                     let acc_val = self.local_var[buf_local]
                         .clone()
                         .unwrap_or_else(|| args[acc_i].clone());
+                    let piece_val = if self.builder_mode
+                        && let Some(piece_temp) = arg_locals.get(piece_i).copied().flatten()
+                        && let Some(piece_builder) =
+                            append_piece_accumulator_of_arg_temp(self.body, self.llbc, piece_temp)
+                    {
+                        self.resolve_builder_build(mir_bb, piece_builder)?
+                    } else {
+                        args[piece_i].clone()
+                    };
                     if self.builder_mode
                         && is_builder_mode_accumulator(self.body, self.llbc, buf_local)
                     {
@@ -8359,12 +8444,12 @@ impl<'a> Lowering<'a> {
                                             .to_string(),
                                     ],
                                 },
-                                args: vec![acc_val, args[piece_i].clone()],
+                                args: vec![acc_val, piece_val],
                                 result_ty: ValueType::Void,
                             },
                         });
                     } else {
-                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
+                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &piece_val);
                         self.local_var[buf_local] = Some(concat);
                     }
                     self.local_var[dest_local] = Some(
@@ -15333,7 +15418,8 @@ fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashS
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the
 /// interpreter's repr accumulator) or std `String` (the byte / leaf / module
 /// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a
-/// `push_str` append models identically as `buf = ll_strconcat(buf, arg)`;
+/// `push` / `push_str` append models identically as
+/// `buf = ll_strconcat(buf, arg)`;
 /// `push_wtf8` is `Wtf8Buf`-only but the leaf gate never matches it on a
 /// `String`, so one owner set serves both.
 fn is_str_builder_owner(owner: Option<&str>) -> bool {
@@ -15341,8 +15427,8 @@ fn is_str_builder_owner(owner: Option<&str>) -> bool {
 }
 
 /// The string-builder ctor leaf a MIR call resolves to, restricted to the
-/// fresh-buffer constructors this pass models (`new` / `with_capacity`) on a
-/// `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
+/// fresh-buffer constructors this pass models (`new` / `with_capacity` /
+/// `from_string`) on a `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
 /// runs before the impl-owner resolution so the type lookup only fires for the
 /// candidate names.  Appends are recognised separately by
 /// [`str_builder_append_args`].
@@ -15350,6 +15436,10 @@ fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> 
     let CallFunc::Regular(reg) = &call.func else {
         return None;
     };
+    str_builder_ctor_leaf(llbc, reg)
+}
+
+fn str_builder_ctor_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
@@ -15358,6 +15448,8 @@ fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> 
     let leaf = match np.rsplit("::").next()? {
         "new" => "new",
         "with_capacity" => "with_capacity",
+        "from_string" => "from_string",
+        "push" => "push",
         "push_str" => "push_str",
         "push_wtf8" => "push_wtf8",
         _ => return None,
@@ -15366,9 +15458,11 @@ fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> 
 }
 
 /// If `reg` is a functional-concat string append, its `(accumulator, piece)`
-/// argument positions.  `push_str` / `push_wtf8` (on `Wtf8Buf` / `String`)
-/// take the accumulator as `&mut self` (arg 0) and the appended piece as
-/// arg 1.  `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps them: the
+/// argument positions.  `push` / `push_str` / `push_wtf8` (on `String` /
+/// `Wtf8Buf`) take the accumulator as `&mut self` (arg 0) and the appended
+/// piece as arg 1.  `String::push(char)` is upstream
+/// `AbstractStringBuilderRepr.rtype_method_append`'s `SomeChar` arm;
+/// `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps the arguments: the
 /// piece is `self` (arg 0) and the accumulator is `out` (arg 1).  Every
 /// `Wtf8Piece` impl body is `out.push_str(self)` / `out.push_wtf8(self)`, so
 /// `out = out ++ self` models all of them; the accumulator gate
@@ -15381,7 +15475,7 @@ fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usi
     let fd = llbc.fn_by_id(*id)?;
     let np = fd.item_meta.name_path();
     match np.rsplit("::").next()? {
-        "push_str" | "push_wtf8" => {
+        "push" | "push_str" | "push_wtf8" => {
             is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some((0, 1))
         }
         // `Wtf8Piece::push_onto`: the `str` / `String` / `Wtf8` impls live
@@ -15425,14 +15519,16 @@ fn operand_reads_local(op: &Operand, l: usize) -> bool {
     matches!(op, Operand::Copy(p) | Operand::Move(p) if place_references_local(p, l))
 }
 
-/// Whether a `&(mut) buf` ref-temp `rt` is used exactly once — as the
-/// accumulator argument of a recognised append (`push_str` / `push_wtf8`
-/// arg 0, or `Wtf8Piece::push_onto` arg 1) — and nowhere else, so rebinding
-/// `buf` to the concat captures the whole mutation.  A ref-temp that also
-/// escapes elsewhere would leave that other reader observing the pre-append
-/// buffer, so it declines.
-fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
-    let mut receiver = 0usize;
+/// Whether a builder borrow temp is used exactly once in the selected role of
+/// a recognised append (`accumulator == true` selects the receiver, false the
+/// appended piece) and nowhere else.  A temp that also escapes declines.
+fn ref_temp_is_sole_append_arg(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+    accumulator: bool,
+) -> bool {
+    let mut selected = 0usize;
     let mut other = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
@@ -15459,10 +15555,9 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
         }
         match bb.term() {
             Ok(TermKind::Call { call, .. }) => {
-                let acc_idx = match &call.func {
-                    CallFunc::Regular(reg) => {
-                        str_builder_append_args(llbc, reg).map(|(acc, _)| acc)
-                    }
+                let selected_idx = match &call.func {
+                    CallFunc::Regular(reg) => str_builder_append_args(llbc, reg)
+                        .map(|(acc, piece)| if accumulator { acc } else { piece }),
                     _ => None,
                 };
                 if let CallFunc::Dynamic(op) = &call.func
@@ -15472,8 +15567,8 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
                 }
                 for (i, arg) in call.args.iter().enumerate() {
                     if operand_reads_local(arg, rt) {
-                        if acc_idx == Some(i) {
-                            receiver += 1;
+                        if selected_idx == Some(i) {
+                            selected += 1;
                         } else {
                             other += 1;
                         }
@@ -15493,7 +15588,7 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
             _ => {}
         }
     }
-    receiver == 1 && other == 0
+    selected == 1 && other == 0
 }
 
 /// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
@@ -15606,14 +15701,19 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
     }
     let mut receivers = Vec::with_capacity(ref_temps.len());
     for &rt in &ref_temps {
-        receivers.push(append_receiver_of_borrow(body, llbc, rt)?);
+        if let Some(receiver) = append_receiver_of_borrow(body, llbc, rt) {
+            receivers.push(receiver);
+        } else if append_piece_of_borrow(body, llbc, rt).is_none() {
+            return None;
+        }
     }
     Some(receivers)
 }
 
 /// Resolve a direct `&(mut) buf` borrow temp `rt` to the temp actually passed
 /// as the append's accumulator argument.  A method-autoref receiver
-/// (`buf.push_str(s)`) reaches the call unchanged, so `rt` is itself the sole
+/// (`buf.push(ch)` / `buf.push_str(s)`) reaches the call unchanged, so `rt` is
+/// itself the sole
 /// append receiver.  An explicit `&mut buf` argument (`Wtf8Piece::push_onto(&s,
 /// &mut buf)`) is a two-phase reborrow — `rt := &Mut buf; recv := &TwoPhaseMut
 /// *rt` — so the call receives `recv` instead; accept it when `rt`'s only use
@@ -15621,7 +15721,109 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
 /// returned temp is the call's accumulator-argument local the append arm
 /// resolves against ([`append_accumulator_of_arg_temp`]).
 fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    if ref_temp_is_sole_append_receiver(body, llbc, rt) {
+    append_arg_of_borrow(body, llbc, rt, true)
+}
+
+fn append_piece_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    let mut current = rt;
+    for _ in 0..8 {
+        if ref_temp_is_sole_append_arg(body, llbc, current, false) {
+            return Some(current);
+        }
+        current = sole_string_alias_successor(body, llbc, current)?;
+    }
+    None
+}
+
+/// Follow one Rust reference/coercion shell which the lowered string value
+/// model aliases away: an immediate reborrow, or `Deref::deref` between two
+/// string-family types.  The source temp must have exactly this one use.
+fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) -> Option<usize> {
+    fn record(slot: &mut Option<usize>, other: &mut usize, candidate: usize) {
+        if slot.replace(candidate).is_some() {
+            *other += 1;
+        }
+    }
+    let mut successor: Option<usize> = None;
+    let mut other = 0usize;
+    for block in &body.body {
+        for stmt in &block.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: inner, .. } | Rvalue::RawPtr { place: inner, .. } =
+                        &rvalue
+                        && place_is_immediate_deref_of(inner, source)
+                    {
+                        if let PlaceKind::Local(dest) = place.kind {
+                            record(&mut successor, &mut other, dest as usize);
+                        } else {
+                            other += 1;
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, source, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, source)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    other += usize::from(operand_reads_local(&assert.cond, source));
+                }
+                _ => {}
+            }
+        }
+        match block.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let reads = call
+                    .args
+                    .iter()
+                    .filter(|arg| operand_reads_local(arg, source))
+                    .count();
+                let string_deref = if reads == 1 && call.args.len() == 1 {
+                    matches!(&call.func, CallFunc::Regular(reg) if is_deref_call(reg, llbc))
+                        && operand_tyref(&call.args[0])
+                            .is_some_and(|ty| tyref_is_string_value(ty, llbc))
+                        && tyref_is_string_value(&call.dest.ty, llbc)
+                } else {
+                    false
+                };
+                if string_deref {
+                    if let PlaceKind::Local(dest) = call.dest.kind {
+                        record(&mut successor, &mut other, dest as usize);
+                    } else {
+                        other += 1;
+                    }
+                } else {
+                    other += reads;
+                }
+                if let CallFunc::Dynamic(op) = &call.func {
+                    other += usize::from(operand_reads_local(op, source));
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                other += usize::from(operand_reads_local(&discr, source));
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                other += usize::from(operand_reads_local(&assert.cond, source));
+            }
+            _ => {}
+        }
+    }
+    (other == 0).then_some(successor?)
+}
+
+fn append_arg_of_borrow(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+    accumulator: bool,
+) -> Option<usize> {
+    let is_selected = |candidate| ref_temp_is_sole_append_arg(body, llbc, candidate, accumulator);
+    if is_selected(rt) {
         return Some(rt);
     }
     let mut recv: Option<usize> = None;
@@ -15689,12 +15891,12 @@ fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Opt
     if other != 0 {
         return None;
     }
-    ref_temp_is_sole_append_receiver(body, llbc, recv).then_some(recv)
+    is_selected(recv).then_some(recv)
 }
 
 /// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
 /// exactly one def and that def is a `Wtf8Buf` / `String` `new` /
-/// `with_capacity` call.  A local with a second def, or one defined by a
+/// `with_capacity` / `from_string` call.  A local with a second def, or one defined by a
 /// non-ctor rvalue, is not a fresh accumulator and keeps its residual.
 fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut def_count = 0usize;
@@ -15713,7 +15915,7 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
             def_count += 1;
             ctor_def = matches!(
                 wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity")
+                Some("new") | Some("with_capacity") | Some("from_string")
             );
         }
     }
@@ -15721,7 +15923,7 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
 }
 
 /// Resolve the accumulator local a recognised append rebinds, given the MIR
-/// local `rt` passed as the append's accumulator argument (`push_str` /
+/// local `rt` passed as the append's accumulator argument (`push` / `push_str` /
 /// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
 /// borrows the accumulator directly (method autoref) or through a single
 /// two-phase reborrow; the owning `buf` is the fresh `new` / `with_capacity`
@@ -15743,6 +15945,38 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
     })
 }
 
+/// Resolve a shared-borrow temp used as an append piece to the completed
+/// inner builder it borrows.  Membership is proven from the MIR definition of
+/// `rt` and the same single-use append-piece test accepted by
+/// [`clean_accumulator_ref_temps`].
+fn append_piece_accumulator_of_arg_temp(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> Option<usize> {
+    for candidate in builder_ctor_dest_locals(body, llbc) {
+        if !is_builder_mode_accumulator(body, llbc, candidate) {
+            continue;
+        }
+        for block in &body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                    stmt.stmt_kind()
+                else {
+                    continue;
+                };
+                if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
+                    && let PlaceKind::Local(direct_borrow) = place.kind
+                    && append_piece_of_borrow(body, llbc, direct_borrow as usize) == Some(rt)
+                {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Count the by-value consumptions (`move c`) of a fresh accumulator local
 /// `c`.  [`clean_accumulator_ref_temps`] already proves every other use of `c`
 /// is the ctor def or an append borrow, so each `move c` is a terminal
@@ -15750,12 +15984,20 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
 /// must run `ll_build`.  Counted so the builder lift only fires when the build
 /// point is unambiguous (see [`is_builder_mode_accumulator`]).
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
-fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
+fn accumulator_materialization_site_count(body: &Unstructured, llbc: &Llbc, c: usize) -> usize {
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
             if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind() {
+                if let Rvalue::Ref { place: source, .. } = &rvalue
+                    && matches!(source.kind, PlaceKind::Local(i) if i as usize == c)
+                    && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                    && let PlaceKind::Local(rt) = place.kind
+                    && append_piece_of_borrow(body, llbc, rt as usize).is_some()
+                {
+                    moves += 1;
+                }
                 match &rvalue {
                     Rvalue::Use(op)
                     | Rvalue::UnaryOp(_, op)
@@ -15797,8 +16039,9 @@ fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
 /// * a single-def `Wtf8Buf` / `String` `new` / `with_capacity` ctor
 ///   ([`is_fresh_str_builder`]),
 /// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
-/// * exactly one by-value terminal consumption ([`accumulator_move_site_count`])
-///   — the single `ll_build` materialisation point.
+/// * exactly one terminal consumption
+///   ([`accumulator_materialization_site_count`]) — a by-value move or an
+///   inner-builder append piece, both spelling the single `ll_build` point.
 ///
 /// Zero or several terminal moves keep the `ll_strconcat` fallback so the
 /// builder rewrite only fires where the ctor, the appends, and the one build
@@ -15808,7 +16051,7 @@ fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
 fn is_builder_mode_accumulator(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     is_fresh_str_builder(body, llbc, c)
         && clean_accumulator_ref_temps(body, llbc, c).is_some()
-        && accumulator_move_site_count(body, c) == 1
+        && accumulator_materialization_site_count(body, llbc, c) == 1
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace
@@ -21651,19 +21894,26 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
 ///   bytes inside a literal are consumed by its length prefix).
 ///
-/// Returns `(pieces, arg_indices)` where `arg_indices` holds the argument
+/// Returns `(pieces, placeholders)` where each placeholder records its
+/// argument index plus the static formatting fields encoded in the template.
+/// `FmtPlaceholder::is_default()` is the old `0xC0`/`0xC8` subset; retaining
+/// the fields lets a later parity rewrite recognize the one non-default shape
+/// used by `bytearray_repr_string` without treating arbitrary Rust formatting
+/// as RPython string operations.
+///
+/// `placeholders[*].arg_index` holds the argument
 /// index each placeholder renders (one per placeholder, so `pieces.len() ==
-/// arg_indices.len() + 1`).  A sequential `0xC0` auto-increments; a reused
+/// placeholders.len() + 1`).  A sequential `0xC0` auto-increments; a reused
 /// `0xC8` index points back at an already-seen argument, so the distinct
 /// argument count is `max(arg_indices) + 1`, which can be less than the
 /// placeholder count.  Returns `None` (bail, leaving the graph untouched)
 /// on any high-bit control byte other than `0xC0`/`0xC8` — a format spec
 /// with width/precision/fill or a named argument — and on non-UTF-8
 /// literal bytes.
-fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)> {
+fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut indices: Vec<usize> = Vec::new();
+    let mut placeholders: Vec<FmtPlaceholder> = Vec::new();
     let mut auto = 0usize; // next sequential argument index
     let mut i = 0;
     let mut terminated = false;
@@ -21676,19 +21926,58 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
             }
             terminated = true;
             break;
-        } else if b == 0xC0 {
-            // sequential placeholder: renders the next argument in order
+        } else if b >= 0xC0 {
+            // `core::fmt::Arguments`' packed placeholder grammar (the pinned
+            // Rust core `fmt/mod.rs`): low bits select optional u32 flags,
+            // u16 width, u16 precision, and u16 argument-index fields; bits
+            // 4/5 mark indirect width/precision.  Decode all field lengths so
+            // embedded zero bytes are never mistaken for the terminator.
             pieces.push(std::mem::take(&mut current));
-            indices.push(auto);
-            auto += 1;
             i += 1;
-        } else if b == 0xC8 {
-            // explicit / reused placeholder: `0xC8` + little-endian u16 index
-            let lo = *bytes.get(i + 1)? as usize;
-            let hi = *bytes.get(i + 2)? as usize;
-            pieces.push(std::mem::take(&mut current));
-            indices.push(lo | (hi << 8));
-            i += 3;
+            let read_u16 = |at: &mut usize| -> Option<u16> {
+                let lo = *bytes.get(*at)?;
+                let hi = *bytes.get(*at + 1)?;
+                *at += 2;
+                Some(u16::from_le_bytes([lo, hi]))
+            };
+            let read_u32 = |at: &mut usize| -> Option<u32> {
+                let b0 = *bytes.get(*at)?;
+                let b1 = *bytes.get(*at + 1)?;
+                let b2 = *bytes.get(*at + 2)?;
+                let b3 = *bytes.get(*at + 3)?;
+                *at += 4;
+                Some(u32::from_le_bytes([b0, b1, b2, b3]))
+            };
+            let flags = if b & 0x01 != 0 {
+                Some(read_u32(&mut i)?)
+            } else {
+                None
+            };
+            let width = if b & 0x02 != 0 {
+                Some(read_u16(&mut i)?)
+            } else {
+                None
+            };
+            let precision = if b & 0x04 != 0 {
+                Some(read_u16(&mut i)?)
+            } else {
+                None
+            };
+            let arg_index = if b & 0x08 != 0 {
+                usize::from(read_u16(&mut i)?)
+            } else {
+                let index = auto;
+                auto += 1;
+                index
+            };
+            placeholders.push(FmtPlaceholder {
+                arg_index,
+                flags,
+                width,
+                precision,
+                width_indirect: b & 0x10 != 0,
+                precision_indirect: b & 0x20 != 0,
+            });
         } else if b == 0x80 {
             // long literal segment: `0x80` + little-endian u16 length,
             // then that many UTF-8 bytes (a 128+ byte literal that the
@@ -21709,7 +21998,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
             current.push_str(std::str::from_utf8(seg).ok()?);
             i = end;
         } else {
-            // any other control byte = format spec / named arg: bail
+            // 0x81..0xBF are neither literal lengths nor placeholders.
             return None;
         }
     }
@@ -21720,7 +22009,45 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
         return None;
     }
     pieces.push(current);
-    Some((pieces, indices))
+    Some((pieces, placeholders))
+}
+
+/// Static formatting fields carried by one packed `fmt::Arguments`
+/// placeholder.  This mirrors the storage shape documented in the pinned
+/// Rust core; it is a Vec entry in template order, not a side-table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FmtPlaceholder {
+    arg_index: usize,
+    flags: Option<u32>,
+    width: Option<u16>,
+    precision: Option<u16>,
+    width_indirect: bool,
+    precision_indirect: bool,
+}
+
+impl FmtPlaceholder {
+    fn is_default(self) -> bool {
+        self.flags.is_none()
+            && self.width.is_none()
+            && self.precision.is_none()
+            && !self.width_indirect
+            && !self.precision_indirect
+    }
+
+    /// Rust `{:02x}` as emitted for the `u8` in
+    /// `display::bytearray_repr_string`: space fill + unknown alignment,
+    /// sign-aware zero padding, width present and equal to two.
+    fn is_lower_hex_byte_02(self) -> bool {
+        const FILL_SPACE: u32 = b' ' as u32;
+        const ZERO_PAD: u32 = 1 << 24;
+        const WIDTH_PRESENT: u32 = 1 << 27;
+        const ALIGN_UNKNOWN: u32 = 3 << 29;
+        self.flags == Some(FILL_SPACE | ZERO_PAD | WIDTH_PRESENT | ALIGN_UNKNOWN)
+            && self.width == Some(2)
+            && self.precision.is_none()
+            && !self.width_indirect
+            && !self.precision_indirect
+    }
 }
 
 /// Read an `Array` aggregate literal: given the Variable holding a
@@ -21793,6 +22120,7 @@ fn resolve_const_int(
 enum FmtArgKind {
     Display,
     Debug,
+    LowerHex,
 }
 
 /// One placeholder argument recovered from a `format_args!` chain: the
@@ -21815,7 +22143,7 @@ struct FmtArg {
 struct FmtChain {
     pieces: Vec<String>,
     args: Vec<FmtArg>,
-    arg_indices: Vec<usize>,
+    placeholders: Vec<FmtPlaceholder>,
 }
 
 /// Match a `FunctionPath`'s trailing segments against `tail`, so a
@@ -21851,6 +22179,8 @@ fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
         Some(FmtArgKind::Display)
     } else if fmt_path_ends_with(segments, &["Argument", "new_debug"]) {
         Some(FmtArgKind::Debug)
+    } else if fmt_path_ends_with(segments, &["Argument", "new_lower_hex"]) {
+        Some(FmtArgKind::LowerHex)
     } else {
         None
     }
@@ -21966,18 +22296,25 @@ fn extract_fmt_chain(
     for v in &piece_byte_vars {
         bytes.push(u8::try_from(resolve_const_int(graph, v)?).ok()?);
     }
-    let (pieces, arg_indices) = decode_packed_format_pieces(&bytes)?;
+    let (pieces, placeholders) = decode_packed_format_pieces(&bytes)?;
     // Args: an `Array` of `Argument::new_display|new_debug(&v)` ctors, one
     // per *distinct* argument.  The args array holds the distinct arguments;
     // reused placeholders (`0xC8`) point back at an earlier index, so the
     // distinct count is `max(arg_indices) + 1` — bail unless it matches the
     // args array, and every placeholder index must be in range.
     let arg_elems = read_array_literal_elements(graph, &args_var)?;
-    let distinct = arg_indices.iter().map(|i| i + 1).max().unwrap_or(0);
+    let distinct = placeholders
+        .iter()
+        .map(|placeholder| placeholder.arg_index + 1)
+        .max()
+        .unwrap_or(0);
     if arg_elems.len() != distinct {
         return None;
     }
-    if arg_indices.iter().any(|&i| i >= arg_elems.len()) {
+    if placeholders
+        .iter()
+        .any(|placeholder| placeholder.arg_index >= arg_elems.len())
+    {
         return None;
     }
     let mut args = Vec::with_capacity(arg_elems.len());
@@ -21987,7 +22324,7 @@ fn extract_fmt_chain(
     Some(FmtChain {
         pieces,
         args,
-        arg_indices,
+        placeholders,
     })
 }
 
@@ -22057,7 +22394,8 @@ fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) 
     // Walk placeholders in template order via `arg_indices`; a reused
     // argument re-renders the same recovered value (`str(&str)` is pure, so
     // referencing the value var twice is sound).
-    for (i, &ai) in chain.arg_indices.iter().enumerate() {
+    for (i, placeholder) in chain.placeholders.iter().enumerate() {
+        let ai = placeholder.arg_index;
         acc = emit_str_add(graph, bb_id, &acc, &chain.args[ai].value);
         let next_piece = emit_str_const(graph, bb_id, &chain.pieces[i + 1]);
         acc = emit_str_add(graph, bb_id, &acc, &next_piece);
@@ -22138,6 +22476,125 @@ fn emit_fmt_expansion_ops(
     ops
 }
 
+/// Expand the byte-only `{:02x}` in `bytearray_repr_string` to the exact
+/// operations PyPy uses in `bytearrayobject.py::descr_repr`:
+///
+/// ```python
+/// digits = "0123456789abcdef"
+/// digits[n >> 4] + digits[n & 0xF]
+/// ```
+///
+/// The caller proves the formatted value came from a `(u8,)` argument tuple,
+/// so two digits are complete (never truncating a wider integer).  Each
+/// getitem annotates as `SomeChar`; `str(char)` follows
+/// `AbstractCharRepr.ll_str -> ll_chr2str`, and the final `add` is ordinary
+/// `StringRepr` concatenation.  No Rust fmt runtime or new helper survives.
+fn emit_lower_hex_byte_02_ops(
+    graph: &mut FunctionGraph,
+    value: &Variable,
+    result: Variable,
+) -> Vec<SpaceOperation> {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let alloc = |graph: &mut FunctionGraph| {
+        graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown)
+    };
+    let mut ops = Vec::new();
+
+    let digits = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(digits.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let four = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(four.clone()),
+        kind: OpKind::ConstInt(4),
+    });
+    let fifteen = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(fifteen.clone()),
+        kind: OpKind::ConstInt(15),
+    });
+    let hi_index = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi_index.clone()),
+        kind: OpKind::BinOp {
+            op: "rshift".to_string(),
+            lhs: value.clone(),
+            rhs: four,
+            result_ty: ValueType::Int,
+        },
+    });
+    let lo_index = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo_index.clone()),
+        kind: OpKind::BinOp {
+            op: "and".to_string(),
+            lhs: value.clone(),
+            rhs: fifteen,
+            result_ty: ValueType::Int,
+        },
+    });
+    let hi_char = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi_char.clone()),
+        kind: OpKind::ArrayRead {
+            base: digits.clone(),
+            index: hi_index,
+            item_ty: ValueType::Int,
+            array_type_id: None,
+            nolength: false,
+            pure: true,
+        },
+    });
+    let lo_char = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo_char.clone()),
+        kind: OpKind::ArrayRead {
+            base: digits,
+            index: lo_index,
+            item_ty: ValueType::Int,
+            array_type_id: None,
+            nolength: false,
+            pure: true,
+        },
+    });
+    let hi = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi.clone()),
+        kind: OpKind::UnaryOp {
+            op: "str".to_string(),
+            operand: hi_char,
+            result_ty: ValueType::Str,
+        },
+    });
+    let lo = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo.clone()),
+        kind: OpKind::UnaryOp {
+            op: "str".to_string(),
+            operand: lo_char,
+            result_ty: ValueType::Str,
+        },
+    });
+    ops.push(SpaceOperation {
+        result: Some(result),
+        kind: OpKind::BinOp {
+            op: "add".to_string(),
+            lhs: hi,
+            rhs: lo,
+            result_ty: ValueType::Str,
+        },
+    });
+    ops
+}
+
 /// The unique `Link` feeding `target`'s inputarg at `pos`: the source
 /// block id, its exit index, and the threaded value Variable. Returns
 /// `None` when `target` has more than one predecessor (a phi merge, so
@@ -22202,12 +22659,17 @@ struct FmtCollapse {
 struct SingleArgFmtChainNav {
     /// The render kind of the single argument (`Display` / `Debug`).
     kind: FmtArgKind,
+    /// Static options and argument index decoded from the packed template.
+    placeholder: FmtPlaceholder,
     /// The literal template pieces around the single placeholder.
     pieces: Vec<String>,
     /// The `alloc::fmt::format` result var.
     format_result: Variable,
     /// The single rendered value (the tuple field source).
     context: Variable,
+    /// The argument tuple is exactly Rust `(u8,)`; used by the LowerHex
+    /// parity collapse to prove that two hexadecimal digits cannot truncate.
+    context_is_u8: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -22247,15 +22709,16 @@ fn navigate_single_arg_fmt_chain(
         _ => return None,
     };
     let chain = extract_fmt_chain(graph, &fmt_args)?;
-    if chain.args.len() != 1 || chain.arg_indices.len() != 1 {
+    if chain.args.len() != 1 || chain.placeholders.len() != 1 {
         // scope: exactly one argument rendered by exactly one placeholder.
         // A single argument reused across several placeholders (`{0}…{0}`)
-        // has `arg_indices.len() > 1` and stays residual here (none of the
+        // has `placeholders.len() > 1` and stays residual here (none of the
         // census walls), rather than mis-driving the single-placeholder
         // expansion below.
         return None;
     }
     let kind = chain.args[0].kind;
+    let placeholder = chain.placeholders[0];
     let pieces = chain.pieces.clone();
 
     // `fmt_args` reaches Bf as an inputarg threaded from Bp's
@@ -22313,6 +22776,13 @@ fn navigate_single_arg_fmt_chain(
     })?;
     // The rendered value written into the argument tuple field.
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
+    let context_is_u8 = block_0.operations.iter().any(|op| {
+        matches!(&op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) && name == "Tuple<u8>")
+    });
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -22335,9 +22805,11 @@ fn navigate_single_arg_fmt_chain(
 
     Some(SingleArgFmtChainNav {
         kind,
+        placeholder,
         pieces,
         format_result,
         context,
+        context_is_u8,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -22350,7 +22822,7 @@ fn navigate_single_arg_fmt_chain(
 /// leaves the graph untouched.
 fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Display {
+    if nav.kind != FmtArgKind::Display || !nav.placeholder.is_default() {
         // `str(value)` renders Display; `{:?}` Debug has no native rstr
         // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
         return None;
@@ -22455,6 +22927,127 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
             continue;
         };
         let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
+        graph
+            .block_mut(site.format_block)
+            .operations
+            .splice(idx..idx + 1, expansion);
+    }
+    sites.len()
+}
+
+/// A byte `{:02x}` chain whose Rust formatting shell can be replaced by
+/// PyPy's two-nibble lookup while reusing the common single-argument chain
+/// deletion plan.
+struct LowerHexByteFmtCollapse {
+    format_block: BlockId,
+    format_result: u64,
+    link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
+    dead_results: Vec<u64>,
+    dead_bases: Vec<u64>,
+}
+
+fn collect_lower_hex_byte_fmt_collapse(
+    graph: &FunctionGraph,
+    bf: BlockId,
+    fi: usize,
+) -> Option<LowerHexByteFmtCollapse> {
+    let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
+    if nav.kind != FmtArgKind::LowerHex
+        || !nav.placeholder.is_lower_hex_byte_02()
+        || !nav.context_is_u8
+        || nav.pieces != ["\\x".to_string(), String::new()]
+    {
+        return None;
+    }
+    Some(LowerHexByteFmtCollapse {
+        format_block: bf,
+        format_result: nav.format_result.id(),
+        link_rewrites: nav.link_rewrites,
+        dead_results: nav.dead_results,
+        dead_bases: nav.dead_bases,
+    })
+}
+
+/// Replace the exact `format!("\\x{c:02x}")` shell used by the bytearray
+/// repr loop with PyPy's `"0123456789abcdef"[c >> 4]` / `[c & 0xF]`
+/// implementation.  The packed template, `new_lower_hex` ctor, argument tuple
+/// and `alloc::fmt::format` all disappear; only RPython-native integer,
+/// string-getitem and string-concat operations remain.
+fn collapse_lower_hex_byte_fmt_chains(graph: &mut FunctionGraph) -> usize {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let sites: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .filter_map(move |(fi, op)| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
+                    _ => None,
+                })
+        })
+        .filter_map(|(bid, fi)| collect_lower_hex_byte_fmt_collapse(graph, bid, fi))
+        .collect();
+    if sites.is_empty() {
+        return 0;
+    }
+
+    for site in &sites {
+        for (bid, ei, pos, replacement) in &site.link_rewrites {
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei)
+                && let Some(arg) = link.args.get_mut(*pos)
+            {
+                *arg = LinkArg::Value(replacement.clone());
+            }
+        }
+    }
+    let dead_results: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|site| site.dead_results.iter().copied())
+        .collect();
+    let dead_bases: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|site| site.dead_bases.iter().copied())
+        .collect();
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if op
+                .result
+                .as_ref()
+                .is_some_and(|result| dead_results.contains(&result.id()))
+            {
+                return false;
+            }
+            !matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead_bases.contains(&base.id()))
+        });
+    }
+    for site in &sites {
+        let Some((idx, value, result)) = graph
+            .blocks
+            .iter()
+            .find(|block| block.id == site.format_block)
+            .and_then(|block| {
+                let idx = block.operations.iter().position(|op| {
+                    op.result.as_ref().map(|result| result.id()) == Some(site.format_result)
+                })?;
+                let value = match &block.operations[idx].kind {
+                    OpKind::Call { args, .. } => args.first()?.clone(),
+                    _ => return None,
+                };
+                Some((idx, value, block.operations[idx].result.clone()?))
+            })
+        else {
+            continue;
+        };
+        // The original context value was defined in B0.  After link rewrites,
+        // the format op's own argument Variable is Bf's inputarg carrying that
+        // value; use it so every emitted operand is defined in this block.
+        let expansion = emit_lower_hex_byte_02_ops(graph, &value, result);
         graph
             .block_mut(site.format_block)
             .operations
@@ -22906,7 +23499,12 @@ fn collect_fmt_collapse_multi(
     if chain.args.len() < 2 {
         return None; // single-argument chains handled by `collapse_fmt_chains`
     }
-    if chain.args.iter().any(|a| a.kind != FmtArgKind::Display) {
+    if chain.args.iter().any(|a| a.kind != FmtArgKind::Display)
+        || chain
+            .placeholders
+            .iter()
+            .any(|placeholder| !placeholder.is_default())
+    {
         // `{:?}` Debug over an enum has no native rstr render (no
         // `rtype_str` on enum reprs); leave Debug chains residual.
         return None;
@@ -22980,7 +23578,11 @@ fn collect_fmt_collapse_multi(
         args_block,
         arguments_var,
         arg_elem_vars,
-        arg_indices: chain.arg_indices,
+        arg_indices: chain
+            .placeholders
+            .iter()
+            .map(|placeholder| placeholder.arg_index)
+            .collect(),
         pieces,
         new_display_ops,
         format_block: bf,
@@ -23077,7 +23679,18 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
                     kind: FmtArgKind::Display,
                 })
                 .collect(),
-            arg_indices: site.arg_indices.clone(),
+            placeholders: site
+                .arg_indices
+                .iter()
+                .map(|&arg_index| FmtPlaceholder {
+                    arg_index,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                })
+                .collect(),
         };
         let folded = emit_fmt_concat(graph, site.args_block, &fold_chain);
         // 4. Re-thread the folded String onto the link that forwarded the
@@ -23242,7 +23855,7 @@ fn collect_debug_enum_fmt_collapse(
     // gate below selects only the `{:?}` renders, and the navigation also
     // supplies the residual-chain delete / re-thread plan the switch needs.
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Debug {
+    if nav.kind != FmtArgKind::Debug || !nav.placeholder.is_default() {
         return None; // Display is handled by `collapse_fmt_chains`
     }
     // The rendered value is the enum being `Debug`-formatted.
@@ -24337,7 +24950,10 @@ mod tests {
             pieces,
             vec!["stack underflow during ".to_string(), String::new()]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("{} indices must be integers or slices, not {}", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -24354,7 +24970,10 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         // `format!("'{}' object does not support item assignment", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -24370,7 +24989,10 @@ mod tests {
                 "' object does not support item assignment".to_string(),
             ]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("__init__() should return None, not '{}'", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -24386,7 +25008,10 @@ mod tests {
                 "'".to_string(),
             ]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("can only concatenate {a} (not \"{b}\") to {a}", ..)` —
         // the `add`-operand error tail (descroperation.rs), where the first
@@ -24408,24 +25033,41 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(indices, vec![0, 1, 0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1, 0]
+        );
 
         // A template naming arguments 1 and 3 explicitly (`0xC8` + u16 index
         // each): three sequential `0xC0` then two explicit reuses.
         let (pieces, indices) =
             decode_packed_format_pieces(&[192, 192, 192, 200, 1, 0, 200, 3, 0, 0]).unwrap();
         assert_eq!(pieces.len(), 6);
-        assert_eq!(indices, vec![0, 1, 2, 1, 3]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 1, 3]
+        );
     }
 
     #[test]
     fn decode_packed_format_pieces_bails_and_handles_edges() {
         use super::decode_packed_format_pieces;
 
-        // A control byte other than 0xC0 / 0xC8 (e.g. a width/precision
-        // format-spec) must bail so the recognizer leaves the graph alone.
+        // A flags-bearing placeholder truncated before its four-byte flags
+        // field, and the reserved 0x80 long-literal marker without a length,
+        // must bail.
         assert_eq!(decode_packed_format_pieces(&[0xC1, 0]), None);
         assert_eq!(decode_packed_format_pieces(&[0x80, 0]), None);
+
+        // Verbatim `format!("\\x{c:02x}")` template from the production
+        // LLBC.  0xC3 selects flags+width; 0x69000020 is space fill,
+        // sign-aware zero-pad, width-present, unknown alignment.
+        let (pieces, placeholders) =
+            decode_packed_format_pieces(&[2, b'\\', b'x', 0xC3, 0x20, 0, 0, 0x69, 2, 0, 0])
+                .unwrap();
+        assert_eq!(pieces, ["\\x".to_string(), String::new()]);
+        assert_eq!(placeholders.len(), 1);
+        assert!(placeholders[0].is_lower_hex_byte_02());
 
         // A literal length that overruns the buffer bails.
         assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);
@@ -24446,13 +25088,16 @@ mod tests {
         // Literal-only template (no placeholders) → single piece, no args.
         let (pieces, indices) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
         assert_eq!(pieces, vec!["hi".to_string()]);
-        assert_eq!(indices, Vec::<usize>::new());
+        assert!(indices.is_empty());
 
         // Two consecutive literal segments accumulate into one piece
         // (how a >127-byte literal is split); one placeholder follows.
         let (pieces, indices) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
         assert_eq!(pieces, vec!["ab".to_string(), String::new()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 
     #[test]
@@ -24505,7 +25150,10 @@ mod tests {
         assert_eq!(decoded, vec![2, 104, 105, 0xC0, 0]);
         let (pieces, indices) = decode_packed_format_pieces(&decoded).unwrap();
         assert_eq!(pieces, vec!["hi".to_string(), String::new()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // A non-Array producer (plain ConstInt) is rejected.
         assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
@@ -25566,7 +26214,7 @@ mod tests {
 
     #[test]
     fn emit_fmt_concat_builds_interleaved_str_add_fold() {
-        use super::{FmtArg, FmtArgKind, FmtChain, emit_fmt_concat};
+        use super::{FmtArg, FmtArgKind, FmtChain, FmtPlaceholder, emit_fmt_concat};
         use crate::flowspace::model::Variable;
         use crate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -25587,7 +26235,24 @@ mod tests {
                     kind: FmtArgKind::Display,
                 },
             ],
-            arg_indices: vec![0, 1],
+            placeholders: vec![
+                FmtPlaceholder {
+                    arg_index: 0,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                },
+                FmtPlaceholder {
+                    arg_index: 1,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                },
+            ],
         };
         let result = emit_fmt_concat(&mut graph, bb, &chain);
 
@@ -27609,7 +28274,10 @@ mod tests {
         bytes.push(0x00); // terminator
         let (pieces, indices) = decode_packed_format_pieces(&bytes).unwrap();
         assert_eq!(pieces, vec!["ab".to_string(), tail.to_string()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // A long-literal marker whose declared length overruns the buffer
         // bails (no OOB, fail-safe residual).
@@ -29107,6 +29775,217 @@ mod tests {
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "le")),
             "{name}: RangeFrom get must guard start <= len"
         );
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
+    /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
+    /// `String::push_str` and `String::push(char)` in one loop, so omitting the
+    /// char arm prevents the whole fresh accumulator from lifting.
+    #[test]
+    #[ignore]
+    fn bytearray_repr_mixed_string_appends_lift_to_rpython_builder() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "bytearray_repr_string")
+            .expect("lower bytearray_repr_string");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|leaf| leaf == "push" || leaf == "push_str"))
+            }),
+            "String::push/push_str must not survive the RPython builder lift"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "fmt")
+                        || segments.last().is_some_and(|leaf| leaf == "new_lower_hex"))
+            }),
+            "Rust fmt shell must collapse to PyPy's two-nibble lookup"
+        );
+        for opname in ["rshift", "and"] {
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == opname) }),
+                "missing PyPy byte-hex operation {opname}"
+            );
+        }
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}",
+                        block.id,
+                        operand,
+                        op.kind
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
+    }
+
+    /// PyPy's `bytesobject.py::string_escape_encode` is an ordinary
+    /// StringBuilder loop.  The interpreter now carries that loop directly,
+    /// so the frozen production LLBC must lower without the former external
+    /// `rustpython_literal::escape::AsciiEscape` iterator.
+    #[test]
+    #[ignore]
+    fn bytes_repr_lifts_without_external_ascii_escape() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "bytes_repr_string").expect("lower bytes_repr_string");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "AsciiEscape"))
+            }),
+            "external AsciiEscape must not survive the PyPy loop port"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|segment| segment == "HEX"))
+            }),
+            "the borrowed HEX table must be a prebuilt constant, not an accessor call"
+        );
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+    }
+
+    /// PyPy's `unicodeobject.py::_repr_function` is the ordinary
+    /// `rutf8.make_utf8_escape_function(pass_printable=True, quotes=True)`
+    /// StringBuilder loop.  The production graph must retain that loop and
+    /// its prebuilt lowercase-hex table without the former RustPython escape
+    /// iterator or a named-const accessor.
+    #[test]
+    #[ignore]
+    fn unicode_repr_lifts_without_external_unicode_escape() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "format_wtf8_repr").expect("lower format_wtf8_repr");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "UnicodeEscape"))
+            }),
+            "external UnicodeEscape must not survive the PyPy loop port"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|segment| segment == "HEX"))
+            }),
+            "the borrowed HEX table must be a prebuilt constant, not an accessor call"
+        );
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+    }
+
+    /// Every local UTF-8 accumulator in PyPy's repr helpers is a
+    /// `StringBuilder`; the large `py_repr_wtf8` dispatcher must therefore
+    /// eliminate the Rust `Wtf8Buf` mutation shell as well as the smaller
+    /// leaf helpers do.
+    #[test]
+    #[ignore]
+    fn py_repr_wtf8_lifts_owned_wtf8buf_appends() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block.operations.iter().filter_map(move |op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["Wtf8Buf", "push_wtf8"])
+                    .then_some((block.id, op))
+                })
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "owned Wtf8Buf appends must lift to StringBuilder operations: {residual:#?}"
+        );
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}",
+                        block.id,
+                        operand,
+                        op.kind
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
     }
 
     /// PyPy's `_match_keywords` indexes its small signature and argument
