@@ -2293,6 +2293,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_rangefrom_sites.is_empty()
             || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
         {
@@ -2307,6 +2308,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_rangefrom_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_rangefrom_sites(
+                &mut lo.graph,
+                &lo.slice_index_rangefrom_sites,
+            );
+        }
         if !lo.slice_index_range_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_range_sites(
                 &mut lo.graph,
@@ -3240,6 +3247,11 @@ struct Lowering<'a> {
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
     /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
+    /// RangeFrom aggregates retained for the orthodox
+    /// `getslice(start, None)` rewrite. The slice-index consumer proves the
+    /// bound is a `usize`, hence non-negative as required by RPython's
+    /// `decompose_slice_args`.
+    slice_index_rangefrom_sites: Vec<crate::front::slice_index::SliceIndexRangeFromSite>,
     /// RangeTo aggregates retained as candidates for the slice-index
     /// recognizer. The end's unsigned coloring is captured from MIR here,
     /// before the operand can become a block inputarg.
@@ -3486,6 +3498,7 @@ impl<'a> Lowering<'a> {
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
+            slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -4512,7 +4525,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         inner: Place,
         elem: ProjectionElem,
-        value: LinkArg,
+        mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
         // A plain `*p = v` (`__deref_write` Call below) reads a
@@ -4609,12 +4622,28 @@ impl<'a> Lowering<'a> {
                     // fallback keeps non-Adt containers lowering as
                     // before.
                     let (field, ty) = match self.resolve_adt_field(field_payload) {
-                        Some((owner_root, field_name, _field_ty, owner_id)) => (
-                            FieldDescriptor::new(field_name, Some(owner_root))
-                                .with_owner_id(owner_id)
-                                .with_base_is_deref(base_is_deref),
-                            tyref_to_value_type(dest_ty, self.llbc),
-                        ),
+                        Some((owner_root, field_name, _field_ty, owner_id)) => {
+                            // Rust type-checks every assignment against the
+                            // projected place's substituted field type.  A
+                            // raw pointer to a named ADT is therefore the
+                            // same typed nullable instance slot as a field
+                            // initialized by an aggregate: preserve that
+                            // class on ordinary `self.field = value` writes
+                            // too.  Otherwise one classdef-less raw value
+                            // generalizes the session-global ClassDef attr to
+                            // the root object repr before a later getattr is
+                            // rtyped.  RPython's SomeNone union instead keeps
+                            // the declared SomeInstance class and merely sets
+                            // `can_be_None`.
+                            value =
+                                self.narrow_typed_nullable_field_value(bb_id, value, Some(dest_ty));
+                            (
+                                FieldDescriptor::new(field_name, Some(owner_root))
+                                    .with_owner_id(owner_id)
+                                    .with_base_is_deref(base_is_deref),
+                                tyref_to_value_type(dest_ty, self.llbc),
+                            )
+                        }
                         None => (
                             FieldDescriptor::new(field_label_from_payload(field_payload), None),
                             ValueType::Int,
@@ -4653,6 +4682,48 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(())
+    }
+
+    /// Preserve the declared class of a raw-pointer field value.
+    ///
+    /// RPython represents a nullable instance attribute as
+    /// `SomeInstance(classdef, can_be_None=True)`.  Rust spells the same slot
+    /// as `*mut/*const NamedAdt`, but a producer such as `null_mut()` begins as
+    /// a classdef-less pointer.  The Rust field type-check is the proof needed
+    /// to narrow that producer before `setattr`; this is an identity cast for
+    /// non-null values and a typed null for null values.
+    fn narrow_typed_nullable_field_value(
+        &mut self,
+        bb_id: BlockId,
+        value: LinkArg,
+        declared_ty: Option<&TyRef>,
+    ) -> LinkArg {
+        let Some(root) = declared_ty.and_then(|ty| {
+            tyref_node(ty, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+        }) else {
+            return value;
+        };
+        let LinkArg::Value(value) = value else {
+            // Ref-kind constants are materialized calls in this frontend;
+            // only scalar constants can remain inline in a FieldWrite.
+            return value;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                },
+                args: vec![value],
+                result_ty: ValueType::Ref(Some(root)),
+            },
+        });
+        LinkArg::Value(narrowed)
     }
 
     /// Extract the `offset` operand from an `Index { offset, from_end }`
@@ -5213,7 +5284,7 @@ impl<'a> Lowering<'a> {
                                 tyref_positional_aggregate_suffix(dest_ty, self.llbc)
                             );
                             let positional = (0..arg_vars.len())
-                                .map(|i| (format!("__pos_{i}"), String::new()))
+                                .map(|i| (format!("__pos_{i}"), String::new(), None))
                                 .collect();
                             // Not an Adt at all, so there is no struct decl to
                             // stand behind an allocation rewrite.
@@ -5300,8 +5371,17 @@ impl<'a> Lowering<'a> {
                         },
                     );
                 }
-                // RangeFrom alone stays dormant: its Void ConstNone stop has
-                // no regalloc coloring on the legacy-walker path.
+                if owner_path.as_slice() == ["core", "ops", "range"]
+                    && ctor_name == "RangeFrom"
+                    && arg_vars.len() == 1
+                {
+                    self.slice_index_rangefrom_sites.push(
+                        crate::front::slice_index::SliceIndexRangeFromSite {
+                            range_result: res.clone(),
+                            start: arg_vars[0].clone(),
+                        },
+                    );
+                }
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -5311,8 +5391,9 @@ impl<'a> Lowering<'a> {
                 for (i, value) in arg_vars.into_iter().enumerate() {
                     let (name, field_ty) = field_rows
                         .get(i)
-                        .cloned()
+                        .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                         .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
+                    let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
                     // `_names_without_voids()` / `heaptracker.py:104-105`: a
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
@@ -5321,6 +5402,15 @@ impl<'a> Lowering<'a> {
                     {
                         continue;
                     }
+                    let value = self
+                        .narrow_typed_nullable_field_value(
+                            bb_id,
+                            LinkArg::Value(value),
+                            declared_ty,
+                        )
+                        .as_variable()
+                        .expect("aggregate field operand stays materialized")
+                        .clone();
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::FieldWrite {
@@ -6501,7 +6591,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<(
         Vec<String>,
         String,
-        Vec<(String, String)>,
+        Vec<(String, String, Option<TyRef>)>,
         majit_ir::descr::StructId,
         bool,
     )> {
@@ -6530,13 +6620,14 @@ impl<'a> Lowering<'a> {
         let owner_path = segments;
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
-                let field_rows: Vec<(String, String)> = fields
+                let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
                         (
                             f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
                             tyref_to_ast_string(&f.ty, self.llbc),
+                            Some(clone_tyref(&f.ty)),
                         )
                     })
                     .collect();
@@ -6568,7 +6659,7 @@ impl<'a> Lowering<'a> {
                     None => type_leaf,
                 };
                 variant_owner.push(leaf);
-                let field_rows: Vec<(String, String)> = v
+                let field_rows: Vec<(String, String, Option<TyRef>)> = v
                     .fields
                     .iter()
                     .enumerate()
@@ -6576,6 +6667,7 @@ impl<'a> Lowering<'a> {
                         (
                             f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
                             tyref_to_ast_string(&f.ty, self.llbc),
+                            Some(clone_tyref(&f.ty)),
                         )
                     })
                     .collect();
@@ -28977,6 +29069,186 @@ mod tests {
             }),
             "From<bool> for usize should use RPython's cast_bool_to_uint path"
         );
+    }
+
+    /// `basename_start` indexes `path[drive..]` with a runtime `usize`
+    /// RangeFrom. RPython represents this as `getslice(start, None)`, so the
+    /// core SliceIndex shim must be gone before annotation.
+    #[test]
+    #[ignore]
+    fn basename_start_rangefrom_lowers_to_getslice_marker() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "basename_start").expect("lower basename_start");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &[
+                        "core".to_string(),
+                        "slice".to_string(),
+                        "index".to_string(),
+                        "<Impl>".to_string(),
+                        "index".to_string(),
+                    ])
+            }),
+            "RangeFrom SliceIndex call must not survive as an opaque core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["__getslice_rangefrom".to_string()])
+            }),
+            "runtime RangeFrom should use the post-annotation getslice marker"
+        );
+    }
+
+    /// The exception carrier's cached object is PyPy's `W_Root` field. Its
+    /// registry spelling must retain `PyObjectRef`; erasing it to a generic
+    /// reference makes `InstanceRepr._setup_repr` choose the root object
+    /// pointer while field reads expect the concrete PyObject repr.
+    #[test]
+    #[ignore]
+    fn pyerror_exc_object_registry_retains_pyobjectref() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(&llbc);
+        let (owner, ty) = fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| owner.ends_with("PyError"))
+            .find_map(|(owner, rows)| {
+                rows.iter()
+                    .find(|(name, _)| name == "exc_object")
+                    .map(|(_, ty)| (owner.as_str(), ty.as_str()))
+            })
+            .map(|(owner, ty)| (owner.to_string(), ty.to_string()))
+            .expect("PyError.exc_object registry row");
+        assert!(
+            ty == "PyObjectRef"
+                || ty.ends_with("::PyObjectRef")
+                || ty.ends_with("pyobject::PyObject")
+                || ty == "*mut PyObject",
+            "{owner}.exc_object must retain its concrete object-pointer spelling, got {ty}"
+        );
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        bk.set_pyre_struct_fields(std::rc::Rc::new(fields));
+        let crate::annotator::model::SomeValue::Instance(projected) =
+            bk.project_pyre_field_type(&ty)
+        else {
+            panic!("{owner}.exc_object field must project to an instance annotation")
+        };
+        assert!(
+            projected.classdef.is_some(),
+            "{owner}.exc_object field must project to the concrete PyObject class"
+        );
+    }
+
+    /// `PyError::new` initializes three `PyObjectRef` fields with
+    /// `null_mut()`. These are typed nullable W_Root slots, not erased root
+    /// references; each aggregate write must consume a PyObject-narrowed
+    /// value so `InstanceRepr._setup_repr` and later reads agree.
+    #[test]
+    #[ignore]
+    fn pyerror_new_narrows_null_object_fields() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::error::<Impl>::new")
+            .expect("lower PyError::new");
+        for field_name in ["exc_object", "w_name_context", "w_obj_context"] {
+            let value = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|op| match &op.kind {
+                    OpKind::FieldWrite { field, value, .. } if field.name == field_name => {
+                        match value {
+                            LinkArg::Value(value) => Some(value.clone()),
+                            LinkArg::Const(_) => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("PyError::{field_name} aggregate write"));
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    op.result.as_ref() == Some(&value)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments == &["__pyre_cast_instance", "PyObject"]
+                        )
+                }),
+                "PyError::{field_name} null must retain the declared PyObject class"
+            );
+        }
+    }
+
+    /// The same declared-slot rule applies after construction.  PyPy's
+    /// `OperationError` object attributes never lose their W_Root class when
+    /// assigned in a method, so an ordinary MIR projection write must carry
+    /// the same narrowing as a struct-literal initializer.
+    #[test]
+    #[ignore]
+    fn pyerror_projection_writes_retain_pyobject_class() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::error::<Impl>::enrich_attribute_error",
+        )
+        .expect("lower PyError::enrich_attribute_error");
+        let mut writes = 0;
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::FieldWrite { field, value, .. } = &op.kind else {
+                continue;
+            };
+            if !matches!(field.name.as_str(), "w_name_context" | "w_obj_context") {
+                continue;
+            }
+            writes += 1;
+            let LinkArg::Value(value) = value else {
+                panic!(
+                    "PyError::{} write must use a materialized object value",
+                    field.name
+                )
+            };
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|producer| {
+                        producer.result.as_ref() == Some(value)
+                            && matches!(
+                                &producer.kind,
+                                OpKind::Call {
+                                    target: CallTarget::FunctionPath { segments },
+                                    ..
+                                } if segments == &["__pyre_cast_instance", "PyObject"]
+                            )
+                    }),
+                "PyError::{} projection write must retain the declared PyObject class",
+                field.name
+            );
+        }
+        assert!(writes >= 2, "expected both PyError context-field writes");
     }
 
     /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving

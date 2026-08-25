@@ -1,13 +1,10 @@
 //! `&s[k..]` / `&s[..k]` sub-slice indexes → orthodox `getslice` copies.
 //!
-//! ## Status: RangeFrom dormant
-//!
-//! These recognizers are CAPSTONES, not independently wired primitives. The
-//! RangeFrom arm is built and unit-tested but is not captured or invoked from
-//! `front::mir`: its rewrite plants a Void `ConstNone` stop, which had no
-//! regalloc coloring when the rewritten
-//! `pyre_interpreter::module::_io::buffered_rwpair::<Impl>::readinto` graph
-//! dropped to the legacy walker.
+//! These recognizers are CAPSTONES, not independently wired primitives.
+//! RangeFrom is carried as a synthetic marker until the flowspace adapter,
+//! where it expands to `getslice(slice, start, None)` after annotation. This
+//! keeps the Void `None` bound out of any graph that drops to the legacy
+//! walker, matching the existing Range/RangeTo marker split.
 //!
 //! The `ll_listslice_startstop` clamp (`rpython/rtyper/rlist.py`)
 //! repairs the oversized result of an unsigned `len - 1` wrap. The MinusOne
@@ -18,12 +15,9 @@
 //! those checks have no Python-observable meaning.
 //!
 //! The earlier failure was an unwired frontend `getslice` planted before a
-//! graph fell through the legacy walker. The admitted MinusOne path uses an
-//! unregistered synthetic call, expanded only by the rtyper flowspace
-//! adapter, so no frontend `getslice` is planted. RangeFrom alone stays
-//! dormant because its Void `ConstNone` stop has no regalloc coloring on that
-//! path.
-#![allow(dead_code)]
+//! graph fell through the legacy walker. Every admitted path now uses an
+//! unregistered synthetic call expanded only by the rtyper flowspace adapter,
+//! so no frontend `getslice` or Void bound is planted.
 //!
 //! ## Positioning
 //!
@@ -54,10 +48,9 @@
 //!
 //! The `getslice` operand contract (`decompose_slice_args`,
 //! `rtyper.rs`) selects `SliceKind::StartOnly` when args[2] (`stop`)
-//! annotates as a constant `None`; `k` (a proven-nonneg / const start) becomes
-//! args[1]. The stop operand is a fresh [`OpKind::ConstNone`] — the annotator
-//! constant `None` (`Void` `concretetype`), which folds to `SomeValue::None_`
-//! so the `stop_is_none` branch fires and the `len-k` copy runs at runtime.
+//! annotates as a constant `None`; `k` (a proven-nonnegative `usize` start)
+//! becomes args[1]. The adapter supplies the annotated constant `None`, so the
+//! `stop_is_none` branch fires and the `len-k` copy runs at runtime.
 //!
 //! ## Consumer gate + fail-safe (the UNWIRED hazard)
 //!
@@ -285,19 +278,11 @@ fn rewire_one_slice_index_site(
         ));
     }
 
-    // 3. Validate the selected bounds before mutating. Both bounds must be a
-    // NON-NEGATIVE CONSTANT. `decompose_slice_args`
-    //     (rtyper.rs) raises "slice start must be proved
-    //     non-negative" for a `nonneg==false` runtime `SomeInteger` start, and
-    //     a `usize` literal decodes to a bare `OpKind::ConstInt(k)` with no
-    //     `Unsigned`/nonneg annotation (only its value is ≥ 0). A runtime
-    //     start could annotate `nonneg==false`, making the getslice fail to
-    //     rtype → the graph drops to legacy carrying a bare unwired `getslice`
-    //     → the unwired-opname snapshot breaks. Restricting to a const k ≥ 0
-    //     (the `&s[1..]` / `&s[k..]` literal shape, which
-    //     `immutablevalue(ConstInt(k))` annotates `nonneg = k>=0`) keeps every
-    //     rewritten graph lift-able; a computed start declines cleanly
-    //     (residual, census Skip). RangeTo's constant-nonnegative gate is only
+    // 3. Validate the selected bounds before mutating. `decompose_slice_args`
+    // (rtyper.rs) requires a non-negative start. A RangeFrom slice-index
+    // consumer statically selects `SliceIndex<usize>`, so its bound retains
+    // the unsigned/nonnegative annotation even when computed; the marker is
+    // expanded only after annotation. RangeTo's proof gate is only
     //     the secondary blocker: activating it admitted bare unwired
     //     `getslice/rii>r` from `split_builtin_kwargs` and
     //     `do_warn_explicit`; both measured ends were `args.len() - 1`,
@@ -310,11 +295,6 @@ fn rewire_one_slice_index_site(
             if !graph_defines(graph, start) {
                 return Err(format!(
                     "{name}: RangeFrom start is not defined in the graph"
-                ));
-            }
-            if !bound_is_const_nonneg(graph, start) {
-                return Err(format!(
-                    "{name}: RangeFrom start is not a non-negative constant — declining"
                 ));
             }
         }
@@ -430,20 +410,16 @@ fn rewire_one_slice_index_site(
             };
         }
         SliceIndexBounds::RangeFrom { start } => {
-            let synthetic_bound = graph.alloc_value_var();
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
-                kind: OpKind::GetSlice {
-                    args: vec![slice, start.clone(), synthetic_bound.clone()],
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_rangefrom".to_string()],
+                    },
+                    args: vec![slice, start.clone()],
+                    result_ty: index_result_ty,
                 },
             };
-            graph.blocks[rb].operations.insert(
-                ri,
-                SpaceOperation {
-                    result: Some(synthetic_bound),
-                    kind: OpKind::ConstNone,
-                },
-            );
         }
     }
     Ok(())
@@ -1321,21 +1297,6 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
             || b.operations
                 .iter()
                 .any(|op| op.result.as_ref() == Some(var))
-    })
-}
-
-/// `true` when `var` is produced by an `OpKind::ConstInt(k)` op with `k >= 0`
-/// — the `&s[k..]` literal start `decompose_slice_args` selects `StartOnly`
-/// for. A `usize` slice literal decodes to `ConstInt(k)` (`decode_literal`
-/// collapses `Usize` into `DecodedConst::Int`), which
-/// `immutablevalue(ConstInt(k))` annotates as `SomeInteger` with
-/// `nonneg = k>=0`, so a const k ≥ 0 satisfies the getslice nonneg contract
-/// without a computed-stop hazard.
-fn bound_is_const_nonneg(graph: &FunctionGraph, var: &Variable) -> bool {
-    graph.blocks.iter().any(|b| {
-        b.operations.iter().any(|op| {
-            op.result.as_ref() == Some(var) && matches!(&op.kind, OpKind::ConstInt(k) if *k >= 0)
-        })
     })
 }
 
@@ -2644,27 +2605,30 @@ mod tests {
         );
         assert!(!has_start_write, "start FieldWrite removed");
 
-        // A single `getslice` op with 3 args (slice, k, None) is emitted, its
-        // stop operand produced by a `ConstNone` op.
-        let getslice_ops: Vec<_> = g
+        // A single marker with (slice, k) is emitted. The adapter adds the
+        // constant None only after annotation, so an unrelated phaseA failure
+        // cannot leak an unwired getslice into the legacy walker.
+        let marker_ops: Vec<_> = g
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
-            .filter(|op| matches!(&op.kind, OpKind::GetSlice { .. }))
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__getslice_rangefrom".to_string()]
+                )
+            })
             .collect();
-        assert_eq!(getslice_ops.len(), 1, "exactly one getslice op");
-        let OpKind::GetSlice { args } = &getslice_ops[0].kind else {
+        assert_eq!(marker_ops.len(), 1, "exactly one RangeFrom marker");
+        let OpKind::Call { args, .. } = &marker_ops[0].kind else {
             unreachable!()
         };
-        assert_eq!(args.len(), 3, "getslice has [slice, start, stop]");
+        assert_eq!(args.len(), 2, "marker has [slice, start]");
         assert_eq!(args[0], slice, "arg0 = slice receiver");
         assert_eq!(args[1], k, "arg1 = const start k");
-        let stop = &args[2];
-        let stop_is_const_none =
-            g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
-                op.result.as_ref() == Some(stop) && matches!(&op.kind, OpKind::ConstNone)
-            });
-        assert!(stop_is_const_none, "arg2 = ConstNone (StartOnly stop)");
     }
 
     #[test]
@@ -3016,11 +2980,11 @@ mod tests {
         ]));
     }
 
-    /// A RangeFrom whose start is a RUNTIME value (not a const) declines: a
-    /// non-nonneg runtime start would fail `decompose_slice_args` and drop the
-    /// graph to legacy carrying a bare unwired `getslice`.
+    /// A RangeFrom whose `usize` start is a runtime value is retained as a
+    /// marker; its unsigned annotation proves the start nonnegative to
+    /// `decompose_slice_args` when the adapter expands it.
     #[test]
-    fn rewrite_declines_runtime_start() {
+    fn rewrite_lifts_runtime_unsigned_start() {
         let mut g = FunctionGraph::new("test_slice_index_runtime");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
@@ -3033,7 +2997,7 @@ mod tests {
                     op: "add".into(),
                     lhs: x.clone(),
                     rhs: x.clone(),
-                    result_ty: ValueType::Int,
+                    result_ty: ValueType::Unsigned,
                 },
                 true,
             )
@@ -3073,21 +3037,21 @@ mod tests {
             start: start.clone(),
         };
         let rewritten = rewire_slice_index_rangefrom_sites(&mut g, &[site]);
-        assert_eq!(rewritten, 0, "runtime start declines");
-        // The residual call and ctor survive untouched (census Skip).
+        assert_eq!(rewritten, 1, "runtime unsigned start is rewritten");
         assert!(
             g.blocks
                 .iter()
                 .flat_map(|blk| &blk.operations)
-                .any(|op| is_slice_range_index_call(&op.kind)),
-            "residual slice::index call left in place"
-        );
-        assert!(
-            !g.blocks
-                .iter()
-                .flat_map(|blk| &blk.operations)
-                .any(|op| matches!(&op.kind, OpKind::GetSlice { .. })),
-            "no getslice planted on decline"
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if segments == &["__getslice_rangefrom".to_string()]
+                        && args == &[slice.clone(), start.clone()]
+                )),
+            "runtime RangeFrom becomes an adapter marker"
         );
     }
 

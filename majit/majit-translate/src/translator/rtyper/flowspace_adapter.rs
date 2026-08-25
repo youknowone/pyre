@@ -1644,6 +1644,24 @@ pub fn translate_op(
                             result,
                         )]);
                     }
+                    if segments.as_slice() == ["__getslice_rangefrom"] && arg_hls.len() == 2 {
+                        // slice, start -> getslice(slice, start, None).
+                        // RPython `decompose_slice_args` selects StartOnly;
+                        // the frontend records only SliceIndex<usize>
+                        // consumers, which prove the runtime start nonnegative.
+                        let mut args = arg_hls.into_iter();
+                        let slice = args.next().expect("slice arg");
+                        let start = args.next().expect("RangeFrom start arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                start,
+                                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                            ],
+                            result,
+                        )]);
+                    }
                     if segments.as_slice() == ["__getslice_range"] && arg_hls.len() == 3 {
                         // slice, start, end -> getslice(slice, start, end)
                         // The frontend plants this marker only after proving
@@ -5063,6 +5081,40 @@ mod tests {
             Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
         );
         assert_eq!(translated[0].args[2], end);
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
+    fn translate_op_getslice_rangefrom_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_rangefrom_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let slice = Hlvalue::Variable(Variable::new());
+        let start = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), start.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangefrom".into()],
+                },
+                args: vec![vars[0].clone(), vars[1].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RangeFrom marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(translated[0].args[1], start);
+        assert_eq!(
+            translated[0].args[2],
+            Hlvalue::Constant(Constant::new(ConstValue::None))
+        );
         assert_eq!(translated[0].result, result);
     }
 
