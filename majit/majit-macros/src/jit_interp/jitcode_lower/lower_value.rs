@@ -669,6 +669,17 @@ impl<'c> Lowerer<'c> {
                     #type_id,
                     #headerless,
                     &[ #(#field_layout),* ],
+                    {
+                        // The struct's own `_immutable_fields_` declaration.  Read through
+                        // an in-scope trait rather than a qualified
+                        // `<T as MajitImmutableFields>::...`, which would select the blanket
+                        // empty default and never see a struct's own declaration.  The import
+                        // is unused exactly when the inherent const wins, which is the common
+                        // case.
+                        #[allow(unused_imports)]
+                        use majit_metainterp::MajitImmutableFields as _;
+                        <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                    },
                 );
             },
         );
