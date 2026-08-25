@@ -7632,29 +7632,51 @@ impl<'a> Lowering<'a> {
                 let element_is_addressable = element_scalar.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
-                if args.len() == 2
+                let index_leg = args.len() == 2
                     && (workspace_index
-                        || (element_is_addressable
-                            && ((self.is_vec_index_call(&reg)
-                                && (!is_vec_index_mut_regular(&reg, self.llbc)
-                                    || add_dest_used_only_as_single_deref(
-                                        self.body, dest_local,
-                                    )))
-                                || (self
-                                    .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
-                                    && (!self.is_slice_scalar_index_mut_call(&reg)
-                                        || add_dest_used_only_as_single_deref(
-                                            self.body, dest_local,
-                                        ))))))
-                {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    // `Index::index(_mut)` returns `&T`/`&mut T`, while
-                    // RPython's getarrayitem returns `T`.  Preserve that
-                    // pointee kind: treating the reference wrapper itself as
-                    // the item makes an integer Vec load flow into
-                    // `int_mul/ri>i`.
+                        || (self.is_vec_index_call(&reg)
+                            && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
+                        || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                            && (!self.is_slice_scalar_index_mut_call(&reg)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local))));
+                // The element kind and the ARRAY identity are decided above the
+                // gate, not at the emit below, because the gate turns on the
+                // identity: minting one is one of the two ways the element's
+                // width reaches the descr.  One expression has to answer both
+                // questions or a later edit desynchronises them, admitting an
+                // element whose width the descr never learns.
+                //
+                // `Index::index(_mut)` returns `&T`/`&mut T`, while RPython's
+                // getarrayitem returns `T`.  Preserve that pointee kind:
+                // treating the reference wrapper itself as the item makes an
+                // integer Vec load flow into `int_mul/ri>i`.
+                //
+                // The `pyre_`-fenced workspace arm has exactly three element
+                // banks — `FixedObjectArray`, `IntArray`, `FloatArray` — so a
+                // `*mut PyObject` element there IS the length-prefixed object
+                // block that `set_ref` and the `swap` decomposition name, and
+                // this read has to share their descr or a cached element
+                // survives their store.  The `Vec<T>` and slice legs reach
+                // object pointers that are not that block, and they keep the
+                // identity-less descr, which `arraydescrof_concrete` mints
+                // locally without a cache publish.
+                //
+                // Unlike the `swap` arm, the item kind is sound evidence here.
+                // The `Ref(None)` fallback that forced `swap` onto a positive
+                // `output_type_is_objectptr` proof is reached when
+                // `monomorphize:false` leaves a `TypeVar` at the call site; the
+                // impls behind this arm are non-generic inherent/trait impls on
+                // three concrete types, so `call.dest.ty` is a resolved
+                // associated `Output` at every one and never lands on that
+                // fallback.
+                //
+                // Outside that arm the element is whatever the receiver spells,
+                // and an int-banked one narrower than 8 bytes needs its
+                // identity for `get_type_flag` to be reachable at all
+                // ([`narrow_item_array_type_id`]); a `Vec<u8>` read strides by
+                // 8 without it.
+                let index_element = index_leg.then(|| {
                     let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
@@ -7709,6 +7731,35 @@ impl<'a> Lowering<'a> {
                                     .and_then(|ty| narrow_item_array_type_id(ty, self.llbc))
                             })
                     };
+                    (item_ty, array_type_id)
+                });
+                // `ArrayRead` addresses its element as `base + index *
+                // itemsize`, so the op is sound only where that itemsize is the
+                // element's real width.  Two disjoint proofs supply it:
+                //
+                // * the ARRAY identity minted above, which gives
+                //   `arraydescrof_concrete` an element name to hand
+                //   `get_type_flag` and so stamps the true width — this is the
+                //   narrow-int case, `Vec<u8>` striding 1 and `Vec<i16>` 2;
+                // * `element_is_addressable`, for an element the identity-less
+                //   descr already describes: a scalar names its own spelling,
+                //   and a thin pointer IS the one target word that arm assumes.
+                //
+                // An element neither proof can name falls through to the
+                // residual call, where Rust computes the address itself.
+                // `ValueType` cannot stand in for either: `Unsigned` is one
+                // width-less variant spanning `u8` through `usize`, and every
+                // non-primitive shape flattens to `Ref(None)`, so a `Vec<u8>`
+                // and a `Vec<String>` are indistinguishable there while
+                // striding 1 and 24 bytes.  The workspace arm needs no proof:
+                // its `pyre_` fence admits exactly the three element banks
+                // named above, all of them one word.
+                if let Some((item_ty, array_type_id)) = index_element
+                    && (workspace_index || array_type_id.is_some() || element_is_addressable)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
@@ -18811,9 +18862,13 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
 ///   would hand one of the two the other's base.
 /// * `get_type_flag` must bank the named element as an integer narrower
 ///   than 8 bytes.  Everything else — pointers, floats, structs, `String`,
-///   and the unknown-name fallback — keeps `None` and the third arm, whose
-///   answer is already right for them or whose element is a multi-word
-///   aggregate no `getarrayitem` can load.
+///   and the unknown-name fallback — keeps `None`.
+///
+/// A `None` here is not on its own a decline: the callsite also admits an
+/// element `element_is_addressable` proves the identity-less third arm already
+/// describes — a scalar spelling or a thin pointer.  An element
+/// neither answers for — a multi-word aggregate, `String`, a fat pointer —
+/// reaches no `ArrayRead` at all and stays a residual call.
 fn narrow_item_array_type_id(receiver: &TyRef, llbc: &Llbc) -> Option<String> {
     let identity = tyref_to_ast_string(receiver, llbc);
     if identity.starts_with("??")
