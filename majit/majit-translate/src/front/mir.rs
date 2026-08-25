@@ -28523,11 +28523,22 @@ mod tests {
     #[ignore]
     fn struct_ptr_write_lowers_to_per_field_initialization() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
-        let llbc = Llbc::load(path).expect("load real LLBC");
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/llbc/");
+        let llbcs = [
+            Llbc::load(format!("{root}pyre-object.ullbc")).expect("load pyre-object LLBC"),
+            Llbc::load(format!("{root}pyre-interpreter.ullbc"))
+                .expect("load pyre-interpreter LLBC"),
+            Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load pyre-jit LLBC"),
+        ];
+        let names = ["w_cell_new", "w_long_from_raw", "w_str_from_wtf8_managed"];
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &llbcs,
+                crate::HostStaticAddrs::default(),
+                &[],
+                &names,
+            )
+            .expect("build production-shaped semantic program");
         for (name, owner, expected_fields) in [
             ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
             (
@@ -28535,8 +28546,26 @@ mod tests {
                 "W_LongObject",
                 &["ob_header", "value"][..],
             ),
+            (
+                "w_str_from_wtf8_managed",
+                "W_UnicodeObject",
+                &[
+                    "ob_header",
+                    "value",
+                    "byte_len",
+                    "len",
+                    "w_slots",
+                    "index_storage",
+                    "hash",
+                ][..],
+            ),
         ] {
-            let graph = super::lower_function(&llbc, name).expect("lower function");
+            let graph = &program
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing semantic function {name}"))
+                .graph;
             assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                     matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }

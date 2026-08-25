@@ -3073,13 +3073,15 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 ///
 /// The MIR front has already made the concrete type explicit on both sides:
 /// the destination is a `__pyre_cast_instance(T)` result and the value is a
-/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Replace
-/// only that exact same-block cluster, preserving the source field order and
-/// values while retargeting each store to the destination.  The call's unit
-/// result, when still carried by MIR bookkeeping, becomes a `ConstNone` with
-/// the same `Void` representation.  Any indirect, cross-block,
-/// mismatched-owner, or incomplete spelling is left untouched to fail loud
-/// rather than guessing at a memory layout.
+/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Calls in
+/// the source often split the aggregate from the stable allocation with
+/// residual GC hooks; resolve only phis whose every incoming path reaches the
+/// same constructor, then re-emit the registered complete field layout in
+/// declaration order at the destination.  The call's unit result, when still
+/// carried by MIR bookkeeping, becomes a `ConstNone` with the same `Void`
+/// representation.  Any indirect, disagreeing-phi, mismatched-owner, or
+/// incomplete spelling is left untouched to fail loud rather than guessing at
+/// a memory layout.
 pub fn lower_struct_ptr_writes(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
@@ -3098,6 +3100,43 @@ pub fn lower_struct_ptr_writes(
             .filter(|(key, _)| key.rsplit("::").next() == Some(owner));
         let (_, only) = leaf_matches.next()?;
         (leaf_matches.next().is_none()).then_some(only)
+    }
+
+    fn producer_root(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<Variable> {
+        if depth == 0 {
+            return None;
+        }
+        if graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| op.result.as_ref() == Some(var))
+        {
+            return Some(var.clone());
+        }
+        let (target, slot) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|input| input == var)
+                .map(|slot| (block.id, slot))
+        })?;
+        let mut root: Option<Variable> = None;
+        let mut saw_predecessor = false;
+        for link in graph.blocks.iter().flat_map(|block| &block.exits) {
+            if link.target != target {
+                continue;
+            }
+            saw_predecessor = true;
+            let incoming = link.args.get(slot)?.as_variable()?;
+            let incoming_root = producer_root(graph, incoming, depth - 1)?;
+            match &root {
+                None => root = Some(incoming_root),
+                Some(seen) if seen == &incoming_root => {}
+                Some(_) => return None,
+            }
+        }
+        saw_predecessor.then_some(root).flatten()
     }
 
     #[derive(Clone)]
@@ -3129,7 +3168,9 @@ pub fn lower_struct_ptr_writes(
                 continue;
             }
             let destination = &args[0];
-            let aggregate = &args[1];
+            let Some(aggregate) = producer_root(graph, &args[1], 16) else {
+                continue;
+            };
             let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
                 match (&candidate.result, &candidate.kind) {
                     (
@@ -3149,30 +3190,36 @@ pub fn lower_struct_ptr_writes(
                     _ => None,
                 }
             });
-            let aggregate_owner = block.operations[..oi].iter().find_map(|candidate| {
-                match (&candidate.result, &candidate.kind) {
+            let aggregate_owner = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find_map(|candidate| match (&candidate.result, &candidate.kind) {
                     (
                         Some(result),
                         OpKind::Call {
                             target: CallTarget::SyntheticTransparentCtor { name, .. },
                             ..
                         },
-                    ) if result == aggregate => Some(name.as_str()),
+                    ) if result == &aggregate => Some(name.as_str()),
                     _ => None,
-                }
-            });
+                });
             if destination_owner.is_none() || destination_owner != aggregate_owner {
                 continue;
             }
-            let stores: Vec<_> = block.operations[..oi]
+            let stores: Vec<_> = graph
+                .blocks
                 .iter()
+                .flat_map(|block| &block.operations)
                 .filter_map(|candidate| match &candidate.kind {
                     OpKind::FieldWrite {
                         base,
                         field,
                         value,
                         ty,
-                    } if base == aggregate => Some((field.clone(), value.clone(), ty.clone())),
+                    } if producer_root(graph, base, 16).as_ref() == Some(&aggregate) => {
+                        Some((field.clone(), value.clone(), ty.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -3182,18 +3229,31 @@ pub fn lower_struct_ptr_writes(
             ) else {
                 continue;
             };
-            if !stores
-                .iter()
-                .map(|(field, _, _)| field.name.as_str())
-                .eq(layout.iter().map(|(name, _)| name.as_str()))
-            {
+            if stores.len() != layout.len() {
+                continue;
+            }
+            let mut ordered_stores = Vec::with_capacity(layout.len());
+            let mut complete = true;
+            for (name, _) in layout {
+                let mut matches = stores.iter().filter(|(field, _, _)| &field.name == name);
+                let Some(store) = matches.next() else {
+                    complete = false;
+                    break;
+                };
+                if matches.next().is_some() {
+                    complete = false;
+                    break;
+                }
+                ordered_stores.push(store.clone());
+            }
+            if !complete {
                 continue;
             }
             rewrites.push(Rewrite {
                 block: bi,
                 op: oi,
                 destination: destination.clone(),
-                stores,
+                stores: ordered_stores,
                 result: op.result.clone(),
             });
         }
