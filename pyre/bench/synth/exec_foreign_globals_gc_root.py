@@ -1,4 +1,10 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=main,root:__init__
+# Both names are the WORKLOAD text's, not this module's -- the module
+# defines nothing from it.  `root:__init__` is measured and belongs to the
+# declaration for the same reason the comment below says not to tidy the
+# workload: the shapes that reach the JIT are what carry a `ConstRef` into the
+# constant pool this fixture guards.
 # Guard for the jitcode constant pool's GC rooting.  `constants_r` is a bare
 # `Vec<i64>` carrying no GC header, and a jitcode is built per CodeObject at run
 # time, so a trace's `Operand::ConstRef` reaches the pool straight off the heap.

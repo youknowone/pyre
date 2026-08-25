@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=hot,main
 # Self-checking guard for local tracing armed on a frame that is ALREADY
 # running compiled code.
 #

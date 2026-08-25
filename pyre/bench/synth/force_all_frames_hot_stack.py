@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: spec-folds=for_iter_next,compare_op_int
+# pyre-check: selfcheck-compiles=hot
 # Self-checking regression guard for `force_all_frames`
 # (`executioncontext.rs`), the only frame-materializing consumer in the tree
 # that no fixture reached.

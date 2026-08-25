@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=loop
 # pyre-check: skip-backends=wasm
 # The wasm guest has no `time` module, which this timing guard requires.
 # Regression guard: a compiled hot loop must be re-entered on every call of its

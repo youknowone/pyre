@@ -7509,12 +7509,18 @@ pub fn make_malloc_unicode_calldescr() -> DescrRef {
 /// gc.py + gc.py generate_function('malloc_big_fixedsize', ...).
 /// CallDescr for CALL_R(malloc_big_fixedsize_fn, size, type_id) -> Ref.
 ///
-/// rewrite.py `gen_malloc_fixedsize` framework-GC arm.  The
-/// helper allocates a fixed-size object directly in the old gen
-/// because the requested size is too large for the nursery
-/// (gc.py `malloc_big_fixedsize` "Never called as far as I can
-/// tell, but there for completeness: allocate a fixed-size object,
-/// but not in the nursery, because it is too big.").
+/// rewrite.py `gen_malloc_fixedsize` framework-GC arm, reached when the
+/// requested size is too large for the nursery (gc.py `malloc_big_fixedsize`
+/// "Never called as far as I can tell, but there for completeness: allocate a
+/// fixed-size object, but not in the nursery, because it is too big.").  The
+/// helper calls `do_malloc_fixedsize_clear`, so the object skips the nursery by
+/// taking `malloc_fixedsize`'s large arm — a *young* raw-malloced block, not an
+/// old-generation one.  `gen_malloc_fixedsize` selects a separate
+/// old-generation twin for the descrs that need one.
+///
+/// Shares `EffectInfo::MOST_GENERAL` and the rest of its shape with
+/// `make_malloc_array_calldescr`, whose helper has always been able to collect;
+/// the CALL_R therefore carries the same gcmap contract.
 pub fn make_malloc_big_fixedsize_calldescr() -> DescrRef {
     use std::sync::{Arc, OnceLock};
     static MALLOC_BIG_FIXEDSIZE_DESCR: OnceLock<DescrRef> = OnceLock::new();

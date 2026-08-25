@@ -252,6 +252,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_GC_DIAG`, `PYRE_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
+`PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
 `PYRE_M73_LASTINSTR_AUDIT`, `PYRE_M73_MIDBODY_CARRY_AUDIT`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
@@ -305,6 +306,15 @@ the flag itself keeps no provenance for. It is the second half of a two-step
 read: `PYRE_FBW_CENSUS` finds the walks that ended `committed=false` with
 unrecoverable effects, and this one says which residual decline put them there.
 It goes when the flag carries its own provenance.
+
+`PYRE_LOOP_CENSUS` prints one `[loop-census] <arm> <name>` line per compiled
+trace, naming it through `get_printable_location` — the JitDriver green-key
+hook ported for parity in `pyre-jit`. Unlike the rest of this section it has a
+gate consumer, not just a reader: `check.py` sets it on every selfcheck run and
+grades the run against each fixture's `# pyre-check: selfcheck-compiles=`
+header, so retiring it would silently un-gate those fixtures. It goes when a
+compiled trace carries its own identity somewhere a gate can read without a
+diagnostic env var.
 
 `PYRE_CHECK_INHERIT_ENV` is the other odd one: an A/B switch, not a report.
 `check.py` starts a benchmark child from an allowlisted environment because the

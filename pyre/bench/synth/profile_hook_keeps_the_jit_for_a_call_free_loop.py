@@ -1,4 +1,9 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=pure,root:_callee
+# `pure` is the call-free loop of the title.  `builtin_only` and `py_callee`
+# compile no loop -- the walker declines at the call, which is the rule this
+# fixture states -- so only `_callee` reaching the JIT as a root trace is
+# declared for them.
 # A frame under `sys.setprofile` is no longer handed to the plain evaluator.
 #
 # `interp_jit.py` carries `is_being_profiled` as a portal green rather than as

@@ -1,4 +1,9 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=settrace_direct,settrace_nested,setprofile_direct,setprofile_nested,root:callee,root:wrapper
+# The two `root:` arms are the premise, not a relaxation: the events this fixture
+# counts are owed precisely because compiled code enters the callee past
+# `execute_frame`'s bracket.  A callee that stopped reaching the JIT would make
+# every count below pass without testing anything.
 # Self-checking guard for the events a callee owes a hook when the loop that
 # calls it is running compiled.
 #

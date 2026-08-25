@@ -3424,6 +3424,10 @@ pub fn bh_probe_tid_ignored(type_id: u32) -> bool {
 pub const BH_PROBE_ORIGIN_BORN_OLD: u8 = 1;
 /// Origin tag for a nursery survivor the minor promoted.
 pub const BH_PROBE_ORIGIN_PROMOTED: u8 = 2;
+/// Origin tag for a block born young through the non-moving rawmalloc path
+/// (`external_malloc(..., alloc_young=True)`), which the next minor either
+/// frees or promotes.
+pub const BH_PROBE_ORIGIN_BORN_YOUNG_RAW: u8 = 3;
 
 /// Whether the blackhole-object probe is enabled.
 pub fn bh_probe_enabled() -> bool {

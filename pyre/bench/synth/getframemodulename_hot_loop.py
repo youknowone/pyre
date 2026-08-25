@@ -1,4 +1,15 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=root:_callee_template
+# The `root:` arm is measured, not a relaxation: this fixture's loop aborts
+# five times with ABORT_ESCAPE and what reaches the JIT is the root trace
+# `finish_and_compile` attaches. The cause is that no fold row exists for
+# `sys._getframemodulename`: the fold's head gate tests
+# `is_builtin_getframe_function(concrete_callable)`, a fn-pointer whitelist a
+# separate closure cannot match. Substituting `sys._getframe(0)` at the same
+# site compiles, and suppressing the getframe fold on that substitute
+# reproduces this fixture byte for byte. Folding the depth-0 read alone is
+# measured sufficient. ⚠ Because `hot` never compiles a loop, the depth-0
+# assertion below is checked on interpreted iterations only.
 # Self-checking regression guard for `sys._getframemodulename` read from a hot
 # loop, at depth 0 and from one frame further in.
 #

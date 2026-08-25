@@ -5878,6 +5878,7 @@ impl TraceCtx {
     pub fn set_green_key(&mut self, key: u64, raw: (usize, usize)) {
         self.green_key = key;
         self.green_key_raw = raw;
+        crate::loop_census::note_key(key, raw);
     }
 
     /// Record the structured greenkey for the root trace. Called once
@@ -5887,6 +5888,7 @@ impl TraceCtx {
     pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
         self.green_key_raw = raw;
         self.root_green_key_raw = raw;
+        crate::loop_census::note_key(self.green_key, raw);
     }
 
     /// pyjitpl.py:1396-1401 element-wise greenkey comparison against

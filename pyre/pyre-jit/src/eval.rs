@@ -7338,6 +7338,13 @@ pub fn init_jit_hooks() {
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
     pyre_interpreter::call::register_eval_override(eval_with_jit);
+    // `get_printable_location` was ported for JitDriver parity with no runtime
+    // consumer; the compile census is that consumer. The green tuple carries
+    // `pycode` as the `w_code` object (`green_key_raw: (w_code as usize, ..)`),
+    // which is the argument this hook already takes.
+    majit_metainterp::loop_census::register_location_printer(|next_instr, profiled, w_pycode| {
+        get_printable_location(next_instr, profiled, w_pycode as pyre_object::PyObjectRef)
+    });
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);

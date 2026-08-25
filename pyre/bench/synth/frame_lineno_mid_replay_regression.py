@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=mid_replay_getframe,mid_replay_handler,plain,recursive_mid_replay
 # Self-checking regression guard for the coordinate a frame reports WHILE it is
 # still running. The synthetic suite discovers it as a self-checking fixture.
 #

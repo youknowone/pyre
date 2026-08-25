@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=bound_method,builtin_through_star,method_with_keyword,plain_builtin,raising_builtin,static_new,type_calls
 # `c_call` / `c_return` belong to the call the BYTECODE made, not to whatever
 # the interpreter reaches on its way there.
 #

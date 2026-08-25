@@ -29,6 +29,18 @@ struct RawMallocedObject {
 pub struct OldGen {
     ac: ArenaCollection,
     old_rawmalloced_objects: Vec<RawMallocedObject>,
+    /// incminimark.py:382,1075-1078 `young_rawmalloced_objects`.  An object
+    /// born through `external_malloc(..., alloc_young=True)` is non-moving
+    /// like every other rawmalloc block, but it is *young*: the minor
+    /// collection that ends without stamping `GCFLAG_VISITED_RMY` on it frees
+    /// it, and the one that does stamps it promotes the record into
+    /// `old_rawmalloced_objects`.
+    ///
+    /// Upstream keeps only an address dict and recomputes the arena at free
+    /// time; `alloc::dealloc` needs the `Layout` the record carries, so
+    /// membership and the records are two structures here.
+    young_rawmalloced_objects: Vec<RawMallocedObject>,
+    young_rawmalloced_payloads: AddressSet,
     /// incminimark.py:2688-2694 `raw_malloc_might_sweep`.  At sweep
     /// preparation the old rawmalloc stack is swapped into this one, isolating
     /// it from rawmalloc allocations made by minors between sweep steps.
@@ -58,6 +70,8 @@ impl OldGen {
                 SMALL_REQUEST_THRESHOLD,
             ),
             old_rawmalloced_objects: Vec::new(),
+            young_rawmalloced_objects: Vec::new(),
+            young_rawmalloced_payloads: AddressSet::default(),
             raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: AddressSet::default(),
             rawmalloced_total_size: 0,
@@ -122,34 +136,120 @@ impl OldGen {
         let header_ptr = if card_header_bytes == 0 && alloc_size <= SMALL_REQUEST_THRESHOLD {
             self.ac.malloc(alloc_size)
         } else {
-            let layout = Layout::from_size_align(alloc_size, OBJECT_ALIGN).ok()?;
-            let raw = unsafe { alloc::alloc(layout) };
-            if raw.is_null() {
-                return None;
-            }
-            if card_header_bytes > 0 {
-                unsafe { ptr::write_bytes(raw, 0, card_header_bytes) };
-            }
-            let header_ptr = unsafe { raw.add(card_header_bytes) };
-            self.old_rawmalloced_objects.push(RawMallocedObject {
+            let (header_ptr, record) = self.try_rawmalloc_block(alloc_size, card_header_bytes)?;
+            self.old_rawmalloced_objects.push(record);
+            header_ptr
+        };
+        self.poison_if_enabled(header_ptr, obj_size);
+        Some(header_ptr)
+    }
+
+    /// incminimark.py:1075-1078, the `alloc_young` arm of `external_malloc`.
+    ///
+    /// Upstream's `alloc_young` also *forces* the rawmalloc branch — an object
+    /// taken from the `ArenaCollection` must be old (incminimark.py:999-1000
+    /// `and not alloc_young`), because the arena's sweep is the major's and it
+    /// has no per-object free — so this entry point never consults
+    /// `SMALL_REQUEST_THRESHOLD`.
+    pub fn try_alloc_young(&mut self, total_size: usize) -> Option<*mut u8> {
+        let obj_size = try_round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE))?;
+        let alloc_size = try_round_up(obj_size)?;
+        let (header_ptr, record) = self.try_rawmalloc_block(alloc_size, 0)?;
+        self.young_rawmalloced_payloads
+            .insert(header_ptr as usize + GcHeader::SIZE);
+        self.young_rawmalloced_objects.push(record);
+        self.poison_if_enabled(header_ptr, obj_size);
+        Some(header_ptr)
+    }
+
+    /// The `arena_malloc` half both rawmalloc births share.  Which list the
+    /// returned record joins is what separates a young birth from an old one.
+    fn try_rawmalloc_block(
+        &mut self,
+        alloc_size: usize,
+        card_header_bytes: usize,
+    ) -> Option<(*mut u8, RawMallocedObject)> {
+        let layout = Layout::from_size_align(alloc_size, OBJECT_ALIGN).ok()?;
+        let raw = unsafe { alloc::alloc(layout) };
+        if raw.is_null() {
+            return None;
+        }
+        if card_header_bytes > 0 {
+            unsafe { ptr::write_bytes(raw, 0, card_header_bytes) };
+        }
+        let header_ptr = unsafe { raw.add(card_header_bytes) };
+        self.rawmalloced_payloads
+            .insert(header_ptr as usize + GcHeader::SIZE);
+        self.rawmalloced_total_size += alloc_size;
+        self.rawmalloced_peak_size = self.rawmalloced_peak_size.max(self.rawmalloced_total_size);
+        Some((
+            header_ptr,
+            RawMallocedObject {
                 alloc_start: raw as usize,
                 header_addr: header_ptr as usize,
                 layout,
-            });
-            self.rawmalloced_payloads
-                .insert(header_ptr as usize + GcHeader::SIZE);
-            self.rawmalloced_total_size += alloc_size;
-            self.rawmalloced_peak_size =
-                self.rawmalloced_peak_size.max(self.rawmalloced_total_size);
-            header_ptr
-        };
+            },
+        ))
+    }
+
+    /// llarena debug-fill parity: `ArenaCollection.malloc` intentionally
+    /// returns uninitialized memory.  In detector mode make that contract
+    /// observable for fresh/recycled arena blocks and rawmalloced objects
+    /// alike.
+    #[inline]
+    fn poison_if_enabled(&self, header_ptr: *mut u8, obj_size: usize) {
         if self.poison_on_alloc {
-            // ArenaCollection.malloc intentionally returns uninitialized
-            // memory.  In detector mode make that contract observable for
-            // both fresh/recycled arena blocks and rawmalloced objects.
             unsafe { ptr::write_bytes(header_ptr, 0xAA, obj_size) };
         }
-        Some(header_ptr)
+    }
+
+    /// incminimark.py:1219-1221, the second half of `is_young_object`.
+    #[inline]
+    pub fn young_rawmalloced_contains(&self, obj_addr: usize) -> bool {
+        !self.young_rawmalloced_payloads.is_empty()
+            && self.young_rawmalloced_payloads.contains(&obj_addr)
+    }
+
+    /// `bool(self.young_rawmalloced_objects)` — the guard upstream puts in
+    /// front of every use of the dict, so a heap with no young rawmalloc
+    /// object pays nothing for the machinery.
+    #[inline]
+    pub fn has_young_rawmalloced(&self) -> bool {
+        !self.young_rawmalloced_objects.is_empty()
+    }
+
+    /// incminimark.py `free_young_rawmalloced_objects` and
+    /// `_free_young_rawmalloced_obj`, which is
+    /// `free_rawmalloced_object_if_unvisited(obj, GCFLAG_VISITED_RMY)`: a
+    /// record the minor reached carries the flag, clears it and joins
+    /// `old_rawmalloced_objects`; one it did not reach is freed here.
+    ///
+    /// Runs at the END of the minor collection, after every root and every
+    /// remembered old parent has had its chance to stamp the flag.
+    pub fn free_young_rawmalloced_objects(&mut self) {
+        let young = std::mem::take(&mut self.young_rawmalloced_objects);
+        self.young_rawmalloced_payloads.clear();
+        for object in young {
+            let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
+            if hdr.has_flag(flags::VISITED_RMY) {
+                hdr.clear_flag(flags::VISITED_RMY);
+                self.old_rawmalloced_objects.push(object);
+                continue;
+            }
+            if crate::gc_lifetime_log_enabled() {
+                eprintln!(
+                    "[gc][free] addr={:#x} type_id={} kind=raw-young",
+                    object.header_addr + GcHeader::SIZE,
+                    hdr.type_id()
+                );
+            }
+            self.rawmalloced_total_size -= object.layout.size();
+            let removed = self
+                .rawmalloced_payloads
+                .remove(&(object.header_addr + GcHeader::SIZE));
+            debug_assert!(removed);
+            unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
+        }
     }
 
     /// `raw_malloc_usage(totalsize)` for an object allocation.
@@ -217,6 +317,7 @@ impl OldGen {
     pub(crate) fn object_count(&self) -> usize {
         self.ac.object_count()
             + self.old_rawmalloced_objects.len()
+            + self.young_rawmalloced_objects.len()
             + self.raw_malloc_might_sweep.len()
     }
 
@@ -234,6 +335,13 @@ impl OldGen {
             self.raw_malloc_might_sweep.is_empty(),
             "raw_malloc_might_sweep must be empty"
         );
+        // incminimark.py:1312-1313 `debug_check_consistency` asserts
+        // `not self.young_rawmalloced_objects` here, on the premise that every
+        // major runs a minor first and that minor's last act empties the list.
+        // Pyre has one major for which the premise is false by design —
+        // `do_collect_oldgen_nonmoving` deliberately skips the leading minor —
+        // so the check lives at the collector's call site, which knows which
+        // entry it is on. See `MiniMarkGC::sweep_step_prepare`.
         std::mem::swap(
             &mut self.raw_malloc_might_sweep,
             &mut self.old_rawmalloced_objects,
