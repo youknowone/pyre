@@ -525,6 +525,7 @@ pub(super) fn create_module_from_export_slots(
             ob_base: CPyObject {
                 ob_refcnt: 0,
                 ob_pyre_link: PY_NULL,
+                ob_pyre_pad: 0,
                 ob_type: std::ptr::null_mut(),
             },
             m_init: None,

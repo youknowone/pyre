@@ -16,11 +16,12 @@ extern "C" {
 struct _object {
     Py_ssize_t ob_refcnt;
     Py_ssize_t ob_pyre_link;
+    Py_ssize_t ob_pyre_pad;
     PyTypeObject *ob_type;
 };
 
 #define PyObject_HEAD PyObject ob_base;
-#define PyObject_HEAD_INIT(type) { 0, 0, type },
+#define PyObject_HEAD_INIT(type) { 0, 0, 0, type },
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 
 /* `Py_TYPE` is exported as well as spelled here, because an extension that

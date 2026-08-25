@@ -31,8 +31,10 @@ pub struct CPyStructObject {
 
 const _: () = {
     assert!(std::mem::offset_of!(CPyStructObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPyStructObject, s_size) == 3 * size_of::<usize>());
-    assert!(std::mem::offset_of!(CPyStructObject, s_len) == 4 * size_of::<usize>());
+    assert!(std::mem::offset_of!(CPyStructObject, s_size) == size_of::<CPyObject>());
+    assert!(
+        std::mem::offset_of!(CPyStructObject, s_len) == size_of::<CPyObject>() + size_of::<usize>()
+    );
     assert!(size_of::<CPyStructObject>() == size_of::<CPyObject>() + 5 * size_of::<usize>());
 };
 

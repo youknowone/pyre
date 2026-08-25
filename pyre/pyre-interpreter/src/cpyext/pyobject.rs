@@ -56,6 +56,7 @@ pub use rawrefcount::REFCNT_IMMORTAL;
 pub struct CPyObject {
     pub ob_refcnt: isize,
     pub ob_pyre_link: PyObjectRef,
+    pub ob_pyre_pad: usize,
     pub ob_type: *mut CPyTypeObject,
 }
 
@@ -681,6 +682,7 @@ pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
             (raw as *mut CPyObject).write(CPyObject {
                 ob_refcnt: 0,
                 ob_pyre_link: PY_NULL,
+                ob_pyre_pad: 0,
                 ob_type: std::ptr::null_mut(),
             })
         };
@@ -1127,6 +1129,7 @@ const fn immortal() -> CPyObject {
     CPyObject {
         ob_refcnt: REFCNT_IMMORTAL,
         ob_pyre_link: PY_NULL,
+        ob_pyre_pad: 0,
         ob_type: std::ptr::null_mut(),
     }
 }

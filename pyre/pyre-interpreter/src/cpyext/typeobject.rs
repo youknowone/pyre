@@ -327,6 +327,7 @@ const fn immortal_type() -> CPyTypeObject {
             ob_base: CPyObject {
                 ob_refcnt: REFCNT_IMMORTAL,
                 ob_pyre_link: pyre_object::PY_NULL,
+                ob_pyre_pad: 0,
                 ob_type: std::ptr::null_mut(),
             },
             ob_size: 0,

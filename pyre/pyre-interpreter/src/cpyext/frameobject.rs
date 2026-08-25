@@ -9,7 +9,7 @@
 //! The block therefore has to be [`CPyFrameObject`]-sized rather than
 //! `PyObject`-sized, which is what [`basicsize`] tells the allocator through
 //! `tp_basicsize`.  Getting that wrong is not a failure that reports itself:
-//! the writes below would land past the end of a 24-byte block.  [`fields`] is
+//! the writes below would land past the end of a header-sized block.  [`fields`] is
 //! the one place that turns a mirror into a frame mirror, and it refuses on a
 //! block that was not sized for one.
 
@@ -41,12 +41,24 @@ pub struct CPyFrameObject {
 /// `pyre/pyrex/tests/fixtures/cpyext_frames.c` carries the C half.
 const _: () = {
     assert!(std::mem::offset_of!(CPyFrameObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPyFrameObject, f_code) == 24);
-    assert!(std::mem::offset_of!(CPyFrameObject, f_globals) == 32);
-    assert!(std::mem::offset_of!(CPyFrameObject, f_locals) == 40);
-    assert!(std::mem::offset_of!(CPyFrameObject, f_lineno) == 48);
-    assert!(std::mem::offset_of!(CPyFrameObject, f_back) == 56);
-    assert!(size_of::<CPyFrameObject>() == 64);
+    assert!(std::mem::offset_of!(CPyFrameObject, f_code) == size_of::<CPyObject>());
+    assert!(
+        std::mem::offset_of!(CPyFrameObject, f_globals)
+            == size_of::<CPyObject>() + size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyFrameObject, f_locals)
+            == size_of::<CPyObject>() + 2 * size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyFrameObject, f_lineno)
+            == size_of::<CPyObject>() + 3 * size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyFrameObject, f_back)
+            == size_of::<CPyObject>() + 4 * size_of::<usize>()
+    );
+    assert!(size_of::<CPyFrameObject>() == size_of::<CPyObject>() + 5 * size_of::<usize>());
 };
 
 type PendingSet = super::address_table::HeldSet;

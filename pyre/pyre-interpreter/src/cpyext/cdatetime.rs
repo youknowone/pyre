@@ -53,9 +53,12 @@ pub struct CPyDateTimeWithTZInfo {
 }
 
 const _: () = {
-    assert!(std::mem::offset_of!(CPyDateTimeDelta, days) == 3 * size_of::<usize>());
-    assert!(std::mem::offset_of!(CPyDateTimeWithTZInfo, tzinfo) == 4 * size_of::<usize>());
-    assert!(size_of::<CPyDateTimeWithTZInfo>() == 5 * size_of::<usize>());
+    assert!(std::mem::offset_of!(CPyDateTimeDelta, days) == size_of::<CPyObject>());
+    assert!(
+        std::mem::offset_of!(CPyDateTimeWithTZInfo, tzinfo)
+            == size_of::<CPyObject>() + size_of::<usize>()
+    );
+    assert!(size_of::<CPyDateTimeWithTZInfo>() == size_of::<CPyObject>() + 2 * size_of::<usize>());
 };
 
 // ── the module the whole of this reaches through ────────────────────────
