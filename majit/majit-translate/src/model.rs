@@ -3059,6 +3059,175 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     total_removed
 }
 
+/// Lower `core::ptr::write(raw as *mut T, T { fields... })` to field stores.
+///
+/// This is the Rust-source spelling of RPython's ordinary alloc-then-init
+/// graph shape: after `malloc(T)`, each member is written with its own
+/// `setfield`.  Charon extracts `ptr::write` as one generic FunDecl plus a
+/// concrete `generics.types[0]` at every call site.  Routing all those calls
+/// through one `FunctionPath(["core", "ptr", "write"])` therefore collapses
+/// the monomorphisations onto one `FunctionDesc`; the whole-program annotator
+/// then tries to union unrelated aggregate arguments (observed first as
+/// `W_LongObject ∪ Cell`).  RPython has no corresponding callable or union:
+/// the stores are operations in each caller graph.
+///
+/// The MIR front has already made the concrete type explicit on both sides:
+/// the destination is a `__pyre_cast_instance(T)` result and the value is a
+/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Replace
+/// only that exact same-block cluster, preserving the source field order and
+/// values while retargeting each store to the destination.  The call's unit
+/// result, when still carried by MIR bookkeeping, becomes a `ConstNone` with
+/// the same `Void` representation.  Any indirect, cross-block,
+/// mismatched-owner, or incomplete spelling is left untouched to fail loud
+/// rather than guessing at a memory layout.
+pub fn lower_struct_ptr_writes(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> usize {
+    use crate::flowspace::model::Variable;
+
+    fn registered_layout<'a>(
+        owner: &str,
+        struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<&'a Vec<(String, ValueType)>> {
+        if let Some(exact) = struct_field_attrs.get(owner) {
+            return Some(exact);
+        }
+        let mut leaf_matches = struct_field_attrs
+            .iter()
+            .filter(|(key, _)| key.rsplit("::").next() == Some(owner));
+        let (_, only) = leaf_matches.next()?;
+        (leaf_matches.next().is_none()).then_some(only)
+    }
+
+    #[derive(Clone)]
+    struct Rewrite {
+        block: usize,
+        op: usize,
+        destination: Variable,
+        stores: Vec<(FieldDescriptor, LinkArg, ValueType)>,
+        result: Option<Variable>,
+    }
+
+    let mut rewrites = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                result_ty: ValueType::Void,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if args.len() != 2
+                || !segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["core", "ptr", "write"])
+            {
+                continue;
+            }
+            let destination = &args[0];
+            let aggregate = &args[1];
+            let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
+                match (&candidate.result, &candidate.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            ..
+                        },
+                    ) if result == destination
+                        && args.len() == 1
+                        && segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        && segments.len() == 2 =>
+                    {
+                        Some(segments[1].as_str())
+                    }
+                    _ => None,
+                }
+            });
+            let aggregate_owner = block.operations[..oi].iter().find_map(|candidate| {
+                match (&candidate.result, &candidate.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        },
+                    ) if result == aggregate => Some(name.as_str()),
+                    _ => None,
+                }
+            });
+            if destination_owner.is_none() || destination_owner != aggregate_owner {
+                continue;
+            }
+            let stores: Vec<_> = block.operations[..oi]
+                .iter()
+                .filter_map(|candidate| match &candidate.kind {
+                    OpKind::FieldWrite {
+                        base,
+                        field,
+                        value,
+                        ty,
+                    } if base == aggregate => Some((field.clone(), value.clone(), ty.clone())),
+                    _ => None,
+                })
+                .collect();
+            let Some(layout) = registered_layout(
+                destination_owner.expect("owner equality checked"),
+                struct_field_attrs,
+            ) else {
+                continue;
+            };
+            if !stores
+                .iter()
+                .map(|(field, _, _)| field.name.as_str())
+                .eq(layout.iter().map(|(name, _)| name.as_str()))
+            {
+                continue;
+            }
+            rewrites.push(Rewrite {
+                block: bi,
+                op: oi,
+                destination: destination.clone(),
+                stores,
+                result: op.result.clone(),
+            });
+        }
+    }
+
+    let rewritten = rewrites.len();
+    for rewrite in rewrites.into_iter().rev() {
+        let block = &mut graph.blocks[rewrite.block];
+        let mut replacement: Vec<_> = rewrite
+            .stores
+            .into_iter()
+            .map(|(field, value, ty)| SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: rewrite.destination.clone(),
+                    field,
+                    value,
+                    ty,
+                },
+            })
+            .collect();
+        if let Some(result) = rewrite.result {
+            replacement.push(SpaceOperation {
+                result: Some(result),
+                kind: OpKind::ConstNone,
+            });
+        }
+        block
+            .operations
+            .splice(rewrite.op..=rewrite.op, replacement);
+    }
+    rewritten
+}
+
 /// Fuse the boxing-constructor idiom into a native GC allocation.
 ///
 /// pyre's boxing constructors (`floatobject::w_float_new` etc.) are written

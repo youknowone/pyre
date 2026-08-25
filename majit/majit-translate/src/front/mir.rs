@@ -2858,11 +2858,17 @@ fn simplify_lowered_graph(
     // eagerly so the direct-scan passes see the same surface
     // `iterblocks()` exposes upstream.
     crate::model::clear_unreachable_blocks(graph);
+    // Rust's `ptr::write(raw as *mut T, T { .. })` is the source spelling of
+    // RPython's already-allocated object followed by one setfield per member.
+    // Lower that aggregate copy before allocation fusion so generic
+    // `core::ptr::write<T>` never becomes one shared FunctionDesc whose `T`
+    // argument would merge unrelated object classes.
+    let mut dirty = crate::model::lower_struct_ptr_writes(graph, struct_field_attrs) > 0;
     // Lower the boxing-constructor idiom `malloc_typed(W_FloatObject{…})`
     // to a native `NewWithVtable` + payload store before the dead-aggregate
     // sweep, which then reclaims the orphaned construct-on-stack ctor and
     // header field writes.
-    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -28511,6 +28517,61 @@ mod tests {
             narrowed_none,
             "the niche None arm must be the same nullable PyObject/W_Root repr as the Some arm"
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn struct_ptr_write_lowers_to_per_field_initialization() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for (name, owner, expected_fields) in [
+            ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
+            (
+                "w_long_from_raw",
+                "W_LongObject",
+                &["ob_header", "value"][..],
+            ),
+        ] {
+            let graph = super::lower_function(&llbc, name).expect("lower function");
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["core", "ptr", "write"])
+                }),
+                "{name}: generic core::ptr::write must not survive as a shared callee"
+            );
+            let destination = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|op| match (&op.result, &op.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        },
+                    ) if segments == &["__pyre_cast_instance", owner] => Some(result),
+                    _ => None,
+                })
+                .expect("typed raw allocation destination");
+            let fields: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite { base, field, .. } if base == destination => {
+                        Some(field.name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(fields, expected_fields, "{name}: source field order");
+        }
     }
 
     /// PyPy's `_match_keywords` indexes its small signature and argument
