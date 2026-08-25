@@ -11565,7 +11565,11 @@ pub fn compile_err_to_syntax_error(
 /// module locates itself by scanning `source`; a location the compiler reports
 /// for a parser diagnostic already counts characters and must not be passed
 /// through here.  The line and the span are the caller's to choose.
-fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize) -> usize {
+pub(crate) fn syntax_error_character_offset(
+    source: &str,
+    lineno: usize,
+    byte_offset: usize,
+) -> usize {
     if lineno == 0 || byte_offset == 0 {
         return byte_offset;
     }

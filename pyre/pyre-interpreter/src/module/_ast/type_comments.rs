@@ -30,6 +30,13 @@ const PREFIX: &[u8] = b"# type: ";
 /// `TYPE_IGNORE`.
 pub struct TypeComment {
     start: u32,
+    /// Where `text` begins.  `lexer.c` starts the token past the prefix, so
+    /// this is the position a diagnostic about the token reports.
+    text_start: u32,
+    /// Just past the last byte before the comment that is not a space, a tab
+    /// or a form feed.  A rule that takes the comment as its very next token
+    /// is satisfied exactly when the node it follows ends at or after this.
+    code_end: u32,
     pub lineno: u32,
     pub text: String,
 }
@@ -40,6 +47,8 @@ impl TypeComment {
     pub fn new(lineno: u32, text: String) -> Self {
         Self {
             start: 0,
+            text_start: 0,
+            code_end: 0,
             lineno,
             text,
         }
@@ -48,14 +57,21 @@ impl TypeComment {
 
 /// Every `# type:` comment a parse found, split by what the lexer would call
 /// it. The comments are consumed as they are attached; the grammar gives each
-/// one at most one home, and one it never reaches is simply dropped, which is
-/// what the lexer's own `TYPE_COMMENT` token does when no rule accepts it.
+/// one at most one home, and one it never reaches is a `TYPE_COMMENT` token
+/// standing where no rule accepts it, which is a parse failure -- see
+/// [`TypeComments::misplaced`].
 #[derive(Default)]
 pub struct TypeComments {
     comments: Vec<TypeComment>,
     attached: Vec<bool>,
     pub ignores: Vec<TypeComment>,
     line_starts: Vec<u32>,
+    /// The `def` whose header comment is followed by a second one before the
+    /// body, as (that second comment's offset, the first body statement's).
+    /// `python.gram:1364 invalid_double_type_comments` matches
+    /// `TYPE_COMMENT NEWLINE TYPE_COMMENT NEWLINE INDENT`, names the error
+    /// itself, and reports it against the `INDENT` it ends on.
+    double_def: Option<(u32, u32)>,
 }
 
 /// The offset just past `PREFIX` within `text`, or `None` when the comment is
@@ -117,6 +133,12 @@ pub fn collect(tokens: &[Token], source: &str) -> TypeComments {
         let lineno = out
             .line_starts
             .partition_point(|first| *first as usize <= start) as u32;
+        // The three bytes skipped are ASCII, so the last byte that is not one
+        // of them ends whatever character it belongs to.
+        let code_end = source.as_bytes()[..start]
+            .iter()
+            .rposition(|byte| !matches!(byte, b' ' | b'\t' | 0x0c))
+            .map_or(0, |index| index + 1) as u32;
         if is_ignore(&text.as_bytes()[at..]) {
             // The tag runs to the end of the comment, and takes the line break
             // with it when nothing but whitespace precedes the comment on its
@@ -134,12 +156,16 @@ pub fn collect(tokens: &[Token], source: &str) -> TypeComments {
             }
             out.ignores.push(TypeComment {
                 start: start as u32,
+                text_start: (start + at) as u32,
+                code_end,
                 lineno,
                 text: tag,
             });
         } else {
             out.comments.push(TypeComment {
                 start: start as u32,
+                text_start: (start + at) as u32,
+                code_end,
                 lineno,
                 text: text[at..].to_owned(),
             });
@@ -164,14 +190,138 @@ impl TypeComments {
         Some(self.comments[index].text.as_str().into())
     }
 
-    /// The first unattached comment on the same line as `offset`, consumed.
+    /// The unattached comment standing directly after `offset`, consumed.
     ///
-    /// An assignment takes its comment before the line break that ends the
-    /// statement, so the span runs from the value's end to the next line.
-    fn take_to_line_end(&mut self, offset: u32) -> Option<Box<str>> {
-        let next = self.line_starts.partition_point(|first| *first <= offset);
-        let to = self.line_starts.get(next).copied().unwrap_or(u32::MAX);
-        self.take(offset, to)
+    /// An assignment's rule reads its `TYPE_COMMENT` straight after the value,
+    /// so the comment has to be the next token: in `x = 1; y = 2  # type: int`
+    /// it belongs to the second assignment and in `x = 1;  # type: int` to
+    /// neither.  Only spaces and tabs may stand between, which a line break
+    /// is not -- a comment on the following line is nobody's.
+    fn take_adjacent(&mut self, offset: u32) -> Option<Box<str>> {
+        let index = self
+            .comments
+            .iter()
+            .enumerate()
+            .find(|(index, comment)| {
+                !self.attached[*index] && comment.start >= offset && comment.code_end <= offset
+            })
+            .map(|(index, _)| index)?;
+        self.attached[index] = true;
+        Some(self.comments[index].text.as_str().into())
+    }
+
+    /// The one-based line `offset` falls on.
+    fn line_of(&self, offset: u32) -> u32 {
+        self.line_starts.partition_point(|first| *first <= offset) as u32
+    }
+
+    /// Record a `def` that has taken a header comment and still has one left
+    /// before its body, which `invalid_double_type_comments` names.
+    ///
+    /// The header one is what makes it that rule rather than a missing block:
+    /// a `def` whose only comment already stands on its own line matches the
+    /// `NEWLINE TYPE_COMMENT` alternative, and a second one there fails as
+    /// `expected an indented block` instead.
+    fn note_double_def(&mut self, header_line: u32, from: u32, to: u32) {
+        if self.double_def.is_some() {
+            return;
+        }
+        let in_span = |comment: &TypeComment| comment.start >= from && comment.start < to;
+        let took_header =
+            self.comments
+                .iter()
+                .zip(self.attached.iter())
+                .any(|(comment, attached)| {
+                    *attached && comment.lineno == header_line && in_span(comment)
+                });
+        if !took_header {
+            return;
+        }
+        if let Some(second) = self
+            .comments
+            .iter()
+            .zip(self.attached.iter())
+            .find(|(comment, attached)| !**attached && in_span(comment))
+            .map(|(comment, _)| comment.start)
+        {
+            self.double_def = Some((second, to));
+        }
+    }
+
+    /// The source line `lineno` names, as the tokenizer would hand it over.
+    ///
+    /// File input has a line break appended to a source that lacks one, so
+    /// its reported line always ends in `\n`; `eval` and `single` input
+    /// report the line as it stands.
+    fn line_text(&self, source: &str, lineno: u32, file_input: bool) -> String {
+        let line_start = self.line_starts[lineno as usize - 1] as usize;
+        let mut line = source[line_start..]
+            .split_inclusive('\n')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if file_input && !line.ends_with('\n') {
+            line.push('\n');
+        }
+        line
+    }
+
+    /// The `SyntaxError` a comment the grammar had no place for owes, if any.
+    ///
+    /// A `TYPE_COMMENT` is a token, so a rule that does not accept one leaves
+    /// the parser looking at a token it cannot shift and the parse fails
+    /// there: `x += 1  # type: int` and `x: int = 1  # type: int` are both
+    /// refused, while the five accepted positions are not. The failure is the
+    /// parser's ordinary one -- `invalid syntax`, spanning the token, which is
+    /// the type text and not the `#` -- except for the one the grammar names
+    /// itself, a second comment on a `def` that already took one.
+    ///
+    /// Answers the first such comment in source order, which is the one the
+    /// parser would have reached first.
+    pub fn misplaced(&self, source: &str, file_input: bool) -> Option<crate::PyError> {
+        let comment = self
+            .comments
+            .iter()
+            .zip(self.attached.iter())
+            .find(|(_, attached)| !**attached)
+            .map(|(comment, _)| comment)?;
+        // `invalid_double_type_comments` ends on the `INDENT`, so it reports
+        // the body's indent as a column and carries no end.
+        let named = self
+            .double_def
+            .filter(|(second, _)| *second == comment.start)
+            .map(|(_, body)| (self.line_of(body), body));
+        let (message, lineno, column, end_column) = match named {
+            Some((lineno, body)) => {
+                let line_start = self.line_starts[lineno as usize - 1] as usize;
+                let indent = source[line_start..body as usize].chars().count() as i64;
+                ("Cannot have two type comments on def", lineno, indent, -1)
+            }
+            None => {
+                let line_start = self.line_starts[comment.lineno as usize - 1] as usize;
+                let column = crate::builtins::syntax_error_character_offset(
+                    source,
+                    comment.lineno as usize,
+                    comment.text_start as usize - line_start + 1,
+                ) as i64;
+                (
+                    "invalid syntax",
+                    comment.lineno,
+                    column,
+                    column + comment.text.chars().count() as i64,
+                )
+            }
+        };
+        Some(crate::PyError::syntax_error_located(
+            message,
+            // `compile()` overwrites this with the name it was given.
+            rustpython_wtf8::Wtf8::new(""),
+            lineno as i64,
+            column,
+            lineno as i64,
+            end_column,
+            Some(&self.line_text(source, lineno, file_input)),
+        ))
     }
 
     /// Attach every comment the grammar has a place for, and answer the
@@ -191,7 +341,7 @@ impl TypeComments {
     fn stmt(&mut self, stmt: &mut ast::Stmt) {
         match stmt {
             ast::Stmt::Assign(node) => {
-                node.runtime_type_comment = self.take_to_line_end(node.range.end().into());
+                node.runtime_type_comment = self.take_adjacent(node.range.end().into());
             }
             ast::Stmt::For(node) => {
                 let from = node.iter.range().end().into();
@@ -222,7 +372,15 @@ impl TypeComments {
                     .map(|returns| returns.range().end().into())
                     .unwrap_or_else(|| node.parameters.range().end().into());
                 if let Some(to) = node.body.first().map(|s| s.range().start().into()) {
+                    // The rule reads the header's comment before the line
+                    // break, so only that one leaves the second one redundant:
+                    // a `def` whose first comment already stands on its own
+                    // line fails as a missing block instead.
+                    let header_line = self.line_of(from);
                     node.runtime_type_comment = self.take(from, to);
+                    if node.runtime_type_comment.is_some() {
+                        self.note_double_def(header_line, from, to);
+                    }
                 }
                 self.stmts(&mut node.body);
             }

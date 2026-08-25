@@ -1869,8 +1869,14 @@ pub fn parse_to_object_with_opts(
     // the token list the parser hands back beside the tree.
     let mut collected = super::type_comments::TypeComments::default();
     let mut module = match mode {
-        crate::compile::Mode::Eval => parser::parse_expression(source)
-            .map(|parsed| ast::Mod::Expression(parsed.into_syntax())),
+        // An expression has none of the five positions a `TYPE_COMMENT` is
+        // accepted in, so the comments are collected here only to be refused.
+        crate::compile::Mode::Eval => parser::parse_expression(source).map(|parsed| {
+            if type_comments {
+                collected = super::type_comments::collect(parsed.tokens(), source);
+            }
+            ast::Mod::Expression(parsed.into_syntax())
+        }),
         crate::compile::Mode::Exec
         | crate::compile::Mode::Single
         | crate::compile::Mode::BlockExpr => parser::parse_module(source).map(|parsed| {
@@ -1883,6 +1889,15 @@ pub fn parse_to_object_with_opts(
     .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
     if type_comments {
         collected.attach(&mut module);
+        // What attachment left over is a token no rule accepted, which the
+        // parser would have failed on.
+        let file_input = matches!(
+            mode,
+            crate::compile::Mode::Exec | crate::compile::Mode::BlockExpr
+        );
+        if let Some(error) = collected.misplaced(source, file_input) {
+            return Err(error);
+        }
     }
     preprocess_module(&mut module, mode, opts, syntax_check_only);
 
