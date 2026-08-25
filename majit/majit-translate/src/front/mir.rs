@@ -2946,7 +2946,7 @@ impl std::error::Error for LowerError {}
 /// name it explicitly instead. Without a name `arraydescrof_concrete`
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
-const PYOBJECT_GCARRAY_TYPE_ID: &str = "pyre::pyobject_gcarray";
+const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
 
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
@@ -7608,7 +7608,7 @@ impl<'a> Lowering<'a> {
                     // every one and never lands on that fallback.
                     let array_type_id = if workspace_index {
                         matches!(item_ty, ValueType::Ref(_))
-                            .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string())
+                            .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
                     } else {
                         // `get_array_descr` keys the descr cache on the ARRAY
                         // lltype, so two sites naming the same element name the
@@ -7704,7 +7704,7 @@ impl<'a> Lowering<'a> {
                             base: args[0].clone(),
                             index: args[1].clone(),
                             item_ty: ValueType::Ref(None),
-                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
                             pure: false,
                         },
@@ -7716,7 +7716,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
-                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -7749,7 +7749,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             value: LinkArg::Value(args[2].clone()),
                             item_ty: ValueType::Ref(None),
-                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
                         },
                     });
@@ -7802,7 +7802,7 @@ impl<'a> Lowering<'a> {
                     let elem_array_type_id = elem_tyref
                         .as_ref()
                         .is_some_and(|ty| output_type_is_objectptr(ty, self.llbc))
-                        .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string());
+                        .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string());
                     let elem_a = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

@@ -1458,7 +1458,7 @@ impl MiniMarkGC {
     /// on the allocation fast path — the same shape measured at −15% in the GC
     /// box-probe experiment — so the tid witness stands.
     #[inline]
-    fn registered_pyobject_header(&self, addr: usize) -> Option<*mut GcHeader> {
+    fn registered_external_header(&self, addr: usize) -> Option<*mut GcHeader> {
         if addr < GcHeader::SIZE || !addr.is_multiple_of(GcHeader::ALIGN) {
             return None;
         }
@@ -3441,7 +3441,7 @@ impl MiniMarkGC {
         }
     }
 
-    /// Whether `pyobject`'s count makes it root its linked object.
+    /// Whether `mirror`'s count makes it root its linked object.
     ///
     /// `incminimark.py:3263` is the bare `rc != REFCNT_FROM_PYPY` — every
     /// reference above the link share is one C holds, and holding it is what
@@ -3449,16 +3449,16 @@ impl MiniMarkGC {
     /// another block in the census supplies is not one from outside the heap,
     /// and whether *that* block's own object lives is settled by the trace, in
     /// [`Self::mark_c_edges`], rather than assumed here.
-    fn rrc_roots_link(&self, pyobject: usize) -> bool {
-        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
+    fn rrc_roots_link(&self, mirror: usize) -> bool {
+        let rc = unsafe { (*rawrefcount::pyobj(mirror)).ob_refcnt };
         let held = rc - rawrefcount::REFCNT_FROM_PYPY;
-        held > self.rrc.c_discount.get(&pyobject).copied().unwrap_or(0)
+        held > self.rrc.c_discount.get(&mirror).copied().unwrap_or(0)
     }
 
     /// The interpreter object a census entry names, or zero once the collector
     /// has cleared the link.
-    fn rrc_linked_object(pyobject: usize) -> usize {
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    fn rrc_linked_object(mirror: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link }
     }
 
     /// Whether a major has decided `obj` lives — the question
@@ -3524,17 +3524,17 @@ impl MiniMarkGC {
     /// The drain is an action the embedder runs between bytecodes, and a second
     /// collection can reach here before it has: freeing the block there would
     /// leave the queue naming one whose references are already gone.
-    fn rrc_owes_finalizer(&mut self, pyobject: usize) -> bool {
-        if self.rrc.finalize_pending.contains(&pyobject) {
+    fn rrc_owes_finalizer(&mut self, mirror: usize) -> bool {
+        if self.rrc.finalize_pending.contains(&mirror) {
             return true;
         }
         let Some(claim) = self.rrc.finalizer_claim else {
             return false;
         };
-        if !claim(pyobject) {
+        if !claim(mirror) {
             return false;
         }
-        self.rrc.finalize_pending.push_back(pyobject);
+        self.rrc.finalize_pending.push_back(mirror);
         true
     }
 
@@ -3570,9 +3570,9 @@ impl MiniMarkGC {
                 RrcList::P => std::mem::take(&mut self.rrc.p_list_old),
                 RrcList::O => std::mem::take(&mut self.rrc.o_list_old),
             };
-            for &pyobject in &list {
-                let obj = Self::rrc_linked_object(pyobject);
-                if obj == 0 || self.rrc_object_marked(obj) || !self.rrc_owes_finalizer(pyobject) {
+            for &mirror in &list {
+                let obj = Self::rrc_linked_object(mirror);
+                if obj == 0 || self.rrc_object_marked(obj) || !self.rrc_owes_finalizer(mirror) {
                     continue;
                 }
                 self.seed_major_root(GcRef(obj), "rrc_finalizer");
@@ -3678,12 +3678,12 @@ impl MiniMarkGC {
                 RrcList::P => std::mem::take(&mut self.rrc.p_list_young),
                 RrcList::O => std::mem::take(&mut self.rrc.o_list_young),
             };
-            for &pyobject in &list {
-                let obj = Self::rrc_linked_object(pyobject);
+            for &mirror in &list {
+                let obj = Self::rrc_linked_object(mirror);
                 if obj == 0
                     || self.rrc_young_object_alive(obj)
                     || !self.is_nursery_object_start(obj)
-                    || !self.rrc_owes_finalizer(pyobject)
+                    || !self.rrc_owes_finalizer(mirror)
                 {
                     continue;
                 }
@@ -3711,18 +3711,18 @@ impl MiniMarkGC {
     /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYPY`] to
     /// the mirror's count: that share is what this link is worth, and what
     /// [`Self::_rrc_free`] gives back when the object dies.
-    pub fn rawrefcount_create_link_pypy(&mut self, obj: usize, pyobject: usize) {
+    pub fn rawrefcount_create_link_pypy(&mut self, obj: usize, mirror: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link = obj };
         if self.is_in_nursery(obj) || self.is_young_rawmalloced(obj) {
-            self.rrc.p_list_young.push(pyobject);
+            self.rrc.p_list_young.push(mirror);
         } else {
-            self.rrc.p_list_old.push(pyobject);
+            self.rrc.p_list_old.push(mirror);
         }
         if self.is_in_nursery(obj) {
-            self.rrc.p_dict_nurs.insert(obj, pyobject);
+            self.rrc.p_dict_nurs.insert(obj, mirror);
         } else {
-            self.rrc.p_dict.insert(obj, pyobject);
+            self.rrc.p_dict.insert(obj, mirror);
         }
     }
 
@@ -3730,14 +3730,14 @@ impl MiniMarkGC {
     ///
     /// The mirror owns the interpreter object here, so no trace pass roots the
     /// object on the mirror's behalf and there is no identity table to keep.
-    pub fn rawrefcount_create_link_pyobj(&mut self, obj: usize, pyobject: usize) {
+    pub fn rawrefcount_create_link_pyobj(&mut self, obj: usize, mirror: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
         if self.is_in_nursery(obj) || self.is_young_rawmalloced(obj) {
-            self.rrc.o_list_young.push(pyobject);
+            self.rrc.o_list_young.push(mirror);
         } else {
-            self.rrc.o_list_old.push(pyobject);
+            self.rrc.o_list_old.push(mirror);
         }
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link = obj };
         // there is no rrc_o_dict
     }
 
@@ -3749,9 +3749,9 @@ impl MiniMarkGC {
     /// something it can recognise instead of a freed address.  A mirror is off
     /// every list by the time this is called, so no trace pass can mistake the
     /// sentinel for a reference.
-    pub fn rawrefcount_mark_deallocating(&mut self, marker: usize, pyobject: usize) {
+    pub fn rawrefcount_mark_deallocating(&mut self, marker: usize, mirror: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = marker };
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link = marker };
     }
 
     /// incminimark.py `rawrefcount_from_obj`.  Zero when unlinked.
@@ -3765,8 +3765,8 @@ impl MiniMarkGC {
     }
 
     /// incminimark.py `rawrefcount_to_obj`.
-    pub fn rawrefcount_to_obj(&self, pyobject: usize) -> usize {
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    pub fn rawrefcount_to_obj(&self, mirror: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link }
     }
 
     /// The next mirror whose finalizer the drain owes a call, or zero.
@@ -3816,8 +3816,8 @@ impl MiniMarkGC {
     fn rrc_minor_collection_trace(&mut self) {
         self.rrc.p_dict_nurs.clear();
         let young = std::mem::take(&mut self.rrc.p_list_young);
-        for &pyobject in &young {
-            self._rrc_minor_trace(pyobject);
+        for &mirror in &young {
+            self._rrc_minor_trace(mirror);
         }
         self.rrc.p_list_young = young;
     }
@@ -3828,13 +3828,13 @@ impl MiniMarkGC {
     /// upstream drags the object out through a scratch cell, and
     /// [`Self::_rrc_minor_free`] then reads the forwarding bit at the *old*
     /// address to decide whether the mirror survives.
-    fn _rrc_minor_trace(&mut self, pyobject: usize) {
-        if !self.rrc_roots_link(pyobject) {
+    fn _rrc_minor_trace(&mut self, mirror: usize) {
+        if !self.rrc_roots_link(mirror) {
             // Nothing outside the census references this mirror, so the linked
             // object may die.
             return;
         }
-        let mut root = GcRef(unsafe { (*rawrefcount::pyobj(pyobject)).ob_link });
+        let mut root = GcRef(unsafe { (*rawrefcount::pyobj(mirror)).ob_link });
         debug_assert!(!root.is_null(), "a mirror on the P list has a link");
         self.drag_out_root(&mut root);
     }
@@ -3847,21 +3847,21 @@ impl MiniMarkGC {
         debug_assert!(self.rrc.p_dict_nurs.is_empty(), "p_dict_nurs not empty 1");
         let mut young = std::mem::take(&mut self.rrc.p_list_young);
         let mut still_young = Vec::new();
-        while let Some(pyobject) = young.pop() {
-            self._rrc_minor_free(pyobject, RrcList::P, &mut still_young);
+        while let Some(mirror) = young.pop() {
+            self._rrc_minor_free(mirror, RrcList::P, &mut still_young);
         }
         self.rrc.p_list_young = still_young;
         let mut young = std::mem::take(&mut self.rrc.o_list_young);
         let mut still_young = Vec::new();
-        while let Some(pyobject) = young.pop() {
-            self._rrc_minor_free(pyobject, RrcList::O, &mut still_young);
+        while let Some(mirror) = young.pop() {
+            self._rrc_minor_free(mirror, RrcList::O, &mut still_young);
         }
         self.rrc.o_list_young = still_young;
     }
 
     /// incminimark.py `_rrc_minor_free`.
-    fn _rrc_minor_free(&mut self, pyobject: usize, list: RrcList, still_young: &mut Vec<usize>) {
-        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+    fn _rrc_minor_free(&mut self, mirror: usize, list: RrcList, still_young: &mut Vec<usize>) {
+        let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
         // incminimark.py:3300-3312: a young raw-malloced target survives
         // without moving and is recognised by GCFLAG_VISITED_RMY rather than by
         // a forwarding pointer. Its link already names its final address, so a
@@ -3870,10 +3870,10 @@ impl MiniMarkGC {
             if unsafe { (*header_of(obj)).has_flag(flags::VISITED_RMY) } {
                 match list {
                     RrcList::P => {
-                        self.rrc.p_dict.insert(obj, pyobject);
-                        self.rrc.p_list_old.push(pyobject);
+                        self.rrc.p_dict.insert(obj, mirror);
+                        self.rrc.p_list_old.push(mirror);
                     }
-                    RrcList::O => self.rrc.o_list_old.push(pyobject),
+                    RrcList::O => self.rrc.o_list_old.push(mirror),
                 }
             } else {
                 if list == RrcList::P {
@@ -3882,7 +3882,7 @@ impl MiniMarkGC {
                     // entry has to be removed by hand.
                     self.rrc.p_dict.remove(&obj);
                 }
-                self._rrc_free(pyobject);
+                self._rrc_free(mirror);
             }
             return;
         }
@@ -3893,15 +3893,15 @@ impl MiniMarkGC {
         let hdr = unsafe { header_of(obj) };
         if unsafe { (*hdr).is_forwarded() } {
             let moved = unsafe { GcHeader::forwarding_address(hdr) };
-            unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = moved };
+            unsafe { (*rawrefcount::pyobj(mirror)).ob_link = moved };
             match list {
                 RrcList::P => {
                     // It was keyed in `p_dict_nurs`, which this collection
                     // emptied; at its new address it belongs in `p_dict`.
-                    self.rrc.p_dict.insert(moved, pyobject);
-                    self.rrc.p_list_old.push(pyobject);
+                    self.rrc.p_dict.insert(moved, mirror);
+                    self.rrc.p_list_old.push(mirror);
                 }
-                RrcList::O => self.rrc.o_list_old.push(pyobject),
+                RrcList::O => self.rrc.o_list_old.push(mirror),
             }
         } else if self.is_surviving_pinned(obj) {
             // A pinned object that was reached survives *in place*
@@ -3918,11 +3918,11 @@ impl MiniMarkGC {
             // VISITED is still set on this collection's surviving pins here,
             // so an unreached pinned object still falls through to the free.
             if list == RrcList::P {
-                self.rrc.p_dict_nurs.insert(obj, pyobject);
+                self.rrc.p_dict_nurs.insert(obj, mirror);
             }
-            still_young.push(pyobject);
+            still_young.push(mirror);
         } else {
-            self._rrc_free(pyobject);
+            self._rrc_free(mirror);
         }
     }
 
@@ -3933,8 +3933,8 @@ impl MiniMarkGC {
     /// port — nothing here creates a light mirror — and the immortal branch
     /// (:3326) is unreachable, because a count above the link share forces the
     /// linked object alive in both trace passes.
-    fn _rrc_free(&mut self, pyobject: usize) {
-        let header = rawrefcount::pyobj(pyobject);
+    fn _rrc_free(&mut self, mirror: usize) {
+        let header = rawrefcount::pyobj(mirror);
         let mut rc = unsafe { (*header).ob_refcnt };
         debug_assert!(
             rc < rawrefcount::REFCNT_IMMORTAL,
@@ -3952,7 +3952,7 @@ impl MiniMarkGC {
             // back and expect the deallocator to have run the moment the count
             // reached 0.  Queue it and leave it at 1, so the drain's own
             // release is what frees it.
-            self.rrc.dealloc_pending.push(pyobject);
+            self.rrc.dealloc_pending.push(mirror);
             rc = 1;
         } else {
             // The link died and references are left over, so they come from
@@ -3969,18 +3969,18 @@ impl MiniMarkGC {
     /// incminimark.py `rrc_major_collection_trace`.
     fn rrc_major_collection_trace(&mut self) {
         let old = std::mem::take(&mut self.rrc.p_list_old);
-        for &pyobject in &old {
-            self._rrc_major_trace(pyobject);
+        for &mirror in &old {
+            self._rrc_major_trace(mirror);
         }
         self.rrc.p_list_old = old;
     }
 
     /// incminimark.py `_rrc_major_trace`.
-    fn _rrc_major_trace(&mut self, pyobject: usize) {
-        if !self.rrc_roots_link(pyobject) {
+    fn _rrc_major_trace(&mut self, mirror: usize) {
+        if !self.rrc_roots_link(mirror) {
             return;
         }
-        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+        let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
         self.seed_major_root(GcRef(obj), "rrc_major_trace");
         self.drain_gray_stack();
     }
@@ -3998,11 +3998,11 @@ impl MiniMarkGC {
     fn rrc_nonmoving_major_trace_young(&mut self) {
         debug_assert!(self.oldgen_nonmoving_active);
         let young = std::mem::take(&mut self.rrc.p_list_young);
-        for &pyobject in &young {
-            if !self.rrc_roots_link(pyobject) {
+        for &mirror in &young {
+            if !self.rrc_roots_link(mirror) {
                 continue;
             }
-            let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+            let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
             self.seed_major_root(GcRef(obj), "rrc_nonmoving_major_young");
             self.drain_gray_stack();
         }
@@ -4027,24 +4027,24 @@ impl MiniMarkGC {
         self.rrc.p_dict.clear();
         let mut old = std::mem::take(&mut self.rrc.p_list_old);
         let mut surviving = Vec::with_capacity(old.len());
-        while let Some(pyobject) = old.pop() {
-            self._rrc_major_free(pyobject, &mut surviving, RrcList::P);
+        while let Some(mirror) = old.pop() {
+            self._rrc_major_free(mirror, &mut surviving, RrcList::P);
         }
         self.rrc.p_list_old = surviving;
         let mut old = std::mem::take(&mut self.rrc.o_list_old);
         let mut surviving = Vec::with_capacity(old.len());
-        while let Some(pyobject) = old.pop() {
-            self._rrc_major_free(pyobject, &mut surviving, RrcList::O);
+        while let Some(mirror) = old.pop() {
+            self._rrc_major_free(mirror, &mut surviving, RrcList::O);
         }
         self.rrc.o_list_old = surviving;
     }
 
     /// incminimark.py `_rrc_major_free`.
-    fn _rrc_major_free(&mut self, pyobject: usize, surviving: &mut Vec<usize>, list: RrcList) {
+    fn _rrc_major_free(&mut self, mirror: usize, surviving: &mut Vec<usize>, list: RrcList) {
         // incminimark.py:3395-3401 — the mirror survives exactly if its object
         // did: VISITED means marking reached it, NO_HEAP_PTRS an immortal
         // object marking never has to reach.
-        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+        let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
         let alive = if !self.is_managed_heap_object(obj) {
             // Upstream reaches the flag test unconditionally because every
             // RPython GC object has a header, prebuilt ones included — which is
@@ -4058,12 +4058,12 @@ impl MiniMarkGC {
             unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) }
         };
         if alive {
-            surviving.push(pyobject);
+            surviving.push(mirror);
             if list == RrcList::P {
-                self.rrc.p_dict.insert(obj, pyobject);
+                self.rrc.p_dict.insert(obj, mirror);
             }
         } else {
-            self._rrc_free(pyobject);
+            self._rrc_free(mirror);
         }
     }
 
@@ -7207,7 +7207,7 @@ impl MiniMarkGC {
             return;
         }
         // `malloc_typed` bootstrap objects are incminimark's prebuilt family.
-        // The witness is `registered_pyobject_header`, not vtable membership
+        // The witness is `registered_external_header`, not vtable membership
         // alone: `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
         // `Box::into_raw` when no GC is installed, and those objects carry the
         // very same registered `ob_header` at offset 0 with NO preceding
@@ -7215,7 +7215,7 @@ impl MiniMarkGC {
         // front of the box and — if its `TRACK_YOUNG_PTRS` bit happens to be
         // set — has `remember_young_pointer` write flags back into that
         // metadata. The tid equality is what separates the two families.
-        let Some(hdr) = self.registered_pyobject_header(obj.0) else {
+        let Some(hdr) = self.registered_external_header(obj.0) else {
             return;
         };
         if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
@@ -10664,7 +10664,7 @@ mod tests {
     }
 
     #[test]
-    fn write_barrier_ignores_headerless_pyobject_with_registered_vtable() {
+    fn write_barrier_ignores_headerless_external_object_with_registered_vtable() {
         // `w_tuple_new` / `w_specialisedtuple_new_*` fall back to a bare
         // `Box::into_raw` when `try_gc_alloc_stable` finds no installed
         // collector, and the struct they build still starts with `ob_header` —
@@ -10673,7 +10673,7 @@ mod tests {
         // bootstrap-prebuilt arm; a vtable-only test there would read the
         // allocator word in FRONT of the box as a `GcHeader` and, on a set
         // `TRACK_YOUNG_PTRS` bit, have `remember_young_pointer` write flags
-        // back into that metadata. `registered_pyobject_header`'s tid equality
+        // back into that metadata. `registered_external_header`'s tid equality
         // is what rejects it.
         let mut gc = test_gc(1024);
         let tid = gc.register_type(TypeInfo::simple(2 * std::mem::size_of::<usize>()));
@@ -14366,12 +14366,12 @@ cache size\t: 8192 kB\n";
         })) as usize
     }
 
-    fn mirror_refcnt(pyobject: usize) -> isize {
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt }
+    fn mirror_refcnt(mirror: usize) -> isize {
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_refcnt }
     }
 
-    fn mirror_link(pyobject: usize) -> usize {
-        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    fn mirror_link(mirror: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(mirror)).ob_link }
     }
 
     thread_local! {

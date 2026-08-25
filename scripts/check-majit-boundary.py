@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject pyre-owned identifiers and filenames in the majit subtree."""
+"""Reject consumer-object-model identifiers and filenames in the majit subtree."""
 
 from pathlib import Path
 import os
@@ -13,10 +13,10 @@ TOKEN = re.compile(r'//|/\*|r(#{0,255})"|"|[A-Za-z_][A-Za-z0-9_]*')
 
 
 def is_runtime_owned(name: str) -> bool:
-    # Match the project's conventional lower-, upper-, and CamelCase spellings
-    # without misclassifying Python/RPython names such as `PyResult` and
-    # `GetRpyReferentsFn`.
-    return "pyre" in name or "Pyre" in name or "PYRE" in name
+    # Match project and object-model spellings without misclassifying names
+    # such as `PyResult` and `GetRpyReferentsFn`.
+    folded = name.casefold().replace("_", "")
+    return "pyre" in name or "Pyre" in name or "PYRE" in name or "pyobject" in folded
 
 
 def code_identifiers(source: str):

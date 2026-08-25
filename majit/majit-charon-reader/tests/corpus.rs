@@ -28,7 +28,7 @@ fn loads_fixture_corpus() {
     //
     // + 10 for the header-first object model: `w_object_type`, `w_new_int`,
     // `w_new_type_only_int`, `w_number_add`, `w_int_add`,
-    // `lltype::malloc_typed`, the fixture's `pyobject::get_instantiate`, and
+    // `lltype::malloc_typed`, the fixture's `object_model::get_instantiate`, and
     // the initializer bodies for `INT_CLASS`, `DOUBLE_CLASS`, and
     // `_immutable_fields_W_IntObject`.
     //
