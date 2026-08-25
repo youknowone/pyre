@@ -360,6 +360,9 @@ PyAPI_FUNC(void *) PyModule_GetState(PyObject *);
 PyAPI_FUNC(PyObject *) PyModule_New(const char *);
 PyAPI_FUNC(PyObject *) PyModule_NewObject(PyObject *);
 PyAPI_FUNC(int) PyModule_SetDocString(PyObject *, const char *);
+PyAPI_FUNC(int) PyState_AddModule(PyObject *, PyModuleDef *);
+PyAPI_FUNC(PyObject *) PyState_FindModule(PyModuleDef *);
+PyAPI_FUNC(int) PyState_RemoveModule(PyModuleDef *);
 
 /* cpyext/number.rs */
 PyAPI_FUNC(int) PyIndex_Check(PyObject *);

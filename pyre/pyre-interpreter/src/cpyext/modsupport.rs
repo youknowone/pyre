@@ -47,6 +47,7 @@ static MODULE_FIELDS: super::ForkMutex<ModuleTable> = super::ForkMutex::new(
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { MODULE_FIELDS.reinit_after_fork() };
+    unsafe { MODULES_BY_INDEX.reinit_after_fork() };
 }
 
 /// The pair a module has recorded, all zero for one that has recorded none.
@@ -84,6 +85,121 @@ fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
 /// and an extension may still hold the address.
 pub(super) fn forget_module_fields(mirror: usize) {
     MODULE_FIELDS.lock().remove(&mirror);
+}
+
+/// The single-phase modules `PyState_AddModule` has filed, one slot per module
+/// index (`MODULES_BY_INDEX` in `import.c`).  Slot 0 is never used, because a
+/// def carries index 0 until `PyModuleDef_Init` stamps it; an empty slot is
+/// upstream's `None`.
+///
+/// A slot owns its reference, as upstream's list does, so a module filed here
+/// outlives every other name for it.
+static MODULES_BY_INDEX: super::ForkMutex<Vec<usize>> = super::ForkMutex::new(Vec::new());
+
+/// The index a def is filed under (`_get_module_index_from_def`).
+unsafe fn module_index(def: *mut CPyModuleDef) -> isize {
+    unsafe { (*def).m_base.m_index }
+}
+
+/// `_modules_by_index_check` — why an index cannot be read or cleared, or
+/// `None` when it can.
+fn modules_by_index_check(table: &[usize], index: isize) -> Option<&'static str> {
+    if index <= 0 {
+        return Some("invalid module index");
+    }
+    if index as usize >= table.len() {
+        return Some("Module index out of bounds.");
+    }
+    None
+}
+
+/// `PyState_FindModule(def)` — the module filed under a def's index, borrowed.
+///
+/// A def with slots is multi-phase and files nothing, so it answers NULL
+/// rather than reading a slot another def could own.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyState_FindModule(def: *mut CPyModuleDef) -> *mut CPyObject {
+    if def.is_null() {
+        return std::ptr::null_mut();
+    }
+    if unsafe { !(*def).m_slots.is_null() } {
+        return std::ptr::null_mut();
+    }
+    let index = unsafe { module_index(def) };
+    let table = MODULES_BY_INDEX.lock();
+    if modules_by_index_check(&table, index).is_some() {
+        return std::ptr::null_mut();
+    }
+    table[index as usize] as *mut CPyObject
+}
+
+/// `PyState_AddModule(module, def)` — file a single-phase module under its
+/// def's index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyState_AddModule(
+    module: *mut CPyObject,
+    def: *mut CPyModuleDef,
+) -> c_int {
+    if def.is_null() {
+        super::pyerrors::fatal_error(None, "module definition is NULL");
+    }
+    if unsafe { !(*def).m_slots.is_null() } {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyState_AddModule called on module with slots",
+        ));
+        return -1;
+    }
+    let index = unsafe { module_index(def) };
+    let mut table = MODULES_BY_INDEX.lock();
+    if index > 0 && (index as usize) < table.len() && table[index as usize] == module as usize {
+        super::pyerrors::fatal_error(
+            Some("PyState_AddModule"),
+            &format!("module {module:p} already added"),
+        );
+    }
+    // `_modules_by_index_set` asserts a positive index rather than refusing
+    // one: a def reaching here with 0 has skipped `PyModuleDef_Init`, and the
+    // slot it then writes is the one every reader rejects.
+    debug_assert!(index > 0, "PyState_AddModule on an uninitialized def");
+    if table.len() <= index as usize {
+        table.resize(index as usize + 1, 0);
+    }
+    let previous = std::mem::replace(&mut table[index as usize], module as usize);
+    drop(table);
+    unsafe { super::pyobject::incref(module) };
+    if previous != 0 {
+        unsafe { super::pyobject::decref(previous as *mut CPyObject) };
+    }
+    0
+}
+
+/// `PyState_RemoveModule(def)` — empty the slot a def's index owns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyState_RemoveModule(def: *mut CPyModuleDef) -> c_int {
+    if def.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    if unsafe { !(*def).m_slots.is_null() } {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyState_RemoveModule called on module with slots",
+        ));
+        return -1;
+    }
+    let index = unsafe { module_index(def) };
+    let mut table = MODULES_BY_INDEX.lock();
+    if let Some(err) = modules_by_index_check(&table, index) {
+        drop(table);
+        super::pyerrors::fatal_error(None, err);
+    }
+    let previous = std::mem::replace(&mut table[index as usize], 0);
+    drop(table);
+    if previous != 0 {
+        unsafe { super::pyobject::decref(previous as *mut CPyObject) };
+    }
+    0
 }
 
 static NEXT_MODULE_INDEX: AtomicIsize = AtomicIsize::new(1);
@@ -1113,6 +1229,9 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyModule_Create2 as *const ());
     std::hint::black_box(PyModule_GetDict as *const ());
     std::hint::black_box(PyModule_GetState as *const ());
+    std::hint::black_box(PyState_AddModule as *const ());
+    std::hint::black_box(PyState_FindModule as *const ());
+    std::hint::black_box(PyState_RemoveModule as *const ());
     std::hint::black_box(PyModule_GetDef as *const ());
     std::hint::black_box(PyModule_AddObject as *const ());
     std::hint::black_box(PyModule_AddObjectRef as *const ());
