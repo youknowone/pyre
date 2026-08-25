@@ -2830,6 +2830,30 @@ extern "C" fn jit_frame_f_lineno_at(frame: i64, last_instr: i64) -> i64 {
 /// same `loops_compiled`, `loops_aborted` and `guard_failures`, so the
 /// difference is the emission and not one arm compiling less.
 ///
+/// The call states an empty `EffectInfo` descr set, which is not a claim that
+/// the leaf reads nothing: `make_call_descr_sized` panics on a non-empty raw
+/// descr set minted after `compute_bitstrings`, and `finish_setup_descrs` runs
+/// before any trace does, so every trace-time residual states the empty set and
+/// `extraeffect` carries what is claimed.
+///
+/// The empty set is inert because no trace op names a field the leaf reads, and
+/// `force_from_effectinfo` forces only descrs already in `cached_fields`.  The
+/// reads are `PyFrame.pycode` and `PyFrame.debugdata`, then
+/// `FrameDebugData.w_f_trace` and the code object's `linetable` and
+/// `first_line_number`; `pyframe_debugdata_descr` has no emitter, `w_f_trace`
+/// has no descr at all, and neither vable slot has a writer.  A later fold that
+/// gives one of them a descr and caches it owes this call an explicit op, the
+/// way `ResolveExceptionContext` records its own `SetfieldGc` rather than
+/// naming `w_context` in a write set it cannot carry.
+///
+/// `pycode` and `debugdata` are read off the frame in memory rather than
+/// through `virtualizable_entry_at`, where the neighbouring `locals()` fold
+/// reads `debugdata`.  Neither slot has a `setfield_vable` writer
+/// (`virtualizable_spec.rs` names the ones that do), so memory holds the live
+/// value while compiled code runs, while the recording-time shadow's
+/// `debugdata` is a `clone_debugdata_ptr` copy of it.  Memory answers the same
+/// at both times; the shadow does not.
+///
 /// The receiver is pinned by [`walker_prove_owned_frame_pc`].
 fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
