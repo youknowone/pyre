@@ -66,6 +66,12 @@ pub struct TypeComments {
     attached: Vec<bool>,
     pub ignores: Vec<TypeComment>,
     line_starts: Vec<u32>,
+    /// The `def` whose header comment is followed by a second one before the
+    /// body, as (that second comment's offset, the first body statement's).
+    /// `python.gram:1364 invalid_double_type_comments` matches
+    /// `TYPE_COMMENT NEWLINE TYPE_COMMENT NEWLINE INDENT`, names the error
+    /// itself, and reports it against the `INDENT` it ends on.
+    double_def: Option<(u32, u32)>,
 }
 
 /// The offset just past `PREFIX` within `text`, or `None` when the comment is
@@ -204,35 +210,51 @@ impl TypeComments {
         Some(self.comments[index].text.as_str().into())
     }
 
-    /// The `SyntaxError` a comment the grammar had no place for owes, if any.
+    /// The one-based line `offset` falls on.
+    fn line_of(&self, offset: u32) -> u32 {
+        self.line_starts.partition_point(|first| *first <= offset) as u32
+    }
+
+    /// Record a `def` that has taken a header comment and still has one left
+    /// before its body, which `invalid_double_type_comments` names.
     ///
-    /// A `TYPE_COMMENT` is a token, so a rule that does not accept one leaves
-    /// the parser looking at a token it cannot shift and the parse fails
-    /// there: `x += 1  # type: int` and `x: int = 1  # type: int` are both
-    /// refused, while the five accepted positions are not. The failure is the
-    /// parser's ordinary one, so the message is `invalid syntax` and the span
-    /// is the token -- the type text, not the `#`.
-    ///
-    /// Answers the first such comment in source order, which is the one the
-    /// parser would have reached first.
-    ///
-    /// `file_input` says whether the tokenizer appends the line break a source
-    /// without one is missing: file input gets one, so its reported line always
-    /// ends in `\n`, while `eval` and `single` input report the line as it
-    /// stands.
-    pub fn misplaced(&self, source: &str, file_input: bool) -> Option<crate::PyError> {
-        let comment = self
+    /// The header one is what makes it that rule rather than a missing block:
+    /// a `def` whose only comment already stands on its own line matches the
+    /// `NEWLINE TYPE_COMMENT` alternative, and a second one there fails as
+    /// `expected an indented block` instead.
+    fn note_double_def(&mut self, header_line: u32, from: u32, to: u32) {
+        if self.double_def.is_some() {
+            return;
+        }
+        let in_span = |comment: &TypeComment| comment.start >= from && comment.start < to;
+        let took_header =
+            self.comments
+                .iter()
+                .zip(self.attached.iter())
+                .any(|(comment, attached)| {
+                    *attached && comment.lineno == header_line && in_span(comment)
+                });
+        if !took_header {
+            return;
+        }
+        if let Some(second) = self
             .comments
             .iter()
             .zip(self.attached.iter())
-            .find(|(_, attached)| !**attached)
-            .map(|(comment, _)| comment)?;
-        let line_start = self.line_starts[comment.lineno as usize - 1] as usize;
-        let column = crate::builtins::syntax_error_character_offset(
-            source,
-            comment.lineno as usize,
-            comment.text_start as usize - line_start + 1,
-        ) as i64;
+            .find(|(comment, attached)| !**attached && in_span(comment))
+            .map(|(comment, _)| comment.start)
+        {
+            self.double_def = Some((second, to));
+        }
+    }
+
+    /// The source line `lineno` names, as the tokenizer would hand it over.
+    ///
+    /// File input has a line break appended to a source that lacks one, so
+    /// its reported line always ends in `\n`; `eval` and `single` input
+    /// report the line as it stands.
+    fn line_text(&self, source: &str, lineno: u32, file_input: bool) -> String {
+        let line_start = self.line_starts[lineno as usize - 1] as usize;
         let mut line = source[line_start..]
             .split_inclusive('\n')
             .next()
@@ -241,15 +263,64 @@ impl TypeComments {
         if file_input && !line.ends_with('\n') {
             line.push('\n');
         }
+        line
+    }
+
+    /// The `SyntaxError` a comment the grammar had no place for owes, if any.
+    ///
+    /// A `TYPE_COMMENT` is a token, so a rule that does not accept one leaves
+    /// the parser looking at a token it cannot shift and the parse fails
+    /// there: `x += 1  # type: int` and `x: int = 1  # type: int` are both
+    /// refused, while the five accepted positions are not. The failure is the
+    /// parser's ordinary one -- `invalid syntax`, spanning the token, which is
+    /// the type text and not the `#` -- except for the one the grammar names
+    /// itself, a second comment on a `def` that already took one.
+    ///
+    /// Answers the first such comment in source order, which is the one the
+    /// parser would have reached first.
+    pub fn misplaced(&self, source: &str, file_input: bool) -> Option<crate::PyError> {
+        let comment = self
+            .comments
+            .iter()
+            .zip(self.attached.iter())
+            .find(|(_, attached)| !**attached)
+            .map(|(comment, _)| comment)?;
+        // `invalid_double_type_comments` ends on the `INDENT`, so it reports
+        // the body's indent as a column and carries no end.
+        let named = self
+            .double_def
+            .filter(|(second, _)| *second == comment.start)
+            .map(|(_, body)| (self.line_of(body), body));
+        let (message, lineno, column, end_column) = match named {
+            Some((lineno, body)) => {
+                let line_start = self.line_starts[lineno as usize - 1] as usize;
+                let indent = source[line_start..body as usize].chars().count() as i64;
+                ("Cannot have two type comments on def", lineno, indent, -1)
+            }
+            None => {
+                let line_start = self.line_starts[comment.lineno as usize - 1] as usize;
+                let column = crate::builtins::syntax_error_character_offset(
+                    source,
+                    comment.lineno as usize,
+                    comment.text_start as usize - line_start + 1,
+                ) as i64;
+                (
+                    "invalid syntax",
+                    comment.lineno,
+                    column,
+                    column + comment.text.chars().count() as i64,
+                )
+            }
+        };
         Some(crate::PyError::syntax_error_located(
-            "invalid syntax",
+            message,
             // `compile()` overwrites this with the name it was given.
             rustpython_wtf8::Wtf8::new(""),
-            comment.lineno as i64,
+            lineno as i64,
             column,
-            comment.lineno as i64,
-            column + comment.text.chars().count() as i64,
-            Some(&line),
+            lineno as i64,
+            end_column,
+            Some(&self.line_text(source, lineno, file_input)),
         ))
     }
 
@@ -301,7 +372,15 @@ impl TypeComments {
                     .map(|returns| returns.range().end().into())
                     .unwrap_or_else(|| node.parameters.range().end().into());
                 if let Some(to) = node.body.first().map(|s| s.range().start().into()) {
+                    // The rule reads the header's comment before the line
+                    // break, so only that one leaves the second one redundant:
+                    // a `def` whose first comment already stands on its own
+                    // line fails as a missing block instead.
+                    let header_line = self.line_of(from);
                     node.runtime_type_comment = self.take(from, to);
+                    if node.runtime_type_comment.is_some() {
+                        self.note_double_def(header_line, from, to);
+                    }
                 }
                 self.stmts(&mut node.body);
             }

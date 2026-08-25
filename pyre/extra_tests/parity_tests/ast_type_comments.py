@@ -248,6 +248,46 @@ assert refused("x += 1  # type: int", mode="single") == (
 )
 assert refused("x", mode="eval") is None
 
+# `test_type_comments.py::test_inappropriate_type_comments` is the list the
+# suite grades a runtime against; every one of its nine is refused here, at the
+# same place.
+assert refused("pass  # type: int\n") == (1, 15, 18, "pass  # type: int\n")
+assert refused("foo()  # type: int\n") == (1, 16, 19, "foo()  # type: int\n")
+assert refused("x += 1  # type: int\n") == (1, 17, 20, "x += 1  # type: int\n")
+assert refused("while True:  # type: int\n  continue\n")[:3] == (1, 22, 25)
+assert refused("while True:\n  continue  # type: int\n")[:3] == (2, 21, 24)
+assert refused("try:  # type: int\n  pass\nfinally:\n  pass\n")[:3] == (1, 15, 18)
+assert refused("try:\n  pass\nfinally:  # type: int\n  pass\n")[:3] == (3, 19, 22)
+# `ignore` only stands on its own when what follows is not alphanumeric, so
+# both of these are types rather than ignores -- including the non-ASCII one,
+# which the byte test has to treat as a letter.
+assert refused("pass  # type: ignorewhatever\n")[:3] == (1, 15, 29)
+assert refused("pass  # type: ignore\u00e9\n")[:3] == (1, 15, 22)
+
+# A comment on the line after the header is the function's own -- the rule
+# reads `NEWLINE TYPE_COMMENT` before the block.
+assert owner("def f():\n    # type: () -> str\n    pass\n") == [
+    ("FunctionDef", 0, "() -> str"),
+]
+# Taking one on the header and finding another before the body is the one
+# failure the grammar names for itself, and it reports the `INDENT`: the
+# body's own indent as a column, and no end.
+for indent in ("  ", "    ", "        "):
+    src = "def f():  # type: () -> a\n%s# type: () -> b\n%spass\n" % (indent, indent)
+    assert refused(src) == (3, len(indent), -1, indent + "pass\n"), indent
+# A blank line between them does not change which rule matches.
+assert refused("def f():  # type: () -> a\n\n    # type: () -> b\n    pass\n") == (
+    4,
+    4,
+    -1,
+    "    pass\n",
+)
+# The body's comment is its statement's, so it is not a second one on the def.
+assert owner("def f():  # type: () -> a\n    x = 1  # type: int\n    pass\n") == [
+    ("Assign", 4, "int"),
+    ("FunctionDef", 0, "() -> a"),
+]
+
 # Without the flag the comment is just a comment.
 ast.parse("x += 1  # type: int")
 
