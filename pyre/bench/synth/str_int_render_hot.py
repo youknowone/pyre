@@ -29,6 +29,12 @@
 #   * a `str` SUBCLASS reboxes through its own `__new__`; admitting it hands
 #     back a plain `str`, which the reported type name catches.
 #
+# `fresh_identity` is the leg for what the fold must not do to the renders it
+# DOES admit. A render of more than one code point has storage identity under
+# `is_w`, so two calls on the same operand are two objects; recording the call
+# as elidable let the pure pass share one, and the loop below counts that
+# sharing directly rather than inferring it from a timing.
+#
 # The ceiling is set BETWEEN the two arms of the fold, not at the measured
 # number: `PYRE_FBW_NO_SPECIALIZE=str_call` reads 38.2x pypy and the default
 # reads 11.5x (9.6x through check.py's own medians), so 15 catches the fold
@@ -77,6 +83,16 @@ def declined_shapes(n, big):
     return acc
 
 
+def fresh_identity(n, i):
+    shared = 0
+    for _ in range(n):
+        if str(i) is str(i):
+            shared += 1
+        if repr(i) is repr(i):
+            shared += 1
+    return shared
+
+
 def declined_callables(n):
     acc = 0
     names = 0
@@ -97,6 +113,7 @@ def main():
     print("edges", str(-(1 << 63)), str((1 << 63) - 1), str(0), str(-1))
     print("declined", declined_shapes(20000, 1 << 70))
     print("callables", declined_callables(20000))
+    print("shared", fresh_identity(20000, 123456))
 
 
 main()

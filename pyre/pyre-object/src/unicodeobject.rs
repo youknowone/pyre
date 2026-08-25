@@ -1160,7 +1160,14 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 /// as a graph-level `UnaryOp { op: "str" }`; `jtransform` lowers the
 /// Int-operand form to a residual call here (the Ref-operand form is
 /// identity, mirroring `ll_str` on a string).
-#[majit_macros::elidable]
+///
+/// NOT elidable, though `ll_int2dec` is: `descr_repr` (intobject.py) renders
+/// with the elidable helper and wraps the result in a separate
+/// `space.newutf8` allocation, and this function does both.  Marking the pair
+/// elidable let the pure pass share one call between two `str(i)` sites, which
+/// `is_w` makes visible — a `str` of `_len() > 1` has storage identity, so the
+/// shared box answered `str(i) is str(i)` True against False everywhere else.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
     w_str_new_managed(&int_str_text(v)) as i64
 }

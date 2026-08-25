@@ -12293,31 +12293,31 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         crate::descr::int_intval_descr(),
     )?;
     let helper = pyre_object::unicodeobject::jit_int_str as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
+    let raw = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
         &[int_raw],
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        // The effect the `jtransform` channel already records for this same
-        // address: `#[majit_macros::elidable]` on the helper, so pure but
-        // allocating, and the trailing `GuardNoException` below is what makes
-        // the raise leg observable.  `ll_str__IntegerR_SignedConst_Signed`
-        // carries `EF_ELIDABLE_OR_MEMORYERROR`, one step narrower; keeping the
-        // helper's own annotation costs nothing and stops one address from
-        // meaning two different things in two channels.
+        // `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
+        // an elidable effect.  `descr_repr` (intobject.py) splits the render
+        // from the wrapper — `str(self.intval)` is the `@jit.elidable`
+        // `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
+        // allocation — while this helper performs both in one call.  Recording
+        // the pair pure let the pure pass share one call between two `str(i)`
+        // sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
+        // storage identity, so a compiled loop answered `str(i) is str(i)`
+        // True where the interpreter, pypy3 and CPython all answer False.
+        // Recovering the elidable half needs the render and the wrapper split
+        // into two ops, the shape `emit_box_long_inline` already gives the
+        // bigint arms.
         //
-        // Recording it pure lets the optimizer share one call between two
-        // `str(i)` sites on the same operand, so a compiled loop can hand back
-        // the same object where the interpreter allocates twice.  Which object
-        // a fresh render returns is not a guarantee anything may read, and it
-        // is the same trade the upstream descr makes.
-        majit_metainterp::ELIDABLE_EFFECT_INFO,
-        &[
-            majit_ir::Value::Int(helper as usize as i64),
-            majit_ir::Value::Int(int_value),
-        ],
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+        // The read/write sets stay empty: the call allocates and touches no
+        // field the trace has cached.
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
     );
     // Concrete before the guard: the guard captures a resume snapshot, and a
     // `raw` with no value yet is recorded into it without one.
@@ -12325,9 +12325,7 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         raw,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    }
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
     Ok(Some(()))
 }

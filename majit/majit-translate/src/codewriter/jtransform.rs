@@ -1638,8 +1638,14 @@ impl<'a> Transformer<'a> {
             // so it assembles to the wired `residual_call_ir_r/iIRd>r`.
             // Without this the op falls through to the unwired
             // `int_str/i>r` default.  Like `_ll_2_int_*` (route-(a)) the
-            // helper carries no oopspec; `ElidableCanRaise` mirrors the
-            // sibling `jit_str_concat` allocating string helper.
+            // helper carries no oopspec.
+            //
+            // `CanRaise`, not an elidable effect: `ll_int2dec` is elidable
+            // but returns the rendered characters, and `descr_repr`
+            // (intobject.py) wraps them in a separate `space.newutf8`
+            // allocation.  `jit_int_str` performs both, and sharing that
+            // allocation between two renders of one operand is visible to
+            // `is_w`, which gives a `str` of `_len() > 1` storage identity.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -1655,7 +1661,7 @@ impl<'a> Transformer<'a> {
                         descriptor: CallDescriptor::from_signature(
                             &[majit_ir::value::Type::Int],
                             majit_ir::value::Type::Ref,
-                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
                         ),
                         args_i: vec![operand.clone()],
                         args_r: vec![],
@@ -8633,10 +8639,7 @@ mod tests {
                 indirect_targets,
             } => {
                 assert!(matches!(funcptr, CallFuncPtr::Value(_)));
-                assert_eq!(
-                    descriptor.extra_info.extraeffect,
-                    ExtraEffect::ElidableCanRaise
-                );
+                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
                 assert_eq!(args_i, &vec![n_var.clone()]);
                 assert!(args_r.is_empty());
                 assert!(args_f.is_empty());
