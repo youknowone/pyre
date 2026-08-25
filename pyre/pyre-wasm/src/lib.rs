@@ -162,45 +162,62 @@ mod residual_host {
     unsafe impl Sync for Scratch {}
     static SCRATCH: Scratch = Scratch(UnsafeCell::new([0u8; SCRATCH_LEN]));
 
-    /// Direct-call the small family of blackhole helpers whose real wasm ABI
-    /// is exactly the uniform `i64` signature carried by the residual call.
+    /// Direct-call the blackhole helpers whose real wasm ABI is exactly the
+    /// uniform `i64` signature carried by the residual call.
     ///
     /// The generic path below must reflect the callee's wasm type in the host:
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
     /// a word-returning target, and guessing either signature traps at a wasm
-    /// `call_indirect`.  These five targets are different: their declarations
-    /// are explicit `extern "C" fn(i64, ...) -> i64` wrappers, and the CPU
+    /// `call_indirect`.  These targets are different: every one is declared as
+    /// an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper, and the CPU
     /// function table stores those exact function addresses.  Comparing the
     /// table index (`fn as usize` on wasm32) therefore proves both the callee
     /// identity and its ABI.  Calling the named wrapper directly matches the
     /// native blackhole dispatch while avoiding a guest -> host -> guest
     /// reflection round-trip.
     ///
-    /// Keep this as an exact-function allow-list, not a signature inference.
-    /// A mismatched arity deliberately falls through to the reflective path.
+    /// Keep this an exact-function allow-list, not a signature inference: the
+    /// macro spells one line per callee so the arity and the symbol stay
+    /// auditable together.  A mismatched arity deliberately falls through to
+    /// the reflective path.
+    ///
+    /// The membership is measured, not guessed.  `PYRE_WASM_CALL_HIST` reports
+    /// crossings per callee split by importer, and over the synth corpus every
+    /// remaining crossing arrives on this path (`src=host`) rather than from a
+    /// compiled trace; these are its heaviest callees.
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-        match args {
-            [value] if func_ptr == pyre_jit::call_jit::bh_box_int_fn as usize => {
-                Some(pyre_jit::call_jit::bh_box_int_fn(*value))
-            }
-            [value] if func_ptr == pyre_jit::call_jit::bh_truth_fn as usize => {
-                Some(pyre_jit::call_jit::bh_truth_fn(*value))
-            }
-            [lhs, rhs, op_code] if func_ptr == pyre_jit::call_jit::bh_binary_op_fn as usize => {
-                Some(pyre_jit::call_jit::bh_binary_op_fn(*lhs, *rhs, *op_code))
-            }
-            [lhs, rhs, op_code] if func_ptr == pyre_jit::call_jit::bh_compare_fn as usize => {
-                Some(pyre_jit::call_jit::bh_compare_fn(*lhs, *rhs, *op_code))
-            }
-            [obj, key, value]
-                if func_ptr == pyre_interpreter::opcode_ops::bh_store_subscr_fn as usize =>
-            {
-                Some(pyre_interpreter::opcode_ops::bh_store_subscr_fn(
-                    *obj, *key, *value,
-                ))
-            }
-            _ => None,
+        macro_rules! uniform_i64_allow_list {
+            ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
+                match args {
+                    $(
+                        [$($arg),*] if func_ptr == $callee as usize => {
+                            Some($callee($(*$arg),*))
+                        }
+                    )*
+                    _ => None,
+                }
+            };
         }
+        uniform_i64_allow_list![
+            [] => pyre_jit::call_jit::bh_get_current_exception,
+            [value] => pyre_jit::call_jit::bh_box_int_fn,
+            [value] => pyre_jit::call_jit::bh_truth_fn,
+            [array] => pyre_jit::call_jit::bh_newtuple_from_array,
+            [array] => pyre_jit::call_jit::bh_newlist_from_array,
+            [index, seq] => pyre_jit::call_jit::bh_unpack_item_fn,
+            [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
+            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_binary_op_fn,
+            [lhs, rhs, op_code] => pyre_jit::call_jit::bh_compare_fn,
+            [obj, key, value] => pyre_interpreter::opcode_ops::bh_store_subscr_fn,
+            [callable, null_or_self, arg0] => pyre_jit::call_jit::bh_call_fn,
+            [obj, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_attr_fn,
+            [frame_ptr, w_name, namei] => pyre_jit::call_jit::bh_load_name_fn,
+            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_name_fn,
+            [callable, null_or_self, arg0, arg1] => pyre_jit::call_jit::bh_call_fn_2,
+            [obj, attr, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_method_self_fn,
+            [namespace_ptr, w_code_ptr, frame_ptr, namei] =>
+                pyre_jit::call_jit::bh_load_global_fn,
+        ]
     }
 
     fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
