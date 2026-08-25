@@ -828,6 +828,15 @@ pub(crate) fn function_new_impl(
             unsafe {
                 std::ptr::write(raw as *mut Function, function);
             }
+            // The fields were published by the `ptr::write` above, which no
+            // barrier sees. An old-gen Function that never joins the
+            // remembered set is not scanned by a minor collection, so a
+            // freshly nursery-born `w_func_globals_obj` reached only through
+            // it is neither forwarded nor kept alive. The setters barrier
+            // just ahead of their single store; a bulk write has no such
+            // point, so barrier once behind it for the whole initial set.
+            // Nothing collectable runs in between.
+            function_write_barrier(raw as PyObjectRef);
             return raw as PyObjectRef;
         }
     }
