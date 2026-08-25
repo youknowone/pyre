@@ -1,5 +1,10 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=1
+# pyre-check: selfcheck-compiles=root:bump
+# The `root:` arm is measured, not a relaxation: this fixture's loop is
+# aborted (loops_aborted=5) and what reaches the JIT is the root trace
+# `finish_and_compile` attaches. The guard still runs against compiled
+# code; that the loop itself no longer compiles is an open question the
+# old `selfcheck-loops=<n>` floor could not have asked.
 # Self-checking regression guard for the frame-escape flush that resumes past
 # the abort. The synthetic suite discovers it as a self-checking fixture.
 # A residual (may-force) callee stores its own frame; the loop body then reads

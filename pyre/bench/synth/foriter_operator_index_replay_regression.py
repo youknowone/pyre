@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=1
+# pyre-check: selfcheck-compiles=<module>
 # `operator.index(x)` reaches `space.index`, whose first test is
 # `is_int_or_long`: an int is returned as-is, before any `__index__` lookup, so
 # that call runs no user code and is replay-safe.  Every other argument

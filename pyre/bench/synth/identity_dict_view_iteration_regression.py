@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=7
+# pyre-check: selfcheck-compiles=main,walk
 # pyre-check: skip-backends=wasm
 # The wasm guest has no `time` module, which the ratio below is built on.
 # Self-checking regression guard for the cost of walking an IDENTITY dict's view.

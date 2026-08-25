@@ -240,6 +240,127 @@ pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
     majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
+/// The compile census: `PYRE_LOOP_CENSUS=1` names every trace the run actually
+/// compiled, one `[loop-census] <arm> <name>` line each.
+///
+/// `loops_compiled` cannot answer "did the loop under test reach the JIT".
+/// It is bumped at five places in `pyjitpl.rs` and only three of them close a
+/// loop — `finish_and_compile` attaches a root trace ending in FINISH with no
+/// LABEL — and it is a whole-process figure besides, so any hot loop in the
+/// file moves it. The census answers the question directly: the arm says which
+/// of the five minted the trace, and the name comes from the JitDriver hook
+/// that already exists for it, `get_printable_location` (interp_jit.py), whose
+/// leading field is the code object's name.
+///
+/// Off by default and gated on a cached flag, so the production compile path
+/// pays one bool read and records nothing.
+pub mod loop_census {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// `interp_jit.py:34 get_printable_location(next_instr, is_being_profiled,
+    /// bytecode)`. The green tuple reaches majit as raw words, so the code
+    /// object arrives as its address and the front end casts it back.
+    /// `w_pycode` is the green tuple's `pycode` slot as majit carries it: the
+    /// `w_code` object address (`green_key_raw: (w_code as usize, pc)`), not
+    /// the inner `CodeObject` — the front end dereferences it.
+    pub type LocationPrinter =
+        fn(next_instr: usize, is_being_profiled: bool, w_pycode: usize) -> String;
+
+    static PRINTER: OnceLock<LocationPrinter> = OnceLock::new();
+
+    /// Publish the front end's `get_printable_location`. Ported for parity in
+    /// `pyre-jit`'s `pypyjitdriver` but with no runtime consumer until now.
+    pub fn register_location_printer(printer: LocationPrinter) {
+        let _ = PRINTER.set(printer);
+    }
+
+    /// Armed by [`enable`] for an embedder whose environment the census cannot
+    /// read, and which collects the lines rather than reading a stderr.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// The lines recorded since the last [`report`], for that embedder.
+    static RECORDS: Mutex<String> = Mutex::new(String::new());
+
+    /// Arm the census without an environment, and collect its lines for
+    /// [`report`] to hand back.
+    ///
+    /// wasm32-unknown-unknown needs both halves: `std::env` there reads every
+    /// name as unset, so `PYRE_LOOP_CENSUS` can never arm a guest, and its
+    /// stderr goes to a sink, so a line printed inside the module is lost. The
+    /// host arms this before the run and reads the lines back afterwards, the
+    /// same shape `guard_census_enable` / `guard_census_summary` take.
+    pub fn enable() {
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// Take the collected lines, leaving the buffer empty. Non-empty only when
+    /// [`enable`] armed the census: a host that has a real stderr already has
+    /// every line on it, so nothing is buffered for it to read twice.
+    pub fn report() -> String {
+        std::mem::take(&mut *RECORDS.lock().unwrap())
+    }
+
+    /// Whether `PYRE_LOOP_CENSUS` is set — cached like `majit_log_enabled` —
+    /// or [`enable`] armed it.
+    pub fn enabled() -> bool {
+        static FROM_ENV: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("PYRE_LOOP_CENSUS").is_some());
+        *FROM_ENV || ARMED.load(Ordering::Relaxed)
+    }
+
+    thread_local! {
+        /// green key -> `(code_ptr, pc)`, the raw green tuple the hash was
+        /// taken over. Recorded at trace start because that is where the
+        /// untyped pair is in scope; read back when a compile succeeds.
+        static KEYS: RefCell<HashMap<u64, (usize, usize)>> = RefCell::new(HashMap::new());
+    }
+
+    /// Remember what a green key hashes, so a later compile can be named.
+    ///
+    /// Called from `TraceCtx`'s two green-key setters rather than from the
+    /// tracing entry points: a root trace started by the force-tracing arm
+    /// never passes through `setup_tracing`, and a back-edge retarget replaces
+    /// the key a trace will compile under, so seeding at trace start alone
+    /// left the `root` arm's compiles printing `<unnamed>`.
+    pub fn note_key(green_key: u64, green_key_raw: (usize, usize)) {
+        if !enabled() || green_key_raw.0 == 0 {
+            return;
+        }
+        KEYS.with(|keys| keys.borrow_mut().insert(green_key, green_key_raw));
+    }
+
+    /// Emit one census line for a trace that just compiled.
+    ///
+    /// *kind* is which compile arm minted it, because `loops_compiled` counts
+    /// all of them alike and they are not all loops: `finish_and_compile`
+    /// attaches a root trace that ends in FINISH with no LABEL, and says so in
+    /// its own comment. A census that hid the arm would reproduce exactly the
+    /// conflation it exists to undo, so the arm is part of the line and the
+    /// reader decides what a given fixture is entitled to.
+    ///
+    /// A key with no recorded pair or no registered printer still emits, with
+    /// the raw key in place of the name: silence here would read as "nothing
+    /// compiled", which is the one answer the census must never invent.
+    pub fn note_compiled(green_key: u64, kind: &str) {
+        if !enabled() {
+            return;
+        }
+        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied());
+        let line = match (raw, PRINTER.get()) {
+            (Some((w_pycode, pc)), Some(printer)) => printer(pc, false, w_pycode),
+            _ => format!("<unnamed> key={green_key}"),
+        };
+        let record = format!("[loop-census] {kind} {line}\n");
+        if ARMED.load(Ordering::Relaxed) {
+            RECORDS.lock().unwrap().push_str(&record);
+        }
+        eprint!("{record}");
+    }
+}
+
 /// Whether `MAJIT_LOG` is set, cached at first access.
 ///
 /// `std::env::var_os` acquires a global env lock and walks the env table on

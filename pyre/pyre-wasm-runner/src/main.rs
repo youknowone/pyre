@@ -152,14 +152,18 @@ struct Host {
 /// armed through `pyre_fbw_spec_census_enable` and read through
 /// `pyre_fbw_spec_census`.
 /// `PYRE_WASM_TRACE_ENTRY_CENSUS` similarly arms the emitted-module entry
-/// census before tracing starts.
+/// census before tracing starts. `PYRE_LOOP_CENSUS` keeps its native spelling
+/// instead of gaining a `PYRE_WASM_` twin, because `check.py` grades every
+/// backend against the same `# pyre-check: selfcheck-compiles=` header and a
+/// second name would make the wasm leg answer a differently-spelled question.
 ///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
-/// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
+/// `PYRE_STDLIB`, `MAJIT_STATS`, `PYRE_LOOP_CENSUS`) and `check.py`'s own
+/// `PYRE_CHECK_*`
 /// interpreter paths. A knob that later becomes host-interpreted must be added
 /// here; the prefix match needs no upkeep for new guest-side knobs.
 fn warn_inert_guest_env() {
-    const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS"];
+    const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS", "PYRE_LOOP_CENSUS"];
     // `to_string_lossy`, not `into_string().ok()`: a name the platform allows
     // but UTF-8 does not is still a setting the guest silently ignores, and
     // dropping it here would hide exactly the case worth reporting.
@@ -576,6 +580,14 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some()
         && let Ok(arm) =
             instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_trace_entry_census_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    // The compile census records as each trace compiles, so it too has to be
+    // armed before the run. It keeps its native name: `check.py` grades a
+    // selfcheck fixture's declared shapes on every backend from one header.
+    if std::env::var_os("PYRE_LOOP_CENSUS").is_some()
+        && let Ok(arm) = instance.get_typed_func::<(), ()>(&mut store, "pyre_loop_census_enable")
     {
         arm.call(&mut store, ())?;
     }
@@ -1370,6 +1382,32 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 }
             }
             Err(_) => eprintln!("[jit-stats] guard_census=unexported"),
+        }
+    }
+    // The compile census armed before the run, printed verbatim: these are the
+    // same `[loop-census] <arm> <name>` lines a native run puts on stderr, and
+    // `check.py` parses one shape for every backend. A module predating the
+    // export says so rather than reading as a run that compiled nothing, which
+    // is the answer a selfcheck fixture would be failed on.
+    if std::env::var_os("PYRE_LOOP_CENSUS").is_some() {
+        match instance.get_typed_func::<(), u64>(&mut store, "pyre_loop_census") {
+            Ok(census) => {
+                let census_result: Result<()> = (|| {
+                    let packed = census.call(&mut store, ())?;
+                    let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+                    if clen != 0 {
+                        let mut bytes = vec![0u8; clen as usize];
+                        memory.read(&store, ptr as usize, &mut bytes)?;
+                        dealloc.call(&mut store, (ptr, clen))?;
+                        eprint!("{}", String::from_utf8_lossy(&bytes));
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = census_result {
+                    eprintln!("pyre-wasm-runner: loop census failed: {err}");
+                }
+            }
+            Err(_) => eprintln!("pyre-wasm-runner: loop_census=unexported"),
         }
     }
     if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some() {

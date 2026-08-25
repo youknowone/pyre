@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=2
+# pyre-check: selfcheck-compiles=collapse,hot
 # Self-checking guard for `f_trace_opcodes` armed on a frame that is ALREADY
 # running compiled code.  Sibling of `settrace_f_trace_armed_mid_loop`; see
 # that fixture for why the `debugdata` read in `dispatch_bytecode`'s

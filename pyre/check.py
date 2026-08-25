@@ -1935,17 +1935,19 @@ def synth_selfcheck_interpreted(path):
     invariant holds — including on a run where the JIT compiled nothing at all,
     which for a guard against a *compiled* mis-admission is a pass that
     establishes nothing. `run_selfcheck` therefore requires the run to have
-    compiled a loop, and this is how a fixture says its invariant is not about
-    compiled code: the three that carry it (`oserror_errno_fields_regression`,
-    `posix_replace_regression`, `settrace_local_tracer_armed_before_entry`)
-    guard interpreter-level behaviour and measure `loops_compiled=0` on every
-    backend.
+    compiled what the fixture names, and this is how a fixture says its
+    invariant is not about compiled code: the three that carry it
+    (`oserror_errno_fields_regression`, `posix_replace_regression`,
+    `settrace_local_tracer_armed_before_entry`) guard interpreter-level
+    behaviour and compile nothing their assertion is about.
 
-    Note the floor it turns off is corpus-level — `loops_compiled >= 1` for the
-    run, not "the loop under test compiled" — so any hot loop in the file
-    satisfies it, a bookkeeping loop over recorded events included. A fixture
-    whose subject never compiles can therefore clear the floor by accident;
-    measure which loop was counted before concluding the floor covered it.
+    It declares the empty set rather than turning a threshold off. What
+    `selfcheck-compiles` names is censused per compiled trace by arm and name
+    (`PYRE_LOOP_CENSUS=1`), so carrying this marker no longer means "some
+    unrelated loop in the file may clear the bar for me" — it means the fixture
+    asks for nothing compiled, and a bookkeeping loop that happens to compile
+    is neither required nor forbidden. A fixture that does reach the JIT, but
+    only as a root trace, declares `root:<name>` rather than this.
 
     An opt-out rather than an opt-in, so a fixture that quietly stops being
     compiled is reported rather than passing on in silence.
@@ -1957,79 +1959,84 @@ def synth_selfcheck_interpreted(path):
     )
 
 
-def synth_selfcheck_loops(path):
-    """Read a selfcheck fixture's compiled-loop floor from its header:
-        # pyre-check: selfcheck-loops=8
+def synth_selfcheck_compiles(path):
+    """Read what a selfcheck fixture requires the JIT to compile:
+        # pyre-check: selfcheck-compiles=hot,inner
+        # pyre-check: selfcheck-compiles=root:callee_d1
 
-    `run_selfcheck` asks whether the guard reached the JIT at all, and the
-    figure it reads is `loops_compiled` off the whole-process `[jit-stats]`
-    line. A constant floor of one says nothing about a fixture with more than
-    one loop: `wrapper_subclass_load_method_self` reads eight, so seven of its
-    guarded shapes can stop reaching the JIT and it still passes green with
-    its assertion intact. That is exactly the failure the floor exists to
-    catch, and for every multi-loop fixture it was going uncaught.
+    Each entry is a code object name — what `get_printable_location`
+    (interp_jit.py) puts first in the string it renders for a green key —
+    optionally prefixed by the compile arm that has to mint it. A bare name
+    means `loop`. The run is asked whether each named shape compiled, by name,
+    not how many traces compiled anywhere.
 
-    ⚠ Read what this number is and is not before trusting it.
+    The arm is part of the declaration because `loops_compiled` is not a count
+    of loops. It is bumped at five places in `majit-metainterp/src/pyjitpl.rs`
+    and only three of them close one: `finish_and_compile` attaches a root
+    trace that ends in FINISH with no LABEL, and says so in its own comment.
+    Measured on `wrapper_subclass_load_method_self`: eight bumps, seven `loop`
+    arms and one `root`. So `root:` is not a weaker form of the same claim —
+    it says the guarded shape reaches the JIT as a root trace, which is a
+    different fact about it, and a fixture whose loop degrades into one is
+    still reported.
 
-    It is not a count of compiled loops. `MetaInterp::stats.loops_compiled` is
-    bumped at four places in `majit-metainterp/src/pyjitpl.rs`, and the
-    root-FINISH arm counts a non-loop as a loop by design — its own comment in
-    the tree says so, because a root trace ending in FINISH with no LABEL
-    attaches through `ResumeFromInterpDescr.compile_and_attach`, which mints a
-    token of its own. Measured on the fixture named above: `loops_compiled=8`
-    against seven `[jit] compiled loop at key=` lines, all seven keys distinct.
-    A terminal-raise fixture inflates the counter for the same reason.
+    This replaces a bare number, `selfcheck-loops=8`, read off
+    `loops_compiled`. That number could not answer the question it was asked in
+    two independent ways: it counted non-loops, as above, and it was a
+    whole-process figure, so any hot loop in the file cleared the floor — which
+    is why `settrace_local_tracer_armed_before_entry` had to count its own
+    events with `list.count` instead of a `for` loop. Both are the same
+    failure: the gate read an aggregate because nothing named the parts.
 
-    It is also not attributed to the loop under test. The figure is
-    whole-process, so any hot loop in the file clears the floor — a bookkeeping
-    loop over the fixture's own recorded events included. `settrace_local_-
-    tracer_armed_before_entry` had to have its counting loop rewritten as
-    `list.count` for exactly that reason, which is the instrument bending the
-    fixture rather than measuring it.
+    `PYRE_LOOP_CENSUS=1` names them, through the JitDriver hook pyre had
+    already ported for parity and never called. The census rides the selfcheck
+    run itself rather than a second process, so per-backend coverage is kept:
+    a shape admitted on dynasm and declined on wasm is a wasm failure here,
+    which a single native census run could not see.
 
-    A per-loop line does exist — `pyjitpl.rs` prints `[jit] compiled loop at
-    key={green_key}` under `majit_log_enabled()` — but the key is an opaque
-    64-bit hash and is not stable across processes, so there is no identity a
-    fixture header could declare. That, not the absence of any per-loop
-    signal, is why this reads an aggregate. `spec-folds` shows the shape the
-    honest version takes: names censused by label, where a declared name that
-    never fires and an unknown label are reported as different failures.
-
-    So the floor is per fixture, and the number is measured, not guessed. A
-    floor rather than an equality, and one number rather than one per backend:
-    the backends do not agree on the count (a fold admitted on dynasm can be
-    declined on wasm), so the value to declare is the SMALLEST count the
-    enabled backends read. Above it the fixture is free to compile more; below
-    it something that used to reach the JIT no longer does.
-
-    Required, not optional. Defaulting a silent fixture to one is what let the
-    multi-loop fixtures sit under a floor that could not see them, and a new
-    guard has no way to notice it inherited the weak version.
-    `selfcheck-interpreted` is the way to say the invariant is not about
-    compiled code at all.
+    Required, not optional, for the same reason the floor was: a fixture that
+    quietly stops being compiled must be reported rather than inheriting a weak
+    default. `selfcheck-interpreted` is how a fixture says its invariant is not
+    about compiled code at all.
     """
-    found = _header_directive(path, "# pyre-check: selfcheck-loops=")
+    found = _header_directive(path, "# pyre-check: selfcheck-compiles=")
     if found is None:
         raise ValueError(
-            f"{path} is a selfcheck fixture with no compiled-loop floor. Run it "
-            "on every enabled backend with MAJIT_STATS=1, take the smallest "
-            "`loops_compiled` the run reports, and declare it:\n"
-            "    # pyre-check: selfcheck-loops=<n>\n"
-            "A fixture whose invariant is not about compiled code carries "
+            f"{path} is a selfcheck fixture that does not say what it needs "
+            "compiled. Run it with PYRE_LOOP_CENSUS=1, read the "
+            "`[loop-census] <arm> <name>` lines, and declare the shapes the "
+            "guard is about:\n"
+            "    # pyre-check: selfcheck-compiles=<name>[,<arm>:<name>...]\n"
+            "A bare name means the `loop` arm. A fixture whose invariant is "
+            "not about compiled code carries "
             "`# pyre-check: selfcheck-interpreted` instead."
         )
     raw, line = found
-    try:
-        value = int(raw, 10)
-    except ValueError as e:
-        raise ValueError(
-            f"invalid compiled-loop floor in {path}: {line.strip()}"
-        ) from e
-    if value < 1:
-        raise ValueError(
-            f"compiled-loop floor must be at least 1 in {path}: {line.strip()}"
-        )
-    return value
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        arm, _, name = part.rpartition(":")
+        arm = arm or "loop"
+        if name.isdigit():
+            raise ValueError(
+                f"{path} declares a compiled-trace COUNT, not a name: "
+                f"{line.strip()}\n"
+                "`selfcheck-compiles` names the shapes that must compile. Run "
+                "the fixture with PYRE_LOOP_CENSUS=1 and read the "
+                "`[loop-census]` lines for the arms and names."
+            )
+        if arm not in SELFCHECK_COMPILE_ARMS:
+            raise ValueError(
+                f"unknown compile arm {arm!r} in {path}: {line.strip()}\n"
+                "The arms the census emits are: "
+                + ", ".join(sorted(SELFCHECK_COMPILE_ARMS))
+            )
+        entries.append((arm, name))
+    if not entries:
+        raise ValueError(f"empty compiled-trace list in {path}: {line.strip()}")
+    return tuple(entries)
 
 
 def synth_ungated_jitstats(path):
@@ -2127,6 +2134,31 @@ def spec_fold_census(binary, path, timeout_s, wasm=False):
     if code != 0:
         return None, code
     return {m.group(1): int(m.group(2)) for m in SPEC_CENSUS_FOLD_RE.finditer(err)}, 0
+
+
+# The arms `majit_metainterp::loop_census` tags a compile with, which are the
+# five places `pyjitpl.rs` bumps `loops_compiled`. Spelled out here so a typo
+# in a fixture header is an authoring error rather than a shape that silently
+# never matches.
+SELFCHECK_COMPILE_ARMS = frozenset({"loop", "retrace", "root", "entry-bridge"})
+
+SELFCHECK_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)", re.M)
+
+
+def selfcheck_compiled_census(stderr):
+    """`(kind, name)` for every trace `PYRE_LOOP_CENSUS=1` saw compiled.
+
+    *kind* is the compile arm — `loop`, `retrace`, `root`, `entry-bridge` —
+    and it is carried because `loops_compiled` counts all four alike while
+    only some of them close a loop. *name* is the code object the green key
+    points at.
+
+    One line per compiled trace, so a name repeats when a function is compiled
+    more than once; the caller only asks whether a pair is present. A trace
+    whose green key carries no code pointer prints `<unnamed>` rather than
+    nothing, because a missing line and "nothing compiled" must not look alike.
+    """
+    return [m.groups() for m in SELFCHECK_LOOP_CENSUS_RE.finditer(stderr or "")]
 
 
 def default_binary(backend):
@@ -4222,7 +4254,7 @@ class Check:
     # ── self-checking regression guard ──
 
     def run_selfcheck(self, name, script, timeout, expect="PASS", skip_backends=(),
-                      require_jit=True, spec_folds=(), min_loops=1):
+                      require_jit=True, spec_folds=(), want_compiles=()):
         """Run a self-checking regression script on each enabled backend.
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
@@ -4234,20 +4266,23 @@ class Check:
         `time`-module timing guard cannot run on the wasm guest, which has no
         `time` module).
 
-        With *require_jit* the run must also have compiled at least
-        *min_loops* loops. A self-asserted invariant is satisfied by an
-        interpreted run, so without this a fixture guarding a compiled
-        mis-admission passes while establishing nothing — and it would go on
-        passing if a shape it guards stopped reaching the JIT, which is the
-        change most likely to make the guard vacuous.
+        With *require_jit* the run must also have compiled every
+        `(arm, name)` in *want_compiles*. A self-asserted invariant is
+        satisfied by an interpreted run, so without this a fixture guarding a
+        compiled mis-admission passes while establishing nothing — and it would
+        go on passing if a shape it guards stopped reaching the JIT, which is
+        the change most likely to make the guard vacuous.
         `synth_selfcheck_interpreted` turns it off for a fixture whose
         invariant is not about compiled code.
 
-        *min_loops* is what makes that true of a fixture with more than one
-        guarded shape: `loops_compiled` is a whole-process figure, so a floor
-        of one is reached by any single loop and says nothing about the rest.
-        `synth_selfcheck_loops` carries the measured floor, and documents what
-        that counter does and does not attribute.
+        *want_compiles* names those shapes, so the answer is about them and not
+        about the file, and carries which compile arm has to mint each one, so
+        a loop that degrades into a root trace is reported rather than counted.
+        Both come from the same run's `PYRE_LOOP_CENSUS=1` lines — no second
+        process, and the question is asked once per backend, which is where it
+        has to be asked: a fold admitted on dynasm can be declined on wasm, and
+        only a per-backend census sees that. `synth_selfcheck_compiles` carries
+        the list and records why it replaced a count.
 
         *spec_folds* is the `# pyre-check: spec-folds=` list, read the same way
         `run_synthetic_bench` reads it. A fixture written to guard a trace-time
@@ -4271,10 +4306,16 @@ class Check:
             effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
             sys.stdout.write(f"    {backend:<10s}")
             sys.stdout.flush()
+            # The census rides this run: a selfcheck fixture is not measured
+            # against a ratio gate (its cpython/pypy cells are `-`), so the
+            # extra stderr lines cost nothing a gate reads, and asking here
+            # keeps the answer per backend.
+            selfcheck_env = pyre_env()
+            selfcheck_env["PYRE_LOOP_CENSUS"] = "1"
             output, elapsed, code, stderr = run_timed(
                 [self._pyre(backend), script],
                 timeout_s=effective_timeout,
-                env=pyre_env(),
+                env=selfcheck_env,
             )
             panic_reason = _jit_panic_reason(stderr)
             if panic_reason:
@@ -4299,24 +4340,22 @@ class Check:
                 self._append_comparison(backend, name, "-", "-", "FAIL")
                 continue
             if require_jit:
-                compiled = _jit_stats_field(stderr, "loops_compiled")
-                if compiled is None or compiled < min_loops:
-                    if compiled is None:
-                        detail = (
-                            "the guard ran interpreted (no [jit-stats] line), so "
-                            "its assertion says nothing about compiled code"
-                        )
-                    elif compiled == 0:
-                        detail = (
-                            "the guard ran interpreted (loops_compiled=0), so its "
-                            "assertion says nothing about compiled code"
-                        )
+                saw = selfcheck_compiled_census(stderr)
+                missing = [want for want in want_compiles if want not in saw]
+                if missing:
+                    if not saw:
+                        seen = "the run compiled nothing at all"
                     else:
-                        detail = (
-                            f"loops_compiled={compiled} < {min_loops}: a shape this "
-                            "guard covers stopped reaching the JIT, so its assertion "
-                            "no longer says anything about that shape"
+                        seen = "compiled: " + ", ".join(
+                            f"{arm}:{name}" for arm, name in sorted(set(saw))
                         )
+                    wanted = ", ".join(f"{arm}:{name}" for arm, name in missing)
+                    detail = (
+                        f"nothing compiled for {wanted} — {seen}. A shape this "
+                        "guard covers stopped reaching the JIT the way it was "
+                        "declared to, so its assertion no longer says anything "
+                        "about that shape"
+                    )
                     self._record(backend, False, name, detail)
                     print(f"{red('FAIL')}  {detail}")
                     _dump_failed_run(output, stderr)
@@ -4596,8 +4635,10 @@ class Check:
                 # to report by name, not a traceback out of the suite loop.
                 selfcheck_folds = synth_spec_folds(path) if selfcheck else ()
                 interpreted = selfcheck and synth_selfcheck_interpreted(path)
-                min_loops = (
-                    synth_selfcheck_loops(path) if selfcheck and not interpreted else 1
+                want_compiles = (
+                    synth_selfcheck_compiles(path)
+                    if selfcheck and not interpreted
+                    else ()
                 )
             except ValueError as e:
                 print(f"{red('ERROR')}: {e}")
@@ -4610,7 +4651,7 @@ class Check:
                     skip_backends=skip_backends,
                     require_jit=not interpreted,
                     spec_folds=selfcheck_folds,
-                    min_loops=min_loops,
+                    want_compiles=want_compiles,
                 )
             else:
                 self.run_synthetic_bench(

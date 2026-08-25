@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=3
+# pyre-check: selfcheck-compiles=coro_body,drive_generator,gen
 # Self-checking regression guard for a frame handed to application code through
 # `gi_frame` / `cr_frame` instead of `sys._getframe`.
 #

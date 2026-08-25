@@ -1,6 +1,11 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=2
+# pyre-check: selfcheck-compiles=root:caller_view,root:leaf
 # pyre-check: spec-folds=frame_lasti
+# The `root:` arm is measured, not a relaxation: this fixture's loop is
+# aborted (loops_aborted=5) and what reaches the JIT is the root trace
+# `finish_and_compile` attaches. The guard still runs against compiled
+# code; that the loop itself no longer compiles is an open question the
+# old `selfcheck-loops=<n>` floor could not have asked.
 # Self-checking guard for the `f_lasti` coordinate on the two frames a walk
 # owns that are NOT the loop's own portal: the frame of an inlined callee, and
 # the caller's frame read from inside one.

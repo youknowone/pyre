@@ -7664,6 +7664,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
                 self.stats.loops_compiled += 1;
+                crate::loop_census::note_compiled(green_key, "loop");
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity); no
                 // explicit metainterp-side bump needed here.
@@ -9034,6 +9035,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
+                crate::loop_census::note_compiled(green_key, "retrace");
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
 
@@ -9974,6 +9976,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
+                crate::loop_census::note_compiled(green_key, "root");
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
                 //
@@ -10357,6 +10360,7 @@ impl<M: Clone> MetaInterp<M> {
                     compile_time,
                 );
                 self.stats.loops_compiled += 1;
+                crate::loop_census::note_compiled(green_key, "loop");
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
                 if crate::majit_log_enabled() {
@@ -13122,6 +13126,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
+                crate::loop_census::note_compiled(original_green_key, "entry-bridge");
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {

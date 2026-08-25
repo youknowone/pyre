@@ -1187,6 +1187,28 @@ mod host_abi {
         majit_metainterp::guard_census_enable();
     }
 
+    /// Arm the compile census before `pyre_run_python`, and collect its lines
+    /// for [`pyre_loop_census`] to hand back.
+    ///
+    /// `PYRE_LOOP_CENSUS` selects it on a native build. The guest needs the
+    /// call for both halves of the usual reason: it reads no environment, and
+    /// its stderr is a sink, so the lines have to be buffered and read out
+    /// rather than printed where they are made.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_loop_census_enable() {
+        majit_metainterp::loop_census::enable();
+    }
+
+    /// The lines the armed compile census recorded, as the same packed pair.
+    /// The runner prints them verbatim: they are the same
+    /// `[loop-census] <arm> <name>` records a native run puts on stderr, so
+    /// `check.py` reads one shape on every backend. Draining, so a host that
+    /// reads twice does not see the run's traces twice.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_loop_census() -> u64 {
+        pack_into_guest(majit_metainterp::loop_census::report().into_bytes())
+    }
+
     /// Arm the per-trace, per-entry-resume-key census before tracing starts.
     /// The runner owns `PYRE_WASM_TRACE_ENTRY_CENSUS`; the wasm guest cannot
     /// read its environment, and arming before compilation keeps the counter

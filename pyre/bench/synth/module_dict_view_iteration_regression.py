@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-loops=1
+# pyre-check: selfcheck-compiles=main
 # Self-checking regression guard for the cost of walking a MODULE dict's view.
 #
 # `celldict.py:188-192 getiterkeys`/`getitervalues` are lazy iterators upstream.
