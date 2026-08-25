@@ -334,23 +334,59 @@ enum InitProtocol {
 }
 
 impl InitProtocol {
-    fn symbol(self, basename: &str) -> String {
-        match self {
-            InitProtocol::Export => format!("PyModExport_{basename}"),
-            InitProtocol::Init => format!("PyInit_{basename}"),
-        }
+    fn symbol(self, basename: &InitName) -> String {
+        let prefix = match (self, basename.non_ascii) {
+            (InitProtocol::Export, false) => "PyModExport_",
+            (InitProtocol::Export, true) => "PyModExportU_",
+            (InitProtocol::Init, false) => "PyInit_",
+            (InitProtocol::Init, true) => "PyInitU_",
+        };
+        format!("{prefix}{}", basename.text)
     }
 }
 
-fn init_basename(name: &str) -> Result<&str, crate::PyError> {
+/// The variable part of a module's export symbol.
+///
+/// PEP 489: a name outside ASCII is spelled in punycode and looked up under
+/// the `U` prefix instead, so the two namespaces cannot collide.
+struct InitName {
+    text: String,
+    non_ascii: bool,
+}
+
+/// `importdl.c get_encoded_name`: the short name, encoded to ASCII where it
+/// can be and to punycode where it cannot.  `-` is punycode's delimiter and is
+/// not a C identifier character, so it becomes `_`.
+fn init_basename(name: &str) -> Result<InitName, crate::PyError> {
     let basename = name.rsplit('.').next().unwrap_or(name);
-    if !basename.is_ascii() {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("non-ASCII cpyext init names are not implemented yet: {basename}"),
-        ));
+    if basename.is_ascii() {
+        return Ok(InitName {
+            text: basename.to_string(),
+            non_ascii: false,
+        });
     }
-    Ok(basename)
+    // `encode_object` reaches the `punycode` codec, which is written in
+    // Python and allocates, so the name it reads is rooted across the call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let basename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(basename));
+    let encoded = crate::type_methods::encode_object(
+        pyre_object::gc_roots::shadow_stack_get(basename_slot),
+        "punycode",
+        "strict",
+    )?;
+    let text = String::from_utf8(encoded)
+        .map_err(|_| {
+            crate::PyError::new(
+                crate::PyErrorKind::ImportError,
+                format!("punycode encoding of {basename} is not text"),
+            )
+        })?
+        .replace('-', "_");
+    Ok(InitName {
+        text,
+        non_ascii: true,
+    })
 }
 
 /// The entry point an open library publishes.
@@ -361,7 +397,7 @@ fn init_basename(name: &str) -> Result<&str, crate::PyError> {
 fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)>, crate::PyError> {
     let basename = init_basename(name)?;
     for protocol in [InitProtocol::Export, InitProtocol::Init] {
-        if let Some(address) = lookup_init_address(handle, &protocol.symbol(basename)) {
+        if let Some(address) = lookup_init_address(handle, &protocol.symbol(&basename)) {
             return Ok(Some((protocol, address)));
         }
     }
@@ -370,13 +406,13 @@ fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)
 
 /// What the lookup reports when neither entry point is there.
 fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
-    let basename = name.rsplit('.').next().unwrap_or(name);
+    let symbol = match init_basename(name) {
+        Ok(basename) => InitProtocol::Init.symbol(&basename),
+        // The name could not be encoded at all, so name it as it was written.
+        Err(_) => format!("PyInit_{}", name.rsplit('.').next().unwrap_or(name)),
+    };
     extension_import_error(
-        format!(
-            "function {} not found in library '{}'",
-            InitProtocol::Init.symbol(basename),
-            path.display()
-        ),
+        format!("function {symbol} not found in library '{}'", path.display()),
         name,
         path,
     )
