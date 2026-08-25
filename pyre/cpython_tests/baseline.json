@@ -107,7 +107,7 @@
     },
     "test.test_buffer": {
       "cranelift": "PASS",
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_bufio": {
       "cranelift": "PASS",
@@ -614,7 +614,7 @@
     },
     "test.test_importlib": {
       "cranelift": "PASS",
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_index": {
       "cranelift": "PASS",

@@ -335,7 +335,12 @@ PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
 SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S = 5
 CARGO_CONFIG = {
     "dynasm": {
-        "extra": ["--no-default-features", "--features", "dynasm"],
+        # `cpyext`, because the CPython suite step that rides this backend's
+        # Linux leg builds `_testbuffer`, `_testsinglephase` and
+        # `_testmultiphase` against the binary built here: without the feature
+        # `test_buffer` skips `TestBufferProtocol` wholesale, which is 95 of
+        # that module's cases, and `test_importlib.extension` skips too.
+        "extra": ["--no-default-features", "--features", "dynasm,cpyext"],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
