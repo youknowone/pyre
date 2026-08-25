@@ -62,29 +62,6 @@ fn pat_lit_int_value(lit: &Lit) -> Option<i64> {
     }
 }
 
-/// Extract integer literal values from a match arm pattern.
-///
-/// Supports `Pat::Lit` (integer, byte and char literals — see
-/// [`pat_lit_int_value`]), `Pat::Or` (multiple patterns like `1 | 2 | 3`), and
-/// `Pat::Path` (constant paths — evaluated at compile time via `#pat as i64`).
-///
-/// Returns `None` if the pattern contains unsupported constructs.
-pub(super) fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
-    match pat {
-        Pat::Lit(expr_lit) => Some(vec![pat_lit_int_value(&expr_lit.lit)?]),
-        Pat::Or(pat_or) => {
-            let mut values = Vec::new();
-            for case in &pat_or.cases {
-                values.extend(extract_pat_literals(case)?);
-            }
-            Some(values)
-        }
-        // Constant path pattern (e.g., `MY_CONST`): we cannot evaluate
-        // this at proc-macro time, so return None to bail out.
-        _ => None,
-    }
-}
-
 /// Extract pattern values as token expressions for use in generated code.
 ///
 /// Unlike `extract_pat_literals`, this accepts constant paths (`Pat::Path`)
@@ -125,15 +102,35 @@ pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
     }
 }
 
-/// True when an identifier reads as a constant rather than a binding.
+/// True when a match arm's pattern binds a name rather than naming a constant.
 ///
 /// syn parses `OP_NOP => ..` and `other => ..` as the same `Pat::Ident`, and
 /// nothing at proc-macro time can resolve which one it is. Rust's own
-/// convention decides it: `non_upper_case_globals` puts constants in upper
-/// case, so an identifier holding no lower-case letter is one.
-pub(super) fn is_const_ident(ident: &syn::Ident) -> bool {
-    let name = ident.to_string();
-    !name.chars().any(|c| c.is_lowercase())
+/// convention decides it: a binding is `snake_case`, so a pattern whose first
+/// character is a lower-case ASCII letter is one and everything else names a
+/// constant.
+///
+/// The two mistakes are not symmetric, which is why the ambiguous cases resolve
+/// toward "constant". Reading a constant as a binding makes the arm the
+/// catch-all: its guard is never emitted and the jitcode computes one arm for
+/// every discriminant, while the concrete path — real Rust — stays right, so
+/// only a warm-versus-cold answer can see it. Reading a binding as a constant
+/// emits `#name as i64` into the generated builder, which does not compile.
+///
+/// This is the single answer for every arm classifier here: the dispatch
+/// chain, `lower_match_stmt` and `lower_match_value` all consult it.
+pub(super) fn is_lowercase_binding_pat(pat: &Pat) -> bool {
+    let Pat::Ident(pi) = pat else {
+        return false;
+    };
+    if pi.subpat.is_some() || pi.mutability.is_some() || pi.by_ref.is_some() {
+        return false;
+    }
+    pi.ident
+        .to_string()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
 }
 
 /// Case emitters for `switch_dispatch`.

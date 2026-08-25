@@ -109,14 +109,8 @@ impl<'c> Lowerer<'c> {
                 Pat::Wild(_) => {
                     default_arm = Some(&arm.body);
                 }
-                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
-                    let name = pat_ident.ident.to_string();
-                    if name.starts_with(|c: char| c.is_lowercase()) {
-                        default_arm = Some(&arm.body);
-                    } else {
-                        let tokens = extract_pat_value_tokens(&arm.pat)?;
-                        guarded_arms.push((tokens, &arm.body));
-                    }
+                _ if is_lowercase_binding_pat(&arm.pat) => {
+                    default_arm = Some(&arm.body);
                 }
                 _ => {
                     let tokens = extract_pat_value_tokens(&arm.pat)?;
@@ -598,15 +592,9 @@ impl<'c> Lowerer<'c> {
                     default_arm = Some(&arm.body);
                 }
                 // syn parses `OP_NOP => ..` and `other => ..` identically, so
-                // the name is all there is to go on.  A constant is upper case
-                // (rustc's own `non_upper_case_globals` says so), and reading
-                // one as a binding is the silent failure: the arm becomes the
-                // catch-all, its guard is never emitted, and the jitcode
-                // computes whichever constant arm came last no matter what the
-                // discriminant is, while the concrete path stays right.
-                Pat::Ident(pat_ident)
-                    if pat_ident.subpat.is_none() && !is_const_ident(&pat_ident.ident) =>
-                {
+                // the name is all there is to go on, and `is_lowercase_binding_pat`
+                // is the one place that decides it.
+                _ if is_lowercase_binding_pat(&arm.pat) => {
                     default_arm = Some(&arm.body);
                 }
                 _ => {

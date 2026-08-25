@@ -3096,20 +3096,6 @@ pub(super) fn lower_dispatch_chain(
     default_label
 }
 
-fn is_lowercase_binding_pat(pat: &Pat) -> bool {
-    let Pat::Ident(pi) = pat else {
-        return false;
-    };
-    if pi.subpat.is_some() || pi.mutability.is_some() || pi.by_ref.is_some() {
-        return false;
-    }
-    pi.ident
-        .to_string()
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase())
-}
-
 fn pat_contains_range(pat: &Pat) -> bool {
     match pat {
         Pat::Range(_) => true,
