@@ -18,9 +18,8 @@
 //! Each variant also carries Python 3.14's mutable-once tuple hash cache;
 //! this is the requested 3.14 delta from PyPy's specialized layouts.
 //!
-//! Data structures are landed. Construction
-//! dispatch (`makespecialisedtuple2`) and JIT specialisation are
-//! not yet implemented.
+//! Construction dispatch lives in `tupleobject::makespecialisedtuple2`; tuple
+//! readers and the generated JIT dispatch on these three concrete layouts.
 
 #![allow(non_camel_case_types)]
 

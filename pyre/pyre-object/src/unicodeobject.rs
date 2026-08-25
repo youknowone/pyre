@@ -60,6 +60,20 @@ pub struct W_UnicodeObject {
     pub hash: i64,
 }
 
+impl W_UnicodeObject {
+    /// `unicodeobject.py W_UnicodeObject.eq_w` — the typed equality shortcut
+    /// used by `UnicodeDictStrategy` and `argument.contains_w_names`.
+    ///
+    /// Both operands are already proven `W_UnicodeObject`s by those callers,
+    /// so this compares the underlying WTF-8 buffers directly and never
+    /// dispatches an app-level `__eq__`.  WTF-8 preserves PyPy's `_utf8`
+    /// byte equality for lone surrogates as well as ordinary Unicode.
+    #[inline]
+    pub fn eq_w(&self, w_other: &W_UnicodeObject) -> bool {
+        unsafe { &*self.value == &*w_other.value }
+    }
+}
+
 /// The translated user-subclass layout selected by `typedef.py:174-227`.
 /// The builtin string payload stays unchanged; the generated user class adds
 /// `MapdictStorageMixin` after it.
@@ -835,6 +849,19 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
     }
 }
 
+/// Object-space entry to [`W_UnicodeObject::eq_w`].
+///
+/// # Safety
+/// Both arguments must point to valid `W_UnicodeObject`s.
+#[inline]
+pub unsafe fn w_str_eq_w(obj: PyObjectRef, w_other: PyObjectRef) -> bool {
+    unsafe {
+        let this = &*(obj as *const W_UnicodeObject);
+        let other = &*(w_other as *const W_UnicodeObject);
+        this.eq_w(other)
+    }
+}
+
 /// `rstr.py ll_strhash` — the memoized digest, or zero while it has
 /// not been computed yet ("our malloc initializes the memory to zero, so we
 /// use zero as the value of a string whose hash is not computed yet").
@@ -1271,6 +1298,31 @@ mod tests {
             let str_obj = obj as *const W_UnicodeObject;
             assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
             assert_eq!((*str_obj).len, 4); // 4 codepoints
+        }
+    }
+
+    #[test]
+    fn test_str_eq_w_compares_wtf8_without_python_dispatch() {
+        let a = w_str_new("café");
+        let b = w_str_new("café");
+        let c = w_str_new("cafe");
+        unsafe {
+            assert!(w_str_eq_w(a, b));
+            assert!(!w_str_eq_w(a, c));
+        }
+
+        let mut left = Wtf8Buf::new();
+        left.push(CodePoint::from_u32(0xD800).unwrap());
+        let mut right = Wtf8Buf::new();
+        right.push(CodePoint::from_u32(0xD800).unwrap());
+        let mut different = Wtf8Buf::new();
+        different.push(CodePoint::from_u32(0xD801).unwrap());
+        let left = w_str_from_wtf8(left);
+        let right = w_str_from_wtf8(right);
+        let different = w_str_from_wtf8(different);
+        unsafe {
+            assert!(w_str_eq_w(left, right));
+            assert!(!w_str_eq_w(left, different));
         }
     }
 
