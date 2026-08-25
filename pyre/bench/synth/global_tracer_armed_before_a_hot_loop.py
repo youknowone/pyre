@@ -1,4 +1,9 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=hot,root:callee
+# The callee's `root:` arm is the premise, not a relaxation: the events this
+# fixture counts are owed precisely because compiled code enters the callee past
+# `execute_frame`'s bracket.  A callee that stopped reaching the JIT would make
+# every count below pass without testing anything.
 # A global trace function is installed while a loop is already compiled, and
 # the loop keeps running.
 #
