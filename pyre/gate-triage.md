@@ -168,7 +168,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 **OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
 `PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
 
-### §6a — Live default-ON (5): the removal targets
+### §6a — Live default-ON (7): the removal targets
 
 | gate | what is ON by default | retire when |
 |---|---|---|
@@ -178,6 +178,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_BRIDGE_PARAMS | a wasm guard passing its fail args to the bridge as call parameters (`lib.rs bridge_params_enabled`); `=0`/`false`/`off` restores the jitframe spill crossing | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_INLINE_BRIDGE | merging a loop-closing bridge's ops into the module of the loop it guards into, so `guard → bridge → loop` becomes a `br` (`lib.rs inline_bridge_enabled`); `=0`/`false`/`off` restores the separate bridge module | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
+| PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a forcing residual wrote to the frame, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the second arm of the same defect closes: a callee that is INLINED makes the store a residual that forces nothing, and until that is fixed this is the one-binary A/B separating the two |
 
 ### §6a2 — Default-OFF experiments (3)
 
