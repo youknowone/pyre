@@ -3765,9 +3765,22 @@ impl<'a> Transformer<'a> {
             && let Some(variant) = sum_variant_ctor(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
+            // No fallback: `sum_variant_ctor` matched the ctor's variant leaf,
+            // so the result owner is that variant's class and the suffix is
+            // there. Keeping the unstripped owner instead would aim the
+            // `__discriminant` write at the variant class rather than the enum
+            // base, and would send a payload-less variant's allocation back to
+            // the zero-sized descr the walker refuses — both silent, and
+            // neither ever right. Fail where the assumption breaks, like the
+            // `expect` on the ctor's result below.
             let result_base = owner
                 .strip_suffix(format!("::{}", variant.leaf).as_str())
-                .unwrap_or(owner)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "niladic sum variant ctor owner `{owner}` must end with `::{}`",
+                        variant.leaf
+                    )
+                })
                 .to_string();
             let alloc_owner = if variant.carries_payload {
                 owner.clone()
@@ -11782,6 +11795,70 @@ mod tests {
                 && field.owner_root.as_deref()
                     == Some("core::result::Result<i64,PyError>")
                 && value.value == crate::flowspace::model::ConstValue::Int(1)
+        ));
+    }
+
+    /// The payload-less half of the same arm: `Option::None` has no fields, so
+    /// `New` on the variant class would resolve to a zero-sized descr the
+    /// collector never issued a type id for (`UnregisteredNewGcType`). The
+    /// value it builds is a bare tag, which the enum base's shell carries, so
+    /// the allocation goes there while the tag write keeps the base owner the
+    /// payload-carrying variant already uses.
+    #[test]
+    fn niladic_payload_less_variant_allocates_the_enum_base() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("option_none_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let base = "core::option::Option<i64>".to_string();
+        let owner = format!("{base}::None");
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec![
+                "core".to_string(),
+                "option".to_string(),
+                "Option<i64>".to_string(),
+            ],
+            "None",
+        );
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "option_none_malloc",
+            &mut graph,
+        ) else {
+            panic!("niladic Option variant must lower to malloc + tag store");
+        };
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner: allocated },
+            } if result == &result_var && allocated == &base
+        ));
+        assert!(matches!(
+            &ops[1].kind,
+            OpKind::FieldWrite {
+                base: write_base,
+                field,
+                value: crate::model::LinkArg::Const(value),
+                ty: ValueType::Int,
+            } if write_base == &result_var
+                && field.name == "__discriminant"
+                && field.owner_root.as_deref() == Some(base.as_str())
+                && value.value == crate::flowspace::model::ConstValue::Int(0)
         ));
     }
 
