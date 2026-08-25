@@ -4993,7 +4993,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Run `f` with the typed greenkey `[next_instr, is_being_profiled,
-    /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
+    /// pycode]` that matches `warmstate.py make_green_key`,
     /// reusing a thread-local `GreenKey` so the warmup-hot decision path
     /// does not allocate the key's value/type vectors per back-edge.
     /// `is_being_profiled` is the one green the raw `(code, pc)` pair does not
@@ -25654,6 +25654,49 @@ mod tests {
         assert!(
             meta.warm_state.lookup_chain_with_key(&key).is_some(),
             "force-started cell must carry a typed comparekey"
+        );
+    }
+
+    #[test]
+    fn on_back_edge_typed_recovers_the_profiled_green_from_the_bucket_hash() {
+        // `is_being_profiled` is an `interp_jit.py` portal green, so a profiled
+        // activation of the same `(code, pc)` buckets elsewhere and owns a cell
+        // of its own. `with_typed_decision_key` is handed the bucket hash and
+        // the raw pair only, and recovers the green by reproducing the hash; a
+        // spelling hardcoded to the unprofiled value would install a cell whose
+        // `comparekey` names a bucket the cell is not in, so the marker path
+        // (`lookup_chain_with_key`) would never resolve to it.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x6000;
+        let pc: usize = 17;
+        let green_key = majit_ir::pypyjit_greenkey_uhash(pc, true, code as u64);
+        assert_ne!(
+            green_key,
+            crate::green_key_from_code_ptr(code, pc),
+            "the two spellings of this green must not share a bucket"
+        );
+        let live = [Value::Int(0)];
+        for _ in 0..2 {
+            meta.on_back_edge_typed(green_key, (code, pc), None, None, &live);
+        }
+        assert!(meta.tracing.is_some(), "expected tracing to start");
+
+        let profiled = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 1, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let cell = meta
+            .warm_state
+            .lookup_chain_with_key(&profiled)
+            .expect("profiled back-edge cell must carry a typed comparekey");
+        let stored = cell
+            .comparekey
+            .as_ref()
+            .expect("the installed cell must store a comparekey");
+        assert_eq!(
+            stored.values[1], 1,
+            "the profiled green must survive into the cell's comparekey"
         );
     }
 

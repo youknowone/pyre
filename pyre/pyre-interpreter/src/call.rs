@@ -1198,7 +1198,7 @@ pub fn call_callable_in_ctx(
 /// `c_call` the bytecode never made.  Taking the frame from the caller keeps
 /// the two apart, and it no longer forces the vref at all — `gettopframe_raw`
 /// is `force_vref`, and a vref forced while the trace records is marked as
-/// escaping (`virtualref.py:161-167`).
+/// escaping (`virtualref.py force_virtual`, the `TOKEN_TRACING_RESCALL` arm).
 ///
 /// `baseobjspace.py` gates the arm on `frame.get_is_being_profiled()` alone,
 /// which is safe against a stale flag: `executioncontext.py call_trace` sets

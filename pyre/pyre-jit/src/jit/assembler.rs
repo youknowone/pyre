@@ -2076,21 +2076,6 @@ fn untag_const_ref_value(value: i64) -> i64 {
     }
 }
 
-/// Route a ref constant through the constant pool, rooting it for the rest of
-/// the drain first.
-///
-/// A pool records an address once and nothing rewrites it, so a constant the
-/// collector may move has to be tracked from the moment it is baked:
-/// `note_build_const_ref` roots it until `install_jitcodes` publishes the pool
-/// and patches the slot, after which `walk_jitcode_constants_refs` forwards it
-/// like any other root.  RPython needs none of this — its `ConstPtr` constants
-/// come from the translated program and are prebuilt.
-fn add_const_r_rooted(state: &mut AssemblyState, value: i64) -> u16 {
-    let value = untag_const_ref_value(value);
-    pyre_jit_trace::state::note_build_const_ref(value);
-    state.builder.add_const_r(value)
-}
-
 fn expect_ref_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
     match op {
         Operand::Register(Register {
@@ -2098,7 +2083,7 @@ fn expect_ref_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
             index,
         }) => *index,
         Operand::ConstRef(value) => {
-            let idx = add_const_r_rooted(state, *value);
+            let idx = state.builder.add_const_r(untag_const_ref_value(*value));
             state.builder.num_regs_r() + idx
         }
         other => panic!(
@@ -2196,7 +2181,7 @@ fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: K
                         Kind::Ref,
                         "ConstRef found inside non-ref ListOfKind({expected:?})"
                     );
-                    let idx = add_const_r_rooted(state, *value);
+                    let idx = state.builder.add_const_r(untag_const_ref_value(*value));
                     state.builder.num_regs_r() + idx
                 }
                 other => panic!(

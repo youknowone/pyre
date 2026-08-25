@@ -4839,11 +4839,6 @@ fn register_thread_root_areas() {
             "jitcode_constants",
         );
         register(
-            build_const_refs_root_walker_area,
-            pyre_jit_trace::state::capture_build_const_refs_area(),
-            "jitcode_build_const_refs",
-        );
-        register(
             fbw_store_journal_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
             "fbw_store_journal",
@@ -5696,15 +5691,6 @@ unsafe fn jitcode_code_root_walker_area(
         return;
     }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
-}
-
-/// Ref constants baked into a pool that `install_jitcodes` has not published
-/// yet — see `pyre_jit_trace::state::note_build_const_ref`.
-unsafe fn build_const_refs_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe { pyre_jit_trace::state::walk_build_const_refs_area(data, visitor) };
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
@@ -8578,32 +8564,58 @@ fn eval_with_jit_inner(
     // `gettrace() is not None` — so an untraced activation pays one null read
     // per hook.  Both run application-level Python and may move the frame, so
     // each takes its argument from the root rather than from a saved word.
+    //
+    // The bracket is two nested `try`s under one `finally`, and the nesting is
+    // what decides which hook still runs after another one raised:
+    // `call_trace` sits in the outer `try`, `return_trace` in the inner
+    // `finally`, and `leave` in the outer one.  So a `call_trace` that raises
+    // skips the eval body AND `return_trace` yet still owes the leave hook,
+    // `return_trace` runs on the raising path too — with `w_exitvalue` still
+    // the `None` the bracket opened with — and each hook that raises replaces
+    // whatever was pending, in that order.  `?` on any of the three would
+    // flatten the nesting and drop the hooks after it.
+    fn portal_body(frame_root: &mut FrameRoot) -> PyResult {
+        match try_function_entry_jit(frame_root.frame()) {
+            Some(result) => result,
+            None => handle_jitexception(frame_root.frame()),
+        }
+    }
     let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
-    if !ec.is_null() {
-        unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame)? };
-    }
-    let result = match try_function_entry_jit(frame_root.frame()) {
-        Some(result) => result,
-        None => handle_jitexception(frame_root.frame()),
-    };
     if ec.is_null() {
-        return result;
+        // No execution context is no hook to owe, and no `leave` either.
+        return portal_body(&mut frame_root);
     }
-    // Upstream runs `return_trace` from a `finally`, so it runs on the raising
-    // path too — with `w_exitvalue` still the `None` the bracket opened with —
-    // and a failure of its own replaces the pending exception.
-    let w_exitvalue = match &result {
-        Ok(value) => *value,
-        Err(_) => w_none(),
+    // `w_exitvalue` is `execute_frame`'s own local, not a re-read of the result
+    // word: it opens as the `None` the bracket opened with, takes the body's
+    // value if the body produced one, and KEEPS that value across a
+    // `return_trace` that raises — so the leave hook is handed what the body
+    // returned rather than the `None` a failed hook would otherwise imply.
+    // Same shape, and the same assign-only-what-came-back-live rule, as
+    // `eval::eval_frame_plain_with_resume`.
+    let mut w_exitvalue = w_none();
+    let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
+        Err(err) => Err(err),
+        Ok(()) => {
+            let result = portal_body(&mut frame_root);
+            if let Ok(value) = &result {
+                w_exitvalue = *value;
+            }
+            match unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) } {
+                Err(err) => Err(err),
+                Ok(live) => {
+                    w_exitvalue = live;
+                    result.map(|_| live)
+                }
+            }
+        }
     };
-    let live = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
     // `setprofile`'s `return` is not `return_trace`'s — that one tests
     // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
     // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
     // this arm never reaches `leave`: the declining paths above return through
     // `execute_frame_plain`, which does, and these two do not.
-    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, live)? };
-    result.map(|_| live)
+    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
+    outer_result.map(|_| live)
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
