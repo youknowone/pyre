@@ -371,24 +371,44 @@ pub extern "C" fn jit_mapdict_unboxed_read_raw(
     }
 }
 
+/// Enter a residual leaf's exception into both channels the trailing
+/// `GuardNoException` and the blackhole read, and answer the null a leaf
+/// returns on the raising arm.
+fn publish_leaf_exception(err: &mut pyre_interpreter::PyError) -> i64 {
+    let exc = err.to_exc_object() as i64;
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc));
+    #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+    majit_backend_cranelift::jit_exc_raise(exc);
+    #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
+    majit_backend_dynasm::jit_exc_raise(exc);
+    #[cfg(target_arch = "wasm32")]
+    majit_backend_wasm::jit_exc_raise(exc);
+    let _ = exc;
+    0
+}
+
 /// `normalize_hash_digest` as a JIT residual: normalize a boxed `__hash__`
 /// digest to the machine hash, raising for a non-integer.  On error the
 /// exception enters both channels for the trailing `GuardNoException`.
 pub extern "C" fn jit_hash_normalize_digest(digest: i64) -> i64 {
     match pyre_interpreter::builtins::normalize_hash_digest(digest as PyObjectRef) {
         Ok(h) => h,
-        Err(mut err) => {
-            let exc = err.to_exc_object() as i64;
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc));
-            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
-            majit_backend_cranelift::jit_exc_raise(exc);
-            #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
-            majit_backend_dynasm::jit_exc_raise(exc);
-            #[cfg(target_arch = "wasm32")]
-            majit_backend_wasm::jit_exc_raise(exc);
-            let _ = exc;
-            0
-        }
+        Err(mut err) => publish_leaf_exception(&mut err),
+    }
+}
+
+/// `descriptor.py _super_from_frame` as a JIT residual: build the zero-argument
+/// `super()` proxy from the frame the caller names, rather than from the frame
+/// `ExecutionContext::gettopframe()` rediscovers.
+///
+/// This is the entry point `LOAD_SUPER_ATTR` already reaches through
+/// `bh_load_super_attr_fn`; naming it directly is what lets the name-bound
+/// spelling take the same route.
+pub extern "C" fn jit_bare_super_from_frame(frame: i64) -> i64 {
+    let frame = frame as usize as *mut pyre_interpreter::PyFrame;
+    match pyre_interpreter::builtins::builtin_super_from_frame(frame) {
+        Ok(proxy) => proxy as i64,
+        Err(mut err) => publish_leaf_exception(&mut err),
     }
 }
 
