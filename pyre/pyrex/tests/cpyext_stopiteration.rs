@@ -25,11 +25,14 @@ def eq(name, got, want):
 
 
 word = 8
+# `PyObject` is the refcount, pyre's link to the interpreter object, a padding
+# word and the type pointer.
+header = 4 * word
 
 # ── the layout ─────────────────────────────────────────────────────────
 
 # The header and one word, which is what the Rust twin asserts.
-eq('layout', m.layout(), (3 * word, 4 * word))
+eq('layout', m.layout(), (header, header + word))
 
 # ── the value the block carries ────────────────────────────────────────
 
