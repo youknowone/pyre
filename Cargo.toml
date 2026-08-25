@@ -36,6 +36,7 @@ members = [
     "majit/examples/i64env",
     "majit/examples/cel",
     "majit/examples/spcount",
+    "majit/examples/regex",
     # pyre
     "pyre/pyre-object",
     "pyre/pyre-macros",
