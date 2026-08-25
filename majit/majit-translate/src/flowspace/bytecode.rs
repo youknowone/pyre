@@ -408,7 +408,7 @@ mod test {
     use rustpython_compiler::{Mode, compile as rp_compile};
 
     fn compile_source(src: &str) -> CodeObject {
-        rp_compile(src, Mode::Exec, "<pyre>", Default::default()).expect("compile should succeed")
+        rp_compile(src, Mode::Exec, "<flow>", Default::default()).expect("compile should succeed")
     }
 
     // RPython basis: test_objspace.py shapes these round-trips by calling

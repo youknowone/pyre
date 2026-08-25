@@ -242,7 +242,7 @@ fn iter_next_item_type(
 }
 
 /// Whether `var` traces back to `front::range_iter`'s reserved
-/// `["__pyre_range"]` call — the `range(a, b)` builtin standing in for an
+/// `["__majit_range"]` call — the `range(a, b)` builtin standing in for an
 /// exclusive int `Range`.
 ///
 /// The same backward walk the iterator itself gets.  `range_iter` emits the
@@ -256,7 +256,7 @@ fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments },
             ..
-        } if segments.len() == 1 && segments[0] == "__pyre_range" => Some(()),
+        } if segments.len() == 1 && segments[0] == "__majit_range" => Some(()),
         _ => None,
     })
     .is_some()
@@ -358,7 +358,7 @@ pub(crate) fn rewire_next_call_sites(
     rewritten
 }
 
-/// `true` iff `segments` is a `__pyre_cast_instance` narrow — the front-end
+/// `true` iff `segments` is a `__cast_instance_intrinsic` narrow — the front-end
 /// pointer-downcast marker (`front::mir` `Rvalue::Cast` #298 arm) the MIR
 /// emits when an opaque `Ref` result is reinterpreted as a registered struct
 /// root.  It lowers to `cast_pointer` (a pure alias), so it carries no
@@ -370,13 +370,13 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__pyre_cast_instance")
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__cast_instance_intrinsic")
     )
 }
 
 /// An unregistered `next()` returns an opaque `Ref`; the MIR immediately
 /// narrows it to the concrete `Option<T>` with one or more pure
-/// `__pyre_cast_instance` recasts (the front-end analogue of
+/// `__cast_instance_intrinsic` recasts (the front-end analogue of
 /// `ListIteratorRepr::rtype_next`'s `recast`, `rpython/rtyper/rlist.py`).
 /// Peel that trailing chain: starting from the raw `next` result at
 /// `next_idx`, follow each contiguous recast whose sole operand is the prior
@@ -391,7 +391,7 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
 ///
 /// Shared with `front::bool_then`: a residual `then`/`then_some` produces the
 /// same opaque `Ref` narrowed to the concrete `Option<T>` by a
-/// `__pyre_cast_instance` recast tail, so it peels the identical chain (the
+/// `__cast_instance_intrinsic` recast tail, so it peels the identical chain (the
 /// caller passes its own `op_label` for the decline messages).
 pub(crate) fn peel_recast_chain(
     graph: &FunctionGraph,
@@ -494,7 +494,7 @@ fn rewire_one_next_site(
     // `lower_call` closes the block right after the raising call, so the
     // `next()` call is normally A's last op.  An UNREGISTERED `next()`
     // returns an opaque `Ref` that the MIR immediately recasts to the
-    // concrete `Option<T>` via one or more pure `__pyre_cast_instance`
+    // concrete `Option<T>` via one or more pure `__cast_instance_intrinsic`
     // narrows (the front-end analogue of `ListIteratorRepr::rtype_next`'s
     // `recast`, `rpython/rtyper/rlist.py` `self.r_list.recast`).  Such a
     // narrow is a `cast_pointer` alias, so the native `next` op subsumes it:
@@ -768,7 +768,7 @@ mod tests {
         let mut g = FunctionGraph::new("test_iter_next_item_type");
         let n = g.startblock;
         let container_segments = if over_a_range {
-            vec!["__pyre_range".to_string()]
+            vec!["__majit_range".to_string()]
         } else {
             vec![
                 "some".to_string(),

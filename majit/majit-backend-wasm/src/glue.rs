@@ -45,10 +45,10 @@ mod imports {
 
 #[cfg(all(feature = "host-import", not(feature = "web")))]
 mod imports {
-    // Plain wasm imports from the `pyre_jit` module namespace. A native
+    // Plain wasm imports from the `majit_host` module namespace. A native
     // embedder backs these with its own runtime, e.g. `wasmi::Module::new`
     // + `Instance::new` sharing this module's exported linear memory.
-    #[link(wasm_import_module = "pyre_jit")]
+    #[link(wasm_import_module = "majit_host")]
     unsafe extern "C" {
         pub(super) fn jit_compile_wasm(bytes_ptr: u32, bytes_len: u32) -> u32;
         pub(super) fn jit_replace_wasm(func_id: u32, bytes_ptr: u32, bytes_len: u32) -> u32;

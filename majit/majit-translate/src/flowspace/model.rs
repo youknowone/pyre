@@ -1718,8 +1718,8 @@ impl HostEnv {
         // qualname and its typer (rtyper/rbuiltin.rs) keys on this same
         // singleton Arc, so the binding must live in HOST_ENV.
         self.insert_builtin(
-            "__pyre_cast_instance",
-            HostObject::new_builtin_callable("__pyre_cast_instance"),
+            "__cast_instance_intrinsic",
+            HostObject::new_builtin_callable("__cast_instance_intrinsic"),
         );
         // Pyre-internal front-end pointer-type ERASURE, the twin of the
         // narrow above: the frontend lowers `obj as *mut u8` to a
@@ -1731,8 +1731,8 @@ impl HostEnv {
         // for a pointee-less raw pointer.  Same three-way binding as the
         // narrow (analyzer keys the qualname, typer keys this Arc).
         self.insert_builtin(
-            "__pyre_cast_address",
-            HostObject::new_builtin_callable("__pyre_cast_address"),
+            "__cast_address_intrinsic",
+            HostObject::new_builtin_callable("__cast_address_intrinsic"),
         );
     }
 
@@ -2315,8 +2315,8 @@ impl HostEnv {
         // (`rbuiltin.rs lookup_typer`), so a fresh
         // `new_builtin_callable` with the same qualname would miss the
         // registered typer.
-        let pyre_object_pyobject = HostObject::new_module("pyre_object.pyobject");
-        pyre_object_pyobject.module_set(
+        let object_module = HostObject::new_module("pyre_object.pyobject");
+        object_module.module_set(
             "PY_NULL",
             core_ptr
                 .module_get("null_mut")
@@ -2330,12 +2330,12 @@ impl HostEnv {
         // crate-qualified FunctionPath `["pyre_object","lltype","malloc_typed"]`,
         // which `translate_op`'s Layer-3b resolves via this module
         // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
-        let pyre_object_lltype = HostObject::new_module("pyre_object.lltype");
-        pyre_object_lltype.module_set(
+        let lltype_module = HostObject::new_module("pyre_object.lltype");
+        lltype_module.module_set(
             "malloc_typed",
             HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed"),
         );
-        pyre_object_lltype.module_set(
+        lltype_module.module_set(
             "malloc_typed_managed",
             HostObject::new_builtin_callable("pyre_object.lltype.malloc_typed_managed"),
         );
@@ -2345,7 +2345,7 @@ impl HostEnv {
         // `malloc_raw_alloc` analyzer types the result as the `*mut T`
         // pointer shell.  Resolved by `translate_op`'s Layer-3b via this
         // module (prefix `pyre_object.lltype`, leaf `malloc_raw`).
-        pyre_object_lltype.module_set(
+        lltype_module.module_set(
             "malloc_raw",
             HostObject::new_builtin_callable("pyre_object.lltype.malloc_raw"),
         );
@@ -2389,8 +2389,8 @@ impl HostEnv {
         mods.insert("FrameDebugData".into(), frame_debug_data);
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
-        mods.insert("pyre_object.pyobject".into(), pyre_object_pyobject);
-        mods.insert("pyre_object.lltype".into(), pyre_object_lltype);
+        mods.insert("pyre_object.pyobject".into(), object_module);
+        mods.insert("pyre_object.lltype".into(), lltype_module);
     }
 
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
@@ -3240,7 +3240,7 @@ fn alloc_constant_id(value: &ConstValue) -> u64 {
 fn constant_trace_backtrace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("PYRE_DTRACE_CONST_BT")
+        std::env::var("MAJIT_DTRACE_CONST_BT")
             .as_deref()
             .is_ok_and(|value| value == "1")
     })
@@ -3254,11 +3254,11 @@ fn constant_trace_window() -> Option<&'static (u64, u64)> {
             if !crate::determinism_trace_enabled() {
                 return None;
             }
-            let from = std::env::var("PYRE_DTRACE_CONST_FROM")
+            let from = std::env::var("MAJIT_DTRACE_CONST_FROM")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-            let to = std::env::var("PYRE_DTRACE_CONST_TO")
+            let to = std::env::var("MAJIT_DTRACE_CONST_TO")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);

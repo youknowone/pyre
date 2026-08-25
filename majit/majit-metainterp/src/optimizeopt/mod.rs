@@ -1461,7 +1461,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         // `FieldDescrInfo.index` must carry the stable descriptor index
         // (tagged offset) so resume-data readers can identify the field by
         // byte offset. Previously stored `fi as u32` (iteration counter),
-        // which made `extract_pyre_field_offset` always fail for virtuals
+        // which made `extract_runtime_field_offset` always fail for virtuals
         // being materialized on bridge entry.
         let built_fielddescrs: Vec<majit_ir::FieldDescrInfo> = fielddescrs
             .iter()
@@ -4980,15 +4980,15 @@ impl OptContext {
         "a-producerless"
     }
 
-    /// S9 probe sink (env-gated). No-op unless `PYRE_S9_PROBE` is set; appends
+    /// S9 probe sink (env-gated). No-op unless `MAJIT_S9_PROBE` is set; appends
     /// one classified line per `from_opref` fallback fire to
-    /// `/tmp/pyre_s9_probe.log`. Process-global file sink because the caller is
+    /// `/tmp/majit_s9_probe.log`. Process-global file sink because the caller is
     /// `&self` (no context-local counter). When the flag is unset, only a
     /// cached bool is read and the sink is never opened.
     fn s9_probe_fire(&self, opref: OpRef) {
         use std::sync::{LazyLock, Mutex};
         static ENABLED: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("PYRE_S9_PROBE").is_some());
+            LazyLock::new(|| std::env::var_os("MAJIT_S9_PROBE").is_some());
         if !*ENABLED {
             return;
         }
@@ -4997,16 +4997,16 @@ impl OptContext {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open("/tmp/pyre_s9_probe.log")
-                    .expect("open /tmp/pyre_s9_probe.log"),
+                    .open("/tmp/majit_s9_probe.log")
+                    .expect("open /tmp/majit_s9_probe.log"),
             )
         });
         let cat = self.classify_s9_fallback(opref);
-        // `PYRE_S9_PROBE=bt` additionally captures the caller backtrace per
+        // `MAJIT_S9_PROBE=bt` additionally captures the caller backtrace per
         // fire, to attribute fallback fires to their `get_box_replacement`
         // call sites.
         static BT: LazyLock<bool> = LazyLock::new(|| {
-            std::env::var("PYRE_S9_PROBE")
+            std::env::var("MAJIT_S9_PROBE")
                 .map(|v| v == "bt")
                 .unwrap_or(false)
         });

@@ -104,7 +104,7 @@ pub struct ArrayToken {
 /// `{length: usize, items: *mut ItemsBlock}` fields directly (no
 /// `PyObjectArray` fat wrapper for list/tuple). The `std::alloc`
 /// `alloc_items_block` / `grow_items_block` below are the
-/// `PYRE_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
+/// `MAJIT_GC_ITEMSBLOCK=0` fallback (provably identical pre-migration
 /// behaviour).
 #[repr(C)]
 pub struct ItemsBlock {
@@ -587,7 +587,7 @@ pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsB
 }
 
 /// Allocate a fresh `ItemsBlock` with the given capacity via
-/// `std::alloc::alloc`. This is the `PYRE_GC_ITEMSBLOCK=0` fallback;
+/// `std::alloc::alloc`. This is the `MAJIT_GC_ITEMSBLOCK=0` fallback;
 /// the default path is the moving-nursery `alloc_items_block_gc` above
 /// (`try_gc_alloc`, caller-side root tracking via `gc_roots::pin_root` +
 /// the block write-barrier). An earlier `try_gc_alloc_stable` attempt was

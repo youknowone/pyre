@@ -1351,11 +1351,8 @@ def write_readfiles(path: Path, by_crate: dict[str, set[Path]]) -> None:
         {item for crate_files in by_crate.values() for item in crate_files},
         key=lambda item: item.as_posix(),
     )
-    path.write_text(
-        "".join(f"{item.as_posix()}\n" for item in files),
-        encoding="utf-8",
-        newline="\n",
-    )
+    with path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write("".join(f"{item.as_posix()}\n" for item in files))
 
 
 def assert_readfiles_resolve(root: Path, dest: Path, by_crate: dict[str, set[Path]]) -> None:
@@ -2602,9 +2599,8 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # compared against a string built in memory with "\n", so a writer
         # that translates makes the artefact describe the same tree
         # differently on Windows than everywhere else.
-        stamp_path.write_text(
-            current_stamp + "\n", encoding="utf-8", newline="\n"
-        )
+        with stamp_path.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(current_stamp + "\n")
         print(
             f"    wrote {dest} ({dest.stat().st_size} bytes),"
             f" stamped in {time.monotonic() - phase_started:.0f} s"

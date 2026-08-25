@@ -2302,7 +2302,7 @@ fn rebuild_state_after_failure_dispatch(
     bridge_num_inputs: usize,
 ) {
     let cb = RESUMEDATA_DEOPT_FN.get().copied().expect(
-        "RESUMEDATA_DEOPT_FN not registered — pyre-jit's init_callbacks (eval.rs) must call \
+        "RESUMEDATA_DEOPT_FN not registered — the runtime must call \
          register_resumedata_deopt before any guard can fail.",
     );
     // `cranelift_resumedata_deopt` recovers the descr via
@@ -6534,7 +6534,7 @@ fn emit_stack_check_result(
             &[],
             Some(cl_types::I64),
         )
-        .expect("pyre_stack_check_for_jit_prologue must return an i64");
+        .expect("the registered prologue stack-check callback must return an i64");
     }
 
     builder.ins().iconst(cl_types::I64, 0)
@@ -7361,13 +7361,13 @@ fn emit_guard_exit(
     //
     // aarch64 re-verified post-fix (cranelift 0.132): tail_sp_leak.rs has
     // zero drift, nbody_50k matches the reference exactly, and the full
-    // bench suite is correct.  `PYRE_CL_NO_CLOSING_JUMP` is an opt-out
+    // bench suite is correct.  `MAJIT_CL_NO_CLOSING_JUMP` is an opt-out
     // hatch for A/B and rollback.
     if let Some((ll_loop_code_addr, label_block_id_addr, target_frame_depth_addr)) =
         info.external_jump_ll_loop_code_addr
     {
         let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
-            && std::env::var_os("PYRE_CL_NO_CLOSING_JUMP").is_none();
+            && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
         if enabled {
             emit_attached_loop_dispatch(
                 builder,
@@ -17222,7 +17222,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // External JUMP fallback: the in-code `closing_jump` dispatch
         // (`emit_attached_loop_dispatch`) is on by default for x86_64 and
         // aarch64, but stays off on other arches and whenever
-        // `PYRE_CL_NO_CLOSING_JUMP` is set.  In those cases a guard exit may
+        // `MAJIT_CL_NO_CLOSING_JUMP` is set.  In those cases a guard exit may
         // legitimately surface an `is_external_jump` descr here, and the
         // host loop re-enters the target trace exactly as
         // `execute_with_inputs` (compiler.rs) does.  This block
@@ -17341,7 +17341,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // fail descriptor and continue dispatch, mirroring
             // `execute_with_inputs`.  Reached when in-code `closing_jump` is
             // disabled (non-x86_64/non-aarch64 arch, or
-            // `PYRE_CL_NO_CLOSING_JUMP`); otherwise the JUMP transfers
+            // `MAJIT_CL_NO_CLOSING_JUMP`); otherwise the JUMP transfers
             // entirely inside generated code.
             if fail_descr_fd.is_external_jump() {
                 slice_x2_probe::record_execute_with_inputs_hit();
@@ -24384,9 +24384,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
+    #[ignore = "sets the process-global MAJIT_CL_NO_CLOSING_JUMP env var to force the \
         host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
-        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
+        `MAJIT_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
         test_host_loop_external_jump_to_middle_label -- --ignored --test-threads=1`"]
     fn test_host_loop_external_jump_to_middle_label_uses_label_selector() {
         // Same scenario as the in-code variant above, but with closing_jump
@@ -24397,7 +24397,7 @@ mod tests {
         // selects the loader (reading the carried value run_compiled_code
         // loaded into slot 0) instead of the preamble — which would re-run
         // the start LABEL and finish 35 instead of 25.
-        unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
+        unsafe { std::env::set_var("MAJIT_CL_NO_CLOSING_JUMP", "1") };
 
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1_500_280);
@@ -24492,16 +24492,16 @@ mod tests {
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
 
-        unsafe { std::env::remove_var("PYRE_CL_NO_CLOSING_JUMP") };
+        unsafe { std::env::remove_var("MAJIT_CL_NO_CLOSING_JUMP") };
 
         assert!(is_finish);
         assert_eq!(value, 25);
     }
 
     #[test]
-    #[ignore = "sets the process-global PYRE_CL_NO_CLOSING_JUMP env var to force the \
+    #[ignore = "sets the process-global MAJIT_CL_NO_CLOSING_JUMP env var to force the \
         host-loop external-JUMP path (in-code closing_jump disabled); run serially: \
-        `PYRE_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
+        `MAJIT_CL_NO_CLOSING_JUMP=1 cargo test -p majit-backend-cranelift \
         test_host_loop_external_jump_to_first_label -- --ignored --test-threads=1`"]
     fn test_host_loop_external_jump_to_first_label_uses_label_selector() {
         // The first LABEL (`label_block_id` 0) is not special: `closing_jump`
@@ -24514,7 +24514,7 @@ mod tests {
         // LABEL's loader) so the carried value (5) reaches the body verbatim
         // and it finishes 15.  Routing the first LABEL to the preamble (key 0)
         // would re-run the `+1000` and finish 1015 instead.
-        unsafe { std::env::set_var("PYRE_CL_NO_CLOSING_JUMP", "1") };
+        unsafe { std::env::set_var("MAJIT_CL_NO_CLOSING_JUMP", "1") };
 
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1_500_290);
@@ -24594,7 +24594,7 @@ mod tests {
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
 
-        unsafe { std::env::remove_var("PYRE_CL_NO_CLOSING_JUMP") };
+        unsafe { std::env::remove_var("MAJIT_CL_NO_CLOSING_JUMP") };
 
         assert!(is_finish);
         assert_eq!(value, 15);

@@ -511,7 +511,7 @@ pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-/// Deserialized `pipeline.insns` overlaid with `pyre_extension_insns()`
+/// Deserialized `pipeline.insns` overlaid with `extension_insns()`
 /// — the build-observed `Assembler::write_insn` emit set plus the
 /// `_pyre/P` adapter keys that pyre's production blackhole builder
 /// registers via `setup_insns(...)` at runtime.  Both sources must
@@ -522,7 +522,7 @@ pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
 ///
 /// `Assembler::get_opnum` mirrors RPython
 /// `assembler.py setdefault(key, len(self.insns))`: keys present
-/// in `majit_translate::insns::{wellknown_bh_insns, pyre_extension_insns}`
+/// in `majit_translate::insns::{wellknown_bh_insns, extension_insns}`
 /// reuse their reserved `BC_*` byte for build/runtime stability, and
 /// translator-only keys outside the canonical universe get the lowest
 /// available non-reserved dynamic byte.  Both kinds land here verbatim,
@@ -569,7 +569,7 @@ pub fn build_emitted_insns() -> &'static indexmap::IndexMap<String, u8> {
 static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock::new(|| {
     let mut table = BUILD_EMITTED_INSNS.clone();
     // Overlay the canonical `wellknown_bh_insns` and pyre-only
-    // `pyre_extension_insns` keys so the runtime table covers every
+    // `extension_insns` keys so the runtime table covers every
     // opname a `BlackholeInterpBuilder` could be asked to dispatch.
     //
     // RPython parity: `blackhole.py BlackholeInterpBuilder.__init__`
@@ -579,7 +579,7 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock
     // assembler actually emitted during `make_jitcodes`; canonical
     // opnames the analyzed source set did not exercise (e.g.
     // `ref_guard_value/r`) are absent.  Overlaying
-    // both `wellknown_bh_insns` and `pyre_extension_insns` restores
+    // both `wellknown_bh_insns` and `extension_insns` restores
     // the closed key universe RPython's runtime sees, so callers
     // (`build_default_bh_builder_with_unwired_report`, dispatch
     // tests) treat opname coverage as a property of the codebase,
@@ -602,7 +602,7 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock
         }
     }
     overlay_insns(&mut table, &majit_translate::insns::wellknown_bh_insns());
-    overlay_insns(&mut table, &majit_translate::insns::pyre_extension_insns());
+    overlay_insns(&mut table, &majit_translate::insns::extension_insns());
     table
 });
 
@@ -1307,7 +1307,7 @@ pub fn field_position_jit_stats() -> String {
     ) = {
         let gc = majit_ir::descr::gc_cache();
         let guard = gc.lock().unwrap_or_else(|e| e.into_inner());
-        let sample = if std::env::var_os("PYRE_SIZE_SHELL_OWNERS").is_some() {
+        let sample = if std::env::var_os("MAJIT_SIZE_SHELL_OWNERS").is_some() {
             let lines = guard.size_shell_owner_sample(24);
             format!("\n[jit-stats] {}", lines.join("\n[jit-stats] "))
         } else {
@@ -1952,43 +1952,43 @@ pub struct DecodedOp {
 ///
 /// | opname                              | producer (`assembler.rs`)             | payload bytes |
 /// |-------------------------------------|---------------------------------------|---------------|
-/// | `inline_call_pyre_nested`           | `:nested_inline_call_*_typed_args`    | `4 + num_args*3 + 3`  (`sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src u8, callee_dst u8) + return_i u8 + return_r u8 + return_f u8`) |
-/// | `call_assembler_int_pyre`           | `:3429 call_assembler_int_like`       | `5 + num_args*2`  (`target_idx u16 + dst u8 + num_args u16 + num_args × (kind u8, reg u8)`) |
-/// | `call_assembler_ref_pyre`           | `:3451 call_assembler_ref_like`       | same as int |
-/// | `call_assembler_float_pyre`         | `:3489 call_assembler_float_like`     | same as int |
-/// | `call_assembler_void_pyre`          | `:3370 call_assembler_void_like`      | `4 + num_args*2`  (omits `dst u8`) |
-/// | `cond_call_void_pyre`               | `:2642 call_cond_like`                | `4 + arg_count*2`  (`first_reg u8 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u8)`) |
-/// | `record_known_result_int_pyre`      | `:2618 call_cond_like`                | same as cond_call |
-/// | `record_known_result_ref_pyre`      | `:2630 call_cond_like`                | same as cond_call |
-/// | `cond_call_value_int_pyre`          | `:2660 call_cond_value_like`          | `5 + arg_count*2`  (cond_call layout + trailing `dst u8`) |
-/// | `cond_call_value_ref_pyre`          | `:2660 call_cond_value_like`          | same as int variant |
+/// | `inline_call_nested_ext`           | `:nested_inline_call_*_typed_args`    | `4 + num_args*3 + 3`  (`sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src u8, callee_dst u8) + return_i u8 + return_r u8 + return_f u8`) |
+/// | `call_assembler_int_ext`           | `:3429 call_assembler_int_like`       | `5 + num_args*2`  (`target_idx u16 + dst u8 + num_args u16 + num_args × (kind u8, reg u8)`) |
+/// | `call_assembler_ref_ext`           | `:3451 call_assembler_ref_like`       | same as int |
+/// | `call_assembler_float_ext`         | `:3489 call_assembler_float_like`     | same as int |
+/// | `call_assembler_void_ext`          | `:3370 call_assembler_void_like`      | `4 + num_args*2`  (omits `dst u8`) |
+/// | `cond_call_void_ext`               | `:2642 call_cond_like`                | `4 + arg_count*2`  (`first_reg u8 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u8)`) |
+/// | `record_known_result_int_ext`      | `:2618 call_cond_like`                | same as cond_call |
+/// | `record_known_result_ref_ext`      | `:2630 call_cond_like`                | same as cond_call |
+/// | `cond_call_value_int_ext`          | `:2660 call_cond_value_like`          | `5 + arg_count*2`  (cond_call layout + trailing `dst u8`) |
+/// | `cond_call_value_ref_ext`          | `:2660 call_cond_value_like`          | same as int variant |
 fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize> {
     match opname {
-        "inline_call_pyre_nested" => {
+        "inline_call_nested_ext" => {
             // sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src
             // u8, callee_dst u8) + return_i u8 + return_r u8 + return_f u8
             let num_args =
                 u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
             Some(4 + num_args * 3 + 3)
         }
-        "call_assembler_int_pyre" | "call_assembler_ref_pyre" | "call_assembler_float_pyre" => {
+        "call_assembler_int_ext" | "call_assembler_ref_ext" | "call_assembler_float_ext" => {
             // target_idx u16 + dst u8 + num_args u16 + num_args × (kind u8, reg u8)
             let num_args =
                 u16::from_le_bytes([*code.get(cursor + 3)?, *code.get(cursor + 4)?]) as usize;
             Some(5 + num_args * 2)
         }
-        "call_assembler_void_pyre" => {
+        "call_assembler_void_ext" => {
             // target_idx u16 + num_args u16 + num_args × (kind u8, reg u8)
             let num_args =
                 u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
             Some(4 + num_args * 2)
         }
-        "cond_call_void_pyre" | "record_known_result_int_pyre" | "record_known_result_ref_pyre" => {
+        "cond_call_void_ext" | "record_known_result_int_ext" | "record_known_result_ref_ext" => {
             // first_reg u8 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u8)
             let arg_count = *code.get(cursor + 3)? as usize;
             Some(4 + arg_count * 2)
         }
-        "cond_call_value_int_pyre" | "cond_call_value_ref_pyre" => {
+        "cond_call_value_int_ext" | "cond_call_value_ref_ext" => {
             // cond_call shape + trailing dst u8
             let arg_count = *code.get(cursor + 3)? as usize;
             Some(5 + arg_count * 2)
@@ -2804,7 +2804,7 @@ mod tests {
 
     /// Every key in build-observed `pipeline.insns` that ALSO appears in
     /// the canonical universe (`majit_translate::insns::
-    /// {wellknown_bh_insns, pyre_extension_insns}`) must carry the
+    /// {wellknown_bh_insns, extension_insns}`) must carry the
     /// matching reserved byte.  Translator-only keys allocated by
     /// `Assembler::get_opnum`'s `setdefault` fallback (`assembler.py`
     /// parity) may live in any non-reserved byte, including gaps below
@@ -2821,11 +2821,11 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        for (k, v) in majit_translate::insns::pyre_extension_insns() {
+        for (k, v) in majit_translate::insns::extension_insns() {
             assert!(
                 canonical.insert(k.to_string(), v).is_none(),
                 "duplicate opname {k:?} between wellknown_bh_insns() and \
-                 pyre_extension_insns()",
+                 extension_insns()",
             );
         }
         for (key, &observed_byte) in observed.iter() {
@@ -2841,7 +2841,7 @@ mod tests {
                 assert!(
                     !majit_translate::insns::is_reserved_opcode_byte(observed_byte),
                     "pipeline.insns key {key:?} is absent from \
-                     wellknown_bh_insns() ∪ pyre_extension_insns() but \
+                     wellknown_bh_insns() ∪ extension_insns() but \
                      was assigned reserved byte {observed_byte}; \
                      translator-only dynamic bytes must not collide with \
                      canonical/extension opcodes",
@@ -3263,7 +3263,7 @@ mod tests {
     /// a real jitcode in this binary can carry.  Each must be dispatchable.
     ///
     /// Deliberately NOT asserted over `insns_opname_to_byte()`: that map
-    /// additionally carries the `wellknown_bh_insns` / `pyre_extension_insns`
+    /// additionally carries the `wellknown_bh_insns` / `extension_insns`
     /// overlay, i.e. canonical opnames this build never emitted. Their bytes
     /// cannot appear in any jitcode here, so leaving them unregistered is the
     /// same state upstream is in — its `asm.insns` would not list them either.

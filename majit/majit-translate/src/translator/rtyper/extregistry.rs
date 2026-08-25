@@ -173,7 +173,7 @@ pub enum ExtRegistryEntry {
     ///
     /// `From::from` has no `self` receiver, so the front-end lowers it as a
     /// `simple_call` against the `BigInt.from` host callable (not a
-    /// `CallTarget::FunctionPath` the `PyreCallRegistry` callee-stub path
+    /// `CallTarget::FunctionPath` the `CallRegistry` callee-stub path
     /// handles).  The annotation half is served by the `BigInt.from`
     /// `BUILTIN_ANALYZERS` entry (`annotator/builtin.rs`, `bigint_from` →
     /// the classdef-less `SomeInstance` shell), which

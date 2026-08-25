@@ -1,4 +1,4 @@
-//! `PYRE_FNPTR_INDIRECT` — how a call through a host-registered `fn`
+//! `MAJIT_FNPTR_INDIRECT` — how a call through a host-registered `fn`
 //! pointer lowers, in both states of the switch.
 //!
 //! Its own test binary, holding exactly one `#[test]`, because the switch is
@@ -94,7 +94,7 @@ fn fnptr_indirect_switch_moves_the_lowering_in_both_directions() {
     // environment mutation races.  This file's test binary holds exactly
     // one test, so nothing else in the process reads or writes the
     // environment while it runs.
-    unsafe { std::env::remove_var("PYRE_FNPTR_INDIRECT") };
+    unsafe { std::env::remove_var("MAJIT_FNPTR_INDIRECT") };
     for name in FIXTURES {
         assert_eq!(
             shape_of(&llbc, name),
@@ -106,7 +106,7 @@ fn fnptr_indirect_switch_moves_the_lowering_in_both_directions() {
         );
     }
 
-    unsafe { std::env::set_var("PYRE_FNPTR_INDIRECT", "1") };
+    unsafe { std::env::set_var("MAJIT_FNPTR_INDIRECT", "1") };
     for name in FIXTURES {
         assert_eq!(
             shape_of(&llbc, name),
@@ -118,5 +118,5 @@ fn fnptr_indirect_switch_moves_the_lowering_in_both_directions() {
         );
     }
 
-    unsafe { std::env::remove_var("PYRE_FNPTR_INDIRECT") };
+    unsafe { std::env::remove_var("MAJIT_FNPTR_INDIRECT") };
 }

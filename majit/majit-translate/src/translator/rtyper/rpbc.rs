@@ -1101,10 +1101,10 @@ pub(crate) mod tests {
         use crate::parse::CallPath;
 
         // Control — the fill is engaged and rewrites the marker.
-        let wrapper = CallPath::from_segments(["helpers", "__pyre_wrap_add"]);
+        let wrapper = CallPath::from_segments(["helpers", "__majit_wrap_add"]);
         let mut with_wrappers = CallControl::new();
         with_wrappers
-            .register_function_graph(wrapper.clone(), JitFunctionGraph::new("__pyre_wrap_add"));
+            .register_function_graph(wrapper.clone(), JitFunctionGraph::new("__majit_wrap_add"));
         with_wrappers.register_function_fnaddr(wrapper.clone(), 0x1234);
         assert_eq!(
             with_wrappers.builtin_wrapper_indirect_graphs().to_vec(),

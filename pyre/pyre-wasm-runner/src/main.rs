@@ -5,7 +5,7 @@
 //! implements the same host-import contract:
 //!
 //!   * the main module (`pyre-wasm` built with `--features wasm-host`) imports
-//!     `pyre_jit.{jit_compile_wasm, jit_execute_wasm, jit_free_wasm}` and
+//!     `majit_host.{jit_compile_wasm, jit_execute_wasm, jit_free_wasm}` and
 //!     exports `memory`, `__indirect_function_table`, `pyre_alloc`,
 //!     `pyre_dealloc`, and `pyre_run_python`;
 //!   * each JIT-emitted trace module imports `env.memory` (shared with the
@@ -1540,7 +1540,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap(
-        "pyre_jit",
+        "majit_host",
         "jit_compile_wasm",
         |mut caller: Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32| -> u32 {
             match jit_compile(&mut caller, bytes_ptr, bytes_len) {
@@ -1554,7 +1554,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     )?;
 
     linker.func_wrap(
-        "pyre_jit",
+        "majit_host",
         "jit_replace_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32, bytes_ptr: u32, bytes_len: u32| -> u32 {
             match jit_replace(&mut caller, func_id, bytes_ptr, bytes_len) {
@@ -1568,7 +1568,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     )?;
 
     linker.func_wrap(
-        "pyre_jit",
+        "majit_host",
         "jit_execute_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32, frame_ptr: u32| -> u32 {
             match jit_execute(&mut caller, func_id, frame_ptr) {
@@ -1582,7 +1582,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     )?;
 
     linker.func_wrap(
-        "pyre_jit",
+        "majit_host",
         "jit_free_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32| {
             // Only a trace slot may be cleared; nulling a main-module slot
@@ -1616,7 +1616,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     // `store_subscr_fn` invoked in a void context) is coerced correctly
     // rather than trapping on an indirect-call type mismatch.
     linker.func_wrap(
-        "pyre_jit",
+        "majit_host",
         "jit_call_host",
         |mut caller: Caller<'_, Host>, frame_ptr: u32| {
             if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32) {

@@ -89,7 +89,7 @@
 # torn at a resume; here nothing resumes, a live reader just reads the field.
 # That filing lists four more refuted attempts -- read it too.
 #
-# HOW THIS SURFACED.  `a67442cccb0` listed `PyreHelperKind::LoadDeref` as a
+# HOW THIS SURFACED.  `a67442cccb0` listed `RuntimeHelperKind::LoadDeref` as a
 # replay-safe read, which classified every freevar-reading callee
 # `DeferredCall` and let it inline; `b6d9cc510cd` then denied such a callee
 # from its first vable escape so the enclosing loop would stop being retired by

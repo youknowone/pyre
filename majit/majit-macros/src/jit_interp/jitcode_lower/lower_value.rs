@@ -66,7 +66,7 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
                 .collect::<Vec<_>>()
                 .join("::");
             return quote! {
-                majit_metainterp::__pyre_struct_type_id_path(
+                majit_metainterp::__majit_struct_type_id_path(
                     module_path!(),
                     #type_path,
                     #is_gc_managed,
@@ -93,7 +93,7 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
         let type_id = hasher.finish();
         quote! { #type_id }
     } else {
-        quote! { majit_metainterp::__pyre_struct_type_id::<#path>(#is_gc_managed) }
+        quote! { majit_metainterp::__majit_struct_type_id::<#path>(#is_gc_managed) }
     }
 }
 

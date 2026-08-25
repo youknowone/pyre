@@ -149,7 +149,7 @@ pub use crate::codewriter::AllJitCodes;
 /// the runtime + production analyser pipeline produce.  Empty module
 /// path (test fixtures that bypass module wiring) is reserved for
 /// `parse_source`; here every entry carries its real module path.
-const PYRE_JIT_GRAPH_MODULES: &[&str] = &["pyopcode", "eval", "pyframe", "shared_opcode", "eval"];
+const JIT_GRAPH_MODULES: &[&str] = &["pyopcode", "eval", "pyframe", "shared_opcode", "eval"];
 
 thread_local! {
     /// Per-thread cache for the pyre-interpreter JitCode registry.
@@ -184,7 +184,7 @@ fn build() -> AllJitCodes {
     // Full canonical pipeline — the same entry point the
     // `test_analyze_pipeline_runs_canonical_graph_path` integration test
     // exercises. Builds a `SemanticProgram` from the LLBC modules
-    // listed in `PYRE_JIT_GRAPH_MODULES`, runs `analyze_program`,
+    // listed in `JIT_GRAPH_MODULES`, runs `analyze_program`,
     // collects trait impls + inherent impl methods with full
     // struct-field / return-type / known-struct context, wires up
     // jitdriver / portal / oopspec metadata, then calls
@@ -201,7 +201,7 @@ fn build() -> AllJitCodes {
     //
     // The blocker is wider than "need a binding table":
     //
-    // - Many graphs in `PYRE_JIT_GRAPH_MODULES` are generic source-level
+    // - Many graphs in `JIT_GRAPH_MODULES` are generic source-level
     //   functions, e.g. `pyopcode.rs` / `shared_opcode.rs`
     //   `opcode_*<H: ...>` helpers and trait default methods on
     //   `OpcodeStepExecutor`. A source graph like
@@ -221,7 +221,7 @@ fn build() -> AllJitCodes {
     // fallback is therefore part of the current API contract and is locked
     // down by the unit tests below.
     let result = crate::analyze_multiple_pipeline_with_modules(
-        PYRE_JIT_GRAPH_MODULES,
+        JIT_GRAPH_MODULES,
         &crate::AnalyzeConfig {
             pipeline: crate::PipelineConfig {
                 transform: crate::GraphTransformConfig::default(),

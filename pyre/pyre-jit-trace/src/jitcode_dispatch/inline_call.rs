@@ -620,7 +620,7 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
 fn body_sample_safe_with(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
-    pure_helpers: &[majit_ir::PyreHelperKind],
+    pure_helpers: &[majit_ir::RuntimeHelperKind],
 ) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -661,8 +661,8 @@ pub(crate) fn exception_string_override_sample_safe(
         body_code,
         callee_descr_refs,
         &[
-            majit_ir::PyreHelperKind::LoadConst,
-            majit_ir::PyreHelperKind::BoxInt,
+            majit_ir::RuntimeHelperKind::LoadConst,
+            majit_ir::RuntimeHelperKind::BoxInt,
         ],
     )
 }
@@ -676,7 +676,7 @@ pub(crate) fn exception_string_override_sample_safe(
 /// them apart — but the ones that matter here are separable at run time by the
 /// executed-effect odometer, which is what [`try_walker_inline_index`] consults
 /// once the body has run.  `STORE_ATTR` is a distinct residual
-/// ([`majit_ir::PyreHelperKind::StoreAttr`]) and stays rejected here, so the
+/// ([`majit_ir::RuntimeHelperKind::StoreAttr`]) and stays rejected here, so the
 /// ordinary writing `__index__` never runs at all: it has to be refused before
 /// execution, because by the time the odometer could report it the write has
 /// already happened once.
@@ -685,9 +685,9 @@ pub(crate) fn index_inline_sample_safe(body_code: &[u8], callee_descr_refs: &[De
         body_code,
         callee_descr_refs,
         &[
-            majit_ir::PyreHelperKind::LoadConst,
-            majit_ir::PyreHelperKind::BoxInt,
-            majit_ir::PyreHelperKind::LoadAttr,
+            majit_ir::RuntimeHelperKind::LoadConst,
+            majit_ir::RuntimeHelperKind::BoxInt,
+            majit_ir::RuntimeHelperKind::LoadAttr,
         ],
     )
 }
@@ -732,7 +732,7 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// resume, never walked.  A blocker sitting on an arm the call at hand does not
 /// take is therefore never reached, and a whole-body scan that declines on it
 /// declines a body the walk would have recorded cleanly.  That is not a corner:
-/// the generated `__pyre_wrap_*` gateways all begin by checking their argument
+/// the generated `__majit_wrap_*` gateways all begin by checking their argument
 /// count and calling `gateway::method_{noarg,arity,min_arity}_failure` on the
 /// reject arm, and those three helpers are `#[dont_look_inside]` precisely so
 /// the formatting stays out of the wrapper's hot JitCode.  Declining on them
@@ -1326,7 +1326,7 @@ pub(crate) fn exception_string_override_has_nested_call(
         }
         if d.opname.starts_with("residual_call")
             && residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
-                == Some(majit_ir::PyreHelperKind::CallFn)
+                == Some(majit_ir::RuntimeHelperKind::CallFn)
         {
             return true;
         }
@@ -1541,7 +1541,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     funcptr: OpRef,
     r_args: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -1565,7 +1565,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // Only a genuine `call_fn` residual is a candidate — every
     // container/builtin helper carries a distinct tag.
-    if pyre_helper != majit_ir::PyreHelperKind::CallFn {
+    if runtime_helper != majit_ir::RuntimeHelperKind::CallFn {
         return Ok(None);
     }
     // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`);
@@ -2231,7 +2231,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// `call_kw` is excluded for the same reason one step subtler: its list is a
 /// PERMUTATION of the stack rather than a different set of values.  The wire
 /// order is `(callable, null_or_self, kwnames, arg0..arg{n-1})`
-/// (`majit-ir effectinfo.rs` `PyreHelperKind::CallKw`), while `CALL_KW` pops
+/// (`majit-ir effectinfo.rs` `RuntimeHelperKind::CallKw`), while `CALL_KW` pops
 /// `kwnames` FIRST (`eval.rs call_kw`), so the stack image is
 /// `[callable, null_or_self, arg0..arg{n-1}, kwnames]`.  A real `CALL_KW`
 /// always carries a non-empty kwnames tuple, so `n >= 1` on every reachable
@@ -2245,8 +2245,8 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
     if !matches!(
-        call_descr.get_extra_info().pyre_helper,
-        majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallFunctionEx
+        call_descr.get_extra_info().runtime_helper,
+        majit_ir::RuntimeHelperKind::CallFn | majit_ir::RuntimeHelperKind::CallFunctionEx
     ) {
         return None;
     }
@@ -2695,7 +2695,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     funcptr: OpRef,
     r_args: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -2705,8 +2705,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         return Ok(None);
     }
     // Only a genuine Python call helper is an inline target: positional
-    // `call_fn` / `call_fn_N` (`PyreHelperKind::CallFn`) and keyword `call_kw_N`
-    // (`PyreHelperKind::CallKw`), both tagged by the flatten lowering.  Every
+    // `call_fn` / `call_fn_N` (`RuntimeHelperKind::CallFn`) and keyword `call_kw_N`
+    // (`RuntimeHelperKind::CallKw`), both tagged by the flatten lowering.  Every
     // container/builtin helper routed here carries a different tag or `None`
     // (`store_subscr_fn` -> StoreSubscr, `normalize_raise_varargs_fn` /
     // `set_current_exception` -> None).  Without this guard `d[f] = v` with a
@@ -2715,16 +2715,17 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     // as `f(v)`, skipping the store.  Upstream never inlines a Python call at a
     // residual_call site (inlinable calls get their own inline_call jitcodes);
     // this restores that invariant for the pyre FBW inline-at-residual lever.
-    let is_call_kw = pyre_helper == majit_ir::PyreHelperKind::CallKw;
-    let is_call_function_ex = pyre_helper == majit_ir::PyreHelperKind::CallFunctionEx;
-    if pyre_helper != majit_ir::PyreHelperKind::CallFn && !is_call_kw && !is_call_function_ex {
+    let is_call_kw = runtime_helper == majit_ir::RuntimeHelperKind::CallKw;
+    let is_call_function_ex = runtime_helper == majit_ir::RuntimeHelperKind::CallFunctionEx;
+    if runtime_helper != majit_ir::RuntimeHelperKind::CallFn && !is_call_kw && !is_call_function_ex
+    {
         return Ok(None);
     }
     if fbw_inline_diag_enabled() {
         eprintln!(
             "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={} dst_bank={dst_bank}",
             op.pc,
-            pyre_helper,
+            runtime_helper,
             r_args.len(),
             ctx.fbw_mode.inline_subwalk,
         );
@@ -3224,7 +3225,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     code: &[u8],
     ref_operand_offset: usize,
     r_args: &[OpRef],
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -3234,7 +3235,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // that `split_builtin_kwargs` strips — a shape the flat
         // `&[PyObjectRef]` array built below does not construct, so leave those
         // calls to `bh_call_kw_<n>`.
-        || pyre_helper != majit_ir::PyreHelperKind::CallFn
+        || runtime_helper != majit_ir::RuntimeHelperKind::CallFn
         || r_args.len() < 2
         || dst_bank != 'r'
     {
@@ -3279,7 +3280,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // non-Function callable, while `no jitcode for address` names a builtin
     // whose `BuiltinCode.func` is not a member of the PBC family
     // `builtin_wrapper_indirect_graphs` builds — i.e. one registered without a
-    // `__pyre_wrap_*` gateway.  The address is what identifies the missing
+    // `__majit_wrap_*` gateway.  The address is what identifies the missing
     // member, so print it.
     macro_rules! builtin_inline_decline {
         ($why:expr, $addr:expr) => {

@@ -108,7 +108,7 @@ fn a_range_loops_next_yields_an_int_element() {
                 ..
             } = &op.kind
                 && segments.len() == 1
-                && segments[0] == "__pyre_range"
+                && segments[0] == "__majit_range"
                 && let Some(result) = &op.result
             {
                 range_results.push(result.clone());

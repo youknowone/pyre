@@ -3611,7 +3611,7 @@ pub(crate) fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            ann.bookkeeper.project_pyre_field_type("PyObjectRef")
+            ann.bookkeeper.project_struct_field_type("PyObjectRef")
         }
         // unaryop.py — `next(self)` / `method_next = next`.  The
         // bound iterator is the receiver; next takes no positional args and
@@ -4263,7 +4263,7 @@ fn init_someinstance_overrides(
                         // A classdef-less `SomeInstance` has no RPython analogue
                         // (`SomeInstance` upstream always carries a classdef).
                         // It arises only from pyre's pointer erasure:
-                        // `project_pyre_field_type` strips `*mut`/`*const`/`&`
+                        // `project_struct_field_type` strips `*mut`/`*const`/`&`
                         // and resolves the pointee — when the pointee is an
                         // unregistered host struct the field becomes
                         // `SomeInstance(classdef=None)`.  Any attr other than

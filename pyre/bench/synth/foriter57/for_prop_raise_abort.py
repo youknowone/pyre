@@ -18,7 +18,7 @@ def f():
     seen = []
     for x in range(500):
         # `obj.p` lowers to a value-returning `load_attr` residual
-        # (`PyreHelperKind::None`, `Ref` result, `MayForce`).  Its getter
+        # (`RuntimeHelperKind::None`, `Ref` result, `MayForce`).  Its getter
         # frame mutates `Obj.hits` and raises; the raise takes the residual's
         # Err arm.  The R1 body-effect marking used to run ONLY on the Ok arm,
         # so the Err arm left the in-flight FOR_ITER item's body-effect flag

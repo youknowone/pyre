@@ -51,7 +51,7 @@ use majit_ir::{OpRef, Type};
 /// relative module path. Keep GC-managed and raw layouts distinct, matching
 /// RPython's distinct `GcStruct(T)` / `Struct(T)` lltypes.
 #[doc(hidden)]
-pub fn __pyre_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
+pub fn __majit_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
     use std::any::TypeId;
     use std::hash::{Hash, Hasher};
 
@@ -66,7 +66,7 @@ pub fn __pyre_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
 /// Resolve a `crate`/`self`/`super` type path at its macro expansion module
 /// and hash the crate-stripped definition path used by the graph codewriter.
 #[doc(hidden)]
-pub fn __pyre_struct_type_id_path(module_path: &str, type_path: &str, is_gc_managed: bool) -> u64 {
+pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_managed: bool) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut resolved: Vec<&str> = module_path.split("::").collect();
@@ -281,12 +281,12 @@ pub fn bh_debug_enabled() -> bool {
 
 pub fn callee_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_CALLEE_RCA").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_CALLEE_RCA").is_some())
 }
 
 pub fn nbody_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NBODY_DEBUG").is_some())
 }
 
 /// Constness of every index arriving at `TraceCtx::get_arrayitem_vable_index`.
@@ -295,7 +295,7 @@ pub fn nbody_debug_enabled() -> bool {
 /// caller family without pairing it with a call-site probe.
 pub fn vable_idx_probe_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_VABLE_IDX_PROBE").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_VABLE_IDX_PROBE").is_some())
 }
 
 pub fn mptrace_enabled() -> bool {
@@ -369,7 +369,7 @@ pub fn bridge_debug_enabled() -> bool {
 
 pub fn no_unroll_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_UNROLL").is_some())
 }
 
 /// Why the unroll optimizer will be skipped, or `None` when it runs.
@@ -382,11 +382,11 @@ pub fn no_unroll_enabled() -> bool {
 ///
 /// Reporting the env override's name for both is worse than reporting nothing.
 /// A frontend that left `unroll` out of its `enable_opts` produces a log naming
-/// `PYRE_NO_UNROLL`; the reader checks their environment, finds it unset, and
+/// `MAJIT_NO_UNROLL`; the reader checks their environment, finds it unset, and
 /// has been sent to look for a cause that does not exist.
 pub fn unroll_skip_reason(env_override: bool, enable_opts: &[String]) -> Option<&'static str> {
     if env_override {
-        Some("PYRE_NO_UNROLL env override")
+        Some("MAJIT_NO_UNROLL env override")
     } else if !enable_opts.iter().any(|opt| opt == "unroll") {
         Some("`unroll` is absent from this jitdriver's enable_opts")
     } else {

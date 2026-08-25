@@ -3801,7 +3801,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::BinaryOp,
+        majit_ir::RuntimeHelperKind::BinaryOp,
         result_reg,
     ))
 }
@@ -3834,7 +3834,7 @@ pub fn build_binary_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::BinaryOp,
+        majit_ir::RuntimeHelperKind::BinaryOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3869,7 +3869,7 @@ fn build_residual_call_ir_r_insn_from_operands(
     lhs_operand: Operand,
     rhs_operand: Operand,
     flavor: CallFlavor,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_reg: Register,
 ) -> Insn {
     let mut effect_info = effect_info_for_call_flavor(flavor);
@@ -3878,11 +3878,11 @@ fn build_residual_call_ir_r_insn_from_operands(
     // specialization (guard_class + getfield_gc + int/float_OP +
     // new_with_vtable) instead of recording an opaque CALL_MAY_FORCE.
     // The walker cannot match the helper by fnaddr (pyre-jit-trace does
-    // not depend on pyre-jit), so the `pyre_helper` tag on the descr's
+    // not depend on pyre-jit), so the `runtime_helper` tag on the descr's
     // EffectInfo is the recognition vehicle (kept off `oopspecindex` so
-    // `has_oopspec()` stays false for ordinary calls). `PyreHelperKind::None`
+    // `has_oopspec()` stays false for ordinary calls). `RuntimeHelperKind::None`
     // for callers that are not a recognized specialization.
-    effect_info.pyre_helper = pyre_helper;
+    effect_info.runtime_helper = runtime_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -3910,13 +3910,13 @@ fn build_residual_call_ir_r_insn_from_ref_list(
     op_val: i64,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_reg: Register,
 ) -> Insn {
     let mut arg_kinds = vec![Kind::Ref; ref_operands.len()];
     arg_kinds.push(Kind::Int);
     let mut effect_info = effect_info_for_call_flavor(flavor);
-    effect_info.pyre_helper = pyre_helper;
+    effect_info.runtime_helper = runtime_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -3998,7 +3998,7 @@ where
         lhs_operand,
         rhs_operand,
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::CompareOp,
+        majit_ir::RuntimeHelperKind::CompareOp,
         result_reg,
     ))
 }
@@ -4027,7 +4027,7 @@ pub fn build_compare_op_residual_call_ir_r_insn(
         Operand::Register(Register::new(Kind::Ref, lhs_reg)),
         Operand::Register(Register::new(Kind::Ref, rhs_reg)),
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::CompareOp,
+        majit_ir::RuntimeHelperKind::CompareOp,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -4140,8 +4140,8 @@ fn build_load_global_fn_insn_from_operands(
     // Tag the calldescr so the full-body walker can recognize this as the
     // `LOAD_GLOBAL` module-dict read and emit the cell-cache fold; the
     // recognition reader is dev-gated and default-off (see
-    // PyreHelperKind::LoadGlobal).
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
+    // RuntimeHelperKind::LoadGlobal).
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadGlobal;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -4218,7 +4218,7 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
     dst_reg: u16,
 ) -> Insn {
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadMethodSelf;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadMethodSelf;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -4293,7 +4293,7 @@ where
         // Tag so the full-body walker can try the module-scope cell fold
         // (`try_walker_load_name_cell_fold`); the fold falls through to this
         // residual for non-module frames (`w_locals` set).
-        majit_ir::PyreHelperKind::LoadName,
+        majit_ir::RuntimeHelperKind::LoadName,
         dst_reg,
     ))
 }
@@ -4337,7 +4337,7 @@ where
         // in-place store fold (`try_walker_store_name_cell_fold`); the fold
         // falls through to this residual for non-module frames / non-int
         // values / non-cell slots.
-        majit_ir::PyreHelperKind::StoreName,
+        majit_ir::RuntimeHelperKind::StoreName,
     ))
 }
 
@@ -4379,7 +4379,7 @@ where
         true,
         // Tag for the same module-scope IntMutableCell in-place store fold as
         // `lower_store_name_hlop_to_insn` (`try_walker_store_name_cell_fold`).
-        majit_ir::PyreHelperKind::StoreGlobal,
+        majit_ir::RuntimeHelperKind::StoreGlobal,
     ))
 }
 
@@ -4407,7 +4407,7 @@ where
         // Tagged so the walker can run the `jit_force_quasi_immutable` test
         // (`pyjitpl.py:1094-1118`) before executing the delete — `delitem_str`
         // calls `mutated()` on a successful removal.
-        majit_ir::PyreHelperKind::DeleteName,
+        majit_ir::RuntimeHelperKind::DeleteName,
     ))
 }
 
@@ -4419,7 +4419,7 @@ fn lower_frame_only_ref_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     opname: &str,
     fn_idx: u16,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     get_register: &mut F,
     lower_constant: &mut LC,
 ) -> Option<Insn>
@@ -4439,7 +4439,7 @@ where
         fn_idx,
         vec![frame_operand],
         CallFlavor::Plain,
-        pyre_helper,
+        runtime_helper,
         dst_reg,
     ))
 }
@@ -4459,7 +4459,7 @@ where
         op,
         "load_locals",
         ctx.load_locals_fn_idx,
-        majit_ir::PyreHelperKind::LoadLocals,
+        majit_ir::RuntimeHelperKind::LoadLocals,
         get_register,
         lower_constant,
     )
@@ -4480,7 +4480,7 @@ where
         op,
         "load_build_class",
         ctx.load_build_class_fn_idx,
-        majit_ir::PyreHelperKind::LoadBuildClass,
+        majit_ir::RuntimeHelperKind::LoadBuildClass,
         get_register,
         lower_constant,
     )
@@ -4512,7 +4512,7 @@ where
     // Plain flavor means “no graph was analyzed” and becomes RANDOM_EFFECTS /
     // CALL_MAY_FORCE, contradicting PyPy's zero-forcing IMPORT_NAME trace.
     let mut effect_info = majit_ir::EffectInfo::default();
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadImport;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadImport;
     Some(build_residual_call_r_r_insn_with_effect_info(
         ctx.load_import_fn_idx,
         vec![frame_operand],
@@ -4558,7 +4558,7 @@ where
         op,
         "load_import_locals",
         ctx.load_import_locals_fn_idx,
-        majit_ir::PyreHelperKind::LoadImportLocals,
+        majit_ir::RuntimeHelperKind::LoadImportLocals,
         get_register,
         lower_constant,
     )
@@ -4586,7 +4586,7 @@ where
         CallFlavor::Plain,
         true,
         // See [`lower_delete_name_hlop_to_insn`].
-        majit_ir::PyreHelperKind::DeleteGlobal,
+        majit_ir::RuntimeHelperKind::DeleteGlobal,
     ))
 }
 
@@ -4634,7 +4634,7 @@ pub fn build_call_fn_residual_call_r_r_insn(
         call_fn_idx,
         ref_operands,
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::CallFn,
+        majit_ir::RuntimeHelperKind::CallFn,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -4660,7 +4660,7 @@ pub fn build_get_current_exception_fn_residual_call_r_r_insn(
         get_current_exception_fn_idx,
         Vec::new(),
         CallFlavor::PlainCannotRaiseNoHeap,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -4769,7 +4769,7 @@ where
                 ctx.newtuple_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::PyreHelperKind::NewtupleFromArray,
+                majit_ir::RuntimeHelperKind::NewtupleFromArray,
                 dst_reg,
             ))
         }
@@ -4790,7 +4790,7 @@ where
                 ctx.build_map_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::MayForce,
-                majit_ir::PyreHelperKind::None,
+                majit_ir::RuntimeHelperKind::None,
                 dst_reg,
             ))
         }
@@ -4811,7 +4811,7 @@ where
                 ctx.build_set_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::MayForce,
-                majit_ir::PyreHelperKind::None,
+                majit_ir::RuntimeHelperKind::None,
                 dst_reg,
             ))
         }
@@ -4837,7 +4837,7 @@ where
                 ctx.call_function_ex_fn_idx,
                 ref_operands,
                 CallFlavor::MayForce,
-                majit_ir::PyreHelperKind::CallFunctionEx,
+                majit_ir::RuntimeHelperKind::CallFunctionEx,
                 dst_reg,
             ))
         }
@@ -4870,7 +4870,7 @@ where
                 ctx.call_kw_idx_by_nargs[nargs],
                 ref_operands,
                 CallFlavor::MayForce,
-                majit_ir::PyreHelperKind::CallKw,
+                majit_ir::RuntimeHelperKind::CallKw,
                 dst_reg,
             ))
         }
@@ -4891,7 +4891,7 @@ where
                 ctx.build_string_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::PyreHelperKind::None,
+                majit_ir::RuntimeHelperKind::None,
                 dst_reg,
             ))
         }
@@ -4920,14 +4920,14 @@ where
             // intercept it and emit the virtualizable decomposed `newlist`
             // shape (`pyjitpl.py opimpl_newlist`) instead of recording the
             // opaque CallR.  Inert on the assembler/baseline path (it reads
-            // fn_idx + args, not `pyre_helper`) and on the legacy trait path
+            // fn_idx + args, not `runtime_helper`) and on the legacy trait path
             // (which never emitted this residual); only the FBW intercept keys
             // on it.
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.newlist_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::PyreHelperKind::NewlistFromArray,
+                majit_ir::RuntimeHelperKind::NewlistFromArray,
                 dst_reg,
             ))
         }
@@ -4947,7 +4947,7 @@ pub fn build_residual_call_r_r_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     dst_reg: Register,
 ) -> Insn {
     // `bh_call_fn_N` dispatches the callable supplied at runtime.  Its target
@@ -4957,12 +4957,12 @@ pub fn build_residual_call_r_r_insn_from_operands(
     // which makes both the tracing heapcache and OptHeap forget values across
     // the residual call.  In particular, a callee can rewrite an
     // `IntMutableCell.intvalue` without changing the module-dict version.
-    let mut effect_info = if pyre_helper == majit_ir::PyreHelperKind::CallFn {
+    let mut effect_info = if runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
         majit_ir::EffectInfo::MOST_GENERAL
     } else {
         effect_info_for_call_flavor(flavor)
     };
-    effect_info.pyre_helper = pyre_helper;
+    effect_info.runtime_helper = runtime_helper;
     build_residual_call_r_r_insn_with_effect_info(fn_idx, ref_operands, effect_info, dst_reg)
 }
 
@@ -5038,7 +5038,7 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
             cause,
         ],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -5104,7 +5104,7 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
     // `box_int_fn` boxes a raw Int into a fresh `PyLong`; tag it so the
     // full-body walker emits the virtualizable `new_with_vtable` +
     // `setfield_gc` form instead of an opaque CanRaise residual.
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::BoxInt;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Int],
@@ -5308,7 +5308,7 @@ fn build_residual_call_r_i_insn_from_operands(
     // operand specialises to `guard_class INT` + `getfield intval` +
     // `int_is_true`, eliding the may-force call's GUARD_NOT_FORCED /
     // GUARD_NO_EXCEPTION (mirrors the StoreSubscr / BinaryOp tags).
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::Truth;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::Truth;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref],
@@ -5371,7 +5371,7 @@ where
         vec![obj_operand, key_operand, value_operand],
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::StoreSubscr,
+        majit_ir::RuntimeHelperKind::StoreSubscr,
     ))
 }
 
@@ -5413,7 +5413,7 @@ where
         vec![obj_operand, start_operand, stop_operand, value_operand],
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
     ))
 }
 
@@ -5730,7 +5730,7 @@ where
     // vehicle (the walker crate cannot match the helper by fnaddr); a decline
     // falls back to this same residual, so tagging is behaviour-preserving when
     // the fold is disabled or the receiver shape is unsupported.
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadAttr;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -5923,7 +5923,7 @@ where
     // Tag the STORE_ATTR helper calldescr so the full-body walker can replace
     // a plain unboxed same-type integer store with the non-forcing raw write.
     // A declined fold continues with this unchanged MayForce residual.
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::StoreAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -5977,7 +5977,7 @@ where
         ctx.binary_slice_fn_idx,
         vec![obj, start, stop],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6064,7 +6064,7 @@ where
         ctx.format_simple_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6104,7 +6104,7 @@ where
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
     // Recognition tag for the walker's `Cell.get` fold; carries no replay-safety
     // standing of its own.
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadDeref;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadDeref;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -6172,7 +6172,7 @@ where
         // re-running the body doubles the cell write).  The tag is orthogonal
         // to the raise classification: the FOR_ITER body-effect guard keys on
         // this `StoreDeref` helper tag, not on the `PlainCannotRaise` flavor.
-        majit_ir::PyreHelperKind::StoreDeref,
+        majit_ir::RuntimeHelperKind::StoreDeref,
         dst_reg,
     ))
 }
@@ -6261,7 +6261,7 @@ where
         ctx.make_function_fn_idx,
         vec![globals, code],
         CallFlavor::Plain,
-        majit_ir::PyreHelperKind::MakeFunction,
+        majit_ir::RuntimeHelperKind::MakeFunction,
         dst_reg,
     ))
 }
@@ -6298,7 +6298,7 @@ where
         _ => return None,
     };
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::SetFunctionAttribute;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::SetFunctionAttribute;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -6347,7 +6347,7 @@ where
         ctx.unary_negative_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::UnaryNegative,
+        majit_ir::RuntimeHelperKind::UnaryNegative,
         dst_reg,
     ))
 }
@@ -6383,7 +6383,7 @@ where
         ctx.unary_invert_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::UnaryInvert,
+        majit_ir::RuntimeHelperKind::UnaryInvert,
         dst_reg,
     ))
 }
@@ -6419,7 +6419,7 @@ where
         ctx.unary_positive_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::UnaryPositive,
+        majit_ir::RuntimeHelperKind::UnaryPositive,
         dst_reg,
     ))
 }
@@ -6454,7 +6454,7 @@ where
         ctx.list_to_tuple_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6486,7 +6486,7 @@ where
         fn_idx,
         vec![subject],
         flavor,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6585,7 +6585,7 @@ where
         ctx.match_keys_fn_idx,
         vec![subject, keys],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6625,7 +6625,7 @@ where
         count,
         vec![subject, cls, kwd_attrs],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6661,7 +6661,7 @@ where
         ctx.unary_not_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -6698,7 +6698,7 @@ where
         ctx.format_with_spec_fn_idx,
         vec![value, spec],
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
         dst_reg,
     ))
 }
@@ -7053,7 +7053,7 @@ where
         vec![obj_operand, key_operand],
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
     ))
 }
 
@@ -7093,7 +7093,7 @@ where
         vec![list_operand, iterable_operand],
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
     ))
 }
 
@@ -7138,7 +7138,7 @@ where
         operands,
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
     ))
 }
 
@@ -7173,7 +7173,7 @@ where
     // the deterministic immutable-type raise to a traced inline exception
     // construction.  A declined fold continues with this unchanged MayForce
     // residual — the tag mirror of `lower_setattr_hlop_to_insn`.
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::DeleteAttr;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::DeleteAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -7229,7 +7229,7 @@ where
         _ => return None,
     };
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadMethodSelf;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadMethodSelf;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -7366,7 +7366,7 @@ where
         ctx.call_fn_idx_by_nargs[nargs],
         operands,
         CallFlavor::MayForce,
-        majit_ir::PyreHelperKind::CallFn,
+        majit_ir::RuntimeHelperKind::CallFn,
         dst_reg,
     ))
 }
@@ -7392,7 +7392,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
         ],
         CallFlavor::MayForce,
         true,
-        majit_ir::PyreHelperKind::StoreSubscr,
+        majit_ir::RuntimeHelperKind::StoreSubscr,
     )
 }
 
@@ -7419,7 +7419,7 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
         CallFlavor::PlainCannotRaiseNoHeap,
         false,
-        majit_ir::PyreHelperKind::None,
+        majit_ir::RuntimeHelperKind::None,
     )
 }
 
@@ -7437,11 +7437,11 @@ fn build_residual_call_r_v_insn_from_operands(
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
     void_word_abi: bool,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
     let mut effect_info = effect_info_for_call_flavor(flavor);
-    effect_info.pyre_helper = pyre_helper;
+    effect_info.runtime_helper = runtime_helper;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds,
@@ -7548,7 +7548,7 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
     dst_reg: Register,
 ) -> Insn {
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
-    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadConst;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
@@ -9552,7 +9552,7 @@ mod tests {
         // full-body walker can recognize + specialize it (#57); the
         // hand-built dual-write descr must mirror that tag.
         let mut may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
-        may_force_ei.pyre_helper = majit_ir::PyreHelperKind::BinaryOp;
+        may_force_ei.runtime_helper = majit_ir::RuntimeHelperKind::BinaryOp;
         let descr = intern_call_descr_stub(
             may_force_ei,
             vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -10044,7 +10044,7 @@ mod tests {
         assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
         // Both paths share `build_residual_call_r_v_insn_from_operands`,
         // so shape equality alone cannot catch the tag regressing to
-        // `PyreHelperKind::None` — pin the value itself.
+        // `RuntimeHelperKind::None` — pin the value itself.
         let Insn::Op { args, .. } = &lowered else {
             panic!("lowered SETITEM must be an Op insn");
         };
@@ -10059,8 +10059,8 @@ mod tests {
             })
             .expect("lowered SETITEM must carry a CallDescrStub descr");
         assert_eq!(
-            stub.effect_info.pyre_helper,
-            majit_ir::PyreHelperKind::StoreSubscr
+            stub.effect_info.runtime_helper,
+            majit_ir::RuntimeHelperKind::StoreSubscr
         );
     }
 
@@ -10293,7 +10293,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
+                            expected_ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadConst;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -10359,7 +10359,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
+                            expected_ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadConst;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -10393,7 +10393,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.pyre_helper = majit_ir::PyreHelperKind::LoadConst;
+                ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadConst;
                 ei
             },
             vec![Kind::Ref, Kind::Int],
@@ -10500,7 +10500,7 @@ mod tests {
                             );
                             assert_eq!(stub.effect_info, {
                                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
+                                ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadGlobal;
                                 ei
                             });
                         }
@@ -10634,7 +10634,7 @@ mod tests {
                             );
                             assert_eq!(stub.effect_info, {
                                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
+                                ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadGlobal;
                                 ei
                             });
                         }
@@ -10665,7 +10665,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.pyre_helper = majit_ir::PyreHelperKind::LoadGlobal;
+                ei.runtime_helper = majit_ir::RuntimeHelperKind::LoadGlobal;
                 ei
             },
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -10704,7 +10704,7 @@ mod tests {
         // `EffectInfo::MOST_GENERAL` (`graphanalyze.py:109-112`
         // `top_result()` → `effectinfo.py:285-292`) and share
         // `ExtraEffect::RandomEffects`. What still separates the two
-        // descrs is the `pyre_helper` tag the walker dispatches on.
+        // descrs is the `runtime_helper` tag the walker dispatches on.
         let bin = build_binary_op_residual_call_ir_r_insn(7, 0, 1, 2, 3);
         let glob = build_load_global_fn_residual_call_ir_r_insn(7, 0, 1, 2, 4, 3);
         let bin_descr = match &bin {
@@ -10745,10 +10745,10 @@ mod tests {
         }
         assert_ne!(
             bin_descr, glob_descr,
-            "the two descrs stay distinguishable through `pyre_helper`, \
+            "the two descrs stay distinguishable through `runtime_helper`, \
              which is what the walker's fold recognisers dispatch on"
         );
-        assert_ne!(bin_descr.pyre_helper, glob_descr.pyre_helper);
+        assert_ne!(bin_descr.runtime_helper, glob_descr.runtime_helper);
     }
 
     #[test]
@@ -10828,7 +10828,7 @@ mod tests {
                                 vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref]
                             );
                             let mut expected_ei = majit_ir::EffectInfo::MOST_GENERAL;
-                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
+                            expected_ei.runtime_helper = majit_ir::RuntimeHelperKind::CallFn;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -10912,7 +10912,7 @@ mod tests {
         let arg2 = Variable::new(VariableId(8), Kind::Ref);
         let dst = Variable::new(VariableId(9), Kind::Ref);
         let mut call_fn_ei = majit_ir::EffectInfo::MOST_GENERAL;
-        call_fn_ei.pyre_helper = majit_ir::PyreHelperKind::CallFn;
+        call_fn_ei.runtime_helper = majit_ir::RuntimeHelperKind::CallFn;
         let descr = intern_call_descr_stub(
             call_fn_ei,
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref],
@@ -11002,7 +11002,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(stub.arg_kinds, vec![Kind::Int]);
                             let mut expected_ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
+                            expected_ei.runtime_helper = majit_ir::RuntimeHelperKind::BoxInt;
                             assert_eq!(stub.effect_info, expected_ei);
                         }
                         other => panic!("expected CallDescrStub, got {other:?}"),
@@ -11053,7 +11053,7 @@ mod tests {
         let descr = intern_call_descr_stub(
             {
                 let mut ei = effect_info_for_call_flavor(CallFlavor::Plain);
-                ei.pyre_helper = majit_ir::PyreHelperKind::BoxInt;
+                ei.runtime_helper = majit_ir::RuntimeHelperKind::BoxInt;
                 ei
             },
             vec![Kind::Int],
@@ -12833,7 +12833,7 @@ mod tests {
                         DescrOperand::CallDescrStub(stub) => {
                             let mut expected_ei =
                                 effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
-                            expected_ei.pyre_helper = majit_ir::PyreHelperKind::StoreDeref;
+                            expected_ei.runtime_helper = majit_ir::RuntimeHelperKind::StoreDeref;
                             assert_eq!(
                                 stub.effect_info, expected_ei,
                                 "STORE_DEREF residual must carry PlainCannotRaise + StoreDeref tag"
@@ -13672,8 +13672,8 @@ mod tests {
                     Operand::Descr(descr) => match &**descr {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(
-                                stub.effect_info.pyre_helper,
-                                majit_ir::PyreHelperKind::LoadImportLocals
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::LoadImportLocals
                             );
                             // A `CannotRaise` shape here would advertise
                             // concrete-empty readonly and write sets the
@@ -13745,8 +13745,8 @@ mod tests {
                     Operand::Descr(descr) => match &**descr {
                         DescrOperand::CallDescrStub(stub) => {
                             assert_eq!(
-                                stub.effect_info.pyre_helper,
-                                majit_ir::PyreHelperKind::LoadImport
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::LoadImport
                             );
                             assert_eq!(
                                 stub.effect_info.extraeffect,

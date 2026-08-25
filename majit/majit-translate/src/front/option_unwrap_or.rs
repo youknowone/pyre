@@ -128,7 +128,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
         .expect("result var producer resolved to block A above");
     let last_idx = graph.blocks[a].operations.len() - 1;
     // The call sits at the block tail, optionally followed by a single
-    // `__pyre_cast_instance(result)` narrowing op.  `lower_call` appends that
+    // `__cast_instance_intrinsic(result)` narrowing op.  `lower_call` appends that
     // cast when the payload is a `*mut <registered ADT>` (a raw-pointer
     // `Option` payload) and reassigns the destination local to the narrowed
     // var, so the continuation consumes `narrowed`, not the raw call result.
@@ -147,7 +147,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
                     result_ty,
                 },
                 Some(narrowed),
-            ) if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+            ) if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                 && args.as_slice() == std::slice::from_ref(&site.result_var) =>
             {
                 (Some((segments.clone(), result_ty.clone())), narrowed)
@@ -329,7 +329,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     Ok(())
 }
 
-/// Re-emit the `__pyre_cast_instance` narrowing the residual call carried into
+/// Re-emit the `__cast_instance_intrinsic` narrowing the residual call carried into
 /// an arm's `raw` payload value.  `None` (no cast on the original result) is a
 /// pass-through: the raw value flows on unchanged.  The cast is jitcode-identity
 /// (`cast_pointer` → `same_as`), so duplicating it per arm is sound.
@@ -477,7 +477,7 @@ mod tests {
     }
 
     /// A raw-pointer payload (`Option<*mut PyObject>`) makes `lower_call`
-    /// append a `__pyre_cast_instance(result)` narrowing op after the
+    /// append a `__cast_instance_intrinsic(result)` narrowing op after the
     /// `unwrap_or` call, so the call is the block's second-to-last op and the
     /// continuation consumes the *narrowed* var.  The rewrite must tolerate
     /// that trailing identity cast: lift to the discriminant select and apply
@@ -507,7 +507,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
                     },
                     args: vec![result.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -546,7 +546,7 @@ mod tests {
             .flat_map(|blk| &blk.operations)
             .filter(|op| {
                 matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance"))
+                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic"))
             })
             .count();
         assert_eq!(arm_casts, 2, "each diamond arm narrows its payload");

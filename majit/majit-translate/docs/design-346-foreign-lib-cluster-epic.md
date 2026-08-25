@@ -7,12 +7,12 @@ three readings of one unchanged input set:
 
 - **268 total phaseA failures:** commit `eca75827fe43618b24328653c150751f9b5399e8`,
   release profile, default features, the then-current frozen `build/llbc`
-  snapshot (not re-extracted), and `PYRE_RTYPER_VERBOSE=1`. The exact command
+  snapshot (not re-extracted), and `MAJIT_RTYPER_VERBOSE=1`. The exact command
   was:
 
   ```text
   touch pyre/pyre-jit-trace/build.rs
-  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  MAJIT_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
   stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
   rg --no-config 'PREPASS phaseA fail' "$stderr" | sort -u | wc -l
   ```
@@ -20,18 +20,18 @@ three readings of one unchanged input set:
 - **16 `try_from`-headed phaseA failures:** commit
   `ccdc1a52be2237365154976149e7b573db811d82`, release profile, default
   features, that worktree's frozen `build/llbc` snapshot, and
-  `PYRE_RTYPER_VERBOSE=1`. This is a filtered diagnostic count, not a total:
+  `MAJIT_RTYPER_VERBOSE=1`. This is a filtered diagnostic count, not a total:
 
   ```text
   touch pyre/pyre-jit-trace/build.rs
-  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  MAJIT_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
   stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
   rg --no-config 'PREPASS phaseA fail' "$stderr" | rg --no-config 'try_from' | sort -u | wc -l
   ```
 
 - **276 total post-Slice-A phaseA failures** (the *post-Slice-A baseline
   commit*, named that way everywhere below): release profile, default
-  features, and `PYRE_RTYPER_VERBOSE=1`.
+  features, and `MAJIT_RTYPER_VERBOSE=1`.
 
   That commit existed only on a feature branch and was later replaced by the
   squash merge in PR #606 (`7944966b4dd`, "jit: retire foreign-lib cluster
@@ -45,7 +45,7 @@ three readings of one unchanged input set:
   ```text
   python3 scripts/extract-llbc.py
   touch pyre/pyre-jit-trace/build.rs
-  PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
+  MAJIT_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace
   stderr=$(ls -t target/release/build/pyre-jit-trace-*/stderr | head -1)
   rg --no-config 'PREPASS phaseA fail' "$stderr" | sort -u | wc -l
   ```

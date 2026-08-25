@@ -13,7 +13,7 @@
 //! the one place that turns a mirror into a frame mirror, and it refuses on a
 //! block that was not sized for one.
 
-use super::pyobject::{self, CPyObject, REFCNT_FROM_PYRE};
+use super::pyobject::{self, CPyObject, REFCNT_FROM_PYPY};
 use super::typeobject::CPyTypeObject;
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::collections::HashSet;
@@ -227,7 +227,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     pyobject::link_allocated(
         boxed.into_raw() as PyObjectRef,
         raw,
-        REFCNT_FROM_PYRE + refcnt,
+        REFCNT_FROM_PYPY + refcnt,
     );
 }
 

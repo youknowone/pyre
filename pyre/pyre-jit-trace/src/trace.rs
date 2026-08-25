@@ -3356,11 +3356,11 @@ fn try_adopt_multi_frame_blackhole(
         crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
     // The workspace entry turns this crate's defaults off, so a `pyre-jit`
     // that names no backend no longer forwards one and the call has to be
-    // gated. The predicate is `pyre_production_cpu`'s own: present on wasm32
+    // gated. The predicate is `production_cpu`'s own: present on wasm32
     // regardless of feature, since `BackendImpl` is `WasmBackend` there.
     #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     {
-        mf_builder.cpu = Some(majit_metainterp::blackhole::pyre_production_cpu());
+        mf_builder.cpu = Some(majit_metainterp::blackhole::production_cpu());
     }
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,

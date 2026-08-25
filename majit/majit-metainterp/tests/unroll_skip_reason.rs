@@ -1,9 +1,9 @@
 //! A suppressed unroll has two possible causes, and the log has to say which.
 //!
-//! `compile_loop` skips the unroll optimizer when either the `PYRE_NO_UNROLL`
+//! `compile_loop` skips the unroll optimizer when either the `MAJIT_NO_UNROLL`
 //! env override is set OR the jitdriver's `enable_opts` does not list `unroll`.
-//! Both paths used to emit the same line — `[jit] PYRE_NO_UNROLL: skipping
-//! unroll optimizer` — and raise the same `InvalidLoop("PYRE_NO_UNROLL")`.
+//! Both paths used to emit the same line — `[jit] MAJIT_NO_UNROLL: skipping
+//! unroll optimizer` — and raise the same `InvalidLoop("MAJIT_NO_UNROLL")`.
 //!
 //! That is not a cosmetic difference. A frontend that deliberately leaves
 //! `unroll` out of its `enable_opts` (measuring that peeling the preamble costs
@@ -36,7 +36,7 @@ fn each_cause_is_named_as_itself() {
     let reason = unroll_skip_reason(true, &with_unroll)
         .expect("the env override suppresses unrolling whatever the opts say");
     assert!(
-        reason.contains("PYRE_NO_UNROLL"),
+        reason.contains("MAJIT_NO_UNROLL"),
         "the env override must name the variable a reader can check; got {reason:?}",
     );
 
@@ -50,7 +50,7 @@ fn each_cause_is_named_as_itself() {
          variable a reader would then look for in vain; got {reason:?}",
     );
     assert!(
-        !reason.contains("PYRE_NO_UNROLL"),
+        !reason.contains("MAJIT_NO_UNROLL"),
         "…and must not name the env override at all: it is unset in exactly \
          this case, which is what made the old message misleading; got {reason:?}",
     );

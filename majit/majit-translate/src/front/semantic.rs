@@ -94,7 +94,7 @@ pub struct SemanticFunction {
     /// Fully-qualified `name_path()` of the trait when this function
     /// is an `impl Trait for Type {…}` method, otherwise `None`.
     /// Distinguishes traits whose leaf names collide — the unique-impl
-    /// map (`pyre_trait_unique_impls`) keys on this, not `trait_root`.
+    /// map (`trait_unique_impls`) keys on this, not `trait_root`.
     /// Trait default bodies leave it `None`: Charon names them with
     /// only the trait leaf segment, and they never feed the
     /// unique-impl map.
@@ -301,7 +301,7 @@ pub struct SemanticProgram {
     /// `CallControl.unsafe_fn_stubs` →
     /// `cutover::register_unsafe_fn_stubs` so the dual gate registers a
     /// stub PyGraph for each, covering the "not registered in
-    /// PyreCallRegistry" Skip cluster dominated by `pyre_object::is_*`.
+    /// CallRegistry" Skip cluster dominated by `pyre_object::is_*`.
     /// These callees' bodies access raw pointers the flowspace adapter
     /// does not model, so only a typed signature stub is registered.
     pub unsafe_fn_stubs: Vec<(

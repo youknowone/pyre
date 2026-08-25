@@ -131,7 +131,7 @@ fn build() -> majit_metainterp::JitCode {
 /// if nothing registered it.
 fn cached_data_field() -> Option<(majit_ir::Type, usize, bool)> {
     use majit_ir::descr::FieldDescr as _;
-    let type_id = majit_metainterp::__pyre_struct_type_id::<PointerFieldStack>(false);
+    let type_id = majit_metainterp::__majit_struct_type_id::<PointerFieldStack>(false);
     let cache = majit_ir::descr::gc_cache().lock().unwrap();
     let descr = cache
         ._cache_field
@@ -188,7 +188,7 @@ fn a_write_set_declaration_over_an_array_field_describes_a_pointer() {
 fn a_scalar_field_of_the_same_struct_is_still_a_scalar() {
     use majit_ir::descr::FieldDescr as _;
     let _jc = build();
-    let type_id = majit_metainterp::__pyre_struct_type_id::<PointerFieldStack>(false);
+    let type_id = majit_metainterp::__majit_struct_type_id::<PointerFieldStack>(false);
     let cache = majit_ir::descr::gc_cache().lock().unwrap();
     let size_field = cache
         ._cache_field

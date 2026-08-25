@@ -615,13 +615,13 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
 
 /// Whether `spelling` is a list-shaped container type (`Vec<T>`,
 /// `VecDeque<T>`, `&[T]`, `[T; N]`) that the annotator's
-/// `project_pyre_field_type` maps to a `SomeList` element model rather
+/// `project_struct_field_type` maps to a `SomeList` element model rather
 /// than a class instance.  The named-ADT root resolver
 /// (`adt_node_class_root`) answers `None` for the core/std/alloc
 /// container family, so a list-typed parameter would otherwise seed the
 /// classdef-less `SomeInstance(None)` shell; this recognizer lets the
 /// parameter seam route it through the list model instead.  Mirrors the
-/// `Vec<` / `[` arms of `project_pyre_field_type`.
+/// `Vec<` / `[` arms of `project_struct_field_type`.
 pub fn is_list_container_spelling(spelling: &str) -> bool {
     let stripped = spelling
         .trim()
@@ -893,7 +893,7 @@ static FIELD_UNRESOLVED_NAMES: std::sync::Mutex<
 ///
 /// The COUNT (`field_pos_unresolved`) is ungated and always accurate; only the
 /// names cost anything, so they sit behind a knob like
-/// `PYRE_SIZE_SHELL_OWNERS`. Read through this one function so the variable has
+/// `MAJIT_SIZE_SHELL_OWNERS`. Read through this one function so the variable has
 /// exactly one spelling in-tree — the collector lives here and the printer
 /// lives in `pyre-jit-trace`, and two independently-checked names would let the
 /// printer report "nothing unresolved" from a run that never recorded.

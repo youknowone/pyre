@@ -14,7 +14,7 @@
 //! # Ownership
 //!
 //! The link is a `rawrefcount` P-link, and the collector owns it: a mirror
-//! whose count is exactly [`REFCNT_FROM_PYRE`] is referenced by nothing but the
+//! whose count is exactly [`REFCNT_FROM_PYPY`] is referenced by nothing but the
 //! link, so the collector is free to let the interpreter object die and queue
 //! the mirror on its dead list.  [`drain_dead`] is what then runs the mirror's
 //! deallocator.  Nothing in this module roots an interpreter object.
@@ -42,13 +42,13 @@ use std::hash::BuildHasherDefault;
 ///
 /// The collector reads it too, and decides on it, so the constant is defined
 /// where the algorithm is.
-pub use rawrefcount::REFCNT_FROM_PYRE;
+pub use rawrefcount::REFCNT_FROM_PYPY;
 
 /// The count an immortal mirror starts at.
 ///
 /// Type mirrors and the singletons are borrowed by every consumer and never
 /// handed out with an owning reference, so their count must never fall back to
-/// [`REFCNT_FROM_PYRE`] and free them.
+/// [`REFCNT_FROM_PYPY`] and free them.
 pub use rawrefcount::REFCNT_IMMORTAL;
 
 /// C-visible `PyObject`, matching PyPy's `parse/cpyext_object.h` shape.
@@ -166,7 +166,7 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         // second call finds this mirror in the table and terminates.
         let mirror = attach(
             w_obj,
-            REFCNT_FROM_PYRE,
+            REFCNT_FROM_PYPY,
             std::ptr::null_mut(),
             size_of::<super::typeobject::CPyHeapTypeObject>(),
         ) as *mut CPyTypeObject;
@@ -194,7 +194,7 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     }
     let ob_type = type_mirror(w_obj);
     let size = mirror_size(ob_type);
-    let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, size);
+    let raw = attach(w_obj, REFCNT_FROM_PYPY, ob_type, size);
     // Each fill allocates, so the object is read back through the mirror
     // before the next one rather than kept in a local: the block's address
     // does not move and the object's does, and the link is what the collector
@@ -301,28 +301,28 @@ pub(super) fn attach_foreign(w_obj: PyObjectRef, raw: *mut CPyObject) {
 /// [`free_block`] later releases it by.
 pub(super) fn link_allocated(w_obj: PyObjectRef, raw: *mut CPyObject, refcnt: isize) {
     debug_assert!(
-        refcnt >= REFCNT_FROM_PYRE,
+        refcnt >= REFCNT_FROM_PYPY,
         "a linked mirror carries the link share"
     );
     unsafe {
         (*raw).ob_refcnt = refcnt;
         (*raw).ob_pyre_link = w_obj;
     }
-    majit_gc::gc_rawrefcount_create_link_pyre(majit_ir::GcRef(w_obj as usize), raw as usize);
+    majit_gc::gc_rawrefcount_create_link_pypy(majit_ir::GcRef(w_obj as usize), raw as usize);
 }
 
 /// `pyobject.py:track_reference` — hand the collector the P-link.
 ///
 /// The mirror's header is already filled at this point, including the
-/// [`REFCNT_FROM_PYRE`] share this link is worth, which is what
+/// [`REFCNT_FROM_PYPY`] share this link is worth, which is what
 /// `track_reference`'s `c_ob_refcnt += REFCNT_FROM_PYPY` establishes.
 fn enter(w_obj: PyObjectRef, raw: *mut CPyObject, size: usize) {
     debug_assert!(
-        unsafe { (*raw).ob_refcnt } >= REFCNT_FROM_PYRE,
+        unsafe { (*raw).ob_refcnt } >= REFCNT_FROM_PYPY,
         "a linked mirror carries the link share"
     );
     record_block(raw as usize, size);
-    majit_gc::gc_rawrefcount_create_link_pyre(majit_ir::GcRef(w_obj as usize), raw as usize);
+    majit_gc::gc_rawrefcount_create_link_pypy(majit_ir::GcRef(w_obj as usize), raw as usize);
 }
 
 /// How large a mirror of `ob_type` has to be.
@@ -489,7 +489,7 @@ pub unsafe fn decref(raw: *mut CPyObject) {
         "decref of a mirror with no references left"
     );
     debug_assert!(
-        unsafe { (*raw).ob_pyre_link.is_null() } || unsafe { (*raw).ob_refcnt } > REFCNT_FROM_PYRE,
+        unsafe { (*raw).ob_pyre_link.is_null() } || unsafe { (*raw).ob_refcnt } > REFCNT_FROM_PYPY,
         "a linked mirror must not be decrefed below the link share"
     );
     unsafe { (*raw).ob_refcnt -= 1 };
@@ -1091,7 +1091,7 @@ pub unsafe extern "C" fn _PyPyre_RefCount(object: *mut CPyObject) -> isize {
     if object.is_null() {
         return 0;
     }
-    unsafe { (*object).ob_refcnt - REFCNT_FROM_PYRE }
+    unsafe { (*object).ob_refcnt - REFCNT_FROM_PYPY }
 }
 
 pub(super) fn ensure_linked() {

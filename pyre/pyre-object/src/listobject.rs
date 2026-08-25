@@ -2014,7 +2014,7 @@ pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
 ///
 /// The tracer uses this to decide whether the recorded trace needs
 /// `list_write_barrier` at all — see `FbwWalkMode::append_inplace_wb_covered`.
-/// A `std::alloc` block (`PYRE_GC_ITEMSBLOCK=0`) answers false: it has no GC
+/// A `std::alloc` block (`MAJIT_GC_ITEMSBLOCK=0`) answers false: it has no GC
 /// header for an array barrier to mark, so the barrier on the enclosing
 /// `W_ListObject` is the only thing keeping the block's slots reachable.
 ///

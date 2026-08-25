@@ -40,8 +40,8 @@ pub use descr::{
     make_vtable_field_descr, memcpy_fn_addr, recover_fail_descr_cell, unpack_fielddescr,
 };
 pub use effectinfo::{
-    CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, PyreHelperKind, UnsupportedFieldExc,
-    consider_array, consider_struct, frozenset_or_none,
+    CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, RuntimeHelperKind,
+    UnsupportedFieldExc, consider_array, consider_struct, frozenset_or_none,
 };
 pub use indexmap_ext::{ConstMap, IndexMapExt};
 pub use op_type_index::OpTypeIndex;

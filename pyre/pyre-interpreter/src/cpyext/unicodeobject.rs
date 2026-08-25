@@ -356,7 +356,7 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     pyobject::link_allocated(
         pyre_object::gc_roots::shadow_stack_get(slot),
         raw,
-        pyobject::REFCNT_FROM_PYRE + refcnt,
+        pyobject::REFCNT_FROM_PYPY + refcnt,
     );
 }
 

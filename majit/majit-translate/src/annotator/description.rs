@@ -985,7 +985,7 @@ pub struct FunctionDesc {
     /// If that eager lift fails, cache misses must surface the recorded
     /// producer-side error here instead of falling through to
     /// `buildflowgraph`'s generic synthetic-function failure.
-    pub(crate) pyre_lift_error: RefCell<Option<String>>,
+    pub(crate) lift_error: RefCell<Option<String>>,
     /// Upstream `self.pyobj._signature_` (description.py:294, :315).
     /// Carried on FunctionDesc rather than HostObject because
     /// `_signature_` is a function-level attribute.
@@ -1054,7 +1054,7 @@ impl FunctionDesc {
             defaults: defaults.unwrap_or_default(),
             specializer,
             cache: RefCell::new(HashMap::new()),
-            pyre_lift_error: RefCell::new(None),
+            lift_error: RefCell::new(None),
             annsignature: None,
             annenforceargs: None,
         }
@@ -1068,12 +1068,12 @@ impl FunctionDesc {
     /// Record a pyre eager-lift failure to be observed at the same
     /// lazy `cachedgraph` use-site where upstream would run
     /// `buildgraph` and propagate the original construction error.
-    pub(crate) fn record_pyre_lift_error(&self, message: String) {
-        *self.pyre_lift_error.borrow_mut() = Some(message);
+    pub(crate) fn record_lift_error(&self, message: String) {
+        *self.lift_error.borrow_mut() = Some(message);
     }
 
-    pub(crate) fn pyre_lift_error_message(&self) -> Option<String> {
-        self.pyre_lift_error.borrow().clone()
+    pub(crate) fn lift_error_message(&self) -> Option<String> {
+        self.lift_error.borrow().clone()
     }
 
     /// RPython `FunctionDesc.rowkey()` (description.py).
@@ -1265,9 +1265,9 @@ impl FunctionDesc {
             }
             return Ok(existing.clone());
         }
-        if let Some(lift_err) = self.pyre_lift_error_message() {
+        if let Some(lift_err) = self.lift_error_message() {
             return Err(AnnotatorError::new(format!(
-                "{}.cachedgraph: pyre-side lift failed during \
+                "{}.cachedgraph: source lift failed during \
                  populate_call_registry_from_call_graphs (recorded \
                  lazy-failure error): {lift_err}",
                 self.name,
@@ -3515,9 +3515,9 @@ mod tests {
     }
 
     #[test]
-    fn function_desc_cachedgraph_surfaces_recorded_pyre_lift_error() {
+    fn function_desc_cachedgraph_surfaces_recorded_lift_error() {
         let fd = FunctionDesc::new(bk(), None, "bad_leaf", int_sig(&[]), None, None);
-        fd.record_pyre_lift_error("producer failed before pygraph lift".to_string());
+        fd.record_lift_error("producer failed before pygraph lift".to_string());
 
         let err = fd
             .cachedgraph(
@@ -3530,7 +3530,7 @@ mod tests {
             .expect_err("recorded pyre lift error must surface at cachedgraph");
 
         let msg = err.msg.expect("AnnotatorError should carry message");
-        assert!(msg.contains("bad_leaf.cachedgraph: pyre-side lift failed"));
+        assert!(msg.contains("bad_leaf.cachedgraph: source lift failed"));
         assert!(msg.contains("producer failed before pygraph lift"));
     }
 

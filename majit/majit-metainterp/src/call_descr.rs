@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use majit_backend::JitCellToken;
 use majit_ir::effectinfo::EffectInfoCell;
-use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, PyreHelperKind, Type};
+use majit_ir::{
+    CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, RuntimeHelperKind, Type,
+};
 
 /// Generic CallDescr for function call operations.
 ///
@@ -215,12 +217,12 @@ pub fn can_raise_effect_info() -> EffectInfo {
 /// an allocation publishes a fresh object and writes no field of any
 /// object the trace already cached, so `graphanalyze.py:60
 /// analyze_external_call`'s `bottom_result()` is the honest answer.
-/// Stamped with [`PyreHelperKind::NurseryAlloc`] so the dynasm CallR
+/// Stamped with [`RuntimeHelperKind::NurseryAlloc`] so the dynasm CallR
 /// genop emits an inline nursery bump; the tag does not change effect
 /// analysis.
 pub fn nursery_alloc_effect_info() -> EffectInfo {
     let mut ei = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
-    ei.pyre_helper = PyreHelperKind::NurseryAlloc;
+    ei.runtime_helper = RuntimeHelperKind::NurseryAlloc;
     ei
 }
 
@@ -293,7 +295,7 @@ pub fn forces_virtual_or_virtualizable_effect_info() -> EffectInfo {
 pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::CannotRaise,
     oopspecindex: OopSpecIndex::None,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),
@@ -335,7 +337,7 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::None,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),
@@ -371,7 +373,7 @@ pub const ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntPyDiv,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),
@@ -400,7 +402,7 @@ pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntPyMod,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),
@@ -437,7 +439,7 @@ pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const UINT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntUdiv,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),
@@ -464,7 +466,7 @@ pub const UINT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const UINT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntUmod,
-    pyre_helper: PyreHelperKind::None,
+    runtime_helper: RuntimeHelperKind::None,
     _readonly_descrs_fields: Some(Vec::new()),
     _write_descrs_fields: Some(Vec::new()),
     _readonly_descrs_arrays: Some(Vec::new()),

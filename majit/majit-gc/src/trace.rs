@@ -1121,13 +1121,13 @@ impl TypeRegistry {
             if info.item_size == 0 {
                 let _ = writeln!(
                     text,
-                    "member{member:<4} GcStruct pyre_type_{type_id} {{ size={}, gcptr_offsets={:?} }}",
+                    "member{member:<4} GcStruct gc_type_{type_id} {{ size={}, gcptr_offsets={:?} }}",
                     info.size, info.gc_ptr_offsets,
                 );
             } else {
                 let _ = writeln!(
                     text,
-                    "member{member:<4} GcArray pyre_type_{type_id} {{ base_size={}, item_size={}, gcptr_offsets={:?} }}",
+                    "member{member:<4} GcArray gc_type_{type_id} {{ base_size={}, item_size={}, gcptr_offsets={:?} }}",
                     info.size, info.item_size, info.gc_ptr_offsets,
                 );
             }

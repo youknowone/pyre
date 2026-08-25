@@ -3130,8 +3130,8 @@ impl<'a> AssemblerARM64<'a> {
                 self.genop_call_with_arglocs(op, arglocs);
             }
             OpCode::CallR => {
-                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().pyre_helper)
-                    == Some(majit_ir::PyreHelperKind::NurseryAlloc);
+                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
+                    == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
                 if is_nursery_alloc {
                     self.genop_nursery_alloc_inline(op, arglocs);
                 } else {
@@ -4292,7 +4292,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
-        if std::env::var("PYRE_TRACE_CALL_DIAG")
+        if std::env::var("MAJIT_TRACE_CALL_DIAG")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             == Some(self.trace_id)
@@ -5493,7 +5493,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.store_rax_to_result(op.pos.get());
             }
         }
-        if std::env::var("PYRE_TRACE_CALL_DIAG")
+        if std::env::var("MAJIT_TRACE_CALL_DIAG")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             == Some(self.trace_id)
@@ -5511,7 +5511,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// Inline nursery bump for a call tagged
-    /// [`majit_ir::PyreHelperKind::NurseryAlloc`].
+    /// [`majit_ir::RuntimeHelperKind::NurseryAlloc`].
     ///
     /// The tag declares a two-word headerless node taken from the
     /// interpreter's own nursery, whose payload is the call's two arguments:

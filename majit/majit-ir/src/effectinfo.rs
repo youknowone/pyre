@@ -355,7 +355,7 @@ impl Clone for EffectInfoCell {
 /// would have to duplicate all six raw descriptor sets to find the cell it
 /// replaces.
 ///
-/// The key is `EffectInfo` equality, which carries `pyre_helper`.  Upstream has
+/// The key is `EffectInfo` equality, which carries `runtime_helper`.  Upstream has
 /// no such field, and it must stay in: the walker matches a helper by that tag
 /// on the descr's EffectInfo because it cannot match by fnaddr (`pyre-jit`'s
 /// `flatten.rs`), so two helpers with identical effect sets but different tags
@@ -541,7 +541,7 @@ pub struct EffectInfo {
     /// would break the `_OS_CANRAISE` invariant for the CanRaise members.
     /// `None` for every ordinary call, so `has_oopspec()` and the OS_* universe
     /// stay identical to upstream.
-    pub pyre_helper: PyreHelperKind,
+    pub runtime_helper: RuntimeHelperKind,
     // ── effectinfo.py:128-145 raw descr sets ──
     //
     // PyPy stores `_readonly_descrs_fields: frozenset[Descr]` (and the
@@ -638,7 +638,7 @@ impl PartialEq for EffectInfo {
     fn eq(&self, other: &Self) -> bool {
         self.extraeffect == other.extraeffect
             && self.oopspecindex == other.oopspecindex
-            && self.pyre_helper == other.pyre_helper
+            && self.runtime_helper == other.runtime_helper
             && descr_set_eq(
                 &self._readonly_descrs_fields,
                 &other._readonly_descrs_fields,
@@ -674,7 +674,7 @@ impl std::hash::Hash for EffectInfo {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.extraeffect.hash(state);
         self.oopspecindex.hash(state);
-        self.pyre_helper.hash(state);
+        self.runtime_helper.hash(state);
         descr_set_hash(&self._readonly_descrs_fields, state);
         descr_set_hash(&self._write_descrs_fields, state);
         descr_set_hash(&self._readonly_descrs_arrays, state);
@@ -692,7 +692,7 @@ impl Default for EffectInfo {
         EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
             oopspecindex: OopSpecIndex::None,
-            pyre_helper: PyreHelperKind::None,
+            runtime_helper: RuntimeHelperKind::None,
             // effectinfo.py frozenset_or_none: empty frozenset for
             // a non-random-effects EI with no field/array touches yet.
             _readonly_descrs_fields: Some(Vec::new()),
@@ -850,7 +850,7 @@ pub enum OopSpecIndex {
 /// its siblings rather than appending it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
-pub enum PyreHelperKind {
+pub enum RuntimeHelperKind {
     #[default]
     None,
     BinaryOp,
@@ -864,7 +864,7 @@ pub enum PyreHelperKind {
     /// The full-body walker recognises this tag to fold a module-scope name
     /// read (frame's `w_locals_object` is null, so `w_locals` aliases
     /// `w_globals`) through the same module-dict cell fast path as
-    /// [`PyreHelperKind::LoadGlobal`], eliding the per-iteration residual.
+    /// [`RuntimeHelperKind::LoadGlobal`], eliding the per-iteration residual.
     LoadName,
     /// `bh_store_name_fn(frame, w_name, value)` — the STORE_NAME frame-receiver
     /// helper (`pyopcode.py:855-859`, delegates to `store_name_value` →
@@ -873,12 +873,12 @@ pub enum PyreHelperKind {
     /// module-scope int store whose slot holds an `IntMutableCell` (the
     /// stabilised in-place shape) to a `setfield_gc_i(cell, intvalue)`,
     /// eliding the boxing + residual dict setitem — the store dual of
-    /// [`PyreHelperKind::LoadName`].
+    /// [`RuntimeHelperKind::LoadName`].
     StoreName,
     /// `bh_store_global_fn(frame, w_name, value)` — the STORE_GLOBAL
     /// frame-receiver helper (`pyopcode.py:567`, delegates to
     /// `store_global_value`).  Recognised for the same `IntMutableCell`
-    /// in-place store fold as [`PyreHelperKind::StoreName`].
+    /// in-place store fold as [`RuntimeHelperKind::StoreName`].
     StoreGlobal,
     /// `bh_delete_name_fn(frame, w_name)` — the DELETE_NAME frame-receiver
     /// helper (`pyopcode.py:869-880`, delegates to `delitem_str`).  Recognised
@@ -890,7 +890,7 @@ pub enum PyreHelperKind {
     /// meets the rtyper operation and has to ask before executing.
     DeleteName,
     /// `bh_delete_global_fn(frame, w_name)` — the DELETE_GLOBAL twin of
-    /// [`PyreHelperKind::DeleteName`], recognised for the same reason.
+    /// [`RuntimeHelperKind::DeleteName`], recognised for the same reason.
     DeleteGlobal,
     /// `bh_load_locals_fn(frame)` — the LOAD_LOCALS frame-receiver helper
     /// (`pyopcode.py:793-794`). Carries no fold; the tag exists so the class
@@ -899,15 +899,15 @@ pub enum PyreHelperKind {
     LoadLocals,
     /// `bh_load_build_class_fn(frame)` — the LOAD_BUILD_CLASS frame-receiver
     /// helper (`pyopcode.py:866-870`). Same standing as
-    /// [`PyreHelperKind::LoadLocals`].
+    /// [`RuntimeHelperKind::LoadLocals`].
     LoadBuildClass,
     /// `bh_load_import_fn(frame)` — the builtin lookup half of IMPORT_NAME.
-    /// The following invocation is emitted through [`PyreHelperKind::CallFn`]
+    /// The following invocation is emitted through [`RuntimeHelperKind::CallFn`]
     /// so gateway builtins retain their ordinary meta-traceable call shape.
     LoadImport,
     /// `bh_load_import_locals_fn(frame)` — IMPORT_NAME's locals argument
     /// (`pyopcode.py`'s `IMPORT_NAME`).  Infallible, same standing as
-    /// [`PyreHelperKind::LoadLocals`].
+    /// [`RuntimeHelperKind::LoadLocals`].
     LoadImportLocals,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
@@ -951,7 +951,7 @@ pub enum PyreHelperKind {
     /// length and returns the normalized tuple.  The full-body walker
     /// recognises this tag to fold an arity-2 specialised int tuple to a
     /// `guard_class` + pass-through, eliding the opaque residual so the
-    /// partner [`PyreHelperKind::UnpackItem`] reads fold against it.
+    /// partner [`RuntimeHelperKind::UnpackItem`] reads fold against it.
     UnpackSequence,
     /// `bh_unpack_item_fn(index, tuple)` — the per-index UNPACK_SEQUENCE item
     /// reader.  The full-body walker recognises this tag to read `value0` /
@@ -965,7 +965,7 @@ pub enum PyreHelperKind {
     /// virtualize an arity-2 plain-int tuple as a `spec_ii`
     /// `new_with_vtable` + `value0` / `value1` (mirroring the retired
     /// trace-side tuple builder), so the backing array build and the
-    /// partner [`PyreHelperKind::UnpackItem`] reads DCE to a pure-int loop.
+    /// partner [`RuntimeHelperKind::UnpackItem`] reads DCE to a pure-int loop.
     NewtupleFromArray,
     /// `newlist_from_array(array)` — the BUILD_LIST array consumer that
     /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
@@ -976,7 +976,7 @@ pub enum PyreHelperKind {
     /// from the concrete element shadows the way `w_list_new` /
     /// `list_strategy_for` does at runtime, so the array build and the
     /// residual DCE when the list never escapes.  Unlike
-    /// [`PyreHelperKind::NewtupleFromArray`], the element boxes are
+    /// [`RuntimeHelperKind::NewtupleFromArray`], the element boxes are
     /// recovered from the backing array (const length + per-index element
     /// shadows) rather than from residual args.
     NewlistFromArray,
@@ -1047,7 +1047,7 @@ pub enum PyreHelperKind {
     /// operands are the peeked target list and the popped value; the result
     /// is void.  The full-body walker recognises this tag to fold the append
     /// through the same orthodox `w_list_append` descent as the method-call
-    /// form ([`PyreHelperKind::CallFn`] `lst.append(x)`), recording the
+    /// form ([`RuntimeHelperKind::CallFn`] `lst.append(x)`), recording the
     /// native array store instead of the opaque `jit_list_append` residual.
     /// The recognition has no bound-method callable to pin: the list and
     /// value arrive directly as the residual's Ref operands.
@@ -1117,7 +1117,7 @@ pub enum PyreHelperKind {
     LoadMethodSelf,
     /// `bh_delete_attr_fn(obj, code, name_idx)` — the plain DELETE_ATTR
     /// residual (`lower_delete_attr_hlop_to_insn` → `space.delattr`), the
-    /// deletion counterpart of [`StoreAttr`](PyreHelperKind::StoreAttr).
+    /// deletion counterpart of [`StoreAttr`](RuntimeHelperKind::StoreAttr).
     /// The full-body walker recognises this tag to fold the deterministic
     /// immutable-type raise (`del int.x` → TypeError before any dict
     /// access) to a traced inline exception construction the optimizer
@@ -1146,7 +1146,7 @@ pub enum PyreHelperKind {
     /// a traced `s.add(x)` on a `set` (`try_walker_specialize_set_add_method`).
     /// It inserts into the live set and RETURNS `None` (`Ref`), so it is a
     /// value-returning heap write the `Void`-result write proxy cannot see —
-    /// the same standing as [`PyreHelperKind::StoreDeref`], and the reason the
+    /// the same standing as [`RuntimeHelperKind::StoreDeref`], and the reason the
     /// tag exists: without it the substitution would replace a `CallFn` the
     /// `writes_live_heap` discriminator counts with a descr it does not, and a
     /// nested abort would rewind past a completed insert.  The element's
@@ -1229,7 +1229,7 @@ impl EffectInfo {
         EffectInfo {
             extraeffect,
             oopspecindex,
-            pyre_helper: PyreHelperKind::None,
+            runtime_helper: RuntimeHelperKind::None,
             _readonly_descrs_fields: Some(Vec::new()),
             _write_descrs_fields: Some(Vec::new()),
             _readonly_descrs_arrays: Some(Vec::new()),
@@ -1292,7 +1292,7 @@ impl EffectInfo {
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
         oopspecindex: OopSpecIndex::None,
-        pyre_helper: PyreHelperKind::None,
+        runtime_helper: RuntimeHelperKind::None,
         _readonly_descrs_fields: None,
         _write_descrs_fields: None,
         _readonly_descrs_arrays: None,
@@ -1684,7 +1684,7 @@ struct EiCanonKey {
 struct FrozenEiCanonKey {
     extraeffect: ExtraEffect,
     oopspecindex: u16,
-    pyre_helper: u8,
+    runtime_helper: u8,
     descr_set_keys: Option<DescrSetKeys>,
     can_invalidate: bool,
     can_collect: bool,
@@ -1696,7 +1696,7 @@ impl FrozenEiCanonKey {
         Self {
             extraeffect: ei.extraeffect,
             oopspecindex: ei.oopspecindex as u16,
-            pyre_helper: ei.pyre_helper as u8,
+            runtime_helper: ei.runtime_helper as u8,
             descr_set_keys: ei.descr_set_keys.as_deref().cloned(),
             can_invalidate: ei.can_invalidate,
             can_collect: ei.can_collect,

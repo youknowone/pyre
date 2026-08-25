@@ -262,7 +262,7 @@ pub struct TranslationContext {
     /// `getdesc → newfuncdesc → buildgraph` chain
     /// (`rpython/annotator/bookkeeper.py:353-409`) where the
     /// original exception propagates.
-    pub _pyre_lift_errors: RefCell<HashMap<HostObject, String>>,
+    pub _lift_errors: RefCell<HashMap<HostObject, String>>,
     /// RPython `self.entry_point_graph`. Set by
     /// `RPythonAnnotator.build_types(main_entry_point=True)`.
     pub entry_point_graph: RefCell<Option<GraphRef>>,
@@ -301,7 +301,7 @@ impl TranslationContext {
             graphs: RefCell::new(Vec::new()),
             callgraph: RefCell::new(HashMap::new()),
             _prebuilt_graphs: RefCell::new(HashMap::new()),
-            _pyre_lift_errors: RefCell::new(HashMap::new()),
+            _lift_errors: RefCell::new(HashMap::new()),
             entry_point_graph: RefCell::new(None),
         }
     }
@@ -354,9 +354,9 @@ impl TranslationContext {
         // where the original construction error propagates from the
         // lazy `cachedgraph` consumer
         // (`rpython/annotator/description.py:228`).
-        if let Some(lift_err) = self._pyre_lift_errors.borrow().get(&func).cloned() {
+        if let Some(lift_err) = self._lift_errors.borrow().get(&func).cloned() {
             return Err(format!(
-                "buildflowgraph({}): pyre-side lift failed during \
+                "buildflowgraph({}): source lift failed during \
                  populate_call_registry_from_call_graphs (recorded \
                  lazy-failure error): {lift_err}",
                 graph_func.name,

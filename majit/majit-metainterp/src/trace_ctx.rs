@@ -1280,7 +1280,7 @@ impl TraceCtx {
         effectinfo: Option<&majit_ir::EffectInfo>,
         argboxes: &[OpRef],
     ) {
-        if std::env::var_os("PYRE_PROBE_SUBSCR").is_some() {
+        if std::env::var_os("MAJIT_PROBE_SUBSCR").is_some() {
             let ei_summary = effectinfo.map(|ei| {
                 format!(
                     "extraeffect={:?} forces_vorv={} can_raise={} plain_call={} oopspec={:?}",
@@ -1292,7 +1292,7 @@ impl TraceCtx {
                 )
             });
             eprintln!(
-                "[PYRE_PROBE_SUBSCR] invalidate_caches_varargs opnum={:?} argboxes.len={} ei={:?}",
+                "[MAJIT_PROBE_SUBSCR] invalidate_caches_varargs opnum={:?} argboxes.len={} ei={:?}",
                 opnum,
                 argboxes.len(),
                 ei_summary
@@ -4846,7 +4846,7 @@ impl TraceCtx {
         index_runtime_value: i64,
         fdescr: &DescrRef,
     ) -> Option<usize> {
-        // `PYRE_VABLE_IDX_PROBE`: does a non-constant index ever arrive here?
+        // `MAJIT_VABLE_IDX_PROBE`: does a non-constant index ever arrive here?
         //
         // Prints on BOTH branches deliberately. A probe that prints only on
         // the branch it is hunting cannot distinguish "never taken" from

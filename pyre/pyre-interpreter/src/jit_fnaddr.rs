@@ -1694,7 +1694,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // odometer bump and the items-block strategy gate: each reads a
     // runtime-mutable global (`COLLECT_STATE` atomic, `EVAL_NESTING` / `POLL_TICK`
     // TLS, the two GC hook fn-pointer cells, `FRAME_ENTRY_COUNT` TLS, the
-    // `PYRE_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
+    // `MAJIT_GC_ITEMSBLOCK` `OnceLock`) — none a build-time constant — so all carry
     // `#[dont_look_inside]` and bind their `-> bool` / `()` Rust `fn` directly by
     // qualified path (siblings of `gc_interp::enabled`).
     pa0(
@@ -4266,10 +4266,10 @@ mod tests {
     fn jit_trace_fnaddrs_covers_int_bit_length_gateway_wrapper() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected =
-            crate::typedef::__pyre_wrap_int_descr_bit_length as *const () as usize as i64;
+            crate::typedef::__majit_wrap_int_descr_bit_length as *const () as usize as i64;
 
         assert_eq!(
-            bindings["pyre_interpreter::typedef::__pyre_wrap_int_descr_bit_length"],
+            bindings["pyre_interpreter::typedef::__majit_wrap_int_descr_bit_length"],
             expected,
         );
     }

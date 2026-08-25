@@ -3628,7 +3628,7 @@ impl JitCodeBuilder {
     /// `result_size = 0`, so it has no counterpart for a semantically void
     /// helper that physically returns a word. `pyre-jit/src/jit/codewriter.rs`
     /// (`CodeWriter::intern_call_descr_stub`) sets it for
-    /// `PyreHelperKind::ListAppendValue`.
+    /// `RuntimeHelperKind::ListAppendValue`.
     pub fn residual_call_void_canonical_via_target_with_effect_info_and_word_abi(
         &mut self,
         fn_ptr_idx: u16,

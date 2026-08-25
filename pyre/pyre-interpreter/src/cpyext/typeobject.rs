@@ -6,7 +6,7 @@
 //! block of the same shape, so `Py_TYPE(x)->tp_name` reads something either
 //! way.
 
-use super::pyobject::{self, CPyObject, REFCNT_FROM_PYRE, REFCNT_IMMORTAL};
+use super::pyobject::{self, CPyObject, REFCNT_FROM_PYPY, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
@@ -6183,7 +6183,7 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     // collector queues this block for `tp_dealloc`.
     let raw = pyobject::attach(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
-        REFCNT_FROM_PYRE + 1,
+        REFCNT_FROM_PYPY + 1,
         tp,
         size,
     );
@@ -6312,7 +6312,7 @@ pub unsafe extern "C" fn PyObject_Init(
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
     let instance = pyre_object::w_instance_new(pyre_object::gc_roots::shadow_stack_get(type_slot));
-    pyobject::link_allocated(instance, object, REFCNT_FROM_PYRE + 1);
+    pyobject::link_allocated(instance, object, REFCNT_FROM_PYPY + 1);
     object
 }
 

@@ -244,10 +244,10 @@ mod tests {
         crate::typedef::init_typeobjects();
         let cls = type_object();
         let seed = w_int_new(37);
-        let obj = __pyre_wrap___new__(&[cls, seed]).expect("synthesized __new__");
+        let obj = __majit_wrap___new__(&[cls, seed]).expect("synthesized __new__");
         let demo = Demo::from_obj(obj).expect("Demo allocation");
         assert_eq!(demo.state, 0);
-        __pyre_wrap___init__(&[obj, seed]).expect("Demo.__init__");
+        __majit_wrap___init__(&[obj, seed]).expect("Demo.__init__");
         assert_eq!(Demo::from_obj(obj).expect("initialized Demo").state, 37);
     }
 
@@ -260,8 +260,8 @@ mod tests {
     fn instance_method_binds_keyword_only_through_signature() {
         crate::typedef::init_typeobjects();
         let cls = type_object();
-        let obj = __pyre_wrap___new__(&[cls]).expect("synthesized __new__");
-        __pyre_wrap___init__(&[obj, w_int_new(7)]).expect("Demo.__init__");
+        let obj = __majit_wrap___new__(&[cls]).expect("synthesized __new__");
+        __majit_wrap___init__(&[obj, w_int_new(7)]).expect("Demo.__init__");
 
         // The `Signature` the instance-method arm derives for
         // `combine(&self, factor, #[kwonly] bias)`: `self` positional-only,
@@ -281,11 +281,12 @@ mod tests {
         )
         .expect("signature binding");
         // 7 * 3 + 5 through the bound (marker-free, PY_NULL-padded) scope.
-        let via_keyword = __pyre_wrap_combine(&bound).expect("keyword-bound combine");
+        let via_keyword = __majit_wrap_combine(&bound).expect("keyword-bound combine");
         assert_eq!(unsafe { w_int_get_value(via_keyword) }, 26);
 
         // The all-positional call omits `bias`, so its `#[default(0)]` applies.
-        let via_positional = __pyre_wrap_combine(&[obj, w_int_new(3)]).expect("positional combine");
+        let via_positional =
+            __majit_wrap_combine(&[obj, w_int_new(3)]).expect("positional combine");
         assert_eq!(unsafe { w_int_get_value(via_positional) }, 21);
     }
 

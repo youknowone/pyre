@@ -9,7 +9,7 @@
 //!   `legacy_resolve` are transitional bridges between pyre's legacy
 //!   `model::FunctionGraph` and the orthodox
 //!   `flowspace::FunctionGraph` / `RPythonTyper` path.
-//! * `pyre_call_registry` owns symbolic `FunctionPath` -> synthetic
+//! * `call_registry` owns symbolic `FunctionPath` -> synthetic
 //!   `HostObject` / `FunctionDesc` registration, because pyre has no
 //!   CPython callable object identity to key `Bookkeeper.descs`.
 //! * `pairtype` centralizes rtyper-side `class __extend__(pairtype(...))`
@@ -31,6 +31,7 @@
 
 pub mod annlowlevel;
 pub(crate) mod box_str_const_fold;
+pub(crate) mod call_registry;
 pub mod callparse;
 pub mod controllerentry;
 pub(crate) mod cutover;
@@ -48,7 +49,6 @@ pub mod llinterp;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub(crate) mod pairtype;
-pub(crate) mod pyre_call_registry;
 pub mod raddress;
 pub mod rbool;
 pub mod rbuilder;

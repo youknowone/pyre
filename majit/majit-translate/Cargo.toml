@@ -63,9 +63,9 @@ majit-charon-reader = { workspace = true }
 [features]
 default = ["mir-frontend"]
 # When this feature is on, `build_semantic_program_via_active_frontend`
-# resolves LLBC artefacts via `PYRE_MIR_FRONTEND_LLBC` env-var or
-# auto-discovers `<workspace>/build/llbc/{pyre-object,
-# pyre-interpreter}.ullbc`; panics when neither source resolves.
+# resolves LLBC artefacts supplied by the caller or via the
+# `MAJIT_MIR_FRONTEND_LLBC` environment variable; it panics when neither
+# source resolves.
 #
 # `tyref_to_value_type` recognises Charon's literal-type schema —
 # `Literal::Int` (signed) / `Literal::UInt` (unsigned) for integers,

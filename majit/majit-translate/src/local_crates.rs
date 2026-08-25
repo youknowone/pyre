@@ -12,13 +12,10 @@
 //! (`populate_call_registry_from_call_graphs`).
 //!
 //! Seeded from the loaded LLBC set's `crate_name()`s by
-//! `build_semantic_program_via_active_frontend`; the pyre trio is always
-//! included so fixtures that build programs without the active frontend
-//! (and the pyre production set itself) keep their spellings unchanged.
+//! `build_semantic_program_via_active_frontend`. Consumers that construct
+//! programs without the active frontend must register their own crate roots.
 
 use std::cell::RefCell;
-
-const DEFAULT_ROOTS: [&str; 3] = ["pyre_interpreter", "pyre_object", "pyre_jit"];
 
 thread_local! {
     /// Per-pipeline-invocation local-crate alias roots, seeded once at the
@@ -47,19 +44,11 @@ pub(crate) fn register_local_crate_roots(names: impl IntoIterator<Item = String>
     REGISTERED.with(|registered| *registered.borrow_mut() = names.into_iter().collect());
 }
 
-/// Registered local crate names plus the always-included pyre trio,
-/// registered names first.
+/// Registered local crate names for the current pipeline invocation.
 pub(crate) fn local_crate_roots() -> Vec<String> {
-    let mut roots: Vec<String> = REGISTERED.with(|registered| registered.borrow().clone());
-    for default in DEFAULT_ROOTS {
-        if !roots.iter().any(|r| r == default) {
-            roots.push(default.to_string());
-        }
-    }
-    roots
+    REGISTERED.with(|registered| registered.borrow().clone())
 }
 
 pub(crate) fn is_local_crate_root(seg: &str) -> bool {
-    DEFAULT_ROOTS.contains(&seg)
-        || REGISTERED.with(|registered| registered.borrow().iter().any(|r| r == seg))
+    REGISTERED.with(|registered| registered.borrow().iter().any(|r| r == seg))
 }

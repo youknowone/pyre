@@ -183,17 +183,43 @@ impl DeterminismCheck {
 
 const LOWERING_GATE_ENV: [&str; 5] = [
     "PYRE_DYN_INDIRECT",
-    "PYRE_FNPTR_INDIRECT",
-    "PYRE_MIR_FRAMESTATE",
+    "MAJIT_FNPTR_INDIRECT",
+    "MAJIT_MIR_FRAMESTATE",
     "PYRE_OPTION_RESIDUAL_NARROW",
     "PYRE_TUPLE_PER_SHAPE_CLASSDEF",
 ];
+
+const ENGINE_ENV_ALIASES: &[(&str, &str)] = &[
+    ("PYRE_RTYPER_VERBOSE", "MAJIT_RTYPER_VERBOSE"),
+    ("PYRE_CALLEE_CENSUS", "MAJIT_CALLEE_CENSUS"),
+    ("PYRE_CALLEE_CENSUS_ROWS", "MAJIT_CALLEE_CENSUS_ROWS"),
+    ("PYRE_MIR_FRONTEND_LLBC", "MAJIT_MIR_FRONTEND_LLBC"),
+    ("PYRE_PROFILE_PIPELINE", "MAJIT_PROFILE_PIPELINE"),
+    ("PYRE_FNPTR_INDIRECT", "MAJIT_FNPTR_INDIRECT"),
+    ("PYRE_MIR_FRAMESTATE", "MAJIT_MIR_FRAMESTATE"),
+];
+
+fn forward_engine_env_aliases() {
+    for &(runtime_name, engine_name) in ENGINE_ENV_ALIASES {
+        if std::env::var_os(engine_name).is_none()
+            && let Some(value) = std::env::var_os(runtime_name)
+        {
+            // The build script has not created its analysis worker yet, so no
+            // other thread can concurrently read or modify this process's
+            // environment. The worker and majit libraries then see the
+            // engine-owned spelling.
+            unsafe { std::env::set_var(engine_name, value) };
+        }
+    }
+}
 
 /// Entry of the real build: the translation prepass over the LLBC set.
 ///
 /// `build.rs` dispatches here only when the `prepass` feature is on and the
 /// build is not an LLBC extraction; both other cases end in its placeholders.
 pub fn main() {
+    forward_engine_env_aliases();
+
     // Fail fast with an actionable message when the Charon-extracted LLBC
     // artefacts the codegen consumes are absent.  Without this, the missing
     // set surfaces deep inside `real_main` as a worker-thread `panic!`
@@ -232,9 +258,33 @@ pub fn main() {
 /// two-artefact consumers it requires `pyre-jit` too.
 const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
+fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
+    if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
+        let paths: Vec<String> = std::env::split_paths(&paths)
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+
+    let llbc_dir = std::path::Path::new(repo_root).join("build").join("llbc");
+    LLBC_CRATES
+        .iter()
+        .map(|crate_name| llbc_dir.join(format!("{crate_name}.ullbc")))
+        .chain(
+            llbc_layout_sidecars()
+                .into_iter()
+                .map(|name| llbc_dir.join(name)),
+        )
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
-/// honour the `PYRE_MIR_FRONTEND_LLBC` override, else require the canonical
+/// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the canonical
 /// `build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc` set. The third
 /// artifact contains the exact `eval::eval_loop_jit` portal.
 ///
@@ -254,7 +304,7 @@ const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", 
 fn preflight_llbc_or_fail() {
     // Explicit override: trust it and let the translator validate the
     // individual paths (its loader panics per-file with the bad path).
-    if std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+    if std::env::var_os("MAJIT_MIR_FRONTEND_LLBC")
         .map(|v| std::env::split_paths(&v).any(|p| !p.as_os_str().is_empty()))
         .unwrap_or(false)
     {
@@ -310,7 +360,7 @@ fn preflight_llbc_or_fail() {
     // wasm32, so any other target's sidecars are produced only when the
     // extraction is told this target explicitly.  Advertise it (harmless but
     // redundant for wasm32).  The override must also list the sidecar paths,
-    // since `PYRE_MIR_FRONTEND_LLBC` is treated as the complete input set and
+    // since `MAJIT_MIR_FRONTEND_LLBC` is treated as the complete input set and
     // returns before the sidecar check above.
     let sidecars = llbc_layout_sidecars();
     let (extract_cmd, override_extra) = if sidecars.is_empty() {
@@ -346,7 +396,7 @@ fn preflight_llbc_or_fail() {
    {}\n\
 \n\
  …or point the build at existing artefacts:\n\
-   export PYRE_MIR_FRONTEND_LLBC={}{}\n\
+   export MAJIT_MIR_FRONTEND_LLBC={}{}\n\
 ========================================================================\n",
         missing
             .iter()
@@ -1006,12 +1056,13 @@ fn real_main() {
     // The verbose prepass is a census over every attempted graph. Restoring
     // generated outputs would skip the analysis entirely and leave no
     // `PREPASS phaseA/phaseB fail` lines, contradicting the documented
-    // `PYRE_RTYPER_VERBOSE=1` workflow. The generated artifacts themselves do
+    // `MAJIT_RTYPER_VERBOSE=1` workflow. The generated artifacts themselves do
     // not depend on verbosity, so an ordinary build may still reuse the cache.
-    let verbose_prepass = std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|value| value == "1");
+    let verbose_prepass =
+        std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|value| value == "1");
     // The callee census is emitted from the analysis itself. A cache restore
     // would print no rows, which is indistinguishable from an empty census.
-    let callee_census = std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|value| value == "1");
+    let callee_census = std::env::var_os("MAJIT_CALLEE_CENSUS").is_some_and(|value| value == "1");
     // Restoring the outputs leaves the self-check nothing to compare, so it
     // bypasses the cache for the same reason the verbose prepass does.
     let determinism_check = DeterminismCheck::from_env();
@@ -1041,9 +1092,12 @@ fn real_main() {
     // outputs and the probe subdirectory for the second generation
     // `DeterminismCheck::InProcess` compares against; the parameter shadows
     // the outer `out_dir` so both calls read as "write into out_dir".
+    let llbc_paths = analysis_llbc_paths(&repo_root);
+    let llbc_path_refs: Vec<&str> = llbc_paths.iter().map(String::as_str).collect();
     let generate_into = |out_dir: &str| {
         majit_ir::descr::reset_field_mint_census();
-        let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
+        let pipeline = majit_translate::analyze_multiple_pipeline_from_llbc_with_modules(
+            &llbc_path_refs,
             &module_path_refs,
             &analyze_config,
             None,
@@ -1776,12 +1830,15 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
     println!("cargo::rerun-if-changed=src/llbc_fingerprint.rs");
-    println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
-    println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS");
-    println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS_ROWS");
+    println!("cargo::rerun-if-env-changed=MAJIT_RTYPER_VERBOSE");
+    println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS");
+    println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS_ROWS");
     println!("cargo::rerun-if-env-changed=MAJIT_FIELD_MINT_TRACE");
     println!("cargo::rerun-if-env-changed=MAJIT_STRUCT_LAYOUT_CENSUS");
     println!("cargo::rerun-if-env-changed={DETERMINISM_CHECK_ENV}");
+    for &(runtime_name, _) in ENGINE_ENV_ALIASES {
+        println!("cargo::rerun-if-env-changed={runtime_name}");
+    }
     // Re-runs this script without changing anything it hashes. That is the
     // only way to exercise `DeterminismCheck::AgainstCache`, which needs two
     // runs at the *same* cache key: with the gate value held constant Cargo
@@ -1793,11 +1850,11 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
         println!("cargo::rerun-if-env-changed={key}");
     }
     // The mir-frontend analysis derives `jit_trace_gen.rs` from
-    // the workspace LLBC artefacts or the `PYRE_MIR_FRONTEND_LLBC`
+    // the workspace LLBC artefacts or the `MAJIT_MIR_FRONTEND_LLBC`
     // override. Track both so re-extracting LLBC or repointing the override
     // invalidates Cargo's build-script cache and our content cache key.
-    println!("cargo::rerun-if-env-changed=PYRE_MIR_FRONTEND_LLBC");
-    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
+    println!("cargo::rerun-if-env-changed=MAJIT_MIR_FRONTEND_LLBC");
+    if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
         for path in std::env::split_paths(&paths) {
             if !path.as_os_str().is_empty() {
                 println!("cargo::rerun-if-changed={}", path.display());
@@ -2124,7 +2181,7 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
         h.write_str(&key);
         h.write_str(&value);
     }
-    h.write_os(std::env::var_os("PYRE_MIR_FRONTEND_LLBC"));
+    h.write_os(std::env::var_os("MAJIT_MIR_FRONTEND_LLBC"));
     for key in LOWERING_GATE_ENV {
         h.write_str(key);
         h.write_os(std::env::var_os(key));
@@ -2219,7 +2276,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     // serve stale output and skip re-analysis. The `.ullbc` set is ~660 MB
     // (89 % of it `fun_decls`), so the read costs under a second — still
     // negligible next to the tens of seconds of analysis it gates.
-    if let Some(paths) = std::env::var_os("PYRE_MIR_FRONTEND_LLBC") {
+    if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
         for path in std::env::split_paths(&paths) {
             if !path.as_os_str().is_empty() {
                 hash_file_content(h, &path);

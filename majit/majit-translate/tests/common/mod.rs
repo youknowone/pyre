@@ -9,7 +9,7 @@ use rustpython_compiler_core::bytecode::CodeObject;
 /// source contains no function body.
 pub fn compile_first_code(src: &str) -> CodeObject {
     let module =
-        rp_compile(src, Mode::Exec, "<pyre>", Default::default()).expect("compile should succeed");
+        rp_compile(src, Mode::Exec, "<flow>", Default::default()).expect("compile should succeed");
     module
         .constants
         .iter()

@@ -630,7 +630,7 @@ pub(crate) enum CallPolicyKind {
     ElidableIntOrMemerrorWrapped,
     ResidualRef,
     /// Like `ResidualRef` but stamps the descr EffectInfo with
-    /// `PyreHelperKind::NurseryAlloc`, which the backend lowers to an inline
+    /// `RuntimeHelperKind::NurseryAlloc`, which the backend lowers to an inline
     /// nursery bump. Result is a
     /// real escaping Ref — no virtualization.
     NurseryAllocRef,

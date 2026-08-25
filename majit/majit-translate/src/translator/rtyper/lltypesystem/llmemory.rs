@@ -1116,16 +1116,10 @@ pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     }
     let is_weakref_ptr = |p: &Ptr| LowLevelType::Ptr(Box::new(p.clone())) == *WEAKREF_PTR;
     if is_weakref_ptr(expected) {
-        return Err(
-            "cast_ptr_to_weakrefptr requires the GC transformer, which pyre does not run"
-                .to_string(),
-        );
+        return Err("cast_ptr_to_weakrefptr requires a configured GC transformer".to_string());
     }
     if is_weakref_ptr(ptrtype) {
-        return Err(
-            "cast_weakrefptr_to_ptr requires the GC transformer, which pyre does not run"
-                .to_string(),
-        );
+        return Err("cast_weakrefptr_to_ptr requires a configured GC transformer".to_string());
     }
     if matches!(expected.TO, PtrTarget::Opaque(_)) || matches!(ptrtype.TO, PtrTarget::Opaque(_)) {
         return cast_opaque_ptr(expected, ptr);

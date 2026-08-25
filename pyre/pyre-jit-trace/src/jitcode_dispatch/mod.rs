@@ -2488,7 +2488,7 @@ pub enum DispatchError {
     /// `abort/` (BC_ABORT) reached. The front-end emits this marker for a
     /// graph node with no dedicated `OpKind`; reaching it during a body
     /// walk means the trace contains an untranslatable op and cannot be
-    /// recorded. Blackhole counterpart `handler_abort_marker_pyre`
+    /// recorded. Blackhole counterpart `handler_abort_marker`
     /// (`blackhole.rs`) sets `aborted = true` + `LeaveFrame`; the
     /// walker surfaces it as a typed abort that the production driver
     /// maps to `TraceAction::Abort` (recoverable — may retry later).
@@ -4957,7 +4957,7 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     ei: &majit_ir::EffectInfo,
     allboxes: &mut [OpRef],
 ) {
-    if ei.pyre_helper != majit_ir::PyreHelperKind::LoadGlobal {
+    if ei.runtime_helper != majit_ir::RuntimeHelperKind::LoadGlobal {
         return;
     }
     let Some(ns_box) = allboxes.get_mut(1) else {
@@ -6491,7 +6491,7 @@ thread_local! {
 
     /// In-flight FOR_ITER continuation (#57 Option C): `(consumed_item,
     /// body coordinate)` stashed when the FOR_ITER `for_iter_next` residual
-    /// ([`PyreHelperKind::ForIterNext`]) runs concretely on the
+    /// ([`RuntimeHelperKind::ForIterNext`]) runs concretely on the
     /// authoritative walk and advances the real shared heap iterator.  The
     /// advance is an irreversible side effect with no journal undo
     /// (`functional.rs` `current += step`); on a successful CloseLoop commit
@@ -9278,7 +9278,7 @@ fn next_op_is_load_method_self_for_attr<Sym: WalkSym>(
     crate::jitcode_runtime::record_descr_demand(descr_index);
     ctx.descr_refs.at(descr_index).is_some_and(|descr| {
         descr.as_call_descr().is_some_and(|cd| {
-            cd.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
+            cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::LoadMethodSelf
         })
     })
 }
@@ -11058,7 +11058,7 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "abort/" => {
-            // pyre-only `BC_ABORT` marker (`handler_abort_marker_pyre`,
+            // pyre-only `BC_ABORT` marker (`handler_abort_marker`,
             // `blackhole.rs`): the front-end emitted a graph node
             // with no dedicated `OpKind`, so reaching it means the body
             // carries an untranslatable op. The trace cannot be recorded;

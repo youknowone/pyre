@@ -194,7 +194,7 @@ pub struct Cpu {
     pub dict_merge_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
     /// list peeked + mutated in place).  The full-body walker's #171 fold
-    /// intercepts it (`PyreHelperKind::ListAppendValue`); this is the decline
+    /// intercepts it (`RuntimeHelperKind::ListAppendValue`); this is the decline
     /// fallback, identical to the residual the retired MIFrame tracer recorded.
     pub list_append_fn: extern "C" fn(i64, i64) -> i64,
     /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).

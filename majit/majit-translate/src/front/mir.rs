@@ -362,7 +362,7 @@ fn normalize_function_filter(function_names: &[&str]) -> Option<std::collections
 /// every graph and leaves an un-rewritable one to the residual-call ABI
 /// rather than aborting the build.  The coverage gate at the end of this
 /// function reports the shape-coverage gap (split by category under
-/// `PYRE_MIR_FRONTEND_DEBUG=1`) and proceeds; the check.py suite is the
+/// `MAJIT_MIR_FRONTEND_DEBUG=1`) and proceeds; the check.py suite is the
 /// regression net for a silent fallback.
 fn is_known_lowering_gap(msg: &str) -> bool {
     // The forward-reference shape: a body reads a MIR local on a path the
@@ -582,7 +582,7 @@ fn is_inline_aggregate_type(s: &str) -> bool {
 ///
 /// The unsuffixed template rows (`Result::Ok`, [`derive_program_metadata`])
 /// carry the bare type variable, which `tyref_to_ast_string` renders as
-/// `??TypeVar` → `project_pyre_field_type` → `Impossible`.  So a
+/// `??TypeVar` → `project_struct_field_type` → `Impossible`.  So a
 /// narrowing-only receiver (`Result<Tuple>` matched + read, never
 /// constructed in-graph) finds no concrete payload: its suffixed variant
 /// classdef `__pos_0` stays `Impossible` (annotator bottom) and the graph
@@ -968,7 +968,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
-        // surfaced via `PYRE_MIR_FRONTEND_DEBUG=1` for triage, but
+        // surfaced via `MAJIT_MIR_FRONTEND_DEBUG=1` for triage, but
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
@@ -1099,7 +1099,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let (tracked, regressions): (Vec<_>, Vec<_>) = skipped
             .iter()
             .partition(|(_, msg)| is_known_lowering_gap(msg));
-        if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
+        if std::env::var("MAJIT_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
             eprintln!(
                 "[mir-frontend] {} function(s) skipped via a shape \
                  `is_known_lowering_gap` recognises; the per-function \
@@ -2072,7 +2072,7 @@ fn harden_duplicate_leaf_metadata(
         // (`derive_program_metadata`'s enum arm), so the struct-shape
         // check above can never tell two distinct enums sharing a leaf
         // apart — their bare base alias survives and
-        // `pyre_struct_root_names` pre-mints ONE merged base class for
+        // `struct_root_names` pre-mints ONE merged base class for
         // both.  Withdraw it here off the same discriminant-divergence
         // signal, gated on the sentinel so a same-named real struct
         // (whose bare alias the shape check already adjudicated) is left
@@ -2093,11 +2093,11 @@ pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerE
 }
 
 /// Whether the framestate-threaded lowering runs for acyclic bodies.
-/// Default-on; `PYRE_MIR_FRAMESTATE=0` / `=false` is the rollback escape
+/// Default-on; `MAJIT_MIR_FRAMESTATE=0` / `=false` is the rollback escape
 /// hatch to the monotonic lowering.
 fn framestate_enabled() -> bool {
     !matches!(
-        std::env::var("PYRE_MIR_FRAMESTATE").as_deref(),
+        std::env::var("MAJIT_MIR_FRAMESTATE").as_deref(),
         Ok("0") | Ok("false")
     )
 }
@@ -2636,14 +2636,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
     // as block inputargs / phis — the orthodox flowspace shape).
-    // Default-on; `PYRE_MIR_FRAMESTATE=0` rolls back to the monotonic
+    // Default-on; `MAJIT_MIR_FRAMESTATE=0` rolls back to the monotonic
     // lowering.  Acyclic bodies thread via the two-pass RPO walk; cyclic
     // bodies additionally pre-seed each loop header's entry framestate
     // with the live-in phis `new` pre-bound, so the back-edge threads
     // into them in pass 2 instead of skipping the body to the monotonic
     // single-slot scheme.  On any framestate failure the body falls back
     // to the monotonic path — so the threaded path is never worse than
-    // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
+    // the monotonic one — unless `MAJIT_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
         let mut lo = Lowering::new(
@@ -2679,10 +2679,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         match attempt {
             Ok(()) => return Ok(lo.graph),
             Err(e) => {
-                if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRAMESTATE_DEBUG").is_some() {
                     eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
                 }
-                if std::env::var_os("PYRE_MIR_FRAMESTATE_STRICT").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRAMESTATE_STRICT").is_some() {
                     return Err(e);
                 }
             }
@@ -2889,7 +2889,7 @@ fn simplify_lowered_graph(
     // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
     // pass can remove the threaded inputarg, restoring the adapter's per-block
     // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
-    // whose `intval` payload and `__pyre_cast_instance` return chain span the
+    // whose `intval` payload and `__cast_instance_intrinsic` return chain span the
     // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
 }
@@ -3035,7 +3035,7 @@ struct Lowering<'a> {
     /// Whether this function contains a builder-form accumulator. The canonical
     /// lowering sets it directly from [`graph_has_builder_accumulator`]; ctor /
     /// append / terminal-`move` sites then emit the
-    /// `__pyre_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
+    /// `__majit_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
     /// `newstringbuilder` / `append` / `build`) instead of a parallel
     /// `ll_strconcat` graph. Whether a given local *is* such an
     /// accumulator is resolved on demand from `body`
@@ -3248,7 +3248,7 @@ impl<'a> Lowering<'a> {
             // bodies' `&Self`) has no ADT leaf — carry the bound
             // trait's qualified path instead, which the adapter
             // resolves through the unique-impl map
-            // (`pyre_trait_unique_impls`, keyed by qualified path).
+            // (`trait_unique_impls`, keyed by qualified path).
             let class_root = match &ty {
                 ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
                     // A `&str` / `str` param strips to the `str` builtin
@@ -3267,7 +3267,7 @@ impl<'a> Lowering<'a> {
                     // core/std/alloc container family from classdef
                     // minting.  Carry its full monomorphic spelling so
                     // `derive_subject_inputcells` projects it through the
-                    // annotator's list model (`project_pyre_field_type`)
+                    // annotator's list model (`project_struct_field_type`)
                     // instead of the classdef-less `SomeInstance(None)`
                     // shell, on which a `len()` / iteration would wall at
                     // `getattr` over a classdef-less instance.
@@ -4036,7 +4036,7 @@ impl<'a> Lowering<'a> {
                     if let LinkArg::Value(var) = arg
                         && !self.graph.variable_defined_in_block(bb_id, var)
                     {
-                        if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                        if std::env::var_os("MAJIT_MIR_FRAMESTATE_DEBUG").is_some() {
                             self.debug_dump_undefined_link_arg(
                                 bb, bb_id, tgt, tmir, var, &ex, &tgt_state,
                             );
@@ -4102,7 +4102,7 @@ impl<'a> Lowering<'a> {
 
     /// Diagnostic dump for a framestate threading that would emit a
     /// `Link.arg` undefined at its source block.  Gated behind
-    /// `PYRE_MIR_FRAMESTATE_DEBUG`.  Prints the source / target block
+    /// `MAJIT_MIR_FRAMESTATE_DEBUG`.  Prints the source / target block
     /// shapes and both framestates so the alignment bug can be located.
     #[allow(clippy::too_many_arguments)]
     fn debug_dump_undefined_link_arg(
@@ -5383,7 +5383,7 @@ impl<'a> Lowering<'a> {
             Operand::Move(place) => {
                 // A `move c` of a builder-mode accumulator is its single
                 // `ll_build` materialisation point (`accumulator_move_site_count
-                // == 1`).  Emit the `__pyre_stringbuilder_build` marker
+                // == 1`).  Emit the `__majit_stringbuilder_build` marker
                 // (`flowspace_adapter` → getattr("build") + simple_call →
                 // `SomeString`) instead of moving the concat accumulator out.
                 // Only a bare `Local(c)` move qualifies; a projection falls
@@ -5401,7 +5401,7 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Emit the `__pyre_stringbuilder_build(c)` marker for the terminal
+    /// Emit the `__majit_stringbuilder_build(c)` marker for the terminal
     /// `move c` of a builder-mode accumulator, returning the built
     /// `SomeString` Variable.  The builder Ref was minted at the ctor and
     /// mutated in place by the appends, so it is read (not rebound) here.
@@ -5419,7 +5419,7 @@ impl<'a> Lowering<'a> {
             result: Some(result.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__pyre_stringbuilder_build".to_string()],
+                    segments: vec!["__majit_stringbuilder_build".to_string()],
                 },
                 args: vec![builder],
                 result_ty: ValueType::Ref(None),
@@ -5468,13 +5468,13 @@ impl<'a> Lowering<'a> {
     ///   0 and blocks with "cannot unify instances with no common base
     ///   class".  `llmemory.cast_ptr_to_adr` is the upstream erasure: a
     ///   GC ownership / write-barrier hook operates on a type-erased
-    ///   `Address`, never on `Ptr(instance)`.  `__pyre_cast_address` is
+    ///   `Address`, never on `Ptr(instance)`.  `__cast_address_intrinsic` is
     ///   that erasure — its annotator drops the classdef, which is the
     ///   annotation a pointee-less raw pointer already carries here, so
     ///   the erased callers and the callers that pass an untyped `*mut u8`
     ///   straight through agree on one annotation.
     /// * **narrow** — `obj as *const RegisteredStruct`; see
-    ///   `__pyre_cast_instance` below.
+    ///   `__cast_instance_intrinsic` below.
     ///
     /// Both are pointer-to-pointer only: a `Ref` source is required, since
     /// an `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
@@ -5494,13 +5494,13 @@ impl<'a> Lowering<'a> {
         let (segments, result_ty) =
             if src_root.is_some() && tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
                 (
-                    vec!["__pyre_cast_address".to_string()],
+                    vec!["__cast_address_intrinsic".to_string()],
                     ValueType::Ref(None),
                 )
             } else {
                 let root = tyref_class_root(dest_ty, self.llbc)?;
                 (
-                    vec!["__pyre_cast_instance".to_string(), root.clone()],
+                    vec!["__cast_instance_intrinsic".to_string(), root.clone()],
                     ValueType::Ref(Some(root)),
                 )
             };
@@ -5741,7 +5741,7 @@ impl<'a> Lowering<'a> {
                     // blocks the annotator on a classdef-less instance. The
                     // field's declaring struct is authoritative, so this is a
                     // sound downcast — identity when the base already carries
-                    // the class — the same `__pyre_cast_instance` narrow the
+                    // the class — the same `__cast_instance_intrinsic` narrow the
                     // ptr-identity-cast arm applies before its own field reads.
                     let narrow_root: Option<String> = match &inner.kind {
                         PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {
@@ -5771,7 +5771,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__pyre_cast_instance".to_string(),
+                                        "__cast_instance_intrinsic".to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -5940,7 +5940,7 @@ impl<'a> Lowering<'a> {
                         // `getattr`) on a classdef-less instance.  Narrow the
                         // base to this tuple's `Tuple{suffix}` classdef first
                         // — identity when it already carries it — the same
-                        // `__pyre_cast_instance` downcast the raw-ptr-deref
+                        // `__cast_instance_intrinsic` downcast the raw-ptr-deref
                         // Adt field arm applies (see `narrow_root` above).  A
                         // by-value tuple base is not deref-shaped and keeps
                         // its concrete classdef, so it is left untouched.
@@ -5959,7 +5959,7 @@ impl<'a> Lowering<'a> {
                                 kind: OpKind::Call {
                                     target: CallTarget::FunctionPath {
                                         segments: vec![
-                                            "__pyre_cast_instance".to_string(),
+                                            "__cast_instance_intrinsic".to_string(),
                                             owner.clone(),
                                         ],
                                     },
@@ -6019,7 +6019,7 @@ impl<'a> Lowering<'a> {
                 let segments = self.global_segments(mir_bb, id)?;
                 // A class-singleton static (`&SLICE_TYPE`, `&CEL_INT_CLASS`):
                 // narrow the raw address through
-                // `__pyre_cast_instance[<root>]` so the read types
+                // `__cast_instance_intrinsic[<root>]` so the read types
                 // `SomeInstance(<root>)`, matching the `(*obj).ob_type`
                 // field-read.  The bare `ConstInt` address would pair
                 // `IntegerRepr` against that field's `InstanceRepr` and
@@ -6047,7 +6047,7 @@ impl<'a> Lowering<'a> {
                 // initialiser fold / residual call), which is what any other
                 // static of that shape gets.  Measured empty for pyre: all
                 // 7362 `pyre-object` local functions lower with an identical
-                // `__pyre_cast_instance` root histogram either way.
+                // `__cast_instance_intrinsic` root histogram either way.
                 if let Some(addr) = self.pytype_static_addr(&segments)
                     && let Some(root) = tyref_class_root(&place_ty, self.llbc)
                 {
@@ -6066,7 +6066,10 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                                segments: vec![
+                                    "__cast_instance_intrinsic".to_string(),
+                                    root.clone(),
+                                ],
                             },
                             args: vec![raw],
                             result_ty: ValueType::Ref(Some(root)),
@@ -6077,7 +6080,7 @@ impl<'a> Lowering<'a> {
                 // A prebuilt object-space singleton whose declared type is
                 // a zero-field unit struct (the dict-strategy singletons
                 // `EMPTY_DICT_STRATEGY`, `OBJECT_DICT_STRATEGY`, …).  Narrow
-                // the raw GCREF address through `__pyre_cast_instance[<impl>]`
+                // the raw GCREF address through `__cast_instance_intrinsic[<impl>]`
                 // so the read types `SomeInstance(<impl>)` — the prebuilt
                 // instance the annotator would give it (`immutablevalue`).
                 // The bare `ConstRefAddr` types `SomePtr`, which cannot union
@@ -6105,7 +6108,10 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                                segments: vec![
+                                    "__cast_instance_intrinsic".to_string(),
+                                    root.clone(),
+                                ],
                             },
                             args: vec![raw],
                             result_ty: ValueType::Ref(Some(root)),
@@ -6127,7 +6133,7 @@ impl<'a> Lowering<'a> {
                 // 0-arg accessor call would have, but without the residual call
                 // whose funcptr constant degrades to a `symbolic_fnaddr_for_path`
                 // hash that SIGBUSes at trace time.  Deliberately NOT the
-                // `__pyre_cast_instance` narrowing the addressed siblings use:
+                // `__cast_instance_intrinsic` narrowing the addressed siblings use:
                 // its extra cast Variable shifts the loop's ref-register
                 // allocation so a merge-point red lands past `num_regs_r`
                 // (seed-time out-of-bounds in `trace_jitcode_from_merge_point`).
@@ -6810,7 +6816,7 @@ impl<'a> Lowering<'a> {
 
     /// Address of a `pytypes`-bucket host static — a class singleton
     /// (`&SLICE_TYPE`, `&INT_TYPE`, …).  The `Global` reader lowers these
-    /// to a `__pyre_cast_instance[<root>]` narrow of the raw address
+    /// to a `__cast_instance_intrinsic[<root>]` narrow of the raw address
     /// (a typed instance pointer) rather than the bare `ConstInt` the
     /// `refs` siblings avoid: a class static is the same kind of value
     /// as the `(*obj).ob_type` field-read it is compared against, so it
@@ -7165,7 +7171,7 @@ impl<'a> Lowering<'a> {
         // to a classdef-less `Ref(None)` — `tyref_to_value_type` erases the
         // pointee class root.  Capture the pointee root now so the result can be
         // narrowed to `SomeInstance(root)` after the call op: the call-result
-        // twin of the FieldRead-base and ptr-identity-cast `__pyre_cast_instance`
+        // twin of the FieldRead-base and ptr-identity-cast `__cast_instance_intrinsic`
         // narrows, letting a downstream getattr / method dispatch on the result
         // resolve instead of blocking the annotator on a classdef-less instance.
         // Gated on the raw-pointer pointee (not a bare ADT) so foreign value
@@ -7828,7 +7834,7 @@ impl<'a> Lowering<'a> {
                 // single `Wtf8Buf`/`String` `new`/`with_capacity` def of a
                 // builder-mode accumulator (its dest local, proven single-def
                 // by that ctor in [`is_fresh_str_builder`]) mints the
-                // `StringBuilder` once via the `__pyre_stringbuilder_new`
+                // `StringBuilder` once via the `__majit_stringbuilder_new`
                 // marker instead of the concat empty string; later appends
                 // mutate it in place.  Placed before the method-specific arms
                 // so it preempts any generic ctor lowering. Inert unless
@@ -7852,7 +7858,7 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["__pyre_stringbuilder_new".to_string()],
+                                segments: vec!["__majit_stringbuilder_new".to_string()],
                             },
                             args,
                             result_ty: ValueType::Ref(None),
@@ -7907,7 +7913,7 @@ impl<'a> Lowering<'a> {
                         // Builder form: `b.append(piece)` mutates the buffer in
                         // place and returns `()`, so — unlike the concat rebind
                         // below — the accumulator binding is unchanged.  Emit the
-                        // void `__pyre_stringbuilder_append` marker
+                        // void `__majit_stringbuilder_append` marker
                         // (`flowspace_adapter` → getattr("append") + simple_call).
                         let void = self
                             .graph
@@ -7916,7 +7922,7 @@ impl<'a> Lowering<'a> {
                             result: Some(void),
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
-                                    segments: vec!["__pyre_stringbuilder_append".to_string()],
+                                    segments: vec!["__majit_stringbuilder_append".to_string()],
                                 },
                                 args: vec![acc_val, args[piece_i].clone()],
                                 result_ty: ValueType::Void,
@@ -7962,7 +7968,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__pyre_cast_instance".to_string(),
+                                        "__cast_instance_intrinsic".to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -9242,7 +9248,10 @@ impl<'a> Lowering<'a> {
                 result: Some(narrowed_receiver.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".to_string(), "RBigInt".to_string()],
+                        segments: vec![
+                            "__cast_instance_intrinsic".to_string(),
+                            "RBigInt".to_string(),
+                        ],
                     },
                     args: vec![args[0].clone()],
                     result_ty: ValueType::Ref(Some("RBigInt".to_string())),
@@ -9933,7 +9942,7 @@ impl<'a> Lowering<'a> {
         });
         // Narrow a classdef-less registered-ADT call result to
         // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
-        // jitcode (`__pyre_cast_instance` → cast_pointer → `same_as`), so
+        // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
         // already-resolved results and production codegen are unaffected; only
         // a `Ref(None)` raw-`PyObjectRef` result gains its pointee class.
         if let Some(root) = result_narrow_root {
@@ -9944,7 +9953,7 @@ impl<'a> Lowering<'a> {
                 result: Some(narrowed.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                        segments: vec!["__cast_instance_intrinsic".to_string(), root.clone()],
                     },
                     args: vec![result_var.clone()],
                     result_ty: ValueType::Ref(Some(root)),
@@ -10238,7 +10247,7 @@ impl<'a> Lowering<'a> {
                 // Decline the Method hint for an explicitly-named non-`self`
                 // first input so the call routes as `FunctionPath` and the
                 // call registry resolves the constructor (its residual stub via
-                // `collect_pyre_class_ctor_stubs_from_llbc`).
+                // `collect_marked_class_ctor_stubs_from_llbc`).
                 if fd.first_arg_local_name().is_some_and(|n| n != "self") {
                     return None;
                 }
@@ -10299,7 +10308,10 @@ impl<'a> Lowering<'a> {
             result: Some(narrowed.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__pyre_cast_instance".to_string(), "Constants".to_string()],
+                    segments: vec![
+                        "__cast_instance_intrinsic".to_string(),
+                        "Constants".to_string(),
+                    ],
                 },
                 args: vec![base],
                 result_ty: ValueType::Ref(Some("Constants".to_string())),
@@ -10996,7 +11008,7 @@ impl<'a> Lowering<'a> {
                     // `alloc/src/boxed/iter.rs` — the `Box<[T]>` forms, by
                     // value and by reference; the latter delegates to slice
                     // iter. A boxed slice is the same element sequence as the
-                    // slice it owns (`project_pyre_field_type` strips the
+                    // slice it owns (`project_struct_field_type` strips the
                     // `Box`), so both walk the receiver's list.
                     | "alloc::boxed::iter::<Impl>::into_iter"
             )
@@ -12095,7 +12107,7 @@ impl<'a> Lowering<'a> {
     /// `Some` variant owners the length-checked diamond post-pass spells its
     /// arms with.  Gated on [`Self::option_residual_narrow_root`] returning
     /// `Some`: that is exactly the shape `lower_call` appends a trailing
-    /// `__pyre_cast_instance` narrowing to (the cast the post-pass absorbs and
+    /// `__cast_instance_intrinsic` narrowing to (the cast the post-pass absorbs and
     /// re-applies per arm), and it declines a value-slice `Option<u8>` /
     /// `Option<i64>` (no registered pointee root) cleanly, leaving the residual
     /// call for the census Skip.  `None` when the destination is not a
@@ -13595,7 +13607,7 @@ impl<'a> Lowering<'a> {
     /// message parameters (the `PyError` constructor family) reach
     /// `msg.into()` inside the generic body; the annotation model maps
     /// `String`, `str`, `Wtf8` and `Wtf8Buf` to the same string value
-    /// (`project_pyre_field_type` — `s_unicode0`), matching upstream's
+    /// (`project_struct_field_type` — `s_unicode0`), matching upstream's
     /// single string type (`rstr.py`), so the conversion is an identity
     /// at the annotation level.  Other destination types keep the
     /// generic `Call` form.
@@ -13621,7 +13633,7 @@ impl<'a> Lowering<'a> {
     /// `Wtf8Buf::from_string(String) -> Wtf8Buf`, and the reverse reinterpret
     /// `wtf8_key_as_str_unchecked(&Wtf8) -> &str`, to their sole string
     /// argument.  Rust's `&str` / `String` / `Wtf8` / `Wtf8Buf` all map
-    /// to the single immutable rpy_string value (`project_pyre_field_type`
+    /// to the single immutable rpy_string value (`project_struct_field_type`
     /// — `s_unicode0`, matching upstream's one string type in `rstr.py`),
     /// so the wrap is an identity at the annotation level; the boxing the
     /// callers want (`box_str_constant`) happens downstream on the bound
@@ -13685,7 +13697,7 @@ impl<'a> Lowering<'a> {
     /// zero-field unit struct — the shape of the prebuilt dict-strategy
     /// singletons (`EmptyDictStrategy`, `ObjectDictStrategy`, …).  The
     /// `PlaceKind::Global` reader narrows a `refs`-bucket static of such a
-    /// type through `__pyre_cast_instance[<root>]` to a classed
+    /// type through `__cast_instance_intrinsic[<root>]` to a classed
     /// `SomeInstance`.  Returns `None` for a field-bearing struct (the
     /// object singletons `W_NoneObject` / `W_BoolObject` / … in the same
     /// bucket keep their raw-pointer lowering) or any non-struct shape.
@@ -14283,7 +14295,7 @@ fn operand_fn_ptr_family(operand: &Operand, llbc: &Llbc) -> Option<FnPtrFamily> 
 ///
 /// `is_builtin_shape` is [`fn_ptr_signature_is_builtin_code_fn`], which
 /// matches on signature SHAPE. An `unsafe fn` of that shape would otherwise
-/// be handed the `__pyre_wrap_*` family: a positive claim about a callee set
+/// be handed the `__majit_wrap_*` family: a positive claim about a callee set
 /// it is not a member of. Only a safe pointer may name that family.
 ///
 /// An `unsafe fn` pointer is otherwise the same value with the same ABI as a
@@ -14302,7 +14314,7 @@ fn fn_ptr_family_for(
 
 /// Whether an fn-pointer signature is the exact source signature of
 /// `gateway::BuiltinCodeFn`: `fn(&[PyObjectRef]) -> Result<PyObjectRef,
-/// PyError>`.  That family's members are the `__pyre_wrap_*` graphs
+/// PyError>`.  That family's members are the `__majit_wrap_*` graphs
 /// `CallControl::builtin_wrapper_indirect_graphs` enumerates, so a call
 /// through it carries the deferred-family marker instead of `None`.
 fn fn_ptr_signature_is_builtin_code_fn(
@@ -15697,7 +15709,7 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
 /// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
 /// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
 /// registry-keyed `impl_method_owner_for_fundecl` (which resolves only
-/// self-receiver methods it can key into `PyreCallRegistry`).  Used to
+/// self-receiver methods it can key into `CallRegistry`).  Used to
 /// subtract the `cast_pointer` thin-pointer rewrite for the
 /// header-offset handles whose word is not the pointee address.
 /// Returns `None` when the owner cannot be resolved, in which case the
@@ -15728,7 +15740,7 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// flowspace adapter does not model), but downstream
 /// `OpKind::Call::FunctionPath` sites still need their signature
 /// registered so the dual gate does not Skip with "not registered in
-/// PyreCallRegistry".
+/// CallRegistry".
 ///
 /// An `unsafe fn` is never lowered, so it never enters
 /// `CallControl::function_graphs` and its call sites already residualize
@@ -15862,7 +15874,7 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
 /// Reuses the [`CallControl::unsafe_fn_stubs`] carrier + `register_unsafe_fn_stubs`
 /// registration path (both feed `(segments, Signature, return-token)` specs
 /// through the same annotator-only `residual_return_shell`).
-pub(crate) fn collect_pyre_class_ctor_stubs_from_llbc(
+pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
     Vec<String>,
@@ -15925,7 +15937,7 @@ pub(crate) fn collect_pyre_class_ctor_stubs_from_llbc(
 /// declines the `CallTarget::Method` hint for an opaque owner (routing the
 /// call through `CallTarget::FunctionPath`); this collection feeds the
 /// matching registry entries so the `FunctionPath` lookup resolves instead
-/// of raising "not registered in PyreCallRegistry".
+/// of raising "not registered in CallRegistry".
 ///
 /// The registration key is derived through the SAME
 /// [`impl_method_owner_for_fundecl`] the declined-Method
@@ -17835,7 +17847,7 @@ fn typevar_bounded_by_into_string(
 /// `getattr`.  The bound trait names the receiver's only possible shape
 /// when the analyzed world has exactly one concrete impl;
 /// `derive_subject_inputcells` resolves the returned trait path through
-/// `Bookkeeper::pyre_trait_unique_impls` and only seeds a classdef on a
+/// `Bookkeeper::trait_unique_impls` and only seeds a classdef on a
 /// unique hit, so carrying a multi-impl (or foreign) trait path here is
 /// inert.  The qualified path (not the leaf) is the map key so two
 /// distinct traits sharing a final segment cannot seed each other's
@@ -18629,11 +18641,11 @@ fn render_adt_type_args(
 /// Clearing that needs pyre's elidable helpers to stop reaching an
 /// unanalyzable callee — or those hooks to carry a real family — which is
 /// its own change; until then this stays opt-in with
-/// `PYRE_FNPTR_INDIRECT=1`.  The `BuiltinCodeFn` family is unaffected by
+/// `MAJIT_FNPTR_INDIRECT=1`.  The `BuiltinCodeFn` family is unaffected by
 /// the switch: it reached `IndirectCall` before this arm and still does.
 pub(crate) fn fnptr_indirect_enabled() -> bool {
     matches!(
-        std::env::var("PYRE_FNPTR_INDIRECT").as_deref(),
+        std::env::var("MAJIT_FNPTR_INDIRECT").as_deref(),
         Ok("1") | Ok("true")
     )
 }
@@ -19187,7 +19199,7 @@ fn trait_call_label(v: &serde_json::Value) -> String {
 /// relative to their module root instead (`frame::eval_loop_jit` for a
 /// non-empty `module_path`, or the bare leaf for `module_path == ""`)
 /// so `register_function_graph_alias` (lib.rs) can walk
-/// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, pyre_jit::*}`
+/// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, jit_artifact::*}`
 /// aliases off the same `func.name`.
 fn strip_crate_prefix(path: &str) -> String {
     match path.split_once("::") {
@@ -19213,7 +19225,7 @@ fn strip_crate_prefix(path: &str) -> String {
 ///
 /// Matched on the module-qualified path so a leaf collision in another module
 /// cannot widen the gate, and crate-prefix-independent so the same accessor
-/// matches whether reached from `pyre_object`, `pyre_interpreter`, `pyre_jit`'s
+/// matches whether reached from `pyre_object`, `pyre_interpreter`, `jit_artifact`'s
 /// monomorphized copy — or a non-pyre host crate that lays its block out this
 /// way. The prefix carries no information the suffix does not: what makes the
 /// collapse sound is the accessor's CONTRACT (return the interior pointer for
@@ -22527,8 +22539,8 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let fd = llbc
             .iter_local_fns()
-            .find(|fd| fd.item_meta.name_path().ends_with("::__pyre_wrap_random"))
-            .expect("_random::__pyre_wrap_random");
+            .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+            .expect("_random::__majit_wrap_random");
         let graph = super::lower_fun_decl(&llbc, fd).expect("lower wrapper");
         let receiver = graph
             .blocks
@@ -22562,7 +22574,7 @@ mod tests {
                 target: CallTarget::FunctionPath { segments },
                 result_ty: ValueType::Ref(Some(root)),
                 ..
-            } if segments == &["__pyre_cast_instance".to_string(), "W_Random".to_string()]
+            } if segments == &["__cast_instance_intrinsic".to_string(), "W_Random".to_string()]
                 && root == "W_Random"
         ));
     }
@@ -22874,7 +22886,7 @@ mod tests {
             "pyre_object::object_array::items_block_items_ptr"
         ));
         assert!(graph_is_items_block_base_accessor(
-            "pyre_jit::object_array::items_block_items_base"
+            "jit_artifact::object_array::items_block_items_base"
         ));
         assert!(graph_is_items_block_base_accessor(
             "majit_rlib::lltypesystem::rlist::typed_items_block_items_base"
@@ -22909,7 +22921,7 @@ mod tests {
         for name in [
             "pyre_object::object_array::items_block_items_base",
             "pyre_object::object_array::items_block_items_ptr",
-            "pyre_jit::object_array::items_block_items_base",
+            "jit_artifact::object_array::items_block_items_base",
         ] {
             assert!(
                 is_object_items_block_base_accessor(name),
@@ -24825,7 +24837,7 @@ mod tests {
     /// `for &arg in args { pin_root(arg) }` that 16 census heads funnel
     /// through.  The unregistered `next()` returns an opaque `Ref` the MIR
     /// recasts to `Option<*mut PyObject>` via a trailing
-    /// `__pyre_cast_instance` narrow, so the raw call is not the block's
+    /// `__cast_instance_intrinsic` narrow, so the raw call is not the block's
     /// last op; `peel_recast_chain` must strip the recast and fold anyway.
     /// After the fold no residual `slice::iter::Iter::next` call survives
     /// and the native `[__iter_next]` op is present.  Ignored by default
@@ -25796,7 +25808,7 @@ mod tests {
         reg.fields
             .insert("pyre_object::eval::Point".to_string(), shape.clone());
         reg.fields
-            .insert("pyre_jit::eval::Point".to_string(), shape.clone());
+            .insert("jit_artifact::eval::Point".to_string(), shape.clone());
         reg.fields.insert("Point".to_string(), shape.clone());
         let mut origins = std::collections::HashMap::new();
         origins.insert("Point".to_string(), "eval".to_string());
@@ -25818,11 +25830,11 @@ mod tests {
         let same_as_a = map_a.clone();
         let mut enums = std::collections::HashMap::new();
         enums.insert("pyre_interpreter::eval::StepResult".to_string(), map_a);
-        enums.insert("pyre_jit::eval::StepResult".to_string(), map_b);
+        enums.insert("jit_artifact::eval::StepResult".to_string(), map_b);
         // silent-winner bare alias as the dual-publish would leave it
         enums.insert("StepResult".to_string(), same_as_a.clone());
         enums.insert("pyre_object::flow::Verdict".to_string(), same_as_a.clone());
-        enums.insert("pyre_jit::flow::Verdict".to_string(), same_as_a.clone());
+        enums.insert("jit_artifact::flow::Verdict".to_string(), same_as_a.clone());
         enums.insert("Verdict".to_string(), same_as_a.clone());
         // The `__discriminant`-only base rows as the enum arm registers
         // them — shape-identical across enums, so only the discriminant
@@ -25838,7 +25850,7 @@ mod tests {
             "discriminant-divergent duplicate leaf must lose its bare alias"
         );
         assert!(enums.contains_key("pyre_interpreter::eval::StepResult"));
-        assert!(enums.contains_key("pyre_jit::eval::StepResult"));
+        assert!(enums.contains_key("jit_artifact::eval::StepResult"));
         assert_eq!(
             enums.get("Verdict"),
             Some(&same_as_a),
@@ -26169,7 +26181,7 @@ mod tests {
     /// Anchor the `?`-operator fold to the real lowered IR of
     /// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
     /// The break arm (`None => return None`) narrows the `from_residual`
-    /// result through a `__pyre_cast_instance` recast; before the break-arm
+    /// result through a `__cast_instance_intrinsic` recast; before the break-arm
     /// purity gate peeled that recast, `option_try` declined and the residual
     /// `Try::branch` Method-call stayed, walling ~50 heads reaching `lookup`.
     /// After: zero residual `branch` Method-call.  Ignored by default (loads
@@ -26964,9 +26976,9 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        // Any &mut-self __pyre_wrap setter; set__CHUNK_SIZE takes `&mut self`.
+        // Any &mut-self __majit_wrap setter; set__CHUNK_SIZE takes `&mut self`.
         let graph =
-            super::lower_function(&llbc, "__pyre_wrap_set__CHUNK_SIZE").expect("lower setter");
+            super::lower_function(&llbc, "__majit_wrap_set__CHUNK_SIZE").expect("lower setter");
         let pos0_reads = graph
             .blocks
             .iter()

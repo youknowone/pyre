@@ -140,7 +140,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     let ops_len = graph.blocks[a].operations.len();
 
     // `lower_call` closes the call as the block tail, but a `*mut <registered
-    // ADT>` result gains a trailing `__pyre_cast_instance` narrowing op
+    // ADT>` result gains a trailing `__cast_instance_intrinsic` narrowing op
     // (`result_narrow_root`) whose output is what the block forwards on.
     // Absorb that optional cast: `flow_result` is the value B consumes,
     // `narrow_root` re-applies the narrowing per arm, and `remove_upto` bounds
@@ -158,7 +158,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__pyre_cast_instance"
+                && segments[0] == "__cast_instance_intrinsic"
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {
@@ -383,7 +383,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     Ok(())
 }
 
-/// Re-emit the `__pyre_cast_instance` pointee-class narrowing in `block` on
+/// Re-emit the `__cast_instance_intrinsic` pointee-class narrowing in `block` on
 /// `value`, returning the narrowed value — the same cast `result_narrow_root`
 /// appends after a `*mut <registered ADT>` call result.  `value` unchanged when
 /// no narrowing was absorbed.
@@ -401,7 +401,7 @@ pub(crate) fn emit_narrow(
         result: Some(narrowed.clone()),
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                segments: vec!["__cast_instance_intrinsic".to_string(), root.clone()],
             },
             args: vec![value],
             result_ty: ValueType::Ref(Some(root.clone())),
@@ -505,7 +505,7 @@ mod tests {
     }
 
     /// The production shape: a `*mut <registered ADT>` result appends a
-    /// trailing `__pyre_cast_instance` narrowing op, so the call is NOT the
+    /// trailing `__cast_instance_intrinsic` narrowing op, so the call is NOT the
     /// block tail.  The rewrite absorbs the cast, fires, and re-applies the
     /// narrowing in both arms (so B still consumes a narrowed value).
     #[test]
@@ -532,7 +532,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
                     },
                     args: vec![result.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -558,7 +558,7 @@ mod tests {
             )),
             "residual map_or call removed from A"
         );
-        // Two arms each re-emit a `__pyre_cast_instance` narrowing.
+        // Two arms each re-emit a `__cast_instance_intrinsic` narrowing.
         let narrow_casts = g
             .blocks
             .iter()
@@ -567,7 +567,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                        if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                 )
             })
             .count();

@@ -519,7 +519,7 @@ impl ArenaCollection {
     unsafe fn free_arena(&mut self, arena: *mut ArenaReference) {
         unsafe {
             let base = (*arena).base as usize;
-            if std::env::var_os("PYRE_GC_FREELIST_DIAG").is_some() {
+            if std::env::var_os("MAJIT_GC_FREELIST_DIAG").is_some() {
                 let end = base + (*arena).layout.size();
                 for size_class in 1..self.page_for_size.len() {
                     for (kind, mut page) in [

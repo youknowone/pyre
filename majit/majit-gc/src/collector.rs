@@ -3090,7 +3090,7 @@ impl MiniMarkGC {
     /// [`Self::mark_c_edges`], rather than assumed here.
     fn rrc_roots_link(&self, pyobject: usize) -> bool {
         let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
-        let held = rc - rawrefcount::REFCNT_FROM_PYRE;
+        let held = rc - rawrefcount::REFCNT_FROM_PYPY;
         held > self.rrc.c_discount.get(&pyobject).copied().unwrap_or(0)
     }
 
@@ -3333,10 +3333,10 @@ impl MiniMarkGC {
     /// the nursery; there is no young raw-malloc region here, so the two
     /// questions collapse into one and the third combination cannot arise.
     ///
-    /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYRE`] to
+    /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYPY`] to
     /// the mirror's count: that share is what this link is worth, and what
     /// [`Self::_rrc_free`] gives back when the object dies.
-    pub fn rawrefcount_create_link_pyre(&mut self, obj: usize, pyobject: usize) {
+    pub fn rawrefcount_create_link_pypy(&mut self, obj: usize, pyobject: usize) {
         debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
         unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
         if self.is_in_nursery(obj) {
@@ -3543,10 +3543,10 @@ impl MiniMarkGC {
             "an immortal mirror reached the rawrefcount free pass"
         );
         debug_assert!(
-            rc >= rawrefcount::REFCNT_FROM_PYRE,
+            rc >= rawrefcount::REFCNT_FROM_PYPY,
             "rawrefcount refcount underflow"
         );
-        rc -= rawrefcount::REFCNT_FROM_PYRE;
+        rc -= rawrefcount::REFCNT_FROM_PYPY;
         unsafe { (*header).ob_link = 0 };
         if rc == 0 {
             // incminimark.py:3339-3349 — a mirror at count 0 cannot sit and
@@ -8113,8 +8113,8 @@ mod tests {
     /// concurrently built collector cannot see this table.
     #[test]
     fn supplied_env_fills_in_only_what_the_process_lacks() {
-        let absent = "PYRE_TEST_SUPPLIED_ENV_ABSENT";
-        let present = "PYRE_TEST_SUPPLIED_ENV_PRESENT";
+        let absent = "MAJIT_TEST_SUPPLIED_ENV_ABSENT";
+        let present = "MAJIT_TEST_SUPPLIED_ENV_PRESENT";
         // SAFETY: single-threaded within this test; the names are unique to it.
         unsafe { std::env::set_var(present, "2m") };
 
@@ -13230,8 +13230,8 @@ cache size\t: 8192 kB\n";
         let object = gc.alloc_with_type(tid, 64);
         assert!(gc.is_in_nursery(object.0), "premise: the object is young");
 
-        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
-        gc.rawrefcount_create_link_pyre(object.0, mirror);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY + 1);
+        gc.rawrefcount_create_link_pypy(object.0, mirror);
         assert_eq!(gc.rawrefcount_from_obj(object.0), mirror);
 
         gc.do_collect_nursery();
@@ -13254,8 +13254,8 @@ cache size\t: 8192 kB\n";
         let mut gc = rrc_test_gc();
         let tid = gc.register_type(TypeInfo::object(64));
         let object = gc.alloc_with_type(tid, 64);
-        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE);
-        gc.rawrefcount_create_link_pyre(object.0, mirror);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pypy(object.0, mirror);
 
         RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
         gc.do_collect_nursery();
@@ -13286,10 +13286,10 @@ cache size\t: 8192 kB\n";
         let dying = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
         assert!(!gc.is_in_nursery(kept.0) && !gc.is_in_nursery(dying.0));
 
-        let kept_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
-        let dying_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE);
-        gc.rawrefcount_create_link_pyre(kept.0, kept_mirror);
-        gc.rawrefcount_create_link_pyre(dying.0, dying_mirror);
+        let kept_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY + 1);
+        let dying_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pypy(kept.0, kept_mirror);
+        gc.rawrefcount_create_link_pypy(dying.0, dying_mirror);
         unsafe { gc.roots.add(&mut kept) };
 
         gc.do_collect_full();
@@ -13319,8 +13319,8 @@ cache size\t: 8192 kB\n";
         // Pinning does not root: something must still reach it this collection.
         unsafe { gc.roots.add(&mut object) };
 
-        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
-        gc.rawrefcount_create_link_pyre(object.0, mirror);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY + 1);
+        gc.rawrefcount_create_link_pypy(object.0, mirror);
 
         gc.do_collect_nursery();
 
@@ -13349,8 +13349,8 @@ cache size\t: 8192 kB\n";
         let mut gc = rrc_test_gc();
         let tid = gc.register_type(TypeInfo::object(64));
         let object = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
-        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
-        gc.rawrefcount_create_link_pyre(object.0, mirror);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY + 1);
+        gc.rawrefcount_create_link_pypy(object.0, mirror);
 
         let marker = 0x0DEA_DFFF_usize;
         gc.rawrefcount_mark_deallocating(marker, mirror);
@@ -13380,15 +13380,15 @@ cache size\t: 8192 kB\n";
             // nowhere else; the nursery object is reachable from the mirror
             // and from nowhere else.
             unsafe { *(young.0 as *mut GcRef) = old };
-            gc.rawrefcount_create_link_pyre(young.0, test_mirror(mirror_refcnt));
+            gc.rawrefcount_create_link_pypy(young.0, test_mirror(mirror_refcnt));
 
             gc.do_collect_oldgen_nonmoving();
             assert_eq!(gc.rawrefcount_next_dead(), 0, "the nursery is not swept");
             gc.get_total_memory_used()
         }
 
-        let referenced = survivors_with(rawrefcount::REFCNT_FROM_PYRE + 1);
-        let unreferenced = survivors_with(rawrefcount::REFCNT_FROM_PYRE);
+        let referenced = survivors_with(rawrefcount::REFCNT_FROM_PYPY + 1);
+        let unreferenced = survivors_with(rawrefcount::REFCNT_FROM_PYPY);
         assert!(
             referenced > unreferenced,
             "the old object was swept out from under a live C reference \

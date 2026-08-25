@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
+use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, RuntimeHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
@@ -2072,20 +2072,20 @@ fn test_call_generates_import() {
 }
 
 fn void_call(arg_types: Vec<Type>, args: &[OpRef], result_size: usize) -> Op {
-    void_call_with_helper(arg_types, args, result_size, PyreHelperKind::None)
+    void_call_with_helper(arg_types, args, result_size, RuntimeHelperKind::None)
 }
 
 fn void_call_with_helper(
     arg_types: Vec<Type>,
     args: &[OpRef],
     result_size: usize,
-    helper: PyreHelperKind,
+    helper: RuntimeHelperKind,
 ) -> Op {
     let mut operands = vec![rb(OpRef::const_int(42))];
     operands.extend(args.iter().copied().map(rb));
     let op = Op::new(OpCode::CallN, &operands);
     let effect = EffectInfo {
-        pyre_helper: helper,
+        runtime_helper: helper,
         ..EffectInfo::default()
     };
     op.setdescr(majit_ir::descr::make_call_descr_full(
@@ -2331,7 +2331,7 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
             vec![Type::Ref, Type::Ref],
             &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
             8,
-            PyreHelperKind::ListAppendValue,
+            RuntimeHelperKind::ListAppendValue,
         ),
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),

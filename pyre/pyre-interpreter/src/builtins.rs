@@ -2900,7 +2900,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "len",
-            __pyre_wrap_builtin_len,
+            __majit_wrap_builtin_len,
             1,
             crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
         )
@@ -2911,7 +2911,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "abs",
-            __pyre_wrap_builtin_abs,
+            __majit_wrap_builtin_abs,
             1,
             crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
         )
@@ -2944,7 +2944,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     });
     crate::module_ns_get_or_insert_with(ns, "type", crate::typedef::w_type);
     crate::module_ns_get_or_insert_with(ns, "isinstance", || {
-        make_module_builtin_function_with_arity("isinstance", __pyre_wrap_builtin_isinstance, 2)
+        make_module_builtin_function_with_arity("isinstance", __majit_wrap_builtin_isinstance, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "str", || crate::typedef::gettypeobject(&STR_TYPE));
     crate::module_ns_get_or_insert_with(ns, "repr", || {
@@ -3749,7 +3749,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // `baseobjspace.py:730` keeps that same object as
         // `space.w_default_importlib_import`.
         let w_import =
-            make_module_builtin_function("__import__", __pyre_wrap_builtin_dunder_import);
+            make_module_builtin_function("__import__", __majit_wrap_builtin_dunder_import);
         crate::importing::set_default_importlib_import(w_import);
         w_import
     });
@@ -4441,7 +4441,7 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// True iff `callable` is the builtin `len` function object — a
-/// builtin-code function whose code wraps [`__pyre_wrap_builtin_len`].  The JIT
+/// builtin-code function whose code wraps [`__majit_wrap_builtin_len`].  The JIT
 /// walker uses this to recognize a `len(x)` residual it can lower to the
 /// container's inline length read.
 pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
@@ -4455,7 +4455,7 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            __pyre_wrap_builtin_len as crate::gateway::BuiltinCodeFn,
+            __majit_wrap_builtin_len as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -4595,7 +4595,7 @@ pub fn is_builtin_isinstance_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            __pyre_wrap_builtin_isinstance as crate::gateway::BuiltinCodeFn,
+            __majit_wrap_builtin_isinstance as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -4634,7 +4634,7 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// wrapper must keep the same shape.
 /// Builtins installed by hand must publish the equivalent `BuiltinCode.func`
 /// PBC member so source translation can discover and codewrite its graph.
-pub fn __pyre_wrap_builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return builtin_len(args);
     }
@@ -4645,10 +4645,10 @@ pub fn __pyre_wrap_builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_builtin_len_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_builtin_len_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_len"),
-        func: __pyre_wrap_builtin_len,
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_len"),
+        func: __majit_wrap_builtin_len,
     };
 
 /// `abs(x)` — return the absolute value of a number.
@@ -4790,7 +4790,7 @@ fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
     ))
 }
 
-pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return builtin_abs(args);
     }
@@ -4801,10 +4801,10 @@ pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_abs"),
-        func: __pyre_wrap_builtin_abs,
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_abs"),
+        func: __majit_wrap_builtin_abs,
     };
 
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
@@ -4844,7 +4844,7 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// so the true positional count is the prefix before the first PY_NULL.
 /// A single named function keeps the count off the annotator's shared
 /// iterator-adapter graph: a `take_while` closure inlined per wrapper gives
-/// every `__pyre_wrap_*` shim its own closure type, and merging those
+/// every `__majit_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
 pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
@@ -6306,7 +6306,9 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// wrapper must keep the same shape.
 /// Builtins installed by hand must publish the equivalent `BuiltinCode.func`
 /// PBC member so source translation can discover and codewrite its graph.
-pub fn __pyre_wrap_builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_builtin_isinstance(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
         return builtin_isinstance(args);
     }
@@ -6318,10 +6320,10 @@ pub fn __pyre_wrap_builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRe
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_builtin_isinstance_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_builtin_isinstance_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_isinstance"),
-        func: __pyre_wrap_builtin_isinstance,
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_isinstance"),
+        func: __majit_wrap_builtin_isinstance,
     };
 
 /// isinstance(obj, cls) for JIT fast path.
@@ -19700,10 +19702,10 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `BuiltinCode.func` wrapper is therefore a member of the annotator's PBC
 /// family and the meta-interpreter can descend through it.  Hand-written
 /// builtins have to publish that wrapper explicitly in pyre (the same shape
-/// used by `__pyre_wrap_builtin_len` below), otherwise an `IMPORT_NAME`
+/// used by `__majit_wrap_builtin_len` below), otherwise an `IMPORT_NAME`
 /// reached through the ordinary CALL path stops at an opaque native function
 /// pointer instead of tracing `dunder_import` / `gcd_import_fast`.
-pub fn __pyre_wrap_builtin_dunder_import(
+pub fn __majit_wrap_builtin_dunder_import(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     builtin_dunder_import(args)
@@ -19712,10 +19714,10 @@ pub fn __pyre_wrap_builtin_dunder_import(
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_dunder_import"),
-        func: __pyre_wrap_builtin_dunder_import,
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_dunder_import"),
+        func: __majit_wrap_builtin_dunder_import,
     };
 
 #[cfg(test)]
@@ -20020,7 +20022,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let isinstance = make_module_builtin_function_with_arity(
             "isinstance",
-            __pyre_wrap_builtin_isinstance,
+            __majit_wrap_builtin_isinstance,
             2,
         );
         let renamed_isinstance =

@@ -336,18 +336,22 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `usize` lattice as `size_of`; called by `object_array.rs` /
     // `pyframe.rs`.
     analyzer_for(&mut reg, "std.mem.align_of", std_mem_align_of);
-    // `__pyre_cast_instance` — front-end pointer-downcast narrow (#298).
+    // `__cast_instance_intrinsic` — front-end pointer-downcast narrow (#298).
     // `obj as *const RegisteredStruct` lowers to a simple_call against
     // this stub so the classdef-less pointer narrows to
     // `SomeInstance(root)` and a field read on the pointee resolves.
     // Keyed by the qualname `flowspace/model.rs`'s HOST_ENV bootstrap
     // assigns (which also keys the `BUILTIN_TYPER` entry on the same Arc).
-    analyzer_for(&mut reg, "__pyre_cast_instance", pyre_cast_instance);
-    // `__pyre_cast_address` — the erasing twin.  `p as *mut u8` lowers to
+    analyzer_for(
+        &mut reg,
+        "__cast_instance_intrinsic",
+        cast_instance_intrinsic,
+    );
+    // `__cast_address_intrinsic` — the erasing twin.  `p as *mut u8` lowers to
     // a simple_call against this stub so the pointee class is dropped
     // instead of riding along on a value whose declared type is a bare
     // byte pointer.
-    analyzer_for(&mut reg, "__pyre_cast_address", pyre_cast_address);
+    analyzer_for(&mut reg, "__cast_address_intrinsic", cast_address_intrinsic);
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
     // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
@@ -1375,7 +1379,7 @@ fn std_mem_align_of(
     std_mem_size_of(bk, args_s, kwds)
 }
 
-/// Analyzer for `__pyre_cast_address` — the front-end pointer-type
+/// Analyzer for `__cast_address_intrinsic` — the front-end pointer-type
 /// erasure (`p as *mut u8`).  Upstream a heterogeneous heap block that
 /// reaches a GC ownership predicate or a write barrier travels as
 /// `llmemory.Address` (`llmemory.cast_ptr_to_adr`), never as
@@ -1401,17 +1405,17 @@ fn std_mem_align_of(
 /// twin does reject a non-pointer operand: a downcast to a named root
 /// off a non-pointer is a producer bug, whereas dropping type
 /// information off one never is.)
-fn pyre_cast_address(
+fn cast_address_intrinsic(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     if !kwds.is_empty() || args_s.len() != 1 {
         return Err(AnnotatorError::new(
-            "__pyre_cast_address expects exactly one positional pointer argument",
+            "__cast_address_intrinsic expects exactly one positional pointer argument",
         ));
     }
-    let can_be_none = arg_at(args_s, 0, "__pyre_cast_address").can_be_none();
+    let can_be_none = arg_at(args_s, 0, "__cast_address_intrinsic").can_be_none();
     Ok(SomeValue::Instance(super::model::SomeInstance::new(
         None,
         can_be_none,
@@ -1419,12 +1423,12 @@ fn pyre_cast_address(
     )))
 }
 
-/// Analyzer for `__pyre_cast_instance` — the front-end pointer-downcast
+/// Analyzer for `__cast_instance_intrinsic` — the front-end pointer-downcast
 /// narrow (#298).  `front::mir` aliases the classdef-less pointer for a
 /// same-bank `obj as *const RegisteredStruct` cast, so a field read on
 /// the pointee blocks on a classdef-less `SomeInstance` (unaryop.rs
 /// getattr arm).  The frontend instead lowers such a cast to
-/// `simple_call(__pyre_cast_instance, operand)`, stashing the target
+/// `simple_call(__cast_instance_intrinsic, operand)`, stashing the target
 /// struct root in the `FunctionPath`; `flowspace_adapter` reconstructs
 /// the root as a trailing `ByteStr` constant arg (the `Vec<Variable>`
 /// arg carrier cannot hold a `Constant`).  The result is
@@ -1437,25 +1441,25 @@ fn pyre_cast_address(
 ///
 /// A root the bookkeeper deliberately models as a non-instance value —
 /// a `FixedObjectArray` projected to its `_items` element list, a
-/// `Wtf8Buf` to a byte string (`project_pyre_field_type`,
+/// `Wtf8Buf` to a byte string (`project_struct_field_type`,
 /// in `bookkeeper.rs`) — arrives with a `SomeList`/`SomeString`
 /// operand rather than a pointer.  Its access lowers through
 /// `getitem`/byte reads, not a named-field getattr, so the narrow is a
 /// no-op: the operand passes through unchanged, exactly as the erasure
-/// twin `pyre_cast_address` handles a `SomeList` for a `Vec` whose
+/// twin `cast_address_intrinsic` handles a `SomeList` for a `Vec` whose
 /// address was erased.
-fn pyre_cast_instance(
+fn cast_instance_intrinsic(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // The marker is `Call(["__pyre_cast_instance", <root>], [operand])`:
+    // The marker is `Call(["__cast_instance_intrinsic", <root>], [operand])`:
     // exactly the pointer operand plus the constant-root string, no
     // keywords.  A different shape is a producer bug, surfaced here
     // rather than silently swallowed.
     if !kwds.is_empty() || args_s.len() != 2 {
         return Err(AnnotatorError::new(
-            "__pyre_cast_instance expects (operand, constant_root) positional arguments",
+            "__cast_instance_intrinsic expects (operand, constant_root) positional arguments",
         ));
     }
     let root = match args_s
@@ -1467,14 +1471,14 @@ fn pyre_cast_instance(
         Some(s) => s.to_string(),
         None => {
             return Err(AnnotatorError::new(
-                "__pyre_cast_instance: target struct root must be a constant string",
+                "__cast_instance_intrinsic: target struct root must be a constant string",
             ));
         }
     };
     // Carry the operand's nullability onto the downcast result instead
     // of unconditionally narrowing to non-None: a downcast of a nullable
     // pointer is itself nullable.
-    let operand = arg_at(args_s, 0, "__pyre_cast_instance");
+    let operand = arg_at(args_s, 0, "__cast_instance_intrinsic");
     let can_be_none = match operand {
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::None_(_) => true,
@@ -1483,20 +1487,20 @@ fn pyre_cast_instance(
             // A root the bookkeeper models as a list or string (a
             // `FixedObjectArray` projected to its `_items` element list,
             // a `Wtf8Buf` projected to a byte string —
-            // `project_pyre_field_type` in `bookkeeper.rs`) reads
+            // `project_struct_field_type` in `bookkeeper.rs`) reads
             // through `getitem`/byte access, never a named field, so the
             // pointer→instance narrow is a no-op for it: return the
             // operand unchanged when its variant matches the model, the
             // same operand-agnostic pass-through the erasure twin
-            // `pyre_cast_address` already performs.  `convert_from_to`
+            // `cast_address_intrinsic` already performs.  `convert_from_to`
             // (rclass.py:1035) constrains only the destination repr, not
             // the operand shape.  A genuine variant mismatch is still a
             // producer bug, surfaced with the root that was expected.
-            if bk.project_pyre_field_type(&root).tag() == other.tag() {
+            if bk.project_struct_field_type(&root).tag() == other.tag() {
                 return Ok(operand.clone());
             }
             return Err(AnnotatorError::new(format!(
-                "__pyre_cast_instance: non-pointer operand for root {root:?}: {other:?}"
+                "__cast_instance_intrinsic: non-pointer operand for root {root:?}: {other:?}"
             )));
         }
     };
@@ -1570,7 +1574,7 @@ fn bigint_from(
 /// residualizes a body that builds one of these containers.  A
 /// subsequent method/accessor call on the opaque handle (`Vec::index`,
 /// `IndexMap::get`, `Box::into_raw`, …) is a separate leaf resolved on
-/// its own path (`translate_op` / `PyreCallRegistry`, not the analyser
+/// its own path (`translate_op` / `CallRegistry`, not the analyser
 /// table); this analyser only types the constructor's result.
 fn foreign_container_ctor(
     _bk: &Rc<Bookkeeper>,
@@ -1665,7 +1669,7 @@ fn lltype_cast_int_to_ptr(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
-    let opaque = OpaqueType::gc("PYRE_REF_OPAQUE");
+    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
     let placeholder_ptr = Ptr::from_container_type(
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
     )

@@ -73,7 +73,7 @@ pub const BC_NEW_WITH_VTABLE: u8 = 219;
 // C-form byte 222) so existing serialised byte assignments are undisturbed.
 // These consts only DECLARE the intended byte
 // numbers; a byte is not actually reserved (`is_reserved_opcode_byte`) until its
-// key joins `pyre_extension_insns()`, and the blackhole handler is bound there.
+// key joins `extension_insns()`, and the blackhole handler is bound there.
 // That registration + the macro lowering + the `run_one_step` dispatch arm are
 // wired together (the registration may shift dynamic byte assignments, so it is
 // verified against the serialised JitCode artifacts at that point, not here).  The
@@ -521,7 +521,7 @@ pub const BC_RAW_STORE_I: u8 = 228;
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
-// `pyre_extension_insns()` alongside `abort/` / `abort_permanent/`.
+// `extension_insns()` alongside `abort/` / `abort_permanent/`.
 pub const BC_ABORT_RESULT_R: u8 = 195;
 
 // pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
@@ -579,7 +579,7 @@ pub fn insn_byte(key: &str) -> u8 {
 }
 
 /// Non-panicking lookup against the merged
-/// `wellknown_bh_insns()` + `pyre_extension_insns()` table.  Returns
+/// `wellknown_bh_insns()` + `extension_insns()` table.  Returns
 /// `Some(byte)` for canonical/extension keys (build/runtime-stable
 /// `BC_*`) and `None` for translator-only keys.  `Assembler::get_opnum`
 /// uses the `None` return to fall through to the
@@ -604,9 +604,9 @@ pub fn insn_byte_opt(key: &str) -> Option<u8> {
         // tables keeps every legal key resolvable from a single entry
         // point while the source of truth remains split — canonical
         // opnames live in `wellknown_bh_insns()`, pyre-only quarantine
-        // lives in `pyre_extension_insns()`.
+        // lives in `extension_insns()`.
         let mut merged = wellknown_bh_insns();
-        for (k, v) in pyre_extension_insns() {
+        for (k, v) in extension_insns() {
             assert!(
                 !merged.contains_key(k),
                 "insn_byte: pyre extension key {k:?} collides with \
@@ -620,7 +620,7 @@ pub fn insn_byte_opt(key: &str) -> Option<u8> {
 }
 
 /// Highest byte value reserved across `wellknown_bh_insns()` ∪
-/// `pyre_extension_insns()`.  This is a diagnostic for pyre's fixed
+/// `extension_insns()`.  This is a diagnostic for pyre's fixed
 /// `BC_*` range; translator-only opcode allocation must not use this
 /// as a start offset because gaps below the high-water remain legal
 /// dynamic bytes.
@@ -634,7 +634,7 @@ pub fn canonical_byte_high_water() -> u8 {
                 max = v;
             }
         }
-        for (_, v) in pyre_extension_insns() {
+        for (_, v) in extension_insns() {
             if v > max {
                 max = v;
             }
@@ -645,7 +645,7 @@ pub fn canonical_byte_high_water() -> u8 {
 
 /// True when `byte` is pinned by either canonical RPython-mirror keys
 /// (`wellknown_bh_insns`) or pyre-only extension keys
-/// (`pyre_extension_insns`).  Multiple keys may intentionally share a
+/// (`extension_insns`).  Multiple keys may intentionally share a
 /// byte because some RPython blackhole handlers are aliases; this helper
 /// only answers whether the byte is reserved, not whether the table is
 /// one-to-one.
@@ -657,7 +657,7 @@ pub fn is_reserved_opcode_byte(byte: u8) -> bool {
         for (_, value) in wellknown_bh_insns() {
             reserved[value as usize] = true;
         }
-        for (_, value) in pyre_extension_insns() {
+        for (_, value) in extension_insns() {
             reserved[value as usize] = true;
         }
         reserved
@@ -700,11 +700,11 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("void_return/", BC_VOID_RETURN);
 
     // `abort/` and `abort_permanent/` are pyre-only Rust adaptations and
-    // live in `pyre_extension_insns()` — their byte values
+    // live in `extension_insns()` — their byte values
     // are still `BC_ABORT` / `BC_ABORT_PERMANENT`, but they are kept out
     // of the canonical-mirror table to keep `wellknown_bh_insns()` a
     // strict subset of RPython's `Assembler.insns`. See the comment on
-    // `pyre_extension_insns` for the borrow-checker rationale.
+    // `extension_insns` for the borrow-checker rationale.
 
     // RPython blackhole.py `bhimpl_unreachable()` raises
     // `AssertionError("unreachable")`. Distinct opcode from
@@ -712,10 +712,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("unreachable/", BC_UNREACHABLE);
 
     // The 6 `*_state_*` keys were quarantined into
-    // `pyre_extension_insns()`. They model the
+    // `extension_insns()`. They model the
     // proc-macro-generated JIT-machine-state addressing scheme and have
     // no RPython counterpart — see the doc-comment on
-    // `pyre_extension_insns` for the proc-macro/runtime-bridge
+    // `extension_insns` for the proc-macro/runtime-bridge
     // rationale.
 
     // Virtualizable operations — RPython canonical argcode shapes from
@@ -800,8 +800,8 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // when they are actually emitted; pre-registering them here would make
     // `wellknown_bh_insns()` claim a bytecode contract this runtime does
     // not truthfully expose.  The pyre-only nested-bytecode shape is
-    // registered separately as `inline_call_pyre_nested/P` in
-    // `pyre_extension_insns()`.
+    // registered separately as `inline_call_nested_ext/P` in
+    // `extension_insns()`.
 
     // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
     // Argcodes follow assembler.py: two registers + label.
@@ -1188,7 +1188,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
 /// `wellknown_bh_insns()` at OnceLock init time, so build-time
 /// `write_insn(...)` callers resolve transparently. Runtime dispatch
 /// reads `BC_*` constants directly and is unaffected.
-pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
+pub fn extension_insns() -> IndexMap<&'static str, u8> {
     let mut m = IndexMap::new();
     // Borrow-checker abort signals.
     m.insert("abort/", BC_ABORT);
@@ -1213,13 +1213,13 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // Pyre does not compile inlined helpers into separate native
     // functions — guard-failure resume must re-interpret the helper as
     // nested bytecode.  Byte 17 (`BC_INLINE_CALL`) is reused for this
-    // pyre-only handler (`handler_inline_call_pyre_nested`).  The `P`
+    // pyre-only handler (`handler_inline_call_nested_ext`).  The `P`
     // pseudo-argcode is opaque from the canonical RPython argcodes
     // alphabet: payload is `sub_idx u16 + num_args u16 + num_args ×
     // (kind u8, src u16, dst u16) + 3 × (return slot u16; u16::MAX = None)`.
     // Generic walkers must consult `decode_op_at` (which knows `P`) for
     // length, not the canonical argcodes table.
-    m.insert("inline_call_pyre_nested/P", BC_INLINE_CALL);
+    m.insert("inline_call_nested_ext/P", BC_INLINE_CALL);
     // TODO: pyre `call_assembler_*` adapters.
     //
     // `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
@@ -1229,38 +1229,38 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // no `bhimpl_call_assembler_*`; pyre re-interprets the recorded
     // operation by direct-calling `target.concrete_ptr` via the
     // shared `call_int_function` / `call_void_function` helpers.
-    // `P` pseudo-argcode mirrors `inline_call_pyre_nested`'s opaque
+    // `P` pseudo-argcode mirrors `inline_call_nested_ext`'s opaque
     // pyre-payload classification.
-    m.insert("call_assembler_int_pyre/P", BC_CALL_ASSEMBLER_INT);
-    m.insert("call_assembler_ref_pyre/P", BC_CALL_ASSEMBLER_REF);
-    m.insert("call_assembler_float_pyre/P", BC_CALL_ASSEMBLER_FLOAT);
-    m.insert("call_assembler_void_pyre/P", BC_CALL_ASSEMBLER_VOID);
+    m.insert("call_assembler_int_ext/P", BC_CALL_ASSEMBLER_INT);
+    m.insert("call_assembler_ref_ext/P", BC_CALL_ASSEMBLER_REF);
+    m.insert("call_assembler_float_ext/P", BC_CALL_ASSEMBLER_FLOAT);
+    m.insert("call_assembler_void_ext/P", BC_CALL_ASSEMBLER_VOID);
     // TODO: pyre `cond_call` / `record_known_result`
     // adapters.
     //
     // `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
     // (`majit-metainterp/src/jitcode/assembler.rs`) emit a pyre-only flat payload that
     // does not match canonical `iiIRd` / `riIRd>r` argcodes.  The
-    // `_pyre/P` handlers split semantically:
+    // `_ext/P` handlers split semantically:
     //
-    //   * `cond_call_*_pyre` (`blackhole.rs`'s `handler_cond_call_*_pyre`) execute the
+    //   * `cond_call_*_ext` (`blackhole.rs`'s `handler_cond_call_*_ext`) execute the
     //     conditional call directly, mirroring upstream
     //     `bhimpl_conditional_call_ir_v` /
     //     `bhimpl_conditional_call_value_ir_{i,r}`
     //     (`blackhole.py:1257-1276`).
-    //   * `record_known_result_*_pyre` (`blackhole.rs`'s
-    //     `handler_record_known_result_*_pyre`)
+    //   * `record_known_result_*_ext` (`blackhole.rs`'s
+    //     `handler_record_known_result_*_ext`)
     //     are no-ops that skip the operand bytes, mirroring the
     //     `pass`-bodied `bhimpl_record_known_result_{i,r}_ir_v`
     //     (`blackhole.py:621-628`).
     //
     // Producers: `majit-macros/src/jit_interp/jitcode_lower/`,
     // `pyre/pyre-jit/src/jit/assembler.rs`.
-    m.insert("cond_call_void_pyre/P", BC_COND_CALL_VOID);
-    m.insert("cond_call_value_int_pyre/P", BC_COND_CALL_VALUE_INT);
-    m.insert("cond_call_value_ref_pyre/P", BC_COND_CALL_VALUE_REF);
-    m.insert("record_known_result_int_pyre/P", BC_RECORD_KNOWN_RESULT_INT);
-    m.insert("record_known_result_ref_pyre/P", BC_RECORD_KNOWN_RESULT_REF);
+    m.insert("cond_call_void_ext/P", BC_COND_CALL_VOID);
+    m.insert("cond_call_value_int_ext/P", BC_COND_CALL_VALUE_INT);
+    m.insert("cond_call_value_ref_ext/P", BC_COND_CALL_VALUE_REF);
+    m.insert("record_known_result_int_ext/P", BC_RECORD_KNOWN_RESULT_INT);
+    m.insert("record_known_result_ref_ext/P", BC_RECORD_KNOWN_RESULT_REF);
     // pyre-only `abort/>r` — Ref-result variant of `abort/`.  Emitted by
     // `Assembler::encode_op`'s default branch when an `OpKind::Abort` with
     // `result_kind: Ref` reaches the assembler.  The blackhole-side
@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn opcode_bytes_are_one_to_one() {
         let mut byte_to_key: HashMap<u8, String> = HashMap::new();
-        for table in [wellknown_bh_insns(), pyre_extension_insns()] {
+        for table in [wellknown_bh_insns(), extension_insns()] {
             for (key, byte) in table.iter() {
                 let key = (*key).to_string();
                 let byte = *byte;
@@ -1323,7 +1323,7 @@ mod recursive_call_byte_tests {
     /// The reserved `BC_RECURSIVE_CALL_*` bytes (223-226) must be mutually
     /// distinct, sit above the prior high-water (`BC_NEW_WITH_VTABLE` = 219),
     /// and not collide with any byte already registered in `wellknown_bh_insns`
-    /// or `pyre_extension_insns`.  Guards against the #199-class byte-collision
+    /// or `extension_insns`.  Guards against the #199-class byte-collision
     /// (BC_INT_BETWEEN vs BC_NEW) at the point the bytes are reserved, before
     /// the recursive-call lowering/handlers are wired.
     #[test]
@@ -1354,7 +1354,7 @@ mod recursive_call_byte_tests {
 
         let registered: Vec<u8> = wellknown_bh_insns()
             .values()
-            .chain(pyre_extension_insns().values())
+            .chain(extension_insns().values())
             .copied()
             .collect();
         for b in reserved {

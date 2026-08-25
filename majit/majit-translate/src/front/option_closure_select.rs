@@ -150,7 +150,7 @@ fn rewire_one_closure_select_site(
         .ok_or_else(|| format!("{name}: closure-select call op not found in block {a}"))?;
     let ops_len = graph.blocks[a].operations.len();
 
-    // Absorb the optional trailing `__pyre_cast_instance` narrowing cast a
+    // Absorb the optional trailing `__cast_instance_intrinsic` narrowing cast a
     // `*mut <registered ADT>` result gains (see `option_map_or`).
     let (flow_result, narrow_root, remove_upto) = if ci + 1 == ops_len {
         (site.result_var.clone(), None, ci)
@@ -165,7 +165,7 @@ fn rewire_one_closure_select_site(
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__pyre_cast_instance"
+                && segments[0] == "__cast_instance_intrinsic"
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {

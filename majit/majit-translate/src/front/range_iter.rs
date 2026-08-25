@@ -29,7 +29,7 @@
 //!     ... next(r) folded by front::iter_next into the native `next` op
 //! ```
 //!
-//! `range` is emitted under the reserved `["__pyre_range"]` spelling (see
+//! `range` is emitted under the reserved `["__majit_range"]` spelling (see
 //! [`range_builtin_call`]) and resolves through
 //! `HOST_ENV.lookup_builtin("range")` →
 //! `SomeBuiltin("range")` → `builtin_range` (`SomeList` with `range_step`);
@@ -371,9 +371,9 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
 /// through `HOST_ENV.lookup_builtin("range")` → `SomeBuiltin("range")` →
 /// `builtin_range` (a `SomeList` carrying `range_step`).
 ///
-/// Spelled with the reserved `__pyre_range` segment rather than a bare
+/// Spelled with the reserved `__majit_range` segment rather than a bare
 /// `["range"]`: the adapter resolves a single-segment path against the
-/// `PyreCallRegistry` before `HOST_ENV`, and pyre's registry is one flat
+/// `CallRegistry` before `HOST_ENV`, and pyre's registry is one flat
 /// namespace keyed by leaf-only `CallPath`s, so a pyre free function named
 /// `range` (`pyre_interpreter::module::_ast::convert::range`) registers as
 /// `["range"]` and would capture this call. The reserved spelling has a
@@ -384,7 +384,7 @@ fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> Space
         result: Some(result),
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__pyre_range".to_string()],
+                segments: vec!["__majit_range".to_string()],
             },
             args: vec![start, end],
             result_ty: ValueType::Ref(None),
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
-            count_calls_ending(&g, &["__pyre_range"]),
+            count_calls_ending(&g, &["__majit_range"]),
             1,
             "one range() builtin emitted"
         );
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(rewritten, 1, "two-hop range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
-            count_calls_ending(&g, &["__pyre_range"]),
+            count_calls_ending(&g, &["__majit_range"]),
             1,
             "one range() builtin emitted"
         );
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(rewritten, 0, "a second range consumer declines the divert");
         assert_eq!(count_range_ctors(&g), 1, "range ctor survives");
         assert_eq!(
-            count_calls_ending(&g, &["__pyre_range"]),
+            count_calls_ending(&g, &["__majit_range"]),
             0,
             "no range() builtin emitted"
         );

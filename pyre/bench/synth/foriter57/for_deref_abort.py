@@ -7,7 +7,7 @@ def make():
         for x in range(500):
             # `n += 1` on a closure free variable lowers to STORE_DEREF, whose
             # `store_deref_value` residual is a VALUE-returning (`Ref`) in-place
-            # cell write carrying `PyreHelperKind::StoreDeref`.  It commits a
+            # cell write carrying `RuntimeHelperKind::StoreDeref`.  It commits a
             # NON-journaled heap mutation before the later `seen.append` aborts
             # the trace.
             #

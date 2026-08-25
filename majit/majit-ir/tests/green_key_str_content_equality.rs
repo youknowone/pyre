@@ -32,7 +32,7 @@ use std::sync::Once;
 /// `default_unicode_hash`.  `OnceLock`-backed setters are
 /// init-once, so the first registration wins regardless of test
 /// ordering.
-fn ensure_pyre_resolvers() {
+fn ensure_resolvers() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         set_str_resolver(default_str_eq, default_str_hash);
@@ -42,7 +42,7 @@ fn ensure_pyre_resolvers() {
 
 #[test]
 fn str_greens_compare_by_content() {
-    ensure_pyre_resolvers();
+    ensure_resolvers();
     let s1: &str = "hello";
     // Distinct backing &str slot (different stack allocation), same content.
     let owned = String::from("hello");
@@ -94,7 +94,7 @@ fn rpython_ll_strhash_reference(s: &str) -> u64 {
 
 #[test]
 fn str_greens_hash_by_content() {
-    ensure_pyre_resolvers();
+    ensure_resolvers();
     let s1: &str = "match-me";
     let owned = String::from("match-me");
     let s2: &str = owned.as_str();
@@ -127,7 +127,7 @@ fn str_greens_hash_by_content() {
 /// `default_str_hash` must surface the same sentinel rather than `0`.
 #[test]
 fn str_green_empty_hashes_to_minus_one_per_rpython() {
-    ensure_pyre_resolvers();
+    ensure_resolvers();
     let s: &str = "";
     let p = (&s) as *const _ as usize as i64;
     let h = hash_whatever(GreenType::Str, p);
@@ -141,7 +141,7 @@ fn str_green_empty_hashes_to_minus_one_per_rpython() {
 
 #[test]
 fn distinct_content_str_greens_are_unequal() {
-    ensure_pyre_resolvers();
+    ensure_resolvers();
     let s1: &str = "foo";
     let s2: &str = "bar";
     let p1 = (&s1) as *const _ as usize as i64;
@@ -167,7 +167,7 @@ fn distinct_content_str_greens_are_unequal() {
 #[test]
 fn make_str_slot_decodes_via_default_str_eq() {
     use majit_ir::make_str_slot;
-    ensure_pyre_resolvers();
+    ensure_resolvers();
     let p_macro_emitted = make_str_slot("decoded-content");
     let owned = String::from("decoded-content");
     let s_local: &str = owned.as_str();

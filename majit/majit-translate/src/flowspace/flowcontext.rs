@@ -3542,7 +3542,7 @@ mod test {
     }
 
     fn compile_function_body(src: &str) -> CodeObject {
-        let module = rp_compile(src, Mode::Exec, "<pyre>", Default::default())
+        let module = rp_compile(src, Mode::Exec, "<flow>", Default::default())
             .expect("compile should succeed");
         module
             .constants

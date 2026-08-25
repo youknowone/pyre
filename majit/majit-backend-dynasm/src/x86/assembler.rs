@@ -4270,8 +4270,8 @@ impl<'a> Assembler386<'a> {
                 self.genop_call_with_arglocs(op, arglocs);
             }
             OpCode::CallR => {
-                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().pyre_helper)
-                    == Some(majit_ir::PyreHelperKind::NurseryAlloc);
+                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
+                    == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
                 if is_nursery_alloc {
                     self.genop_nursery_alloc_inline_x86(op, arglocs);
                 } else {
@@ -6887,7 +6887,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Inline nursery bump for a call tagged
-    /// [`majit_ir::PyreHelperKind::NurseryAlloc`].
+    /// [`majit_ir::RuntimeHelperKind::NurseryAlloc`].
     ///
     /// The tag declares a two-word headerless node taken from the
     /// interpreter's own nursery, whose payload is the call's two arguments:
