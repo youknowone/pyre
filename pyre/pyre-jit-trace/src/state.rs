@@ -1398,13 +1398,18 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 /// from `jitcode.constants_r` (`init_register_files_from_runtime_jitcode`),
 /// so a constant boxed object reachable only from a jitcode and swept by a
 /// major collection between trace executions leaves the next guard-failure
-/// resume reading a freed pointer.  The constant pool is immutable after
-/// build.  With tagged ints disabled, its objects are non-moving —
-/// interpreter-routed int/float consts live in the non-moving old-gen and
-/// build-time consts are `malloc_typed`-immortal — so the pyre-jit root-area
-/// wrapper skips this walk for minor collections and marks the slots in place
-/// during major marking.  The tagged-int configuration retains the minor walk
-/// because normalization can materialize a moving `W_IntObject`.
+/// resume reading a freed pointer.
+///
+/// The pool's VALUES are immutable after build; their ADDRESSES are not.  A
+/// `residual_call` whose ref argument is a constant bakes whatever object the
+/// tracer read, and that object is non-moving only when it happens to be an
+/// old-generation number or a `malloc_typed`-immortal build-time constant.
+/// `MAKE_FUNCTION` bakes the frame's globals dict
+/// (`jit_make_function_from_globals(globals, code)`), and a frame running
+/// under `exec(code, {...})` carries an ordinary collectable one.  So this
+/// walk writes the visitor's answer back into the slot instead of marking a
+/// copy of it, and `jitcode_constants_root_walker_area` runs it for minor
+/// collections too.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_constants_refs_in(&state.borrow(), visitor);
@@ -1429,11 +1434,11 @@ pub unsafe fn walk_jitcode_constants_refs_area(
     walk_jitcode_constants_refs_in(sd, visitor);
 }
 
-/// Relocation probe for the non-moving invariant stated on
-/// [`walk_jitcode_constants_refs`] above.  `drag_out_root` relocates a root
-/// only when it is a nursery object start, so a slot whose value the visitor
-/// CHANGES is proof that a movable object entered the pool and that marking
-/// in place without forwarding leaves a stale address behind.
+/// Forwarding probe for [`walk_jitcode_constants_refs`] above.
+/// `drag_out_root` relocates a root only when it is a nursery object start, so
+/// a slot whose value the visitor CHANGES is one where a movable object entered
+/// the pool and the walk had to write the new address back.  Before that
+/// write-back existed the same count named relocations the walk DISCARDED.
 ///
 /// `WALKS`/`SLOTS` are the arming witnesses: `RELOCATED == 0` means nothing
 /// moved only when `SLOTS > 0`.  With `SLOTS == 0` the walker observed
