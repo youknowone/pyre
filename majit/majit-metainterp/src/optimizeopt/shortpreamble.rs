@@ -2847,12 +2847,32 @@ impl ExtendedShortPreambleBuilder {
                 // unmapped is what `_map_args` (unroll.py) raises
                 // KeyError on, and shortening the JUMP instead would disagree
                 // with the already-compiled target LABEL's arity.
+                // A USED_BOX PRODUCER is carried by the target LABEL, not by
+                // the short preamble's own JUMP, so the `jump_args` test above
+                // does not see it. `used_boxes` is appended to the LABEL's
+                // arglist verbatim (`jump_to_existing_trace` builds
+                // `current_label_args` as `label_args + used_boxes`), which puts
+                // the box in `inputargs_set` — so every later short op that
+                // reads it stays `resolvable` and survives, and the transitive
+                // drop that would otherwise carry them out with their producer
+                // never fires. Those survivors then resolve the box through the
+                // LABEL-slot seed in `inline_short_preamble`
+                // (`builder.label_args()` zipped with the body's jump args)
+                // instead of through the replay result the dropped op would have
+                // registered. The seed names the slot's back-edge value, not the
+                // box the producer computes, so a kept reader silently reads a
+                // different loop-carried value: for `t += c[0] + c[-1]` the
+                // LABEL slot holding `c[0]`'s unboxed intval receives the
+                // accumulator, and the invariant is clobbered once per
+                // iteration.
                 let decline = if op.opcode.is_guard() {
                     Some("guard")
                 } else if op.opcode.is_ovf() {
                     Some("ovf producer")
                 } else if short_preamble.jump_args.contains(&op.pos.get()) {
                     Some("jump-arg producer")
+                } else if short_preamble.used_boxes.contains(&op.pos.get()) {
+                    Some("used-box producer")
                 } else {
                     None
                 };
