@@ -1536,7 +1536,7 @@ impl<'c> Lowerer<'c> {
                     }
                 }
                 crate::jit_interp::CallPolicyKind::InlineVoid => {
-                    let builder_path = inline_builder_path(&call.func)?;
+                    let shared_path = inline_shared_path(&call.func)?;
                     let prebuild_path = inline_prebuild_path(&call.func)?;
                     let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
                     let __arg_regs: Vec<Register> =
@@ -1547,8 +1547,8 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::InlineCall, __arg_regs, vec![]),
                         quote! {
-                            let __sub_jitcode = #builder_path(__asm);
-                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            let __sub_edge = #shared_path(__asm);
+                            let __sub_idx = __builder.add_sub_jitcode_ref(__sub_edge);
                             #inline_call
                         },
                     );
@@ -1599,7 +1599,8 @@ impl<'c> Lowerer<'c> {
                     let result_kind = binding_kind_for_inline_policy(kind)
                         .expect("the arm's own patterns are the inline result policies");
                     let throwaway_reg = self.alloc_reg();
-                    let builder_path = inline_builder_path(&call.func)?;
+                    let shared_path = inline_shared_path(&call.func)?;
+                    let sub_return_kind = jit_arg_kind_tokens(result_kind);
                     let prebuild_path = inline_prebuild_path(&call.func)?;
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, throwaway_reg);
                     let __arg_regs: Vec<Register> =
@@ -1614,12 +1615,9 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, throwaway_reg)],
                         ),
                         quote! {
-                            use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
-                            let __sub_jitcode = #builder_path(__asm);
-                            let (__sub_return_kind, _) = __sub_jitcode
-                                .trailing_return_info()
-                                .expect("inline helper jitcode must end in a typed return opcode");
-                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            let __sub_edge = #shared_path(__asm);
+                            let __sub_return_kind = #sub_return_kind;
+                            let __sub_idx = __builder.add_sub_jitcode_ref(__sub_edge);
                             #inline_call
                         },
                     );

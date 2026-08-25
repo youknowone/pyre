@@ -1439,7 +1439,9 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
             // target straight from `RawDescrPool::PerFn`, not through this
             // adapted `DescrRef` slot; the jitcode-descr stand-in is a
             // fail-loud tripwire for a mis-routed slot.
-            RuntimeBhDescr::JitCode(_) => crate::descr::make_jitcode_descr(i),
+            RuntimeBhDescr::JitCode(_) | RuntimeBhDescr::JitCodeBackEdge(_) => {
+                crate::descr::make_jitcode_descr(i)
+            }
             RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
                 crate::descr::make_jitcode_descr(i)
             }

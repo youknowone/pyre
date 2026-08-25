@@ -242,6 +242,19 @@ pub enum RuntimeBhDescr {
     /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
     /// `isinstance(value, JitCode)`.
     JitCode(std::sync::Arc<JitCode>),
+    /// The same `j` edge, non-owning: the back edge of a self- or mutually
+    /// recursive `#[jit_inline]` helper, pointing at a jitcode that is still
+    /// being assembled when the edge is recorded.
+    ///
+    /// `CallControl.get_jitcode` hands a recursive graph the shell it is
+    /// already registered under, and CPython's collector reclaims the resulting
+    /// cycle.  `Arc` has no collector, so the ownership classification stands in
+    /// for one: the owning edge keeps the callee alive, the back edge does not,
+    /// and a helper that names itself does not pin itself forever.
+    ///
+    /// Both variants name the same allocation, so everything downstream reads
+    /// identically through [`Self::as_jitcode_owned`].
+    JitCodeBackEdge(std::sync::Weak<JitCode>),
     /// Target function for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
     /// RPython `blackhole.py:1225-1256` reads the function address
     /// from an int register (`i` argcode) and the calling convention
@@ -270,9 +283,31 @@ impl RuntimeBhDescr {
 
     /// RPython parity: `isinstance(value, JitCode)` assertion at
     /// `blackhole.py:156`.  Returns the callee JitCode for `BC_INLINE_CALL`.
+    ///
+    /// **Owning edges only.**  A back edge answers `None` here, and callers
+    /// that walk the pool to number or publish sub-jitcodes rely on that:
+    /// `build_jitcode_registry` asserts each sub-jitcode it reaches is unnumbered,
+    /// and a recursive helper's back edge names a jitcode that walk has already
+    /// numbered.  Use [`Self::as_jitcode_owned`] where the question is "what
+    /// does this `j` operand execute".
     pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
         match self {
             Self::JitCode(arc) => Some(arc),
+            _ => None,
+        }
+    }
+
+    /// The callee a `j` operand names, whichever kind of edge recorded it.
+    ///
+    /// `None` for a back edge whose callee is still under construction — the
+    /// `Weak` cannot be upgraded from inside `Arc::new_cyclic`.  Every caller
+    /// must treat that as "not answerable yet" and decline, never unwrap: it is
+    /// a build-time window, not a missing target, and by the time anything
+    /// executes the `j` operand the upgrade succeeds.
+    pub fn as_jitcode_owned(&self) -> Option<std::sync::Arc<JitCode>> {
+        match self {
+            Self::JitCode(arc) => Some(std::sync::Arc::clone(arc)),
+            Self::JitCodeBackEdge(weak) => weak.upgrade(),
             _ => None,
         }
     }
@@ -292,6 +327,66 @@ impl RuntimeBhDescr {
             _ => None,
         }
     }
+}
+
+/// What the `Assembler`'s helper cache holds for one `#[jit_inline]` helper.
+///
+/// Two states because a recursive helper is reachable while it is still being
+/// assembled, and the answer differs: mid-assembly there is no `Arc` to hand
+/// out yet, only the `Weak` that `Arc::new_cyclic` supplies.
+pub enum InlineJitCodeSlot {
+    /// The body is being assembled right now.  Anything that reaches the helper
+    /// from inside its own assembly gets this.
+    UnderConstruction(std::sync::Weak<JitCode>),
+    /// Assembly finished; later callers link to the finished jitcode directly.
+    Finished(std::sync::Arc<JitCode>),
+}
+
+/// The edge an inline call site should record for a helper.
+pub enum InlineJitCodeRef {
+    /// A normal call: the caller owns a reference to its callee.
+    Strong(std::sync::Arc<JitCode>),
+    /// A recursive call: the callee is (transitively) the caller, so an owning
+    /// edge would be a cycle of `Arc`s that never drops.
+    BackEdge(std::sync::Weak<JitCode>),
+}
+
+/// `call.py CallControl.get_jitcode`'s cache probe.
+///
+/// `None` means this helper has not been entered, and the caller must assemble
+/// it — registering the shell with [`begin_inline_jitcode`] BEFORE the body, so
+/// that a self-call arriving during assembly finds this probe answering.
+pub fn lookup_inline_jitcode(asm: &crate::Assembler, key: usize) -> Option<InlineJitCodeRef> {
+    let slot = asm.inline_jitcode_slot(key)?;
+    match (**slot).downcast_ref::<InlineJitCodeSlot>()? {
+        InlineJitCodeSlot::UnderConstruction(weak) => {
+            Some(InlineJitCodeRef::BackEdge(weak.clone()))
+        }
+        InlineJitCodeSlot::Finished(arc) => {
+            Some(InlineJitCodeRef::Strong(std::sync::Arc::clone(arc)))
+        }
+    }
+}
+
+/// Register the helper's identity before its body exists.
+///
+/// This is the whole mechanism: `make_jitcodes` mints one JitCode per graph up
+/// front and fills bodies afterwards, so the identity a recursive call links to
+/// is available before there is anything to link.
+pub fn begin_inline_jitcode(
+    asm: &mut crate::Assembler,
+    key: usize,
+    weak: std::sync::Weak<JitCode>,
+) {
+    asm.inline_jitcode_insert(
+        key,
+        std::sync::Arc::new(InlineJitCodeSlot::UnderConstruction(weak)),
+    );
+}
+
+/// Publish the finished jitcode, so later call sites take an owning edge.
+pub fn finish_inline_jitcode(asm: &mut crate::Assembler, key: usize, arc: std::sync::Arc<JitCode>) {
+    asm.inline_jitcode_insert(key, std::sync::Arc::new(InlineJitCodeSlot::Finished(arc)));
 }
 
 /// Runtime view of the process-global build-time descriptor pool.

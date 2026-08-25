@@ -1815,6 +1815,7 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
             .map(|(i, d)| match d {
                 RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
                 RuntimeBhDescr::JitCode(_)
+                | RuntimeBhDescr::JitCodeBackEdge(_)
                 | RuntimeBhDescr::Call(_)
                 | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
             })

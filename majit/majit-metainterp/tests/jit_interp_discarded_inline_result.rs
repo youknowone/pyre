@@ -137,6 +137,69 @@ fn install() -> (majit_metainterp::JitCode, Vec<u8>) {
     (dispatch_jc, helper_code)
 }
 
+/// The same discarding arm, alone.
+///
+/// The two-arm portal above cannot say WHICH arm registered the helper: the
+/// descr pool memoises a callee, so one entry is what both arms sharing a
+/// splice looks like AND what the binding arm splicing alone looks like. Here
+/// the binding arm does not exist, so the entry can only have come from the
+/// discarding one.
+struct DiscardOnlyState {
+    total: i64,
+    sel: usize,
+}
+
+#[majit_macros::jit_interp(
+    state = DiscardOnlyState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = { total: int, sel: ref(PopStack) },
+    calls = { pop_stack => inline_int },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn dispatch_discard_only(program: &Bytecode, threshold: u32) -> i64 {
+    let mut driver: JitDriver<DiscardOnlyState> = JitDriver::new(threshold);
+    let mut pc: usize = 0;
+    let mut state = DiscardOnlyState { total: 0, sel: 0 };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+    while pc < program.len() {
+        jit_merge_point!();
+        let opcode = program[pc];
+        pc += 1;
+        match opcode {
+            OP_DISCARD_POP => {
+                pop_stack(state.sel);
+            }
+            OP_BACK => {
+                if state.total != 0 {
+                    pc = 0;
+                    continue;
+                }
+            }
+            _ => break,
+        }
+    }
+    state.total
+}
+
+fn install_discard_only() -> (majit_metainterp::JitCode, Vec<u8>) {
+    let mut asm = Assembler::new();
+    asm.set_canonical_liveness_triple(vec![0], vec![0], vec![]);
+    __prebuild_jitcode_liveness_dispatch_discard_only(&mut asm);
+    let _ = asm.ensure_canonical_liveness_offset();
+    let dispatch_jc = __dispatch_jitcode_dispatch_discard_only(&mut asm, 0i64)
+        .expect("dispatch lower must succeed");
+    let helper_code = __majit_inline_jitcode_pop_stack_with_asm(&mut asm)
+        .code
+        .clone();
+    (dispatch_jc, helper_code)
+}
+
 fn degraded_arms() -> Vec<String> {
     let _ = install();
     majit_metainterp::degraded_dispatch_arms()
@@ -188,35 +251,55 @@ fn a_discarded_inline_int_call_does_not_degrade_its_arm() {
     );
 }
 
-/// …and the arm must carry the splice, not merely avoid degrading. An arm that
-/// lowered while silently dropping the call would pass the test above.
-///
-/// The oracle is the portal's sub-JitCode list — one `add_sub_jitcode` per
-/// splice site — not a byte scan of the bodies. A jitcode body is a bytecode
-/// stream whose operands are bytes too, so `code.contains(&BC_INLINE_CALL)`
-/// answers about any operand that happens to equal that opcode: counting
-/// `BC_INLINE_CALL` bytes here returns 2 even with the discarding arm degraded
-/// to `[BC_ABORT]`, which is exactly the reading this test exists to reject.
-#[test]
-fn the_discarded_call_is_spliced_into_a_jitcode_body() {
-    let (dispatch_jc, helper_code) = install();
-    let sub_bodies: Vec<&[u8]> = dispatch_jc
+fn helper_entries(dispatch_jc: &majit_metainterp::JitCode, helper_code: &[u8]) -> usize {
+    dispatch_jc
         .exec
         .descrs
         .iter()
         .filter_map(|descr| descr.as_jitcode())
-        .map(|sub| sub.code.as_slice())
-        .collect();
-    let helper_splices = sub_bodies
-        .iter()
-        .filter(|body| **body == helper_code.as_slice())
-        .count();
+        .filter(|sub| sub.code.as_slice() == helper_code)
+        .count()
+}
+
+/// …and the arm must carry the splice, not merely avoid degrading. An arm that
+/// lowered while silently dropping the call would pass the test above.
+///
+/// The oracle is the portal's sub-JitCode list, not a byte scan of the bodies.
+/// A jitcode body is a bytecode stream whose operands are bytes too, so
+/// `code.contains(&BC_INLINE_CALL)` answers about any operand that happens to
+/// equal that opcode: counting `BC_INLINE_CALL` bytes here returns 2 even with
+/// the discarding arm degraded to `[BC_ABORT]`, which is exactly the reading
+/// this test exists to reject.
+///
+/// The portal read is `dispatch_discard_only`, whose only caller of `pop_stack`
+/// is the discarding arm. The two-arm portal cannot answer this: a callee is
+/// memoised in the descr pool (`assembler.py Assembler._encode_descr` keeps
+/// `_descr_dict`), so both arms splicing and the binding arm splicing alone
+/// both leave one entry.
+#[test]
+fn the_discarded_call_is_spliced_into_a_jitcode_body() {
+    let (dispatch_jc, helper_code) = install_discard_only();
+    let spliced = helper_entries(&dispatch_jc, &helper_code);
     assert_eq!(
-        helper_splices, 2,
-        "exactly two arms call `pop_stack` — the discarding one and the \
-         binding one — so the portal must register the helper twice. One \
-         registration means the discarding arm dropped its call; \
-         helper={helper_code:?} sub-bodies={sub_bodies:?}"
+        spliced, 1,
+        "the only arm calling `pop_stack` here is the discarding one, so an \
+         unregistered helper means that arm dropped its call; \
+         helper={helper_code:?}"
+    );
+}
+
+/// The memo itself: two arms calling one helper claim one descr slot.
+///
+/// Recorded because the count above reads as a cardinality claim, and this is
+/// the one that would move if the pool stopped memoising.
+#[test]
+fn two_call_sites_share_one_helper_descr() {
+    let (dispatch_jc, helper_code) = install();
+    let spliced = helper_entries(&dispatch_jc, &helper_code);
+    assert_eq!(
+        spliced, 1,
+        "`pop_stack` is one callee named twice, so it takes one descr index; \
+         helper={helper_code:?}"
     );
 }
 

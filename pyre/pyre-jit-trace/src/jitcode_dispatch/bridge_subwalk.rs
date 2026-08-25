@@ -1127,6 +1127,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         .map(|(i, d)| match d {
             RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
             RuntimeBhDescr::JitCode(_)
+            | RuntimeBhDescr::JitCodeBackEdge(_)
             | RuntimeBhDescr::Call(_)
             | RuntimeBhDescr::AssemblerToken(_) => crate::descr::make_jitcode_descr(i),
         })

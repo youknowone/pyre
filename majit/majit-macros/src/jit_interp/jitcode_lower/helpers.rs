@@ -469,14 +469,34 @@ pub(super) fn extract_branch_int(expr: &Expr) -> Option<i64> {
     }
 }
 
-pub(super) fn inline_builder_path(expr: &Expr) -> Option<Path> {
+/// The memoizing entry point `#[jit_inline]` generates beside `_with_asm`.
+///
+/// `_with_asm` assembles unconditionally; this one is `CallControl.get_jitcode`
+/// — it consults the driver-shared cache first and registers the helper's
+/// identity before assembling, so a helper that calls itself resolves to the
+/// jitcode it is already being built under instead of recursing.
+pub(super) fn inline_shared_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;
     };
     let mut path = path.clone();
     let last = path.segments.last_mut()?;
-    last.ident = format_ident!("__majit_inline_jitcode_{}_with_asm", last.ident);
+    last.ident = format_ident!("__majit_inline_jitcode_{}_shared", last.ident);
     Some(path)
+}
+
+/// The callee's return kind, as a token.
+///
+/// It used to be read back off the assembled jitcode's trailing return opcode.
+/// A recursive call has no assembled jitcode to read — the callee is the caller,
+/// still under construction — and the kind is a static property of the emit site
+/// anyway, so it is spelled rather than recovered.
+pub(super) fn jit_arg_kind_tokens(kind: BindingKind) -> TokenStream {
+    match kind {
+        BindingKind::Int => quote! { majit_metainterp::JitArgKind::Int },
+        BindingKind::Ref => quote! { majit_metainterp::JitArgKind::Ref },
+        BindingKind::Float => quote! { majit_metainterp::JitArgKind::Float },
+    }
 }
 
 /// Construct the path of the per-helper liveness prebuild fn that

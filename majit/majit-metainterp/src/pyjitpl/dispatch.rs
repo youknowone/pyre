@@ -6807,16 +6807,20 @@ where
                 let pc = self.frames.current_mut().pc;
                 // RPython `blackhole.py:150-157` — `j` argcode resolves
                 // via `self.descrs[idx]` asserted to be a `JitCode`.
+                // `as_jitcode_owned`, so a recursive helper's back edge resolves
+                // to the same callee an owning edge would.  By the time anything
+                // executes this operand the callee is published, so the `Weak`
+                // upgrades; the `None` window is confined to the helper's own
+                // assembly, which never runs code.
                 let sub_jitcode = self
                     .frames
                     .current_mut()
                     .jitcode
                     .descr_at(sub_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
                     .unwrap_or_else(|| {
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
-                    })
-                    .clone();
+                    });
                 let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
                 ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;

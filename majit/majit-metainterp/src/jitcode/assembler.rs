@@ -3550,10 +3550,16 @@ impl JitCodeBuilder {
     /// so an empty declaration reads as "not stated" rather than "takes
     /// nothing", and a genuinely nullary callee is indistinguishable from it.
     fn check_inline_call_arg_classes(&self, sub_jitcode_idx: u16, args: &[(JitArgKind, u16, u16)]) {
+        // `as_jitcode_owned`, so a recursive helper's back edge is checked
+        // like any other callee once it can be — and `let ... else` rather than
+        // an unwrap because it cannot be during the helper's own assembly: the
+        // `Weak` handed out by `Arc::new_cyclic` does not upgrade until the
+        // value is published.  Declining there costs nothing; the callee is
+        // this same jitcode and its own emit sites are checked.
         let Some(callee) = self
             .descrs
             .get(sub_jitcode_idx as usize)
-            .and_then(RuntimeBhDescr::as_jitcode)
+            .and_then(RuntimeBhDescr::as_jitcode_owned)
         else {
             return;
         };
@@ -5303,7 +5309,43 @@ impl JitCodeBuilder {
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
+        // `assembler.py Assembler._encode_descr` memoises every descr through
+        // `_descr_dict`, and upstream's `JitCode` IS an `AbstractDescr`, so a
+        // jitcode operand goes through that memo like any other.  This was the
+        // one descr kind here that never got it: every other `add_*` on this
+        // builder already dedups by a linear scan.  It matters now because a
+        // helper that names itself twice would otherwise claim two slots for
+        // one callee.
+        if let Some(existing) = self.descrs.iter().position(|entry| {
+            matches!(entry, RuntimeBhDescr::JitCode(arc) if std::sync::Arc::ptr_eq(arc, &jitcode))
+        }) {
+            return existing as u16;
+        }
         self.push_descr_entry(RuntimeBhDescr::JitCode(jitcode))
+    }
+
+    /// Record whichever `j` edge an inline call site resolved.
+    ///
+    /// A back edge is deduped by the address it names rather than by `Arc`
+    /// identity: two `Weak`s cloned from one `Arc::new_cyclic` are distinct
+    /// values naming one allocation, and `Weak::ptr_eq` on an
+    /// under-construction target is the only comparison available — the
+    /// upgrade that `Arc::ptr_eq` would need returns `None` until assembly
+    /// finishes.
+    pub fn add_sub_jitcode_ref(&mut self, edge: crate::jitcode::InlineJitCodeRef) -> u16 {
+        match edge {
+            crate::jitcode::InlineJitCodeRef::Strong(arc) => self.add_sub_jitcode_arc(arc),
+            crate::jitcode::InlineJitCodeRef::BackEdge(weak) => {
+                let target = std::sync::Weak::as_ptr(&weak);
+                if let Some(existing) = self.descrs.iter().position(|entry| {
+                    matches!(entry, RuntimeBhDescr::JitCodeBackEdge(seen)
+                             if std::sync::Weak::as_ptr(seen) == target)
+                }) {
+                    return existing as u16;
+                }
+                self.push_descr_entry(RuntimeBhDescr::JitCodeBackEdge(weak))
+            }
+        }
     }
 
     pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
