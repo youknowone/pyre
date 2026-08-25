@@ -1377,7 +1377,7 @@ own field list, and that was an error: `shift`'s `Sequence` arm reads both
 children's `empty`, so leaving it undeclared would survive the fold as one reload
 per node — exactly the thing the experiment is supposed to eliminate.
 
-## Task 5 — blocked, and the plan's framing of it was wrong
+## Task 5 — landed, and the plan's framing of it was wrong
 
 The plan called this "memoize helper JitCode construction". That is not
 sufficient. `add_sub_jitcode` pushes `RuntimeBhDescr::JitCode(Arc<JitCode>)` into
@@ -1387,5 +1387,107 @@ RPython does not hit it because `CodeWriter.make_jitcodes` / `get_jitcode` mint 
 empty JitCode **shell** per graph before any body is written; majit's
 `JitCodeBuilder` produces a `JitCode` by value at the end.
 
-Under evaluation before implementing.
+What landed is that shell, spelled in Rust as `Arc::new_cyclic`: it hands the
+body a `Weak` to the `Arc` that does not exist yet, which is exactly what
+`get_jitcode` registering before writing buys upstream.
 
+* `#[jit_inline]` now emits a `_shared` entry point beside `_with_asm`.
+  `_shared` is `CallControl.get_jitcode`: it consults an assembler-wide memo
+  keyed by the address of a per-helper `AtomicU8` static, registers the helper's
+  identity through `begin_inline_jitcode` before assembling, and publishes with
+  `finish_inline_jitcode`. `_with_asm` still assembles unconditionally and keeps
+  its signature.
+* `RuntimeBhDescr` gained `JitCodeBackEdge(Weak<JitCode>)`, and
+  `as_jitcode_owned()` resolves either variant. `as_jitcode()` stays narrowed to
+  owning edges — `jitdriver.rs build_jitcode_registry` asserts each sub-jitcode
+  it reaches is unnumbered, and a back edge is the same jitcode reached twice.
+  The three resolvers that answer "what does this `j` operand execute"
+  (`pyjitpl/dispatch.rs`'s `BC_INLINE_CALL`, `blackhole.rs`'s
+  `read_inline_call_jitcode` and `handler_inline_call_pyre_nested`) went to
+  `as_jitcode_owned`. The `None` window is confined to the helper's own
+  assembly, which never runs code.
+* The self-edge is a `Weak`, so a recursive helper is not a cycle of owning
+  references that never drops.
+
+`tests/jit_inline_self_recursive.rs` is the gate: a `sum_chain` that calls
+itself, driven by a `#[jit_interp]` portal. Reaching the first assertion is the
+first result — before this the process died in `dispatch_sum` with a build-time
+stack overflow. The measured loop unrolls the whole 4-link walk with no call of
+any kind, identical on both backends.
+
+**A pre-existing test had to change with it.** `_shared`'s memo means two arms
+calling one helper now hold the same `Arc`, and `add_sub_jitcode_arc` deduplicates
+it — `assembler.py Assembler._encode_descr` memoises every descr through
+`_descr_dict`, and upstream's `JitCode` **is** an `AbstractDescr`, so upstream
+gives those two arms one index too. `jit_interp_discarded_inline_result.rs`'s
+`the_discarded_call_is_spliced_into_a_jitcode_body` counted descr entries and
+expected two. Counting cannot answer that question under a memo — one entry is
+what both arms splicing and only the binding arm splicing both look like — so the
+fixture grew a second portal, `dispatch_discard_only`, whose only caller of
+`pop_stack` is the discarding arm. The memo itself is now pinned separately.
+
+**`MAX_INLINE_DEPTH = 10` is not the ceiling this plan feared.** The depth-26
+left-associated tree traces to the same 194-op body as the depth-8 balanced one.
+
+## Tasks 7–9 — landed
+
+`majit/examples/regex/src/jit_interp.rs`: the recursive `#[jit_inline] shift`,
+the `#[jit_interp]` portal, 5 tests, and `main.rs`'s benchmark.
+
+**Three spellings the plan did not have.**
+
+* Sub-word fields need explicit casts on both sides. `int_fields` declares the
+  real width (`NodeRec::kind => u8`), and the concrete path keeps the Rust type,
+  so a read is `n.kind as i64` and the store is `n.marked = m as u8`. Both cast
+  forms lower.
+* The kinds are spelled as integer literals inside `shift`. A value-position
+  `match` runs through `extract_pat_literals`, which takes only int literals —
+  and a constant path parses as `Pat::Ident`, which that function's caller reads
+  as the *catch-all binding*. `if` chains on literals sidestep it. Filed as a
+  finding: `lower_match_value` should refuse a `Pat::Ident` arm rather than
+  silently treat a `KIND_CHAR`-style constant as a default.
+* **The input must not be an `[int; virt]` state field.** It was, and at
+  `1 << 20` characters the run died in `resumecode.py Writer.append_int` —
+  `append_int: value 1048577 out of i16 range`. A virtualizable array's elements
+  ride every guard's `vable_array` resume section, so the section is O(input
+  length) and the tagged short overflows past 32767. The fix is the
+  non-virtualizable vocabulary: a `ref(Input)` state field plus
+  `array_fields = { Input::data => u8 }`, which also drops the `u8 → i64`
+  widening pass the `Vec<i64>` needed. That is the same distinction
+  `ArrayFieldEntry`'s doc comment draws, read the right way round.
+
+**The trace.** The peeled loop body — what runs per input character — measured
+on `(a|b)*a(a|b){20}a(a|b)*`, 93 nodes, identical on dynasm and cranelift and
+identical for both associations:
+
+```text
+194 ops: 0 getfield_gc_r, 24 getfield_gc_i, 93 setfield_gc,
+         2 int_eq, 0 guard_value, 1 getarrayitem_gc_i
+```
+
+Zero pointer reads: the tree walk's 92 edges are gone. 93 stores is one mark per
+node, so the whole tree is in the trace. The root promote and the input buffer's
+base pointer are loop invariant and sit in the preamble. `2 int_eq` for 46 `Char`
+nodes is the subset construction — a node whose incoming mark the optimizer
+proved constant zero has no comparison left to make.
+
+## Stage 5's table, filled
+
+Release build, 1,048,576-character non-matching input, three runs:
+
+| row | chars/s |
+|---|---|
+| Rust interp over `NodeRec`, no JIT | 8,712,202 – 9,082,961 |
+| **majit JIT, regex promoted** | **47,506,708 – 47,751,626** |
+| ratio | **5.2 – 5.5x** |
+
+The Rust-interp row supersedes this document's earlier 1,705,377 – 2,582,170.
+That figure came from the scratchpad probe built with a bare `rustc`, i.e.
+unoptimized; the row above is `--release` and is the one the JIT number is
+divided by.
+
+The comparable quantity in the post is its own JIT-over-no-JIT ratio,
+16,500,000 / 720,000 = 22.9x. Ours is 5.2 – 5.5x against a matcher that
+`rustc -O` had already optimized, where the post's denominator was RPython
+translated to C. The absolute rows are not comparable across the two machines
+and sixteen years, and `main.rs` says so where it prints them.
