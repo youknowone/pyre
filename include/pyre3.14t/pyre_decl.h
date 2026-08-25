@@ -554,6 +554,15 @@ PyAPI_FUNC(double) PyOS_string_to_double(const char *, char **, PyObject *);
 PyAPI_FUNC(int) Py_IsFinalizing(void);
 PyAPI_FUNC(int) Py_IsInitialized(void);
 
+/* cpyext/pytime.rs */
+PyAPI_FUNC(double) PyTime_AsSecondsDouble(PyTime_t);
+PyAPI_FUNC(int) PyTime_Monotonic(PyTime_t *);
+PyAPI_FUNC(int) PyTime_MonotonicRaw(PyTime_t *);
+PyAPI_FUNC(int) PyTime_PerfCounter(PyTime_t *);
+PyAPI_FUNC(int) PyTime_PerfCounterRaw(PyTime_t *);
+PyAPI_FUNC(int) PyTime_Time(PyTime_t *);
+PyAPI_FUNC(int) PyTime_TimeRaw(PyTime_t *);
+
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PySequence_Concat(PyObject *, PyObject *);

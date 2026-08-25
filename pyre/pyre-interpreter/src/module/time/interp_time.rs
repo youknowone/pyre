@@ -43,7 +43,7 @@ fn monotonic_seconds() -> f64 {
 
 /// Wall-clock seconds since the unix epoch, falling back to 0 on
 /// `SystemTimeError`.  Routes through `host_env::time` when enabled.
-fn duration_since_epoch() -> std::time::Duration {
+pub(crate) fn duration_since_epoch() -> std::time::Duration {
     #[cfg(feature = "sandbox")]
     {
         let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
@@ -237,7 +237,7 @@ pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// Monotonic clock as integer nanoseconds.
-fn monotonic_nanos() -> i128 {
+pub(crate) fn monotonic_nanos() -> i128 {
     #[cfg(all(unix, feature = "host_env"))]
     {
         if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {

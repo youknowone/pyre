@@ -50,6 +50,9 @@
 /* The `datetime` C API's structs, which the entry points below name. */
 #include "datetime.h"
 
+/* `PyTime_t`, which the clock entry points below take and answer with. */
+#include "pytime.h"
+
 /* Every exported entry point. It sits here because the headers above
    name the types it uses, and the ones below define `static inline`
    functions that call it. */

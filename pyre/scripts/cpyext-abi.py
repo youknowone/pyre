@@ -143,7 +143,7 @@ SCALARS = {
     "i32": "int32_t", "u32": "uint32_t", "i64": "int64_t", "u64": "uint64_t",
     # Named aliases the Rust side spells the same way the header does, so the
     # comparison is against the reference name rather than its width.
-    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t",
+    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t", "PyTime_t": "PyTime_t",
     # A Rust function that never returns has no C spelling of its own: the
     # header declares it `void` and marks the fact separately.
     "!": "void",
