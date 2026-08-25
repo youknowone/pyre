@@ -236,8 +236,8 @@ Every link of the chain below was read at its definition; only the two marked
 **MISSING** do not exist.
 
 ```
-#[jit_immutable_fields("left", "right", "kind", "ch")]
-  └─ emits  const _immutable_fields_NodeRec: &str = "left,right,kind,ch"   [exists]
+#[jit_immutable_fields("left", "right", "kind", "ch", "empty")]
+  └─ emits  const _immutable_fields_NodeRec: &str = "left,right,kind,ch,empty"   [exists]
   └─ emits  NodeRec::__MAJIT_IMMUTABLE_FIELDS                              [MISSING]
        └─ lower_vable.rs: 9 × register_struct_layout(…, IMMUT)             [MISSING]
             └─ field_specs_from_layout — ImmutableRank::parse              [MISSING]
@@ -265,10 +265,10 @@ const shadowing a blanket-trait default, verified by rustc:
 pub trait MajitImmutableFields { const __MAJIT_IMMUTABLE_FIELDS: &'static str = ""; }
 impl<T: ?Sized> MajitImmutableFields for T {}
 // #[jit_immutable_fields] additionally emits, next to the untouched struct:
-impl NodeRec { #[doc(hidden)] pub const __MAJIT_IMMUTABLE_FIELDS: &'static str = "left,right,kind,ch"; }
+impl NodeRec { #[doc(hidden)] pub const __MAJIT_IMMUTABLE_FIELDS: &'static str = "left,right,kind,ch,empty"; }
 ```
 
-`NodeRec::__MAJIT_IMMUTABLE_FIELDS` → `"left,right,kind,ch"`;
+`NodeRec::__MAJIT_IMMUTABLE_FIELDS` → `"left,right,kind,ch,empty"`;
 `Plain::__MAJIT_IMMUTABLE_FIELDS` → `""`. The inherent const wins, so the
 generated call site is uniform and nothing opting out breaks.
 
@@ -549,7 +549,7 @@ majit gaps that block it rather than measuring around them.
 **Architecture:** an `enum Node` authoring tree is lowered once to a leaked
 `#[repr(C)] NodeRec` graph; a `#[jit_interp]` portal drives one `shift` per
 input character; `shift` is a recursive `#[jit_inline]` helper reaching children
-through `ref_fields`. `left`/`right`/`kind`/`ch` are declared immutable so the
+through `ref_fields`. `left`/`right`/`kind`/`ch`/`empty` are declared immutable so the
 tree walk constant-folds; `marked` is not, so it stays a store.
 
 **Tech stack:** Rust 2021, `majit-macros` proc macros, `majit-metainterp`,
@@ -611,7 +611,7 @@ struct OptedOut {
 fn a_declaring_struct_exposes_its_ranks_by_inherent_const() {
     assert_eq!(
         <Declared>::__MAJIT_IMMUTABLE_FIELDS,
-        "left,right,kind,ch",
+        "left,right,kind,ch,empty",
         "the inherent const must shadow the blanket-trait default",
     );
 }
@@ -625,7 +625,7 @@ fn a_struct_that_never_declared_falls_back_to_empty() {
 fn the_free_const_the_llbc_front_end_harvests_still_exists() {
     // `harvest_immutable_fields_from_llbcs` reads this one; widening the
     // attribute must not disturb it.
-    assert_eq!(_immutable_fields_Declared, "left,right,kind,ch");
+    assert_eq!(_immutable_fields_Declared, "left,right,kind,ch,empty");
 }
 ```
 
@@ -748,9 +748,11 @@ fn declared_ranks_land_on_the_field_specs() {
 
     assert!(by_name("kind").is_immutable);
     assert!(by_name("left").is_immutable);
-    // `?` is quasi-immutable: declared immutable, but NOT always-pure.
-    assert!(by_name("version").is_immutable);
+    // The two flags are disjoint. `ImmutableRanking.pure` is false for the
+    // quasi ranks — a quasi-immutable read is pinned by a guard, not by the
+    // descr's pure flag — and the LLBC front end writes the same pair.
     assert!(by_name("version").is_quasi_immutable);
+    assert!(!by_name("version").is_immutable);
 }
 
 #[test]
@@ -1169,7 +1171,7 @@ depth 8 / left-associated depth 26, 0 disagreements over 1560 strings.
 **Interfaces:**
 - Produces: `regex::{Node, lower, bench_regex, bench_regex_left, nonmatching}`,
   `interp::{shift, matches, reset}`, `NodeRec` with
-  `#[jit_immutable_fields("left", "right", "kind", "ch")]`.
+  `#[jit_immutable_fields("left", "right", "kind", "ch", "empty")]`.
 - Consumed by: Tasks 7–9.
 
 - [ ] **Step 1: Port the verified transcription**
@@ -1321,4 +1323,69 @@ Assisted-by: Claude"
 * **Ordering.** Tasks 1→2→3→4 are strictly sequential (each is inert without its
   predecessor). Task 5 is independent of 1–4 and may run in parallel. Task 6 is
   independent of all majit work. Task 7 depends on 4, 5 and 6.
+
+---
+
+# Execution log
+
+## Tasks 1–4 — landed
+
+**Task 1** (`cb4b242d799`) — `MajitImmutableFields` trait + blanket impl in
+`majit-metainterp`, and `#[jit_immutable_fields]` additionally emitting the
+inherent `__MAJIT_IMMUTABLE_FIELDS` const. 5 tests.
+
+**Tasks 2–4 landed as one commit, not three.** The plan sequenced them
+2 → 3 → 4, but widening `register_struct_layout`'s signature breaks every caller
+in the same build, and the proc macro is one of those callers — so the parameter,
+the macro emission and the callers had to move together or the workspace would
+not compile between commits. Task 3's descr-mint change is separable and is
+reflected in its own test module.
+
+**The call sites were wider than the plan said.** Beyond the 9 emissions in
+`lower_vable.rs`, the arity change reached:
+
+* `new_struct` — a 10th emission, in `lower_value.rs`'s `lower_struct_value`.
+  Given the declaration too, so that a `new_struct` registering a struct's layout
+  cannot pre-empt the declaring site.
+* `newlist_clear` — an internal caller synthesizing a `list` header. Passes `""`:
+  the JIT synthesizes that struct and there is no declaring type to read.
+* 8 call sites in `tests/struct_layout_conflict.rs`, 3 `register_struct_layout` and
+  3 `field_specs_from_layout` sites in `assembler.rs`'s own unit tests, and 4
+  `new_struct` sites in `pyjitpl/dispatch.rs`'s unit tests.
+
+**One design change against the plan.** `register_struct_layout` now applies the
+declaration to an already-registered spec *before* its "every offset known" early
+return, and only ever raises a rank. Without that, a struct whose layout was first
+registered by a site carrying no declaration would keep `is_immutable: false`
+forever — emit sites lower in an arbitrary order, so the declaration must not
+depend on arriving first. Two tests pin both directions.
+
+**A wrong assertion in this plan, corrected.** Task 2's snippet asserted
+`is_immutable` for a `?` entry. It is false: the ranks are disjoint —
+`ImmutableRanking.pure` excludes the quasi variants, and the LLBC front end writes
+the same pair from `ImmutableRank::is_immutable` / `is_quasi_immutable`. Note
+`StructFieldLayout::is_immutable()` on the translate side uses a *different* rule
+(`rank.is_some()`), so "immutable" is not one predicate repo-wide.
+
+## Task 6 — landed (`aa5b55f91af`)
+
+`majit/examples/regex` with `regex.rs` / `interp.rs` / `main.rs`, 11 tests,
+asserting the fixture facts (93 nodes; depth 8 balanced, 26 left-associated).
+
+`empty` was added to the declaration afterwards. It was omitted from this plan's
+own field list, and that was an error: `shift`'s `Sequence` arm reads both
+children's `empty`, so leaving it undeclared would survive the fold as one reload
+per node — exactly the thing the experiment is supposed to eliminate.
+
+## Task 5 — blocked, and the plan's framing of it was wrong
+
+The plan called this "memoize helper JitCode construction". That is not
+sufficient. `add_sub_jitcode` pushes `RuntimeBhDescr::JitCode(Arc<JitCode>)` into
+the **current builder's own** descr pool, so direct self-recursion needs a JitCode
+whose pool holds an `Arc` to itself — a reference cycle, not a caching problem.
+RPython does not hit it because `CodeWriter.make_jitcodes` / `get_jitcode` mint an
+empty JitCode **shell** per graph before any body is written; majit's
+`JitCodeBuilder` produces a `JitCode` by value at the end.
+
+Under evaluation before implementing.
 

@@ -18,10 +18,14 @@ pub const KIND_REPETITION: u8 = 4;
 /// `left` and `right` are all fixed once lowered; `marked` is the single
 /// mutable bit the algorithm shifts around.
 ///
-/// The declaration below names four of the five fixed fields.  `empty` is
-/// immutable as well and is left undeclared for now.
+/// The declaration names every fixed field and stops there.  `marked` is the
+/// one omission and the whole experiment turns on it: with the others declared,
+/// a walk from a constant root folds away entirely and the marks are all that
+/// is left to store.  `empty` belongs in the list because `shift` reads it —
+/// the `Sequence` arm reads both children's — and an undeclared read would
+/// survive the fold as a reload per node.
 #[repr(C)]
-#[majit_macros::jit_immutable_fields("left", "right", "kind", "ch")]
+#[majit_macros::jit_immutable_fields("left", "right", "kind", "ch", "empty")]
 pub struct NodeRec {
     pub kind: u8,
     pub ch: u8,
