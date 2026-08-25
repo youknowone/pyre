@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # `object_getstate` calls an overriding `__getstate__` and only falls back to
 # `object_getstate_default(required)` when the type still uses
 # `object.__getstate__`.  The `required` refusal therefore stops at the
@@ -8,8 +9,8 @@
 # `__reduce_ex__` is called directly rather than through `pickle`: this
 # directory carries its own `_pickle.py`, which shadows the stdlib extension
 # module and stops `import pickle` from working here.  That keeps this file
-# green under CPython too, unlike its `pickle_*` neighbours; it still carries
-# no `gate=1` marker until it has been run against a build.
+# green under CPython too, unlike its `pickle_*` neighbours, which is what
+# lets it be gated.
 import io
 import itertools
 import types
