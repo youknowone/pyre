@@ -257,8 +257,8 @@ pub struct CallEffectOverride {
     /// against the artifact and still matches nothing, because non-`Method`
     /// patterns are compared by full structural equality.
     ///
-    /// The spelling a call site actually carries is what `PYRE_CALLEE_CENSUS=1`
-    /// prints in its `with_graph` table (set `PYRE_CALLEE_CENSUS_ROWS=all`;
+    /// The spelling a call site actually carries is what `MAJIT_CALLEE_CENSUS=1`
+    /// prints in its `with_graph` table (set `MAJIT_CALLEE_CENSUS_ROWS=all`;
     /// the default cap is 25 rows). Confirm a new row against the per-entry
     /// match counter in the same output — a row that reads `0x INERT` is not
     /// installed, whatever it looks like here.
@@ -3845,22 +3845,22 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `__pyre_cast_instance/<Root>` — front::mir's pointer-downcast
-        // narrow (#298, `mir.rs` emits `Call(["__pyre_cast_instance",
+        // `__cast_instance_intrinsic/<Root>` — front::mir's pointer-downcast
+        // narrow (#298, `mir.rs` emits `Call(["__cast_instance_intrinsic",
         // root], [v])` for a `Ref → *Struct` reinterpret).  The rtyper
-        // lowers it to `cast_pointer` (`rbuiltin.rs rtype_pyre_cast_instance`,
+        // lowers it to `cast_pointer` (`rbuiltin.rs rtype_cast_instance_intrinsic`,
         // `exception_cannot_occur`), which jtransform folds to `same_as`;
         // the charon front-end skips the rtyper, so fold the marker to the
         // operand alias here too.  The JIT does not distinguish a downcast
         // pointer from its source, so this emits no jitcode op.
-        // `__pyre_cast_address` — the erasing twin (`p as *mut u8`), which
+        // `__cast_address_intrinsic` — the erasing twin (`p as *mut u8`), which
         // carries no root and so is single-segment.  It reinterprets the
         // same pointer too, and the JIT distinguishes a pointer no more
         // from its erasure than from its downcast, so it folds the same
         // way: the operand alias, no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && ((segments.len() == 2 && segments[0] == "__pyre_cast_instance")
-                || (segments.len() == 1 && segments[0] == "__pyre_cast_address"))
+            && ((segments.len() == 2 && segments[0] == "__cast_instance_intrinsic")
+                || (segments.len() == 1 && segments[0] == "__cast_address_intrinsic"))
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -7763,7 +7763,7 @@ static CLASSIFY_SEEN_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::
 
 fn record_classify_seen(target: &CallTarget) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|v| v == "1")) {
+    if !*ON.get_or_init(|| std::env::var_os("MAJIT_CALLEE_CENSUS").is_some_and(|v| v == "1")) {
         return;
     }
     CLASSIFY_SEEN_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10915,7 +10915,7 @@ mod tests {
 
         let mut cc = CallControl::new();
         cc.setup_jitdriver(
-            CallPath::from_segments(["pyre_jit", "other_portal"]),
+            CallPath::from_segments(["jit_artifact", "other_portal"]),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -10924,7 +10924,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let portal_graph = CallPath::from_segments(["pyre_jit", "eval_loop_jit"]);
+        let portal_graph = CallPath::from_segments(["jit_artifact", "eval_loop_jit"]);
         cc.setup_jitdriver(
             portal_graph.clone(),
             vec![

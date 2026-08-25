@@ -850,7 +850,7 @@ fn header_read_narrows_to_a_typed_field_read() {
                     ..
                 } if segments.as_slice()
                     == [
-                        "__pyre_cast_instance".to_string(),
+                        "__cast_instance_intrinsic".to_string(),
                         "ObjectHeader".to_string(),
                     ] =>
                 {
@@ -1042,7 +1042,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
             else {
                 continue;
             };
-            if segments.first().map(String::as_str) != Some("__pyre_cast_instance") {
+            if segments.first().map(String::as_str) != Some("__cast_instance_intrinsic") {
                 continue;
             }
             let root = segments.get(1).cloned().unwrap_or_default();

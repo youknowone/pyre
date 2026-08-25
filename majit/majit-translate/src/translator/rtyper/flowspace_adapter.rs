@@ -478,8 +478,8 @@ fn resolve_result_hlvalue(
 /// `flowcontext.py` → `op.invert`); without static type info,
 /// the adapter cannot discriminate, so fail-loud is the only safe
 /// choice.
-fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
-    match pyre_name {
+fn normalize_unary_op_name(source_name: &str) -> Result<String, TyperError> {
+    match source_name {
         "neg" => Ok("neg".to_string()),
         // RPython `bool` is registered as a unary op at
         // `operation.py add_operator('bool', 1, ..)` and emitted
@@ -564,8 +564,8 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 /// (`operation.py:475-510` registers no such binary operator), so the
 /// keyword-suffixed `and_` / `or_` names below are unambiguously the
 /// bitwise registrations.
-fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
-    let normalized = match pyre_name {
+fn normalize_binop_name(source_name: &str) -> Result<String, TyperError> {
+    let normalized = match source_name {
         "and" | "bitand" => "and_",
         "or" | "bitor" => "or_",
         "bitxor" => "xor",
@@ -1046,7 +1046,7 @@ pub fn translate_op(
     // `rpbc.rs`'s `FunctionRepr::rtype_simple_call`).  Empty registry
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     // Unit-variant ctors (`StepResult::Continue`, `LoopResult::Done`, …)
     // pre-fold to `Hlvalue::Constant(HostObject(prebuilt_instance))` in the
@@ -1569,7 +1569,7 @@ pub fn translate_op(
             let result = resolve_result_hlvalue(op, value_map)?;
             match target {
                 // `FunctionPath` resolves through
-                // `PyreCallRegistry`, returning the registry entry's
+                // `CallRegistry`, returning the registry entry's
                 // `HostObject::UserFunction` instead of an opaque
                 // wrapper. The rtyper's `pair_simple_call` then
                 // short-circuits on `bookkeeper.descs` (pre-populated
@@ -1753,9 +1753,9 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
-                    // `__pyre_cast_instance` — front-end pointer-downcast
+                    // `__cast_instance_intrinsic` — front-end pointer-downcast
                     // narrow (#298).  `front::mir` emits a synthetic
-                    // `Call(["__pyre_cast_instance", <root>], [operand])`
+                    // `Call(["__cast_instance_intrinsic", <root>], [operand])`
                     // for `obj as *const RegisteredStruct`, stashing the
                     // target struct root in `segments[1]` because the
                     // `Vec<Variable>` arg carrier cannot hold a `Constant`
@@ -1766,20 +1766,20 @@ pub fn translate_op(
                     // trailing `ByteStr` root to type the result
                     // `SomeInstance(root)`, and the typer lowers the call
                     // to a `cast_pointer`.  The callable resolves through
-                    // the `__pyre_cast_instance` HOST_ENV singleton so its
+                    // the `__cast_instance_intrinsic` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
-                    if segments.len() == 2 && segments[0] == "__pyre_cast_instance" {
+                    if segments.len() == 2 && segments[0] == "__cast_instance_intrinsic" {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
-                                "__pyre_cast_instance requires exactly one operand, got {}",
+                                "__cast_instance_intrinsic requires exactly one operand, got {}",
                                 arg_hls.len()
                             )));
                         }
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__pyre_cast_instance")
+                            .lookup_builtin("__cast_instance_intrinsic")
                             .ok_or_else(|| {
                                 TyperError::message(
-                                    "__pyre_cast_instance missing from HOST_ENV bootstrap"
+                                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
                                         .to_string(),
                                 )
                             })?;
@@ -1793,25 +1793,25 @@ pub fn translate_op(
                         ))));
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
-                    // `__pyre_cast_address` — the erasing twin of the narrow
+                    // `__cast_address_intrinsic` — the erasing twin of the narrow
                     // above (`front::mir` emits it for `p as *mut u8`).  It
                     // carries no root, so the reconstruction is the plain
                     // `simple_call(callable, operand)`; resolving through the
                     // HOST_ENV singleton keeps the Arc identity that keys its
                     // `BUILTIN_TYPER` entry, which a single-segment path
-                    // consulting the `PyreCallRegistry` first would lose.
-                    if segments.len() == 1 && segments[0] == "__pyre_cast_address" {
+                    // consulting the `CallRegistry` first would lose.
+                    if segments.len() == 1 && segments[0] == "__cast_address_intrinsic" {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
-                                "__pyre_cast_address requires exactly one operand, got {}",
+                                "__cast_address_intrinsic requires exactly one operand, got {}",
                                 arg_hls.len()
                             )));
                         }
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__pyre_cast_address")
+                            .lookup_builtin("__cast_address_intrinsic")
                             .ok_or_else(|| {
                                 TyperError::message(
-                                    "__pyre_cast_address missing from HOST_ENV bootstrap"
+                                    "__cast_address_intrinsic missing from HOST_ENV bootstrap"
                                         .to_string(),
                                 )
                             })?;
@@ -1824,9 +1824,9 @@ pub fn translate_op(
                     }
                     // `front::range_iter`'s synthesized `range(start, stop)`
                     // (the exclusive int-`Range` for-loop divert).  It carries
-                    // the reserved `__pyre_range` spelling rather than a bare
+                    // the reserved `__majit_range` spelling rather than a bare
                     // `["range"]` because the registry ladder below resolves a
-                    // single-segment path against the `PyreCallRegistry`
+                    // single-segment path against the `CallRegistry`
                     // *first* (the `frame.globals`-before-`__builtin__` order
                     // of `flowcontext.py:845-853`), and pyre's registry is one
                     // flat namespace keyed by leaf-only `CallPath`s.  A pyre
@@ -1841,8 +1841,8 @@ pub fn translate_op(
                     // spelling straight to the `HOST_ENV` singleton keeps the
                     // Arc identity that keys `rtype_builtin_range`
                     // (`rrange.py:96-126`), the same discipline the
-                    // `__pyre_cast_instance` arm above documents.
-                    if segments.len() == 1 && segments[0] == "__pyre_range" {
+                    // `__cast_instance_intrinsic` arm above documents.
+                    if segments.len() == 1 && segments[0] == "__majit_range" {
                         let callable_host = HOST_ENV.lookup_builtin("range").ok_or_else(|| {
                             TyperError::message("range missing from HOST_ENV bootstrap".to_string())
                         })?;
@@ -1863,24 +1863,24 @@ pub fn translate_op(
                     // `newstringbuilder` arms already consume, mirroring the
                     // `Vec::push` / `slice.reverse` method arms below.
                     //
-                    // `__pyre_stringbuilder_new` → `newstringbuilder`, forwarding
+                    // `__majit_stringbuilder_new` → `newstringbuilder`, forwarding
                     // the ctor operands verbatim: `new()` carries none and
                     // `with_capacity(n)` carries the size `n`.  The operand count
                     // mirrors `len(hop.args_v)` in
                     // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py),
                     // which `rtype_newstringbuilder` honours — no arg selects
                     // `ll_new(INIT_SIZE)`, the size arg threads `ll_new(n)`.
-                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_new" {
+                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_new" {
                         return Ok(vec![FlowspaceOp::new("newstringbuilder", arg_hls, result)]);
                     }
-                    // `__pyre_stringbuilder_append(recv, piece)` →
+                    // `__majit_stringbuilder_append(recv, piece)` →
                     // `getattr(recv, "append") + simple_call(bound, piece)`,
                     // reaching `StringBuilderRepr::rtype_method("append")`
                     // (rstring.py) — identical to the `Vec::push` arm.
-                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_append" {
+                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_append" {
                         if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
-                                "__pyre_stringbuilder_append requires exactly two args \
+                                "__majit_stringbuilder_append requires exactly two args \
                                  (receiver, piece), got {}",
                                 arg_hls.len()
                             )));
@@ -1888,12 +1888,12 @@ pub fn translate_op(
                         let mut iter = arg_hls.into_iter();
                         let receiver = iter.next().ok_or_else(|| {
                             TyperError::message(
-                                "__pyre_stringbuilder_append requires a receiver arg".to_string(),
+                                "__majit_stringbuilder_append requires a receiver arg".to_string(),
                             )
                         })?;
                         let piece = iter.next().ok_or_else(|| {
                             TyperError::message(
-                                "__pyre_stringbuilder_append requires a piece arg".to_string(),
+                                "__majit_stringbuilder_append requires a piece arg".to_string(),
                             )
                         })?;
                         let bound_method = Hlvalue::Variable(Variable::new());
@@ -1911,15 +1911,15 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method, piece], result),
                         ]);
                     }
-                    // `__pyre_stringbuilder_build(recv)` →
+                    // `__majit_stringbuilder_build(recv)` →
                     // `getattr(recv, "build") + simple_call(bound)`, reaching
                     // `StringBuilderRepr::rtype_method("build")`
                     // (rstring.py) → `SomeString` — identical to the
                     // `slice.reverse` arm (no extra args on the bound method).
-                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_build" {
+                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_build" {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
-                                "__pyre_stringbuilder_build requires exactly one receiver arg, \
+                                "__majit_stringbuilder_build requires exactly one receiver arg, \
                                  got {}",
                                 arg_hls.len()
                             )));
@@ -1927,7 +1927,7 @@ pub fn translate_op(
                         let mut iter = arg_hls.into_iter();
                         let receiver = iter.next().ok_or_else(|| {
                             TyperError::message(
-                                "__pyre_stringbuilder_build requires a receiver arg".to_string(),
+                                "__majit_stringbuilder_build requires a receiver arg".to_string(),
                             )
                         })?;
                         let bound_method = Hlvalue::Variable(Variable::new());
@@ -2192,7 +2192,7 @@ pub fn translate_op(
                         ));
                     }
                     let key =
-                        crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(
+                        crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
                         );
                     // Method-routing for a registered dispatch family
@@ -2246,7 +2246,7 @@ pub fn translate_op(
                     // Three resolution layers, matching upstream's three
                     // dispatch shapes for a dotted call site:
                     //
-                    // 1. `PyreCallRegistry` — user functions registered
+                    // 1. `CallRegistry` — user functions registered
                     //    by the production builder.  Analogous to
                     //    `flowspace/flowcontext.py:LOAD_GLOBAL` reading
                     //    `frame.globals` (user globals) first.
@@ -2306,11 +2306,11 @@ pub fn translate_op(
                         // unresolved so the referencing graph deterministically
                         // Skips to the legacy walker (unbuildable callee →
                         // caller Skips).
-                        if let Some(lift_err) = entry.pyre_lift_error() {
+                        if let Some(lift_err) = entry.lift_error() {
                             return Err(TyperError::message(format!(
                                 "translate_op: OpKind::Call::FunctionPath \
                                  {{ segments: {:?} }} resolves to a \
-                                 PyreCallRegistry entry whose pyre-side lift \
+                                 CallRegistry entry whose source lift \
                                  failed ({lift_err}); the referencing graph \
                                  falls back to the legacy walker. \
                                  Result slot = {}",
@@ -2390,11 +2390,11 @@ pub fn translate_op(
                         // Same fail-closed rule as the exact-lookup branch: a
                         // lift-errored entry is unresolved, so the referencing
                         // graph Skips to the legacy walker.
-                        if let Some(lift_err) = entry.pyre_lift_error() {
+                        if let Some(lift_err) = entry.lift_error() {
                             return Err(TyperError::message(format!(
                                 "translate_op: OpKind::Call::FunctionPath \
                                  {{ segments: {:?} }} leaf-matches a \
-                                 PyreCallRegistry entry whose pyre-side lift \
+                                 CallRegistry entry whose source lift \
                                  failed ({lift_err}); the referencing graph \
                                  falls back to the legacy walker. \
                                  Result slot = {}",
@@ -2406,7 +2406,7 @@ pub fn translate_op(
                     } else {
                         return Err(TyperError::message(format!(
                             "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
-                             not registered in PyreCallRegistry, not in HOST_ENV \
+                             not registered in CallRegistry, not in HOST_ENV \
                              `__builtin__`, and not a known module-qualified host attribute — \
                              the production builder (a SemanticProgram walker, or a test \
                              fixture building the registry directly) must register the path \
@@ -2552,7 +2552,7 @@ pub fn translate_op(
                         let owner_tail = owner_path.last();
                         let owner_qual = owner_path.join("::");
                         let is_enum_variant =
-                            bk.pyre_struct_fields.borrow().as_ref().is_some_and(|reg| {
+                            bk.struct_fields.borrow().as_ref().is_some_and(|reg| {
                                 reg.is_enum_base(&owner_qual)
                                     || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
                             });
@@ -2575,7 +2575,7 @@ pub fn translate_op(
                             let colon_qual = format!("{owner_qual}::{name}");
                             let is_closure_root = majit_charon_reader::ullbc::is_closure_leaf(name)
                                 && bk
-                                    .pyre_struct_fields
+                                    .struct_fields
                                     .borrow()
                                     .as_ref()
                                     .is_some_and(|reg| reg.fields.contains_key(&colon_qual));
@@ -2637,10 +2637,10 @@ pub fn translate_op(
                 // inputargs, not temps — so the method getattr would block
                 // on the classdef-less shell.  Narrow the receiver first to
                 // the trait-family base `ClassDef` via the
-                // `__pyre_cast_instance` mechanism (same as the `mir.rs`
-                // path, lowered by `translate_op`'s `__pyre_cast_instance`
+                // `__cast_instance_intrinsic` mechanism (same as the `mir.rs`
+                // path, lowered by `translate_op`'s `__cast_instance_intrinsic`
                 // arm): emit
-                // `simple_call(__pyre_cast_instance, receiver,
+                // `simple_call(__cast_instance_intrinsic, receiver,
                 // Constant(byte_str(base_root)))` producing a narrowed
                 // receiver, then `getattr(narrowed, method_name)`.  The
                 // family base's impl subclasses carry the methods through
@@ -2649,7 +2649,7 @@ pub fn translate_op(
                 // through the ordinary bound-method path
                 // (`rpbc.py FunctionRepr.call`); dispatch stays virtual.
                 //
-                // The cast root must resolve through `pyre_struct_root_classes`
+                // The cast root must resolve through `struct_root_classes`
                 // to the base classdef `register_trait_family` minted under
                 // `canonical_struct_name(base_root)`.  `trait_root` here is
                 // the bare trait leaf (`dyn_indirect_target`), but the family
@@ -2679,10 +2679,10 @@ pub fn translate_op(
                     // trait is a registered dispatch family.
                     let getattr_receiver = if let Some(base_root) = base_root {
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__pyre_cast_instance")
+                            .lookup_builtin("__cast_instance_intrinsic")
                             .ok_or_else(|| {
                                 TyperError::message(
-                                    "__pyre_cast_instance missing from HOST_ENV bootstrap"
+                                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
                                         .to_string(),
                                 )
                             })?;
@@ -2926,7 +2926,7 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         // Each front-end `stop_unsupported` / `continue_with_unknown`
         // emit-site is retired by lowering its specific expression
         // form (`ConstStr`, `Range`, `Closure`, etc.).
-        OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
+        OpKind::Abort { .. } => "Abort (runtime extension marker)",
         _ => return None,
     })
 }
@@ -2999,7 +2999,7 @@ fn constant_from_constvalue(value: ConstValue) -> Constant {
 
 fn legacy_const_define_hlvalue(
     op: &SpaceOperation,
-    call_registry: Option<&crate::translator::rtyper::pyre_call_registry::PyreCallRegistry>,
+    call_registry: Option<&crate::translator::rtyper::call_registry::CallRegistry>,
 ) -> Result<Option<Hlvalue>, TyperError> {
     // Const-define ops always carry a result Variable; bail on the
     // (malformed) result-less op so the caller can key the const
@@ -3084,12 +3084,11 @@ fn legacy_const_define_hlvalue(
             let segments = crate::model::fn_const_segments(target).expect("guard checked");
             let call_registry = call_registry.ok_or_else(|| {
                 TyperError::message(format!(
-                    "fn const {:?} requires a PyreCallRegistry to materialise getfunctionptr",
+                    "fn const {:?} requires a CallRegistry to materialise getfunctionptr",
                     segments
                 ))
             })?;
-            let key =
-                crate::translator::rtyper::pyre_call_registry::FunctionPathKey(segments.to_vec());
+            let key = crate::translator::rtyper::call_registry::FunctionPathKey(segments.to_vec());
             let entry = call_registry.lookup_with_leaf_match(&key).ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} did not resolve to a registered callee",
@@ -3119,7 +3118,7 @@ fn legacy_const_define_hlvalue(
             // `None`; the site then fails closed with the most specific
             // diagnosis, exactly as before.
             use crate::translator::rtyper::lltypesystem::lltype;
-            let lift_error = entry.pyre_lift_error();
+            let lift_error = entry.lift_error();
             let graphs = entry.function_desc.borrow().getgraphs();
             let maybe_graph = graphs.into_iter().next();
             // Precise fn-ptr only when the callee is lifted (cached graph, no
@@ -3423,20 +3422,20 @@ pub(crate) fn derive_subject_inputcells(
                 // root resolver excludes the core/std/alloc container
                 // family precisely so the receiver projects to the
                 // annotator's list model here, not a minted classdef).
-                // `project_pyre_field_type` maps the spelling to
+                // `project_struct_field_type` maps the spelling to
                 // `SomeList(elem)` so a `len()` / iteration on the receiver
                 // resolves as a list op instead of `getattr` over the
                 // classdef-less `SomeInstance(None)` shell.
                 if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
                     && majit_ir::descr::is_list_container_spelling(root)
                 {
-                    cells.push(bk.project_pyre_field_type(root));
+                    cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
                 // String-typed params are string values, not class
                 // instances: `String` and `str` both map to the byte
                 // string type (`s_str0` = `SomeString(no_nul=True)`,
-                // matching `project_pyre_field_type`).  String literals
+                // matching `project_struct_field_type`).  String literals
                 // lower through `__str_const` to `ConstValue::ByteStr`
                 // (flowspace_adapter, stamped `Ptr(STR)`/`StringRepr`),
                 // so a literal flowing into a `&str`/`String` param must
@@ -3462,11 +3461,7 @@ pub(crate) fn derive_subject_inputcells(
                     // instead of blocking on the classdef-less shell.
                     // Checked before the unique-impl substitution below —
                     // a multi-impl family has no unique impl to fold to.
-                    let family_base = bk
-                        .pyre_trait_family_bases
-                        .borrow()
-                        .get(root.as_str())
-                        .cloned();
+                    let family_base = bk.trait_family_bases.borrow().get(root.as_str()).cloned();
                     if let Some(base_host) = family_base {
                         let cd = bk.getuniqueclassdef(&base_host).map_err(|e| {
                             TyperError::message(format!(
@@ -3493,27 +3488,27 @@ pub(crate) fn derive_subject_inputcells(
                     // that impl type — substitute its struct root and
                     // seed below as if the param were typed concretely.
                     let root = bk
-                        .pyre_trait_unique_impls
+                        .trait_unique_impls
                         .borrow()
                         .get(root)
                         .cloned()
                         .unwrap_or_else(|| root.clone());
                     let root = &root;
                     let known = bk
-                        .pyre_struct_fields
+                        .struct_fields
                         .borrow()
                         .as_ref()
                         .is_some_and(|reg| reg.fields.contains_key(root));
                     if known {
                         // A `&FixedObjectArray` receiver models as its
                         // `_items` element list, not the wrapping struct
-                        // (project_pyre_field_type), so an `arr[idx]` access
+                        // (project_struct_field_type), so an `arr[idx]` access
                         // resolves as a list `getitem` rather than rewriting
                         // to `getattr("__getitem__")`.
                         if majit_ir::descr::canonical_struct_name(root)
                             == "object_array::FixedObjectArray"
                         {
-                            cells.push(bk.project_pyre_field_type(root));
+                            cells.push(bk.project_struct_field_type(root));
                             continue;
                         }
                         let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
@@ -3636,7 +3631,7 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
 pub fn function_graph_to_flowspace(
     legacy: &FunctionGraph,
     // Call resolution plumbing — see [`translate_op`].
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
     let mut value_to_var: LegacyToTyped = HashMap::new();
     let mut value_to_var_candidates: LegacyToTypedCandidates = HashMap::new();
@@ -4161,8 +4156,8 @@ mod tests {
     use crate::model::{
         Block, BlockId, FunctionGraph as LegacyGraph, OpKind, SpaceOperation, ValueType,
     };
+    use crate::translator::rtyper::call_registry::CallRegistry;
     use crate::translator::rtyper::legacy_annotator::setbinding;
-    use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
 
     /// Mint `n` fresh values on `graph`, returned indexed `0..n` so
     /// fixtures can refer to operands / results / inputargs positionally.
@@ -4179,12 +4174,12 @@ mod tests {
         vids.iter().map(|&i| vars[i].clone()).collect()
     }
 
-    /// Helper: empty `PyreCallRegistry` for tests that don't exercise
+    /// Helper: empty `CallRegistry` for tests that don't exercise
     /// the Call resolution path.  The registry's
     /// bookkeeper is freshly minted because translate_op tests don't
     /// share state with an enclosing annotator.
-    fn empty_call_registry() -> PyreCallRegistry {
-        PyreCallRegistry::new(Rc::new(Bookkeeper::new()))
+    fn empty_call_registry() -> CallRegistry {
+        CallRegistry::new(Rc::new(Bookkeeper::new()))
     }
 
     #[test]
@@ -4823,12 +4818,12 @@ mod tests {
     fn translate_op_call_function_path_lowers_to_simple_call() {
         // Call::FunctionPath → `simple_call(callable_host, args...)` per
         // `flowspace/operation.py SimpleCall.opname = 'simple_call'`.
-        // The callable Constant wraps the `PyreCallRegistry` entry's
+        // The callable Constant wraps the `CallRegistry` entry's
         // synthetic `HostObject::UserFunction` so the rtyper's
         // `bookkeeper.getdesc` short-circuits onto the registered
         // FunctionDesc.
         use crate::flowspace::argument::Signature;
-        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -5036,7 +5031,7 @@ mod tests {
         // fallback it would error instead.  Locks in the
         // exact-before-leaf-match precedence the resolver depends on.
         use crate::flowspace::argument::Signature;
-        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -5095,7 +5090,7 @@ mod tests {
         // captured by a registered `[mymod, ValueError]` free fn through
         // `lookup_with_leaf_match`.
         use crate::flowspace::argument::Signature;
-        use crate::translator::rtyper::pyre_call_registry::FunctionPathKey;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -5153,7 +5148,7 @@ mod tests {
 
     #[test]
     fn translate_op_call_function_path_falls_back_to_host_env_builtin() {
-        // Single-segment FunctionPath unregistered in PyreCallRegistry
+        // Single-segment FunctionPath unregistered in CallRegistry
         // falls back to HOST_ENV.lookup_builtin(name), letting frontend
         // `Expr::Cast` lowering emit
         // `Call { target: FunctionPath { segments: vec!["int"] }, args }`
@@ -5199,7 +5194,7 @@ mod tests {
 
     #[test]
     fn translate_op_call_function_path_resolves_host_module_attr_for_lltype_cast() {
-        // Multi-segment FunctionPath unregistered in PyreCallRegistry
+        // Multi-segment FunctionPath unregistered in CallRegistry
         // falls back to Layer 3 (HOST_ENV.import_module + module_get).
         // Mirrors upstream `LOAD_GLOBAL lltype` → `LOAD_ATTR cast_ptr_\
         // to_int` chain (`flowcontext.py:861-866`).  The resolved
@@ -5248,7 +5243,7 @@ mod tests {
     fn translate_op_call_function_path_rejects_unregistered_multi_segment_path() {
         // Defense-in-depth: an arbitrary multi-segment user path
         // (`some.unknown.module.path`) that misses every layer —
-        // PyreCallRegistry, HOST_ENV single-segment builtin, and
+        // CallRegistry, HOST_ENV single-segment builtin, and
         // HOST_ENV module attr (because `some.unknown.module` is not
         // curated in `populate_host_env`) — surfaces a `TyperError`
         // rather than a silent host-attribute resolution.  This pins
@@ -5277,7 +5272,7 @@ mod tests {
             .expect_err("Unregistered FunctionPath must surface TyperError, not silently resolve");
         let msg = format!("{err}");
         assert!(
-            msg.contains("not registered in PyreCallRegistry"),
+            msg.contains("not registered in CallRegistry"),
             "error must name the missing-registration invariant, got: {msg}"
         );
     }
@@ -5374,7 +5369,7 @@ mod tests {
 
     #[test]
     fn translate_op_stringbuilder_new_marker_lowers_to_newstringbuilder() {
-        // Bare `new()` `__pyre_stringbuilder_new` (front builder-mode ctor
+        // Bare `new()` `__majit_stringbuilder_new` (front builder-mode ctor
         // rewrite) → one `newstringbuilder` op with no operands; the annotator
         // types its result `SomeStringBuilder` and `rtype_newstringbuilder`
         // picks `ll_new(INIT_SIZE)` (`len(hop.args_v) == 0`).
@@ -5387,14 +5382,14 @@ mod tests {
             result: Some(vars[1].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__pyre_stringbuilder_new".into()],
+                    segments: vec!["__majit_stringbuilder_new".into()],
                 },
                 args: vec![],
                 result_ty: ValueType::Ref(None),
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("__pyre_stringbuilder_new marker must lower");
+            .expect("__majit_stringbuilder_new marker must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "newstringbuilder");
         assert!(translated[0].args.is_empty());
@@ -5403,7 +5398,7 @@ mod tests {
 
     #[test]
     fn translate_op_stringbuilder_new_marker_forwards_with_capacity_size() {
-        // `with_capacity(n)` `__pyre_stringbuilder_new` → `newstringbuilder`
+        // `with_capacity(n)` `__majit_stringbuilder_new` → `newstringbuilder`
         // carrying the size operand `n`.  `rtype_newstringbuilder` then takes
         // the `len(hop.args_v) != 0` branch and threads `ll_new(n)`
         // (rtyper/rbuilder.py) instead of the `INIT_SIZE` default.
@@ -5418,14 +5413,14 @@ mod tests {
             result: Some(vars[1].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__pyre_stringbuilder_new".into()],
+                    segments: vec!["__majit_stringbuilder_new".into()],
                 },
                 args: vec![vars[2].clone()],
                 result_ty: ValueType::Ref(None),
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("__pyre_stringbuilder_new marker must lower");
+            .expect("__majit_stringbuilder_new marker must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "newstringbuilder");
         assert_eq!(translated[0].args.len(), 1);
@@ -5435,7 +5430,7 @@ mod tests {
 
     #[test]
     fn translate_op_stringbuilder_append_marker_chains_getattr_simple_call() {
-        // `__pyre_stringbuilder_append(recv, piece)` → `getattr(recv,
+        // `__majit_stringbuilder_append(recv, piece)` → `getattr(recv,
         // "append") + simple_call(bound, piece)`, the same method shape as
         // `Vec::push`; reaches `StringBuilderRepr::rtype_method("append")`.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -5450,14 +5445,14 @@ mod tests {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__pyre_stringbuilder_append".into()],
+                    segments: vec!["__majit_stringbuilder_append".into()],
                 },
                 args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Void,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("__pyre_stringbuilder_append marker must lower");
+            .expect("__majit_stringbuilder_append marker must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[0].args.len(), 2);
@@ -5478,7 +5473,7 @@ mod tests {
 
     #[test]
     fn translate_op_stringbuilder_build_marker_chains_getattr_simple_call() {
-        // `__pyre_stringbuilder_build(recv)` → `getattr(recv, "build") +
+        // `__majit_stringbuilder_build(recv)` → `getattr(recv, "build") +
         // simple_call(bound)`, the same shape as `slice.reverse` (no extra
         // arg); reaches `StringBuilderRepr::rtype_method("build")` →
         // `SomeString`.
@@ -5493,14 +5488,14 @@ mod tests {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__pyre_stringbuilder_build".into()],
+                    segments: vec!["__majit_stringbuilder_build".into()],
                 },
                 args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(None),
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("__pyre_stringbuilder_build marker must lower");
+            .expect("__majit_stringbuilder_build marker must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[0].args[0], recv);
@@ -6739,7 +6734,7 @@ mod tests {
         use crate::model::CallTarget;
 
         let registry = empty_call_registry();
-        let key = crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments([
+        let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments([
             "module", "function",
         ]);
         let func = crate::flowspace::model::GraphFunc::new(

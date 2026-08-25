@@ -2597,7 +2597,7 @@ impl Assembler {
     /// Pyre serialises `insns.bin` at build time and the runtime
     /// decoder reads those bytes verbatim, so canonical/extension keys
     /// pin a reserved `BC_*` (`crate::insns::wellknown_bh_insns` /
-    /// `pyre_extension_insns`, merged through
+    /// `extension_insns`, merged through
     /// [`crate::insns::insn_byte_opt`]) — this preserves byte stability
     /// across builds for keys that the runtime walker dispatches.
     /// Translator-only keys (transient codewriter helpers, test

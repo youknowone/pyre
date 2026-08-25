@@ -61,14 +61,12 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
+use crate::translator::rtyper::call_registry::{CallRegistry, FunctionEntry, FunctionPathKey};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{
     FlowspaceAdapterOutput, LegacyToTyped, LegacyToTypedCandidates,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-use crate::translator::rtyper::pyre_call_registry::{
-    FunctionPathKey, PyreCallRegistry, PyreFunctionEntry,
-};
 
 /// The `graph.return_type` marker the front-end stamps on a
 /// `dont_look_inside` callee that returns `*mut PyObject` (a
@@ -271,7 +269,7 @@ pub(crate) enum DualGateOutcome {
 /// Production dual-gate — registry-aware entry.
 ///
 /// Drives the real path via [`specialize_legacy_graph_with_registry_returning_value_to_var`]
-/// against a pre-populated `PyreCallRegistry` so graphs with
+/// against a pre-populated `CallRegistry` so graphs with
 /// `OpKind::Call::FunctionPath` callsites resolve through the upstream
 /// `Constant(<function>) -> getdesc -> FunctionDesc` chain
 /// (`bookkeeper.py:353-409`).  Production callers
@@ -301,7 +299,7 @@ pub(crate) enum DualGateOutcome {
 /// directly for hand-built fixtures.
 pub(crate) fn dual_gate_check_with_registry(
     legacy_graph: &LegacyGraph,
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     lift_sources: &crate::codewriter::call::GraphStore,
 ) -> Result<DualGateOutcome, String> {
     // Same panic-catch contract as `dual_gate_check` — the rtyper's
@@ -407,11 +405,11 @@ struct SubjectSessionSnapshot {
 }
 
 impl SubjectSessionSnapshot {
-    fn capture(call_registry: &PyreCallRegistry) -> Self {
+    fn capture(call_registry: &CallRegistry) -> Self {
         Self::capture_fixed_only(call_registry)
     }
 
-    fn capture_fixed_only(call_registry: &PyreCallRegistry) -> Self {
+    fn capture_fixed_only(call_registry: &CallRegistry) -> Self {
         let Some((annotator, _)) = call_registry.session_if_started() else {
             return Self::default();
         };
@@ -421,7 +419,7 @@ impl SubjectSessionSnapshot {
 }
 
 fn unpoison_failed_subject_callees(
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     session_at_entry: &SubjectSessionSnapshot,
     lift_sources: &crate::codewriter::call::GraphStore,
 ) {
@@ -1367,7 +1365,7 @@ fn compare_real_against_legacy(
 ///
 /// | Substring                                  | Unimplemented feature                                                        |
 /// |--------------------------------------------|------------------------------------------------------------------------------|
-/// | `not registered in PyreCallRegistry`       | Extern Rust helper registry walker.                                          |
+/// | `not registered in CallRegistry`       | Extern Rust helper registry walker.                                          |
 /// | `translate_op: undefined operand`          | Adapter producer correctness.                                                |
 /// | `unimplemented operation`                  | Per-opname rtyper handlers.                                                  |
 /// | `variable used before definition`          | Cross-block locals threading.                                                |
@@ -1419,7 +1417,7 @@ fn compare_real_against_legacy(
 /// from maintaining a second, drifting copy of the substring table. Lowering
 /// only tests whether the result is `Some`.
 pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
-    if msg.contains("not registered in PyreCallRegistry") {
+    if msg.contains("not registered in CallRegistry") {
         return Some("call-registry-miss");
     }
     if msg.contains("translate_op: undefined operand") {
@@ -1518,7 +1516,7 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     // `<default methods of IterOpcodeHandler>::record_for_iter_guard`,
     // `pyjitpl_step::Cannot find attribute`); production cannot
     // compile until each underlying real-path gap is closed
-    // (classdef-less SomeInstance dispatch + `PyreCallRegistry::
+    // (classdef-less SomeInstance dispatch + `CallRegistry::
     // ensure_session` coverage — every analyser body routes through
     // per-touch `arg_at` rather than an eager-prefix concrete
     // walk).  Until each gap-hitter is
@@ -1771,7 +1769,7 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
 pub(crate) fn is_known_unported(msg: &str) -> bool {
     unported_category(msg).is_some()
 }
-/// Populate a `PyreCallRegistry` from a
+/// Populate a `CallRegistry` from a
 /// `HashMap<CallPath, FunctionGraph>` (the shape pyre's
 /// `CallControl::function_graphs()` returns).
 ///
@@ -1795,12 +1793,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
     unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
-    registry: &PyreCallRegistry,
+    registry: &CallRegistry,
 ) -> Result<(), TyperError> {
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
     // (`bookkeeper.py:353-409`) returns the *same* FunctionDesc for
     // any reference to the same callable, keyed by `Constant(pyobj)`
-    // identity.  Pyre's `function_graphs: HashMap<CallPath, FunctionGraph>`
+    // identity. This port's `function_graphs: HashMap<CallPath, FunctionGraph>`
     // can carry the same callable under multiple keys (`lib.rs`
     // registers free functions under both their canonical path AND a
     // `crate::`-prefixed alias for callsite matching); without dedupe,
@@ -1808,20 +1806,18 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // pair, violating upstream's "create once, share thereafter"
     // contract.
     //
-    // The dedupe key strips a leading crate-prefix segment so the
-    // five alias-explosion shapes registered by `lib.rs` for
-    // each free function (`[mod, foo]`, `[crate, mod, foo]`,
-    // `[pyre_interpreter, mod, foo]`, `[pyre_object, mod, foo]`,
-    // `[pyre_jit, mod, foo]`) collapse to a single canonical entry
-    // `[mod, foo]`.  Stripping only `crate` (the previous heuristic)
-    // left the three external crate-name aliases as distinct canonical
-    // entries with distinct `Rc<PyreFunctionEntry>` HostObjects, and
+    // The dedupe key strips a leading crate-prefix segment so the alias
+    // spellings registered by `lib.rs` for each free function (`[mod, foo]`,
+    // `[crate, mod, foo]`, and `[loaded_crate, mod, foo]`) collapse to a
+    // single canonical entry `[mod, foo]`. Stripping only `crate` (the
+    // previous heuristic) left the external crate-name aliases as distinct canonical
+    // entries with distinct `Rc<FunctionEntry>` HostObjects, and
     // `lookup_with_leaf_match`'s multi-match convergence check
     // (`all_same` on `host_object` Arc identity) then failed —
     // callsites like `["crate", "w_str_new"]` (a `use crate::w_str_new`
     // bare callsite from another module) found four matches with four
-    // distinct hosts and rejected the cluster.  Stripping all four
-    // well-known prefixes preserves the rule that genuinely distinct
+    // distinct hosts and rejected the cluster. Stripping all registered
+    // prefixes preserves the rule that genuinely distinct
     // functions in different modules (`a::foo` vs `b::foo`) stay
     // separate (`a` / `b` aren't in the stripped set), and the
     // bare-name dedupe trap (using `FunctionGraph::name`) is still
@@ -1838,12 +1834,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         segs
     }
-    let mut pending: Vec<(
-        FunctionPathKey,
-        &LegacyGraph,
-        Rc<PyreFunctionEntry>,
-        &Signature,
-    )> = Vec::with_capacity(function_graphs.len());
+    let mut pending: Vec<(FunctionPathKey, &LegacyGraph, Rc<FunctionEntry>, &Signature)> =
+        Vec::with_capacity(function_graphs.len());
     // `by_canonical_path` tracks the canonical `FunctionPathKey` of
     // the first-encountered alias for each canonical-stripped key.
     // Subsequent aliases of the same callable register an alias row
@@ -1899,7 +1891,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // that surfaces on the first constructing caller (`w_range_new`,
         // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
         // constructor as a user function so its key is instead served by the
-        // residual stub from `collect_pyre_class_ctor_stubs_from_llbc` (seeded
+        // residual stub from `collect_marked_class_ctor_stubs_from_llbc` (seeded
         // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
         // shell lets the caller annotate.  The numeric boxes never reach here —
         // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
@@ -2001,13 +1993,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // and unsafe-fn stubs above.
     register_foreign_opaque_method_externals(registry, foreign_opaque_method_externals);
     // Pass 2 — prefill the default-cache once per *unique* registry
-    // entry.  Aliases already point at the same `Rc<PyreFunctionEntry>`
+    // entry.  Aliases already point at the same `Rc<FunctionEntry>`
     // so their `prefill_default_cache` would be redundant; identify
     // unique entries by `Rc::as_ptr` so the dedupe survives any
     // alternate dedup-key shape.  Each unique entry is lifted exactly
     // once (`Rc::as_ptr` identity dedup); aliases share the same
     // pre-filled `FunctionDesc.cache` because they hold the same
-    // `Rc<PyreFunctionEntry>`.
+    // `Rc<FunctionEntry>`.
     //
     // Per-callee failure isolation matches RPython
     // `bookkeeper.py getdesc(pyobj)` semantics: each
@@ -2018,7 +2010,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // that lazy shape by isolating per-callee failures here — but
     // unlike a previous draft that *swallowed* the error outright,
     // the lift error is now stashed on the entry via
-    // `PyreFunctionEntry::record_lift_error` so the next
+    // `FunctionEntry::record_lift_error` so the next
     // `cachedgraph` consumer surfaces the actual producer-side
     // failure instead of falling through to `buildflowgraph`'s
     // generic "missing code object" message
@@ -2031,10 +2023,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // behind every later use-site's generic fallback — a divergence
     // from upstream's per-callable failure model where the original
     // exception propagates.
-    let mut lifted: HashSet<*const PyreFunctionEntry> =
-        HashSet::with_capacity(by_canonical_path.len());
+    let mut lifted: HashSet<*const FunctionEntry> = HashSet::with_capacity(by_canonical_path.len());
     // Each lift failure pushes into the translator's
-    // `_pyre_lift_errors` map keyed by the entry's `HostObject`
+    // `_lift_errors` map keyed by the entry's `HostObject`
     // identity, making the recorded error visible to
     // `buildflowgraph` consumers downstream.  Resolved lazily so
     // test fixtures whose `Bookkeeper` runs without an attached
@@ -2054,7 +2045,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // leaves the slot `None` — the fallback declines and the site fails
     // closed exactly as before.
     {
-        let mut seeded: HashSet<*const PyreFunctionEntry> =
+        let mut seeded: HashSet<*const FunctionEntry> =
             HashSet::with_capacity(by_canonical_path.len());
         for (_key, graph, entry, _signature) in &pending {
             if !seeded.insert(Rc::as_ptr(entry)) {
@@ -2110,7 +2101,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
                 if let Some(annotator) = registry.bookkeeper().try_annotator() {
                     annotator
                         .translator
-                        ._pyre_lift_errors
+                        ._lift_errors
                         .borrow_mut()
                         .insert(entry.host_object.clone(), message);
                 }
@@ -2146,7 +2137,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         let [.., owner, method] = segs else {
             continue;
         };
-        if !bk.is_pyre_struct_root(owner) || bk.pyre_struct_root_has_field(owner, method) {
+        if !bk.is_known_struct_root(owner) || bk.struct_root_has_field(owner, method) {
             continue;
         }
         let class_host = bk.intern_class_by_qualname(owner);
@@ -2184,20 +2175,20 @@ pub(crate) fn populate_call_registry_from_call_graphs(
 /// `PyGraph` here.
 ///
 /// `signature` is the callee's authoritative parameter `Signature`
-/// (the same one stored on the `FunctionDesc` in `PyreCallRegistry`).
+/// (the same one stored on the `FunctionDesc` in `CallRegistry`).
 /// `defaults` is empty — pyre's surface DSL does not yet expose
 /// per-parameter default values; when it does, this helper grows a
 /// `defaults: Vec<Constant>` parameter mirroring upstream
 /// `func.__defaults__`.
 ///
-/// `nested_registry` carries the program-wide `PyreCallRegistry`.
+/// `nested_registry` carries the program-wide `CallRegistry`.
 /// For leaf callees (no `OpKind::Call` ops in the body) the registry
 /// is unused; nested callees recursively consult it as the adapter
 /// processes the callee's own `OpKind::Call` ops.
 pub(crate) fn lift_callee_to_pygraph(
     callee_graph: &LegacyGraph,
     signature: Signature,
-    nested_registry: &PyreCallRegistry,
+    nested_registry: &CallRegistry,
 ) -> Result<Rc<PyGraph>, TyperError> {
     // The adapter also returns `value_to_var` and `constant_concretetypes`
     // side maps, but they are not consumed here.
@@ -2268,7 +2259,7 @@ pub(crate) fn lift_callee_to_pygraph(
 /// (`Func` / `Struct` / `Array` / `Opaque` / `ForwardReference` /
 /// `FixedSizeArray`) or `Address` (no `SomeAddress` port yet) —
 /// the caller skips registration for that fn and the original
-/// "not registered in PyreCallRegistry" Skip path covers it.
+/// "not registered in CallRegistry" Skip path covers it.
 ///
 /// **Why pre-annotated Variable rather than `Constant`.** A
 /// `Constant(default_value)` in the return Link routes through
@@ -2514,11 +2505,11 @@ fn declared_funcptr_type_from_legacy(
 /// `(segments, signature, FUNC.RESULT token)` specs into `registry`.
 /// Each entry is wrapped through [`residual_return_shell`] +
 /// [`build_stub_pygraph_with_result_shell`]
-/// + [`PyreCallRegistry::register_callee`], so subsequent
+/// + [`CallRegistry::register_callee`], so subsequent
 ///   `flowspace_adapter::translate_op` lookups via
 ///   `call_registry.lookup_with_leaf_match` find a registered entry and
 ///   the dual gate no longer Skips with "not registered in
-///   PyreCallRegistry" for these paths.
+///   CallRegistry" for these paths.
 ///
 /// `specs` is typically the output of
 /// `front::mir::collect_unsafe_fn_stubs_from_llbc` (the Charon/LLBC-
@@ -2538,7 +2529,7 @@ fn declared_funcptr_type_from_legacy(
 /// **Annotator-only carrier — never reaches the codewriter.**
 /// The stub graph carries a single return link holding a pre-annotated
 /// Variable, suitable for `RPythonAnnotator` return-type inference via
-/// `cachedgraph` (see `pyre_call_registry::prefill_default_cache`).
+/// `cachedgraph` (see `call_registry::prefill_default_cache`).
 /// Because `CallControl::function_graphs` is populated exclusively
 /// by lowered safe-fn bodies (unsafe fns never produce a flow graph —
 /// they only get a metadata-only stub key), the unsafe stub key
@@ -2556,7 +2547,7 @@ fn declared_funcptr_type_from_legacy(
 /// safe by virtue of the `function_graphs` gate, not by any
 /// `look_inside_graph` policy on the stub itself.
 pub(crate) fn register_unsafe_fn_stubs(
-    registry: &PyreCallRegistry,
+    registry: &CallRegistry,
     specs: &[(Vec<String>, Signature, Option<String>)],
 ) {
     for (segments, signature, return_token) in specs {
@@ -2745,13 +2736,13 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
 /// through the same opaque stub-pygraph carrier
 /// [`register_unsafe_fn_stubs`] uses, so subsequent
 /// `flowspace_adapter::translate_op` `FunctionPath` lookups resolve the
-/// callee instead of raising "not registered in PyreCallRegistry".  Like
+/// callee instead of raising "not registered in CallRegistry".  Like
 /// `register_unsafe_fn_stubs` the registration is annotator-only and
 /// non-overwriting: a path already registered by the `function_graphs`
 /// or unsafe-fn pass wins, and the codewriter residualizes the call
 /// through its fnaddr lowering (these foreign stubs are never present in
 /// `CallControl::function_graphs`, so they never compile into JITCode).
-pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
+pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         let signature = Signature::new(
             argnames.iter().map(|n| (*n).to_string()).collect(),
@@ -2784,7 +2775,7 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
 /// declines the `CallTarget::Method` hint for an opaque owner so the call
 /// lowers as `CallTarget::FunctionPath`; registering each path here lets
 /// the residual lookup resolve instead of raising "not registered in
-/// PyreCallRegistry" (and avoids the classdef-less `SomeInstance.getattr`
+/// CallRegistry" (and avoids the classdef-less `SomeInstance.getattr`
 /// panic the Method form would surface).
 ///
 /// The result shell comes from the per-method faithful `ValueType` the
@@ -2794,7 +2785,7 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &PyreCallRegistry) {
 /// Same non-overwriting, annotator-only-carrier contract as
 /// [`register_foreign_stdlib_externals`].
 pub(crate) fn register_foreign_opaque_method_externals(
-    registry: &PyreCallRegistry,
+    registry: &CallRegistry,
     externals: &[(Vec<String>, Signature, crate::model::ValueType)],
 ) {
     for (segments, signature, result_ty) in externals {
@@ -2817,7 +2808,7 @@ pub(crate) fn register_foreign_opaque_method_externals(
 }
 
 /// Test-only restricted entry: only graphs without `OpKind::Call::FunctionPath`
-/// ops resolve through this path.  An empty `PyreCallRegistry` is
+/// ops resolve through this path.  An empty `CallRegistry` is
 /// constructed internally and shared with the annotator; any
 /// `simple_call` op the adapter emits would surface a fail-loud
 /// `TyperError` at `flowspace_adapter::translate_op`'s
@@ -2839,7 +2830,7 @@ pub(crate) fn register_foreign_opaque_method_externals(
 pub fn specialize_legacy_graph(
     legacy: &LegacyGraph,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
-    let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(Rc::new(
+    let registry = crate::translator::rtyper::call_registry::CallRegistry::new(Rc::new(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
     specialize_legacy_graph_with_registry_returning_value_to_var(legacy, &registry)
@@ -2862,7 +2853,7 @@ pub fn specialize_legacy_graph(
 /// this so `seed_variable` has type info to attach.
 pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
     let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes) =
         drive_subject(legacy, call_registry, true)?;
@@ -2885,7 +2876,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
 /// flowspace `GraphRef` so the two-phase cache can record its `GraphKey`.
 fn drive_subject(
     legacy: &LegacyGraph,
-    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     do_rtype: bool,
 ) -> Result<
     (
@@ -2903,7 +2894,7 @@ fn drive_subject(
     // once per graph (one per `transform_graph_to_jitcode`); the
     // upstream "specialize-once" semantics are reproduced by sharing
     // one annotator + rtyper across subjects through
-    // `PyreCallRegistry::ensure_session` and rtyping only the newly
+    // `CallRegistry::ensure_session` and rtyping only the newly
     // added blocks each entry.  Already-cached PyGraphs hold
     // post-specialize LL ops; re-seeding them into the per-session
     // annotator would let `specialize_more_blocks` walk the LL ops a
@@ -2924,7 +2915,7 @@ fn drive_subject(
     // ── Step 2 — annotator surface ────────────────────────────────
     //
     // The annotator + rtyper are
-    // session-shared through `PyreCallRegistry::ensure_session`,
+    // session-shared through `CallRegistry::ensure_session`,
     // mirroring RPython's "one annotator + one rtyper per Translator"
     // (`translator.py:69-83`).  Each per-graph subject seeds its
     // blocks into the shared annotator; subsequent
@@ -3094,7 +3085,7 @@ fn drive_subject(
     //        immediately before specialization instead (see
     //        `specialize_block`).
     //   2. `self.exceptiondata.finish(self)` — hoisted into
-    //      `PyreCallRegistry::ensure_session` so it runs **once** at
+    //      `CallRegistry::ensure_session` so it runs **once** at
     //      session start (idempotent — `getclassrepr` is cached on
     //      `rtyper.instance_reprs`).
     //   3. `self.already_seen = {}` — pyre keeps `already_seen`
@@ -3189,7 +3180,7 @@ fn drive_subject(
 /// prepass still yields Match for the graphs that completed and a safe
 /// legacy-walker Skip for the rest (zero regression, never the poisoned session).
 pub(crate) fn run_two_phase_prepass(
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
@@ -3199,11 +3190,11 @@ pub(crate) fn run_two_phase_prepass(
     call_registry.two_phase().prepass_done = true;
 }
 
-/// Whether the `PYRE_RTYPER_VERBOSE` de-aggregating census is enabled.
+/// Whether the `MAJIT_RTYPER_VERBOSE` de-aggregating census is enabled.
 /// Matches the `== "1"` contract the codewriter's coverage gauge uses
-/// (`codewriter.rs`), so a literal `PYRE_RTYPER_VERBOSE=0` stays off.
+/// (`codewriter.rs`), so a literal `MAJIT_RTYPER_VERBOSE=0` stays off.
 fn rtyper_verbose_enabled() -> bool {
-    std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1")
+    std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|v| v == "1")
 }
 
 /// Map a captured prepass failure reason to its orthodox-disposition
@@ -3278,7 +3269,7 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         "ANNOTATION-SLOT-GAP (cross-block threading)"
     }
     // ── FunctionPath-not-registered family, split by callee nature ──
-    else if reason.contains("not registered in PyreCallRegistry")
+    else if reason.contains("not registered in CallRegistry")
         || reason.contains("translate_op")
         || reason.contains("cachedgraph")
     {
@@ -3349,7 +3340,7 @@ fn classify_unported_reason(reason: &str) -> &'static str {
 }
 
 /// Print a sorted disposition histogram for a prepass phase's failures
-/// (`PYRE_RTYPER_VERBOSE`). The ranked buckets are the legacy-walker
+/// (`MAJIT_RTYPER_VERBOSE`). The ranked buckets are the legacy-walker
 /// deletion worklist; as each disposition's port lands its bucket shrinks.
 fn emit_disposition_histogram(phase: &str, reasons: &[String]) {
     let mut counts: std::collections::BTreeMap<&'static str, usize> =
@@ -3390,7 +3381,7 @@ fn emit_determinism_trace(phase: &str, index: usize, canonical_key: &str) {
 }
 
 fn run_two_phase_prepass_inner(
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
@@ -3424,7 +3415,7 @@ fn run_two_phase_prepass_inner(
                 let key = path.canonical_key();
                 call_registry.two_phase().subjects.insert(
                     key,
-                    crate::translator::rtyper::pyre_call_registry::TwoPhaseSubject {
+                    crate::translator::rtyper::call_registry::TwoPhaseSubject {
                         graph: graph.clone(),
                         graph_key: crate::flowspace::model::GraphKey::of(&graph),
                         value_to_var,
@@ -3434,7 +3425,7 @@ fn run_two_phase_prepass_inner(
                 );
             }
             ref other @ (Ok(Err(_)) | Err(_)) => {
-                // De-aggregating census (PYRE_RTYPER_VERBOSE): the dual-gate
+                // De-aggregating census (MAJIT_RTYPER_VERBOSE): the dual-gate
                 // otherwise lumps every Phase-A failure under one opaque
                 // "subject not annotated/rtyped" Skip. Surface the per-graph
                 // reason so the onion can be triaged.
@@ -3535,7 +3526,7 @@ fn run_two_phase_prepass_inner(
 /// `unpoison_failed_subject_callees`. The skip set is written into the cache
 /// incrementally so partial progress survives a cut-short call.
 fn run_phase_b_rtype_isolated(
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     lift_sources: &crate::codewriter::call::GraphStore,
     determinism_trace: bool,
     paths: &[&crate::parse::CallPath],
@@ -3900,7 +3891,7 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
 /// migration safety oracle) but consumes the cached real types.
 pub(crate) fn dual_gate_outcome_from_cache(
     legacy: &LegacyGraph,
-    call_registry: &PyreCallRegistry,
+    call_registry: &CallRegistry,
     diag_key: &str,
 ) -> Result<DualGateOutcome, String> {
     // Clone the cached real types out so the cache borrow drops before the
@@ -5260,9 +5251,9 @@ mod tests {
         setbinding(&fill, ValueType::Int);
         setbinding(&count, ValueType::Int);
 
-        let registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
-            Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
-        );
+        let registry = crate::translator::rtyper::call_registry::CallRegistry::new(Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
         let (flow_graph, _, _, _) = drive_subject(&graph, &registry, /* do_rtype = */ false)
             .expect("repeat subject must annotate and transform");
         let transformed_ops: Vec<String> = flow_graph
@@ -5429,8 +5420,7 @@ mod tests {
         graph.blocks = vec![startblock, returnblock];
 
         let bookkeeper = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
-        let registry =
-            crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(bookkeeper);
+        let registry = crate::translator::rtyper::call_registry::CallRegistry::new(bookkeeper);
 
         // Leaf callee `fn foo(x: i64) -> i64 { x }` lifted through a
         // child registry; the entry's `FunctionDesc` (whose
@@ -5476,7 +5466,7 @@ mod tests {
         };
         callee_graph.blocks = vec![foo_start, foo_return];
         callee_graph.hints.push("always_inline".to_string());
-        let leaf_registry = crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(
+        let leaf_registry = crate::translator::rtyper::call_registry::CallRegistry::new(
             std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
         );
         setbinding(&foo_v10_var, ValueType::Int);
@@ -5511,7 +5501,7 @@ mod tests {
         // `funcobj.graph` points at after rtyping.
         let callee_graph_ref = pygraph.graph.clone();
         registry.register_callee(
-            crate::translator::rtyper::pyre_call_registry::FunctionPathKey::from_segments(["foo"]),
+            crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(["foo"]),
             crate::flowspace::argument::Signature::new(
                 vec!["x".to_string(), "n".to_string()],
                 None,
@@ -5566,7 +5556,7 @@ mod tests {
         let _lock = anchor_lock();
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::flowspace::model::{BlockKey, GraphKey};
-        use crate::translator::rtyper::pyre_call_registry::{FunctionPathKey, PyreCallRegistry};
+        use crate::translator::rtyper::call_registry::{CallRegistry, FunctionPathKey};
 
         let mut source = LegacyGraph::new("shared_int_value");
         let vars = mint_vars(&mut source, 2);
@@ -5596,7 +5586,7 @@ mod tests {
         ];
         setbinding(&value, ValueType::Int);
 
-        let registry = PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
         // `mint_vars` allocates unnamed value vars, so the startblock's single
         // inputarg has no source name and takes the positional `arg0`.
         let signature =
@@ -5830,9 +5820,9 @@ mod tests {
     #[test]
     fn register_unsafe_fn_stubs_registers_each_spec_and_skips_compound_returns() {
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        use crate::translator::rtyper::call_registry::CallRegistry;
         let bk = std::rc::Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let specs = vec![
             (
                 vec!["pyobject".to_string(), "is_none".to_string()],
@@ -5880,7 +5870,7 @@ mod tests {
     /// Pin the layering invariant
     /// that the synthetic stub-pygraph is annotator-only.  The
     /// `register_unsafe_fn_stubs` helper writes the stub into the
-    /// `PyreCallRegistry` cache but does NOT mutate any
+    /// `CallRegistry` cache but does NOT mutate any
     /// `CallControl::function_graphs` map; the codewriter's BFS walks
     /// `function_graphs.keys()` and resolves each call op's target via
     /// `target_to_path_and_graph` which requires the target to be
@@ -5892,7 +5882,7 @@ mod tests {
     fn register_unsafe_fn_stubs_does_not_populate_callcontrol_function_graphs() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::codewriter::call::CallControl;
-        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        use crate::translator::rtyper::call_registry::CallRegistry;
         let mut callcontrol = CallControl::new();
         callcontrol.unsafe_fn_stubs = vec![(
             vec!["pyobject".to_string(), "is_none".to_string()],
@@ -5900,7 +5890,7 @@ mod tests {
             Some("bool".to_string()),
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs);
         // Registry side: the stub is present for `cachedgraph` lookups.
         let key = FunctionPathKey::from_segments(["pyobject".to_string(), "is_none".to_string()]);
@@ -5928,9 +5918,9 @@ mod tests {
         // A path already registered via function_graphs (e.g. a safe fn
         // wearing the same segments) must NOT be overwritten by a stub.
         use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
+        use crate::translator::rtyper::call_registry::CallRegistry;
         let bk = std::rc::Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["pyobject".to_string(), "shared".to_string()]);
         let signature = Signature::new(vec!["x".to_string()], None, None);
         let existing = registry.get_or_register(key.clone(), signature.clone());

@@ -346,7 +346,7 @@ pub struct Bookkeeper {
     /// registered `ClassDef.attrs`.  `None` for unit-test fixtures that
     /// build the bookkeeper directly, in which case
     /// `getuniqueclassdef_for_struct_root` leaves `attrs` empty.
-    pub pyre_struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
+    pub struct_fields: RefCell<Option<Rc<crate::front::StructFieldRegistry>>>,
     /// TODO: no upstream equivalent (RPython has no Rust enums).  Enum
     /// type-root name (dual-keyed: qualified path and bare leaf) →
     /// `discriminant value → variant name` table.  Consulted by
@@ -354,8 +354,7 @@ pub struct Bookkeeper {
     /// discriminant→variant narrowing `knowntypedata` the `__discriminant`
     /// getattr attaches.  `None` for unit-test fixtures that build the
     /// bookkeeper directly.
-    pub pyre_enum_variant_by_discriminant:
-        RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
+    pub enum_variant_by_discriminant: RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
     /// TODO: no upstream equivalent.  Interning table mapping a struct
     /// type-root name to its canonical host class `HostObject`.  Because
     /// `HostObject` equality is `Arc` pointer identity (`impl PartialEq for
@@ -367,7 +366,7 @@ pub struct Bookkeeper {
     /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py)
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
-    pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    pub struct_root_classes: RefCell<HashMap<String, HostObject>>,
     /// TODO: no upstream equivalent.  Qualified trait path → owner
     /// root of its only concrete impl in the analyzed LLBC world
     /// (computed in `lib.rs` from `concrete_trait_methods`; multi-impl
@@ -380,7 +379,7 @@ pub struct Bookkeeper {
     /// [`Self::getuniqueclassdef_for_struct_root`].
     /// RPython's annotator never needs this: it sees the concrete
     /// receiver class at every call site (`classdesc.py lookup`).
-    pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
+    pub trait_unique_impls: RefCell<HashMap<String, String>>,
     /// Trait qualified-path (`name_path()`) → base `HostObject` for a
     /// receiver-driven method-dispatch family registered through
     /// [`Self::register_trait_family`] (receiver-dispatch configuration).
@@ -390,9 +389,9 @@ pub struct Bookkeeper {
     /// `MethodDesc` family (attrfamily merge) rather than blocking on
     /// the classdef-less shell.  Empty unless a consumer opts a trait
     /// in; pyre production registers none.
-    pub pyre_trait_family_bases: RefCell<HashMap<String, HostObject>>,
+    pub trait_family_bases: RefCell<HashMap<String, HostObject>>,
     /// TODO: no upstream equivalent.  Struct names first interned by
-    /// [`Self::project_pyre_field_type`]'s bare-name arm whose
+    /// [`Self::project_struct_field_type`]'s bare-name arm whose
     /// registry rows have not been projected yet — drained at the end
     /// of [`Self::getuniqueclassdef_for_struct_root`] so a class
     /// never exposes its untyped FORCE shells to subject flow (a
@@ -579,11 +578,11 @@ impl Bookkeeper {
             all_specializations: RefCell::new(HashMap::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
-            pyre_struct_fields: RefCell::new(None),
-            pyre_enum_variant_by_discriminant: RefCell::new(None),
-            pyre_struct_root_classes: RefCell::new(HashMap::new()),
-            pyre_trait_unique_impls: RefCell::new(HashMap::new()),
-            pyre_trait_family_bases: RefCell::new(HashMap::new()),
+            struct_fields: RefCell::new(None),
+            enum_variant_by_discriminant: RefCell::new(None),
+            struct_root_classes: RefCell::new(HashMap::new()),
+            trait_unique_impls: RefCell::new(HashMap::new()),
+            trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
         }
@@ -600,33 +599,30 @@ impl Bookkeeper {
     /// arrived has its attrs back-filled on the next lookup (RPython grows
     /// class attrs as annotation proceeds).  Idempotent: a second call
     /// overwrites the previous registry.
-    pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
-        *self.pyre_struct_fields.borrow_mut() = Some(registry);
+    pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
+        *self.struct_fields.borrow_mut() = Some(registry);
     }
 
     /// TODO: no upstream equivalent.  Wire the enum
     /// `discriminant → variant` tables consumed by
     /// [`Self::enum_variant_narrowing_knowntypedata`].  Idempotent: a
     /// second call overwrites the previous map.
-    pub fn set_pyre_enum_variant_by_discriminant(
-        &self,
-        map: Rc<HashMap<String, HashMap<i64, String>>>,
-    ) {
-        *self.pyre_enum_variant_by_discriminant.borrow_mut() = Some(map);
+    pub fn set_enum_variant_by_discriminant(&self, map: Rc<HashMap<String, HashMap<i64, String>>>) {
+        *self.enum_variant_by_discriminant.borrow_mut() = Some(map);
     }
 
     /// TODO: no upstream equivalent.  Wire the trait →
     /// unique-concrete-impl-owner map (see
-    /// [`Self::pyre_trait_unique_impls`]).  Idempotent: a second call
+    /// [`Self::trait_unique_impls`]).  Idempotent: a second call
     /// overwrites the previous map.
-    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
-        *self.pyre_trait_unique_impls.borrow_mut() = map;
+    pub fn set_trait_unique_impls(&self, map: HashMap<String, String>) {
+        *self.trait_unique_impls.borrow_mut() = map;
     }
 
     /// TODO: no upstream equivalent.  The full set of struct type-root
     /// keys in the snapshot registry (`StructFieldRegistry.fields`).
     /// The session-prologue inheritance-id pass
-    /// (`PyreCallRegistry::ensure_session`) iterates these to eagerly
+    /// (`CallRegistry::ensure_session`) iterates these to eagerly
     /// pre-register the build-time-closed `W_*` struct hierarchy before
     /// running [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`].
     /// Returns owned `String`s (not an iterator) so the registry borrow
@@ -634,9 +630,9 @@ impl Bookkeeper {
     /// [`Self::getuniqueclassdef_for_struct_root`].  Empty when no
     /// registry is set (unit-test fixtures), degrading the pass to a
     /// no-op over whatever classdefs already exist.
-    pub fn pyre_struct_root_names(&self) -> Vec<String> {
+    pub fn struct_root_names(&self) -> Vec<String> {
         let mut roots: Vec<String> = self
-            .pyre_struct_fields
+            .struct_fields
             .borrow()
             .as_ref()
             .map(|reg| reg.fields.keys().cloned().collect())
@@ -654,31 +650,31 @@ impl Bookkeeper {
     }
 
     /// True when `leaf` is the trait-leaf of a registered dispatch family
-    /// ([`Self::pyre_trait_family_bases`], keyed by the trait's full
+    /// ([`Self::trait_family_bases`], keyed by the trait's full
     /// `name_path()`).  A method call lowered as `FunctionPath [<leaf>,
     /// method]` (`front::mir`'s `CallKind::Trait` arm spells the trait by
     /// leaf) routes through the receiver's getattr when this matches and
     /// the direct-path registry has no entry (the required-method,
     /// `>=2`-impl case).  Empty unless a consumer opts a trait in.
     pub fn is_registered_trait_family_leaf(&self, leaf: &str) -> bool {
-        self.pyre_trait_family_bases
+        self.trait_family_bases
             .borrow()
             .keys()
             .any(|path| path.rsplit("::").next().unwrap_or(path) == leaf)
     }
 
     /// Resolve a bare trait `leaf` to the unique registered dispatch-family
-    /// base spelling ([`Self::pyre_trait_family_bases`] key = the trait's
+    /// base spelling ([`Self::trait_family_bases`] key = the trait's
     /// full `name_path()`).  The inline-Field `CallTarget::Indirect` carries
     /// the trait by leaf (`dyn_indirect_target` strips the vtable path to its
     /// leaf, matching `register_trait_method`), but the receiver-narrowing
-    /// cast (`__pyre_cast_instance`) and the family base mint both key on the
+    /// cast (`__cast_instance_intrinsic`) and the family base mint both key on the
     /// qualified spelling — so the leaf must map back to it.  Returns `None`
     /// when the leaf matches no family or matches more than one qualified
     /// path (ambiguous — the caller then keeps the classdef-less receiver
     /// rather than casting to an arbitrary base).
     pub fn registered_trait_family_base_root(&self, leaf: &str) -> Option<String> {
-        let bases = self.pyre_trait_family_bases.borrow();
+        let bases = self.trait_family_bases.borrow();
         let mut matches = bases
             .keys()
             .filter(|path| path.rsplit("::").next().unwrap_or(path) == leaf);
@@ -707,7 +703,7 @@ impl Bookkeeper {
     /// subclasses of every registered enum so the session-prologue
     /// [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`]
     /// pass numbers each `enum-base + variant-children` subtree as one
-    /// contiguous bracket.  Called from `PyreCallRegistry::ensure_session`
+    /// contiguous bracket.  Called from `CallRegistry::ensure_session`
     /// AFTER the struct-root loop (so the enum-base classdefs already
     /// exist, UNNUMBERED) and BEFORE the single `assign_inheritance_ids`.
     ///
@@ -742,12 +738,12 @@ impl Bookkeeper {
     pub fn pre_register_enum_variant_classes(self: &Rc<Self>) {
         // Collect (qualified_root, [variant names]) for every enum base,
         // releasing both registry borrows before minting (the intern /
-        // getuniqueclassdef calls re-borrow `pyre_struct_fields` and
-        // `pyre_struct_root_classes`).  Sorted for a deterministic mint
+        // getuniqueclassdef calls re-borrow `struct_fields` and
+        // `struct_root_classes`).  Sorted for a deterministic mint
         // order so the numbering bracket is reproducible.
         let mut pairs: Vec<(String, Vec<String>)> = {
-            let variant_guard = self.pyre_enum_variant_by_discriminant.borrow();
-            let fields_guard = self.pyre_struct_fields.borrow();
+            let variant_guard = self.enum_variant_by_discriminant.borrow();
+            let fields_guard = self.struct_fields.borrow();
             let (Some(variants), Some(reg)) = (variant_guard.as_ref(), fields_guard.as_ref())
             else {
                 return;
@@ -1747,7 +1743,7 @@ impl Bookkeeper {
         if root.contains("::") || root.contains('<') {
             return None;
         }
-        let guard = self.pyre_struct_fields.borrow();
+        let guard = self.struct_fields.borrow();
         let reg = guard.as_ref()?;
         if reg.fields.contains_key(root) {
             return None;
@@ -1795,13 +1791,13 @@ impl Bookkeeper {
     /// The struct fields are instance attributes: RPython discovers them
     /// by annotating `setattr`/`__init__`, but pyre has no such pass for
     /// host structs, so the registry projection (via
-    /// [`Self::project_pyre_field_type`]) stands in.  The whole reachable
+    /// [`Self::project_struct_field_type`]) stands in.  The whole reachable
     /// struct-field graph is registered and projected — an explicit
     /// work-list bounds recursion at the reachable-struct count — so a
     /// field typed as another struct resolves to a fully populated inner
     /// `SomeInstance(classdef)`, not an attrs-empty inner stub.
     ///
-    /// Order-independent w.r.t. [`Self::set_pyre_struct_fields`]: the call
+    /// Order-independent w.r.t. [`Self::set_struct_fields`]: the call
     /// re-traverses and re-projects every time, so a root registered
     /// before the field registry arrived has its (and its transitive
     /// structs') attrs back-filled on a later call — RPython grows class
@@ -1822,7 +1818,7 @@ impl Bookkeeper {
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
         // reachable struct (via `intern_class_by_qualname` ->
-        // `getuniqueclassdef`).  `project_pyre_field_type`'s bare-name arm
+        // `getuniqueclassdef`).  `project_struct_field_type`'s bare-name arm
         // resolves inner struct references through the same identity path,
         // so it sees the registered classdef.  Registration is idempotent
         // (the identity cache is the memo), so a root reached before the
@@ -1866,7 +1862,7 @@ impl Bookkeeper {
                 self.getuniqueclassdef(h)?;
             }
             let referenced: Vec<String> = {
-                let guard = self.pyre_struct_fields.borrow();
+                let guard = self.struct_fields.borrow();
                 if let Some(reg) = guard.as_ref() {
                     if let Some(fields) = reg.fields.get(&n) {
                         let mut out: Vec<String> = Vec::new();
@@ -1911,7 +1907,7 @@ impl Bookkeeper {
         for n in &graph {
             self.project_struct_rows(n)?;
         }
-        // Drain structs first interned by `project_pyre_field_type`'s
+        // Drain structs first interned by `project_struct_field_type`'s
         // bare-name arm during the loop above.  Pass-1's
         // `collect_referenced_struct_names` string parser and the
         // projector resolve type strings independently; a name only
@@ -2014,7 +2010,7 @@ impl Bookkeeper {
     /// getattr binds each method to its correct owner.
     ///
     /// OPT-IN: only a trait registered through this entry point gets a
-    /// member-carrying host in `pyre_struct_root_classes`.  Every other
+    /// member-carrying host in `struct_root_classes`.  Every other
     /// (unregistered) multi-impl trait keeps its current classdef-less /
     /// fail-loud disposition, so this cannot perturb the annotation of pyre
     /// production dispatch that was never registered.
@@ -2028,7 +2024,7 @@ impl Bookkeeper {
         impls: Vec<(String, IndexMap<String, ConstValue>)>,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         // Base first — its identity-keyed HostObject must be published in
-        // `pyre_struct_root_classes` before the subclasses intern, so each
+        // `struct_root_classes` before the subclasses intern, so each
         // subclass's `__bases__` resolves to this exact base host (the same
         // discipline `getuniqueclassdef_for_enum_variant` relies on).
         let base_key = majit_ir::descr::canonical_struct_name(base_root);
@@ -2037,14 +2033,14 @@ impl Bookkeeper {
             Vec::new(),
             base_members,
         );
-        self.pyre_struct_root_classes
+        self.struct_root_classes
             .borrow_mut()
             .insert(base_key, base_host.clone());
         // Index the base by the raw `base_root` spelling too, so the
         // receiver seed (`derive_subject_inputcells`) can match a
         // `dyn Trait` receiver's `class_root` (the trait's `name_path()`)
         // directly without re-canonicalising.
-        self.pyre_trait_family_bases
+        self.trait_family_bases
             .borrow_mut()
             .insert(base_root.to_string(), base_host.clone());
         let base_cd = self.getuniqueclassdef(&base_host)?;
@@ -2057,7 +2053,7 @@ impl Bookkeeper {
                 vec![base_host.clone()],
                 members,
             );
-            self.pyre_struct_root_classes
+            self.struct_root_classes
                 .borrow_mut()
                 .insert(impl_key, impl_host.clone());
             self.getuniqueclassdef(&impl_host)?;
@@ -2122,7 +2118,7 @@ impl Bookkeeper {
             // its `<…>` suffix to resolve.  Bare names pass through
             // unchanged.
             let lookup_root = majit_ir::descr::strip_instantiation_suffix(enum_root);
-            let guard = self.pyre_enum_variant_by_discriminant.borrow();
+            let guard = self.enum_variant_by_discriminant.borrow();
             let map = guard.as_ref()?;
             map.get(lookup_root)
                 .or_else(|| {
@@ -2195,7 +2191,7 @@ impl Bookkeeper {
             {
                 Vec::new()
             } else {
-                let guard = self.pyre_struct_fields.borrow();
+                let guard = self.struct_fields.borrow();
                 guard
                     .as_ref()
                     .and_then(|r| r.fields.get(n))
@@ -2207,7 +2203,7 @@ impl Bookkeeper {
             }
         };
         let mut fields: Vec<(String, String)> = {
-            let guard = self.pyre_struct_fields.borrow();
+            let guard = self.struct_fields.borrow();
             match guard.as_ref().and_then(|r| {
                 if majit_ir::descr::is_shaped_tuple_name(n)
                     || majit_ir::descr::is_shaped_array_name(n)
@@ -2229,7 +2225,7 @@ impl Bookkeeper {
             // `setattr` per element), so a projected row has to agree with the
             // value that sequence produces. A sum-typed element does not: the
             // constructor materializes a variant INSTANCE, while
-            // `project_pyre_field_type` models the spelling as the nullable
+            // `project_struct_field_type` models the spelling as the nullable
             // payload — `Option<Vec<*mut PyObject>>` projects to list-or-none
             // and then fails `generalize_attr` against
             // `Instance(Option<Vec<*mut PyObject>>::None)`.  Leave those rows
@@ -2256,7 +2252,7 @@ impl Bookkeeper {
         // of the per-instantiation raw-pointer payload row, so project the two
         // as one slice.
         {
-            let guard = self.pyre_struct_fields.borrow();
+            let guard = self.struct_fields.borrow();
             if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
                 for (fname, fty) in &mut fields {
                     if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname) {
@@ -2306,7 +2302,7 @@ impl Bookkeeper {
             if field_name == "__class__" {
                 continue;
             }
-            let s_value = self.project_pyre_field_type(field_ty);
+            let s_value = self.project_struct_field_type(field_ty);
             let mut classdef_mut = classdef.borrow_mut();
             let attr = classdef_mut
                 .attrs
@@ -2344,7 +2340,7 @@ impl Bookkeeper {
 
     /// Resolve a struct type-root name to its canonical host class
     /// `HostObject`, minting it on first sight and caching by name in
-    /// [`Self::pyre_struct_root_classes`].  Because `HostObject`
+    /// [`Self::struct_root_classes`].  Because `HostObject`
     /// equality is `Arc` pointer identity, this interning is what makes
     /// `getuniqueclassdef` return the SAME `ClassDef` for repeated
     /// lookups of one type-root — the pyre analog of resolving a type
@@ -2398,7 +2394,7 @@ impl Bookkeeper {
         let mut cur = name.to_string();
         loop {
             let key = majit_ir::descr::canonical_struct_name(&cur);
-            if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
+            if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
                 if chain.is_empty() {
                     return existing.clone();
                 }
@@ -2407,7 +2403,7 @@ impl Bookkeeper {
             }
             seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
             chain.push(cur.clone());
-            let next = self.pyre_struct_fields.borrow().as_ref().and_then(|reg| {
+            let next = self.struct_fields.borrow().as_ref().and_then(|reg| {
                 // A constructor mints its class under the dot-joined,
                 // crate-included qualname (`pyre_object.intobject.
                 // W_IntObject`, flowspace_adapter `SyntheticTransparentCtor`
@@ -2424,7 +2420,7 @@ impl Bookkeeper {
                 // (`rclass.py:82-88`).  Checked before the header convention
                 // because a variant's first field is its payload, not a
                 // header: without this the session prologue
-                // (`PyreCallRegistry::ensure_session`), which pre-mints every
+                // (`CallRegistry::ensure_session`), which pre-mints every
                 // `struct_fields` key including the variant keys, would mint
                 // the variant base-less, and first-mint-wins would freeze
                 // that, dropping the subclass link the narrowing relies on.
@@ -2475,7 +2471,7 @@ impl Bookkeeper {
             let key = majit_ir::descr::canonical_struct_name(node);
             let bases = base_host.iter().cloned().collect();
             let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
-            self.pyre_struct_root_classes
+            self.struct_root_classes
                 .borrow_mut()
                 .insert(key, host.clone());
             base_host = Some(host);
@@ -2495,25 +2491,25 @@ impl Bookkeeper {
         bases: Vec<HostObject>,
     ) -> HostObject {
         let key = majit_ir::descr::canonical_struct_name(name);
-        if let Some(existing) = self.pyre_struct_root_classes.borrow().get(&key) {
+        if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
         let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
-        self.pyre_struct_root_classes
+        self.struct_root_classes
             .borrow_mut()
             .insert(key, host.clone());
         host
     }
 
     /// True when `name` is a type-root key in the snapshot
-    /// struct-field registry ([`Self::pyre_struct_fields`]).  Enums and
+    /// struct-field registry ([`Self::struct_fields`]).  Enums and
     /// structs both register under their qualified path AND bare leaf
     /// (`front/mir.rs` `TypeDeclKind::Enum` / `Struct` arms), so a
     /// ctor's `owner_path` last segment answers true exactly when the
     /// owner is itself an ADT (an enum-variant ctor) rather than a
     /// module (a struct ctor).
-    pub fn is_pyre_struct_root(&self, name: &str) -> bool {
-        self.pyre_struct_fields
+    pub fn is_known_struct_root(&self, name: &str) -> bool {
+        self.struct_fields
             .borrow()
             .as_ref()
             .is_some_and(|reg| reg.fields.contains_key(name))
@@ -2524,15 +2520,12 @@ impl Bookkeeper {
     /// so a method member never shadows a same-named instance field — a
     /// function source for a field attribute would union-conflict in
     /// `generalize_attr`.
-    pub fn pyre_struct_root_has_field(&self, root: &str, name: &str) -> bool {
-        self.pyre_struct_fields
-            .borrow()
-            .as_ref()
-            .is_some_and(|reg| {
-                reg.fields
-                    .get(root)
-                    .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
-            })
+    pub fn struct_root_has_field(&self, root: &str, name: &str) -> bool {
+        self.struct_fields.borrow().as_ref().is_some_and(|reg| {
+            reg.fields
+                .get(root)
+                .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
+        })
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type
@@ -2545,7 +2538,7 @@ impl Bookkeeper {
     /// (`PyFrame`, `W_DictObject`) resolve to
     /// `SomeInstance(stub)` only when the registry contains a matching
     /// entry; unknown bare names fall to `Impossible`.
-    pub fn project_pyre_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
+    pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
@@ -2565,7 +2558,7 @@ impl Bookkeeper {
             .strip_prefix("*const ")
             .or_else(|| t.strip_prefix("*mut "))
         {
-            let s_pointee = self.project_pyre_field_type(pointee.trim());
+            let s_pointee = self.project_struct_field_type(pointee.trim());
             if matches!(
                 s_pointee,
                 SomeValue::Integer(_)
@@ -2638,7 +2631,7 @@ impl Bookkeeper {
         }
         for list_wrapper in ["Vec<", "VecDeque<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
-                let s_inner = self.project_pyre_field_type(inner);
+                let s_inner = self.project_struct_field_type(inner);
                 let listdef =
                     super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
                 return SomeValue::List(super::model::SomeList::new(listdef));
@@ -2649,20 +2642,20 @@ impl Bookkeeper {
                 Some(semi) => rest[..semi].trim(),
                 None => rest.trim(),
             };
-            let s_inner = self.project_pyre_field_type(inner);
+            let s_inner = self.project_struct_field_type(inner);
             let listdef = super::listdef::ListDef::new(Some(self.clone()), s_inner, false, false);
             return SomeValue::List(super::model::SomeList::new(listdef));
         }
         if let Some(inner) = strip_generic_one(stripped, "Option<") {
-            let s_inner = self.project_pyre_field_type(inner);
+            let s_inner = self.project_struct_field_type(inner);
             let s_none = super::model::s_none();
             return super::model::unionof([&s_inner, &s_none]).unwrap_or(SomeValue::Impossible);
         }
         if let Some(inner) = strip_generic_one(stripped, "Result<") {
             let parts = split_generic_args(inner);
             if parts.len() == 2 {
-                let s_ok = self.project_pyre_field_type(parts[0]);
-                let s_err = self.project_pyre_field_type(parts[1]);
+                let s_ok = self.project_struct_field_type(parts[0]);
+                let s_err = self.project_struct_field_type(parts[1]);
                 return super::model::unionof([&s_ok, &s_err]).unwrap_or(SomeValue::Impossible);
             }
         }
@@ -2670,8 +2663,8 @@ impl Bookkeeper {
             if let Some(inner) = strip_generic_one(stripped, dict_wrapper) {
                 let parts = split_generic_args(inner);
                 if parts.len() == 2 {
-                    let s_key = self.project_pyre_field_type(parts[0]);
-                    let s_val = self.project_pyre_field_type(parts[1]);
+                    let s_key = self.project_struct_field_type(parts[0]);
+                    let s_val = self.project_struct_field_type(parts[1]);
                     let dictdef = super::dictdef::DictDef::new(
                         Some(self.clone()),
                         s_key,
@@ -2686,7 +2679,7 @@ impl Bookkeeper {
         }
         for set_wrapper in ["HashSet<", "BTreeSet<", "IndexSet<"] {
             if let Some(inner) = strip_generic_one(stripped, set_wrapper) {
-                let s_key = self.project_pyre_field_type(inner);
+                let s_key = self.project_struct_field_type(inner);
                 let s_val = super::model::s_none();
                 let dictdef = super::dictdef::DictDef::new(
                     Some(self.clone()),
@@ -2704,7 +2697,7 @@ impl Bookkeeper {
             if !parts.is_empty() {
                 let items: Vec<SomeValue> = parts
                     .iter()
-                    .map(|p| self.project_pyre_field_type(p))
+                    .map(|p| self.project_struct_field_type(p))
                     .collect();
                 return SomeValue::Tuple(super::model::SomeTuple::new(items));
             }
@@ -2725,13 +2718,13 @@ impl Bookkeeper {
             "Reverse<",
         ] {
             if let Some(inner) = strip_generic_one(stripped, wrapper) {
-                return self.project_pyre_field_type(inner);
+                return self.project_struct_field_type(inner);
             }
         }
         if let Some(inner) = strip_generic_one(stripped, "Cow<") {
             let parts = split_generic_args(inner);
             if parts.len() == 2 {
-                return self.project_pyre_field_type(parts[1]);
+                return self.project_struct_field_type(parts[1]);
             }
         }
         // `FixedObjectArray { len: usize, _items: [PyObjectRef; 0] }` is a
@@ -2746,12 +2739,12 @@ impl Bookkeeper {
         // classdef-less stub.
         if majit_ir::descr::canonical_struct_name(stripped) == "object_array::FixedObjectArray" {
             let items_ty = self
-                .pyre_struct_fields
+                .struct_fields
                 .borrow()
                 .as_ref()
                 .and_then(|reg| reg.field_type(stripped, "_items").map(str::to_string));
             if let Some(items_ty) = items_ty {
-                return self.project_pyre_field_type(&items_ty);
+                return self.project_struct_field_type(&items_ty);
             }
         }
         // Named generic structs in Charon's registry are stored under their
@@ -2763,7 +2756,7 @@ impl Bookkeeper {
         // classes whose dedicated paths never reach this arm.
         let named_root = if strip_generic_one(stripped, "Complex<").is_some()
             && self
-                .pyre_struct_fields
+                .struct_fields
                 .borrow()
                 .as_ref()
                 .is_some_and(|r| r.fields.contains_key("num_complex::Complex"))
@@ -2779,7 +2772,7 @@ impl Bookkeeper {
             majit_ir::descr::strip_generic_args(stripped)
         };
         let registered = {
-            let guard = self.pyre_struct_fields.borrow();
+            let guard = self.struct_fields.borrow();
             guard
                 .as_ref()
                 .map(|r| r.fields.contains_key(named_root.as_ref()))
@@ -3814,7 +3807,7 @@ fn collect_referenced_struct_names(
 }
 
 /// Whether a field-type spelling names a sum type that
-/// [`Bookkeeper::project_pyre_field_type`] models as its *payload* plus
+/// [`Bookkeeper::project_struct_field_type`] models as its *payload* plus
 /// `None` — the nullable-pointer shape (`Option<Vec<T>>` → list-or-none).
 /// That model describes a field lowered to one nullable word; it does NOT
 /// describe a slot the frontend fills with a materialized variant instance
@@ -4322,7 +4315,7 @@ mod tests {
             "PyCode".to_string(),
             vec![("argcount".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         let cd1 = bk
             .getuniqueclassdef_for_struct_root("PyFrame")
@@ -4411,18 +4404,21 @@ mod tests {
             "Complex".to_string(),
             reg.fields["num_complex::Complex"].clone(),
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         assert!(
-            matches!(bk.project_pyre_field_type("BigInt"), SomeValue::Instance(ref s) if s.classdef.is_none()),
+            matches!(bk.project_struct_field_type("BigInt"), SomeValue::Instance(ref s) if s.classdef.is_none()),
             "dependency-opaque compiler BigInt remains one GC reference"
         );
         assert!(
-            matches!(bk.project_pyre_field_type("Wtf8Buf"), SomeValue::String(_)),
+            matches!(
+                bk.project_struct_field_type("Wtf8Buf"),
+                SomeValue::String(_)
+            ),
             "Wtf8Buf shares the immutable string annotation"
         );
 
-        let SomeValue::Instance(complex) = bk.project_pyre_field_type("Complex<f64>") else {
+        let SomeValue::Instance(complex) = bk.project_struct_field_type("Complex<f64>") else {
             panic!("Complex<f64> must project to its registered struct class")
         };
         let complex_cd = complex.classdef.expect("Complex classdef");
@@ -4440,7 +4436,8 @@ mod tests {
             Some(SomeValue::Float(_))
         ));
 
-        let SomeValue::Instance(code) = bk.project_pyre_field_type("Box<CodeObject<ConstantData>>")
+        let SomeValue::Instance(code) =
+            bk.project_struct_field_type("Box<CodeObject<ConstantData>>")
         else {
             panic!("concrete CodeObject instantiation must use the template class")
         };
@@ -4473,7 +4470,7 @@ mod tests {
             "Color::Rgb".to_string(),
             vec![("rgb".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         let base = bk
             .getuniqueclassdef_for_struct_root("Color")
@@ -4544,7 +4541,7 @@ mod tests {
 
     #[test]
     fn enum_variant_subclasses_base_even_when_struct_root_preregistered_first() {
-        // The session prologue (`PyreCallRegistry::ensure_session`) pre-mints
+        // The session prologue (`CallRegistry::ensure_session`) pre-mints
         // EVERY `struct_fields` key through `getuniqueclassdef_for_struct_root`
         // — including the variant keys — BEFORE any narrowing's
         // `getuniqueclassdef_for_enum_variant` runs.  Since
@@ -4561,10 +4558,10 @@ mod tests {
             "Color::Rgb".to_string(),
             vec![("rgb".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // Prologue order: pre-register every struct root, variant keys first.
-        for root in bk.pyre_struct_root_names() {
+        for root in bk.struct_root_names() {
             let _ = bk.getuniqueclassdef_for_struct_root(&root);
         }
         let base = bk
@@ -4603,7 +4600,7 @@ mod tests {
             "shapes::Color::Rgb".to_string(),
             vec![("rgb".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // Constructor side: the adapter interns through this helper.
         let ctor_host = bk.intern_enum_variant_host("shapes::Color", "Rgb");
@@ -4673,7 +4670,7 @@ mod tests {
             "probemod::Newt::Eft".to_string(),
             vec![("eft".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
         // The origin `front::mir` now registers for an enum leaf.
         majit_ir::descr::register_struct_origins(
             [("Newt".to_string(), "probemod".to_string())].into(),
@@ -4716,7 +4713,7 @@ mod tests {
                 ("rgb".to_string(), "i64".to_string()),
             ],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // discriminant 0 -> Rgb, 1 -> Named.
         let mut by_discr: HashMap<i64, String> = HashMap::new();
@@ -4724,7 +4721,7 @@ mod tests {
         by_discr.insert(1, "Named".to_string());
         let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
         map.insert("Color".to_string(), by_discr);
-        bk.set_pyre_enum_variant_by_discriminant(Rc::new(map));
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
 
         let base = bk
             .getuniqueclassdef_for_struct_root("Color")
@@ -4797,7 +4794,7 @@ mod tests {
             "Opt<i64>".to_string(),
             vec![("__discriminant".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // Table keyed by the bare template root (`strip_instantiation_suffix`
         // reduces both `Opt<i64>` and `Opt<i64>::A` to `Opt`).
@@ -4806,7 +4803,7 @@ mod tests {
         by_discr.insert(1, "B".to_string());
         let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
         map.insert("Opt".to_string(), by_discr);
-        bk.set_pyre_enum_variant_by_discriminant(Rc::new(map));
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
 
         let receiver = Rc::new(Variable::new());
         let from_base = bk
@@ -4870,7 +4867,7 @@ mod tests {
                 ("mro".to_string(), "Vec<W_TypeObject>".to_string()),
             ],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         let cd = bk
             .getuniqueclassdef_for_struct_root("FixedObjectArray")
@@ -4926,7 +4923,7 @@ mod tests {
                 ("back".to_string(), "S0".to_string()),
             ],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // Registering from the head walks the full depth + the back-edge
         // cycle without overflowing.
@@ -5011,7 +5008,7 @@ mod tests {
             "PyCode".to_string(),
             vec![("argcount".to_string(), "i64".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         // Re-lookup re-projects onto the SAME ClassDef Rc.
         let late = bk
@@ -6441,7 +6438,7 @@ mod tests {
             "CodeObject".to_string(),
             vec![("varnames".to_string(), "Box<[String]>".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
         let _root = bk
             .getuniqueclassdef_for_struct_root("PyFrame")
             .expect("PyFrame registers");
@@ -6502,7 +6499,7 @@ mod tests {
             "Result<Vec<*mut PyObject>,PyErr>::Ok".to_string(),
             vec![("__pos_0".to_string(), "Vec<*mut PyObject>".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(reg));
+        bk.set_struct_fields(Rc::new(reg));
 
         let tuple_host = bk.intern_class_by_qualname(tuple);
         let tuple_cd = bk.getuniqueclassdef(&tuple_host).expect("tuple classdef");

@@ -8677,7 +8677,7 @@ where
                 // float-result branch): pyre's `call_assembler` wrapper at
                 // `concrete_ptr` is an `extern "C" fn(...) -> i64` whose
                 // result carries the f64 pre-packed via `f64::to_bits()`.
-                // See `handler_call_assembler_float_pyre` in `blackhole.rs`
+                // See `handler_call_assembler_float_ext` in `blackhole.rs`
                 // for the wrapper-ABI
                 // analysis — calling through `call_float_function`
                 // (`extern "C" fn(...) -> f64`) here would transmute the

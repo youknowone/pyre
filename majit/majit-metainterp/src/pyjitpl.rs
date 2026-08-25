@@ -6738,7 +6738,7 @@ impl<M: Clone> MetaInterp<M> {
         let constants_snapshot = constants.clone();
 
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
-        // warmstate.enable_opts. PYRE_NO_UNROLL remains a diagnostic override.
+        // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
         let no_unroll_reason = crate::unroll_skip_reason(
             crate::no_unroll_enabled(),
             self.warm_state.get_enable_opts(),
@@ -22665,7 +22665,7 @@ mod metainterp_static_data_tests {
         assert_eq!(
             meta.staticdata.op_live,
             crate::jitcode::insns::BC_LIVE as i32,
-            "install_canonical_liveness must seed op_live to pyre-static BC_LIVE",
+            "install_canonical_liveness must seed op_live to the static BC_LIVE table",
         );
         assert_eq!(
             meta.staticdata.op_catch_exception,

@@ -833,7 +833,7 @@ pub(crate) fn fbw_bridge_iter_journal_clear() {
 /// Record the in-flight FOR_ITER continuation (#57 Option C): the consumed
 /// item the `for_iter_next` residual produced and its FOR_ITER body coordinate.
 /// Called from the residual
-/// executor's success arm when the helper is [`PyreHelperKind::ForIterNext`]
+/// executor's success arm when the helper is [`RuntimeHelperKind::ForIterNext`]
 /// and it produced a non-null item (a null item is the exhaustion arm — no
 /// body runs, nothing to deliver).  The stack mirrors loop nesting: a consume
 /// of a DIFFERENT (deeper) FOR_ITER pushes a new entry on top of the loops
@@ -2879,7 +2879,7 @@ fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
                 .and_then(|descr| descr.as_call_descr())
                 .map_or_else(
                     || " helper=<no call descr>".to_string(),
-                    |cd| format!(" helper={:?}", cd.get_extra_info().pyre_helper),
+                    |cd| format!(" helper={:?}", cd.get_extra_info().runtime_helper),
                 )
         } else {
             String::new()
@@ -3125,7 +3125,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // contents, writing nothing, and its unbound `NameError` is the
             // same shape as `load_global`'s.  It reached this scan untagged
             // until `load_deref_value` started carrying
-            // `PyreHelperKind::LoadDeref` for the `Cell.get` fold, so the tag
+            // `RuntimeHelperKind::LoadDeref` for the `Cell.get` fold, so the tag
             // it wanted is now here — and it is still not listed.
             //
             // Admitting it classifies every freevar-reading body
@@ -3164,21 +3164,21 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // no empty write set may be claimed for them -- and not about
             // replay: reading a field twice commits nothing either way.
             let replay_safe_read = matches!(
-                ei.pyre_helper,
-                majit_ir::PyreHelperKind::LoadConst
-                    | majit_ir::PyreHelperKind::LoadGlobal
-                    | majit_ir::PyreHelperKind::LoadImport
-                    | majit_ir::PyreHelperKind::LoadImportLocals
-                    | majit_ir::PyreHelperKind::BoxInt
-                    | majit_ir::PyreHelperKind::NewtupleFromArray
-                    | majit_ir::PyreHelperKind::NewlistFromArray
-                    | majit_ir::PyreHelperKind::GetCurrentException
+                ei.runtime_helper,
+                majit_ir::RuntimeHelperKind::LoadConst
+                    | majit_ir::RuntimeHelperKind::LoadGlobal
+                    | majit_ir::RuntimeHelperKind::LoadImport
+                    | majit_ir::RuntimeHelperKind::LoadImportLocals
+                    | majit_ir::RuntimeHelperKind::BoxInt
+                    | majit_ir::RuntimeHelperKind::NewtupleFromArray
+                    | majit_ir::RuntimeHelperKind::NewlistFromArray
+                    | majit_ir::RuntimeHelperKind::GetCurrentException
             );
             // `box_int` is the only generic replay-safe helper here whose
             // result is necessarily numeric.  `load_const` may return a str,
             // tuple, or another nonnumeric immutable value, while the typed
             // jitcode constant pool was classified exactly above.
-            let dst_boxed_int = ei.pyre_helper == majit_ir::PyreHelperKind::BoxInt;
+            let dst_boxed_int = ei.runtime_helper == majit_ir::RuntimeHelperKind::BoxInt;
             let provably_side_effect_free = replay_safe_read
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
@@ -3316,22 +3316,22 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 // `foriter_deferred_admit`'s loop-header check to account for
                 // it (`fbw_callee_body_has_load_method_self_residual`).  Keep
                 // the surface where it was.
-                let defer_truth_or_method_self = match ei.pyre_helper {
-                    majit_ir::PyreHelperKind::LoadMethodSelf => method_form_deferred_helpers,
-                    majit_ir::PyreHelperKind::Truth => true,
+                let defer_truth_or_method_self = match ei.runtime_helper {
+                    majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
+                    majit_ir::RuntimeHelperKind::Truth => true,
                     _ => false,
                 };
                 let defer_helper = defer_truth_or_method_self
                     || matches!(
-                        ei.pyre_helper,
-                        majit_ir::PyreHelperKind::CallFn
-                            | majit_ir::PyreHelperKind::CallKw
-                            | majit_ir::PyreHelperKind::CallFunctionEx
-                            | majit_ir::PyreHelperKind::RaiseVarargs
-                            | majit_ir::PyreHelperKind::SetCurrentException
-                            | majit_ir::PyreHelperKind::LoadAttr
-                            | majit_ir::PyreHelperKind::BinaryOp
-                            | majit_ir::PyreHelperKind::CompareOp
+                        ei.runtime_helper,
+                        majit_ir::RuntimeHelperKind::CallFn
+                            | majit_ir::RuntimeHelperKind::CallKw
+                            | majit_ir::RuntimeHelperKind::CallFunctionEx
+                            | majit_ir::RuntimeHelperKind::RaiseVarargs
+                            | majit_ir::RuntimeHelperKind::SetCurrentException
+                            | majit_ir::RuntimeHelperKind::LoadAttr
+                            | majit_ir::RuntimeHelperKind::BinaryOp
+                            | majit_ir::RuntimeHelperKind::CompareOp
                     );
                 if defer_helper {
                     deferred_call = true;
@@ -3355,7 +3355,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 } else {
                     replay_poison!(
                         poison,
-                        format!("ResidualCallWritesLiveHeap/{:?}", ei.pyre_helper),
+                        format!("ResidualCallWritesLiveHeap/{:?}", ei.runtime_helper),
                         d.pc,
                         d.opname
                     );
@@ -3501,7 +3501,8 @@ pub(crate) fn fbw_callee_body_has_load_method_self_residual(
                 .and_then(|index| callee_descr_refs.get(index))
                 .and_then(|descr| descr.as_call_descr())
                 .is_some_and(|descr| {
-                    descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
+                    descr.get_extra_info().runtime_helper
+                        == majit_ir::RuntimeHelperKind::LoadMethodSelf
                 })
         {
             return true;
@@ -3525,7 +3526,7 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
                 .and_then(|index| callee_descr_refs.get(index))
                 .and_then(|descr| descr.as_call_descr())
                 .is_some_and(|descr| {
-                    descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::BinaryOp
+                    descr.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp
                 })
         {
             return true;

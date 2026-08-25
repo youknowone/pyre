@@ -26,11 +26,11 @@ use crate::address_dict::AddressMap;
 /// A mirror whose count is exactly this is referenced by nothing except the
 /// link, so the collector is free to let the linked object die.  Every count
 /// above it is a reference the C side holds.
-pub const REFCNT_FROM_PYRE: isize = (isize::MAX >> 2) + 1;
+pub const REFCNT_FROM_PYPY: isize = (isize::MAX >> 2) + 1;
 
 /// The count a mirror that must never be freed starts at.
 ///
-/// `rawrefcount.py:16-20` has two constants above [`REFCNT_FROM_PYRE`]:
+/// `rawrefcount.py:16-20` has two constants above [`REFCNT_FROM_PYPY`]:
 /// `REFCNT_FROM_PYPY_LIGHT`, for a mirror whose deallocation is a plain free
 /// with no deallocator to run, and `_Py_IMMORTAL_REFCNT`, for one that is never
 /// deallocated at all.  Only the second has a port — nothing here creates a
@@ -40,10 +40,10 @@ pub const REFCNT_FROM_PYRE: isize = (isize::MAX >> 2) + 1;
 /// constant: the asserts below hold it at least `1 << 60` clear of the
 /// threshold at which a mirror is freed, and the same clear of overflow, so no
 /// incref/decref imbalance a running process can produce reaches either end.
-pub const REFCNT_IMMORTAL: isize = REFCNT_FROM_PYRE + (1 << (isize::BITS - 4));
+pub const REFCNT_IMMORTAL: isize = REFCNT_FROM_PYPY + (1 << (isize::BITS - 4));
 
 const IMMORTAL_HEADROOM: isize = 1 << (isize::BITS - 4);
-const _: () = assert!(REFCNT_IMMORTAL - REFCNT_FROM_PYRE >= IMMORTAL_HEADROOM);
+const _: () = assert!(REFCNT_IMMORTAL - REFCNT_FROM_PYPY >= IMMORTAL_HEADROOM);
 const _: () = assert!(isize::MAX - REFCNT_IMMORTAL >= IMMORTAL_HEADROOM);
 
 /// Scheduled when the dead queue becomes non-empty.
@@ -148,7 +148,7 @@ pub type FinalizerClaimFn = fn(usize) -> bool;
 /// Answers with every block whose references the embedder can enumerate, and
 /// what each one references.
 ///
-/// A mirror's count above [`REFCNT_FROM_PYRE`] otherwise means "C still holds
+/// A mirror's count above [`REFCNT_FROM_PYPY`] otherwise means "C still holds
 /// the linked object", which a reference cycle through C defeats: the two ends
 /// of the cycle hold each other, so each reads as externally held and neither
 /// side's collector can see it.  The edges are what makes the difference
@@ -173,10 +173,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refcnt_from_pyre_is_maxint_over_four_plus_one() {
+    fn refcnt_from_pypy_is_maxint_over_four_plus_one() {
         // rawrefcount.py:15, on a 64-bit host.
-        assert_eq!(REFCNT_FROM_PYRE, (isize::MAX / 4) + 1);
-        assert_eq!(REFCNT_FROM_PYRE, 1 << (isize::BITS - 3));
+        assert_eq!(REFCNT_FROM_PYPY, (isize::MAX / 4) + 1);
+        assert_eq!(REFCNT_FROM_PYPY, 1 << (isize::BITS - 3));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! under the pure-Rust `wasmi` interpreter instead of wasmtime.
 //!
 //! It satisfies the identical host-import contract as the wasmtime path in
-//! `main.rs` (`pyre_jit.*`, `pyre_host.*`, the per-trace `env.memory` /
+//! `main.rs` (`majit_host.*`, `pyre_host.*`, the per-trace `env.memory` /
 //! `env.jit_call` wiring, and the reflective residual-call trampoline). The
 //! only difference is the runtime: wasmi does not compile the module on load,
 //! so there is no per-process cranelift fixed cost — at the price of slower
@@ -216,7 +216,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
 
     linker
         .func_wrap(
-            "pyre_jit",
+            "majit_host",
             "jit_compile_wasm",
             |mut caller: Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32| -> u32 {
                 match jit_compile(&mut caller, bytes_ptr, bytes_len) {
@@ -232,7 +232,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
 
     linker
         .func_wrap(
-            "pyre_jit",
+            "majit_host",
             "jit_replace_wasm",
             |mut caller: Caller<'_, Host>, func_id: u32, bytes_ptr: u32, bytes_len: u32| -> u32 {
                 match jit_replace(&mut caller, func_id, bytes_ptr, bytes_len) {
@@ -248,7 +248,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
 
     linker
         .func_wrap(
-            "pyre_jit",
+            "majit_host",
             "jit_execute_wasm",
             |mut caller: Caller<'_, Host>, func_id: u32, frame_ptr: u32| -> u32 {
                 match jit_execute(&mut caller, func_id, frame_ptr) {
@@ -264,7 +264,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
 
     linker
         .func_wrap(
-            "pyre_jit",
+            "majit_host",
             "jit_free_wasm",
             |mut caller: Caller<'_, Host>, func_id: u32| {
                 caller.data_mut().traces.remove(&func_id);
@@ -276,7 +276,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
     // wasmtime path's `jit_call_host` for the full rationale.
     linker
         .func_wrap(
-            "pyre_jit",
+            "majit_host",
             "jit_call_host",
             |mut caller: Caller<'_, Host>, frame_ptr: u32| {
                 if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32)

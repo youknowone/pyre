@@ -42,7 +42,7 @@
 //!
 //! Block A holds the residual `first` call producing `opt`.  Because
 //! `Option<&PyObjectRef>` triggers `option_residual_narrow_root`, `lower_call`
-//! appends a trailing `__pyre_cast_instance` after the call, so the call is NOT
+//! appends a trailing `__cast_instance_intrinsic` after the call, so the call is NOT
 //! A's last op — the block-A skeleton absorbs that optional cast, exactly as
 //! [`crate::front::option_map_or`] does.  The rewrite:
 //! 1. drops the `first` call (+ absorbed cast) and closes A with a
@@ -124,7 +124,7 @@ fn rewire_one_slice_first_site(
         .ok_or_else(|| format!("{name}: slice::first result var has no producer block"))?;
 
     // Locate the `first` call op by its result (not assuming it is the block
-    // tail — the trailing `__pyre_cast_instance` may follow, see below).
+    // tail — the trailing `__cast_instance_intrinsic` may follow, see below).
     let ci = graph.blocks[a]
         .operations
         .iter()
@@ -132,7 +132,7 @@ fn rewire_one_slice_first_site(
         .ok_or_else(|| format!("{name}: slice::first call op not found in block {a}"))?;
     let ops_len = graph.blocks[a].operations.len();
 
-    // `Option<&PyObjectRef>` gains a trailing `__pyre_cast_instance` narrowing
+    // `Option<&PyObjectRef>` gains a trailing `__cast_instance_intrinsic` narrowing
     // op (`result_narrow_root`) whose output is what the block forwards on.
     // Absorb that optional cast: `flow_result` is the value B consumes,
     // `narrow_root` re-applies the narrowing per arm, `remove_upto` bounds the
@@ -150,7 +150,7 @@ fn rewire_one_slice_first_site(
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__pyre_cast_instance"
+                && segments[0] == "__cast_instance_intrinsic"
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {
@@ -413,7 +413,7 @@ mod tests {
     }
 
     /// The production shape: an `Option<&RegisteredStruct>` result appends a
-    /// trailing `__pyre_cast_instance` narrowing op, so the call is NOT the
+    /// trailing `__cast_instance_intrinsic` narrowing op, so the call is NOT the
     /// block tail.  The rewrite absorbs the cast, fires, and re-applies the
     /// narrowing in both arms.
     #[test]
@@ -444,7 +444,7 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
                     },
                     args: vec![opt.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -471,7 +471,7 @@ mod tests {
             )),
             "residual first call removed from A"
         );
-        // Two arms each re-emit a `__pyre_cast_instance` narrowing.
+        // Two arms each re-emit a `__cast_instance_intrinsic` narrowing.
         let narrow_casts = g
             .blocks
             .iter()
@@ -480,7 +480,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                        if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                 )
             })
             .count();

@@ -50,7 +50,7 @@ Registration is driven two ways:
   codewriter.rs:158. **Empty in production** (test_support.rs:51). NOT gated.
 - **auto** every `>=2`-impl trait, behind `dyn_indirect_enabled()` — **on by default** since
   the `__dyn_call` flip; `PYRE_DYN_INDIRECT=0` is the kill switch. The gate comment warns:
-  minting base/impl subclass classdefs perturbs `pyre_struct_root_names` → `ensure_session`
+  minting base/impl subclass classdefs perturbs `struct_root_names` → `ensure_session`
   inheritance-id numbering even off-path, which is why the kill switch has to restore this
   registration and the `__dyn_call` emit together.
 
@@ -93,9 +93,9 @@ stored spelling from the census/registry before matching.
 ### Hook 2 (constant side): `&'static dyn Trait` static read → `SomeInstance(impl subclass)`
 
 `PlaceKind::Global` (mir.rs:4351). Today only the hard-wired `PyType` bucket narrows a static
-to a classed instance (`pytype_static_addr` → `__pyre_cast_instance["PyType"]`, mir.rs:4379).
+to a classed instance (`pytype_static_addr` → `__cast_instance_intrinsic["PyType"]`, mir.rs:4379).
 Generalize: when the static's declared type is a concrete `impl <RegisteredTrait>` struct,
-wrap the `ConstRefAddr` in `__pyre_cast_instance[<impl_root>]` so its annotation lands as
+wrap the `ConstRefAddr` in `__cast_instance_intrinsic[<impl_root>]` so its annotation lands as
 `SomeInstance(impl_subclass_classdef)`, which unions cleanly (commonbase) with the
 base-classed field cell from Hook 1.
 
@@ -169,7 +169,7 @@ ONLY from `getuniqueclassdef_for_struct_root` (pass-2 bookkeeper.rs:1858, drain 
 `getuniqueclassdef_for_enum_variant` (:1921). None run here.
 
 **Why the eager `ensure_session` struct-root prologue does not cover it** (the true keystone). The
-prologue (pyre_call_registry.rs:562-566) DOES loop `pyre_struct_root_names()` → each is a `reg.fields`
+prologue (call_registry.rs:562-566) DOES loop `struct_root_names()` → each is a `reg.fields`
 key, which is the **`::`-spelled / bare-leaf** spelling (mir.rs:1041-1042). So it calls
 `getuniqueclassdef_for_struct_root("pyre_object::dictmultiobject::W_DictObject")` — the **colon**
 root. But `intern_class_by_qualname` keys its class cache on `canonical_struct_name(&cur)`
@@ -209,10 +209,10 @@ carry a classdef at all. This reframes the fix (see below).
 - **(B) Hook 2 only (constant-side), NO field-side change.** Because the failing union is
   `Ptr ∪ Instance(None)` and `Instance(classed) ∪ Instance(None)` WIDENS (model.rs:3230), lowering the
   `&'static dyn Trait` static reads (mir.rs:4351 `PlaceKind::Global`) to a classed `SomeInstance` via
-  `__pyre_cast_instance[<impl_root>]` may resolve the union with zero field-side / pass-2 work. The
+  `__cast_instance_intrinsic[<impl_root>]` may resolve the union with zero field-side / pass-2 work. The
   field cell stays classdef-less; the widen arm absorbs it. **This is now the most promising minimal
   slice** and sidesteps the entire dotted/colon keystone. Needs: confirm the static read currently
-  produces `_ptr` (Ptr) not an Instance, and that `__pyre_cast_instance` on a static addr is wired.
+  produces `_ptr` (Ptr) not an Instance, and that `__cast_instance_intrinsic` on a static addr is wired.
 
 **Next slice = probe (B):** instrument whether lowering just the static-constant reads flips
 `_ptr ∪ <other>` to `Instance(impl) ∪ Instance(None)` → widen. If yes, (B) is the fix and the
@@ -222,7 +222,7 @@ dotted/colon split never needs touching.
 
 Implemented in `front/mir.rs` `PlaceKind::Global` arm + helper `refs_static_zerofield_struct_root`.
 A `refs`-bucket static whose declared type (`place.ty`, the bare pointee ADT for a Global place)
-resolves to a **zero-field unit struct** is narrowed `ConstRefAddr → __pyre_cast_instance[<impl_root>]`
+resolves to a **zero-field unit struct** is narrowed `ConstRefAddr → __cast_instance_intrinsic[<impl_root>]`
 → classed `SomeInstance(impl)`. Gated to zero-field structs so the 5 field-bearing object singletons
 (`W_NoneObject`/`W_BoolObject`×2/`NotImplemented`/`Ellipsis`) in the same 13-entry `refs` bucket
 (jit_fnaddr.rs:2062-2131) keep their raw-pointer lowering; catches the 8 dstrategy singletons.

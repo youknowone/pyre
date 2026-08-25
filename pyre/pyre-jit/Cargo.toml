@@ -24,7 +24,7 @@ jit-audits = ["majit-metainterp/jit-audits", "majit-ir/jit-audits"]
 # can select the MIR front-end from the top level
 # (`cargo build --features pyre-jit/mir-frontend`).  Production
 # validation runs check.py with this enabled and
-# PYRE_MIR_FRONTEND_LLBC pointing at an extracted .ullbc.
+# MAJIT_MIR_FRONTEND_LLBC pointing at an extracted .ullbc.
 mir-frontend = ["majit-translate/mir-frontend"]
 # Collect on every allocation so instance / container GC tracing is
 # exercised eagerly. majit-gc is compiled once per build, so this single

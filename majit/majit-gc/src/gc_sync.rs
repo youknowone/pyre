@@ -346,7 +346,7 @@ pub struct BlockingGuard {
 /// instruction (`entrypoint.c:78 _RPyGilAcquire`). Takes the GIL back and
 /// rejoins the RUNNING census for as long as the guard lives, then gives both
 /// back so the outward call's `BlockingGuard` finds the state it left.
-#[must_use = "pyre may only run for as long as the guard is alive"]
+#[must_use = "managed runtime code may only run while the guard is alive"]
 pub struct CallbackGuard {
     rejoined: bool,
     took_gil: bool,

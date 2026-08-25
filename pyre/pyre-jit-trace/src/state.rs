@@ -4343,7 +4343,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 {
                     if loaded != cached_int && crate::probe_subscr_enabled() {
                         eprintln!(
-                            "[PYRE_PROBE_SUBSCR] sanity-int-mismatch obj={:?} field_index={} struct_ptr={:#x} descr_pure={} cached={} loaded={}",
+                            "[MAJIT_PROBE_SUBSCR] sanity-int-mismatch obj={:?} field_index={} struct_ptr={:#x} descr_pure={} cached={} loaded={}",
                             obj,
                             field_index,
                             struct_ptr,

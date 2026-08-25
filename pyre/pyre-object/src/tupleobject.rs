@@ -361,7 +361,7 @@ fn w_tuple_new_array_backed_impl(
 
     // pop_roots: read the relocated item pointers back out of the shadow
     // stack, then build the items block. On the Phase L2 nursery path
-    // (`PYRE_GC_ITEMSBLOCK`) the block itself is GC-managed and is the
+    // (`MAJIT_GC_ITEMSBLOCK`) the block itself is GC-managed and is the
     // last allocation here, so it stays put until `wrappeditems` is set;
     // `alloc_tuple_items_block_gc` re-pins the relocated values across its
     // own (collecting) block malloc. Gate off it is the std::alloc block.

@@ -137,7 +137,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) fn determinism_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("PYRE_DETERMINISM_TRACE").is_some_and(|value| value == "1")
+        std::env::var_os("MAJIT_DETERMINISM_TRACE").is_some_and(|value| value == "1")
     })
 }
 
@@ -182,17 +182,12 @@ pub struct MethodInfo {
 ///
 /// 1. Paths supplied by an explicit-LLBC analyzer entry point. These are the
 ///    complete input set and disable every fallback below.
-/// 2. `PYRE_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
+/// 2. `MAJIT_MIR_FRONTEND_LLBC` env-var (OS path-list: `;`-separated on
 ///    Windows, `:`-separated elsewhere). Explicit override for CI /
 ///    test fixtures targeting a specific LLBC set.
-/// 3. Auto-discovery at `<workspace>/build/llbc/<expected>.ullbc`,
-///    where `scripts/extract-llbc.py` writes. If every expected file
-///    exists, the MIR front-end engages automatically.
 ///
-/// Panics when neither source resolves: the MIR front-end is the only
-/// graph builder, so a missing LLBC set (Charon not installed, or
-/// `scripts/extract-llbc.py` not run) is a fatal misconfiguration
-/// rather than a fallback to another path.
+/// Panics when neither source resolves. Artifact selection belongs to the
+/// consumer because only the consumer knows which crates form its program.
 fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
@@ -201,33 +196,29 @@ fn build_semantic_program_via_active_frontend(
 ) -> front::SemanticProgram {
     #[cfg(feature = "mir-frontend")]
     {
-        // Accept an OS path-list so production can pass the canonical
-        // pyre LLBC set in one env-var.
+        // Accept an OS path-list so a consumer can pass its LLBC set in one
+        // environment variable.
         // `std::env::split_paths` uses the platform separator (`;` on
         // Windows, `:` elsewhere) so a Windows drive letter like `Z:`
         // is not mistaken for a separator.  The single-path form also
         // works.
         //
-        // If the env-var is unset, auto-discover the canonical
-        // workspace LLBC artefacts before failing loud.
         let resolved_paths: Option<Vec<String>> = explicit_llbc_paths
             .filter(|paths| !paths.is_empty())
             .map(|paths| paths.iter().map(|path| (*path).to_string()).collect())
             .or_else(|| {
-                std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+                std::env::var_os("MAJIT_MIR_FRONTEND_LLBC")
                     .map(|v| {
                         std::env::split_paths(&v)
                             .filter(|p| !p.as_os_str().is_empty())
                             .map(|p| p.to_string_lossy().into_owned())
                             .collect()
                     })
-                    // A present-but-blank override (`PYRE_MIR_FRONTEND_LLBC=`)
-                    // collects to an empty vec; treat it as unset so workspace
-                    // auto-discovery still runs instead of feeding an empty LLBC
-                    // set into the frontend.
+                    // A present-but-blank override (`MAJIT_MIR_FRONTEND_LLBC=`)
+                    // collects to an empty vec; treat it as unset instead of
+                    // feeding an empty LLBC set into the frontend.
                     .filter(|paths: &Vec<String>| !paths.is_empty())
-            })
-            .or_else(|| auto_discover_workspace_llbc_paths(module_paths));
+            });
         if let Some(paths) = resolved_paths {
             let llbcs: Vec<majit_charon_reader::Llbc> = paths
                 .iter()
@@ -241,8 +232,8 @@ fn build_semantic_program_via_active_frontend(
             // Seed the local-crate alias roots from the loaded set so
             // `free_function_alias_paths` and the registry's canonical
             // dedup treat every extracted crate name as an alias root
-            // (`local_crates.rs`); a non-pyre consumer resolves its
-            // crate-qualified cross-crate callsites through this.
+            // (`local_crates.rs`); consumers resolve crate-qualified
+            // cross-crate callsites through this set.
             crate::local_crates::register_local_crate_roots(
                 llbcs.iter().map(|l| l.crate_name().to_string()),
             );
@@ -289,7 +280,7 @@ fn build_semantic_program_via_active_frontend(
                 .chain(
                     llbcs
                         .iter()
-                        .flat_map(front::mir::collect_pyre_class_ctor_stubs_from_llbc),
+                        .flat_map(front::mir::collect_marked_class_ctor_stubs_from_llbc),
                 )
                 .collect();
             // Foreign opaque-ADT methods (`<BigInt as Add>::add`, …) that
@@ -313,143 +304,15 @@ fn build_semantic_program_via_active_frontend(
     }
     let _ = module_paths; // silence unused warning when the feature is off
     // The MIR front-end is the only graph builder.  Reaching this
-    // point means neither `PYRE_MIR_FRONTEND_LLBC` nor the workspace
-    // auto-discover located an LLBC source — surface the
+    // point means neither an explicit path set nor
+    // `MAJIT_MIR_FRONTEND_LLBC` supplied an LLBC source. Surface the
     // misconfiguration immediately.
     panic!(
         "no LLBC source resolved.\n\
-         Run `scripts/extract-llbc.py` to produce \
-         `build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc`, \
-         or set `PYRE_MIR_FRONTEND_LLBC` to an OS path-list \
+         Pass explicit LLBC paths to the analyzer, or set \
+         `MAJIT_MIR_FRONTEND_LLBC` to an OS path-list \
          (`;`-separated on Windows, `:` elsewhere) explicitly."
     );
-}
-
-/// Locate the workspace's `build/llbc/` directory and return paths to
-/// the canonical pyre LLBC artefacts when every expected file is
-/// present *and* the caller looks like a production build (not a test
-/// fixture).
-///
-/// Returns `None` when:
-///   - no source carries a `module_path` (test fixtures pass empty
-///     module paths; production passes per-file crate-stripped paths),
-///   - the caller passed fewer than `PROD_SOURCE_FILES_FLOOR`
-///     module paths (single-source diagnostic),
-///   - a mandatory artefact (`pyre-object.ullbc` /
-///     `pyre-interpreter.ullbc`) is missing (contributor without
-///     Charon installed), or
-///   - the workspace anchoring fails.
-///
-/// `pyre-jit.ullbc` is included when present. Pyre's production
-/// `eval::eval_loop_jit` driver requires it; the extraction bootstrap no
-/// longer relies on a different temporary portal and instead bypasses this
-/// analysis explicitly with `MAJIT_LLBC_EXTRACTION=1`. Returning the mandatory
-/// pair when it is absent remains useful only to consumers whose configured
-/// portal is contained in those artifacts; exact driver resolution rejects an
-/// unavailable portal later in the pipeline.
-///
-/// The two gates together match the production fingerprint:
-/// `pyre-jit-trace/build.rs` calls
-/// `analyze_multiple_pipeline_with_modules` with ≈100 per-file
-/// `module_path`s.  Non-production callers (test fixtures and the
-/// 5-module `generated::PYRE_JIT_GRAPH_MODULES` manifest) stay below
-/// the floor, so auto-discovery does not silently swap their
-/// front-end.
-///
-/// The workspace root is anchored at compile time via
-/// `env!("CARGO_MANIFEST_DIR")` — `<workspace>/majit/majit-translate`
-/// resolves up to `<workspace>` via two `..` segments.  The
-/// `scripts/extract-llbc.py` script writes to the same
-/// `<workspace>/build/llbc/` directory by convention, so the two
-/// halves stay in sync.
-#[cfg(feature = "mir-frontend")]
-fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<String>> {
-    const PROD_SOURCE_FILES_FLOOR: usize = 50;
-    if module_paths.len() < PROD_SOURCE_FILES_FLOOR {
-        return None;
-    }
-    if !module_paths.iter().any(|mp| !mp.is_empty()) {
-        return None;
-    }
-    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
-    let llbc_dir = workspace_root.join("build").join("llbc");
-    // Canonical production set.  `pyre-module.ullbc` is intentionally
-    // omitted — it is empty in current builds and adds nothing.
-    // `corpus.ullbc` is the Charon fixture, not production.
-    //
-    // The set is fixed at exactly these crates so the generated
-    // `all_jitcodes` table is environment-invariant: every real build
-    // (`cargo test`, `pyre/check.py`) consumes the same `.ullbc`
-    // inputs, so a local tree and CI produce byte-identical codegen.
-    // `majit-rlib.ullbc`, `pyre-object.ullbc` and `pyre-interpreter.ullbc` are
-    // mandatory. `majit-rlib` comes first because it owns `rbigint`: the other
-    // artefacts carry whatever cross-crate references pulled in, and the
-    // first-writer-wins per-type tables below should take the owning crate's
-    // complete declarations rather than those partial ones.
-    //
-    // `pyre-jit.ullbc` hosts Pyre's exact `eval::eval_loop_jit` portal. The
-    // extraction driver sets `MAJIT_LLBC_EXTRACTION=1` while producing that
-    // artifact, so `pyre-jit-trace/build.rs` emits compile-only placeholders
-    // and never enters this analysis during the dependency bootstrap. A normal
-    // Pyre build requires all three artifacts; generic consumers whose portal
-    // lives in the mandatory pair may still use the two-artifact result.
-    const MANDATORY: &[&str] = &[
-        "majit-rlib.ullbc",
-        "pyre-object.ullbc",
-        "pyre-interpreter.ullbc",
-    ];
-    let mut paths = Vec::with_capacity(MANDATORY.len() + 1);
-    for name in MANDATORY {
-        let p = llbc_dir.join(name);
-        if !p.exists() {
-            return None;
-        }
-        paths.push(p.to_string_lossy().into_owned());
-    }
-    let pyre_jit = llbc_dir.join("pyre-jit.ullbc");
-    if pyre_jit.exists() {
-        paths.push(pyre_jit.to_string_lossy().into_owned());
-    } else {
-        eprintln!(
-            "[majit-translate] pyre-jit.ullbc absent — using the 2-crate \
-             front-end. A configured eval::eval_loop_jit driver will fail \
-             exact portal resolution; run scripts/extract-llbc.py first."
-        );
-    }
-    // Cross-target layout sidecars LAST.  Charon resolves struct layouts per
-    // target, and the artefacts above carry the extraction host's; building
-    // for a target with a different pointer width would otherwise read every
-    // field past the first pointer at the wrong offset.  A sidecar is the same
-    // crate re-extracted for that target, reduced to `type_decls`.  It must
-    // contribute *only* its `exact_layouts` (the target field offsets): its
-    // `type_decls` were extracted without the function bodies, so any field
-    // type first hash-consed in a dropped body resolves to nothing, and the
-    // host artefacts — where those types are target-independent and fully
-    // resolvable — are the authority for everything but offsets.  So the
-    // sidecar goes last, and `build_semantic_program_from_llbcs` seeds every
-    // per-type-string table from the host (first-writer) while overwriting
-    // `exact_layouts` from the sidecar (last-writer).
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let host = std::env::var("HOST").unwrap_or_default();
-    if layout::is_cross_target(&target, &host) {
-        for name in MANDATORY {
-            let stem = name.trim_end_matches(".ullbc");
-            let sidecar = llbc_dir.join(layout::layout_sidecar_filename(stem, &target));
-            if sidecar.exists() {
-                paths.push(sidecar.to_string_lossy().into_owned());
-            } else {
-                eprintln!(
-                    "[majit-translate] {stem}.{target}.layouts.ullbc absent — \
-                     cross-target build will read {stem}'s host-extracted field \
-                     offsets, which may be wrong for {target}; run \
-                     scripts/extract-llbc.py to produce it."
-                );
-            }
-        }
-    }
-    Some(paths)
 }
 
 /// Merge JIT-hint markers harvested from the ullbc surrogate consts
@@ -561,8 +424,7 @@ pub struct HostStaticAddrs<'a> {
 /// analyzed source file (e.g. `"intobject"` for
 /// `pyre_object/src/intobject.rs`).  The graph surface itself comes
 /// from the Charon-extracted LLBC set; the `module_paths` slice drives
-/// the workspace LLBC auto-discovery production fingerprint and stays
-/// available for per-file lexical resolution.  Source text is not
+/// per-file lexical resolution. Source text is not
 /// consumed — callers pass paths only.
 ///
 /// An empty `module_paths[i]` keeps simple-name registration only —
@@ -591,9 +453,9 @@ pub fn analyze_multiple_pipeline_with_modules(
 /// Multi-file analysis with an explicit, ordered LLBC input set.
 ///
 /// Consumer build scripts should prefer this entry point over the legacy
-/// `PYRE_MIR_FRONTEND_LLBC` compatibility environment variable. The supplied
-/// paths are the complete translation input and never fall back to Pyre's
-/// workspace auto-discovery.
+/// `MAJIT_MIR_FRONTEND_LLBC` compatibility environment variable. The supplied
+/// paths are the complete translation input and never fall back to the
+/// environment variable.
 pub fn analyze_multiple_pipeline_from_llbc_with_modules(
     llbc_paths: &[&str],
     module_paths: &[&str],
@@ -721,7 +583,7 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     paths
 }
 
-/// `PYRE_PROFILE_PIPELINE=1` phase profiler: elapsed wall time plus the
+/// `MAJIT_PROFILE_PIPELINE=1` phase profiler: elapsed wall time plus the
 /// process high-water RSS at each mark, so a phase's contribution to the
 /// translation prepass's peak footprint is visible next to its cost in time.
 pub struct PhaseProfiler {
@@ -734,7 +596,7 @@ impl PhaseProfiler {
     pub fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
-            enabled: std::env::var_os("PYRE_PROFILE_PIPELINE").is_some(),
+            enabled: std::env::var_os("MAJIT_PROFILE_PIPELINE").is_some(),
             start: now,
             last: now,
         }
@@ -747,7 +609,7 @@ impl PhaseProfiler {
         let now = std::time::Instant::now();
         const GB: f64 = (1u64 << 30) as f64;
         eprintln!(
-            "[PYRE_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  live {:>6.2}GB  peak {:>6.2}GB  {name}",
+            "[MAJIT_PROFILE_PIPELINE] {:>9.3}s  {:>9.3}s  live {:>6.2}GB  peak {:>6.2}GB  {name}",
             (now - self.start).as_secs_f64(),
             (now - self.last).as_secs_f64(),
             live_rss_bytes() as f64 / GB,
@@ -761,7 +623,7 @@ impl PhaseProfiler {
     /// counting the sizes costs nothing when the profiler is off.
     pub fn note(&self, message: impl FnOnce() -> String) {
         if self.enabled {
-            eprintln!("[PYRE_PROFILE_PIPELINE] {}", message());
+            eprintln!("[MAJIT_PROFILE_PIPELINE] {}", message());
         }
     }
 }
@@ -907,8 +769,8 @@ fn analyze_pipeline_from_module_paths(
     // SemanticProgram build through the MIR-driven
     // `front::mir::build_semantic_program_from_llbcs` path.  The LLBC
     // source is a Charon-extracted .ullbc snapshot (produced by
-    // `scripts/extract-llbc.py`), located via `PYRE_MIR_FRONTEND_LLBC`
-    // or workspace auto-discovery.
+    // `scripts/extract-llbc.py`), supplied explicitly by the consumer or
+    // located via `MAJIT_MIR_FRONTEND_LLBC`.
     mark_phase!("known_statics + struct_field_attrs populated");
     let mut program = build_semantic_program_via_active_frontend(
         module_paths,
@@ -1024,10 +886,9 @@ fn analyze_pipeline_from_module_paths(
     // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
-    // Pyre's call registry is keyed on `CallPath` segment strings, and
-    // the alias expansion below intentionally registers each free
-    // function under every well-known pyre-crate prefix
-    // (`pyre_interpreter` / `pyre_object` / `pyre_jit`).  Without a
+    // The call registry is keyed on `CallPath` segment strings, and the
+    // alias expansion below intentionally registers each free function under
+    // every crate root in the loaded LLBC set. Without a
     // collision check the second registration silently overwrites the
     // first when two source crates happen to define a function with
     // the same tail segments, so the call resolver may then route to
@@ -1242,8 +1103,8 @@ fn analyze_pipeline_from_module_paths(
     call_control.recompute_immutable_array_types();
     // The `unsafe_fn_stubs` carrier lets the codewriter's
     // `dual_gate_registry` register every `unsafe fn` / unsafe
-    // impl-method as a stub-pygraph entry in PyreCallRegistry, covering
-    // the bulk of the "not registered in PyreCallRegistry" Skip cluster
+    // impl-method as a stub-pygraph entry in CallRegistry, covering
+    // the bulk of the "not registered in CallRegistry" Skip cluster
     // dominated by `pyre_object::is_*` predicates whose body lowering is
     // intentionally rejected (raw-pointer access the flowspace adapter
     // does not model — only a typed signature stub is registered).
@@ -1385,10 +1246,10 @@ fn analyze_pipeline_from_module_paths(
     //
     // RPython parity: hints live on `graph.func` and survive alias
     // routing because the call path resolves to a single function
-    // object identity (`policy.py:48` / `call.py:126`).  Pyre keys
-    // hints on `CallPath` segments, so every spelling the graph alias
-    // loop registered above (`free_function_alias_paths`: bare +
-    // `crate::` + `pyre_interpreter|pyre_object|pyre_jit::` + the
+    // object identity (`policy.py:48` / `call.py:126`). This port keys hints
+    // on `CallPath` segments, so every spelling the graph alias loop
+    // registered above (`free_function_alias_paths`: bare + `crate::` +
+    // each loaded LLBC crate root + the
     // `source_module`-prefixed variants thereof) must carry the same
     // hint set.  Missing the source-module-qualified aliases silently
     // disables `_jit_look_inside_` etc. for module-qualified callers,
@@ -1611,7 +1472,7 @@ fn analyze_pipeline_from_module_paths(
     // Default bodies registered that direct path in the loop above; a
     // required method (declaration only, no default body) left it
     // unregistered, so the registry lift failed with "not registered
-    // in PyreCallRegistry" and poisoned every caller.  RPython
+    // in CallRegistry" and poisoned every caller.  RPython
     // resolves the call on the receiver's class
     // (`classdesc.py lookup` MRO walk); when exactly one class
     // implements the method in the closed LLBC world, that walk has a
@@ -2098,7 +1959,7 @@ fn analyze_pipeline_from_module_paths(
     // upstream's declared-external arm without a declaration behind them.
     // Off by default — it is a whole extra walk of the registered universe,
     // and it reports a population, not a defect.
-    if std::env::var_os("PYRE_CALLEE_CENSUS").is_some_and(|v| v == "1") {
+    if std::env::var_os("MAJIT_CALLEE_CENSUS").is_some_and(|v| v == "1") {
         eprint!("{}", call_control.unknown_callee_census());
         // the unused-override check's falsifier. `call_target_matches_loose` reports a
         // non-match by returning `false`, so an override entry that names a
@@ -2316,7 +2177,7 @@ fn make_jitcodes(
     // `insns`, mirroring RPython's single-store model.
     let descrs: Vec<jitcode::BhDescr> = codewriter.assembler.snapshot_descrs();
 
-    if std::env::var_os("PYRE_DESCR_POOL_CENSUS").is_some_and(|v| v == "1") {
+    if std::env::var_os("MAJIT_DESCR_POOL_CENSUS").is_some_and(|v| v == "1") {
         let dup = codewriter.assembler.descr_pool_duplication();
         // C1: the mint universe, beside the pool, in the same generation.
         // `all_descrs` stable while the pool moves is a SELECTION defect;

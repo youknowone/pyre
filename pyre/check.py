@@ -2180,7 +2180,7 @@ def workspace_member_dirs():
     return members
 
 
-# The package whose build script reads `PYRE_MIR_FRONTEND_LLBC`. `cargo` runs a
+# The package whose build script reads `MAJIT_MIR_FRONTEND_LLBC`. `cargo` runs a
 # build script with its own package directory as the working directory, so that
 # is what a relative entry in the override is relative to — not this script's.
 LLBC_OVERRIDE_BASE = "pyre/pyre-jit-trace"
@@ -2190,7 +2190,7 @@ def llbc_input_paths():
     """The LLBC artefacts the JIT front end will actually read.
 
     `majit_translate::build_semantic_program_via_active_frontend` reads them from
-    `PYRE_MIR_FRONTEND_LLBC` (an OS path-list) before falling back to the
+    `MAJIT_MIR_FRONTEND_LLBC` (an OS path-list) before falling back to the
     workspace `build/llbc`, so a run under that override is built against
     different bytes than the default glob names.
 
@@ -2203,7 +2203,7 @@ def llbc_input_paths():
     value however often the real artefact is rewritten, so `--no-build` would
     approve a generated JIT front end built from an LLBC that has since moved.
     """
-    override = os.environ.get("PYRE_MIR_FRONTEND_LLBC")
+    override = os.environ.get("MAJIT_MIR_FRONTEND_LLBC")
     if override:
         return [
             entry if os.path.isabs(entry)

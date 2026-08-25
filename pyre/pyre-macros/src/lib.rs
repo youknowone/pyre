@@ -1808,7 +1808,7 @@ fn expand_pyre_methods(
     // Collect (python_name, wrapper_ident) per method as we rewrite the
     // impl block in-place: every `fn name(&self|&mut self, …)` keeps
     // its typed body untouched so users can call it directly from Rust,
-    // and we synthesise a sibling `pub fn name__pyre_wrapper(args)` as
+    // and we synthesise a sibling `pub fn name__majit_wrapper(args)` as
     // a free-fn inside an attached `mod _pyre_wrappers_<Self>` module.
     let mut wrappers = Vec::<proc_macro2::TokenStream>::new();
     let mut registrations = Vec::<proc_macro2::TokenStream>::new();
@@ -1832,7 +1832,7 @@ fn expand_pyre_methods(
             ));
         }
         let mname = &m.sig.ident;
-        let wrapper_name = format_ident!("__pyre_wrap_{}", mname);
+        let wrapper_name = format_ident!("__majit_wrap_{}", mname);
         let wrapper_target_name = format_ident!("__majit_builtin_wrapper_target_{}", mname);
         let kind = classify_method(m)?;
 

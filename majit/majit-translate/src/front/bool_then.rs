@@ -126,7 +126,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     // assuming the last slot: on a simplified graph (a result_exc / next /
     // checked-arith callee runs `simplify_lowered_graph` before this pass) the
     // opaque `Ref` result is immediately narrowed to the concrete `Option<T>`
-    // by a `__pyre_cast_instance` recast tail that `eliminate_empty_blocks`
+    // by a `__cast_instance_intrinsic` recast tail that `eliminate_empty_blocks`
     // folds into A, leaving the call no longer last.
     let call_idx = graph.blocks[a]
         .operations
@@ -256,7 +256,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     )?;
     close_goto_mixed(graph, else_bb, b_target, else_link_args);
 
-    // A: drop the residual `then` call and any peeled `__pyre_cast_instance`
+    // A: drop the residual `then` call and any peeled `__cast_instance_intrinsic`
     // recast tail, branch on `cond`.  `set_branch` appends the `bool(cond)` hop
     // and installs the Bool(false)/Bool(true) arm links; the closure-env
     // construction ops before the call stay as A's tail.

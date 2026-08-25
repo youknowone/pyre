@@ -2083,7 +2083,7 @@ fn record_residual_call_graph_op(
     block: &super::flow::BlockRef,
     fn_idx: u16,
     flavor: CallFlavor,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     args_i: Vec<super::flow::FlowValue>,
     args_r: Vec<super::flow::FlowValue>,
     args_f: Vec<super::flow::FlowValue>,
@@ -2125,7 +2125,7 @@ fn record_residual_call_graph_op(
     // folds (BoxInt / BinaryOp / CompareOp dispatch in
     // `jitcode_dispatch.rs`); mirrors the tag the dedicated walker-emit
     // builders (`flatten.rs build_*_insn`) attach to the same helpers.
-    effect_info.pyre_helper = pyre_helper;
+    effect_info.runtime_helper = runtime_helper;
     op_args.push(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
     );
@@ -5279,8 +5279,8 @@ fn filter_liveness_in_place(
                         if matches!(
                             &**descr,
                             super::flatten::DescrOperand::CallDescrStub(stub)
-                                if stub.effect_info.pyre_helper
-                                    == majit_ir::PyreHelperKind::LoadAttr
+                                if stub.effect_info.runtime_helper
+                                    == majit_ir::RuntimeHelperKind::LoadAttr
                         )
                 )
             });
@@ -5853,7 +5853,7 @@ impl CodeWriter {
         // residual producers do; the tag is part of `EffectInfo` and therefore
         // already separates this entry in the cache key.
         let void_word_abi =
-            key.2.is_none() && key.0.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue;
+            key.2.is_none() && key.0.runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue;
         let mut cache = self.call_descr_stub_cache.lock().unwrap();
         let arc = cache.entry(key.clone()).or_insert_with(|| {
             Arc::new(CallDescrStub {
@@ -7027,7 +7027,7 @@ impl CodeWriter {
                 residual_call!(
                     $fn_idx,
                     $flavor,
-                    majit_ir::PyreHelperKind::None,
+                    majit_ir::RuntimeHelperKind::None,
                     $args_i,
                     $args_r,
                     $args_f,
@@ -7039,7 +7039,7 @@ impl CodeWriter {
             (
                 $fn_idx:expr,
                 $flavor:expr,
-                $pyre_helper:expr,
+                $runtime_helper:expr,
                 $args_i:expr,
                 $args_r:expr,
                 $args_f:expr,
@@ -7052,7 +7052,7 @@ impl CodeWriter {
                     &current_block.block(),
                     $fn_idx,
                     $flavor,
-                    $pyre_helper,
+                    $runtime_helper,
                     $args_i,
                     $args_r,
                     $args_f,
@@ -8869,7 +8869,7 @@ impl CodeWriter {
                             let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
-                                majit_ir::PyreHelperKind::BoxInt,
+                                majit_ir::RuntimeHelperKind::BoxInt,
                                 vec![super::flow::Constant::signed(val).into()],
                                 vec![],
                                 vec![],
@@ -9524,7 +9524,7 @@ impl CodeWriter {
                                 let loaded = residual_call!(
                                     load_global_fn_idx,
                                     CallFlavor::Plain,
-                                    majit_ir::PyreHelperKind::LoadGlobal,
+                                    majit_ir::RuntimeHelperKind::LoadGlobal,
                                     vec![super::flow::Constant::signed(raw_namei).into()],
                                     vec![ns_var.into(), code_const, frame_var.into()],
                                     vec![],
@@ -9603,7 +9603,7 @@ impl CodeWriter {
                                     let loaded = residual_call!(
                                         load_global_fn_idx,
                                         CallFlavor::Plain,
-                                        majit_ir::PyreHelperKind::LoadGlobal,
+                                        majit_ir::RuntimeHelperKind::LoadGlobal,
                                         vec![super::flow::Constant::signed(raw_namei).into()],
                                         vec![ns_const, code_const, frame_var.into()],
                                         vec![],
@@ -10043,7 +10043,7 @@ impl CodeWriter {
                                 let normalized_var = residual_call!(
                                     normalize_raise_varargs_fn_idx,
                                     CallFlavor::MayForce,
-                                    majit_ir::PyreHelperKind::RaiseVarargs,
+                                    majit_ir::RuntimeHelperKind::RaiseVarargs,
                                     vec![],
                                     vec![frame_var.into(), exc_fv.into(), cause_fv.into()],
                                     vec![],
@@ -10097,7 +10097,7 @@ impl CodeWriter {
                                     let reraise_value = residual_call!(
                                         reraise_varargs_zero_fn_idx,
                                         CallFlavor::Plain,
-                                        majit_ir::PyreHelperKind::RaiseVarargs,
+                                        majit_ir::RuntimeHelperKind::RaiseVarargs,
                                         vec![],
                                         vec![],
                                         vec![],
@@ -10126,7 +10126,7 @@ impl CodeWriter {
                                     let reraise_value = residual_call!(
                                         get_current_exception_fn_idx,
                                         CallFlavor::PlainCannotRaiseNoHeap,
-                                        majit_ir::PyreHelperKind::GetCurrentException,
+                                        majit_ir::RuntimeHelperKind::GetCurrentException,
                                         vec![],
                                         vec![],
                                         vec![],
@@ -10245,7 +10245,7 @@ impl CodeWriter {
                             let prev_var = residual_call!(
                                 get_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::PyreHelperKind::GetCurrentException,
+                                majit_ir::RuntimeHelperKind::GetCurrentException,
                                 vec![],
                                 vec![],
                                 vec![],
@@ -10256,7 +10256,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::PyreHelperKind::SetCurrentException,
+                                majit_ir::RuntimeHelperKind::SetCurrentException,
                                 vec![],
                                 vec![exc_value.clone()],
                                 vec![],
@@ -10275,7 +10275,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 clear_in_flight_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::PyreHelperKind::ClearInFlightException,
+                                majit_ir::RuntimeHelperKind::ClearInFlightException,
                                 vec![],
                                 vec![],
                                 vec![],
@@ -10361,7 +10361,7 @@ impl CodeWriter {
                             let cmp_result = residual_call!(
                                 compare_fn_idx,
                                 CallFlavor::MayForce,
-                                majit_ir::PyreHelperKind::CompareOp,
+                                majit_ir::RuntimeHelperKind::CompareOp,
                                 vec![
                                     super::flow::Constant::signed(
                                         pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
@@ -10436,7 +10436,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::PyreHelperKind::SetCurrentException,
+                                majit_ir::RuntimeHelperKind::SetCurrentException,
                                 vec![],
                                 vec![prev_value],
                                 vec![],
@@ -10590,7 +10590,7 @@ impl CodeWriter {
                                 // NULL-ref gate admit that NULL; without it
                                 // every bridge out of a `with` handler is
                                 // refused at this residual.
-                                majit_ir::PyreHelperKind::WithExceptStart,
+                                majit_ir::RuntimeHelperKind::WithExceptStart,
                                 vec![],
                                 vec![exit_func, exit_self, exc],
                                 vec![],
@@ -10963,7 +10963,7 @@ impl CodeWriter {
                             let tuple_var = residual_call!(
                                 unpack_sequence_fn_idx,
                                 CallFlavor::MayForce,
-                                majit_ir::PyreHelperKind::UnpackSequence,
+                                majit_ir::RuntimeHelperKind::UnpackSequence,
                                 vec![super::flow::Constant::signed(n as i64).into()],
                                 vec![seq_value],
                                 vec![],
@@ -11018,7 +11018,7 @@ impl CodeWriter {
                                 let item_var = residual_call!(
                                     unpack_item_fn_idx,
                                     CallFlavor::Plain,
-                                    majit_ir::PyreHelperKind::UnpackItem,
+                                    majit_ir::RuntimeHelperKind::UnpackItem,
                                     vec![super::flow::Constant::signed(k as i64).into()],
                                     vec![tuple_value.clone()],
                                     vec![],
@@ -11047,7 +11047,7 @@ impl CodeWriter {
                             let iter_var = residual_call!(
                                 get_iter_fn_idx,
                                 CallFlavor::MayForce,
-                                majit_ir::PyreHelperKind::GetIter,
+                                majit_ir::RuntimeHelperKind::GetIter,
                                 vec![],
                                 vec![iterable_value],
                                 vec![],
@@ -11138,7 +11138,7 @@ impl CodeWriter {
                             let next_var = residual_call!(
                                 for_iter_next_fn_idx,
                                 CallFlavor::MayForce,
-                                majit_ir::PyreHelperKind::ForIterNext,
+                                majit_ir::RuntimeHelperKind::ForIterNext,
                                 vec![],
                                 vec![iter_value],
                                 vec![],
@@ -11207,7 +11207,7 @@ impl CodeWriter {
                                 &stop_match.block(),
                                 for_iter_exception_match_fn_idx,
                                 CallFlavor::PlainCannotRaise,
-                                majit_ir::PyreHelperKind::ForIterExceptionMatch,
+                                majit_ir::RuntimeHelperKind::ForIterExceptionMatch,
                                 vec![],
                                 vec![
                                     stop_exc_value.into(),
@@ -11668,7 +11668,7 @@ impl CodeWriter {
                             let _ = residual_call!(
                                 list_append_fn_idx,
                                 CallFlavor::Plain,
-                                majit_ir::PyreHelperKind::ListAppendValue,
+                                majit_ir::RuntimeHelperKind::ListAppendValue,
                                 vec![],
                                 vec![list_value.into(), value_value.into()],
                                 vec![],
@@ -12627,7 +12627,7 @@ impl CodeWriter {
                                 let item_var = residual_call!(
                                     unpack_item_fn_idx,
                                     CallFlavor::Plain,
-                                    majit_ir::PyreHelperKind::UnpackItem,
+                                    majit_ir::RuntimeHelperKind::UnpackItem,
                                     vec![super::flow::Constant::signed(k as i64).into()],
                                     vec![tuple_value.clone()],
                                     vec![],
@@ -14276,7 +14276,7 @@ impl CodeWriter {
                         let boxed_lasti = residual_call!(
                             box_int_fn_idx,
                             CallFlavor::Plain,
-                            majit_ir::PyreHelperKind::BoxInt,
+                            majit_ir::RuntimeHelperKind::BoxInt,
                             vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()],
                             vec![],
                             vec![],
@@ -16485,7 +16485,7 @@ mod tests {
     fn list_append_void_stub_records_ignored_word_abi() {
         let writer = CodeWriter::new();
         let mut effect_info = super::super::flatten::effect_info_for_call_flavor(CallFlavor::Plain);
-        effect_info.pyre_helper = majit_ir::PyreHelperKind::ListAppendValue;
+        effect_info.runtime_helper = majit_ir::RuntimeHelperKind::ListAppendValue;
         let descr = writer.intern_call_descr_stub(effect_info, vec![Kind::Ref, Kind::Ref], None);
         let stub = descr
             .as_any()

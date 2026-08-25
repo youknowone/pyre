@@ -54,6 +54,8 @@ jobs:
         components: rustfmt
     - name: Run cargo fmt --check
       run: cargo fmt --all -- --check
+    - name: Check majit ownership boundary
+      run: python3 scripts/check-majit-boundary.py
 
   cpyext-abi:
     name: cpyext ABI

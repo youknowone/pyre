@@ -3454,7 +3454,7 @@ impl TraceCtx {
     /// construction* at all of its index reads. The
     /// `jitcode_dispatch/vable_ops.rs` family is gated only on the index
     /// having a recorded concrete value (`concrete_of_opref`), which a
-    /// non-constant `OpRef` can satisfy — and `PYRE_VABLE_IDX_PROBE`'s own
+    /// non-constant `OpRef` can satisfy — and `MAJIT_VABLE_IDX_PROBE`'s own
     /// caveat, beside that call, says a `NONCONST == 0` reading cannot
     /// separate "that family is constant" from "that family was never
     /// reached", because the const-by-construction callers dilute it.

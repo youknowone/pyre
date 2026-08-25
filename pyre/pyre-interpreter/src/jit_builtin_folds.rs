@@ -315,12 +315,12 @@ static BUILTIN_FOLDS: &[BuiltinFold] = &[
     },
     BuiltinFold {
         name: "abs",
-        code_fn: crate::builtins::__pyre_wrap_builtin_abs,
+        code_fn: crate::builtins::__majit_wrap_builtin_abs,
         raw: BuiltinFoldRaw::Int1(jit_builtin_abs_int),
     },
     BuiltinFold {
         name: "abs",
-        code_fn: crate::builtins::__pyre_wrap_builtin_abs,
+        code_fn: crate::builtins::__majit_wrap_builtin_abs,
         raw: BuiltinFoldRaw::Float1(jit_builtin_abs_float),
     },
     BuiltinFold {

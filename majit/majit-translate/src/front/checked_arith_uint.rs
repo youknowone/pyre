@@ -76,7 +76,7 @@ pub(crate) fn rewire_checked_arith_uint_sites(
         match rewire_one_checked_arith_uint_site(graph, site) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
-                if std::env::var_os("PYRE_MIR_FRONTEND_DEBUG").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
                     eprintln!(
                         "[checked_arith_uint] {} decline at {:?}: {_decline}",
                         graph.name, site.opt

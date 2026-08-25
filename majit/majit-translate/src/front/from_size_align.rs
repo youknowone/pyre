@@ -100,7 +100,7 @@ pub(crate) fn rewire_from_size_align_sites(
         match rewire_one_from_size_align_site(graph, site) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
-                if std::env::var_os("PYRE_MIR_FRONTEND_DEBUG").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
                     eprintln!(
                         "[from_size_align] {} decline at {:?}: {_decline}",
                         graph.name, site.ok_result
@@ -295,7 +295,7 @@ pub(crate) fn rewire_from_size_align_expect_sites(
         match rewire_one_from_size_align_expect_site(graph, site) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
-                if std::env::var_os("PYRE_MIR_FRONTEND_DEBUG").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
                     eprintln!(
                         "[from_size_align expect] {} decline at {:?}: {_decline}",
                         graph.name, site.result_var

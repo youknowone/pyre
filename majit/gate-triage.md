@@ -6,6 +6,47 @@ Each entry records its reader, purpose, and retirement condition. `UNRECORDED` m
 
 ## Live gates
 
+### Translation, backend, and runtime diagnostics
+
+These controls moved with the engine facilities they govern. Unless stated
+otherwise they are disabled when unset and can be removed when ordinary tests
+cover the condition they diagnose.
+
+| gate | default | purpose and retirement condition |
+|---|---|---|
+| `MAJIT_CALLEE_CENSUS` | OFF | Reports resolved and unresolved translation callees; remove when every supported callee is classified. |
+| `MAJIT_CALLEE_CENSUS_ROWS` | value | Limits rows printed by `MAJIT_CALLEE_CENSUS`; remove with that census. |
+| `MAJIT_CALLEE_RCA` | OFF | Reports metainterpreter callee-resolution decisions; remove when those decisions are covered by focused tests. |
+| `MAJIT_CL_NO_CLOSING_JUMP` | OFF | Disables Cranelift's in-code closing jump to exercise external jump dispatch; remove when that fallback no longer needs comparison coverage. |
+| `MAJIT_DESCR_POOL_CENSUS` | OFF | Reports descriptor interning and duplication; remove when descriptor identity is covered by ordinary tests. |
+| `MAJIT_DETERMINISM_TRACE` | OFF | Prints inputs used to diagnose nondeterministic translation output; remove when deterministic output is enforced structurally. |
+| `MAJIT_DTRACE_CONST_BT` | OFF | Adds a backtrace to constant-propagation diagnostics; remove with those diagnostics. |
+| `MAJIT_DTRACE_CONST_FROM` | value | Filters constant-propagation diagnostics by source value; remove with those diagnostics. |
+| `MAJIT_DTRACE_CONST_TO` | value | Filters constant-propagation diagnostics by destination value; remove with those diagnostics. |
+| `MAJIT_DYNASM_EXEC_DIAG` | OFF | Reports dynasm trace execution; remove when trace entry is covered by ordinary telemetry. |
+| `MAJIT_FNPTR_INDIRECT` | OFF | Enables indirect function-pointer lowering; retain while that lowering remains a build configuration. |
+| `MAJIT_GC_FREELIST_DIAG` | OFF | Reports GC freelist allocation and reuse; remove when freelist accounting has sufficient invariant tests. |
+| `MAJIT_GC_ITEMSBLOCK` | ON | Selects GC-managed list item blocks; `0`, `off`, or `false` restores the fallback, which can be removed after deleting the alternate representation. |
+| `MAJIT_JTRANSFORM_SHADOW` | OFF | Compares shadow and primary jtransform results; remove after deleting the shadow implementation. |
+| `MAJIT_MIR_FRAMESTATE` | ON | Selects framestate-threaded MIR lowering; `0` or `false` restores the older lowering, and the escape hatch retires with that path. |
+| `MAJIT_MIR_FRAMESTATE_DEBUG` | OFF | Prints framestate merge diagnostics; remove when merge failures are covered by focused tests. |
+| `MAJIT_MIR_FRAMESTATE_STRICT` | OFF | Turns framestate fallback into a hard failure; remove after deleting the fallback. |
+| `MAJIT_MIR_FRONTEND_DEBUG` | OFF | Prints MIR frontend lowering diagnostics; remove when unsupported shapes are fully classified. |
+| `MAJIT_MIR_FRONTEND_LLBC` | path list | Supplies the complete LLBC input set to the translator; retain as consumer configuration. |
+| `MAJIT_MIR_STRESS_LLBC` | path | Supplies the LLBC snapshot for ignored stress tests; retain while those tests are external-fixture tests. |
+| `MAJIT_NBODY_DEBUG` | OFF | Reports nested-body tracing decisions; remove when those decisions have focused coverage. |
+| `MAJIT_NO_UNROLL` | OFF | Skips the unroll optimizer for diagnosis; remove when the optimizer no longer needs a runtime comparison path. |
+| `MAJIT_PORTAL_RCA` | OFF | Reports portal-selection decisions; remove when portal selection is covered by focused tests. |
+| `MAJIT_PROBE_SUBSCR` | OFF | Reports subscription tracing and dispatch decisions; remove when the relevant opcode paths have focused coverage. |
+| `MAJIT_PROFILE_DRAIN` | OFF | Profiles codewriter queue draining; remove when pipeline performance no longer needs phase attribution. |
+| `MAJIT_PROFILE_PIPELINE` | OFF | Reports translation phase time and memory; retain while translation performance needs phase attribution. |
+| `MAJIT_RTYPER_VERBOSE` | OFF | Emits per-graph rtyper failure census rows; remove when all supported graphs translate or fail through stable classifications. |
+| `MAJIT_S9_PROBE` | OFF | Records optimizer stage-nine diagnostics; remove when that stage has focused invariant coverage. |
+| `MAJIT_SIZE_SHELL_OWNERS` | OFF | Reports owners of size-descriptor shells; remove when shell identity is enforced structurally. |
+| `MAJIT_TRACE_CALL_DIAG` | OFF | Reports calls emitted by the native backend; remove when call lowering has sufficient trace-level coverage. |
+| `MAJIT_TRACE_OPS_DIAG` | OFF | Reports operations executed by the native backend; remove when operation lowering has sufficient trace-level coverage. |
+| `MAJIT_VABLE_IDX_PROBE` | OFF | Reports whether virtualizable array indices are constant; remove when supported index shapes are covered by ordinary tests. |
+
 ### `MAJIT_BH_DEBUG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`

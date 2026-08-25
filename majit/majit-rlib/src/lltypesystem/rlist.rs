@@ -134,7 +134,7 @@ pub fn gc_float_array_gc_type_id() -> u32 {
 /// `std::alloc`. Read once; default ON — the nursery path mirrors the
 /// `GcArray` body upstream allocates (rlist.py:84) and is validated identical
 /// to the `std::alloc` fallback (check.py 158 both backends, both gate states;
-/// fannkuch/nbody/spectral_norm timings unchanged). `PYRE_GC_ITEMSBLOCK=0`
+/// fannkuch/nbody/spectral_norm timings unchanged). `MAJIT_GC_ITEMSBLOCK=0`
 /// (or `off`/`false`) restores the `std::alloc` fallback to bisect a
 /// suspected block-GC regression.
 ///
@@ -151,7 +151,7 @@ pub fn itemsblock_gc_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("PYRE_GC_ITEMSBLOCK")
+        std::env::var("MAJIT_GC_ITEMSBLOCK")
             .map(|v| !matches!(v.trim(), "0" | "off" | "false" | ""))
             .unwrap_or(true)
     })

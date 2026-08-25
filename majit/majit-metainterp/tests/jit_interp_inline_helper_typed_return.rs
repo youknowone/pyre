@@ -305,7 +305,7 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
             .map(|(key, value)| ((*key).to_string(), *value))
             .collect();
     bh_insns.extend(
-        majit_metainterp::jitcode::pyre_extension_insns()
+        majit_metainterp::jitcode::extension_insns()
             .iter()
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
@@ -428,7 +428,7 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
             .map(|(key, value)| ((*key).to_string(), *value))
             .collect();
     bh_insns.extend(
-        majit_metainterp::jitcode::pyre_extension_insns()
+        majit_metainterp::jitcode::extension_insns()
             .iter()
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
@@ -682,7 +682,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     jc_builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
     let jitcode = jc_builder.finish();
 
-    // Route through `handler_inline_call_pyre_nested`
+    // Route through `handler_inline_call_nested_ext`
     // (the production builder shape) instead of the legacy
     // `dispatch_one::BC_INLINE_CALL` fallback.
     let mut bh_builder = build_inline_call_only_bh_builder();

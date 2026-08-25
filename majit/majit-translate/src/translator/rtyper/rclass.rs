@@ -5725,7 +5725,7 @@ mod tests {
                 ("parent".to_string(), "TypeObj".to_string()),
             ],
         );
-        ann.bookkeeper.set_pyre_struct_fields(std::rc::Rc::new(reg));
+        ann.bookkeeper.set_struct_fields(std::rc::Rc::new(reg));
         let cd = ann
             .bookkeeper
             .getuniqueclassdef_for_struct_root("Outer")

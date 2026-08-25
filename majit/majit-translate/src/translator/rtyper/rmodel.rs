@@ -3282,7 +3282,7 @@ pub fn rtyper_makerepr(
         // rweakref.py:13-17
         SomeValue::WeakRef(_) => super::rweakref::weakref_makerepr(rtyper),
         SomeValue::TypeOf(_) => Err(TyperError::missing_rtype_operation(
-            "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; pyre adaptation",
+            "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; host-language adaptation",
         )),
         SomeValue::Ptr(ptr) => {
             Ok(std::sync::Arc::new(PtrRepr::new(ptr.ll_ptrtype.clone()))

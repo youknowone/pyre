@@ -50,7 +50,7 @@ pub mod policy;
 pub mod regalloc;
 pub mod support;
 // Local env-gated profiler for the drain pipeline, with no upstream
-// sibling and no effect unless `PYRE_PROFILE_DRAIN` is set.
+// sibling and no effect unless `MAJIT_PROFILE_DRAIN` is set.
 pub(crate) mod transform_profile;
 // Local Rust boundary for concretetype projection and temporary import
 // compatibility while concretetype data migrates onto Variables.

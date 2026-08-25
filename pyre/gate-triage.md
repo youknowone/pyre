@@ -52,9 +52,9 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
-| PYRE_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
-| PYRE_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
+| MAJIT_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
+| MAJIT_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
+| MAJIT_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
 
 `PYRE_GC_INTERP` is default-ON on every target. Its OFF path still selects the
 unmanaged `malloc_typed` stepping-stone allocation and remains a rollback hatch
@@ -67,13 +67,13 @@ Kept as-is; listed for completeness.
 - **Diagnostics (~35, default-OFF)** — print/log/dump/probe/assert only; tooling,
   not experiments: `PYRE_FBW_DEBUG_ABORT`, `_INLINE_DIAG`, `_MF_DIAG`,
   `_STRICT_DIAG`, `PYRE_WALK_PERFN_JITCODE`, `PYRE_DUMP_PERFN_JITCODE`,
-  `PYRE_P2_DIAG`, `PYRE_PCDEP_VALIDATE`, `PYRE_MIR_FRAMESTATE_DEBUG`,
-  `_FRAMESTATE_STRICT`, `PYRE_MIR_FRONTEND_DEBUG`, `PYRE_VSTACK_DIAG`,
+  `PYRE_P2_DIAG`, `PYRE_PCDEP_VALIDATE`, `MAJIT_MIR_FRAMESTATE_DEBUG`,
+  `_FRAMESTATE_STRICT`, `MAJIT_MIR_FRONTEND_DEBUG`, `PYRE_VSTACK_DIAG`,
   `PYRE_PROBE_AUTHORITATIVE`, `_BH_STARTUP`, `_SNAPSHOT`, `_SUBSCR`,
-  `PYRE_S9_PROBE`, `PYRE_PROFILE_DRAIN`, `_PIPELINE`, `PYRE_MFRAME_DIAG`,
-  `PYRE_RTYPER_VERBOSE`, `PYRE_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
+  `MAJIT_S9_PROBE`, `MAJIT_PROFILE_DRAIN`, `_PIPELINE`, `PYRE_MFRAME_DIAG`,
+  `MAJIT_RTYPER_VERBOSE`, `MAJIT_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
-  `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
+  `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `MAJIT_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`.
   `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
   actually resolves, so the per-index pool loader can be measured against the
@@ -87,11 +87,11 @@ Kept as-is; listed for completeness.
   §6a2 are wasm A/Bs, kept as the switched-off side of a one-binary
   comparison rather than as experiments.
 - **Config / value / master switches (~16)** — tuning, paths, modes; keep:
-  `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
+  `MAJIT_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
   `PYRE_GC_INTERP`, `PYRE_JIT`, `PYRE_NO_JIT`, `PYRE_STDLIB`,
   `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SANDBOX_NO_SECCOMP`,
   `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `PYRE_SYNTH_PYRE`, `PYRE_SYNTH_PYTHON`.
-- **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
+- **Test harness (1)**: `MAJIT_MIR_STRESS_LLBC`.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 
@@ -207,8 +207,8 @@ build.
 `PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
-`PYRE_DTRACE_CONST_FROM`, `PYRE_DTRACE_CONST_TO`,
-`PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
+`MAJIT_DTRACE_CONST_FROM`, `MAJIT_DTRACE_CONST_TO`,
+`MAJIT_TRACE_CALL_DIAG`, `MAJIT_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
@@ -237,31 +237,31 @@ Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
 `PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_BRIDGE_LATCH_AUDIT`,
-`PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
+`MAJIT_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
 `PYRE_CELL_CENSUS`, `PYRE_CHECK_INHERIT_ENV`,
 `PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
-`PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
-`PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
+`MAJIT_DETERMINISM_TRACE`, `MAJIT_DTRACE_CONST_BT`,
+`MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
 `PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
-`PYRE_GC_DIAG`, `PYRE_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
+`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
 `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
 `PYRE_M73_LASTINSTR_AUDIT`, `PYRE_M73_MIDBODY_CARRY_AUDIT`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
-`PYRE_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `PYRE_NO_UNROLL`,
+`MAJIT_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `MAJIT_NO_UNROLL`,
 `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
-`PYRE_PORTAL_RCA`, `PYRE_PROBE_BH_STARTUP`, `PYRE_PROBE_SNAPSHOT`,
-`PYRE_PROBE_SUBSCR`, `PYRE_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
-`PYRE_RERAISE_DIAG`, `PYRE_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
+`MAJIT_PORTAL_RCA`, `PYRE_PROBE_BH_STARTUP`, `PYRE_PROBE_SNAPSHOT`,
+`MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
+`PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_UNJOURNALED_SITE`,
 `PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
@@ -323,20 +323,11 @@ gate restores the whole-environment copy, so the size of that effect stays
 measurable on one binary. It goes when the allowlist stops being the thing
 under measurement.
 
-## §7 — General MAJIT gates
-
-These translator and metainterpreter controls are inert unless explicitly set,
-except for the function-pointer lowering switch, which is a build configuration
-input.
+## §7 — Additional runtime diagnostic
 
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
-| `PYRE_CALLEE_CENSUS` | OFF | build-time census of resolved and unresolved callees; retire when all supported callees are classified without this diagnostic |
-| `PYRE_CALLEE_CENSUS_ROWS` | OFF | row cap for that census; retire with `PYRE_CALLEE_CENSUS` |
-| `PYRE_DESCR_POOL_CENSUS` | OFF | reports descriptor interning and duplication; retire when descriptor identity is covered by ordinary tests |
-| `PYRE_FNPTR_INDIRECT` | OFF | enables indirect function-pointer lowering; retained as a build configuration switch |
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
-| `PYRE_VABLE_IDX_PROBE` | OFF | reports whether virtualizable array indices are constant; retire when all supported index shapes are covered by ordinary tests |
 
 ## Summary
 

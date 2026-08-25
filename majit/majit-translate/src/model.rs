@@ -755,7 +755,7 @@ pub enum OpKind {
         owner: String,
     },
     /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
-    /// heap allocation of a boxed object (`pyre_object::lltype::malloc_typed`).
+    /// heap allocation of a boxed object (`runtime_object::lltype::malloc_typed`).
     /// Lowered to the `new_with_vtable` jitcode op (executor
     /// `OpCode::NewWithVtable`). `owner` is the struct leaf (e.g.
     /// `"W_FloatObject"`); the assembler resolves the size descriptor from it
@@ -1322,7 +1322,7 @@ pub enum OpKind {
     /// to a canonical opname.
     /// Reaching the op at runtime means tracing or blackhole resume
     /// crossed an untranslatable graph slice; downstream handlers
-    /// advance past it (see `blackhole.rs::handler_abort_marker_pyre`).
+    /// advance past it (see `blackhole.rs::handler_abort_marker`).
     /// Distinct from RPython's `SwitchToBlackhole` exception path —
     /// RPython aborts before lowering so no equivalent opname exists.
     /// Kept under `kind: UnknownKind` because the same diagnostic enum
@@ -3019,7 +3019,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// in Rust as `malloc_typed(W_FloatObject { ob_header: …, floatval: v })` —
 /// construct the whole struct on the stack, then heap-copy.  `front::mir`
 /// lowers that to a `SyntheticTransparentCtor` aggregate (`%agg`) + per-field
-/// `FieldWrite`s + a residual `Call(pyre_object::lltype::malloc_typed, [%agg])`.
+/// `FieldWrite`s + a residual `Call(runtime_object::lltype::malloc_typed, [%agg])`.
 /// RPython's orthodox form is alloc-then-init (`p = malloc(S); p.f = v`); the
 /// rtyper lowers `malloc` to the GC allocation op.  pyre's rtyper is an
 /// ephemeral type oracle that never rewrites the surviving model graph, so the
@@ -3069,7 +3069,7 @@ pub fn fuse_boxing_alloc(
     // here (the runtime stamps `ob_type`/`w_class` from the descriptor).  Two
     // spellings reach this pass: the hand-written boxing structs
     // (`W_FloatObject` etc.) name it `ob_header`, while `#[pyre_class]` injects
-    // it as `ob` (pyre-macros `expand_pyre_class`).  Both name the same base,
+    // it as `ob` (pyre-macros `expand_pyre_class`). Both name the same base,
     // so both are recognised as the header and neither is re-emitted as a
     // payload setfield.
     fn is_header_field(name: &str) -> bool {
@@ -3124,7 +3124,7 @@ pub fn fuse_boxing_alloc(
     };
 
     // Resolve the type-pointer the dropped `ob_header.ob_type` store carries:
-    // `%agg.ob_header = %h; %h.ob_type = __pyre_cast_instance(ConstRefAddr(t))`.
+    // `%agg.ob_header = %h; %h.ob_type = __cast_instance_intrinsic(ConstRefAddr(t))`.
     // The runtime stamps the new object's `ob_type`/`w_class` from this address
     // (read out of the `NewWithVtable` size descriptor), so it must travel with
     // the op rather than being dropped.  Returns `0` when the cluster carries no
@@ -3223,7 +3223,7 @@ pub fn fuse_boxing_alloc(
     /// Resolve `var` to the constant address `terminal` reads off its producer.
     ///
     /// The walk itself is shared by every header spelling: it steps through
-    /// `__pyre_cast_instance[<root>]` pointer reinterprets, and through the
+    /// `__cast_instance_intrinsic[<root>]` pointer reinterprets, and through the
     /// links when `var` is a `Block.inputargs` phi rather than an op result.
     /// A boxing cluster whose header stores sit before a call is exactly that
     /// shape — each call ends a block, so the header value crosses the
@@ -3283,7 +3283,7 @@ pub fn fuse_boxing_alloc(
             args,
             ..
         } = &producer.kind
-            && segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+            && segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
             && args.len() == 1
         {
             return resolve_addr(graph, &args[0], depth - 1, terminal);
@@ -3296,13 +3296,13 @@ pub fn fuse_boxing_alloc(
             _ => None,
         })
     }
-    /// The `&T` a `pyre_object::pyobject::get_instantiate(&T)` call was handed.
+    /// The `&T` a runtime `pyobject::get_instantiate(&T)` call was handed.
     ///
     /// The owner path is matched in full rather than by the bare leaf, so a
     /// function elsewhere that happens to share the name can never be read as
     /// the `instantiate`-slot load.
     fn get_instantiate_arg_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
-        const GET_INSTANTIATE: [&str; 3] = ["pyre_object", "pyobject", "get_instantiate"];
+        const GET_INSTANTIATE: [&str; 2] = ["pyobject", "get_instantiate"];
         resolve_addr(graph, var, depth, &|graph, kind, depth| match kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
@@ -3743,7 +3743,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
 /// (`prune_dead_boxing_remnants` / `prune_dead_phis`) then strip the inputargs
 /// that carried the boxing cluster's cross-block values — the scalar payload
 /// (a parameter defined before the `get_instantiate` call that ends the entry
-/// block) and the `__pyre_cast_instance` chain that turns the `NewWithVtable`
+/// block) and the `__cast_instance_intrinsic` chain that turns the `NewWithVtable`
 /// result into the returned `PyObjectRef`.  This pass runs *after* those
 /// sweeps and re-threads every such operand through the predecessor chain,
 /// restoring the per-block operand invariant the adapter
@@ -3860,7 +3860,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// carries the type pointer / `w_class` through its vtable descriptor) the
 /// original aggregate ctor, the inner `PyObject` header ctor, their
 /// `ob_header` / `ob_type` / `w_class` field stores, and the
-/// `__pyre_cast_instance` casts feeding `ob_type` / `w_class` are all dead.
+/// `__cast_instance_intrinsic` casts feeding `ob_type` / `w_class` are all dead.
 /// The exception is a `w_class` the vtable cannot stand for: `fuse_boxing_alloc`
 /// re-emits that store on the new object, so its value stays live and the
 /// liveness gate below keeps the producer.
@@ -3886,9 +3886,9 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// ctor bases — a store *through* an aliasing or loaded base (a cast or a
 /// load) is a real heap side effect and roots its base like any other op.
 /// The header producers eligible for removal are all side-effect-free:
-/// a `SyntheticTransparentCtor` stack construct, a `__pyre_cast_instance`
+/// a `SyntheticTransparentCtor` stack construct, a `__cast_instance_intrinsic`
 /// pointer reinterpret (`exception_cannot_occur` → `cast_pointer`), and the
-/// `pyre_object::pyobject::get_instantiate` read of a type's `instantiate`
+/// `runtime_object::pyobject::get_instantiate` read of a type's `instantiate`
 /// slot feeding the dropped `w_class`.  `get_instantiate` is an `Acquire`
 /// atomic load of an init-once slot (the `set_instantiate` `Release` mutator
 /// writes it during `init_typeobjects`); it is removable not because the slot
@@ -3920,18 +3920,18 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             args,
             ..
         } => {
-            // `__pyre_cast_instance[<root>]` — the front-end pointer-downcast
+            // `__cast_instance_intrinsic[<root>]` — the front-end pointer-downcast
             // narrow (`front::mir`), always a single-operand reinterpret.
             // Pin the arity so an unrelated multi-arg path that happens to
             // share the synthetic marker leaf is never swept as a cast.
-            let is_cast = segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+            let is_cast = segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                 && args.len() == 1;
-            // `pyre_object::pyobject::get_instantiate` — the pure
+            // `pyobject::get_instantiate` — the pure
             // `instantiate`-slot read feeding the dropped `w_class`.  Match
             // the full owner path rather than the bare leaf so a future
             // side-effecting function sharing the `get_instantiate` name in
             // some other module can never be classified removable.
-            let get_instantiate = ["pyre_object", "pyobject", "get_instantiate"];
+            let get_instantiate = ["pyobject", "get_instantiate"];
             let is_get_instantiate = segments.len() >= get_instantiate.len()
                 && segments[segments.len() - get_instantiate.len()..]
                     .iter()
@@ -3969,7 +3969,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     // `SyntheticTransparentCtor` stack construct and a no-arg
     // `boxed::Box::new_uninit()` heap box (the `vec![…]` lowering's fresh
     // allocation, which nothing aliases legitimately).  A store *through* an
-    // aliasing or loaded base (`__pyre_cast_instance` / `get_instantiate` / a
+    // aliasing or loaded base (`__cast_instance_intrinsic` / `get_instantiate` / a
     // parameter / …) is a real heap side effect, so the exemption is scoped to
     // these fresh-allocation results — every other store roots its base.
     let fresh_alloc_results: HashSet<Variable> = graph
@@ -7372,7 +7372,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "pyobject".into(),
                             "get_instantiate".into(),
                         ],
@@ -7406,7 +7406,7 @@ mod tests {
         //        %agg     = SyntheticTransparentCtor("W_FloatObject");
         //        FieldWrite(%agg.ob_header = %header);   // header store
         //        FieldWrite(%agg.floatval = %v);         // payload store
-        //        %ret     = pyre_object.lltype.malloc_typed(%agg);
+        //        %ret     = runtime_object.lltype.malloc_typed(%agg);
         //        return %ret.
         // fuse_boxing_alloc replaces the malloc with
         //        %ret     = NewWithVtable("W_FloatObject");
@@ -7473,7 +7473,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7623,7 +7623,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7690,7 +7690,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -7754,7 +7754,7 @@ mod tests {
             call(
                 graph,
                 blk,
-                &["pyre_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "pyobject", "get_instantiate"],
                 vec![arg],
             )
         }
@@ -7827,7 +7827,7 @@ mod tests {
             let ret = call(
                 &mut graph,
                 entry,
-                &["pyre_object", "lltype", "malloc_typed"],
+                &["runtime_object", "lltype", "malloc_typed"],
                 vec![agg],
             );
             graph.set_return(entry, Some(ret));
@@ -7844,7 +7844,7 @@ mod tests {
             call(
                 graph,
                 blk,
-                &["pyre_object", "gc_roots", "shadow_stack_get"],
+                &["runtime_object", "gc_roots", "shadow_stack_get"],
                 vec![base],
             )
         };
@@ -7988,14 +7988,19 @@ mod tests {
             let ty = graph
                 .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
                 .unwrap();
-            call(graph, entry, &["__pyre_cast_instance", "PyType"], vec![ty])
+            call(
+                graph,
+                entry,
+                &["__cast_instance_intrinsic", "PyType"],
+                vec![ty],
+            )
         };
         let ob_type = cast(&mut graph);
         let w_class_cast = cast(&mut graph);
         let w_class = call(
             &mut graph,
             entry,
-            &["pyre_object", "pyobject", "get_instantiate"],
+            &["runtime_object", "pyobject", "get_instantiate"],
             vec![w_class_cast],
         );
         let header = ctor(&mut graph, entry, "PyObject");
@@ -8032,7 +8037,7 @@ mod tests {
         let raw = call(
             &mut graph,
             probe,
-            &["pyre_object", "gc_hook", "try_gc_alloc_stable_raw"],
+            &["runtime_object", "gc_hook", "try_gc_alloc_stable_raw"],
             vec![],
         );
         let (gc_arm, gc_args) = graph.create_block_with_arg_vars(2);
@@ -8077,7 +8082,7 @@ mod tests {
         let ret = call(
             &mut graph,
             plain_arm,
-            &["pyre_object", "lltype", "malloc_typed"],
+            &["runtime_object", "lltype", "malloc_typed"],
             vec![plain_args[0].clone()],
         );
         graph.set_return(plain_arm, Some(ret));
@@ -8247,14 +8252,19 @@ mod tests {
                 let ty = graph
                     .push_op_var(entry, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(graph, entry, &["__pyre_cast_instance", "PyType"], vec![ty])
+                call(
+                    graph,
+                    entry,
+                    &["__cast_instance_intrinsic", "PyType"],
+                    vec![ty],
+                )
             };
             let ob_type = cast(&mut graph, FLOAT_TYPE_ADDR);
             let w_class_cast = cast(&mut graph, FLOAT_TYPE_ADDR);
             let w_class = call(
                 &mut graph,
                 entry,
-                &["pyre_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "pyobject", "get_instantiate"],
                 vec![w_class_cast],
             );
             let header = ctor(&mut graph, entry, "PyObject");
@@ -8287,7 +8297,7 @@ mod tests {
             let cond = call(
                 &mut graph,
                 entry,
-                &["pyre_object", "gc_interp", "enabled"],
+                &["runtime_object", "gc_interp", "enabled"],
                 vec![],
             );
             let (arm, arm_args) = graph.create_block_with_arg_vars(1);
@@ -8318,7 +8328,7 @@ mod tests {
             let ret = call(
                 &mut graph,
                 join,
-                &["pyre_object", "lltype", "malloc_typed"],
+                &["runtime_object", "lltype", "malloc_typed"],
                 vec![join_args[0].clone()],
             );
             graph.set_return(join, Some(ret));
@@ -8361,7 +8371,12 @@ mod tests {
             let other = graph
                 .push_op_var(blk, OpKind::ConstRefAddr(OTHER_TYPE_ADDR), true)
                 .unwrap();
-            let cast = call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![other]);
+            let cast = call(
+                graph,
+                blk,
+                &["__cast_instance_intrinsic", "PyType"],
+                vec![other],
+            );
             graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
         };
 
@@ -8455,14 +8470,19 @@ mod tests {
                 let ty = graph
                     .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
                     .unwrap();
-                call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![ty])
+                call(
+                    graph,
+                    blk,
+                    &["__cast_instance_intrinsic", "PyType"],
+                    vec![ty],
+                )
             };
             let ob_type = cast(graph);
             let w_class_cast = cast(graph);
             let w_class = call(
                 graph,
                 blk,
-                &["pyre_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "pyobject", "get_instantiate"],
                 vec![w_class_cast],
             );
             let header = ctor(graph, blk, "PyObject");
@@ -8490,7 +8510,7 @@ mod tests {
             let ret = call(
                 graph,
                 blk,
-                &["pyre_object", "lltype", "malloc_typed"],
+                &["runtime_object", "lltype", "malloc_typed"],
                 vec![agg],
             );
             graph.set_return(blk, Some(ret));
@@ -8591,12 +8611,12 @@ mod tests {
     #[test]
     fn fuse_boxing_alloc_sweeps_nested_header_chain() {
         // Faithful `w_float_new` shape: the boxing struct's header is a nested
-        // `PyObject` ctor whose `ob_type` is a `__pyre_cast_instance` pointer
+        // `PyObject` ctor whose `ob_type` is a `__cast_instance_intrinsic` pointer
         // reinterpret of the `&FLOAT_TYPE` constant and whose `w_class` is a
         // `get_instantiate` read of that same constant.  After fusion drops
         // the `ob_header` (it rides the `NewWithVtable` descriptor), the
         // entire header sub-tree — the inner `PyObject` ctor, the outer
-        // `W_FloatObject` ctor, the two `__pyre_cast_instance` casts and the
+        // `W_FloatObject` ctor, the two `__cast_instance_intrinsic` casts and the
         // `get_instantiate` — is dead and must be swept, leaving only the
         // `NewWithVtable`, its `floatval` payload store, and the return cast.
         // (The two `ConstRefAddr` constants legitimately survive as dead
@@ -8605,7 +8625,7 @@ mod tests {
         type Var = crate::flowspace::model::Variable;
         let cast_instance = |to: &str, arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__pyre_cast_instance".into(), to.into()],
+                segments: vec!["__cast_instance_intrinsic".into(), to.into()],
             },
             args: vec![arg.clone()],
             result_ty: ValueType::Ref(Some(to.into())),
@@ -8648,7 +8668,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "pyobject".into(),
                             "get_instantiate".into(),
                         ],
@@ -8709,7 +8729,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -8734,7 +8754,7 @@ mod tests {
 
         let ops = &graph.block(entry).operations;
         // The dead header sub-tree is gone: no SyntheticTransparentCtor and no
-        // `__pyre_cast_instance["PyType"]` cast survives.
+        // `__cast_instance_intrinsic["PyType"]` cast survives.
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
@@ -8750,7 +8770,7 @@ mod tests {
             !ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                         && segments.get(1).map(String::as_str) == Some("PyType")
             )),
             "the dead ob_type/w_class header casts must be swept"
@@ -8779,7 +8799,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                         && segments.get(1).map(String::as_str) == Some("PyObject")
             )),
             "the live return cast must survive"
@@ -8860,7 +8880,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "pyre_object".into(),
+                            "runtime_object".into(),
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
@@ -9018,7 +9038,7 @@ mod tests {
                     Some(call(
                         &mut graph,
                         entry,
-                        &["pyre_object", "pyobject", "get_instantiate"],
+                        &["runtime_object", "pyobject", "get_instantiate"],
                         vec![arg],
                     ))
                 }
@@ -9027,7 +9047,7 @@ mod tests {
                     Some(call(
                         &mut graph,
                         entry,
-                        &["pyre_object", "gc_roots", "shadow_stack_get"],
+                        &["runtime_object", "gc_roots", "shadow_stack_get"],
                         vec![base],
                     ))
                 }
@@ -9059,7 +9079,7 @@ mod tests {
             let ret = call(
                 &mut graph,
                 entry,
-                &["pyre_object", "lltype", "malloc_typed"],
+                &["runtime_object", "lltype", "malloc_typed"],
                 vec![agg],
             );
             graph.set_return(entry, Some(ret));
@@ -9169,7 +9189,7 @@ mod tests {
     fn prune_dead_boxing_remnants_keeps_cast_used_as_live_store_base() {
         // The malloc-removal exemption (a store's base is not rooted) must be
         // scoped to fresh `SyntheticTransparentCtor` aggregates.  A store
-        // *through* a `__pyre_cast_instance` alias is a real heap side effect:
+        // *through* a `__cast_instance_intrinsic` alias is a real heap side effect:
         // even when the cast's result is read nowhere but the store base, the
         // cast and the store must survive.  The same graph carries a genuinely
         // dead `SyntheticTransparentCtor` whose store IS swept, so the pass is
@@ -9201,7 +9221,7 @@ mod tests {
                 entry,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".into(), "W_FloatObject".into()],
+                        segments: vec!["__cast_instance_intrinsic".into(), "W_FloatObject".into()],
                     },
                     args: vec![obj.clone()],
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9260,7 +9280,7 @@ mod tests {
         type Var = crate::flowspace::model::Variable;
         let cast_pytype = |arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__pyre_cast_instance".into(), "PyType".into()],
+                segments: vec!["__cast_instance_intrinsic".into(), "PyType".into()],
             },
             args: vec![arg.clone()],
             result_ty: ValueType::Ref(Some("PyType".into())),
@@ -9294,7 +9314,7 @@ mod tests {
         let get_instantiate = |arg: &Var| OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec![
-                    "pyre_object".into(),
+                    "runtime_object".into(),
                     "pyobject".into(),
                     "get_instantiate".into(),
                 ],
@@ -9371,7 +9391,7 @@ mod tests {
                 blk,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__pyre_cast_instance".into(), "PyObject".into()],
+                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
                     },
                     args: vec![boxed.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -9404,7 +9424,7 @@ mod tests {
             !kinds.iter().any(|k| matches!(
                 k,
                 OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                         && segments.get(1).map(String::as_str) == Some("PyType")
             )),
             "the dead PyType cast threaded across the block boundary must be swept"

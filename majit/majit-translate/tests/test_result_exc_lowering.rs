@@ -363,7 +363,7 @@ fn constant_message_raise_sites_fuse_their_constructor() {
     // `pyerror_type_error_to_exc_object`, leaving no `PyError` constructor
     // behind: the constructor is transparent, has no host symbol, and one of
     // them anywhere in the body refuses the whole descent.
-    let (fused, materialise, ctors) = raise_path_calls("__pyre_wrap_random");
+    let (fused, materialise, ctors) = raise_path_calls("__majit_wrap_random");
     assert!(fused > 0, "the fusion must fire on a gateway wrapper");
     assert_eq!(ctors, 0, "no PyError constructor may survive");
     assert_eq!(materialise, 0, "no unfused materialisation may survive");
@@ -375,7 +375,7 @@ fn formatted_message_raise_sites_keep_the_two_call_form() {
     // result is not the `box_str_constant` object the helper reads. Those
     // sites must keep the constructor plus `pyerror_to_exc_object`: the
     // fusion is additive and never replaces its own fallback.
-    let (fused, materialise, ctors) = raise_path_calls("__pyre_wrap___class_getitem__");
+    let (fused, materialise, ctors) = raise_path_calls("__majit_wrap___class_getitem__");
     assert_eq!(fused, 0, "a formatted message must not fuse");
     assert!(
         ctors > 0,

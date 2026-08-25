@@ -228,7 +228,7 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// field-read side) and compare.
 ///
 /// Deliberately a COMPARE-time identity, NOT an interning cache key: keying
-/// `pyre_struct_root_classes` on this collapse starves the header/base-chain
+/// `struct_root_classes` on this collapse starves the header/base-chain
 /// walk for `ob_header`-bearing `W_*` structs (they mint base-less under
 /// first-mint-wins and lose their `W_Root` base — a measured +184 phaseA
 /// cascade across `_io`/`_pickle`).  This check fires only where

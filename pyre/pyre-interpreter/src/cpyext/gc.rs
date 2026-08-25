@@ -1,7 +1,7 @@
 //! The cyclic-collection protocol -- `tp_traverse`, `tp_clear`, and the set of
 //! blocks that declare them.
 //!
-//! A mirror's count above [`REFCNT_FROM_PYRE`] is what tells the collector that
+//! A mirror's count above [`REFCNT_FROM_PYPY`] is what tells the collector that
 //! C still holds the object, and that rule alone cannot see a cycle: a block
 //! reachable only from another dead block still carries its reference, so both
 //! stay. Breaking one needs to know which references a block holds, which is

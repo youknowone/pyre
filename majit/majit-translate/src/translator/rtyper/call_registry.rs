@@ -110,7 +110,7 @@ impl FunctionPathKey {
 ///   `Signature`.  Pre-registered in `bookkeeper.descs` keyed by
 ///   `host_object`'s Arc identity so `Bookkeeper::getdesc(host_object)`
 ///   short-circuits at the cache.
-pub struct PyreFunctionEntry {
+pub struct FunctionEntry {
     pub host_object: HostObject,
     pub function_desc: Rc<RefCell<FunctionDesc>>,
     /// Declared LLBC fn-ptr signature, projected once at registry
@@ -129,7 +129,7 @@ pub struct PyreFunctionEntry {
         RefCell<Option<crate::translator::rtyper::lltypesystem::lltype::FuncType>>,
 }
 
-impl PyreFunctionEntry {
+impl FunctionEntry {
     /// Pre-fill the entry's `FunctionDesc.cache` for the default
     /// specializer with no `*args` (the lookup key
     /// `Specializer::Default + flatten_star_args(no vararg) ->
@@ -160,7 +160,7 @@ impl PyreFunctionEntry {
     /// from `cutover::populate_call_registry_from_call_graphs`'s Pass
     /// 2 when `lift_callee_to_pygraph` returns Err.
     pub fn record_lift_error(&self, message: String) {
-        self.function_desc.borrow().record_pyre_lift_error(message);
+        self.function_desc.borrow().record_lift_error(message);
     }
 
     /// Read-side twin of [`record_lift_error`]: the recorded pyre-side
@@ -169,12 +169,12 @@ impl PyreFunctionEntry {
     /// whose graph could not be built (unbuildable callee → caller Skips
     /// to the legacy walker), instead of binding a `host_object` that
     /// would partial-codewrite with a pre-real residual kind.
-    pub fn pyre_lift_error(&self) -> Option<String> {
-        self.function_desc.borrow().pyre_lift_error_message()
+    pub fn lift_error(&self) -> Option<String> {
+        self.function_desc.borrow().lift_error_message()
     }
 
     /// Store the callee's declared LLBC fn-ptr signature (see
-    /// [`PyreFunctionEntry::declared_funcptr_type`]).
+    /// [`FunctionEntry::declared_funcptr_type`]).
     pub fn set_declared_funcptr_type(
         &self,
         ft: crate::translator::rtyper::lltypesystem::lltype::FuncType,
@@ -236,7 +236,7 @@ pub struct TwoPhaseTypeCache {
 /// its `Bookkeeper` with the `RPythonAnnotator` so pre-registered
 /// entries are visible to the rtyper's `getdesc` lookup.
 ///
-/// `entries` is the canonical `FunctionPathKey → Rc<PyreFunctionEntry>`
+/// `entries` is the canonical `FunctionPathKey → Rc<FunctionEntry>`
 /// table — one row per distinct callable identity.  Mirrors RPython
 /// `Bookkeeper.descs[Constant(pyobj)] = Desc` (`bookkeeper.py`),
 /// where the dict is keyed by Python function-object identity and
@@ -252,9 +252,9 @@ pub struct TwoPhaseTypeCache {
 /// because Python callable identity gives `Bookkeeper.getdesc` direct
 /// dedup; pyre's segment-key storage stands in for that until host
 /// callable identity is available.
-pub struct PyreCallRegistry {
+pub struct CallRegistry {
     bookkeeper: Rc<Bookkeeper>,
-    entries: RefCell<HashMap<FunctionPathKey, Rc<PyreFunctionEntry>>>,
+    entries: RefCell<HashMap<FunctionPathKey, Rc<FunctionEntry>>>,
     aliases: RefCell<HashMap<FunctionPathKey, FunctionPathKey>>,
     /// Whole-program two-phase type cache. Empty and
     /// `prepass_done = false` unless the two-phase prepass populated it.
@@ -278,10 +278,10 @@ pub struct PyreCallRegistry {
     >,
 }
 
-impl PyreCallRegistry {
+impl CallRegistry {
     /// Construct an empty registry sharing `bookkeeper`.
     pub fn new(bookkeeper: Rc<Bookkeeper>) -> Self {
-        PyreCallRegistry {
+        CallRegistry {
             bookkeeper,
             entries: RefCell::new(HashMap::new()),
             aliases: RefCell::new(HashMap::new()),
@@ -303,11 +303,11 @@ impl PyreCallRegistry {
 
     /// Thread the program-wide `StructFieldRegistry` into the shared
     /// bookkeeper so `getuniqueclassdef_for_struct_root` /
-    /// `project_pyre_field_type` can project struct fields onto a classdef.  Called once from
-    /// `dual_gate_registry` after `PyreCallRegistry::new` with
+    /// `project_struct_field_type` can project struct fields onto a classdef.  Called once from
+    /// `dual_gate_registry` after `CallRegistry::new` with
     /// `CallControl::struct_fields().clone()`.
-    pub fn set_pyre_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
-        self.bookkeeper.set_pyre_struct_fields(registry);
+    pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
+        self.bookkeeper.set_struct_fields(registry);
     }
 
     /// Thread the trait → unique-concrete-impl-owner map into the
@@ -315,8 +315,8 @@ impl PyreCallRegistry {
     /// generic receiver's bound-trait `class_root` to the impl type's
     /// `ClassDef`.  Called once from `dual_gate_registry` with
     /// `CallControl::trait_unique_impls().clone()`.
-    pub fn set_pyre_trait_unique_impls(&self, map: HashMap<String, String>) {
-        self.bookkeeper.set_pyre_trait_unique_impls(map);
+    pub fn set_trait_unique_impls(&self, map: HashMap<String, String>) {
+        self.bookkeeper.set_trait_unique_impls(map);
     }
 
     /// Mint each opt-in receiver-driven dispatch family's base
@@ -359,11 +359,8 @@ impl PyreCallRegistry {
     /// discriminant→variant narrowing `knowntypedata`.  Called once from
     /// `dual_gate_registry` with
     /// `CallControl::enum_variant_by_discriminant().clone()`.
-    pub fn set_pyre_enum_variant_by_discriminant(
-        &self,
-        map: Rc<HashMap<String, HashMap<i64, String>>>,
-    ) {
-        self.bookkeeper.set_pyre_enum_variant_by_discriminant(map);
+    pub fn set_enum_variant_by_discriminant(&self, map: Rc<HashMap<String, HashMap<i64, String>>>) {
+        self.bookkeeper.set_enum_variant_by_discriminant(map);
     }
 
     /// Seed each struct-root class `HostObject`'s dict with its
@@ -389,7 +386,7 @@ impl PyreCallRegistry {
     /// Called once from `dual_gate_registry` after
     /// `populate_call_registry_from_call_graphs`.
     pub fn seed_struct_root_method_members(&self) {
-        let guard = self.bookkeeper.pyre_struct_fields.borrow();
+        let guard = self.bookkeeper.struct_fields.borrow();
         let Some(reg) = guard.as_ref() else {
             return;
         };
@@ -506,7 +503,7 @@ impl PyreCallRegistry {
                 let key = majit_ir::descr::canonical_struct_name(impl_root);
                 let host = self
                     .bookkeeper
-                    .pyre_struct_root_classes
+                    .struct_root_classes
                     .borrow()
                     .get(&key)
                     .cloned();
@@ -615,7 +612,7 @@ impl PyreCallRegistry {
         // already-baked class is NOT append-safe (its bracket would need to
         // nest inside the parent's baked range); it stays unnumbered and
         // the per-graph path Skip-classifies it, exactly as before.
-        for root in self.bookkeeper.pyre_struct_root_names() {
+        for root in self.bookkeeper.struct_root_names() {
             // A malformed root must not abort the whole session — the
             // per-graph path Skip-classifies it later, mirroring the
             // populate path's `is_known_unported` tolerance.
@@ -649,7 +646,7 @@ impl PyreCallRegistry {
     /// resolves through `aliases` to the canonical key and re-reads.
     /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
     /// lookup" plus alias indirection (`bookkeeper.py:362-364`).
-    pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
+    pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         if let Some(entry) = self.entries.borrow().get(key) {
             return Some(entry.clone());
         }
@@ -675,7 +672,7 @@ impl PyreCallRegistry {
     pub fn find_entry_with_cached_graph(
         &self,
         graph: &crate::flowspace::model::GraphRef,
-    ) -> Option<(FunctionPathKey, Rc<PyreFunctionEntry>)> {
+    ) -> Option<(FunctionPathKey, Rc<FunctionEntry>)> {
         let entries = self.entries.borrow();
         let mut sorted_entries: Vec<_> = entries.iter().collect();
         // Pin HashMap order so the first matching cached graph is stable.
@@ -737,7 +734,7 @@ impl PyreCallRegistry {
     ///   distinct from a same-leaf free function.
     /// - Multi-match aliases of the same source (identical
     ///   `host_object` Arc identity) converge on a single resolution.
-    pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<PyreFunctionEntry>> {
+    pub fn lookup_with_leaf_match(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         if let Some(entry) = self.lookup(key) {
             return Some(entry);
         }
@@ -767,7 +764,7 @@ impl PyreCallRegistry {
             .skip(1)
             .all(|s| !starts_with_uppercase(s));
         let entries_borrow = self.entries.borrow();
-        let mut matches: Vec<(&FunctionPathKey, &Rc<PyreFunctionEntry>)> = entries_borrow
+        let mut matches: Vec<(&FunctionPathKey, &Rc<FunctionEntry>)> = entries_borrow
             .iter()
             .filter(|(k, e)| {
                 if !e.host_object.is_user_function() {
@@ -847,7 +844,7 @@ impl PyreCallRegistry {
     ///    cache lookup at upstream `bookkeeper.py:362-364`
     ///    (`try: return self.descs[obj_key]; except KeyError`).
     ///
-    /// Subsequent callers receive the same `Rc<PyreFunctionEntry>`
+    /// Subsequent callers receive the same `Rc<FunctionEntry>`
     /// (identity-cached, matching upstream `Bookkeeper.getdesc`'s
     /// "create once, share thereafter" contract at
     /// `bookkeeper.py:362-364`).
@@ -860,16 +857,12 @@ impl PyreCallRegistry {
     /// adapter must surface the conflict at the producer site rather
     /// than silently route the second caller through the first
     /// caller's signature.
-    pub fn get_or_register(
-        &self,
-        key: FunctionPathKey,
-        signature: Signature,
-    ) -> Rc<PyreFunctionEntry> {
+    pub fn get_or_register(&self, key: FunctionPathKey, signature: Signature) -> Rc<FunctionEntry> {
         if let Some(existing) = self.entries.borrow().get(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,
-                "PyreCallRegistry.get_or_register: conflicting signatures for \
+                "CallRegistry.get_or_register: conflicting signatures for \
                  FunctionPath {:?} — upstream description.py:205 \
                  FunctionDesc.__init__ binds the signature to the underlying \
                  Python function object once at creation time, so a single \
@@ -906,7 +899,7 @@ impl PyreCallRegistry {
             host_object.clone(),
             DescEntry::function(function_desc.clone()),
         );
-        let entry = Rc::new(PyreFunctionEntry {
+        let entry = Rc::new(FunctionEntry {
             host_object,
             function_desc,
             declared_funcptr_type: RefCell::new(None),
@@ -942,7 +935,7 @@ impl PyreCallRegistry {
         key: FunctionPathKey,
         signature: Signature,
         pygraph: Rc<PyGraph>,
-    ) -> Rc<PyreFunctionEntry> {
+    ) -> Rc<FunctionEntry> {
         let entry = self.get_or_register(key, signature);
         entry.prefill_default_cache(pygraph);
         entry
@@ -970,19 +963,19 @@ impl PyreCallRegistry {
     pub fn alias(&self, alias_key: FunctionPathKey, canonical_key: &FunctionPathKey) {
         assert!(
             self.entries.borrow().contains_key(canonical_key),
-            "PyreCallRegistry.alias: canonical key {:?} is not registered",
+            "CallRegistry.alias: canonical key {:?} is not registered",
             canonical_key.segments(),
         );
         assert!(
             !self.entries.borrow().contains_key(&alias_key),
-            "PyreCallRegistry.alias: alias key {:?} is already a canonical entry",
+            "CallRegistry.alias: alias key {:?} is already a canonical entry",
             alias_key.segments(),
         );
         if let Some(existing) = self.aliases.borrow().get(&alias_key) {
             assert_eq!(
                 existing,
                 canonical_key,
-                "PyreCallRegistry.alias: alias key {:?} already maps to a different canonical key",
+                "CallRegistry.alias: alias key {:?} already maps to a different canonical key",
                 alias_key.segments(),
             );
             return;
@@ -1026,14 +1019,14 @@ impl PyreCallRegistry {
     // `model.py`); a parallel `FunctionPathKey -> Variable` side
     // map was a pyre-only divergence with no upstream peer.  Real
     // readers must consult `Variable.concretetype` directly through
-    // the `PyGraph.graph` already cached on the `PyreFunctionEntry.
+    // the `PyGraph.graph` already cached on the `FunctionEntry.
     // function_desc.cache`.
 }
 
 /// Rust naming convention shape check: PascalCase / leading-uppercase
 /// idents are type / struct / enum names (impl method receivers); all-
 /// snake_case idents are modules / functions / primitives.  Used by
-/// [`PyreCallRegistry::lookup_with_leaf_match`] to distinguish
+/// [`CallRegistry::lookup_with_leaf_match`] to distinguish
 /// `Type::method` candidates from `module::fn` candidates when the
 /// query path's shape disagrees.
 fn starts_with_uppercase(s: &str) -> bool {
@@ -1055,7 +1048,7 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unregistered_path() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         assert!(
             registry
                 .lookup(&FunctionPathKey::from_segments(["foo"]))
@@ -1068,7 +1061,7 @@ mod tests {
     #[test]
     fn get_or_register_constructs_entry_with_function_desc_and_host_object() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["foo"]);
         let entry = registry.get_or_register(key.clone(), signature(&["x"]));
         assert_eq!(
@@ -1092,7 +1085,7 @@ mod tests {
     #[test]
     fn get_or_register_preregisters_function_desc_in_bookkeeper_descs() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk.clone());
+        let registry = CallRegistry::new(bk.clone());
         let entry =
             registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
         // Direct cache lookup — Bookkeeper.descs[host_object] must
@@ -1116,7 +1109,7 @@ mod tests {
     #[test]
     fn bookkeeper_getdesc_short_circuits_on_pre_registered_host_object() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk.clone());
+        let registry = CallRegistry::new(bk.clone());
         let entry =
             registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
         // The headline parity claim: bookkeeper.getdesc(host_object)
@@ -1144,7 +1137,7 @@ mod tests {
     #[should_panic(expected = "conflicting signatures")]
     fn get_or_register_panics_on_signature_conflict() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["foo"]);
         registry.get_or_register(key.clone(), signature(&["x"]));
         // Second registration with a different signature must surface
@@ -1158,7 +1151,7 @@ mod tests {
     #[test]
     fn get_or_register_returns_cached_entry_on_repeat_lookup() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["foo"]);
         let first = registry.get_or_register(key.clone(), signature(&["x"]));
         let second = registry.get_or_register(key.clone(), signature(&["x"]));
@@ -1177,7 +1170,7 @@ mod tests {
     #[test]
     fn lookup_after_register_returns_same_entry() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["foo"]);
         let registered = registry.get_or_register(key.clone(), signature(&["x"]));
         let looked_up = registry
@@ -1192,7 +1185,7 @@ mod tests {
     #[test]
     fn distinct_paths_register_distinct_entries() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk.clone());
+        let registry = CallRegistry::new(bk.clone());
         let foo =
             registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
         let bar =
@@ -1216,7 +1209,7 @@ mod tests {
     #[test]
     fn multi_segment_path_distinct_from_single_segment() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let bare =
             registry.get_or_register(FunctionPathKey::from_segments(["foo"]), signature(&["x"]));
         let qualified = registry.get_or_register(
@@ -1248,7 +1241,7 @@ mod tests {
         // free-fn Python callable identity, never colliding with the
         // bound-method object.
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let free_fn = registry.get_or_register(
             FunctionPathKey::from_segments(["pyobject", "is_none"]),
             signature(&["obj"]),
@@ -1275,7 +1268,7 @@ mod tests {
         // upstream would surface the same "no such free fn" gap as a
         // bookkeeper lookup miss.
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let _impl_method = registry.get_or_register(
             FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
             signature(&["self"]),
@@ -1305,7 +1298,7 @@ mod tests {
     #[test]
     fn find_entry_with_cached_graph_resolves_by_graph_identity() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let key = FunctionPathKey::from_segments(["m", "f"]);
         let pygraph = make_pygraph("f", signature(&["x"]));
         registry.register_callee(key.clone(), signature(&["x"]), pygraph.clone());
@@ -1339,7 +1332,7 @@ mod tests {
     #[test]
     fn keys_for_entry_includes_canonical_and_aliases() {
         let bk = Rc::new(Bookkeeper::new());
-        let registry = PyreCallRegistry::new(bk);
+        let registry = CallRegistry::new(bk);
         let canonical = FunctionPathKey::from_segments(["m", "f"]);
         registry.get_or_register(canonical.clone(), signature(&["x"]));
         let alias = FunctionPathKey::from_segments(["crate", "m", "f"]);

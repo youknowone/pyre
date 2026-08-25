@@ -888,7 +888,7 @@ impl UnknownCalleeCensus {
         rows
     }
 
-    /// Rows per table, from `PYRE_CALLEE_CENSUS_ROWS` (`all` for no cap).
+    /// Rows per table, from `MAJIT_CALLEE_CENSUS_ROWS` (`all` for no cap).
     ///
     /// A knob rather than a constant because the question this census is
     /// usually asked — *what spelling does a call site actually carry?* —
@@ -900,7 +900,7 @@ impl UnknownCalleeCensus {
     /// would make the header's own `limit=` a lie.
     fn row_limit() -> (usize, Option<String>) {
         const DEFAULT: usize = 25;
-        match std::env::var("PYRE_CALLEE_CENSUS_ROWS") {
+        match std::env::var("MAJIT_CALLEE_CENSUS_ROWS") {
             Err(_) => (DEFAULT, None),
             Ok(raw) if raw == "all" => (usize::MAX, None),
             Ok(raw) => match raw.parse::<usize>() {
@@ -1330,7 +1330,7 @@ pub struct CallControl {
     /// analyzed LLBC world (traits with two or more impl owners are
     /// absent).  Computed in `lib.rs` from `concrete_trait_methods` and
     /// forwarded to the dual-gate bookkeeper
-    /// (`Bookkeeper::pyre_trait_unique_impls`) so
+    /// (`Bookkeeper::trait_unique_impls`) so
     /// `derive_subject_inputcells` can resolve a generic receiver's
     /// bound-trait `class_root` to the impl type's `ClassDef`.
     /// RPython has no analogue: its annotator sees the concrete
@@ -1388,7 +1388,7 @@ pub struct CallControl {
     /// callees cannot lower their bodies (`build_flow.rs:215` rejects
     /// `sig.unsafety.is_some()` because raw-pointer ops are not
     /// modelled), but `OpKind::Call::FunctionPath` sites still need
-    /// the path registered in `PyreCallRegistry`.  Populated by `lib.rs`
+    /// the path registered in `CallRegistry`.  Populated by `lib.rs`
     /// from `program.unsafe_fn_stubs` via
     /// `front::mir::collect_unsafe_fn_stubs_from_llbc`; consumed by
     /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
@@ -1897,7 +1897,7 @@ impl CallControl {
 
     /// Program-wide struct field shapes accumulated at pipeline init.
     /// Threaded into the dual-gate bookkeeper so
-    /// `getuniqueclassdef_for_struct_root` / `project_pyre_field_type` can
+    /// `getuniqueclassdef_for_struct_root` / `project_struct_field_type` can
     /// project a struct's fields onto its classdef.
     pub fn struct_fields(&self) -> &crate::front::StructFieldRegistry {
         &self.struct_fields
@@ -3932,7 +3932,7 @@ impl CallControl {
                             // non-numeric `lltype::malloc_typed[_stable]`, which
                             // has no ported general `malloc->new` lowering.  The
                             // caller resolves them to the
-                            // `collect_pyre_class_ctor_stubs_from_llbc` residual
+                            // `collect_marked_class_ctor_stubs_from_llbc` residual
                             // stub, so — like a builtin — the BFS must not follow
                             // the constructor body: otherwise the two-phase census
                             // annotates its unliftable body (and its transitive
@@ -4004,7 +4004,7 @@ impl CallControl {
     /// function list — so a ratio taken against one is not comparable to a
     /// ratio taken against the other.  Whenever this count is published as a
     /// proportion, name the denominator alongside it; the pipeline profile
-    /// line (`lib.rs`, `PYRE_PROFILE_PIPELINE`) prints both absolutes rather
+    /// line (`lib.rs`, `MAJIT_PROFILE_PIPELINE`) prints both absolutes rather
     /// than a quotient for exactly that reason.
     pub fn candidate_graph_count(&self) -> usize {
         self.candidate_graphs.len()
@@ -4813,7 +4813,7 @@ impl CallControl {
     /// `CallPath`; otherwise it falls back to the stable symbolic address
     /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
-        // A `__pyre_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
+        // A `__majit_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
         // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
         // one-register-per-slot residual-call ABI can carry. The codewriter
         // gives every wrapper its own jitcode and inlines it, so refusing the
@@ -4832,7 +4832,7 @@ impl CallControl {
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
-                .is_some_and(|leaf| leaf.starts_with("__pyre_wrap_"))
+                .is_some_and(|leaf| leaf.starts_with("__majit_wrap_"))
         {
             return symbolic_fnaddr_for_path(path);
         }
@@ -5217,7 +5217,7 @@ impl CallControl {
             let Some(leaf) = path.last_segment() else {
                 continue;
             };
-            if !leaf.starts_with("__pyre_wrap_") || !self.function_graphs.contains_key(path) {
+            if !leaf.starts_with("__majit_wrap_") || !self.function_graphs.contains_key(path) {
                 continue;
             }
             by_address.entry(fnaddr).or_default().push(path.clone());
@@ -7122,7 +7122,7 @@ pub fn effectinfo_from_writeanalyze(
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
             oopspecindex,
-            pyre_helper: majit_ir::PyreHelperKind::None,
+            runtime_helper: majit_ir::RuntimeHelperKind::None,
             _readonly_descrs_fields: None,
             _write_descrs_fields: None,
             _readonly_descrs_arrays: None,
@@ -7315,7 +7315,7 @@ pub fn effectinfo_from_writeanalyze(
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
             oopspecindex,
-            pyre_helper: majit_ir::PyreHelperKind::None,
+            runtime_helper: majit_ir::RuntimeHelperKind::None,
             _readonly_descrs_fields: None,
             _write_descrs_fields: None,
             _readonly_descrs_arrays: None,
@@ -7339,7 +7339,7 @@ pub fn effectinfo_from_writeanalyze(
     EffectInfo {
         extraeffect,
         oopspecindex,
-        pyre_helper: majit_ir::PyreHelperKind::None,
+        runtime_helper: majit_ir::RuntimeHelperKind::None,
         _readonly_descrs_fields: Some(read_descrs_fields_arcs),
         _write_descrs_fields: Some(write_descrs_fields_arcs),
         _readonly_descrs_arrays: Some(read_descrs_arrays_arcs),
@@ -10404,8 +10404,8 @@ mod tests {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::translator::backendopt::canraise::RaiseAnalyzer;
         use crate::translator::backendopt::graphanalyze::GraphAnalyzer;
+        use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
-        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
         use crate::translator::translator::TranslationContext;
         use std::rc::Rc;
 
@@ -10429,7 +10429,7 @@ mod tests {
         // Real front-end graphs ARE well-formed and DO convert — production
         // runs function_graph_to_flowspace on every graph and check.py is
         // green.
-        let registry = || PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
+        let registry = || CallRegistry::new(Rc::new(Bookkeeper::new()));
 
         // -- non-raising: converts, and both paths agree it cannot raise --
         {
@@ -10551,8 +10551,8 @@ mod tests {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::translator::backendopt::canraise::RaiseAnalyzer;
         use crate::translator::backendopt::graphanalyze::GraphAnalyzer;
+        use crate::translator::rtyper::call_registry::CallRegistry;
         use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
-        use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
         use crate::translator::translator::TranslationContext;
         use std::rc::Rc;
 
@@ -10674,7 +10674,7 @@ mod tests {
             //    the flat tri-state from the (default, ignore-MemoryError)
             //    boolean pair (default ↔ ignore=false; do_ignore_memory_error
             //    ↔ ignore=true) --
-            let reg = PyreCallRegistry::new(Rc::new(Bookkeeper::new()));
+            let reg = CallRegistry::new(Rc::new(Bookkeeper::new()));
             let out = function_graph_to_flowspace(&build("wf_raise", opname, raises), &reg)
                 .expect("well-formed graph converts to flowspace");
             let translator = TranslationContext::new();

@@ -71,7 +71,7 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     // Or-pattern, or a missing wildcard without publishing an opcode side
     // table to production consumers.
     let llbc_paths: Vec<std::path::PathBuf> = std::env::split_paths(
-        &std::env::var_os("PYRE_MIR_FRONTEND_LLBC")
+        &std::env::var_os("MAJIT_MIR_FRONTEND_LLBC")
             .expect("ensure_workspace_llbc_env installs the LLBC path list"),
     )
     .collect();
@@ -380,12 +380,12 @@ fn assert_no_instruction_keyed_output_map() {
     );
 }
 
-/// Resolve workspace LLBC artefacts and export `PYRE_MIR_FRONTEND_LLBC`
-/// when they exist. The compact `PYRE_JIT_GRAPH_MODULES` fixture cannot rely on
+/// Resolve workspace LLBC artefacts and export `MAJIT_MIR_FRONTEND_LLBC`
+/// when they exist. The compact `JIT_GRAPH_MODULES` fixture cannot rely on
 /// production auto-discovery, so this release-only test opts in explicitly.
 /// Returns `false` when the artefacts are absent so the caller can skip.
 fn ensure_workspace_llbc_env() -> bool {
-    if std::env::var_os("PYRE_MIR_FRONTEND_LLBC").is_some() {
+    if std::env::var_os("MAJIT_MIR_FRONTEND_LLBC").is_some() {
         return true;
     }
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -412,7 +412,7 @@ fn ensure_workspace_llbc_env() -> bool {
     // SAFETY: `set_var` is unsafe in Rust 2024 because concurrent environment
     // mutation races. This release-only integration test configures the
     // process before the thread-local generated registry is initialized.
-    unsafe { std::env::set_var("PYRE_MIR_FRONTEND_LLBC", joined) };
+    unsafe { std::env::set_var("MAJIT_MIR_FRONTEND_LLBC", joined) };
     true
 }
 

@@ -238,16 +238,16 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // WindowsError.__init__; HOST_ENV lookup preserves that conditional.
         ("WindowsError.__init__", rtype_WindowsError__init__),
         // Pyre-internal front-end pointer-downcast narrow (#298).  Keyed
-        // by the `__pyre_cast_instance` HOST_ENV singleton (same Arc the
+        // by the `__cast_instance_intrinsic` HOST_ENV singleton (same Arc the
         // adapter resolves the call's callable to), lowers to a
         // `cast_pointer` into the narrowed `InstanceRepr`.
-        ("__pyre_cast_instance", rtype_pyre_cast_instance),
+        ("__cast_instance_intrinsic", rtype_cast_instance_intrinsic),
         // The erasing twin (`p as *mut u8`).  Its annotator dropped the
         // pointee class, so `hop.r_result` is the classdef-less
         // `InstanceRepr` and the same `cast_pointer` body applies — this
         // time as the upcast direction of `pairtype(InstanceRepr,
         // InstanceRepr).convert_from_to`.
-        ("__pyre_cast_address", rtype_pyre_cast_instance),
+        ("__cast_address_intrinsic", rtype_cast_instance_intrinsic),
     ];
     for (name, typer) in entries {
         if let Some(host) = HOST_ENV.lookup_builtin(name) {
@@ -3622,8 +3622,8 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 }
 
 /// Typer for both front-end pointer-cast markers — the
-/// `__pyre_cast_instance` downcast narrow (#298) and the
-/// `__pyre_cast_address` erasure.  Either way the annotator has already
+/// `__cast_instance_intrinsic` downcast narrow (#298) and the
+/// `__cast_address_intrinsic` erasure.  Either way the annotator has already
 /// decided the result's `InstanceRepr` (the target root, or the
 /// classdef-less shell), so `hop.r_result` names the destination and the
 /// call lowers to a `cast_pointer` of the pointer operand to that
@@ -3635,18 +3635,16 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// `args[0]` is the pointer operand; the narrow's `args[1]` is the
 /// constant root name (read by the annotator, unused here — it carries
 /// no runtime value).
-pub fn rtype_pyre_cast_instance(
+pub fn rtype_cast_instance_intrinsic(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 
-    let r_result = hop
-        .r_result
-        .borrow()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| TyperError::message("rtype_pyre_cast_instance: missing r_result"))?;
+    let r_result =
+        hop.r_result.borrow().as_ref().cloned().ok_or_else(|| {
+            TyperError::message("rtype_cast_instance_intrinsic: missing r_result")
+        })?;
     let result_lltype = r_result.lowleveltype().clone();
     // Validated operand extraction: a malformed call (wrong arity)
     // surfaces a `TyperError` here instead of panicking on a raw

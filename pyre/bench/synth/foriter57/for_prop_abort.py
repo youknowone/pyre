@@ -16,7 +16,7 @@ def f():
     seen = []
     for x in range(500):
         # `obj.p` lowers to a value-returning `load_attr` residual
-        # (`PyreHelperKind::None`, `Ref` result, `MayForce`): the OLD R1
+        # (`RuntimeHelperKind::None`, `Ref` result, `MayForce`): the OLD R1
         # write-discriminator (Void result OR a CallFn/StoreSubscr/
         # SetCurrentException/StoreDeref tag) does NOT see it, so its
         # getter side effect (`O.hits += 1`) escaped the body-effect flag.

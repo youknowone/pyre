@@ -1768,7 +1768,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // the default path (`object_array::alloc_*_block_gc` →
     // `try_gc_alloc`); the nursery walker traces each item slot of such
     // a block, and the list/tuple custom traces forward the block
-    // pointer. Under the `PYRE_GC_ITEMSBLOCK=0` fallback the blocks come
+    // pointer. Under the `MAJIT_GC_ITEMSBLOCK=0` fallback the blocks come
     // from `std::alloc` instead and no allocation carries this typeid.
     // See comments on `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID`
     // and `pyre_object::object_array::ItemsBlock` for the companion
@@ -7515,7 +7515,7 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::CallKw { .. }
             // CALL_FUNCTION_EX is the same MayForce call boundary as CALL and
             // CALL_KW.  The codewriter lowers it through
-            // PyreHelperKind::CallFunctionEx, and
+            // RuntimeHelperKind::CallFunctionEx, and
             // fbw_callee_body_replay_scan defers CallFn, CallKw, and
             // CallFunctionEx together; omitting only the starred-call spelling
             // here added no safety beyond the Layer 2 defense above.
@@ -7534,7 +7534,7 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::BuildSet { .. }
             | I::BuildMap { .. }
             // MAKE_FUNCTION is another fresh-object builder: codewriter.rs
-            // lowers PyreHelperKind::MakeFunction as a Plain allocation that
+            // lowers RuntimeHelperKind::MakeFunction as a Plain allocation that
             // runs no user code and cannot raise. SET_FUNCTION_ATTRIBUTE only
             // initializes that newly-built function's typed fields, likewise
             // without user code or an exception, so replay drops or rebuilds
@@ -10553,7 +10553,7 @@ fn compile_and_run_once(
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished
-        && std::env::var_os("PYRE_DYNASM_EXEC_DIAG").is_some()
+        && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some()
         && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
     {
         eprintln!(

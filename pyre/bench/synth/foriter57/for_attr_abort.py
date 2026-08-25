@@ -9,14 +9,14 @@ def f():
     for x in range(500):
         # `o.n += 1` is a concrete NON-journaled, NON-idempotent heap mutation
         # (a STORE_ATTR via the residual `store_attr_fn`, which carries
-        # `PyreHelperKind::None` and is covered by NO journal) that COMMITS
+        # `RuntimeHelperKind::None` and is covered by NO journal) that COMMITS
         # before a later op in the same iteration aborts the trace.
         # `seen.append` is the abort trigger (its inline sub-walk declines);
         # it exists only to force the in-body abort AFTER the attr store has
         # committed.
         #
         # The OLD R1 guard flagged a body effect ONLY for a tiny allow-list of
-        # `PyreHelperKind`s (`StoreSubscr` / `CallFn` / `SetCurrentException`),
+        # `RuntimeHelperKind`s (`StoreSubscr` / `CallFn` / `SetCurrentException`),
         # so this `None`-tagged store was never flagged: the guard delivered the
         # in-flight FOR_ITER item and re-ran the whole body, DOUBLING the
         # accumulate (o.n over-counts by the number of aborts → 500 + #aborts).

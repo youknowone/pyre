@@ -1,6 +1,6 @@
 //! Env-gated per-phase accumulator for `transform_graph_to_jitcode`.
 //!
-//! Enabled when `PYRE_PROFILE_DRAIN` is set; aggregates wall-clock time
+//! Enabled when `MAJIT_PROFILE_DRAIN` is set; aggregates wall-clock time
 //! across every drained graph so the per-phase hotspot is identifiable
 //! without `O(graphs)` log noise.
 
@@ -12,7 +12,7 @@ thread_local! {
 }
 
 pub fn enabled() -> bool {
-    std::env::var_os("PYRE_PROFILE_DRAIN").is_some()
+    std::env::var_os("MAJIT_PROFILE_DRAIN").is_some()
 }
 
 pub fn record(phase: &'static str, dur: Duration) {
@@ -45,14 +45,14 @@ pub fn dump_transform_phase_totals() {
             grand += *d;
         }
         eprintln!(
-            "[PYRE_PROFILE_DRAIN] PHASE TOTALS ({:.3}s wall across all phases):",
+            "[MAJIT_PROFILE_DRAIN] PHASE TOTALS ({:.3}s wall across all phases):",
             grand.as_secs_f64(),
         );
         let mut rows: Vec<_> = t.iter().cloned().collect();
         rows.sort_by_key(|b| std::cmp::Reverse(b.1));
         for (name, dur, n) in rows {
             eprintln!(
-                "[PYRE_PROFILE_DRAIN]   {:>8.3}s  {:>5} calls  {}",
+                "[MAJIT_PROFILE_DRAIN]   {:>8.3}s  {:>5} calls  {}",
                 dur.as_secs_f64(),
                 n,
                 name,

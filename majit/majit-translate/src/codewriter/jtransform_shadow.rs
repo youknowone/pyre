@@ -17,7 +17,7 @@
 //! `SpaceOperation.opname` and reports, per graph, the opname histogram and
 //! the subset of opnames that fall outside the admissible input set jtransform
 //! accepts.  It never mutates the graph and never feeds the production jitcode
-//! path; it is a no-op unless `PYRE_JTRANSFORM_SHADOW` is set in the
+//! path; it is a no-op unless `MAJIT_JTRANSFORM_SHADOW` is set in the
 //! environment, so the default build is byte-for-byte unchanged.  The
 //! histogram of unhandled opnames collected across the corpus is the
 //! per-handler migration backlog for the opname-dispatch rewrite.
@@ -518,16 +518,16 @@ fn admissible_opnames() -> HashSet<String> {
         .collect()
 }
 
-/// Whether the env-gated shadow gauge is active (`PYRE_JTRANSFORM_SHADOW`
+/// Whether the env-gated shadow gauge is active (`MAJIT_JTRANSFORM_SHADOW`
 /// set).  Centralizes the switch so a call site can skip even the graph
 /// borrow when the gauge is off, keeping the default build's behaviour
 /// unchanged.
 pub fn is_enabled() -> bool {
-    std::env::var_os("PYRE_JTRANSFORM_SHADOW").is_some()
+    std::env::var_os("MAJIT_JTRANSFORM_SHADOW").is_some()
 }
 
 /// Walk the post-rtype flowspace graph by `SpaceOperation.opname` and emit a
-/// per-graph diagnostic.  No-op unless `PYRE_JTRANSFORM_SHADOW` is set; never
+/// per-graph diagnostic.  No-op unless `MAJIT_JTRANSFORM_SHADOW` is set; never
 /// mutates the graph.
 pub fn report_if_enabled(graph: &FunctionGraph) {
     if !is_enabled() {

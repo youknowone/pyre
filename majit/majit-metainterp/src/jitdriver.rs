@@ -538,7 +538,7 @@ fn failvals_enabled() -> bool {
 }
 fn portal_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("PYRE_PORTAL_RCA").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_PORTAL_RCA").is_some())
 }
 
 fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String {
@@ -5482,7 +5482,7 @@ impl<S: JitState> JitDriver<S> {
                     .unwrap_or(&fallback_alloc);
 
                 // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
-                // wired to handler_inline_call_pyre_nested when the
+                // wired to handler_inline_call_nested_ext when the
                 // multi-frame state-field-JIT chain reconstructs sub-frames
                 // via parent.descrs[idx].as_jitcode() above.  3
                 // retired the dispatch_one BC_INLINE_CALL legacy arm so an

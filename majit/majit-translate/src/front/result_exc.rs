@@ -2539,7 +2539,7 @@ pub(crate) fn assert_block_pure_besides(
     Ok(())
 }
 
-/// `true` iff `kind` is a `__pyre_cast_instance` narrow — the front-end
+/// `true` iff `kind` is a `__cast_instance_intrinsic` narrow — the front-end
 /// pointer-downcast marker (`front::mir` `Rvalue::Cast` arm) the MIR emits
 /// when an opaque `Ref` result is reinterpreted as a registered struct root.
 /// It lowers to `cast_pointer` (a pure alias), so it carries no side effect
@@ -2551,14 +2551,14 @@ pub(crate) fn is_recast_narrow(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__pyre_cast_instance")
+        } if args.len() == 1 && segments.first().is_some_and(|s| s == "__cast_instance_intrinsic")
     )
 }
 
-/// Peel the trailing chain of pure `__pyre_cast_instance` recasts starting
+/// Peel the trailing chain of pure `__cast_instance_intrinsic` recasts starting
 /// from `start` within `block`: an unregistered call (`from_residual`,
 /// `next`, …) returns an opaque `Ref` the MIR immediately narrows to the
-/// concrete type with one or more `__pyre_cast_instance` recasts.  Follow
+/// concrete type with one or more `__cast_instance_intrinsic` recasts.  Follow
 /// each contiguous recast whose sole operand is the prior result, requiring
 /// that no non-final intermediate is read by anything but the next recast or
 /// escapes on an exit link (else collapsing the chain would strand a live

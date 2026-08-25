@@ -3135,10 +3135,10 @@ pub fn gc_rawrefcount_set_finalizer_claim(claim: rawrefcount::FinalizerClaimFn) 
 /// `obj` owns it: the mirror lives as long as the interpreter object does, plus
 /// as long afterwards as the C side still holds a reference.
 ///
-/// The caller must already have added [`rawrefcount::REFCNT_FROM_PYRE`] to the
+/// The caller must already have added [`rawrefcount::REFCNT_FROM_PYPY`] to the
 /// mirror's count; that share is what this link is worth.
-pub fn gc_rawrefcount_create_link_pyre(obj: GcRef, pyobject: usize) {
-    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pyre(obj.0, pyobject));
+pub fn gc_rawrefcount_create_link_pypy(obj: GcRef, pyobject: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pypy(obj.0, pyobject));
 }
 
 /// `rawrefcount.py:create_link_pyobj` — the other direction: `pyobject` owns

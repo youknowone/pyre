@@ -1,7 +1,7 @@
 //! Source-level acceptance gates for structural RPython parity.
 //!
 //! The tests reject variant-keyed JitCode maps, a separate exception opname
-//! family, and the legacy `compile_pyre_interpreter` entry point. They scan
+//! family, and the legacy `compile_interpreter` entry point. They scan
 //! every MAJIT crate's `src` tree after stripping comments and normalizing
 //! whitespace, with positive controls that prove each selector still matches.
 
@@ -25,8 +25,8 @@ const VARIANT_KEYED_MAP: &[&str] = &[
 
 const NEW_OPNAME_FAMILY: &[&str] = &["_may_raise", "OpKind::Try", "TryOp"];
 
-/// `fn compile_pyre_interpreter` with its whitespace removed.
-const LEGACY_ENTRY_POINT: &[&str] = &["fncompile_pyre_interpreter"];
+/// `fn compile_interpreter` with its whitespace removed.
+const LEGACY_ENTRY_POINT: &[&str] = &["fncompile_interpreter"];
 
 /// Below this the walk is assumed broken rather than the tree assumed empty.
 /// A BRAKE, not a census pin — it is far below the population so that adding
@@ -338,16 +338,16 @@ fn no_new_opname_family_for_exceptions() {
     );
 }
 
-/// The legacy `compile_pyre_interpreter` entry point must not re-emerge. It
+/// The legacy `compile_interpreter` entry point must not re-emerge. It
 /// is replaced with `CodeWriter::make_jitcodes` (upstream `codewriter.py`).
 /// A surviving definition means the pyre-bytecode-walking path lives in
 /// parallel with the graph-keyed one.
 #[test]
-fn no_legacy_compile_pyre_interpreter() {
-    let hits = scan_forbidden("no_legacy_compile_pyre_interpreter", LEGACY_ENTRY_POINT);
+fn no_legacy_interpreter_compiler() {
+    let hits = scan_forbidden("no_legacy_interpreter_compiler", LEGACY_ENTRY_POINT);
     assert!(
         hits.is_empty(),
-        "Plan acceptance violated: `compile_pyre_interpreter` resurfaced. \
+        "Plan acceptance violated: `compile_interpreter` resurfaced. \
          It is replaced with `CodeWriter::make_jitcodes` \
          (`rpython/jit/codewriter/codewriter.py:74`). Remove the legacy \
          definition."
@@ -375,7 +375,7 @@ fn turbofish() { let _ = HashMap::<Instruction, u32>::new(); }
 fn ordered() -> BTreeMap<Instruction, u32> { todo!() }
 fn raising(x: u8) -> bool { x._may_raise() }
 struct S { t: TryOp, k: OpKind::Try }
-fn compile_pyre_interpreter() {}
+fn compile_interpreter() {}
 "###;
 
     let (dense, _lines) = normalise(&strip_comments(SYNTHETIC));
@@ -388,7 +388,7 @@ fn compile_pyre_interpreter() {}
         ("_may_raise", 1),
         ("OpKind::Try", 1),
         ("TryOp", 1),
-        ("fncompile_pyre_interpreter", 1),
+        ("fncompile_interpreter", 1),
     ];
     for &(pattern, want) in expected {
         let got = dense.matches(pattern).count();

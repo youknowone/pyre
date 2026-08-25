@@ -153,7 +153,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 }
 
 /// #124: walker-native truth specialization for the `truth_fn` residual
-/// (oopspec [`majit_ir::PyreHelperKind::Truth`]).  When the sole Ref operand
+/// (oopspec [`majit_ir::RuntimeHelperKind::Truth`]).  When the sole Ref operand
 /// is a concrete boxed `W_IntObject` (excluding `W_BoolObject`, which shares
 /// the `intval: i64` layout but carries a distinct `BOOL_TYPE` `ob_type`, so
 /// the emitted `GUARD_CLASS INT` would not match it), unbox it
@@ -242,7 +242,7 @@ pub(crate) fn try_walker_specialize_truth_bool<Sym: WalkSym>(
 }
 
 /// #61: walker-native identity fold for the `UNARY_POSITIVE` residual
-/// (oopspec [`majit_ir::PyreHelperKind::UnaryPositive`]).  The object-space
+/// (oopspec [`majit_ir::RuntimeHelperKind::UnaryPositive`]).  The object-space
 /// `pos` on an exact int returns the operand unchanged, so a concrete non-bool
 /// `W_IntObject` operand folds to the operand box itself behind the same guard
 /// prefix the truth / binary int folds emit (a low-bit tag test for a tagged
@@ -403,7 +403,7 @@ fn walker_emit_ovf2long_box<Sym: WalkSym>(
 }
 
 /// #61: walker-native int specialization for the `UNARY_NEGATIVE` residual
-/// (oopspec [`majit_ir::PyreHelperKind::UnaryNegative`]).  `-x` on an exact
+/// (oopspec [`majit_ir::RuntimeHelperKind::UnaryNegative`]).  `-x` on an exact
 /// int is `0 - x`; the object-space `neg` promotes only `-INT_MIN` to a
 /// `W_LongObject` (`intobject.py` `descr_neg` → `_make_ovf2long`).  Since
 /// majit has no overflow-checked unary negate, the fold expresses `-x` as
@@ -484,7 +484,7 @@ pub(crate) fn try_walker_specialize_unary_negative_int<Sym: WalkSym>(
 }
 
 /// #61: walker-native int specialization for the `UNARY_INVERT` residual
-/// (oopspec [`majit_ir::PyreHelperKind::UnaryInvert`]).  `~x` on an exact int
+/// (oopspec [`majit_ir::RuntimeHelperKind::UnaryInvert`]).  `~x` on an exact int
 /// is `!x`, which always fits an i64 (`~INT_MIN == INT_MAX`, `~INT_MAX ==
 /// INT_MIN`), so `descr_invert` never promotes to a long: the fold emits a
 /// plain `IntInvert` behind a `GUARD_CLASS INT`, with no overflow guard.
@@ -1989,7 +1989,7 @@ pub(crate) fn specialised_pair_kind(
 pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    helper: majit_ir::PyreHelperKind,
+    helper: majit_ir::RuntimeHelperKind,
     i_args: &[OpRef],
     r_args: &[OpRef],
     allboxes: &[OpRef],
@@ -2036,7 +2036,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             crate::descr::tuple_wrappeditems_descr(),
         );
         match helper {
-            majit_ir::PyreHelperKind::UnpackSequence => {
+            majit_ir::RuntimeHelperKind::UnpackSequence => {
                 if int_val as usize != concrete_len {
                     return Ok(None);
                 }
@@ -2055,7 +2055,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
                 write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
                 return Ok(Some(()));
             }
-            majit_ir::PyreHelperKind::UnpackItem => {
+            majit_ir::RuntimeHelperKind::UnpackItem => {
                 let index = int_val as usize;
                 if index >= concrete_len {
                     return Ok(None);
@@ -2107,7 +2107,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     };
     let spec_type = seq_type;
     match helper {
-        majit_ir::PyreHelperKind::UnpackSequence => {
+        majit_ir::RuntimeHelperKind::UnpackSequence => {
             // Either specialisation is always arity 2, so the class guard
             // subsumes the exact-length check `unpack_sequence_fn` performs.
             if int_val != 2 {
@@ -2119,7 +2119,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, seq)?;
             Ok(Some(()))
         }
-        majit_ir::PyreHelperKind::UnpackItem => {
+        majit_ir::RuntimeHelperKind::UnpackItem => {
             if !(0..2).contains(&int_val) {
                 return Ok(None);
             }
@@ -4439,7 +4439,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             majit_ir::ExtraEffect::CannotRaise,
             majit_ir::OopSpecIndex::None,
         );
-        effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::StoreAttr;
         let descr = majit_metainterp::make_call_descr_with_effect(
             &[
                 majit_ir::Type::Ref,
@@ -4714,7 +4714,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     // virtualizable spill, and the trailing force/exception guards stay exactly
     // as the generic setattr emitted them.
     let mut effect = original_effect.clone();
-    effect.pyre_helper = majit_ir::PyreHelperKind::StoreAttr;
+    effect.runtime_helper = majit_ir::RuntimeHelperKind::StoreAttr;
     let descr = majit_metainterp::make_call_descr_with_effect(
         &[
             majit_ir::Type::Ref,
@@ -4736,7 +4736,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
 /// #171: FBW virtualization of a non-escaping BUILD_LIST.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
-/// (oopspec [`majit_ir::PyreHelperKind::NewlistFromArray`]) whose single
+/// (oopspec [`majit_ir::RuntimeHelperKind::NewlistFromArray`]) whose single
 /// r-arg is the already-built backing array.  Decompose that residual into
 /// the virtualizable `opimpl_newlist` shape (`pyjitpl.py`) —
 /// `new_with_vtable` + `new_array` + `setarrayitem_gc` + `setfield_gc` —
@@ -5073,7 +5073,7 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
 /// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
-/// (oopspec [`majit_ir::PyreHelperKind::NewtupleFromArray`]).  When both
+/// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  When both
 /// backing-array elements are concrete plain `W_IntObject`, re-emit the
 /// former trait-side spec_ii shape walker-native
 /// (`new_with_vtable` + `w_class` / `value0` / `value1` `setfield_gc`),
@@ -9701,10 +9701,10 @@ fn next_op_is_f_locals_for_getframe_result<Sym: WalkSym>(
         .and_then(|descr| {
             descr
                 .as_call_descr()
-                .map(|call| call.get_extra_info().pyre_helper)
+                .map(|call| call.get_extra_info().runtime_helper)
         });
     if next.key != "residual_call_ir_r/iIRd>r"
-        || helper_kind != Some(majit_ir::PyreHelperKind::LoadAttr)
+        || helper_kind != Some(majit_ir::RuntimeHelperKind::LoadAttr)
     {
         return false;
     }
@@ -12833,7 +12833,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
 }
 
 /// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
-/// `MOST_GENERAL`, tagged [`majit_ir::PyreHelperKind::SetAddMethod`].
+/// `MOST_GENERAL`, tagged [`majit_ir::RuntimeHelperKind::SetAddMethod`].
 ///
 /// The EI `bind(..., CallFlavor::MayForce)` gives the SET_ADD residual this one
 /// stands in for: `EffectInfo::MOST_GENERAL`, not the analyzer-empty forcing
@@ -12853,7 +12853,7 @@ pub(crate) fn set_add_method_descr() -> DescrRef {
         &[Type::Ref, Type::Ref],
         Type::Ref,
         majit_ir::EffectInfo {
-            pyre_helper: majit_ir::PyreHelperKind::SetAddMethod,
+            runtime_helper: majit_ir::RuntimeHelperKind::SetAddMethod,
             ..default_effect_info()
         },
     )
@@ -14990,7 +14990,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`), and consume pyre's
 /// propagation-root clear without recording a runtime call.
-/// Recognised by the codewriter-stamped `pyre_helper` tag, NOT a funcptr
+/// Recognised by the codewriter-stamped `runtime_helper` tag, NOT a funcptr
 /// address (the residual calls the cross-crate `cpu.{get,set}_current_
 /// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
 ///
@@ -15027,12 +15027,12 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
-    pyre_helper: majit_ir::PyreHelperKind,
+    runtime_helper: majit_ir::RuntimeHelperKind,
     r_args: &[OpRef],
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if pyre_helper == majit_ir::PyreHelperKind::ClearInFlightException {
+    if runtime_helper == majit_ir::RuntimeHelperKind::ClearInFlightException {
         // The authoritative walk executed record_application_traceback and
         // published its concrete exception in the interpreter-only carrier.
         // Complete that concrete ownership transfer now.  Compiled traceback
@@ -15045,7 +15045,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    if pyre_helper == majit_ir::PyreHelperKind::GetCurrentException {
+    if runtime_helper == majit_ir::RuntimeHelperKind::GetCurrentException {
         // PUSH_EXC_INFO `prev = ec.sys_exc_value` — `[]→Ref`.
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
@@ -16832,7 +16832,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
 pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    helper: majit_ir::PyreHelperKind,
+    helper: majit_ir::RuntimeHelperKind,
     frame_ptr: usize,
     w_name_ptr: usize,
     value_opref: OpRef,
@@ -16852,7 +16852,7 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     // fold set the module cell.  STORE_GLOBAL names globals outright, and its
     // frame is a function frame whose `w_locals` is legitimately null, so the
     // gate must not apply to it.
-    if helper == majit_ir::PyreHelperKind::StoreName {
+    if helper == majit_ir::RuntimeHelperKind::StoreName {
         let w_locals = frame.get_w_locals();
         if !std::ptr::eq(w_locals, w_globals) {
             return Ok(false);

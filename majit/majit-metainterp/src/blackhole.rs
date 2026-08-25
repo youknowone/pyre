@@ -562,7 +562,7 @@ impl BlackholeInterpreter {
 
     /// Spawn a fresh interpreter that shares `parent`'s builder-context
     /// fields (cpu, descrs, op_*, dispatch_table).  Used by
-    /// `handler_inline_call_pyre_nested` for the callee frame of an
+    /// `handler_inline_call_nested_ext` for the callee frame of an
     /// inline-call: a recursive `BlackholeInterpreter` rather than
     /// `BlackholeInterpBuilder::acquire_interp` to avoid re-entering the
     /// thread-local builder pool already lent to the caller.
@@ -584,7 +584,7 @@ impl BlackholeInterpreter {
     /// Copy the builder-shared context fields from `parent` onto `self`.
     /// Mirrors `BlackholeInterpBuilder::acquire_interp` in this file
     /// — the same 6 fields that builder→interp normally propagates.
-    /// Used by `handler_inline_call_pyre_nested` to give the callee
+    /// Used by `handler_inline_call_nested_ext` to give the callee
     /// `BlackholeInterpreter` the same `dispatch_table` (so a nested
     /// `BC_INLINE_CALL` byte routes through the same handler) plus the
     /// CPU/descrs/op_* slots the wired handlers would consult.  pyre-only:
@@ -1373,7 +1373,7 @@ impl BlackholeInterpreter {
         // Take the exception into this frame's walked slot before anything
         // below can allocate.  `record` builds a traceback node, and on the
         // inline-callee path this slot is the exception's ONLY root at that
-        // moment: `handler_inline_call_pyre_nested` reads
+        // moment: `handler_inline_call_nested_ext` reads
         // `callee.exception_last_value` after `callee.run()` returned, which
         // popped the callee's `push_bh_regs` entry, and a callee-local `raise`
         // never went through `BH_LAST_EXC_VALUE`.  Exception objects do not
@@ -2314,7 +2314,7 @@ impl BlackholeInterpBuilder {
             // `blackhole.py` `assert self._insns[value] is None`:
             // every byte slot is filled exactly once across the
             // forward map.  Pyre's `wellknown_bh_insns` +
-            // `pyre_extension_insns` + `pipeline.insns` union must
+            // `extension_insns` + `pipeline.insns` union must
             // not insert two distinct keys at the same byte.  Empty
             // gaps between sparse `BC_*` constants stay
             // `String::new()` and surface as the unwired-handler
@@ -3737,7 +3737,7 @@ mod tests {
         /// `int/ref/float_guard_value`, etc.) now push 1-byte register
         /// operands matching the canonical `bhhandler_*` decoders, so
         /// every key here is the upstream-canonical opname/argcodes
-        /// pair (no `_pyre_u16` suffix).
+        /// pair (no `_u16_ext` suffix).
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
             use majit_translate::insns;
             let mut builder = BlackholeInterpBuilder::new();
@@ -4286,7 +4286,7 @@ mod tests {
             b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some(1));
             let jitcode = b.finish();
 
-            // route through `handler_inline_call_pyre_nested`
+            // route through `handler_inline_call_nested_ext`
             // (the production builder shape) so this test exercises the
             // same path as the production blackhole resume.
             let mut builder = super::build_inline_call_only_bh_builder();
@@ -4640,7 +4640,7 @@ mod tests {
         }
 
         /// Tier 2.1: ref-typed return propagation through
-        /// `handler_inline_call_pyre_nested`.  Sub-jitcode is the ref
+        /// `handler_inline_call_nested_ext`.  Sub-jitcode is the ref
         /// identity (passes its ref arg through and `ref_return`s it);
         /// caller passes a non-trivial constant ref and verifies the
         /// caller-side ref dst slot received the same word.
@@ -4850,7 +4850,7 @@ mod tests {
         ///
         /// The recorder allocates, and on this path — a `raise` inside an
         /// inlined callee, caught by the caller — that slot is the exception's
-        /// only root: `handler_inline_call_pyre_nested` reads
+        /// only root: `handler_inline_call_nested_ext` reads
         /// `callee.exception_last_value` after `callee.run()` popped the
         /// callee's `push_bh_regs` entry, and a callee-local raise never went
         /// through `BH_LAST_EXC_VALUE`.  Exceptions do not move but old gen is
@@ -5011,10 +5011,10 @@ mod tests {
         /// Tier 2.3: callee `abort/` propagates aborted=true.
         /// callee shares the parent's dispatch_table, so
         /// byte `BC_ABORT` fires the wired handler
-        /// (`handler_abort_marker_pyre`), which sets `aborted = true` +
+        /// (`handler_abort_marker`), which sets `aborted = true` +
         /// LeaveFrame.  The
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm
-        /// inside `handler_inline_call_pyre_nested` then propagates to
+        /// inside `handler_inline_call_nested_ext` then propagates to
         /// the caller.
         #[test]
         fn test_bh_interp_inline_call_abort_in_sub_propagates() {
@@ -5045,7 +5045,7 @@ mod tests {
         /// criterion for 's callee runtime context clone:
         /// the inner-most callee inherits the parent's dispatch_table
         /// via `clone_context_from`, so byte 17 routes to
-        /// `handler_inline_call_pyre_nested` recursively.  The
+        /// `handler_inline_call_nested_ext` recursively.  The
         /// caller-side ground truth is that the int value threaded
         /// through three frames lands in the outermost caller's
         /// destination register.
@@ -5130,21 +5130,21 @@ mod tests {
             assert_eq!(callee.jitdrivers_sd.len(), parent.jitdrivers_sd.len());
         }
 
-        /// `handler_abort_marker_pyre` defines the pyre
+        /// `handler_abort_marker` defines the pyre
         /// `BC_ABORT` marker semantics.  Reaching `OpKind::Abort` at
         /// runtime sets `aborted = true` and exits the frame —
         /// continuing dispatch past it would misread the next bytes
         /// as opcodes.
         #[test]
-        fn test_handler_abort_marker_pyre_sets_aborted_and_leaves_frame() {
+        fn test_handler_abort_marker_sets_aborted_and_leaves_frame() {
             let mut builder = BlackholeInterpBuilder::new();
             let mut bh = builder.acquire_interp();
             assert!(!bh.aborted);
-            let result = super::handler_abort_marker_pyre(&mut bh, &[], 0);
+            let result = super::handler_abort_marker(&mut bh, &[], 0);
             match result {
                 Err(super::DispatchError::LeaveFrame) => {}
                 other => {
-                    panic!("handler_abort_marker_pyre must return Err(LeaveFrame), got {other:?}")
+                    panic!("handler_abort_marker must return Err(LeaveFrame), got {other:?}")
                 }
             }
             assert!(bh.aborted);
@@ -5822,14 +5822,14 @@ bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
 // one write, so the bytecode shape is identical to `int_add/ii>i` — same
 // primitive. Has no RPython analog; canonical RPython lowers `+=` to plain
 // BINARY_ADD before reaching jtransform.
-bhhandler_ii_i!(handler_int_add_assign_pyre, bhimpl_int_add);
-bhhandler_ii_i!(handler_int_sub_assign_pyre, bhimpl_int_sub);
+bhhandler_ii_i!(handler_int_add_assign, bhimpl_int_add);
+bhhandler_ii_i!(handler_int_sub_assign, bhimpl_int_sub);
 
 // pyre-only: dereference `*x` lowered to the UnaryOp name `"deref"`.
 // After rtyper lowering the &i64 input has already been resolved to a
 // plain i64 value, so the operation degenerates to a copy at dispatch
 // time. Same primitive as `int_same_as`.
-bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
+bhhandler_i_i!(handler_int_deref, bhimpl_int_same_as);
 
 // pyre-only: `OpKind::Abort` placeholder emitted by the front-end when a
 // syntax node has no dedicated OpKind variant (assembler.rs
@@ -5841,7 +5841,7 @@ bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
 // `aborted = true` + `LeaveFrame`. RPython has no
 // direct analog: its codewriter raises before lowering, so a jitcode
 // never carries an unrecognized op.
-fn handler_abort_marker_pyre(
+fn handler_abort_marker(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _position: usize,
@@ -8260,7 +8260,7 @@ fn handler_residual_call_r_v(
 
 // A1-A8: every BC_* emitted by pyre now follows the canonical
 // RPython argcode contract (1-byte register operands per
-// `blackhole.py:107`).  All `*_pyre_u16` width adapters have been
+// `blackhole.py:107`).  All `*_u16_ext` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
 
 /// Per-thread Backend instance backing every `bh.cpu` call.
@@ -8304,7 +8304,7 @@ fn handler_residual_call_r_v(
 // `WasmBackend`. A narrower gate here leaves `bh.cpu` unset on wasm and
 // every vable handler trips `expect("cpu not set")`.
 #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
+pub fn production_cpu() -> &'static dyn majit_backend::Backend {
     // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
     // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs`)
     // which is itself a `thread_local!` — production blackhole resume
@@ -8333,19 +8333,19 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 /// DSL lowerer, `pyre-jit/src/jit/assembler.rs`) can emit: byte-
 /// identical canonical keys, single-byte register operands,
 /// audited residual_call / vable / state-field families, the pyre
-/// nested inline-call handler, and the `_pyre/P` adapters for
+/// nested inline-call handler, and the `_ext/P` adapters for
 /// `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
 /// `BC_RECORD_KNOWN_RESULT_*` (P10).  The dispatch loop has no legacy
 /// fallback; any emitted byte missing from this table reaches
 /// `dispatch_step`'s unwired-opcode panic.
 ///
 /// Initially registered:
-///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` ()
+///   - `inline_call_nested_ext/P` at `BC_INLINE_CALL` ()
 ///   - byte-identical canonical: `live/`, `loop_header/i`,
 ///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
 ///   - canonical-encoded: every `JitCodeBuilder`-emitted BC_*
 ///     now pushes 1-byte register operands matching the canonical
-///     RPython argcode contract; no `_pyre_u16` width adapters remain.
+///     RPython argcode contract; no `_u16_ext` width adapters remain.
 ///     The pyre-jit production thread-locals (`BH_BUILDER3`,
 ///     `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
 ///     shape.
@@ -8364,15 +8364,15 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // the residual_call (`bh_call_*`) prereq audit is pending.
     #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
     {
-        builder.cpu = Some(pyre_production_cpu());
+        builder.cpu = Some(production_cpu());
     }
     let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
     insns.insert(
-        "inline_call_pyre_nested/P".to_string(),
+        "inline_call_nested_ext/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,
     );
     // P10 — pyre call_assembler / cond_call / record_known_result
-    // adapters.  The `_pyre/P` suffix matches the inline_call adapter
+    // adapters.  The `_ext/P` suffix matches the inline_call adapter
     // pattern so wire_bhimpl_handlers binds the right handler and
     // strict dispatch resolves the byte without panic.  Producers:
     // `pyjitpl/dispatch.rs` (call_assembler), `majit-macros/
@@ -8380,39 +8380,39 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // jit/assembler.rs` (cond_call / record_known_result).
     for (key, byte) in [
         (
-            "call_assembler_int_pyre/P",
+            "call_assembler_int_ext/P",
             majit_translate::insns::BC_CALL_ASSEMBLER_INT,
         ),
         (
-            "call_assembler_ref_pyre/P",
+            "call_assembler_ref_ext/P",
             majit_translate::insns::BC_CALL_ASSEMBLER_REF,
         ),
         (
-            "call_assembler_float_pyre/P",
+            "call_assembler_float_ext/P",
             majit_translate::insns::BC_CALL_ASSEMBLER_FLOAT,
         ),
         (
-            "call_assembler_void_pyre/P",
+            "call_assembler_void_ext/P",
             majit_translate::insns::BC_CALL_ASSEMBLER_VOID,
         ),
         (
-            "cond_call_void_pyre/P",
+            "cond_call_void_ext/P",
             majit_translate::insns::BC_COND_CALL_VOID,
         ),
         (
-            "cond_call_value_int_pyre/P",
+            "cond_call_value_int_ext/P",
             majit_translate::insns::BC_COND_CALL_VALUE_INT,
         ),
         (
-            "cond_call_value_ref_pyre/P",
+            "cond_call_value_ref_ext/P",
             majit_translate::insns::BC_COND_CALL_VALUE_REF,
         ),
         (
-            "record_known_result_int_pyre/P",
+            "record_known_result_int_ext/P",
             majit_translate::insns::BC_RECORD_KNOWN_RESULT_INT,
         ),
         (
-            "record_known_result_ref_pyre/P",
+            "record_known_result_ref_ext/P",
             majit_translate::insns::BC_RECORD_KNOWN_RESULT_REF,
         ),
     ] {
@@ -8882,7 +8882,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // without these entries the bytes reach `dispatch_step`'s unwired panic
     // instead of their handler. Build-time (LLBC-extracted) jitcodes are the
     // only producer — the runtime `JitCodeBuilder` emits the pyre-only
-    // `inline_call_pyre_nested/P` byte instead — and any of them a
+    // `inline_call_nested_ext/P` byte instead — and any of them a
     // guard-failure resume forward-executes can reach one.
     //
     // A target whose path the host never published has no runtime address;
@@ -9260,10 +9260,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_add/ii>i", handler_int_add);
     builder.wire_handler("int_sub/ii>i", handler_int_sub);
     // pyre-only primitives — see handler comments for rationale.
-    builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign_pyre);
-    builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign_pyre);
-    builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
-    builder.wire_handler("abort/", handler_abort_marker_pyre);
+    builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign);
+    builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign);
+    builder.wire_handler("int_deref/i>i", handler_int_deref);
+    builder.wire_handler("abort/", handler_abort_marker);
 
     // pyre-only state_field family (no RPython counterpart). The handlers do
     // real work: they map a logical field/array index to its flat register
@@ -9737,44 +9737,35 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
     // TODO: pyre nested-bytecode `inline_call`.  See
-    // the comment on `handler_inline_call_pyre_nested` for rationale.
+    // the comment on `handler_inline_call_nested_ext` for rationale.
     // The canonical `inline_call_{r,ir,irf}_*` keys above are now pinned
     // in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
     // `insns.rs`'s `wellknown_bh_insns`) so their handlers dispatch through
     // `setup_insns`-built `_insns` like every other canonical opcode.
     // Byte 17 (`BC_INLINE_CALL`) sits below the canonical range and is
-    // exposed via the separate pyre-only `inline_call_pyre_nested/P`
-    // key in `pyre_extension_insns()` — the adapter shape that carries
+    // exposed via the separate pyre-only `inline_call_nested_ext/P`
+    // key in `extension_insns()` — the adapter shape that carries
     // pyre's nested-bytecode payload, distinct from the canonical
     // `dR`/`dIR`/`dIRF` arglists.
-    builder.wire_handler("inline_call_pyre_nested/P", handler_inline_call_pyre_nested);
+    builder.wire_handler("inline_call_nested_ext/P", handler_inline_call_nested_ext);
     // P10 — pyre call_assembler / cond_call / record_known_result adapter wiring.
-    builder.wire_handler("call_assembler_int_pyre/P", handler_call_assembler_int_pyre);
-    builder.wire_handler("call_assembler_ref_pyre/P", handler_call_assembler_ref_pyre);
+    builder.wire_handler("call_assembler_int_ext/P", handler_call_assembler_int_ext);
+    builder.wire_handler("call_assembler_ref_ext/P", handler_call_assembler_ref_ext);
     builder.wire_handler(
-        "call_assembler_float_pyre/P",
-        handler_call_assembler_float_pyre,
+        "call_assembler_float_ext/P",
+        handler_call_assembler_float_ext,
+    );
+    builder.wire_handler("call_assembler_void_ext/P", handler_call_assembler_void_ext);
+    builder.wire_handler("cond_call_void_ext/P", handler_cond_call_void_ext);
+    builder.wire_handler("cond_call_value_int_ext/P", handler_cond_call_value_int_ext);
+    builder.wire_handler("cond_call_value_ref_ext/P", handler_cond_call_value_ref_ext);
+    builder.wire_handler(
+        "record_known_result_int_ext/P",
+        handler_record_known_result_int_ext,
     );
     builder.wire_handler(
-        "call_assembler_void_pyre/P",
-        handler_call_assembler_void_pyre,
-    );
-    builder.wire_handler("cond_call_void_pyre/P", handler_cond_call_void_pyre);
-    builder.wire_handler(
-        "cond_call_value_int_pyre/P",
-        handler_cond_call_value_int_pyre,
-    );
-    builder.wire_handler(
-        "cond_call_value_ref_pyre/P",
-        handler_cond_call_value_ref_pyre,
-    );
-    builder.wire_handler(
-        "record_known_result_int_pyre/P",
-        handler_record_known_result_int_pyre,
-    );
-    builder.wire_handler(
-        "record_known_result_ref_pyre/P",
-        handler_record_known_result_ref_pyre,
+        "record_known_result_ref_ext/P",
+        handler_record_known_result_ref_ext,
     );
 
     // Recursive call (stub — needs portal runner)
@@ -11430,7 +11421,7 @@ fn handler_inline_call_r_v(
 /// The 4 handlers below are the line-by-line port of the legacy
 /// `dispatch_one::BC_CALL_ASSEMBLER_*` arms (pre-P8) into the
 /// strict-dispatch `(bh, code, position) -> Result<usize, _>` shape.
-fn handler_call_assembler_int_pyre(
+fn handler_call_assembler_int_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11453,7 +11444,7 @@ fn handler_call_assembler_int_pyre(
     Ok(p)
 }
 
-fn handler_call_assembler_ref_pyre(
+fn handler_call_assembler_ref_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11490,7 +11481,7 @@ fn handler_call_assembler_ref_pyre(
 /// tracing path; using `call_float_function` here would transmute the
 /// i64-returning concrete wrapper through an `extern "C" fn(...) -> f64`
 /// signature and break the ABI.
-fn handler_call_assembler_float_pyre(
+fn handler_call_assembler_float_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11513,7 +11504,7 @@ fn handler_call_assembler_float_pyre(
     Ok(p)
 }
 
-fn handler_call_assembler_void_pyre(
+fn handler_call_assembler_void_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11570,7 +11561,7 @@ fn read_cond_call_args(
     (args, regs_start + arg_count)
 }
 
-fn handler_cond_call_void_pyre(
+fn handler_cond_call_void_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11590,7 +11581,7 @@ fn handler_cond_call_void_pyre(
     Ok(p_end)
 }
 
-fn handler_cond_call_value_int_pyre(
+fn handler_cond_call_value_int_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11615,7 +11606,7 @@ fn handler_cond_call_value_int_pyre(
     Ok(p_end + 1)
 }
 
-fn handler_cond_call_value_ref_pyre(
+fn handler_cond_call_value_ref_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11632,7 +11623,7 @@ fn handler_cond_call_value_ref_pyre(
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // RPython `blackhole.py bhimpl_conditional_call_value_ir_r`
         // → `cpu.bh_call_r(...)` (ref ABI).  See note on
-        // `handler_call_assembler_ref_pyre`.
+        // `handler_call_assembler_ref_ext`.
         let r = call_ref_function(target.concrete_ptr, &args);
         check_residual_call_exception_after(bh, p_end + 1)?;
         r
@@ -11646,7 +11637,7 @@ fn handler_cond_call_value_ref_pyre(
 /// `bhimpl_record_known_result_*` body is `pass` — pure marker for
 /// the trace optimizer's known-result table.  Resume only advances
 /// past the operand bytes.
-fn handler_record_known_result_int_pyre(
+fn handler_record_known_result_int_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
@@ -11663,12 +11654,12 @@ fn handler_record_known_result_int_pyre(
     Ok(p)
 }
 
-fn handler_record_known_result_ref_pyre(
+fn handler_record_known_result_ref_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    handler_record_known_result_int_pyre(bh, code, p)
+    handler_record_known_result_int_ext(bh, code, p)
 }
 
 /// TODO: pyre nested-bytecode `inline_call`.
@@ -11689,14 +11680,14 @@ fn handler_record_known_result_ref_pyre(
 ///   `return_i: u8`, `return_r: u8`, `return_f: u8`
 /// `NO_RETURN_REG` in any return slot encodes "no caller destination".
 ///
-/// Registered via the pyre-only opname `inline_call_pyre_nested/P`
-/// in `pyre_extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
+/// Registered via the pyre-only opname `inline_call_nested_ext/P`
+/// in `extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
 /// keys are pinned in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
-/// `insns.rs`'s `wellknown_bh_insns`) — this `_pyre_nested/P` shape is a separate
+/// `insns.rs`'s `wellknown_bh_insns`) — this `_nested_ext/P` shape is a separate
 /// pyre-only adapter that carries the nested-bytecode payload layout
 /// described above, distinct from the canonical `dR`/`dIR`/`dIRF`
 /// arglist shapes the upstream walker dispatches.
-fn handler_inline_call_pyre_nested(
+fn handler_inline_call_nested_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,

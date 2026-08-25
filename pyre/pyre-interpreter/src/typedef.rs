@@ -5255,7 +5255,7 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// generated interp2app function graphs. Publishing the wrapper descriptor
 /// below gives pyre's source translator the same candidate graph and lets a
 /// traced `list.pop()` call descend to `w_list_pop_end_inner`.
-pub fn __pyre_wrap_list_descr_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_list_descr_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::list_method_pop(args)
 }
 
@@ -5264,8 +5264,12 @@ pub fn __pyre_wrap_list_descr_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, c
 #[allow(non_upper_case_globals)]
 static __majit_builtin_wrapper_target_list_descr_pop: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__pyre_wrap_list_descr_pop)),
-        func: __pyre_wrap_list_descr_pop,
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_pop)
+        ),
+        func: __majit_wrap_list_descr_pop,
     };
 
 /// Name of `obj`'s type, for operand-type error messages.
@@ -5407,7 +5411,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "pop",
-            make_builtin_function("pop", __pyre_wrap_list_descr_pop),
+            make_builtin_function("pop", __majit_wrap_list_descr_pop),
         )
     };
     unsafe {
@@ -18285,7 +18289,7 @@ fn int_cpython_digit_count(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
 /// function graphs. Publishing the wrapper descriptor below gives pyre's
 /// source translator the same candidate graph and lets a traced
 /// `int.bit_length()` call descend to `rbigint::bit_length_int`.
-pub fn __pyre_wrap_int_descr_bit_length(
+pub fn __majit_wrap_int_descr_bit_length(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     // `intobject.py descr_bit_length` — number of bits in the absolute
@@ -18313,9 +18317,9 @@ static __majit_builtin_wrapper_target_int_descr_bit_length:
     path: concat!(
         module_path!(),
         "::",
-        stringify!(__pyre_wrap_int_descr_bit_length)
+        stringify!(__majit_wrap_int_descr_bit_length)
     ),
-    func: __pyre_wrap_int_descr_bit_length,
+    func: __majit_wrap_int_descr_bit_length,
 };
 
 fn init_int_type(ns: PyObjectRef) {
@@ -18407,7 +18411,7 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "bit_length",
-            make_builtin_function_with_arity("bit_length", __pyre_wrap_int_descr_bit_length, 1),
+            make_builtin_function_with_arity("bit_length", __majit_wrap_int_descr_bit_length, 1),
         )
     };
     unsafe {
@@ -19452,7 +19456,7 @@ fn init_float_type(ns: PyObjectRef) {
             "as_integer_ratio",
             make_builtin_function_with_arity(
                 "as_integer_ratio",
-                __pyre_wrap_float_descr_as_integer_ratio,
+                __majit_wrap_float_descr_as_integer_ratio,
                 1,
             ),
         )
@@ -19802,7 +19806,7 @@ fn float_as_rbigint_ratio(value: f64) -> Result<(BigInt, BigInt), crate::PyError
 }
 
 /// Manual interp2app gateway for `float.as_integer_ratio`.
-pub fn __pyre_wrap_float_descr_as_integer_ratio(
+pub fn __majit_wrap_float_descr_as_integer_ratio(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     float_descr_as_integer_ratio(args)
@@ -19811,14 +19815,14 @@ pub fn __pyre_wrap_float_descr_as_integer_ratio(
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_float_descr_as_integer_ratio_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_float_descr_as_integer_ratio_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
         path: concat!(
             module_path!(),
             "::",
-            "__pyre_wrap_float_descr_as_integer_ratio"
+            "__majit_wrap_float_descr_as_integer_ratio"
         ),
-        func: __pyre_wrap_float_descr_as_integer_ratio,
+        func: __majit_wrap_float_descr_as_integer_ratio,
     };
 
 #[derive(Copy, Clone)]
@@ -20269,17 +20273,17 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
 }
 
 /// Manual interp2app gateway for `object.__new__`.
-pub fn __pyre_wrap_object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     object_descr_new(args)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __pyre_wrap_object_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
+static __majit_wrap_object_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__pyre_wrap_object_descr_new"),
-        func: __pyre_wrap_object_descr_new,
+        path: concat!(module_path!(), "::", "__majit_wrap_object_descr_new"),
+        func: __majit_wrap_object_descr_new,
     };
 
 /// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
@@ -20329,7 +20333,7 @@ fn init_object_type(ns: PyObjectRef) {
             ),
         )
     };
-    let object_new = make_new_descr(__pyre_wrap_object_descr_new);
+    let object_new = make_new_descr(__majit_wrap_object_descr_new);
     unsafe {
         // `make_new_descr` hands back the carrier itself, not a `staticmethod`
         // around it, so the text signature belongs on that object directly.
@@ -27229,7 +27233,7 @@ fn set_op_inplace_xor(
 /// candidate graph and lets the call descend to `w_set_add_hashed_checked`,
 /// the way upstream's tracer descends through `descr_add` into
 /// `W_BaseSetObject.add`.
-pub fn __pyre_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_set_receiver(args, "add", true)?;
     crate::type_methods::arity_exact(args, "add", 1)?;
     // `try_hash_value` may run a user `__hash__` that allocates and triggers
@@ -27259,8 +27263,8 @@ pub fn __pyre_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 #[allow(non_upper_case_globals)]
 static __majit_builtin_wrapper_target_set_descr_add: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__pyre_wrap_set_descr_add)),
-        func: __pyre_wrap_set_descr_add,
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_set_descr_add)),
+        func: __majit_wrap_set_descr_add,
     };
 
 fn init_set_type(ns: PyObjectRef) {
@@ -27313,7 +27317,7 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "add",
-            make_builtin_function_with_arity("add", __pyre_wrap_set_descr_add, 2),
+            make_builtin_function_with_arity("add", __majit_wrap_set_descr_add, 2),
         )
     };
     unsafe {

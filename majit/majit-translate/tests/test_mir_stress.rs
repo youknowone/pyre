@@ -3,7 +3,7 @@
 //!
 //! Skipped by default: the snapshot is 133 MB and not checked into git
 //! (regenerable via `scripts/extract-llbc.py`). Set
-//! `PYRE_MIR_STRESS_LLBC=path/to/file.ullbc` to enable, or use the
+//! `MAJIT_MIR_STRESS_LLBC=path/to/file.ullbc` to enable, or use the
 //! default path the extractor writes to.
 
 use majit_charon_reader::Llbc;
@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 fn stress_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("PYRE_MIR_STRESS_LLBC") {
+    if let Ok(p) = std::env::var("MAJIT_MIR_STRESS_LLBC") {
         return Some(PathBuf::from(p));
     }
     let default = PathBuf::from(concat!(
@@ -520,10 +520,10 @@ fn arm_classifier(llbc: &Llbc) -> String {
 /// on a live `Err(Unsupported)` population and three zeros on an empty one
 /// are different readings, and the tally alone cannot tell them apart.
 #[test]
-#[ignore = "diagnostic; set PYRE_MIR_STRESS_LLBC"]
+#[ignore = "diagnostic; set MAJIT_MIR_STRESS_LLBC"]
 fn classify_uninitialised_local_rpo_vs_loop_carried() {
     let Some(path) = stress_path() else {
-        eprintln!("skip: set PYRE_MIR_STRESS_LLBC");
+        eprintln!("skip: set MAJIT_MIR_STRESS_LLBC");
         return;
     };
     let llbc = Llbc::load(&path).expect("load stress llbc");
@@ -783,11 +783,11 @@ fn classify_unwind_chain(
 
 #[test]
 #[ignore = "requires the 205MB pyre-interpreter.ullbc snapshot; \
-            set PYRE_MIR_STRESS_LLBC"]
+            set MAJIT_MIR_STRESS_LLBC"]
 fn mir_on_unwind_target_taxonomy() {
     let Some(path) = stress_path() else {
         eprintln!(
-            "skip: set PYRE_MIR_STRESS_LLBC or run scripts/extract-llbc.py to make \
+            "skip: set MAJIT_MIR_STRESS_LLBC or run scripts/extract-llbc.py to make \
              build/llbc/pyre-interpreter.ullbc available"
         );
         return;
@@ -918,7 +918,7 @@ fn mir_on_unwind_target_taxonomy() {
 
 #[test]
 #[ignore = "requires the 205MB pyre-interpreter.ullbc snapshot; \
-            set PYRE_MIR_STRESS_LLBC"]
+            set MAJIT_MIR_STRESS_LLBC"]
 fn coverage_gate_accepts_the_real_snapshot() {
     // The fail-loud coverage gate in `build_semantic_program_from_llbc`
     // must return `Ok` over the real snapshot: every current lowering
@@ -927,7 +927,7 @@ fn coverage_gate_accepts_the_real_snapshot() {
     // unrecognised error, this builder returns `Err` and the build
     // (and this test) fails loudly instead of silently dropping the fn.
     let Some(path) = stress_path() else {
-        eprintln!("skip: set PYRE_MIR_STRESS_LLBC");
+        eprintln!("skip: set MAJIT_MIR_STRESS_LLBC");
         return;
     };
     let llbc = Llbc::load(&path).expect("load stress llbc");
@@ -960,14 +960,14 @@ fn coverage_gate_accepts_the_real_snapshot() {
 /// after the change, then `diff`: the expected delta is exactly the 15
 /// forward-ref fns flipping `FAIL`->hash, with zero hash->hash changes.
 #[test]
-#[ignore = "diagnostic; set PYRE_MIR_STRESS_LLBC"]
+#[ignore = "diagnostic; set MAJIT_MIR_STRESS_LLBC"]
 fn dump_lowering_signatures() {
     use majit_translate::model::{ExitSwitch, FunctionGraph, LinkArg};
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
 
     let Some(path) = stress_path() else {
-        eprintln!("skip: set PYRE_MIR_STRESS_LLBC");
+        eprintln!("skip: set MAJIT_MIR_STRESS_LLBC");
         return;
     };
     let llbc = Llbc::load(&path).expect("load stress llbc");

@@ -47,7 +47,7 @@ fn void_return() -> Vec<u8> {
     ]
 }
 
-/// The generated `__pyre_wrap_*` gateways all put their un-lowerable call — the
+/// The generated `__majit_wrap_*` gateways all put their un-lowerable call — the
 /// `#[dont_look_inside]` arity-error formatter — on the arm the argument-count
 /// check rejects into.  The walk is execution-driven, so a call with the right
 /// count never steps there; declining the wrapper for it refuses a body the
@@ -286,7 +286,9 @@ fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
         "`set.add` returns None, so the Void write proxy cannot see this store"
     );
     assert!(
-        super::residual_call::helper_kind_writes_live_heap(call_descr.get_extra_info().pyre_helper),
+        super::residual_call::helper_kind_writes_live_heap(
+            call_descr.get_extra_info().runtime_helper
+        ),
         "an untagged descr takes the insert out of the executed-effect odometer"
     );
 }
@@ -405,7 +407,7 @@ fn fresh_trace_ctx() -> TraceCtx {
 
 #[test]
 fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
-    let wrapper = named_jitcode("__pyre_wrap_random").expect("random builtin wrapper jitcode");
+    let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
     let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .next()
         .expect("wrapper first op");
@@ -437,7 +439,7 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 #[test]
 fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
-        named_jitcode("__pyre_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
+        named_jitcode("__majit_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
     let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .next()
         .expect("wrapper first op");
@@ -448,7 +450,7 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     // and read that instead.
     //
     // Spelled as the entry callee rather than as "op 0 is not an
-    // `inline_call_*`": no `__pyre_wrap_*` jitcode inline-calls the splitter
+    // `inline_call_*`": no `__majit_wrap_*` jitcode inline-calls the splitter
     // anywhere, so the negative form holds of every wrapper and separates
     // nothing, while the opcode form of op 0 only tracks which helpers the
     // codewriter is currently allowed to descend into.
@@ -13198,9 +13200,9 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
 /// residual the walk already ran concretely.
 #[test]
 fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
-    fn descr_for(pyre_helper: majit_ir::PyreHelperKind) -> DescrRef {
+    fn descr_for(runtime_helper: majit_ir::RuntimeHelperKind) -> DescrRef {
         let mut effect = majit_ir::EffectInfo::default();
-        effect.pyre_helper = pyre_helper;
+        effect.runtime_helper = runtime_helper;
         std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
             9,
             vec![Type::Ref, Type::Ref, Type::Ref, Type::Int],
@@ -13220,8 +13222,8 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         tc.const_ref(0xC0DE_2000),
         tc.const_int(2),
     ];
-    let load_global = descr_for(majit_ir::PyreHelperKind::LoadGlobal);
-    let untagged = descr_for(majit_ir::PyreHelperKind::None);
+    let load_global = descr_for(majit_ir::RuntimeHelperKind::LoadGlobal);
+    let untagged = descr_for(majit_ir::RuntimeHelperKind::None);
 
     let mut regs_i: Vec<OpRef> = Vec::new();
     let mut regs_r: Vec<OpRef> = Vec::new();
@@ -13294,9 +13296,9 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
 /// `raise` failed one guard 1786 times and compiled 0 bridges.
 #[test]
 fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
-    fn descr_for(pyre_helper: majit_ir::PyreHelperKind) -> DescrRef {
+    fn descr_for(runtime_helper: majit_ir::RuntimeHelperKind) -> DescrRef {
         let mut effect = majit_ir::EffectInfo::default();
-        effect.pyre_helper = pyre_helper;
+        effect.runtime_helper = runtime_helper;
         std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
             11,
             vec![Type::Ref, Type::Ref, Type::Ref],
@@ -13315,8 +13317,8 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
         tc.const_ref(0),
         tc.const_ref(0xC0DE_4000),
     ];
-    let with_except_start = descr_for(majit_ir::PyreHelperKind::WithExceptStart);
-    let untagged = descr_for(majit_ir::PyreHelperKind::None);
+    let with_except_start = descr_for(majit_ir::RuntimeHelperKind::WithExceptStart);
+    let untagged = descr_for(majit_ir::RuntimeHelperKind::None);
 
     let mut regs_i: Vec<OpRef> = Vec::new();
     let mut regs_r: Vec<OpRef> = Vec::new();
@@ -13392,7 +13394,7 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
 #[test]
 fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
     use super::residual_call::mayforce_null_ref_arg_is_checked_sentinel as is_sentinel;
-    use majit_ir::PyreHelperKind as K;
+    use majit_ir::RuntimeHelperKind as K;
 
     // (helper, nargs, the exempt indices)
     let table: &[(K, usize, &[usize])] = &[

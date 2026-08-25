@@ -66,14 +66,14 @@ pub struct CodeWriter {
     pub assembler: Assembler,
     /// RPython: `self.debug = True` (codewriter.py:18).
     pub debug: bool,
-    /// Lazy program-wide `PyreCallRegistry` for the
-    /// PYRE_RTYPER dual-gate (cf. `transform_graph_to_jitcode`).
+    /// Lazy program-wide `CallRegistry` for the
+    /// MAJIT_RTYPER dual-gate (cf. `transform_graph_to_jitcode`).
     /// Built on first use from `callcontrol.function_graphs()` and
     /// reused across every dual-gated graph in the same CodeWriter
     /// run, mirroring upstream `Bookkeeper.descs` lifecycle (one
     /// descs map per `Translator` driving an `RPythonAnnotator`).
     real_rtyper_registry: std::cell::RefCell<
-        Option<std::rc::Rc<crate::translator::rtyper::pyre_call_registry::PyreCallRegistry>>,
+        Option<std::rc::Rc<crate::translator::rtyper::call_registry::CallRegistry>>,
     >,
 }
 
@@ -116,8 +116,8 @@ impl CodeWriter {
         callcontrol.setup_vrefinfo(vrefinfo);
     }
 
-    /// Get-or-build the program-wide `PyreCallRegistry` for the
-    /// PYRE_RTYPER dual-gate.  Builds once per CodeWriter run and
+    /// Get-or-build the program-wide `CallRegistry` for the
+    /// MAJIT_RTYPER dual-gate.  Builds once per CodeWriter run and
     /// caches; subsequent calls reuse the same `Rc`.  The registry
     /// is populated from `callcontrol.function_graphs()` — pyre's
     /// program-wide graph map, the production analog of
@@ -125,30 +125,29 @@ impl CodeWriter {
     fn dual_gate_registry(
         &self,
         callcontrol: &CallControl,
-    ) -> std::rc::Rc<crate::translator::rtyper::pyre_call_registry::PyreCallRegistry> {
+    ) -> std::rc::Rc<crate::translator::rtyper::call_registry::CallRegistry> {
         if let Some(existing) = self.real_rtyper_registry.borrow().as_ref() {
             return existing.clone();
         }
-        let registry = std::rc::Rc::new(
-            crate::translator::rtyper::pyre_call_registry::PyreCallRegistry::new(std::rc::Rc::new(
-                crate::annotator::bookkeeper::Bookkeeper::new(),
-            )),
-        );
+        let registry =
+            std::rc::Rc::new(crate::translator::rtyper::call_registry::CallRegistry::new(
+                std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
+            ));
         // Thread the program-wide struct field shapes into the shared
         // bookkeeper so
-        // `getuniqueclassdef_for_struct_root` / `project_pyre_field_type`
+        // `getuniqueclassdef_for_struct_root` / `project_struct_field_type`
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
-        registry.set_pyre_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        registry.set_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
         // Enum `discriminant → variant` tables for the `__discriminant`
         // getattr's narrowing knowntypedata producer.
-        registry.set_pyre_enum_variant_by_discriminant(std::rc::Rc::new(
+        registry.set_enum_variant_by_discriminant(std::rc::Rc::new(
             callcontrol.enum_variant_by_discriminant().clone(),
         ));
         // Trait → unique-impl owner map for the generic-receiver seed
         // path (`derive_subject_inputcells` resolves a bound-trait
         // `class_root` through it before the struct-root lookup).
-        registry.set_pyre_trait_unique_impls(callcontrol.trait_unique_impls().clone());
+        registry.set_trait_unique_impls(callcontrol.trait_unique_impls().clone());
         // Opt-in receiver-driven dispatch families (issue #346): mint
         // each registered trait's base ClassDef + impl subclasses BEFORE
         // `seed_struct_root_method_members` below, so the method seeding
@@ -162,7 +161,7 @@ impl CodeWriter {
         // through `is_known_unported`.  Known-unported categories
         // leave a partial registry (the per-graph dual-gate will
         // Skip-classify the affected callsites via the cascade
-        // `"not registered in PyreCallRegistry"`).  Unknown errors
+        // `"not registered in CallRegistry"`).  Unknown errors
         // panic immediately so parity bugs surface here rather than
         // silently shifting downstream behind a Skip mask.
         // Metadata-only stubs for `unsafe fn` callees that
@@ -202,8 +201,8 @@ impl CodeWriter {
         // `Translator.buildrtyper()` (`translator.py`) construct
         // exactly one annotator and one rtyper per Translator and assert
         // on re-entry.  Pyre mirrors that contract through
-        // [`PyreCallRegistry::ensure_session`]
-        // (in `pyre_call_registry.rs`), which lazily builds a single
+        // [`CallRegistry::ensure_session`]
+        // (in `call_registry.rs`), which lazily builds a single
         // `(RPythonAnnotator, RPythonTyper)` pair on first use and
         // returns the cached pair on every subsequent
         // `specialize_legacy_graph_with_registry_returning_value_to_var`
@@ -288,7 +287,7 @@ impl CodeWriter {
     /// let the codewriter consume the rtyper's `Variable` graph directly.
     ///
     /// Run the dual-gate type resolver against the program-wide
-    /// `PyreCallRegistry` and commit every resolved kind to the graph's backing
+    /// `CallRegistry` and commit every resolved kind to the graph's backing
     /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
     /// post-jtransform operands can be rebound to typed variables. A Skip runs
     /// the legacy annotator and resolver, commits their kinds, and returns
@@ -369,9 +368,9 @@ impl CodeWriter {
                 Some(real_value_to_var)
             }
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
-                if std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1") {
+                if std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|v| v == "1") {
                     eprintln!(
-                        "[PYRE_RTYPER skip] graph {diag_label:?} ({:?}): {reason}",
+                        "[MAJIT_RTYPER skip] graph {diag_label:?} ({:?}): {reason}",
                         graph.name,
                     );
                 }
@@ -426,7 +425,7 @@ impl CodeWriter {
                 None
             }
             Err(diff) => panic!(
-                "PYRE_RTYPER real-path failure on graph {diag_label:?} ({:?}): {diff}",
+                "MAJIT_RTYPER real-path failure on graph {diag_label:?} ({:?}): {diff}",
                 graph.name,
             ),
         }
@@ -933,7 +932,7 @@ impl CodeWriter {
         // RPython's enum_pending_graphs() pops from unfinished_graphs (LIFO).
         // During transform, new graphs may be discovered and added via
         // get_jitcode(). We pop one at a time to match RPython's yield semantics.
-        let profile = std::env::var_os("PYRE_PROFILE_DRAIN").is_some();
+        let profile = std::env::var_os("MAJIT_PROFILE_DRAIN").is_some();
         let mut drain_count = 0usize;
         let drain_start = std::time::Instant::now();
         loop {
@@ -966,7 +965,7 @@ impl CodeWriter {
                     let elapsed = iter_start.elapsed().as_secs_f64();
                     if elapsed >= 0.5 {
                         eprintln!(
-                            "[PYRE_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
+                            "[MAJIT_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
                             drain_count, elapsed, jitcode.name,
                         );
                     }
@@ -1024,7 +1023,7 @@ impl CodeWriter {
                 let elapsed = iter_start.elapsed().as_secs_f64();
                 if elapsed >= 0.5 {
                     eprintln!(
-                        "[PYRE_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
+                        "[MAJIT_PROFILE_DRAIN] graph #{:>3} {:>7.3}s name={}",
                         drain_count, elapsed, jitcode.name,
                     );
                 }
@@ -1032,7 +1031,7 @@ impl CodeWriter {
         }
         if profile {
             eprintln!(
-                "[PYRE_PROFILE_DRAIN] DRAIN TOTAL {:>7.3}s  {} graphs",
+                "[MAJIT_PROFILE_DRAIN] DRAIN TOTAL {:>7.3}s  {} graphs",
                 drain_start.elapsed().as_secs_f64(),
                 drain_count,
             );

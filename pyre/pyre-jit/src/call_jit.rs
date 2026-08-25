@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::sync::Once;
 
-/// Whether `PYRE_NBODY_DEBUG` is set, cached at first access.
+/// Whether `MAJIT_NBODY_DEBUG` is set, cached at first access.
 ///
 /// `std::env::var_os` acquires a global env lock on every call. Caching
 /// here matches the equivalent helpers in `majit-backend-cranelift` and
@@ -16,7 +16,7 @@ use std::sync::Once;
 /// and are not part of PyPy.
 fn pyre_nbody_debug_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_NBODY_DEBUG").is_some());
     *ENABLED
 }
 
@@ -7650,7 +7650,7 @@ mod tests_bh_normalize_raise {
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
         let callable = pyre_interpreter::make_builtin_function(
             "len",
-            pyre_interpreter::builtins::__pyre_wrap_builtin_len,
+            pyre_interpreter::builtins::__majit_wrap_builtin_len,
         );
         let code = compile_exec("").expect("empty module should compile");
         let frame = pyre_interpreter::PyFrame::new(code);

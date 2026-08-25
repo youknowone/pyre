@@ -131,7 +131,7 @@ static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 // call it — a residual target whose real signature is not the uniform
 // `(i64…) -> i64` traps. The compiled trace already round-trips such calls
 // through the host (`env.jit_call`); this routes the recording / blackhole
-// path through the symmetric `pyre_jit.jit_call_host` import, which reflects
+// path through the symmetric `majit_host.jit_call_host` import, which reflects
 // the callee's wasm signature and coerces each positional argument.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
@@ -147,7 +147,7 @@ mod residual_host {
     const MAX_ARGS: usize = 16;
     const SCRATCH_LEN: usize = CALL_ARGS_OFS + MAX_ARGS * 8;
 
-    #[link(wasm_import_module = "pyre_jit")]
+    #[link(wasm_import_module = "majit_host")]
     unsafe extern "C" {
         fn jit_call_host(frame_ptr: u32);
     }

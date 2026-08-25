@@ -20,7 +20,7 @@
 //!
 //! The test constructs a **minimal synthetic** dispatch graph (no
 //! pyre-interpreter source dependency) so the parity claim is isolated
-//! to BFS + policy interaction. The broader `test_pyre_find_all_graphs`
+//! to BFS + policy interaction. The broader `test_find_all_graphs`
 //! already covers the integration path on the real handler corpus.
 
 use majit_translate::{
@@ -244,7 +244,7 @@ fn find_all_graphs_leaves_unregistered_targets_as_residual() {
     // (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …) so
     // those functions become residual calls even when the BFS would
     // otherwise follow them. Pyre uses a different but structurally
-    // equivalent mechanism: the `PYRE_JIT_GRAPH_MODULES` whitelist plus
+    // equivalent mechanism: the `JIT_GRAPH_MODULES` whitelist plus
     // `register_function_graph` plays the "allowed module" role, and an
     // unregistered callee is treated as residual by construction —
     // `find_all_graphs_bfs` at `call.rs` only pulls a callee into

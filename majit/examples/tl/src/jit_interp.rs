@@ -190,7 +190,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         // after the shared `pc += 1` below and before the arm's own operand
         // advance at `pc += 1` inside `ROLL`, so the resume position names
         // `ROLL`'s operand byte rather than an opcode boundary:
-        // `PYRE_PORTAL_RCA=1` reports `resume_pc=10 compiled_key=None` where
+        // `MAJIT_PORTAL_RCA=1` reports `resume_pc=10 compiled_key=None` where
         // `ROLL, 2` occupies pc 9–10, against `resume_pc=3` with a real
         // `compiled_key` on the `ROLL`-free control.
         //

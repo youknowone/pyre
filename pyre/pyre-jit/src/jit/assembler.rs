@@ -154,7 +154,7 @@ impl Assembler {
     /// is dropped instead of appended.
     ///
     /// Seeding is sound because the bytes are not allocated here — they come
-    /// from the fixed `wellknown_bh_insns` / `pyre_extension_insns` tables, so
+    /// from the fixed `wellknown_bh_insns` / `extension_insns` tables, so
     /// the build-time and runtime spellings of an opname already agree on a
     /// byte; the map only records which opnames exist.
     pub fn resuming_build_time_liveness() -> Self {

@@ -27,7 +27,7 @@ pub const BC_GOTO: u8 = insns::BC_JUMP;
 // — the import-path sweep is slice #86e.
 pub(crate) use majit_translate::insns::insn_byte;
 
-pub use majit_translate::insns::{pyre_extension_insns, wellknown_bh_insns};
+pub use majit_translate::insns::{extension_insns, wellknown_bh_insns};
 
 /// Re-export of the canonical `enumerate_vars` function so existing
 /// metainterp callers can keep using `crate::jitcode::enumerate_vars`.
@@ -680,9 +680,9 @@ mod tests {
         // keys (`blackhole.py:1258-1296` + `:621-630`) are pinned at the
         // distinct bytes [`BC_CONDITIONAL_CALL_*`] / [`BC_RECORD_KNOWN_RESULT_*`].
         // The pyre-only helper-side proc-macro adapter keys
-        // `cond_call_*_pyre/P` / `record_known_result_*_pyre/P` reuse the
+        // `cond_call_*_ext/P` / `record_known_result_*_ext/P` reuse the
         // legacy [`BC_COND_CALL_*`] / [`BC_RECORD_KNOWN_RESULT_*`] bytes
-        // (`pyre_extension_insns()`).  The two byte ranges must stay
+        // (`extension_insns()`).  The two byte ranges must stay
         // disjoint so the canonical and adapter forms cannot collide on
         // dispatch.
         assert_eq!(
@@ -720,8 +720,8 @@ mod tests {
         // Canonical `inline_call_*/d{R,IR,IRF}>{i,r,v,f}` keys live in
         // `wellknown_bh_insns()` with their own distinct `BC_*` bytes
         // (187-194); the pyre-only nested-bytecode adapter
-        // `inline_call_pyre_nested/P` reuses `BC_INLINE_CALL = 17` and is
-        // quarantined in `pyre_extension_insns()`.  The two byte ranges
+        // `inline_call_nested_ext/P` reuses `BC_INLINE_CALL = 17` and is
+        // quarantined in `extension_insns()`.  The two byte ranges
         // are disjoint, so they cannot collide on dispatch.
         assert!(insns.contains_key("inline_call_ir_r/dIR>r"));
         assert!(insns.contains_key("inline_call_irf_f/dIRF>f"));
@@ -803,21 +803,21 @@ mod tests {
         );
     }
 
-    /// The `pyre_extension_insns()` quarantine holds 8 keys arising from
+    /// The `extension_insns()` quarantine holds 8 keys arising from
     /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
     /// state addressing (6), plus 3 more pyre-only
-    /// keys — `inline_call_pyre_nested/P` (nested-bytecode `inline_call`
+    /// keys — `inline_call_nested_ext/P` (nested-bytecode `inline_call`
     /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
     /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
-    /// reification) — so the `pyre_extension_insns()` table now holds 11
+    /// reification) — so the `extension_insns()` table now holds 11
     /// entries total.  `wellknown_bh_insns()` is a strict
     /// subset of RPython's canonical opname universe; `insn_byte` merges both
     /// tables so build-time `write_insn(...)` callers continue to resolve
     /// unchanged.
     #[test]
-    fn pyre_extension_insns_quarantines_pyre_only_keys_out_of_wellknown() {
+    fn extension_insns_quarantines_runtime_keys_out_of_wellknown() {
         let wellknown = wellknown_bh_insns();
-        let extension = pyre_extension_insns();
+        let extension = extension_insns();
 
         let pairs = [
             // Borrow-checker abort signals.
@@ -831,7 +831,7 @@ mod tests {
             ("load_state_array/dii", insns::BC_LOAD_STATE_ARRAY),
             ("store_state_array/dii", insns::BC_STORE_STATE_ARRAY),
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
-            ("inline_call_pyre_nested/P", insns::BC_INLINE_CALL),
+            ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.
             ("abort/>r", majit_translate::insns::BC_ABORT_RESULT_R),
             // dyn-trait method pointer reification (backend epic).
@@ -844,13 +844,13 @@ mod tests {
         for (key, expected_byte) in pairs {
             assert!(
                 !wellknown.contains_key(key),
-                "{key} must be quarantined in pyre_extension_insns(), not \
+                "{key} must be quarantined in extension_insns(), not \
                  wellknown_bh_insns()",
             );
             assert_eq!(
                 extension.get(key),
                 Some(&expected_byte),
-                "{key} must be present in pyre_extension_insns() with the \
+                "{key} must be present in extension_insns() with the \
                  fixed BC_* byte",
             );
             assert_eq!(

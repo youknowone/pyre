@@ -85,7 +85,7 @@ pub(crate) fn rewire_option_try_call_sites(
             Ok(()) => stats.rewritten += 1,
             Err(decline) => {
                 stats.declined += 1;
-                if std::env::var_os("PYRE_MIR_FRONTEND_DEBUG").is_some() {
+                if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
                     eprintln!(
                         "[option_try] {} decline at {:?}: {decline}",
                         graph.name, site.branch_result_var
@@ -431,7 +431,7 @@ fn verify_break_arm_is_return_none(
         ));
     };
     // An unregistered `from_residual` returns an opaque `Ref` the MIR narrows
-    // to the concrete `Option<T>` via pure `__pyre_cast_instance` recasts (the
+    // to the concrete `Option<T>` via pure `__cast_instance_intrinsic` recasts (the
     // same trailing-recast shape `front::iter_next` peels behind an
     // unregistered `next`).  Peel them so the recognized set covers the recast
     // ops and the None-return forwarding traces the narrowed result.

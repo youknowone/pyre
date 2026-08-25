@@ -152,7 +152,7 @@ pub fn option_question_mark(keep: bool, value: i64, addend: i64) -> Option<i64> 
 // 8. Header-first object model
 //
 //   1. `(*w).ob_type` off a `*mut ObjectHeader` — a `FieldRead` preceded by
-//      a `__pyre_cast_instance/<Root>` narrow, not a classdef-less read.
+//      a `__cast_instance_intrinsic/<Root>` narrow, not a classdef-less read.
 //   2. `lltype::malloc_typed(Leaf { ob_header: .., payload })` — one
 //      by-value argument, header written before the call, so
 //      `fuse_boxing_alloc` mints `NewWithVtable` with a real vtable.
@@ -226,10 +226,10 @@ pub mod lltype {
 /// Minimal stand-in for the class-instantiation lookup whose result the
 /// class word is stored from.
 ///
-/// `model.rs`'s `get_instantiate_arg_addr` matches the three-segment path
-/// suffix `["pyre_object", "pyobject", "get_instantiate"]` literally, so any
+/// `model.rs`'s `get_instantiate_arg_addr` matches the two-segment path
+/// suffix `["pyobject", "get_instantiate"]` literally, so any
 /// other spelling would not exercise that recognizer.
-pub mod pyre_object {
+pub mod runtime_object {
     pub mod pyobject {
         use crate::ClassObject;
 
@@ -253,7 +253,7 @@ pub fn w_new_int(x: i64) -> *mut W_IntObject {
     lltype::malloc_typed(W_IntObject {
         ob_header: ObjectHeader {
             ob_type: &INT_CLASS,
-            w_class: pyre_object::pyobject::get_instantiate(&INT_CLASS),
+            w_class: runtime_object::pyobject::get_instantiate(&INT_CLASS),
         },
         intval: x,
     })
