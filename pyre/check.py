@@ -4768,22 +4768,25 @@ def main():
     backends = args.backends
 
     # Once per run, before any backend is measured: the check is over the tree,
-    # not over a backend, and every backend reads the same offsets.
+    # not over a backend.
     #
-    # A positional binary names one built somewhere else, so `build/llbc/` was
-    # not among its inputs and says nothing about it — the reason
-    # `require_fresh_artefacts` skips its stamp on the same argument. An
-    # external wasm runner is the exception, but only while the module it loads
-    # is this tree's, because building that module is what reads the LLBC: a
-    # `PYRE_WASM_MODULE` naming one built elsewhere leaves neither artefact
-    # described by these offsets, and refusing that pair would contradict the
-    # arm below, which stamps such a module instead of rejecting it. A module
-    # that does not exist answers False here and is left to the existence check
-    # below, which says far more about it than a stale-LLBC message would.
-    local_wasm_only = backends == ["wasm"] and same_file(
-        effective_wasm_module(), WASM_MODULE_PATH
-    )
-    if args.no_build and (not args.pyre_path or local_wasm_only):
+    # The offsets in `build/llbc/` describe an artefact only if that artefact
+    # was built from them, so the question is per leg and it is about the thing
+    # the leg *executes*. For a native backend that is the binary, and a
+    # positional one names a binary built somewhere else — the reason
+    # `require_fresh_artefacts` skips its stamp on the same argument. For wasm
+    # it is the module, not the binary: `pyre-wasm-runner` has no build.rs and
+    # no pyre dependency, so the host carries no generated offset and an
+    # external one changes nothing, while `PYRE_WASM_MODULE` can point the run
+    # at a module built elsewhere. A module that does not exist answers
+    # `same_file` False and is left to the existence check below, which says
+    # far more about it than a stale-LLBC message would.
+    def leg_reads_local_llbc(backend):
+        if backend == "wasm":
+            return same_file(effective_wasm_module(), WASM_MODULE_PATH)
+        return not args.pyre_path
+
+    if args.no_build and any(leg_reads_local_llbc(b) for b in backends):
         require_fresh_llbc()
 
     for backend in backends:
