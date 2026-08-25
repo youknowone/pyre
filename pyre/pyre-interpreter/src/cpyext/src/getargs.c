@@ -661,3 +661,377 @@ int PyArg_UnpackTuple(PyObject *args, const char *name,
     va_end(va);
     return 1;
 }
+
+/* --- the `_PyArg_Parser` API ------------------------------------------- */
+
+/* `getargs.c scan_keywords`: the leading empty names are the positional-only
+   parameters, and one appearing later is a table nobody can look a keyword up
+   in. */
+static int scan_keywords(const char * const *keywords, int *ptotal, int *pposonly)
+{
+    int i;
+    for (i = 0; keywords[i] && !*keywords[i]; i++) {
+    }
+    *pposonly = i;
+
+    for (; keywords[i]; i++) {
+        if (!*keywords[i]) {
+            PyErr_SetString(PyExc_SystemError, "Empty keyword parameter name");
+            return -1;
+        }
+    }
+    *ptotal = i;
+    return 0;
+}
+
+/* `getargs.c new_kwtuple`: the names past the positional-only ones, interned
+   so that the lookup below is nearly always the pointer comparison. */
+static PyObject *_PyPyre_NewKwtuple(const char * const *keywords, int total, int pos)
+{
+    int nkw = total - pos;
+    PyObject *kwtuple = PyTuple_New(nkw);
+    if (kwtuple == NULL) {
+        return NULL;
+    }
+    keywords += pos;
+    for (int i = 0; i < nkw; i++) {
+        PyObject *str = PyUnicode_InternFromString(keywords[i]);
+        if (str == NULL) {
+            Py_DECREF(kwtuple);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(kwtuple, i, str);
+    }
+    return kwtuple;
+}
+
+/* The name an error message calls the parser's function, and the `;` message
+   that replaces the whole of one.  A format carries both after its units, and
+   a parser Clinic wrote carries `fname` already. */
+static void _PyPyre_ParserNames(const char *format, const char **pfname,
+                                const char **pcustommsg)
+{
+    const char *fname = strchr(format, ':');
+    if (fname != NULL) {
+        *pfname = fname + 1;
+        *pcustommsg = NULL;
+        return;
+    }
+    const char *custommsg = strchr(format, ';');
+    *pfname = NULL;
+    *pcustommsg = custommsg != NULL ? custommsg + 1 : NULL;
+}
+
+#define _PyPyre_ONCE_INITIALIZED 2
+
+/* `getargs.c parser_init` behind `_PyOnceFlag_CallOnce`: work the keyword
+   table out once, and let a call that failed be retried by the next one.
+   Every Python thread runs under one lock, so the flag orders the parsers a
+   thread hands off rather than two threads racing inside one. */
+static int parser_init(struct _PyArg_Parser *parser)
+{
+    if (__atomic_load_n(&parser->once.v, __ATOMIC_ACQUIRE)
+            == _PyPyre_ONCE_INITIALIZED) {
+        return 0;
+    }
+
+    const char * const *keywords = parser->keywords;
+    if (keywords == NULL) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+
+    int len, pos;
+    if (scan_keywords(keywords, &len, &pos) < 0) {
+        return -1;
+    }
+
+    const char *fname = parser->fname, *custommsg = NULL;
+    if (parser->format != NULL) {
+        _PyPyre_ParserNames(parser->format, &fname, &custommsg);
+    }
+
+    PyObject *kwtuple = parser->kwtuple;
+    int owned = 0;
+    if (kwtuple == NULL) {
+        kwtuple = _PyPyre_NewKwtuple(keywords, len, pos);
+        if (kwtuple == NULL) {
+            return -1;
+        }
+        owned = 1;
+    }
+
+    parser->pos = pos;
+    parser->fname = fname;
+    parser->custom_msg = custommsg;
+    parser->kwtuple = kwtuple;
+    parser->is_kwtuple_owned = owned;
+    __atomic_store_n(&parser->once.v, _PyPyre_ONCE_INITIALIZED, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* `getargs.c find_keyword`: a keyword's value out of a vectorcall's name
+   tuple.  Both keys are interned, so the first pass finds nearly every one;
+   the second is for the caller that passed a name it built itself. */
+static PyObject *find_keyword(PyObject *kwnames, PyObject *const *kwstack,
+                              PyObject *key)
+{
+    Py_ssize_t nkwargs = PyTuple_GET_SIZE(kwnames);
+    for (Py_ssize_t i = 0; i < nkwargs; i++) {
+        if (PyTuple_GET_ITEM(kwnames, i) == key) {
+            return Py_NewRef(kwstack[i]);
+        }
+    }
+    for (Py_ssize_t i = 0; i < nkwargs; i++) {
+        int equal = PyObject_RichCompareBool(PyTuple_GET_ITEM(kwnames, i), key, Py_EQ);
+        if (equal < 0) {
+            return NULL;
+        }
+        if (equal) {
+            return Py_NewRef(kwstack[i]);
+        }
+    }
+    return NULL;
+}
+
+/* `getargs.c error_unexpected_keyword_arg`: name the keyword that belongs to
+   no parameter.  Reached only once a count has already ruled the call out, so
+   one of the names below is always the offending one. */
+static void _PyPyre_ErrorUnexpectedKeyword(PyObject *kwargs, PyObject *kwnames,
+                                           PyObject *kwtuple, const char *fname)
+{
+    Py_ssize_t j = 0;
+    while (1) {
+        PyObject *keyword;
+        if (kwargs != NULL) {
+            if (!PyDict_Next(kwargs, &j, &keyword, NULL)) {
+                break;
+            }
+        }
+        else {
+            if (j >= PyTuple_GET_SIZE(kwnames)) {
+                break;
+            }
+            keyword = PyTuple_GET_ITEM(kwnames, j);
+            j++;
+        }
+        if (!PyUnicode_Check(keyword)) {
+            PyErr_SetString(PyExc_TypeError, "keywords must be strings");
+            return;
+        }
+        int match = PySequence_Contains(kwtuple, keyword);
+        if (match < 0) {
+            return;
+        }
+        if (!match) {
+            PyErr_Format(PyExc_TypeError,
+                         "%.200s%s got an unexpected keyword argument '%S'",
+                         (fname == NULL) ? "this function" : fname,
+                         (fname == NULL) ? "" : "()",
+                         keyword);
+            return;
+        }
+    }
+    /* Extraneous keywords, and none of them is the one -- which the counts
+       above already proved cannot happen; say so without naming a name. */
+    PyErr_Format(PyExc_TypeError, "invalid keyword argument for %.200s%s",
+                 (fname == NULL) ? "this function" : fname,
+                 (fname == NULL) ? "" : "()");
+}
+
+#undef _PyArg_UnpackKeywords
+
+PyObject * const *_PyArg_UnpackKeywords(PyObject *const *args, Py_ssize_t nargs,
+                                        PyObject *kwargs, PyObject *kwnames,
+                                        struct _PyArg_Parser *parser,
+                                        int minpos, int maxpos, int minkw,
+                                        int varpos, PyObject **buf)
+{
+    PyObject *kwtuple;
+    PyObject *keyword;
+    int i, posonly, minposonly, maxargs;
+    int reqlimit = minkw ? maxpos + minkw : minpos;
+    Py_ssize_t nkwargs;
+    PyObject * const *kwstack = NULL;
+
+    if (parser == NULL) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    if (kwnames != NULL && !PyTuple_Check(kwnames)) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    if (args == NULL && nargs == 0) {
+        args = buf;
+    }
+    if (parser_init(parser) < 0) {
+        return NULL;
+    }
+
+    kwtuple = parser->kwtuple;
+    posonly = parser->pos;
+    minposonly = Py_MIN(posonly, minpos);
+    maxargs = posonly + (int)PyTuple_GET_SIZE(kwtuple);
+
+    if (kwargs != NULL) {
+        nkwargs = PyDict_GET_SIZE(kwargs);
+    }
+    else if (kwnames != NULL) {
+        nkwargs = PyTuple_GET_SIZE(kwnames);
+        kwstack = args + nargs;
+    }
+    else {
+        nkwargs = 0;
+    }
+    if (nkwargs == 0 && minkw == 0 && minpos <= nargs && (varpos || nargs <= maxpos)) {
+        /* Fast path. */
+        return args;
+    }
+    if (!varpos && nargs + nkwargs > maxargs) {
+        /* Saying "keyword" when nargs == 0 keeps the count from reading as a
+           bound on positional arguments the callable does not take. */
+        PyErr_Format(PyExc_TypeError,
+                     "%.200s%s takes at most %d %sargument%s (%zd given)",
+                     (parser->fname == NULL) ? "function" : parser->fname,
+                     (parser->fname == NULL) ? "" : "()",
+                     maxargs,
+                     (nargs == 0) ? "keyword " : "",
+                     (maxargs == 1) ? "" : "s",
+                     nargs + nkwargs);
+        return NULL;
+    }
+    if (!varpos && nargs > maxpos) {
+        if (maxpos == 0) {
+            PyErr_Format(PyExc_TypeError,
+                         "%.200s%s takes no positional arguments",
+                         (parser->fname == NULL) ? "function" : parser->fname,
+                         (parser->fname == NULL) ? "" : "()");
+        }
+        else {
+            PyErr_Format(PyExc_TypeError,
+                         "%.200s%s takes %s %d positional argument%s (%zd given)",
+                         (parser->fname == NULL) ? "function" : parser->fname,
+                         (parser->fname == NULL) ? "" : "()",
+                         (minpos < maxpos) ? "at most" : "exactly",
+                         maxpos,
+                         (maxpos == 1) ? "" : "s",
+                         nargs);
+        }
+        return NULL;
+    }
+    if (nargs < minposonly) {
+        PyErr_Format(PyExc_TypeError,
+                     "%.200s%s takes %s %d positional argument%s (%zd given)",
+                     (parser->fname == NULL) ? "function" : parser->fname,
+                     (parser->fname == NULL) ? "" : "()",
+                     (varpos || minposonly < maxpos) ? "at least" : "exactly",
+                     minposonly,
+                     minposonly == 1 ? "" : "s",
+                     nargs);
+        return NULL;
+    }
+
+    if (varpos) {
+        nargs = Py_MIN(maxpos, nargs);
+    }
+    /* copy tuple args */
+    for (i = 0; i < nargs; i++) {
+        buf[i] = args[i];
+    }
+
+    /* copy keyword args using kwtuple to drive process */
+    for (i = Py_MAX((int)nargs, posonly); i < maxargs; i++) {
+        PyObject *current_arg;
+        if (nkwargs) {
+            keyword = PyTuple_GET_ITEM(kwtuple, i - posonly);
+            if (kwargs != NULL) {
+                if (PyDict_GetItemRef(kwargs, keyword, &current_arg) < 0) {
+                    return NULL;
+                }
+            }
+            else {
+                current_arg = find_keyword(kwnames, kwstack, keyword);
+                if (current_arg == NULL && PyErr_Occurred()) {
+                    return NULL;
+                }
+            }
+        }
+        else if (i >= reqlimit) {
+            break;
+        }
+        else {
+            current_arg = NULL;
+        }
+
+        buf[i] = current_arg;
+
+        if (current_arg) {
+            Py_DECREF(current_arg);
+            --nkwargs;
+        }
+        else if (i < minpos || (maxpos <= i && i < reqlimit)) {
+            /* Less arguments than required */
+            keyword = PyTuple_GET_ITEM(kwtuple, i - posonly);
+            PyErr_Format(PyExc_TypeError,
+                         "%.200s%s missing required argument '%U' (pos %d)",
+                         (parser->fname == NULL) ? "function" : parser->fname,
+                         (parser->fname == NULL) ? "" : "()",
+                         keyword, i + 1);
+            return NULL;
+        }
+    }
+
+    if (nkwargs > 0) {
+        /* make sure there are no arguments given by name and position */
+        for (i = posonly; i < nargs; i++) {
+            PyObject *current_arg;
+            keyword = PyTuple_GET_ITEM(kwtuple, i - posonly);
+            if (kwargs != NULL) {
+                if (PyDict_GetItemRef(kwargs, keyword, &current_arg) < 0) {
+                    return NULL;
+                }
+            }
+            else {
+                current_arg = find_keyword(kwnames, kwstack, keyword);
+                if (current_arg == NULL && PyErr_Occurred()) {
+                    return NULL;
+                }
+            }
+            if (current_arg) {
+                Py_DECREF(current_arg);
+                PyErr_Format(PyExc_TypeError,
+                             "argument for %.200s%s given by name ('%U') "
+                             "and position (%d)",
+                             (parser->fname == NULL) ? "function" : parser->fname,
+                             (parser->fname == NULL) ? "" : "()",
+                             keyword, i + 1);
+                return NULL;
+            }
+        }
+
+        _PyPyre_ErrorUnexpectedKeyword(kwargs, kwnames, kwtuple, parser->fname);
+        return NULL;
+    }
+
+    return buf;
+}
+
+/* `getargs.c _PyArg_ParseTupleAndKeywordsFast`: the parser carries the format
+   and the keyword table the variadic entry point is handed separately, and
+   the walk over them is the same one. */
+int _PyArg_ParseTupleAndKeywordsFast(PyObject *args, PyObject *kwargs,
+                                     struct _PyArg_Parser *parser, ...)
+{
+    if (parser == NULL || parser->format == NULL || parser->keywords == NULL) {
+        PyErr_BadInternalCall();
+        return 0;
+    }
+    va_list va;
+    va_start(va, parser);
+    int parsed = _PyPyre_VaParse(args, kwargs, parser->format,
+                                 (PY_CXX_CONST char *const *)parser->keywords,
+                                 &va, NULL);
+    va_end(va);
+    return parsed;
+}

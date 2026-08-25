@@ -39,6 +39,7 @@ pub mod longobject;
 pub mod mapping;
 pub mod methodobject;
 pub mod modsupport;
+pub mod namespaceobject;
 pub mod number;
 pub mod object;
 pub mod osmodule;
@@ -848,6 +849,7 @@ pub fn ensure_linked() {
     pystrtod::ensure_linked();
     pythonrun::ensure_linked();
     pytime::ensure_linked();
+    namespaceobject::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
     cdatetime::ensure_linked();

@@ -6,7 +6,9 @@
  *
  * An export a hand-written header renames to an inline fast path is
  * left out: that header declares it ahead of the rename, which a
- * declaration here would come after.
+ * declaration here would come after.  So is one a header under
+ * `internal/` declares, which is reached by including that header
+ * and not by including `Python.h`.
  */
 #ifndef PYRE_DECL_H
 #define PYRE_DECL_H
