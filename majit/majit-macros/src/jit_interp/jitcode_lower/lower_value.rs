@@ -947,6 +947,20 @@ impl<'c> Lowerer<'c> {
         Some(binding)
     }
 
+    /// The struct `call_returns` declares for `func`'s result.
+    ///
+    /// A ref-returning call produces a ref binding, and the `result.field`
+    /// after it needs a struct to resolve the field against —
+    /// `lower_ref_binding_getfield` reads exactly this and bails without it,
+    /// which takes the whole dispatch arm down. The concrete path reads the
+    /// same declaration through `RefFieldRewriter`, so a binding that misses
+    /// it still computes the right answer and the loss shows up only as a
+    /// degraded arm.
+    fn declared_return_struct(&self, func: &Expr) -> Option<syn::Path> {
+        let segments = canonical_expr_segments(func)?;
+        self.config?.call_returns.get(&segments).cloned()
+    }
+
     pub(super) fn lower_call_value(&mut self, call: &ExprCall) -> Option<Binding> {
         let policy = self.resolve_call_policy(&call.func)?;
         if call.args.len() > MAX_HELPER_CALL_ARITY {
@@ -1154,18 +1168,11 @@ impl<'c> Lowerer<'c> {
                             quote! { let _ = __builder.live_placeholder(); },
                         );
                     }
-                    // Check `call_returns` config for a declared return
-                    // struct type, enabling subsequent `result.field`
-                    // access to resolve through `ref_fields`.
-                    let func_segments = canonical_expr_segments(func);
-                    let struct_type = func_segments.and_then(|segs| {
-                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
-                    });
                     return Some(Binding {
                         reg,
                         kind: BindingKind::Ref,
                         depends_on_stack: false,
-                        struct_type,
+                        struct_type: self.declared_return_struct(func),
                     });
                 }
                 crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
@@ -1193,18 +1200,11 @@ impl<'c> Lowerer<'c> {
                             quote! { let _ = __builder.live_placeholder(); },
                         );
                     }
-                    // Check `call_returns` config for a declared return
-                    // struct type, enabling subsequent `result.field`
-                    // access to resolve through `ref_fields`.
-                    let func_segments = canonical_expr_segments(func);
-                    let struct_type = func_segments.and_then(|segs| {
-                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
-                    });
                     return Some(Binding {
                         reg,
                         kind: BindingKind::Ref,
                         depends_on_stack: false,
-                        struct_type,
+                        struct_type: self.declared_return_struct(func),
                     });
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
@@ -1701,11 +1701,18 @@ impl<'c> Lowerer<'c> {
             );
         }
 
+        // Every `*_ref_wrapped` policy lands here rather than returning
+        // early above, and its result is a ref like theirs.
+        let struct_type = match result_kind {
+            BindingKind::Ref => self.declared_return_struct(func),
+            BindingKind::Int | BindingKind::Float => None,
+        };
+
         Some(Binding {
             reg,
             kind: result_kind,
             depends_on_stack,
-            struct_type: None,
+            struct_type,
         })
     }
 
