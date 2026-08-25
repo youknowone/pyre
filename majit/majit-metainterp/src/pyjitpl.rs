@@ -12544,6 +12544,12 @@ impl<M: Clone> MetaInterp<M> {
         // the resume-guard descr.  `descr_fd` is the live `FailDescr`
         // we already resolved above; no backend round-trip.
         let status = descr_fd.get_status();
+        if crate::majit_log_enabled() && trace_id == 41 {
+            eprintln!(
+                "[jit] must_compile status: key={} trace={} guard={} status={:#x} descr={:#x}",
+                owning_key, trace_id, fail_index, status, descr_addr
+            );
+        }
         // compile.py: decode status to get hash
         let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
             // compile.py:745: common case — TY_NONE, not busy.
