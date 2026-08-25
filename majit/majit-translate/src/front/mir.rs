@@ -28655,6 +28655,25 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore]
+    fn unicode_hash_atomic_store_is_the_exact_residual_choke_point() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let residuals = super::dont_look_inside_set_of(&llbc);
+        assert!(
+            residuals.contains("unicodeobject::w_str_set_hash"),
+            "the foreign AtomicI64::store must stay behind its pyre-owned wrapper"
+        );
+        assert!(
+            !residuals.contains("unicodeobject::w_str_get_hash"),
+            "the ordinary scalar memo read remains visible to the generated JIT"
+        );
+    }
+
     /// PyPy's `_match_keywords` indexes its small signature and argument
     /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
     /// lower to the same ArrayRead shape instead of remaining an opaque core

@@ -946,13 +946,16 @@ unsafe fn hash_slot<'a>(obj: PyObjectRef) -> &'a std::sync::atomic::AtomicI64 {
 }
 
 /// Publish a computed digest into the memo slot, `rstr.py:411-412`.  Upstream
-/// reaches the field through `conditional_call_elidable`, which likewise
-/// tolerates a repeated computation; [`hash_slot`] carries why a racing
-/// repeat is harmless here.
+/// performs that write inside `LLHelpers._ll_strhash`, whose decorators are
+/// `@dont_inline` and `@jit.dont_look_inside`; the Rust atomic store is the
+/// corresponding foreign-opaque implementation boundary.  The surrounding
+/// memo read and branch remain visible, while [`hash_slot`] carries why a
+/// racing repeat is harmless here.
 ///
 /// # Safety
 /// `obj` must be a `W_UnicodeObject`.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
     unsafe { hash_slot(obj) }.store(hash, std::sync::atomic::Ordering::Relaxed);
 }
