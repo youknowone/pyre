@@ -329,6 +329,21 @@ pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64
     }
 }
 
+/// Word-ABI residual bridge for [`w_bytearray_find`].
+///
+/// The residual-call ABI is uniformly `(i64xn) -> i64`
+/// (`majit-backend-wasm/src/codegen.rs residual_call_i64_arity`), while
+/// `fn(PyObjectRef, u8, usize) -> i64` is `(i32, i32, i32) -> i64` on wasm32,
+/// so publishing the Rust function itself makes the direct `call_indirect`
+/// trap on a table-entry type mismatch.  Word-width agreement on 64-bit
+/// targets hides the difference there.
+///
+/// The three residual words carry the receiver, the byte value and the start
+/// index the wrapped call already requires.
+pub extern "C" fn bh_w_bytearray_find(obj: i64, value: i64, start: i64) -> i64 {
+    unsafe { w_bytearray_find(obj as usize as PyObjectRef, value as u8, start as usize) }
+}
+
 /// Concatenate bytearray + bytes (b'\0' * N pattern).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

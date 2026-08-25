@@ -4700,6 +4700,22 @@ pub(crate) unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
     .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp)))
 }
 
+/// Word-ABI residual bridge for [`abs_uses_builtin`].
+///
+/// The residual-call ABI is uniformly `(i64xn) -> i64`
+/// (`majit-backend-wasm/src/codegen.rs residual_call_i64_arity`), while
+/// `fn(PyObjectRef) -> bool` is `(i32) -> i32` on wasm32, so publishing the
+/// Rust function itself makes the direct `call_indirect` trap on a table-entry
+/// type mismatch.  Word-width agreement on 64-bit targets hides the
+/// difference there.  `jit_force_vref` (`pyre-jit-trace/src/helpers.rs`) is
+/// the same bridge for the same reason.
+///
+/// The receiver arrives as the residual word carrying a live `PyObjectRef`,
+/// which is what the caller already guarantees for the wrapped call.
+pub(crate) extern "C" fn bh_abs_uses_builtin(obj: i64) -> i64 {
+    i64::from(unsafe { abs_uses_builtin(obj as usize as PyObjectRef) })
+}
+
 fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // operation.py `abs` → `space.abs` → descroperation `_make_unaryop_impl`
     // (`__abs__`).  The exact-type shortcut is `use_special_method_shortcut`:

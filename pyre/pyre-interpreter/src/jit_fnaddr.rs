@@ -1461,19 +1461,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // Two helpers a descent reaches on an executed path and cannot get past:
     // neither is given a jitcode, so the codewriter residualizes the call, and
     // an unpublished residual carries a symbolic funcbox the walker refuses
-    // (`OrthodoxSubWalkTraceUnsupported`). Both signatures are one machine
-    // word per argument and one result word, so the typed helpers bind them.
-    upa1(
+    // (`OrthodoxSubWalkTraceUnsupported`).
+    //
+    // Both bind a word-ABI bridge rather than the Rust `fn`. One machine word
+    // per argument is not the contract the direct residual call emits: it is
+    // uniformly `(i64xn) -> i64` (`majit-backend-wasm/src/codegen.rs`
+    // `residual_call_i64_arity`), and on wasm32 a `PyObjectRef` argument is
+    // `i32` and a `bool` result is `i32`, so the raw functions are `(i32) ->
+    // i32` and `(i32, i32, i32) -> i64` — a table-entry type the
+    // `call_indirect` rejects. The mismatch is invisible on 64-bit targets,
+    // where every word agrees. This is the rule `jit_force_vref`
+    // (`pyre-jit-trace/src/helpers.rs`) and `enabled` below already follow.
+    cpa1(
         &mut entries,
         "pyre_interpreter::builtins::abs_uses_builtin",
         "pyre_interpreter::abs_uses_builtin",
-        crate::builtins::abs_uses_builtin,
+        crate::builtins::bh_abs_uses_builtin,
     );
-    upa3(
+    cpa3(
         &mut entries,
         "pyre_object::bytearrayobject::w_bytearray_find",
         "pyre_object::w_bytearray_find",
-        pyre_object::bytearrayobject::w_bytearray_find,
+        pyre_object::bytearrayobject::bh_w_bytearray_find,
     );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
