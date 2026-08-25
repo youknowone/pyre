@@ -1,7 +1,10 @@
-# pyre-check: max-pypy-ratio=52
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (25.1x), rounded up.
+# No `max-pypy-ratio`: pypy's exec time here sits at the startup-subtraction
+# floor, so the printed ratio is a quotient by a clamped denominator rather
+# than a measurement, and which side of the floor it lands on flips run to run
+# -- which decides whether the ceiling is applied at all.  A ceiling read off
+# such a number gates noise; 175 of the 463 fixtures state none for the same
+# reason, and the ratio is still printed on every run.  This fixture's gates
+# are its three-backend jit-stats baselines.
 N = 100000
 
 
