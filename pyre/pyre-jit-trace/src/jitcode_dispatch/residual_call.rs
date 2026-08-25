@@ -5613,6 +5613,37 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     let ei = call_descr.get_extra_info();
     repair_carrier_call_ref_args(ctx, op.pc, ei.pyre_helper, &mut r_args);
+
+    // A profiled frame owes `c_call` / `c_return` around every builtin call
+    // its bytecode makes -- `baseobjspace.py call_valuestack`, `pyopcode.py`
+    // CALL_FUNCTION_KW / CALL_FUNCTION_EX and `callmethod.py CALL_METHOD_KW`
+    // hand `call_args_and_c_profile` the executing frame.  Upstream's compiled
+    // loop carries that reporting because its tracer traced THROUGH
+    // `call_args`; this walker decides the call instead, folding or
+    // residualising it, and either way the arm that reports never runs.
+    //
+    // So decline the walk rather than compile a loop that runs its tail
+    // silently.  The three call helpers are the whole population that owes an
+    // event -- every other `PyreHelperKind` reaching this dispatcher erases an
+    // operator dispatch, which reports nothing on cpython, pypy3 or pyre
+    // alike.  A `CallFn` naming a Python callee owes no `c_call` either, but
+    // the fold gives the walker no way to tell, and declining is the safe
+    // answer: the frame runs interpreted and reports exactly.
+    //
+    // This converges rather than retracing forever: `abort_count` reaches
+    // `MAX_TRACE_ABORT_COUNT` on the profiled green key and the cell latches
+    // `JC_DONT_TRACE_HERE`.  Being a green is also what keeps that ban off the
+    // unprofiled cell -- see `DispatchError::ProfiledResidualCall`.
+    if ctx.session.borrow().is_being_profiled
+        && matches!(
+            ei.pyre_helper,
+            majit_ir::PyreHelperKind::CallFn
+                | majit_ir::PyreHelperKind::CallKw
+                | majit_ir::PyreHelperKind::CallFunctionEx
+        )
+    {
+        return Err(DispatchError::ProfiledResidualCall { pc: op.pc });
+    }
     // Residual-call entry mirrors `execute_varargs`: even when the walker
     // folds the call or leaves it recorded symbolically, stale handled
     // exceptions from earlier opcodes are not visible to the following

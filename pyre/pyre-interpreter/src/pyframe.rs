@@ -1758,29 +1758,25 @@ pub fn report_stack_underflow(frame: &PyFrame) {
 
 /// True when this frame owes trace events no path the JIT takes can emit.
 ///
-/// A profile hook is the whole of the first half: `c_call` / `c_return` are
-/// owed for every builtin the frame calls, and a compiled trace folds those
-/// calls away with nothing left to report them — measured with this test
-/// narrowed to `f_trace` alone, every builtin's `c_call` saturated at the
-/// entry threshold (see `eval::eval_with_jit_inner`).  A frame that arrives
-/// with its own `f_trace` already armed is the second half.
+/// Only a frame carrying its own `f_trace` does.  Such a frame owes a `line`
+/// event at every instruction that can start one, fired by `ec.bytecode_trace`
+/// from the dispatch loop, and compiled code has no route to that call.
 ///
-/// A global trace function is deliberately absent.  `executioncontext.py
-/// settrace` keeps the JIT on and widens `trace_limit` rather than turning it
-/// off, and what such a hook owes is answered per event elsewhere: this
-/// frame's own `call` / `return` by the bracket the portal carries
-/// (`eval::eval_with_jit_inner`), a callee's by the walker declining to enter
-/// one while a hook is installed (`jitcode_dispatch::ec_hook_installed`), and
-/// the line events of a frame that arms local tracing by `eval_loop_jit`'s
-/// `bytecode_trace` — which compiled code cannot reach, so
-/// `record_portal_debugdata_guard` keeps such a frame from compiling.
+/// Neither hook that installs globally is here, and both are deliberate.
+/// `executioncontext.py settrace` keeps the JIT on and widens `trace_limit`
+/// rather than turning it off, and what it owes is answered per event
+/// elsewhere: this frame's own `call` / `return` by the bracket the portal
+/// carries (`eval::eval_with_jit_inner`), a callee's by the walker declining
+/// to enter one while a hook is installed
+/// (`jitcode_dispatch::ec_hook_installed`), and a frame that arms local
+/// tracing by `record_portal_debugdata_guard` keeping it from compiling.
+/// `setprofile` owes the same frame-level pair, from the same bracket plus
+/// `leave`'s `_trace('leaveframe')`, and owes `c_call` / `c_return` on top —
+/// which the walker answers by declining a profiled trace at the call itself
+/// (`DispatchError::ProfiledResidualCall`) rather than by refusing the frame.
+/// A profiled loop that calls nothing therefore compiles and reports.
 pub fn frame_tracing_active(frame: &PyFrame) -> bool {
-    let ec = frame.execution_context;
-    if ec.is_null() {
-        return false;
-    }
-    let ec = unsafe { &*ec };
-    ec.profilefunc.is_some() || !frame.get_w_f_trace().is_null()
+    !frame.get_w_f_trace().is_null()
 }
 
 #[repr(C)]

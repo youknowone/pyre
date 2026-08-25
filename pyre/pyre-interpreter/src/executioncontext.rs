@@ -668,6 +668,40 @@ impl ExecutionContext {
     #[allow(clippy::too_many_arguments)]
     /// Hands back the exit value at its live address: the profile callback is
     /// application-level Python, so a movable value moves under it.
+    /// `executioncontext.py leave`'s profile arm — `_trace(frame,
+    /// 'leaveframe', w_exitvalue)`, which is where `setprofile`'s `return`
+    /// event comes from.  `return_trace` carries only the `gettrace()` one.
+    ///
+    /// Split out of [`Self::leave`] because the JIT portal owes this event
+    /// without the `topframeref` and vref surgery `leave` wraps it in: the
+    /// arms that run a frame compiled never reach `leave` at all
+    /// (`eval::eval_with_jit_inner`).
+    ///
+    /// Returns the exit value at its live address — the callback is
+    /// application-level Python and can move it.
+    pub fn leaveframe_trace(
+        &mut self,
+        frame: *mut PyFrame,
+        w_exitvalue: PyObjectRef,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        if self.profilefunc.is_none() {
+            return Ok(w_exitvalue);
+        }
+        // The exit value rides a root slot for the callback's duration.
+        // Nothing runs Python without a profiler installed, so the slot is
+        // taken on this arm rather than for every frame that leaves.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exitvalue);
+        let result = self._trace(
+            frame,
+            "leaveframe",
+            pyre_object::gc_roots::shadow_stack_get(exit_slot),
+            None,
+        );
+        result.map(|()| pyre_object::gc_roots::shadow_stack_get(exit_slot))
+    }
+
     pub fn leave(
         &mut self,
         frame: *mut PyFrame,
@@ -682,25 +716,7 @@ impl ExecutionContext {
         // `_trace` runs the profile callback, which is application-level
         // Python; the chain surgery below reads the frame's own fields.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        let mut w_exitvalue = w_exitvalue;
-        let trace_result = if self.profilefunc.is_some() {
-            // The exit value rides a root slot for the callback's duration.
-            // Nothing runs Python without a profiler installed, so the slot is
-            // taken on this arm rather than for every frame that leaves.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let exit_slot = pyre_object::gc_roots::shadow_stack_len();
-            w_exitvalue = pyre_object::gc_roots::pin_root(w_exitvalue);
-            let result = self._trace(
-                frame,
-                "leaveframe",
-                pyre_object::gc_roots::shadow_stack_get(exit_slot),
-                None,
-            );
-            w_exitvalue = pyre_object::gc_roots::shadow_stack_get(exit_slot);
-            result
-        } else {
-            Ok(())
-        };
+        let trace_result = self.leaveframe_trace(frame, w_exitvalue);
         let frame = anchor.live();
         let frame_vref = self.topframeref;
         // At interp level a vref in the chain *is* the frame pointer, so the
@@ -728,7 +744,7 @@ impl ExecutionContext {
         // records VIRTUAL_REF_FINISH during tracing.
         // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
         // (executioncontext.py) folds away with the arm in `enter`.
-        trace_result.map(|()| w_exitvalue)
+        trace_result
     }
 
     /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.

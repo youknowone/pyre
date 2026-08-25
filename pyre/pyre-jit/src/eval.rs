@@ -8550,6 +8550,12 @@ fn eval_with_jit_inner(
         Err(_) => w_none(),
     };
     let live = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
+    // `setprofile`'s `return` is not `return_trace`'s — that one tests
+    // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
+    // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
+    // this arm never reaches `leave`: the declining paths above return through
+    // `execute_frame_plain`, which does, and these two do not.
+    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, live)? };
     result.map(|_| live)
 }
 
