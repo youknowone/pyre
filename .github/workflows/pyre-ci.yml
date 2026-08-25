@@ -286,33 +286,24 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
-    # The two non-Linux platforms wait for the Linux `check.py` legs to pass.
-    # Measured over the 596 finished runs of 2026-08-19..24, which cost 9695645
-    # runner-seconds with 55.4% of them on macOS and Windows:
+    # `cargo-fmt` is the only Linux job the two platforms wait for, and the
+    # reason is latency. Job end times on run 32793420243, relative to the
+    # first job's start: `cargo fmt --check` +47 s, `cargo test (ubuntu)`
+    # +7977 s, `pyre/check.py dynasm (ubuntu)` +13327 s. Hanging the platform
+    # prepare on either of the latter two defers everything behind it: that
+    # run's macOS/Windows legs started at +13330 s and it finished at
+    # +18269 s, against roughly +5000 s for the same work started after fmt.
     #
-    #   137 failure runs never reached a green Linux check.py, and their macOS
-    #       and Windows legs spent 1634383 runner-seconds re-proving it;
-    #   297 cancelled runs were superseded before Linux check.py finished --
-    #       the median cancelled run lives 2567 s and Linux check.py completes
-    #       at +5727 s -- and spent 1600008 runner-seconds on the two;
-    #   9 further cancelled runs got past a green Linux check.py, for 77635 s.
-    #
-    # 3312026 runner-seconds, 34.2% of the six days, on legs that either
-    # re-proved a failure Linux had already found or were thrown away.
-    #
-    # This defers a platform answer, it does not drop one: 31 of the 168
-    # failure runs had a green Linux check.py and 19 of those went red on a
-    # platform leg, so every one of them still runs. What a red Linux costs is
-    # the round trip -- the platform answer arrives on the push that turns
-    # Linux green rather than beside it. Restricting the two platforms to
-    # `main` instead saves more and does drop coverage: over the same window 10
-    # runs went red on macOS or Windows while Linux stayed green, 8 of them on
-    # a branch, and under that rule all 10 would have landed first.
-    #
-    # `cargo-fmt` is named as well as reached through `pyre-check-linux`, so
-    # the gate below survives that job's own dependencies being rearranged.
-    needs: [cargo-fmt, pyre-check-linux]
-    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
+    # A Linux `check.py` gate was tried (PR #1440) and removed. It cost more
+    # than the round trip: over the 380 finished runs of 2026-08-21..25, 83
+    # failure runs had a green Linux `cargo test` and a red `check.py`, and 44
+    # of those 83 were ALSO red on a platform leg -- so it withheld a platform
+    # answer that existed in 53% of the runs it applied to, while tripling the
+    # wall time of every run that was going to be green anyway. Restricting the
+    # two platforms to `main` is worse again: 7 runs in that window went red
+    # only on macOS or Windows, and under that rule they would have landed
+    # first.
+    needs: cargo-fmt
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -321,9 +312,8 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
-    # See prepare-charon-llbc-macos for the measurement behind the Linux gate.
-    needs: [cargo-fmt, pyre-check-linux]
-    if: ${{ !cancelled() && needs.pyre-check-linux.result == 'success' }}
+    # See prepare-charon-llbc-macos for why `cargo-fmt` is the only wait.
+    needs: cargo-fmt
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
