@@ -3935,15 +3935,17 @@ impl OpcodeStepExecutor for PyFrame {
     /// closure creation via BUILD_TUPLE + SET_FUNCTION_ATTRIBUTE).
     ///
     /// `initialize_frame_scopes` already installs an empty cell for every
-    /// pure cellvar (a cellvar not shadowing a parameter).  Only an
-    /// argument slot promoted to a cellvar still holds a raw value here,
-    /// so wrap solely when the slot is not already a cell — otherwise a
-    /// never-reassigned cellvar like `__class__` would become a
-    /// cell-wrapping-a-cell, and `fast2locals` / closure reads would
-    /// surface the inner cell instead of the value.
+    /// pure cellvar (a cellvar not sharing a locals slot).  A cellvar which
+    /// does share a locals slot must always wrap that slot's raw value here,
+    /// even when the Python argument itself happens to be a `cell` object.
+    /// PyPy's `PyFrame.init_cells` has distinct argument and cell slots, so
+    /// `cell.set(locals[argnum])` naturally preserves this extra level.
+    /// Only the pre-installed pure-cellvar slot is already the cell which
+    /// MAKE_CELL denotes (notably the implicit `__class__` cell).
     fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
         let current = locals_w!(self)[idx];
-        if current.is_null() || !unsafe { pyre_object::is_cell(current) } {
+        let shares_local_slot = idx < self.code().varnames.len();
+        if shares_local_slot || current.is_null() || !unsafe { pyre_object::is_cell(current) } {
             // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(..., self.pycode.cell_families[i])` —
             // the cellvar this parameter slot was promoted for.
             let family = unsafe {
