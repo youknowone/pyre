@@ -3640,13 +3640,24 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `rtype_intmask` coerces its input to `lltype.Signed` and returns
-        // that value unchanged (`rpython/rtyper/rbuiltin.py:222-225`).  The
-        // frontend preserves the coercion as this call-shaped marker, so fold
-        // it through the same identity alias used for no-op coercions
-        // (`jtransform.py:399-401`).
+        // The two signedness markers `front::mir` emits for a same-width
+        // reinterpret.  Both coerce their input to the result's low-level type
+        // and hand it back unchanged: `rtype_intmask` to `lltype.Signed`, and
+        // `r_uint`'s `ForTypeEntry::specialize_call` to whatever
+        // `hop.r_result.lowleveltype` is, under an
+        // `exception_cannot_occur()`.  The frontend preserves the coercion as
+        // this call-shaped marker because it skips the rtyper step that would
+        // otherwise consume it, so fold both through the same identity alias
+        // used for no-op coercions (`jtransform.py::_noop_rewrite`).
+        //
+        // Aliasing loses the marker's Unsigned annotation, which is why this
+        // sits here and not earlier: the rtyper runs before jtransform and has
+        // already picked `uint_lt` over `int_lt` wherever the annotation
+        // mattered.  Both spellings name the same machine word.
         if let CallTarget::FunctionPath { segments } = target
-            && segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            && let [head @ .., leaf] = segments.as_slice()
+            && head == ["rpython", "rlib", "rarithmetic"]
+            && matches!(leaf.as_str(), "intmask" | "r_uint")
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -3725,7 +3736,7 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // RPython `rtyper` lowers a heap-carried `Result` variant to
+        // RPython `rtyper` lowers a heap-carried sum-type variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
         // `jtransform`; `rewrite_op_malloc` then emits `new(descr)`.
         // Charon exposes the pre-rtyper shape instead: a niladic synthetic
@@ -3733,22 +3744,31 @@ impl<'a> Transformer<'a> {
         // enum tag as a separate MIR operand. Restore the exact low-level
         // shape here. The existing payload write follows this replacement in
         // program order; the tag write is emitted beside the allocation.
-        // Recognize the ctor through the front-side rule rather than a second
-        // spelling test: it anchors the owner path head at `core::result` and
-        // compares the instantiation-stripped leaf for equality, where a
-        // `starts_with("Result")` leaf test also accepts an unrelated enum whose
-        // name merely begins with it and carries `Ok`/`Err` variants. Both gates
-        // decide the same question, so they must not be able to drift.
+        // Recognize the ctor through the front-side rules rather than a second
+        // spelling test: each anchors the owner path head (`core::result`,
+        // `core::option`) and compares the instantiation-stripped leaf for
+        // equality, where a `starts_with("Result")` leaf test also accepts an
+        // unrelated enum whose name merely begins with it and carries
+        // `Ok`/`Err` variants. Both gates decide the same question, so they
+        // must not be able to drift.
+        //
+        // `Result` and `Option` are the two enums whose variant order the
+        // language fixes, so their tags can be spelled here. A user enum's
+        // cannot, and its variant ctor keeps the residual shape.
         if args.is_empty()
-            && let Some(is_err) = crate::front::result_exc::result_ctor_kind(target)
+            && let Some(variant) = sum_variant_ctor(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
-            let name = if is_err { "Err" } else { "Ok" };
-            let tag = i64::from(is_err);
             let result_base = owner
-                .strip_suffix(format!("::{name}").as_str())
+                .strip_suffix(format!("::{}", variant.leaf).as_str())
                 .unwrap_or(owner)
                 .to_string();
+            let alloc_owner = if variant.carries_payload {
+                owner.clone()
+            } else {
+                result_base.clone()
+            };
+            let tag = variant.tag;
             let result = op
                 .result
                 .clone()
@@ -3756,9 +3776,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: Some(result.clone()),
-                    kind: OpKind::New {
-                        owner: owner.clone(),
-                    },
+                    kind: OpKind::New { owner: alloc_owner },
                 },
                 SpaceOperation {
                     result: None,
@@ -3777,6 +3795,23 @@ impl<'a> Transformer<'a> {
                     },
                 },
             ]);
+        }
+        // The struct-shaped spelling of the same aggregate: Charon writes
+        // `Aggregate::Adt(ty, variant_idx = null)` for an `Option<T>` built
+        // through a separate `SetDiscriminant`, which names the type in the
+        // ctor leaf instead of a variant and leaves `front::mir` to emit the
+        // tag as its own `__discriminant` `FieldWrite`. Only the allocation is
+        // owed here; adding a tag would write it twice.
+        if args.is_empty()
+            && crate::front::option_ctor::is_option_base_ctor(target)
+            && let ValueType::Ref(Some(owner)) = result_ty
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::New {
+                    owner: owner.clone(),
+                },
+            }]);
         }
         // `rbuiltin.py rtype_const_result` /
         // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
@@ -6298,6 +6333,44 @@ impl<'a> Transformer<'a> {
         let result_ir = value_type_to_ir_type(result_ty);
         arg_ir == result_ir
     }
+}
+
+/// A niladic sum-type variant ctor lowered to an allocation plus a tag write.
+struct SumVariantCtor {
+    /// The variant leaf, as the ctor's result owner spells it.
+    leaf: &'static str,
+    /// The discriminant to stamp.
+    tag: i64,
+    /// Whether the variant carries a payload field of its own.
+    ///
+    /// A payload-less variant has no fields, so nothing registers a layout for
+    /// its variant class and `New` on it resolves to a zero-sized descr the
+    /// collector never issued a type id for — which the walker refuses
+    /// (`UnregisteredNewGcType`), after the descent has already run. The value
+    /// such a ctor builds is a bare tag, and the enum base's shell is what
+    /// carries one, so the allocation goes there instead.
+    carries_payload: bool,
+}
+
+/// The niladic sum-type variant ctors lowered to an allocation plus a tag.
+///
+/// Both halves come from the front-side spelling rules
+/// ([`crate::front::result_exc::result_ctor_kind`],
+/// [`crate::front::option_ctor::option_variant_ctor_tag`]) so the recogniser
+/// here cannot drift from the one the frontend applies. Which variants carry a
+/// payload is fixed by the language for both enums: `Ok`, `Err` and `Some`
+/// each hold one, `None` holds none.
+fn sum_variant_ctor(target: &CallTarget) -> Option<SumVariantCtor> {
+    let (leaf, tag) = match crate::front::result_exc::result_ctor_kind(target) {
+        Some(true) => ("Err", 1),
+        Some(false) => ("Ok", 0),
+        None => crate::front::option_ctor::option_variant_ctor_tag(target)?,
+    };
+    Some(SumVariantCtor {
+        leaf,
+        tag,
+        carries_payload: leaf != "None",
+    })
 }
 
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a

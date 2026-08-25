@@ -5412,6 +5412,13 @@ pub fn pos(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_numeric_unaryop_override(a, "__pos__")? {
             return Ok(result);
         }
+        if is_int(a) && !is_bool(a) && pyre_object::is_exact_builtin_instance(a) {
+            // `_self_unaryop('pos')` delegates to `W_IntObject.int`, which
+            // returns `self` for the exact builtin representation.  `bool`
+            // takes the rewrapping arm below because its `int` yields a plain
+            // int rather than the singleton it was called on.
+            return Ok(a);
+        }
         if is_int(a) || is_bool(a) {
             return Ok(w_int_new(int_value(a)));
         }

@@ -202,9 +202,10 @@ build.
 | PYRE_WASM_INLINE_NONHEADER | admits an inlined region whose closing JUMP names a resumable LABEL other than the loop header AND whose source guard is in the LOOP BODY (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it.  The preamble-sourced half of that class takes a different placement — blocks outside the header `loop`, body past its `end` — and is admitted unconditionally, so this flag now covers only the body-sourced half.  Arming it removes 49.4M of the 257.3M cross-module crossings on the 81 fixtures that reach the decline and buys 0.74x/0.67x on two of them, but costs 1.23x on `spectral_norm` | the +18 ops per non-failing iteration it levies on the owner's fall-through is paid back on the fixtures it admits, or an admission rule separates them from `spectral_norm`, which sheds 99.7% of its crossings and still loses 23% |
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 
-### §6b — VALUE knobs (12): config, not gates
+### §6b — VALUE knobs (13): config, not gates
 
-`PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
+`PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
+`PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_DTRACE_CONST_FROM`, `PYRE_DTRACE_CONST_TO`,
 `PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
@@ -222,6 +223,14 @@ consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
 wasm backend, where the guest reads no environment and the runner has to arm
 it through the `pyre_fbw_spec_census_enable` export instead.
 
+`PYRE_FBW_MAX_SUBWALK_DEPTH` lowers the host-stack budget for canonical-helper
+descent (`fbw_max_subwalk_depth`, default 64). The default is a backstop
+against exhausting the process stack, not a tuning knob — the walker recurses
+one `walk()` activation per descent level where RPython's `MetaInterp` keeps
+its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
+is exercised without building a pathological helper chain; it retires when the
+descent stops recursing on the host stack.
+
 ### §6c — Default-OFF diagnostics, censuses and probes (72): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
@@ -234,7 +243,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
-`PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
@@ -258,6 +267,14 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
 `PYRE_WASM_TRACE_ENTRY_CENSUS`.
+
+`PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
+(`descent_unlowered_helper_scan_enabled`), so the walker descends into a
+builtin body that holds a symbolic-fnaddr residual call and aborts at the call
+instead of declining before the descent starts. Same shape and same reason as
+`PYRE_WALKABORT_OFF`: the scan decides whether a descent happens at all and its
+cost is invisible in output, so weighing the conservatism against its price
+needs one binary and one variable. It retires when the scan does.
 
 `PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`
 example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`

@@ -242,6 +242,9 @@ xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5
 #
 # `debug-assertions` is a separate setting and is untouched, so every
 # `debug_assert!` and every `cfg(debug_assertions)` arm still compiles in.
+# The LLBC extraction is the one dev-profile build that turns it off, because
+# the image it produces describes the release interpreter the JIT accompanies
+# (`scripts/llbc_extract.py`, `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS`).
 #
 # For a debugger session, ask for it on the command line instead of editing
 # this: `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.

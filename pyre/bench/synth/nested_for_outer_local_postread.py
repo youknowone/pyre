@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=26
+# pyre-check: spec-folds=for_iter_next
+# The iteration fold, 487 firings across the corpus and undeclared. 22 here.
 def variable_inner(n):
     total = 0
     for i in range(n):

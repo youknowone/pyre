@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=30
+# pyre-check: spec-folds=truth_int,subscr
+# `truth_int` fires here more than anywhere else in the corpus (19); the
+# and/or chains below are what present a non-bool truthiness to the walker.
 # Short-circuit and/or chains whose operands call side-effecting helpers,
 # inside a hot loop whose first operand flips truthiness after warm-up. The
 # helpers bump global counters; the computed totals were always correct, but

@@ -394,6 +394,10 @@ thread_local! {
     /// Cached `ALL_JITCODES` index of `w_list_pop_end_inner` for the current
     /// thread. Resolved by name because jitcode indices are build-dependent.
     static LIST_POP_END_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+    /// Cached `ALL_JITCODES` index of `w_tuple_getitem` for the current
+    /// thread. Resolved by graph key rather than by name -- see
+    /// [`compute_pathed_jitcode_index`].
+    static TUPLE_GETITEM_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
 /// Scan the build-time names index for the unique entry equal to `name`.
@@ -479,6 +483,31 @@ pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
 pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
     let idx = LIST_POP_END_JITCODE_INDEX
         .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_pop_end_inner")))?;
+    get_jitcode_by_index(idx)
+}
+
+/// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
+/// key the codewriter allocated it under and cached per thread. `None` if the
+/// helper is absent from the build-time pipeline.
+///
+/// This is the reader behind every tuple subscript. It normalises a negative
+/// index against the length, range-checks it, and dispatches the four
+/// `W_AbstractTupleObject` layouts (`tupleobject.rs`) -- the canonical items
+/// block and the three arity-2 specialisations -- applying each
+/// specialisation's `wraps[i]` (`specialisedtupleobject.py getitem`).
+///
+/// Its `Option<PyObjectRef>` result lowers to a plain nullable ref
+/// (`result_type: 'r'`), so an out-of-range index comes back null rather than
+/// through a second result channel. Descending it rather than the
+/// `_known` reader is what keeps the length test in the trace: the caller's
+/// trace-time range check proves only that THIS receiver is long enough, while
+/// the recorded `arraylen` guard is what holds for the next one.
+pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
+    let idx = TUPLE_GETITEM_JITCODE_INDEX.with(|cell| {
+        *cell.get_or_init(|| {
+            compute_pathed_jitcode_index("pyre_object::tupleobject::w_tuple_getitem")
+        })
+    })?;
     get_jitcode_by_index(idx)
 }
 

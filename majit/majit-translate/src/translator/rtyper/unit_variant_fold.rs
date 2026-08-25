@@ -102,6 +102,27 @@ pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
     )
 }
 
+/// Whether `name` is a shaped positional aggregate carrying no items:
+/// `Tuple<>` or `Array<T;0>`.
+///
+/// The shape suffix is the aggregate's low-level identity, so an empty one is
+/// decidable from the name alone. `Tuple` and `Array` without a suffix are the
+/// bare roots and are not this: the bare `Tuple` is the unit handled above, and
+/// a bare `Array` carries no length to be zero.
+fn is_zero_length_shaped_aggregate(name: &str) -> bool {
+    if majit_ir::descr::is_shaped_tuple_name(name) {
+        return name
+            .strip_prefix("Tuple<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .is_some_and(|args| args.trim().is_empty());
+    }
+    majit_ir::descr::is_shaped_array_name(name)
+        && name
+            .rsplit_once(';')
+            .and_then(|(_, len)| len.strip_suffix('>'))
+            .is_some_and(|len| len.trim() == "0")
+}
+
 /// Rewrite `OpKind::Call { target: SyntheticTransparentCtor, args: [] }`
 /// ops whose qualified path matches
 /// [`is_synthetic_unit_variant_path`] into
@@ -131,6 +152,34 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
                 op.kind = OpKind::ConstRefNull;
                 continue;
             }
+            // A zero-length shaped aggregate — `Tuple<>`, `Array<T;0>`, the
+            // empty argument slice `&[]` — carries no runtime data either, but
+            // unlike the unit above its value IS read: it flows on as a call
+            // argument.  Upstream answers both halves the same way and neither
+            // one allocates: `rtuple.TUPLE_TYPE` returns `Void` for an empty
+            // field list before any `GcStruct` exists, `TupleRepr.newtuple`
+            // returns `inputconst(Void, ())` instead of emitting a `malloc`,
+            // and `TupleRepr.instantiate` hands back the prebuilt
+            // `dum_empty_tuple` PBC.  A zero-length `FixedSizeArray` is
+            // excluded more strongly still: it inherits `Struct._gckind =
+            // 'raw'`, so `lltype.malloc(flavor='gc')` refuses it outright.
+            //
+            // So the value is a prebuilt singleton, not an allocation. It must
+            // also be non-null, which is why this arm interns an instance where
+            // the unit above emits the null ref: a caller passes it on, and the
+            // walker refuses a null ref argument to a may-force call.
+            //
+            // Leaving it as an allocation is what
+            // `register_synthetic_positional_metadata` registers with zero rows
+            // and no collector-issued type id, which the walker rejects with
+            // `UnregisteredNewGcType` after the descent has already run.
+            if owner_path.is_empty()
+                && is_zero_length_shaped_aggregate(name)
+                && let Some(instance) = intern_unit_variant_prebuilt_instance(name)
+            {
+                op.kind = OpKind::ConstRef(instance);
+                continue;
+            }
             let mut segments = owner_path.clone();
             segments.push(name.clone());
             if !is_synthetic_unit_variant_path(&segments) {
@@ -142,5 +191,46 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             };
             op.kind = OpKind::ConstRef(instance);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_length_shapes_are_recognised() {
+        assert!(is_zero_length_shaped_aggregate("Tuple<>"));
+        assert!(is_zero_length_shaped_aggregate("Array<*mut PyObject;0>"));
+        assert!(is_zero_length_shaped_aggregate("Array<u8;0>"));
+    }
+
+    /// The bare roots are not shaped, and a shape that carries items is not
+    /// empty — both keep the allocation.
+    #[test]
+    fn bare_roots_and_non_empty_shapes_are_rejected() {
+        assert!(!is_zero_length_shaped_aggregate("Tuple"));
+        assert!(!is_zero_length_shaped_aggregate("Array"));
+        assert!(!is_zero_length_shaped_aggregate("Tuple<*mut PyObject>"));
+        assert!(!is_zero_length_shaped_aggregate("Array<*mut PyObject;1>"));
+        assert!(!is_zero_length_shaped_aggregate("Array<u8;10>"));
+    }
+
+    /// A length that merely ENDS in `0` is not length zero.
+    #[test]
+    fn a_length_ending_in_zero_is_not_zero() {
+        assert!(!is_zero_length_shaped_aggregate("Array<u8;20>"));
+        assert!(!is_zero_length_shaped_aggregate("Array<u8;100>"));
+    }
+
+    /// One prebuilt instance per shape, shared across graphs, as
+    /// `InstanceRepr.get_reusable_prebuilt_instance` caches per classdef.
+    #[test]
+    fn one_prebuilt_instance_per_shape() {
+        let a = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>").unwrap();
+        let b = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>").unwrap();
+        let other = intern_unit_variant_prebuilt_instance("Array<u8;0>").unwrap();
+        assert_eq!(a.identity_id(), b.identity_id());
+        assert_ne!(a.identity_id(), other.identity_id());
     }
 }

@@ -766,6 +766,9 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// summary a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`summarize_descent_blockers`] caches nothing.
 fn descent_decline(jitcode_index: usize) -> Option<DescentDecline> {
+    if !descent_unlowered_helper_scan_enabled() {
+        return None;
+    }
     let summary = descent_blocker_summary(jitcode_index);
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
@@ -791,6 +794,126 @@ impl std::fmt::Display for DescentDecline {
             Self::BodyNotWalked => f.write_str("body holds bytes the scan cannot decode"),
         }
     }
+}
+
+/// Kill switch for the scan above: `PYRE_FBW_DESCENT_SCAN_OFF=1` lets the
+/// descent run into the symbolic call and abort there instead of declining
+/// before it starts.
+///
+/// The same shape and the same reason as `PYRE_WALKABORT_OFF` in
+/// `trace.rs`: the scan decides, for every builtin the walker might descend
+/// into, whether the descent happens at all, and its cost is invisible in
+/// output — a declined descent is a correct answer that is merely slower.
+/// One binary and one env var is the only way to weigh what the
+/// conservatism buys against what it costs.
+///
+/// Graded over the 561 `__pyre_wrap_*` gateway wrappers, 448 of the 487 the
+/// scan declines block on a call no complete path through the descent
+/// executes, so what this switch measures is mostly the price of a static
+/// answer to a dynamic question. It is a diagnostic, not a tuning knob:
+/// the scan is on unless it is explicitly turned off, because the rewind it
+/// prevents is a wrong answer and not a slow one.
+fn descent_unlowered_helper_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
+}
+
+/// Print every un-lowered helper the descent into `jitcode_index` could reach,
+/// once per body, under `PYRE_FBW_INLINE_DIAG`.
+///
+/// This is deliberately separate from the memoized decision above: production
+/// needs only the effect-aware verdict, while the diagnostic pays to enumerate
+/// the whole body and every callee named by `inline_call_*`.
+fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
+    if !fbw_inline_diag_enabled() {
+        return;
+    }
+    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard
+        .get_or_insert_with(Default::default)
+        .insert(jitcode_index)
+    {
+        return;
+    }
+    drop(guard);
+    let blockers = collect_descent_unlowered_helper_blockers(jitcode_index, &mut Vec::new());
+    let named = blockers
+        .iter()
+        .map(|blocker| format!("{blocker:#x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[builtin-inline-blockers] jitcode={jitcode_index} n={} {named}",
+        blockers.len()
+    );
+}
+
+/// Collect the distinct symbolic funcboxes in a body's decoded byte stream and
+/// in the bodies named by its `inline_call_*` instructions, in byte order.
+fn collect_descent_unlowered_helper_blockers(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+) -> Vec<i64> {
+    if seen.contains(&jitcode_index) {
+        return Vec::new();
+    }
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
+        return Vec::new();
+    };
+    seen.push(jitcode_index);
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let mut known_i = vec![None; body.num_regs_i + body.constants_i.len()];
+    for (slot, &value) in body.constants_i.iter().enumerate() {
+        known_i[body.num_regs_i + slot] = Some(value);
+    }
+    let mut pc = 0usize;
+    let mut blockers = Vec::new();
+    while pc < body.code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
+            break;
+        };
+        if d.opname.starts_with("residual_call") {
+            let funcbox = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize;
+            if let Some(Some(fnaddr)) = known_i.get(funcbox)
+                && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+                && !blockers.contains(fnaddr)
+            {
+                blockers.push(*fnaddr);
+            }
+        } else if d.opname.starts_with("inline_call") {
+            let descr_index = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize
+                | ((body.code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
+            if let Some(callee) = descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+            {
+                for blocker in collect_descent_unlowered_helper_blockers(callee, seen) {
+                    if !blockers.contains(&blocker) {
+                        blockers.push(blocker);
+                    }
+                }
+            }
+        }
+        if d.argcodes
+            .split_once('>')
+            .is_some_and(|(_, dst)| dst == "i")
+            && let Some(&dst) = body.code.get(d.next_pc.wrapping_sub(1))
+        {
+            let carried = (d.key == "int_copy/i>i")
+                .then(|| body.code.get(d.pc + 1))
+                .flatten()
+                .and_then(|&src| known_i.get(src as usize).copied())
+                .flatten();
+            if let Some(slot) = known_i.get_mut(dst as usize) {
+                *slot = carried;
+            }
+        }
+        pc = d.next_pc;
+    }
+    seen.pop();
+    blockers
 }
 
 /// Memoizing entry point for [`summarize_descent_blockers`].
@@ -3207,6 +3330,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         return Ok(None);
     }
     if let Some(decline) = descent_decline(jitcode.index()) {
+        if matches!(decline, DescentDecline::Helper(_)) {
+            log_descent_unlowered_helper_blockers(jitcode.index());
+        }
         builtin_inline_decline!(decline, fnaddr);
         return Ok(None);
     }
@@ -8645,6 +8771,20 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
+/// Drops one host-stack level claimed by [`run_sub_jitcode_walk`].
+///
+/// A plain decrement at the end of that function would leak the level on every
+/// `?` return inside it, and the count would then only ever grow.
+struct SubWalkLevel<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+}
+
+impl Drop for SubWalkLevel<'_> {
+    fn drop(&mut self) {
+        self.session.borrow_mut().subwalk_depth -= 1;
+    }
+}
+
 /// Seed a callee jitcode's register banks with positional args and walk
 /// its body, returning the callee's terminal [`DispatchOutcome`]
 /// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
@@ -8676,6 +8816,24 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
+    // Claim a host-stack level before anything is allocated, so a refusal
+    // costs the caller nothing to undo. The guard drops on every exit path,
+    // including the `?` returns below and a panic unwinding through them.
+    let depth = {
+        let mut session = ctx.session.borrow_mut();
+        session.subwalk_depth += 1;
+        session.subwalk_depth
+    };
+    let _level = SubWalkLevel {
+        session: ctx.session,
+    };
+    if depth > fbw_max_subwalk_depth() {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[subwalk-depth] jitcode_pc={pc} depth={depth} declined");
+        }
+        return Err(DispatchError::SubWalkDepthExceeded { pc, depth });
+    }
+
     let (
         mut callee_regs_r,
         mut callee_regs_i,
