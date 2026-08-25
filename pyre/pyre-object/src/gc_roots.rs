@@ -277,6 +277,40 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
     ROOT_STACK.with(f)
 }
 
+/// Normalize one already-published root in place.
+///
+/// RPython's caller and callee livevars are one GC-transformed graph, so a
+/// collection between argument marshalling and the callee's root push rewrites
+/// the value the callee sees.  A native JIT call copies the argument into the
+/// host ABI first: its jitframe home is rewritten, but that register/stack copy
+/// can still name the forwarding stub when the callee publishes it.  Follow
+/// same-thread nursery forwarding unconditionally before applying the
+/// free-threaded synchronization path.
+#[inline]
+fn normalize_published_slot(stack: &RootStack, index: usize) -> PyObjectRef {
+    // SAFETY: callers claimed `index` before entering this helper and keep the
+    // surrounding RootScope alive throughout it.
+    let mut root = unsafe { *stack.slot(index) };
+    let current = majit_gc::gc_current_object_address(root as usize) as PyObjectRef;
+    if current != root {
+        // SAFETY: same live slot.
+        unsafe { *stack.slot(index) = current };
+        root = current;
+    }
+    if !majit_gc::gc_sync::foreign_mutator_seen() {
+        return root;
+    }
+    // This query is a safepoint.  The slot already contains the locally
+    // normalized value and is therefore safe for a foreign root walk.
+    root = unsafe { *stack.slot(index) };
+    let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
+    if normalized != root {
+        // SAFETY: same live slot.
+        unsafe { *stack.slot(index) = normalized };
+    }
+    normalized
+}
+
 /// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py` →
 /// `shadowstack.py:351-364`).  `sys.setrecursionlimit` scales the root stack
 /// with the limit at `pypy/module/sys/vm.py:97`; the depth can only grow.
@@ -357,21 +391,8 @@ impl RootScope {
             *stack.incr_stack() = root;
             index
         };
-        // RPython has one active mutator under the GIL, so the value just
-        // published cannot have been forwarded between the caller's copy and
-        // this root write.  Pyre's free-threaded seam needs the normalization
-        // only after a second mutator has existed; the sticky predicate also
-        // covers one which collected and unregistered before this point.
-        if !majit_gc::gc_sync::foreign_mutator_seen() {
-            return root;
-        }
-        let normalized =
-            crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-        if normalized != root {
-            // SAFETY: same cell, and `index` is still live.
-            unsafe { *(*self.stack_slot).slot(index) = normalized };
-        }
-        normalized
+        // SAFETY: `stack_slot` is this thread's live root-stack cell.
+        normalize_published_slot(unsafe { &*self.stack_slot }, index)
     }
 
     /// Scope-local [`shadow_stack_get`] using the cached cell.
@@ -403,24 +424,9 @@ impl RootScope {
     pub fn normalize(&self, base: usize, len: usize) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
-        // Same guard as `normalize_roots`: RPython has one active mutator under
-        // the GIL, so no root becomes a forwarding stub between its publication
-        // and the allocation bracket.
-        if !majit_gc::gc_sync::foreign_mutator_seen() {
-            return;
-        }
         for index in base..base + len {
-            // Re-read the slot each time, as [`normalize_roots`] does: a
-            // collection triggered by an earlier query may already have
-            // rewritten every published root in place.
             // SAFETY: `publish` claimed every index in this range.
-            let root = unsafe { *(*self.stack_slot).slot(index) };
-            let current =
-                crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-            if current != root {
-                // SAFETY: same slot, still live.
-                unsafe { *(*self.stack_slot).slot(index) = current };
-            }
+            normalize_published_slot(unsafe { &*self.stack_slot }, index);
         }
     }
 
@@ -435,18 +441,8 @@ impl RootScope {
         // before anything consults the collector about it.
         // SAFETY: same cell; `slot` bounds-checks `index`.
         unsafe { *(*self.stack_slot).slot(index) = root };
-        // Same guard as `shadow_stack_set`, after the raw publish: RPython has
-        // one active mutator under the GIL, so the value just published cannot
-        // have been forwarded between the caller's copy and this write.
-        if !majit_gc::gc_sync::foreign_mutator_seen() {
-            return;
-        }
-        let normalized =
-            crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-        if normalized != root {
-            // SAFETY: same slot, still live.
-            unsafe { *(*self.stack_slot).slot(index) = normalized };
-        }
+        // SAFETY: `stack_slot` is this thread's live root-stack cell.
+        normalize_published_slot(unsafe { &*self.stack_slot }, index);
     }
 }
 
@@ -578,9 +574,9 @@ impl Default for RootedItems {
 /// so the matching [`Drop`] truncates the entry. Pinning without a
 /// guard is a leak from the GC's perspective once the backend GC consumes the stack.
 ///
-/// Returns the word now held by the shadow-stack slot. A foreign collection
-/// may have forwarded `root` while this call waited at its normalization
-/// safepoint, so callers that use the word after pinning must use this value.
+/// Returns the word now held by the shadow-stack slot. A collection may have
+/// forwarded `root` after the caller copied it, so callers that use the word
+/// after pinning must use this value.
 ///
 /// Pushes onto the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the call instead of tracing into
@@ -602,28 +598,7 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
         unsafe { *stack.incr_stack() = root };
         index
     });
-    // A foreign mutator may have completed a nursery collection after the
-    // caller copied this GCREF but before it entered this explicit root
-    // bracket.  RPython's `_trace_drag_out` always rewrites a root that names
-    // an already-forwarded nursery object; normalize the host-side copy at
-    // the same boundary so the shadow stack never gains a forwarding stub.
-    if !majit_gc::gc_sync::foreign_mutator_seen() {
-        return root;
-    }
-    let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    // The slot already holds `root`, so a query that found no forwarding stub
-    // has nothing to write back.  That is the steady state — nothing collected
-    // between the push above and the query — and skipping it keeps a second
-    // thread-local resolve off a path that sits on the interpreter's
-    // allocation and call paths.
-    if normalized != root {
-        with_shadow_stack(|stack| {
-            // SAFETY: `index` was live when claimed and only this thread can
-            // have shortened the stack, which it has not.
-            unsafe { *stack.slot(index) = normalized }
-        });
-    }
-    normalized
+    with_shadow_stack(|stack| normalize_published_slot(stack, index))
 }
 
 /// Publish a complete translated livevar set before performing any
@@ -675,22 +650,8 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
 pub fn normalize_roots(base: usize, len: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
-    if !majit_gc::gc_sync::foreign_mutator_seen() {
-        return;
-    }
     for index in base..base + len {
-        // Read the slot each time: a collection triggered by an earlier query
-        // may already have rewritten every published root in place.
-        // SAFETY: every index in this range was claimed just above.
-        let root = with_shadow_stack(|stack| unsafe { *stack.slot(index) });
-        let current = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-        // Same write-back economy as `pin_root`: the slot already holds `root`,
-        // so a query that found no forwarding stub has nothing to store, and
-        // skipping it saves a second thread-local resolve per livevar.
-        if current != root {
-            // SAFETY: same slot, still live.
-            with_shadow_stack(|stack| unsafe { *stack.slot(index) = current });
-        }
+        with_shadow_stack(|stack| normalize_published_slot(stack, index));
     }
 }
 
@@ -755,10 +716,10 @@ pub fn shadow_stack_get(index: usize) -> PyObjectRef {
     // relocation between the pin and this read updates the slot in place and
     // no forwarding stub can be observed here.
     //
-    // Only [`pin_root`] normalizes, and it must: the value it receives is
-    // copied from outside the bracket, so a foreign mutator can have collected
-    // after that copy and before the pin.  That is also the pin's safepoint;
-    // a read allocates nothing and has no reason to park.
+    // Root publication APIs normalize, and they must: the value they receive
+    // can be copied from outside the bracket before a collection and reach the
+    // new slot as a forwarding stub.  A read allocates nothing and has no
+    // reason to park.
     // SAFETY: `slot` bounds-checks `index` against the live length.
     with_shadow_stack(|stack| unsafe { *stack.slot(index) })
 }
@@ -811,14 +772,9 @@ pub fn shadow_stack_set(index: usize, root: PyObjectRef) {
     // visible to that collector before we enter the query safepoint.
     // SAFETY: `slot` bounds-checks `index` against the live length.
     with_shadow_stack(|stack| unsafe { *stack.slot(index) = root });
-    // Then normalize a GCREF the caller may have copied before a foreign
-    // mutator's nursery collection, so the slot never keeps a forwarding stub.
-    if !majit_gc::gc_sync::foreign_mutator_seen() {
-        return;
-    }
-    let root = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    // SAFETY: same slot, still live.
-    with_shadow_stack(|stack| unsafe { *stack.slot(index) = root });
+    with_shadow_stack(|stack| {
+        normalize_published_slot(stack, index);
+    });
 }
 
 /// Visit every pinned root in the shadow stack with mutable access.
