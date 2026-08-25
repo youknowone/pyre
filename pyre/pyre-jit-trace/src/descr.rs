@@ -8120,6 +8120,38 @@ pub fn stale_absent_containers() -> Vec<String> {
         .collect()
 }
 
+/// One struct's field map holds both spellings a field descriptor can carry:
+/// the bare `field` and the `STRUCT.field` form `PyreFieldDescr` stores, which
+/// `get_field_descr` composes, and a single map mixes them — `W_TupleObject`'s holds
+/// `wrappeditems` and `hash` bare beside `PyObject.w_class` and
+/// `W_TupleObject.w_dict`. Which one a field arrives under depends on the
+/// producer that reached it first, so an analyzer member naming the field
+/// bare cannot be resolved by exact match alone. `all_fielddescrs`'s
+/// field-walk already joins the two forms this way.
+///
+/// A suffix hit still has to be unique. Two qualified keys can end in the
+/// same field — an inherited name redeclared by a subclass — and that IS the
+/// identity split the caller must not paper over, so it stays unresolved.
+fn lookup_field_by_either_spelling<'m>(
+    fields: &'m indexmap::IndexMap<String, std::sync::Arc<majit_ir::descr::SimpleFieldDescr>>,
+    field_name: &str,
+) -> Option<&'m std::sync::Arc<majit_ir::descr::SimpleFieldDescr>> {
+    if let Some(fd) = fields.get(field_name) {
+        return Some(fd);
+    }
+    let needle = format!(".{field_name}");
+    let mut hit = None;
+    for (stored, fd) in fields {
+        if stored.ends_with(&needle) {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(fd);
+        }
+    }
+    hit
+}
+
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -8132,7 +8164,7 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock().unwrap();
             match gc._cache_field.get(&struct_key) {
-                Some(inner) => match inner.get(field_name.as_str()) {
+                Some(inner) => match lookup_field_by_either_spelling(inner, field_name) {
                     Some(fd) => SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef),
                     None => SetMemberLookup::Ambiguous,
                 },
