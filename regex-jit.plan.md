@@ -1597,4 +1597,35 @@ plainly is in scope. The sibling `stmt_contains_call` already scores a macro as
 a hit for the same reason. Gated by `tests/jit_interp_macro_init_is_opaque.rs`,
 whose compiling at all is the gate.
 
+## The corpus's degraded arms, swept (0825)
+
+`MAJIT_LOG=1` over the 13 examples plus `regex`, deduped: 13 degraded arms over
+8 machines, five shapes. Nothing left in it is a majit defect.
+
+| shape | arms | verdict |
+|---|---|---|
+| `find_matching_open` / a `while` scan over `program` | braininterp, dualtape `b'['` `b']'` | data-dependent, genuinely unlowerable |
+| `pc += 8` after `i64::from_le_bytes(..)` | tiny2, tiny3 | the deliberate green-writeback refusal |
+| `storage_roll(state.stack.as_mut_ptr() as usize, ..)` | tl, tlc `ROLL` | a raw-pointer argument has no lowering |
+| `state.regs = vec![0; n]` | tlr `ALLOCATE` | allocation, outside the vocabulary |
+| `state.stack[i] = inputarg` | tl, tlc, spcount `PUSHARG` | below |
+
+`PUSHARG` looks like the `call_returns` shape — a `reds` key that this whole
+corpus uses zero times, beside three machines whose comments call `inputarg`
+"red by nature" — and is not. `red_schema` only *types* a binding that already
+exists; a declared red absent from the body panics, matching
+`decode_hp_hint_args`. It creates nothing. `inputarg` is a portal parameter, so
+it is an unknown local and the store refuses fail-closed, which tl's own test
+pins as `RefusalKind::UnlowerableStmt`. Carrying a portal parameter as a trace
+red is a feature — a binding at entry, a place in the merge-point payload, and
+the runtime plumbing to pass it — and a `state_fields` int is the workaround.
+
+`_ => return X` on the default edge was probed and left alone. `default_label`
+is bound at a return of the portal's *trailing expression*, so an explicit
+`return SENTINEL` there would answer `state.acc` instead. No arm in this corpus
+spells it, and the probe passes: the arm ends the portal, so it runs at most
+once per entry and is never hot enough to be traced. `_ => break` is correct on
+that edge by construction, because a break falls to the same trailing
+expression.
+
 Still open from the plan: "let a matchless portal lower".
