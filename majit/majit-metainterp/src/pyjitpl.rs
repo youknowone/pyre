@@ -4993,7 +4993,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Run `f` with the typed greenkey `[next_instr, is_being_profiled,
-    /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
+    /// pycode]` that matches `warmstate.py make_green_key`,
     /// reusing a thread-local `GreenKey` so the warmup-hot decision path
     /// does not allocate the key's value/type vectors per back-edge.
     /// `is_being_profiled` is the one green the raw `(code, pc)` pair does not
