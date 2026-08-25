@@ -244,6 +244,48 @@ fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
     assert!(summary.may_execute_effect);
 }
 
+/// Every `JitCode` descr names a body the jitcode table holds.
+///
+/// The descent scan answers `body_not_walked` — which declines the descent —
+/// when `get_jitcode_ref_by_index` produces nothing, and that function answers
+/// `None` only past the end of the table.  So whether that arm is ever taken
+/// is exactly this question, and the generated tables settle it rather than a
+/// run does.  Asserted rather than measured once: the comment on the arm says
+/// "unreachable in a consistent build", and this is the consistency it means.
+#[test]
+fn every_jitcode_descr_names_an_installed_body() {
+    let jitcodes = crate::jitcode_runtime::jitcode_count();
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let mut named = 0usize;
+    let mut out_of_range = Vec::new();
+    for slot in 0..descrs.len() {
+        let Some(index) = descrs
+            .at(slot)
+            .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+        else {
+            continue;
+        };
+        named += 1;
+        if index >= jitcodes {
+            out_of_range.push((slot, index));
+        }
+    }
+    // A table holding no JitCode descr at all would pass the assertion below
+    // while proving nothing, which is the shape of a test that cannot fail.
+    assert!(
+        named > 0,
+        "no JitCode descr among {} descrs -- this test proves nothing here",
+        descrs.len()
+    );
+    assert!(
+        out_of_range.is_empty(),
+        "{} of {named} JitCode descrs name an index outside the {jitcodes}-entry \
+         jitcode table: {out_of_range:?}",
+        out_of_range.len(),
+    );
+    eprintln!("[density] {named} JitCode descrs over {jitcodes} jitcodes");
+}
+
 /// A body the decoder cannot read to the end declines on that alone.  The
 /// instruction starts would otherwise name a prefix, and the `push!` gate drops
 /// targets that are not starts — so every path out of the undecodable byte

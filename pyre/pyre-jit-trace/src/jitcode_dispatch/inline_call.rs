@@ -916,10 +916,28 @@ fn collect_descent_unlowered_helper_blockers(
     blockers
 }
 
+/// The answer for a region of a descent the scan did not walk.
+///
+/// `may_execute_effect` because an unwalked region can have done anything, and
+/// `body_not_walked` because that is the condition itself; `descent_decline`
+/// reads the second alone as a refusal, so this is the fail-closed answer to
+/// "what does this body hold".
+fn body_not_walked() -> DescentBlockerSummary {
+    DescentBlockerSummary {
+        may_execute_effect: true,
+        body_not_walked: true,
+        ..DescentBlockerSummary::default()
+    }
+}
+
 /// Memoizing entry point for [`summarize_descent_blockers`].
 fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return DescentBlockerSummary::default();
+        // The same condition the descent answers `body_not_walked` for, one
+        // level up and with nothing walked at all.  Unreachable from the gate,
+        // which holds the `JitCode` this index came off; see the note in
+        // `summarize_descent_blockers`.
+        return body_not_walked();
     };
     jitcode.descent_blocker_summary(|| summarize_descent_blockers(jitcode_index, &mut Vec::new()))
 }
@@ -996,9 +1014,22 @@ fn summarize_descent_blockers(
         };
     }
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        // No installed body means no descent, so there is nothing to answer
-        // for; the caller declines on the same lookup.
-        return DescentBlockerSummary::default();
+        // A body the scan cannot obtain is a callee it holds nothing about, so
+        // it answers the same way as an `inline_call` whose descr names no
+        // JitCode.  Returning the default instead would say "executes no
+        // effect, holds no blocker" — the most permissive answer there is,
+        // reached by not looking — and would also let the blocker behind such a
+        // call read as effect-free, which asserts a rewind covers it.
+        //
+        // Unreachable in a consistent build, and not for the reason the entry
+        // point's own lookup suggests: `descent_blocker_summary` resolves the
+        // index before calling here, so at the top level this repeats a lookup
+        // that just succeeded and only the `inline_call` descent can arrive
+        // with an index of its own.  `get_jitcode_ref_by_index` answers `None`
+        // only past the end of the table — inside it, the cell is loaded on
+        // demand — and every `JitCode` descr names an index inside it: 2335 of
+        // 2335 in this build, over a table of 2905 whose indices are dense.
+        return body_not_walked();
     };
     seen.push(jitcode_index);
     let descrs = crate::jitcode_runtime::descr_ref_table();
@@ -1054,11 +1085,7 @@ pub(crate) fn summarize_body_blockers(
         // walking a graph already known to be partial can only produce an
         // answer that admits for the wrong reason.  Say what is actually
         // known instead.
-        return DescentBlockerSummary {
-            may_execute_effect: true,
-            body_not_walked: true,
-            ..DescentBlockerSummary::default()
-        };
+        return body_not_walked();
     }
 
     let mut entry_known = vec![None; num_regs_i + constants_i.len()];
