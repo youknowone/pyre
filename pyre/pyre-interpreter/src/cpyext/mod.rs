@@ -451,15 +451,17 @@ pub fn load_extension_module(
             )
         })?;
 
-    let found = match lookup_init(handle, name) {
-        Ok(found) => found,
-        Err(error) => {
-            rustpython_host_env::ctypes::drop_library(handle);
-            return Err(error);
-        }
-    };
+    // Every path from here leaves the library loaded, however it fails.  The
+    // handle cache keeps one `dlopen` count per library and hands the same
+    // handle back to a second open, so closing it here unloads the image
+    // outright -- and a multi-phase module never records its path in
+    // `EXTENSIONS`, so a later load of a *different* name out of the same file
+    // reaches this code while the modules the earlier loads built are still
+    // live.  Their types' `tp_traverse` is then a pointer into text nobody has
+    // mapped, which the next minor collection walks.  Upstream keeps the
+    // library on both of these failures.
+    let found = lookup_init(handle, name)?;
     let Some((protocol, address)) = found else {
-        rustpython_host_env::ctypes::drop_library(handle);
         return Err(missing_init_error(name, path));
     };
 
@@ -486,13 +488,7 @@ pub fn load_extension_module(
         }
     };
 
-    let init_result = match answer {
-        Ok(module) => module,
-        Err(error) => {
-            rustpython_host_env::ctypes::drop_library(handle);
-            return Err(error);
-        }
-    };
+    let init_result = answer?;
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(init_result.module());
