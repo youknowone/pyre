@@ -84,8 +84,11 @@ pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) ->
             // typed `w_annotate` slot.
             unsafe { crate::function::function_set_annotate_unchecked(func, attr) };
         }
-        // `TypeParams = 5` carries a PEP 695 type-parameter tuple; pyre has
-        // no PEP 695 surface, so the operand is accepted silently.
+        // `TypeParams = 5` names a PEP 695 type-parameter tuple, but the
+        // codegen never sets that bit: a generic `def` stamps its parameters
+        // through `CALL_INTRINSIC_2 INTRINSIC_SET_FUNCTION_TYPE_PARAMS`
+        // instead, which writes `Function.w_typeparams`.  Accept the operand
+        // rather than panic on a bytecode stream that does carry it.
         _ => {}
     }
     func as i64

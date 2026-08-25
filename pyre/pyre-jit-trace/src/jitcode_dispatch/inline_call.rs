@@ -122,6 +122,126 @@ unsafe fn positional_defaults_for_inline(
     })
 }
 
+/// One keyword-only parameter's binding: the interned name the lookup keys
+/// on, its hash, the entry index the record-time lookup settled on, and the
+/// value that entry held.
+struct KwonlyDefaultInline {
+    key: pyre_object::PyObjectRef,
+    hash: i64,
+    index: i64,
+    value: pyre_object::PyObjectRef,
+}
+
+/// What the record-time resolve proved about `Function.w_kw_defs`, carried to
+/// the emit so it re-establishes the same shape instead of re-deriving it.
+struct KwonlyDefaultsInline {
+    dict: pyre_object::PyObjectRef,
+    canonical_dict: pyre_object::PyObjectRef,
+    values: Vec<KwonlyDefaultInline>,
+}
+
+/// The `w_kw_defs` entry `_match_signature` fills each keyword-only
+/// parameter, in slot order.  A parameter the dict holds no entry for has no
+/// default at all and the call would raise `TypeError`, so the whole inline
+/// declines rather than reproduce a raise.
+///
+/// The interned name is the only thing this carries into the trace as a
+/// constant.  The dict, the entry index and the value are each re-derived live
+/// by the emitting half, and that is what keeps an in-place
+/// `f.__kwdefaults__[name] = ...` visible — every runtime observes such a
+/// write immediately, while an ordinary dict has no version the walker can pin
+/// (`walker_pin_namespace_version` wants a module dict's strategy box), so a
+/// baked value would be the constant nothing watches that it refuses to make.
+///
+/// # Safety
+/// `callable` must be the live `Function` and `w_code` its code object.
+unsafe fn kwonly_defaults_for_inline(
+    callable: pyre_object::PyObjectRef,
+    w_code: *const (),
+    arg_count: usize,
+    kwonly_count: usize,
+) -> Option<KwonlyDefaultsInline> {
+    let dict = unsafe { pyre_interpreter::function_get_kwdefaults(callable) };
+    if dict.is_null() {
+        return None;
+    }
+    let canonical_dict = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
+    let canonical_str = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    if canonical_dict.is_null() || canonical_str.is_null() {
+        return None;
+    }
+    // The three tests the `dict.lookup` fold gates on, for the same reasons: a
+    // dict SUBCLASS shares `ob_type` but reaches `__missing__` on a miss, and
+    // the unicode strategy is what makes the probe non-raising by proving
+    // every stored key is an exact str compared by WTF-8 bytes.
+    if unsafe {
+        !std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
+            || !std::ptr::eq((*dict).w_class, canonical_dict)
+            || pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind()
+                != pyre_object::dictmultiobject::StrategyKind::Unicode
+    } {
+        return None;
+    }
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let varnames = unsafe { &(*raw).varnames };
+    if varnames.len() < arg_count + kwonly_count {
+        return None;
+    }
+    let mut out = Vec::with_capacity(kwonly_count);
+    for slot in arg_count..arg_count + kwonly_count {
+        let key = pyre_object::unicodeobject::intern_str_value(varnames[slot].as_str());
+        if key.is_null()
+            || unsafe {
+                !std::ptr::eq((*key).ob_type, &pyre_object::pyobject::STR_TYPE)
+                    || !std::ptr::eq((*key).w_class, canonical_str)
+            }
+        {
+            return None;
+        }
+        // The key is baked, and a freshly minted `ConstPtr` sits in the
+        // walker's `registers_r` until it is recorded, which no registered
+        // root area walks.  Take only a name a collection cannot move.
+        if majit_gc::can_move(majit_ir::GcRef(key as usize)) {
+            return None;
+        }
+        let hash = unsafe { pyre_object::dictmultiobject::w_dict_unicode_key_hash(key) };
+        let index = unsafe {
+            pyre_object::dictmultiobject::w_dict_unicode_lookup_index(dict, key, hash, 0)
+        };
+        if index < 0 {
+            return None;
+        }
+        let value = unsafe {
+            pyre_object::dictmultiobject::w_dict_unicode_value_at_checked(
+                dict,
+                index as usize,
+                key,
+                hash,
+            )
+        };
+        if value.is_null() {
+            return None;
+        }
+        out.push(KwonlyDefaultInline {
+            key,
+            hash,
+            index,
+            value,
+        });
+    }
+    Some(KwonlyDefaultsInline {
+        dict,
+        canonical_dict,
+        values: out,
+    })
+}
+
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
 /// constant.  This is the walk-time mirror of the codewriter's non-portal
@@ -1797,9 +1917,9 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
 }
 
 /// The scope slot `_match_signature` writes the vararg tuple into
-/// (`argument.py:222-234`): `co_argcount + co_kwonlyargcount`.  This helper
-/// admits only the shape whose slot is exactly `co_argcount`, leaving
-/// `**kwargs` and keyword-only locals residual.
+/// (`_match_signature`): `co_argcount + co_kwonlyargcount`.  `**kwargs`
+/// still leaves the shape residual — see [`fbw_callee_kwonly_count`] for why
+/// that local is the one the seeding cannot build.
 fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -1811,12 +1931,32 @@ fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
     let flags = unsafe { (*raw).flags };
     if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
         && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
-        && unsafe { (*raw).kwonlyarg_count } == 0
     {
-        Some(unsafe { (*raw).arg_count as usize })
+        Some(unsafe { (*raw).arg_count as usize + (*raw).kwonlyarg_count as usize })
     } else {
         None
     }
+}
+
+/// How many keyword-only locals the seeding has to fill, or `None` when the
+/// callee's scope owns one it cannot build at all.
+///
+/// `**kwargs` is that one.  `_match_signature` writes a FRESH mapping into it
+/// on every call (`_match_signature`), and unlike the vararg's empty tuple a
+/// `dict` is mutable, so there is no shared object to bind and no allocation
+/// the walk can stand in for.  That shape stays residual.
+fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return None;
+    }
+    if unsafe { (*raw).flags }.contains(pyre_interpreter::CodeFlags::VARKEYWORDS) {
+        return None;
+    }
+    Some(unsafe { (*raw).kwonlyarg_count } as usize)
 }
 
 unsafe fn fbw_reorder_call_kw_args(
@@ -3460,11 +3600,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a
-    // surplus tuple for `*args` (`argument.py:222-234`); seed that one extra
-    // local here while keeping `**kwargs` and keyword-only locals residual.
+    // surplus tuple for `*args` and fills each keyword-only local from
+    // `w_kw_defs` (`_match_signature`); seed both
+    // of those extra locals here, leaving only `**kwargs` residual.
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
-    if !positional_only && vararg_slot.is_none() {
+    // `**kwargs` is the one local left: `None` here is that decline.
+    let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
+        return resolved_inline_decline(op.pc, line!());
+    };
+    if !positional_only && vararg_slot.is_none() && kwonly_count == 0 {
         return resolved_inline_decline(op.pc, line!());
     }
     // Not every caller pins the callee function itself.  A specializer that
@@ -3548,6 +3693,31 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         Some(defaults)
     };
+    // `_match_signature` fills every keyword-only local from `w_kw_defs`
+    // (`_match_signature`) before it writes the vararg slot.  Resolved here
+    // so a missing default still declines without having recorded anything;
+    // the live reads are emitted alongside the positional defaults below.
+    let kwonly_defaults = if kwonly_count == 0 {
+        None
+    } else {
+        // The dict is read off `callable_guard_op` while the resolve below
+        // reads it off `callable`, so unless the two name the same object the
+        // walk would stamp one function's defaults onto the other's live
+        // reads.  `guards_the_callee_function` is not that test: it proves the
+        // pinned object is *a* function carrying this code, which two closures
+        // minted from one `def` both are.  It is also not the test to gate on
+        // — a module-level callee reaches here with its function baked, which
+        // clears the flag and is the ordinary shape, not a corner.
+        if callable_guard_value != callable {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        let Some(resolved) =
+            (unsafe { kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count) })
+        else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        Some(resolved)
+    };
     // The surplus positional arguments `_match_signature` packs into the
     // vararg.  Collected here and emitted alongside the defaults below, so
     // every remaining eligibility check still declines without having recorded
@@ -3563,10 +3733,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if bound_method.is_some() && nparams == 0 {
             return resolved_inline_decline(op.pc, line!());
         }
-        if callee_arg_concretes.len() != callee_args.len() || callee_args.len() <= nparams {
-            // The empty tuple is a runtime singleton (`() is tuple([])`), so a
-            // freshly allocated walker tuple would not be the object the
-            // interpreter installs for a zero-surplus call.
+        if callee_arg_concretes.len() != callee_args.len() || callee_args.len() < nparams {
             return resolved_inline_decline(op.pc, line!());
         }
         let surplus_ops: Vec<OpRef> = callee_args[nparams..].to_vec();
@@ -3580,21 +3747,42 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             surplus_concretes.push(obj);
         }
-        // A new allocation with no heap mutation, safe during the walk, and the
-        // same constructor `emit_object_tuple_inline` reproduces.
+        // The constructor the interpreter's own `pack_varargs` reaches, so the
+        // walk binds the object the residual would have: a new allocation with
+        // no heap mutation for a surplus — the one `emit_object_tuple_inline`
+        // reproduces below — and the shared `()` for none.
         let concrete = pyre_object::w_tuple_new_array_backed(surplus_concretes);
         if concrete.is_null() {
             return resolved_inline_decline(op.pc, line!());
         }
+        // A zero-surplus vararg is baked rather than built (see the emit
+        // below), and a freshly minted `ConstPtr` sits in the walker's
+        // `registers_r`, which no registered root area walks.  So the object
+        // has to be one a collection during this walk cannot move.
+        if surplus_ops.is_empty() && majit_gc::can_move(majit_ir::GcRef(concrete as usize)) {
+            return resolved_inline_decline(op.pc, line!());
+        }
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
-        callee_args.push(OpRef::NONE);
-        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
         Some((surplus_ops, concrete))
     } else {
         None
     };
-    let seeded_locals = nparams + usize::from(vararg_slot.is_some());
+    // Frame order is positional, then keyword-only, then the vararg
+    // (`_match_signature`), so the placeholders are appended in that order and
+    // the tuple's own slot moves out past the keyword-only block.
+    if let Some(resolved) = kwonly_defaults.as_ref() {
+        for kwonly in &resolved.values {
+            callee_args.push(OpRef::NONE);
+            callee_arg_concretes.push(ConcreteValue::Ref(kwonly.value));
+        }
+    }
+    if let Some((_, concrete)) = vararg_surplus.as_ref() {
+        callee_args.push(OpRef::NONE);
+        callee_arg_concretes.push(ConcreteValue::Ref(*concrete));
+    }
+    let vararg_index = nparams + kwonly_count;
+    let seeded_locals = vararg_index + usize::from(vararg_slot.is_some());
     // Does any incoming binding land a value the callee's register banks can
     // hold unboxed?  Only the `is`-against-None scan below consults this; see
     // its hazard-2 arm for why an int-specialized tested local is unsafe to
@@ -4702,15 +4890,173 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     }
 
+    // `scope_w[i] = space.finditem_str(w_kw_defs, name)` (`_match_signature`),
+    // replacing the keyword-only placeholders pushed above.
+    //
+    // Every part of the read is live.  The dict comes off the guarded
+    // function, the entry index is re-derived by the same elidable
+    // `w_dict_unicode_lookup_index` the `dict.lookup` fold emits — so the
+    // optimizer may hoist it while a store that moves the entry invalidates it
+    // — and the value is read through `jit_dict_value_at`, which re-validates
+    // the index against the key it came from.  That last read is what keeps an
+    // in-place `f.__kwdefaults__[name] = ...` visible on the very next call,
+    // which is what every runtime does.
+    if let Some(resolved) = kwonly_defaults {
+        let kw_defs_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            callable_guard_op,
+            crate::descr::function_w_kw_defs_descr(),
+        );
+        ctx.trace_ctx.try_set_opref_concrete(
+            kw_defs_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(resolved.dict as usize)),
+        );
+        // Which shape the mapping was read with is all that trace time
+        // decided; the entry itself is read live below.
+        //
+        // With the function guarded live, re-check that shape directly, and a
+        // later `f.__kwdefaults__ = {...}` is picked up by the field read
+        // itself.  With it baked, the read comes off a `ConstPtr` — sound
+        // here only because the arm above proved the callee cannot move — and
+        // nothing watches the slot, so pin the mapping by identity instead:
+        // that is what a rebind has to trip.  An in-place
+        // `f.__kwdefaults__[name] = ...` keeps the same object and stays
+        // visible through the live entry read, which is what it must do.
+        if guards_the_callee_function {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[kw_defs_op])?;
+            walker_guard_class(
+                ctx,
+                op.pc,
+                kw_defs_op,
+                &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+            )?;
+            // A dict SUBCLASS shares `ob_type` and reaches `__missing__`.  The
+            // resolve established this `w_class` and is what proved it
+            // non-null.
+            walker_guard_exact_w_class(ctx, op.pc, kw_defs_op, resolved.canonical_dict)?;
+        } else {
+            let dict_expected = ctx.trace_ctx.const_ref(resolved.dict as i64);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardValue, &[kw_defs_op, dict_expected], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        }
+        // The strategy is guarded either way: it is what proves every stored
+        // key is an exact str compared by WTF-8 bytes, so the probes below
+        // cannot run user code, and pinning the mapping by identity does not
+        // pin that — storing a non-str key switches the same dict off it.
+        let strategy = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            kw_defs_op,
+            crate::descr::dict_strategy_word_descr(),
+        );
+        let unicode_strategy_const = ctx
+            .trace_ctx
+            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[strategy, unicode_strategy_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(strategy, unicode_strategy_const);
+
+        let hash_fn = {
+            let f: extern "C" fn(i64) -> i64 =
+                pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash;
+            f as *const ()
+        };
+        let lookup_fn: extern "C" fn(i64, i64, i64, i64) -> i64 =
+            pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_lookup_index;
+        for (offset, kwonly) in resolved.values.into_iter().enumerate() {
+            let key_op = ctx.trace_ctx.const_ref(kwonly.key as i64);
+            let hash_op = ctx.trace_ctx.call_typed_with_effect_pure(
+                OpCode::CallI,
+                hash_fn,
+                &[key_op],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Int,
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::ElidableCannotRaise,
+                    majit_ir::OopSpecIndex::None,
+                ),
+                &[
+                    majit_ir::Value::Int(hash_fn as i64),
+                    majit_ir::Value::Ref(majit_ir::GcRef(kwonly.key as usize)),
+                ],
+                majit_ir::Value::Int(kwonly.hash),
+            );
+            let mut lookup_effect = majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::DictLookup,
+            );
+            lookup_effect.extradescrs = Some(vec![
+                crate::descr::dict_lookup_namespace_descr(),
+                crate::descr::dict_lookup_entries_array_descr(),
+            ]);
+            let lookup_flag = ctx.trace_ctx.const_int(0);
+            let index_op = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallI,
+                lookup_fn as *const (),
+                &[kw_defs_op, key_op, hash_op, lookup_flag],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Int,
+                ],
+                majit_ir::Type::Int,
+                lookup_effect,
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(index_op, majit_ir::Value::Int(kwonly.index));
+            let zero = ctx.trace_ctx.const_int(0);
+            let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[index_op, zero]);
+            ctx.trace_ctx
+                .set_opref_concrete(nonneg, majit_ir::Value::Int(1));
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonneg])?;
+
+            let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
+                crate::helpers::jit_dict_value_at as *const (),
+                &[kw_defs_op, index_op, key_op, hash_op],
+                &[
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                    majit_ir::Type::Ref,
+                    majit_ir::Type::Int,
+                ],
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::CannotRaise,
+                    majit_ir::OopSpecIndex::None,
+                ),
+            );
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value_op])?;
+            ctx.trace_ctx.set_opref_concrete(
+                value_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(kwonly.value as usize)),
+            );
+            callee_args[nparams + offset] = value_op;
+        }
+    }
+
     // `scope_w[co_argcount + co_kwonlyargcount] = space.newtuple(starargs_w)`
     // (`argument.py:233-234`), replacing the placeholder pushed above.
     if let Some((surplus_ops, concrete)) = vararg_surplus {
-        let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &surplus_ops);
-        ctx.trace_ctx.set_opref_concrete(
-            tuple_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-        );
-        callee_args[nparams] = tuple_op;
+        let tuple_op = if surplus_ops.is_empty() {
+            // `space.newtuple([])` hands back one process-wide object — a
+            // call that passes no surplus binds the same `()` every time, and
+            // `is_w` is pointer identity for a tuple — so building a fresh
+            // empty tuple here would bind an object the interpreter never
+            // installs.  Bake the one it does.  This is the ordinary way a
+            // `*args` callee is called, not a corner: `def f(a, *rest)` reached
+            // as `f(i)` was the whole shape being refused, and it ran 509x
+            // slower than the same callee reached as `f(i, 9)`, which inlined.
+            ctx.trace_ctx.const_ref(concrete as i64)
+        } else {
+            let op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &surplus_ops);
+            ctx.trace_ctx
+                .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)));
+            op
+        };
+        callee_args[vararg_index] = tuple_op;
     }
 
     let (

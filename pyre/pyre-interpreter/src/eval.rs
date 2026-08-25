@@ -4311,11 +4311,14 @@ impl OpcodeStepExecutor for PyFrame {
                     );
                 }
             }
-            // `MakeFunctionFlag::TypeParams` (oparg.rs:356) carries the
-            // tuple of TypeVar / ParamSpec / TypeVarTuple bound by a
-            // PEP 695 generic function.  Pyre has no PEP 695 surface
-            // yet (typing tests aren't in the bench suite); accept
-            // the operand silently rather than panic on the bytecode.
+            // `MakeFunctionFlag::TypeParams` names the tuple of
+            // TypeVar / ParamSpec / TypeVarTuple bound by a PEP 695 generic
+            // function, but the codegen never sets that bit: the parameters
+            // reach the function through
+            // `CALL_INTRINSIC_2 INTRINSIC_SET_FUNCTION_TYPE_PARAMS`, whose
+            // `set_function_typeparams` writes `Function.w_typeparams`.
+            // Accept the operand rather than panic on a bytecode stream that
+            // does carry it.
             MakeFunctionFlag::TypeParams => {}
         }
         self.push(func);
