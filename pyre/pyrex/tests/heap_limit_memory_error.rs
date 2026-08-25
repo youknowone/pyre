@@ -36,9 +36,14 @@
 //! receives nothing at all. Measured: the same program read from a file prints
 //! its traceback (the filesystem branch runs no Python), and a `-c` run of it
 //! prints nothing — while both raise, deliver and reach the top-level handler
-//! identically. A handler that frees before it reports has that headroom
-//! because the next cycle sweeps what it dropped, and it was clean on both
-//! dispatch loops and both allocation paths.
+//! identically.
+//!
+//! Freeing the live set before reporting is not enough either, and that cost a
+//! CI round to learn: dropping it only makes it collectable, and an in-flight
+//! cycle that already marked it sweeps nothing, so the completion still breaches
+//! and the abort still discards a `print` that a pipe had block buffered. The
+//! only report that cannot be lost is one that writes nothing and allocates
+//! nothing — the exit status, via `os._exit`.
 //!
 //! `--heapsize` rather than `PYPY_GC_MAX` because it also covers the launcher
 //! plumbing (`take_heapsize_option` -> `gc_set_max_heap_size`), which the env
@@ -83,28 +88,42 @@ const ROUNDS_LARGE: usize = 2_000;
 /// Keeps every object reachable, so the live set really does grow — a dead one
 /// would be reclaimed and the limit never reached.
 ///
-/// The handler drops the live set before it reports, so what it prints is
-/// evidence that the exception arrived, not evidence about how much headroom
-/// was left over after it.
+/// The handler reports by exiting, and `os._exit` rather than a `print` or a
+/// `raise`, because every other way of reporting is itself an allocation on a
+/// heap that is still at its limit. A `print` reaches a pipe, so it is block
+/// buffered and the buffer is discarded if anything later aborts; dropping the
+/// live set first does not help, because the in-flight cycle may already have
+/// marked it and so sweeps nothing. `os._exit` writes nothing, allocates
+/// nothing beyond the call, and skips finalization, which is precisely the
+/// "quit cleanly" the rung exists to offer. The status is the evidence.
 const GROW: &str = "\
+import os
 data = []
 try:
     for _ in range(ROUNDS):
         data.append([0] * WORDS)
-    print('completed')
 except MemoryError:
-    data = None
-    print('caught')
+    os._exit(CAUGHT)
+print('completed')
 ";
 
+/// The exit status the handler reports with. Distinct from anything the
+/// runtime itself exits with, so a bounded arm cannot pass by dying.
+const CAUGHT: i32 = 17;
+
+/// [`run_shape`] at the small shape, which is what every arm but the
+/// large-object one wants.
 fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
     run_shape(env, args, ROUNDS, WORDS)
 }
 
+/// Run [`GROW`] at the given shape, as `-c` source, and collect the child's
+/// output. `env` and `args` select the dispatch loop and the heap limit.
 fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -> Output {
     let src = GROW
         .replace("ROUNDS", &rounds.to_string())
-        .replace("WORDS", &words.to_string());
+        .replace("WORDS", &words.to_string())
+        .replace("CAUGHT", &CAUGHT.to_string());
     let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     argv.push("-c".to_string());
     argv.push(src);
@@ -116,6 +135,9 @@ fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -
     cmd.output().expect("spawn pyre-dynasm")
 }
 
+/// A failure message carrying the child's status, its stdout, and the tail of
+/// its stderr — an assertion here fails in a subprocess, so the parent has to
+/// quote it or the reason is lost.
 fn report(what: &str, out: &Output) -> String {
     format!(
         "{what} exited {:?}\n--- stdout ---\n{}\n--- stderr tail ---\n{}",
@@ -141,19 +163,12 @@ fn assert_caught(what: &str, out: &Output) {
             out
         )
     );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("caught"),
+    assert_eq!(
+        out.status.code(),
+        Some(CAUGHT),
         "{}",
         report(
             &format!("{what}: the limit never became a Python exception"),
-            out
-        )
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        report(
-            &format!("{what}: the handler ran but the process still died"),
             out
         )
     );
