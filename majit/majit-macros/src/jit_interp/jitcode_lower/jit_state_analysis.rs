@@ -140,6 +140,19 @@ impl<'c> Lowerer<'c> {
                 .stmts
                 .iter()
                 .any(|s| self.stmt_references_unknown_local(s)),
+            // A macro invocation's tokens are opaque to this walk. The
+            // question it answers is whether the expression names anything
+            // the generated scope will not carry, and it cannot answer that
+            // about tokens it never reads — so reporting "no reference" is
+            // an assumption, not a finding. `lower_local`'s runtime-constant
+            // fallback reads this as permission to emit the initialiser
+            // verbatim into the `__builder` block, where the portal's own
+            // parameters and locals do not exist: `let bump = pick!(sel);`
+            // ahead of the merge point put `match sel { .. }` in
+            // `__dispatch_jitcode_*`, whose parameters are the assembler and
+            // the driver index. `stmt_contains_call` below scores a macro the
+            // same way, for the same reason.
+            Expr::Macro(_) => true,
             // Literals, returns without expression, etc. are safe.
             _ => false,
         }
