@@ -11050,12 +11050,24 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key(
-        frame_root.frame().pycode,
-        frame_root.frame().next_instr(),
-        frame_root.frame().get_is_being_profiled(),
-    );
+    let code_ptr = frame_root.frame().pycode;
+    let entry_pc = frame_root.frame().next_instr();
+    let is_being_profiled = frame_root.frame().get_is_being_profiled();
+    let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let (driver, info) = driver_pair();
+
+    // `maybe_compile_and_run` matches the greens with `JitCell.comparekey`
+    // before anything is read off a cell, so resolve the bucket hash to the key
+    // that names one cell first. Deciding on the bare hash answers about
+    // whichever cell heads a chained bucket: this entry point read "nothing
+    // compiled" for a function whose own cell held a runnable loop, so it
+    // ticked the counter and asked to trace at every call, while
+    // `force_start_tracing_for_key` -- which does walk the chain -- answered
+    // `RunCompiled` and refused. Neither side moved, the compiled code was
+    // never entered, and every call paid a full trace-start attempt.
+    let green_key = driver.resolve_cell_key(green_key_hash, || {
+        pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
+    });
 
     // RPython warmstate.py maybe_compile_and_run fast path:
     // if no runnable compiled loop and not tracing, just tick the counter.
