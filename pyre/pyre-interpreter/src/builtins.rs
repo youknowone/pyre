@@ -8155,13 +8155,17 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
-/// PyPy: each exception type's descr__new__ creates a W_<Kind>Object.
+/// PyPy: `_new.descr_new_base_exception` unpacks `__args__`, stores `args_w`,
+/// and deliberately ignores `kwds_w`; each exception type's descr__new__ then
+/// creates a W_<Kind>Object.  Pyre's flat builtin ABI carries those keywords
+/// in a trailing marker dict, so remove it before constructing `args_w`.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
         pub(crate) fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            let exc = $ctor(rest)?;
+            let (positional, _) = split_builtin_kwargs(rest);
+            let exc = $ctor(positional)?;
             // Set the exception's w_class to the actual exception type (e.g. AssertionError)
             // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
             if let Some(cls) = cls {
@@ -8489,6 +8493,42 @@ fn make_exc_type_with_doc(
     make_exc_type_with_init(name, Some(doc), new_fn, None, base)
 }
 
+/// The interpreter class that owns an exception TypeDef's instance layout.
+///
+/// `interp_exceptions.py` uses `_new_exception` for fieldless classes; those
+/// keep their base interpreter class and therefore reuse its Layout.  The
+/// concrete `class W_*` definitions below introduce fields and each owns a
+/// child Layout: `W_BaseException`, `W_ImportError`,
+/// `W_UnicodeTranslateError`, `W_StopIteration`, `W_OSError`, `W_NameError`,
+/// `W_SyntaxError`, `W_SystemExit`, `W_UnicodeDecodeError`,
+/// `W_AttributeError`, `W_UnicodeEncodeError`, and
+/// `interp_group.W_BaseExceptionGroup`.
+fn exception_layout_pytype(name: &str, base: PyObjectRef) -> *const pyre_object::PyType {
+    use pyre_object::interp_exceptions as exc;
+    match name {
+        "BaseException" => &exc::EXCEPTION_TYPE,
+        "ImportError" => &exc::EXC_IMPORT_ERROR_TYPE,
+        "UnicodeTranslateError" => &exc::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
+        "StopIteration" => &exc::EXC_STOP_ITERATION_TYPE,
+        "OSError" => &exc::EXC_OS_ERROR_TYPE,
+        "NameError" => &exc::EXC_NAME_ERROR_TYPE,
+        "SyntaxError" => &exc::EXC_SYNTAX_ERROR_TYPE,
+        "SystemExit" => &exc::EXC_SYSTEM_EXIT_TYPE,
+        "UnicodeDecodeError" => &exc::EXC_UNICODE_DECODE_ERROR_TYPE,
+        "AttributeError" => &exc::EXC_ATTRIBUTE_ERROR_TYPE,
+        "UnicodeEncodeError" => &exc::EXC_UNICODE_ENCODE_ERROR_TYPE,
+        "BaseExceptionGroup" => &exc::EXC_BASE_EXCEPTION_GROUP_LAYOUT_TYPE,
+        _ => unsafe {
+            let parent = pyre_object::w_type_get_layout_ptr(base);
+            if parent.is_null() {
+                &exc::EXCEPTION_TYPE
+            } else {
+                (*parent).typedef
+            }
+        },
+    }
+}
+
 /// Variant of `make_exc_type` that also installs a per-class `__init__`
 /// descriptor.  Used for the three Unicode*Error subclasses whose PyPy
 /// `descr_init` does typed slot stamping after `__new__`'s raw
@@ -8507,11 +8547,12 @@ pub(crate) fn make_exc_type_with_init(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    // Every exception class shares one instance layout, distinct from
-    // `object`'s: `class E(Exception, ValueError)` is fine, `class E(Exception,
-    // list)` is an instance lay-out conflict.  The subclasses reach the same
-    // Layout object through the reuse rule (their parent layout already names
-    // this typedef).
+    // `setup_builtin_type` reuses the parent's Layout for `_new_exception`
+    // aliases and creates a child for each concrete `W_*` interpreter class.
+    // That graph is what makes e.g. `(ValueError, OSError)` compatible while
+    // rejecting the sibling layouts `(UnicodeTranslateError,
+    // UnicodeEncodeError)`.
+    let layout_pytype = exception_layout_pytype(name, base);
     let cls = crate::typedef::make_builtin_type_with_layout(
         name,
         move |ns| {
@@ -8995,7 +9036,7 @@ pub(crate) fn make_exc_type_with_init(
             }
         },
         base,
-        &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const pyre_object::PyType,
+        layout_pytype,
     );
     if name == "SyntaxError" {
         for member_name in [
@@ -9738,7 +9779,8 @@ fn make_exception_group_type(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    let cls = crate::typedef::make_builtin_type_with_bases(
+    let layout_pytype = exception_layout_pytype(name, bases[0]);
+    let cls = crate::typedef::make_builtin_type_with_bases_and_layout(
         name,
         move |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
@@ -9835,6 +9877,7 @@ fn make_exception_group_type(
             }
         },
         bases,
+        layout_pytype,
     );
     if name == "BaseExceptionGroup" {
         for member_name in ["message", "exceptions"] {
@@ -19830,6 +19873,65 @@ mod tests {
                 Err(error) => panic!("only {index} of {THREADS} threads finished: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn exception_new_ignores_keyword_marker_when_storing_args() {
+        let _ = new_builtin_module_dict();
+        let cls = lookup_exc_class("Exception").unwrap();
+        let kwargs = pyre_object::w_dict_new();
+        unsafe {
+            pyre_object::w_dict_store(
+                kwargs,
+                pyre_object::w_str_new("x"),
+                pyre_object::w_int_new(8),
+            );
+            pyre_object::w_dict_store(
+                kwargs,
+                pyre_object::kw_marker::w_kw_marker_key(),
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+        }
+
+        let exc = exc_exception_new(&[cls, kwargs]).unwrap();
+        let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
+        assert_eq!(unsafe { pyre_object::w_list_len(stored) }, 0);
+    }
+
+    #[test]
+    fn exception_layouts_follow_concrete_pypy_interpreter_classes() {
+        let _ = new_builtin_module_dict();
+        let value_error = lookup_exc_class("ValueError").unwrap();
+        let os_error = lookup_exc_class("OSError").unwrap();
+        let compatible = pyre_object::w_tuple_new(vec![value_error, os_error]);
+        let best = unsafe { crate::call::check_and_find_best_base(compatible) }.unwrap();
+        assert!(std::ptr::eq(best, os_error));
+
+        let translate = lookup_exc_class("UnicodeTranslateError").unwrap();
+        let encode = lookup_exc_class("UnicodeEncodeError").unwrap();
+        let conflicting = pyre_object::w_tuple_new(vec![translate, encode]);
+        let error = unsafe { crate::call::check_and_find_best_base(conflicting) }.unwrap_err();
+        assert_eq!(error.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            error.message_text(),
+            "instance layout conflicts in multiple inheritance"
+        );
+
+        let arithmetic = lookup_exc_class("ArithmeticError").unwrap();
+        let exception_group = lookup_exc_class("ExceptionGroup").unwrap();
+        let compatible_group = pyre_object::w_tuple_new(vec![arithmetic, exception_group]);
+        let best = unsafe { crate::call::check_and_find_best_base(compatible_group) }.unwrap();
+        assert!(std::ptr::eq(best, exception_group));
+
+        let base_exception_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+        let conflicting_group = pyre_object::w_tuple_new(vec![os_error, base_exception_group]);
+        let error =
+            unsafe { crate::call::check_and_find_best_base(conflicting_group) }.unwrap_err();
+        assert_eq!(error.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            error.message_text(),
+            "instance layout conflicts in multiple inheritance"
+        );
     }
 
     #[test]

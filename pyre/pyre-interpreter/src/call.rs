@@ -6169,13 +6169,24 @@ pub(crate) unsafe fn check_and_find_best_base(
                         continue;
                     }
                     let layout = pyre_object::w_type_get_layout_ptr(w_base);
+                    // PyPy's concrete W_* exception classes have distinct
+                    // TypeDefs in one inherited Layout chain.  Pyre stores
+                    // their fields in the flattened W_BaseException union,
+                    // so distinct native PyType tags inside that family are
+                    // physically compatible exactly when `issublayout` says
+                    // they are.  Keep the native-layout guard for unrelated
+                    // Rust structs, where semantic inheritance alone does not
+                    // make their allocations prefix-compatible.
+                    let exception_layouts =
+                        is_exception_layout(best_layout) && is_exception_layout(layout);
                     let native_layout_conflict = !layout.is_null()
                         && !std::ptr::eq((*best_layout).typedef, (*layout).typedef)
                         && !std::ptr::eq(
                             (*best_layout).typedef,
                             &pyre_object::pyobject::INSTANCE_TYPE,
                         )
-                        && !std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE);
+                        && !std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE)
+                        && !exception_layouts;
                     if !layout.is_null()
                         && (!(*best_layout).issublayout(layout) || native_layout_conflict)
                     {
@@ -6187,6 +6198,29 @@ pub(crate) unsafe fn check_and_find_best_base(
             }
         }
         Ok(w_bestbase)
+    }
+}
+
+/// Whether `layout` belongs to the inherited `W_BaseException` interpreter
+/// layout chain.
+///
+/// Layout-only TypeDef identities such as PyPy's
+/// `interp_group.W_BaseExceptionGroup` are not object vtables and therefore
+/// have no `subclassrange` entry.  Walk the Layout ownership chain itself,
+/// exactly the axis `Layout.issublayout` uses, instead of asking
+/// `ll_issubclass` about an allocation vtable.
+unsafe fn is_exception_layout(mut layout: *const pyre_object::typeobject::Layout) -> bool {
+    unsafe {
+        while !layout.is_null() {
+            if std::ptr::eq(
+                (*layout).typedef,
+                &pyre_object::interp_exceptions::EXCEPTION_TYPE,
+            ) {
+                return true;
+            }
+            layout = (*layout).base_layout;
+        }
+        false
     }
 }
 

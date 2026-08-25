@@ -78,6 +78,50 @@ except NewException as e:
     assert e.value == "test"
 
 
+class KeywordException(Exception):
+    def __init__(self, *, value):
+        self.value = value
+
+
+exc = KeywordException(value="test")
+assert exc.value == "test"
+assert exc.args == ()
+
+# PyPy `check_and_find_best_base`: fieldless exception aliases reuse their
+# parent's Layout, while concrete W_* siblings conflict.
+class CompatibleException(ValueError, OSError):
+    pass
+
+
+assert issubclass(CompatibleException, ValueError)
+assert issubclass(CompatibleException, OSError)
+
+try:
+    class ConflictingUnicodeErrors(UnicodeTranslateError, UnicodeEncodeError):
+        pass
+except TypeError as exc:
+    assert "layout conflict" in str(exc) or "lay-out conflict" in str(exc)
+else:
+    assert False, "conflicting Unicode error layouts accepted"
+
+# `interp_group.W_BaseExceptionGroup` owns a concrete child Layout while
+# `W_ExceptionGroup` reuses it. Fieldless exception aliases remain compatible
+# and the group becomes the best base; concrete sibling layouts conflict.
+class CompatibleGroup(ArithmeticError, ExceptionGroup):
+    pass
+
+
+assert CompatibleGroup.__base__ is ExceptionGroup
+
+try:
+    class ConflictingGroup(OSError, BaseExceptionGroup):
+        pass
+except TypeError as exc:
+    assert "layout conflict" in str(exc) or "lay-out conflict" in str(exc)
+else:
+    assert False, "BaseExceptionGroup sibling layout conflict accepted"
+
+
 exc = SyntaxError("msg", 1, 2, 3, 4, 5)
 assert exc.msg == "msg"
 assert exc.filename is None

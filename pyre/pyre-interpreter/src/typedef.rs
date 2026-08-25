@@ -2762,6 +2762,23 @@ pub fn make_builtin_type_with_bases(
             (*parent_layout).typedef
         }
     };
+    make_builtin_type_with_bases_and_layout(name, init, bases, layout_pytype)
+}
+
+/// [`make_builtin_type_with_bases`] with an explicit interpreter TypeDef
+/// identity for a concrete class that introduces its own instance Layout.
+///
+/// PyPy `setup_builtin_type` receives the concrete `instancetypedef` even for
+/// a TypeDef with multiple declared bases.  Most multi-base builtins introduce
+/// no interpreter class and use the wrapper above; concrete owners such as
+/// `interp_group.W_BaseExceptionGroup` take this path.
+pub fn make_builtin_type_with_bases_and_layout(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    bases: &[PyObjectRef],
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    let base = bases[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
