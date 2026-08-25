@@ -30,6 +30,13 @@ const PREFIX: &[u8] = b"# type: ";
 /// `TYPE_IGNORE`.
 pub struct TypeComment {
     start: u32,
+    /// Where `text` begins.  `lexer.c` starts the token past the prefix, so
+    /// this is the position a diagnostic about the token reports.
+    text_start: u32,
+    /// Just past the last byte before the comment that is not a space, a tab
+    /// or a form feed.  A rule that takes the comment as its very next token
+    /// is satisfied exactly when the node it follows ends at or after this.
+    code_end: u32,
     pub lineno: u32,
     pub text: String,
 }
@@ -40,6 +47,8 @@ impl TypeComment {
     pub fn new(lineno: u32, text: String) -> Self {
         Self {
             start: 0,
+            text_start: 0,
+            code_end: 0,
             lineno,
             text,
         }
@@ -48,8 +57,9 @@ impl TypeComment {
 
 /// Every `# type:` comment a parse found, split by what the lexer would call
 /// it. The comments are consumed as they are attached; the grammar gives each
-/// one at most one home, and one it never reaches is simply dropped, which is
-/// what the lexer's own `TYPE_COMMENT` token does when no rule accepts it.
+/// one at most one home, and one it never reaches is a `TYPE_COMMENT` token
+/// standing where no rule accepts it, which is a parse failure -- see
+/// [`TypeComments::misplaced`].
 #[derive(Default)]
 pub struct TypeComments {
     comments: Vec<TypeComment>,
@@ -117,6 +127,12 @@ pub fn collect(tokens: &[Token], source: &str) -> TypeComments {
         let lineno = out
             .line_starts
             .partition_point(|first| *first as usize <= start) as u32;
+        // The three bytes skipped are ASCII, so the last byte that is not one
+        // of them ends whatever character it belongs to.
+        let code_end = source.as_bytes()[..start]
+            .iter()
+            .rposition(|byte| !matches!(byte, b' ' | b'\t' | 0x0c))
+            .map_or(0, |index| index + 1) as u32;
         if is_ignore(&text.as_bytes()[at..]) {
             // The tag runs to the end of the comment, and takes the line break
             // with it when nothing but whitespace precedes the comment on its
@@ -134,12 +150,16 @@ pub fn collect(tokens: &[Token], source: &str) -> TypeComments {
             }
             out.ignores.push(TypeComment {
                 start: start as u32,
+                text_start: (start + at) as u32,
+                code_end,
                 lineno,
                 text: tag,
             });
         } else {
             out.comments.push(TypeComment {
                 start: start as u32,
+                text_start: (start + at) as u32,
+                code_end,
                 lineno,
                 text: text[at..].to_owned(),
             });
@@ -164,14 +184,73 @@ impl TypeComments {
         Some(self.comments[index].text.as_str().into())
     }
 
-    /// The first unattached comment on the same line as `offset`, consumed.
+    /// The unattached comment standing directly after `offset`, consumed.
     ///
-    /// An assignment takes its comment before the line break that ends the
-    /// statement, so the span runs from the value's end to the next line.
-    fn take_to_line_end(&mut self, offset: u32) -> Option<Box<str>> {
-        let next = self.line_starts.partition_point(|first| *first <= offset);
-        let to = self.line_starts.get(next).copied().unwrap_or(u32::MAX);
-        self.take(offset, to)
+    /// An assignment's rule reads its `TYPE_COMMENT` straight after the value,
+    /// so the comment has to be the next token: in `x = 1; y = 2  # type: int`
+    /// it belongs to the second assignment and in `x = 1;  # type: int` to
+    /// neither.  Only spaces and tabs may stand between, which a line break
+    /// is not -- a comment on the following line is nobody's.
+    fn take_adjacent(&mut self, offset: u32) -> Option<Box<str>> {
+        let index = self
+            .comments
+            .iter()
+            .enumerate()
+            .find(|(index, comment)| {
+                !self.attached[*index] && comment.start >= offset && comment.code_end <= offset
+            })
+            .map(|(index, _)| index)?;
+        self.attached[index] = true;
+        Some(self.comments[index].text.as_str().into())
+    }
+
+    /// The `SyntaxError` a comment the grammar had no place for owes, if any.
+    ///
+    /// A `TYPE_COMMENT` is a token, so a rule that does not accept one leaves
+    /// the parser looking at a token it cannot shift and the parse fails
+    /// there: `x += 1  # type: int` and `x: int = 1  # type: int` are both
+    /// refused, while the five accepted positions are not. The failure is the
+    /// parser's ordinary one, so the message is `invalid syntax` and the span
+    /// is the token -- the type text, not the `#`.
+    ///
+    /// Answers the first such comment in source order, which is the one the
+    /// parser would have reached first.
+    ///
+    /// `file_input` says whether the tokenizer appends the line break a source
+    /// without one is missing: file input gets one, so its reported line always
+    /// ends in `\n`, while `eval` and `single` input report the line as it
+    /// stands.
+    pub fn misplaced(&self, source: &str, file_input: bool) -> Option<crate::PyError> {
+        let comment = self
+            .comments
+            .iter()
+            .zip(self.attached.iter())
+            .find(|(_, attached)| !**attached)
+            .map(|(comment, _)| comment)?;
+        let line_start = self.line_starts[comment.lineno as usize - 1] as usize;
+        let column = crate::builtins::syntax_error_character_offset(
+            source,
+            comment.lineno as usize,
+            comment.text_start as usize - line_start + 1,
+        ) as i64;
+        let mut line = source[line_start..]
+            .split_inclusive('\n')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if file_input && !line.ends_with('\n') {
+            line.push('\n');
+        }
+        Some(crate::PyError::syntax_error_located(
+            "invalid syntax",
+            // `compile()` overwrites this with the name it was given.
+            rustpython_wtf8::Wtf8::new(""),
+            comment.lineno as i64,
+            column,
+            comment.lineno as i64,
+            column + comment.text.chars().count() as i64,
+            Some(&line),
+        ))
     }
 
     /// Attach every comment the grammar has a place for, and answer the
@@ -191,7 +270,7 @@ impl TypeComments {
     fn stmt(&mut self, stmt: &mut ast::Stmt) {
         match stmt {
             ast::Stmt::Assign(node) => {
-                node.runtime_type_comment = self.take_to_line_end(node.range.end().into());
+                node.runtime_type_comment = self.take_adjacent(node.range.end().into());
             }
             ast::Stmt::For(node) => {
                 let from = node.iter.range().end().into();
