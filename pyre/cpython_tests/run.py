@@ -175,10 +175,18 @@ def platform_gate(module: str) -> str | None:
 # headers `pyrex`'s cpyext fixtures compile against.  It reaches the modules
 # below and no others: `PYTHONPATH` is language-visible, and several modules
 # assert on the path their own child interpreters inherit.
-TESTBUFFER_SOURCE = ROOT / "lib_pypy" / "_testbuffer.c"
+TEST_EXTENSION_SOURCES = {
+    "_testbuffer": ROOT / "lib_pypy" / "_testbuffer.c",
+    "_testsinglephase": ROOT / "lib_pypy" / "_testsinglephase.c",
+    "_testmultiphase": ROOT / "lib_pypy" / "_testmultiphase.c",
+}
 CPYEXT_INCLUDE = ROOT / "include" / "pyre3.14t"
+# The headers CPython keeps out of an installed tree and builds these modules
+# against inside its own: `_PyNamespace_New` and the argument parser Argument
+# Clinic writes calls to both live behind one.
+CPYEXT_INTERNAL_INCLUDE = CPYEXT_INCLUDE / "internal"
 EXTENSION_BUILD_DIR = ROOT / "build" / "cpython_tests"
-NEEDS_TEST_EXTENSION = {"test.test_buffer"}
+NEEDS_TEST_EXTENSION = {"test.test_buffer", "test.test_importlib"}
 
 # These modules intentionally assert on a child interpreter's exact stderr.
 # MAJIT_STATS is runner instrumentation rather than language-visible output,
@@ -616,30 +624,47 @@ def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
     return [str(binary), str(module_path(module))]
 
 
-def build_test_extension(binary: Path) -> tuple[Path | None, str]:
-    """Compile `_testbuffer` for `binary`; answer its directory, or why not.
+def build_test_extensions(binary: Path) -> tuple[Path | None, dict[str, str]]:
+    """Compile the test extensions for `binary`; answer their directory and,
+    per extension, why one is missing.
 
     An interpreter built without `cpyext`, a platform the feature is not
-    compiled for, and a missing C compiler each leave the extension unbuilt.
-    `test_buffer` then skips `TestBufferProtocol` exactly as it does upstream
-    when the module is absent, rather than failing the run.
+    compiled for, and a missing C compiler each leave every extension unbuilt,
+    and the directory is then `None`. A source that fails on its own leaves the
+    others usable, so its reason is reported alone. The tests that need one
+    skip exactly as they do upstream when the module is absent, rather than
+    failing the run.
     """
     if sys.platform not in ("darwin", "linux"):
-        return None, f"cpyext is built for macos and linux, not {sys.platform}"
-    if not TESTBUFFER_SOURCE.is_file():
-        return None, f"{TESTBUFFER_SOURCE} is missing"
+        reason = f"cpyext is built for macos and linux, not {sys.platform}"
+        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
     named = subprocess.run(
         [str(binary), "-c", "import _imp; print(_imp.extension_suffixes()[0])"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     suffix = named.stdout.strip().splitlines()[-1] if named.stdout.strip() else ""
     if named.returncode != 0 or not suffix:
-        return None, "the interpreter reported no extension suffix"
+        reason = "the interpreter reported no extension suffix"
+        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
     EXTENSION_BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    extension = EXTENSION_BUILD_DIR / f"_testbuffer{suffix}"
+    unbuilt = {}
+    for name, source in TEST_EXTENSION_SOURCES.items():
+        reason = build_one_test_extension(binary, name, source, suffix)
+        if reason:
+            unbuilt[name] = reason
+    return EXTENSION_BUILD_DIR, unbuilt
+
+
+def build_one_test_extension(binary: Path, name: str, source: Path,
+                             suffix: str) -> str:
+    """Compile one extension and prove the interpreter can import it, or say
+    why not."""
+    if not source.is_file():
+        return f"{source} is missing"
     compile_cmd = [
-        os.environ.get("CC", "cc"), str(TESTBUFFER_SOURCE),
-        "-I", str(CPYEXT_INCLUDE), "-o", str(extension), "-O2",
+        os.environ.get("CC", "cc"), str(source),
+        "-I", str(CPYEXT_INCLUDE), "-I", str(CPYEXT_INTERNAL_INCLUDE),
+        "-o", str(EXTENSION_BUILD_DIR / f"{name}{suffix}"), "-O2",
     ]
     compile_cmd += (
         ["-bundle", "-undefined", "dynamic_lookup"] if sys.platform == "darwin"
@@ -649,17 +674,17 @@ def build_test_extension(binary: Path) -> tuple[Path | None, str]:
         compile_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if built.returncode != 0:
-        return None, f"{compile_cmd[0]}: {last_stderr_line(built.stderr)}"
+        return f"{compile_cmd[0]}: {last_stderr_line(built.stderr)}"
     # Compiling proves the headers agree, not that the interpreter can load
     # what they describe: a build without cpyext resolves none of the symbols.
     loaded = subprocess.run(
-        [str(binary), "-c", "import _testbuffer"],
+        [str(binary), "-c", f"import {name}"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         env=dict(os.environ, PYTHONPATH=str(EXTENSION_BUILD_DIR)),
     )
     if loaded.returncode != 0:
-        return None, f"built but not importable: {last_stderr_line(loaded.stderr)}"
-    return EXTENSION_BUILD_DIR, ""
+        return f"built but not importable: {last_stderr_line(loaded.stderr)}"
+    return ""
 
 
 def run_module(binary: Path, module: str, mode: str, timeout: int,
@@ -885,9 +910,9 @@ def main() -> int:
     if args.no_jit:
         env["PYRE_NO_JIT"] = "1"
 
-    extension_dir, unbuilt = build_test_extension(binary)
-    if extension_dir is None:
-        print(f"warning: _testbuffer not built ({unbuilt}) — "
+    extension_dir, unbuilt = build_test_extensions(binary)
+    for name, reason in sorted(unbuilt.items()):
+        print(f"warning: {name} not built ({reason}) — "
               f"{'/'.join(sorted(NEEDS_TEST_EXTENSION))} will skip the classes "
               "that need it", file=sys.stderr)
 
