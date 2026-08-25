@@ -6608,6 +6608,22 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
             )
     };
+    // Serve the arity-2 specialisations from the real reader.  The canonical
+    // layout is deliberately NOT routed here: its items are an array, so the
+    // descent inlines the whole reader at every subscript, and inside a
+    // recursive bridge that overruns the bridge's trace budget --
+    // `selfrec_bridge_nontail_promote` loses a bridge to `abrt_bridge` and runs
+    // 2.4x slower.  `try_walker_specialize_subscr_tuple` keeps that arm.
+    if specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
+        if let Some(hit) = spec_gate("subscr_tuple_descent", || {
+            try_walker_orthodox_subscr_tuple_item(
+                ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
+            )
+        })? {
+            return Ok(Some(hit));
+        }
+    }
+
     if tuple_canonical {
         return spec_gate("subscr_tuple", || {
             try_walker_specialize_subscr_tuple(
@@ -7082,6 +7098,125 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Descend `w_tuple_getitem`'s compiled body for a tuple subscript whose
+/// receiver class and item index are both known at trace time, instead of
+/// re-emitting that body's length test and field reads by hand.
+///
+/// This is the orthodox shape `subscr_specialised_pair` stands in for:
+/// upstream's `getitem` is an ordinary graph the tracer inlines
+/// (`specialisedtupleobject.py`, whose `getitem` unrolls `iter_n` to the
+/// matching `value%s`), and the callee's `ob_type` chain folds against the
+/// pinned class down to the one specialisation this trace saw.
+///
+/// The trace-time range check here is a decline gate, not the trace's safety
+/// argument: it keeps an out-of-range subscript on the generic residual instead
+/// of tracing a raising path.  What holds for the *next* receiver is the
+/// callee's own length test, which is why this enters at `w_tuple_getitem`
+/// rather than at the `_known` reader it wraps -- the reader is documented
+/// "known-in-bounds" and carries no test to record.
+fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    // Arity-2 specialisations only -- see the caller for why the canonical
+    // layout keeps its own arm.
+    let spec_type = unsafe { (*seq_obj).ob_type };
+    if specialised_pair_kind(spec_type).is_none() {
+        return Ok(None);
+    }
+    // Exact int keys only: a slice, a bool or an int subclass reaches a
+    // different objspace path, and the callee takes a machine index.
+    if !unsafe { pyre_object::is_int(key_obj) } {
+        return Ok(None);
+    }
+    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
+    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
+    let index = if raw_key < 0 { raw_key + len } else { raw_key };
+    if !(0..len).contains(&index) {
+        return Ok(None);
+    }
+
+    // Resolve every possible decline before recording a guard.
+    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Only a specialisation carries its own `ob_type`, so the class guard below
+    // is the whole precondition: a tuple subclass keeps `&TUPLE_TYPE` and can
+    // never reach these arms, and each specialisation's length is 2 by
+    // construction.
+    walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
+
+    // Freeze the key: the two slots are separate fields, so the callee's
+    // `match idx` folds to one of them only against a constant.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
+    let index_arg = ctx.trace_ctx.const_int(raw_key);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_index, index_arg])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(key_index, index_arg);
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        "subscr_tuple_item_commit",
+        "w_tuple_getitem_known_call_site",
+        &[index_arg],
+        &[ConcreteValue::Int(raw_key)],
+        &[seq_op],
+        &[ConcreteValue::Ref(seq_obj)],
+        );
+    let (walk_outcome, _walk_start) = match walk {
+        Ok(pair) => pair,
+        // The body reached a helper this build did not lower.  Nothing is
+        // committed yet -- the read has no effect to undo -- so cut the
+        // tentative IR and let the generic residual serve the subscript.
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] SUBSCR-TUPLE-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
 
