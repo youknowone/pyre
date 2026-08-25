@@ -5971,6 +5971,21 @@ fn emit_load_from_addr(
             Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
         }
         Type::Int | Type::Ref => {
+            // Adaptation, not parity.  Upstream's reference bank is one word by
+            // construction: `get_type_flag` mints FLAG_POINTER only for a Ptr
+            // whose pointee is `_gckind == 'gc'`, and `bh_getarrayitem_gc_r`
+            // strides by WORD without ever reading the descr's itemsize -- its
+            // integer twin one function above takes width and sign from the
+            // descr, and that asymmetry is deliberate.  lltype cannot spell a
+            // non-word element behind a reference load at all: `getkind`
+            // raises NotImplementedError for a by-value aggregate, so the bad
+            // state is unrepresentable and needs no guard.  Rust can spell it
+            // -- `Vec<T>` stores `T` inline for any `T` -- so this checks what
+            // RPython's type system proves.  Upstream serves an array of
+            // structs through the interiorfield family instead
+            // (`getinteriorfield_gc_*`, whose `unpack_interiorfielddescr`
+            // separates the stride from the load width); until that family
+            // exists here, declining is the only sound answer.
             if value_type == Type::Ref && size != 8 {
                 return Err(unsupported_semantics(
                     opcode,
@@ -6018,6 +6033,7 @@ fn emit_store_to_addr(
             builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
         }
         Type::Int | Type::Ref => {
+            // Same adaptation as the load path above, and for the same reason.
             if value_type == Type::Ref && size != 8 {
                 return Err(unsupported_semantics(
                     opcode,
