@@ -3955,6 +3955,16 @@ where
                     .count_ops(kind, crate::counters::RECORDED_OPS);
                 let op = ctx.record_op_with_descr(kind, &[], descr);
                 ctx.set_opref_concrete(op, Value::Ref(majit_ir::GcRef(ptr as usize)));
+                // `execute_new` stamps `heapcache.new(resbox)`;
+                // `execute_new_with_vtable` stamps `class_now_known` on top of
+                // it. The vtable written at offset 0 just above is the word
+                // `cls_of_box` reads back, so the class is known here by
+                // construction — a zero one is the "unavailable" spelling and
+                // stays unrecorded.
+                ctx.heap_cache_mut().new_object(op);
+                if with_vtable && vtable != 0 {
+                    ctx.heap_cache_mut().class_now_known(op, vtable as i64);
+                }
                 self.set_ref_reg(dest, Some(op), Some(ptr));
             }
             jitcode::insns::BC_SETFIELD_GC_I
