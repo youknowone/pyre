@@ -4317,15 +4317,6 @@ fn register_helper_fn_pointers(
         cpu.load_import_locals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
-    // The globals half reads the same two fields the locals half does —
-    // `debugdata` then one of its refs — plus `promote(pycode).w_globals` on
-    // the frames that carry no payload, and reports no error either. Same
-    // pairing.
-    let load_import_globals_fn = bind(
-        assembler,
-        cpu.load_import_globals_fn as *const (),
-        CallFlavor::PlainCannotRaise,
-    );
     // The hand-written PUSH_EXC_INFO lowering must complete the interpreter's
     // caught-exception ownership transfer.  Bind last so every existing
     // helper index remains stable.
@@ -4341,6 +4332,16 @@ fn register_helper_fn_pointers(
     let for_iter_exception_match_fn = bind(
         assembler,
         cpu.for_iter_exception_match_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
+    // The globals half reads the same two fields the locals half does —
+    // `debugdata` then one of its refs — plus `promote(pycode).w_globals` on
+    // the frames that carry no payload, and reports no error either. Same
+    // pairing as the locals half. Bound last so every pre-existing helper
+    // index remains stable.
+    let load_import_globals_fn = bind(
+        assembler,
+        cpu.load_import_globals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
     FnPtrIndices {
