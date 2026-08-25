@@ -58,10 +58,24 @@ def hot(n):
 
 def measure(tail, local):
     counts = {}
+    chain = {}
 
     def hook(frame, event, arg):
         key = (event, frame.f_code.co_name)
         counts[key] = counts.get(key, 0) + 1
+        # The caller chain the hook can see, recorded once per key so the
+        # forcing it costs is paid a fixed number of times rather than per
+        # event.  A frame reported from compiled code is reported by the
+        # portal rather than by the eval loop, so what it answers for
+        # `f_back` and for `sys._getframe` is a separate question from
+        # whether it reports at all.
+        if event == 'call' and key not in chain:
+            back = frame.f_back
+            here = sys._getframe(1)
+            chain[key] = (
+                back.f_code.co_name if back is not None else '<none>',
+                here.f_code.co_name if here is not None else '<none>',
+            )
         return hook if local else None
 
     # Compile the loop first, with nothing installed, so the arming below has
@@ -72,7 +86,7 @@ def measure(tail, local):
         hot(tail)
     finally:
         sys.settrace(None)
-    return counts
+    return counts, chain
 
 
 def exact(counts, key, expected, arm, failures):
@@ -98,12 +112,27 @@ def tracks_the_tail(short, long_, key, arm, failures):
         )
 
 
+def names(chain, key, expected, arm, failures):
+    got = chain.get(key)
+    if got != expected:
+        failures.append(
+            '%s: the caller chain at %s reads %r, expected %r — a frame reported '
+            'from compiled code answers about a chain it never established'
+            % (arm, key, got, expected)
+        )
+
+
 def main():
     failures = []
     for local in (False, True):
         arm = 'local' if local else 'global'
-        short, long_ = (measure(tail, local) for tail in TAILS)
-        for tail, counts in zip(TAILS, (short, long_)):
+        measured = [measure(tail, local) for tail in TAILS]
+        short, long_ = (counts for counts, _ in measured)
+        for tail, (counts, chain) in zip(TAILS, measured):
+            # `hot` is called from `measure`, `callee` from `hot`, and the frame
+            # the hook is running on top of is the one it was handed.
+            names(chain, ('call', 'hot'), ('measure', 'hot'), arm, failures)
+            names(chain, ('call', 'callee'), ('hot', 'callee'), arm, failures)
             # One activation of the loop frame, one of the callee per iteration.
             exact(counts, ('call', 'hot'), 1, arm, failures)
             exact(counts, ('call', 'callee'), tail, arm, failures)
