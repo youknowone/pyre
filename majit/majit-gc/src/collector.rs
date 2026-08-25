@@ -2505,6 +2505,49 @@ impl MiniMarkGC {
         Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr))
     }
 
+    /// `PYRE_GC_SIZE_AUDIT`: refuse a block too small for the type its header
+    /// is about to claim.
+    ///
+    /// The header carries the type id and nothing else; the block's extent
+    /// comes from the caller's `total_size`. When the two disagree the
+    /// collector reads the neighbouring blocks as if they were this object's
+    /// fields, and the first symptom appears an arbitrary number of
+    /// collections later, in whichever object happened to follow. Ask at the
+    /// stamp instead, where the caller is still on the stack.
+    ///
+    /// Varsize types are exempt: their items live past `size` and the length
+    /// is not readable here.
+    fn audit_allocation_size(&self, type_id: u32, total_size: usize, obj_addr: usize, kind: &str) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("PYRE_GC_SIZE_AUDIT").is_some()) {
+            return;
+        }
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        let info = self.types.get(type_id);
+        if info.item_size != 0 {
+            return;
+        }
+        let declared = info.size;
+        let payload = total_size.saturating_sub(GcHeader::SIZE);
+        if payload >= declared {
+            return;
+        }
+        panic!(
+            "GC SIZE AUDIT: {kind} allocation at {obj_addr:#x} stamps type_id={type_id} \
+             (declared payload {declared} bytes, {} gc offsets, is_object={}) but the block \
+             carries only {payload} payload bytes (total_size={total_size}). \
+             gc_state={:?} minors={} majors={}\nbacktrace:\n{}",
+            info.gc_ptr_offsets.len(),
+            info.is_object,
+            self.gc_state,
+            self.minor_collections,
+            self.major_collections,
+            std::backtrace::Backtrace::force_capture(),
+        );
+    }
+
     fn finish_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, ptr: *mut u8) -> GcRef {
         if crate::bh_probe_enabled() {
             let lo = self.nursery.start_ptr() as usize;
@@ -2522,6 +2565,7 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
+        self.audit_allocation_size(type_id, total_size, obj_addr, "oldgen");
         if crate::gc_lifetime_log_enabled() {
             // Pairs with `[gc][free]`: whether a dangling reference names an
             // object freed after the referrer was born, or one already dead

@@ -2070,6 +2070,14 @@ impl BhDescr {
     /// a struct/array cache slot).  Backends call this instead of
     /// `get_type_id() as u32` so a materialized object carries a header the
     /// collector can trace.
+    ///
+    /// Zero is the no-STRUCT-identity sentinel and never a key — the same
+    /// carve-out `field_descr_ref_from_bh` (`majit-metainterp`) and
+    /// `simple_descr_group_from_bh_size` (`pyre-jit-trace`) already take on
+    /// the mint side.  Resolving it would hand whichever group is published
+    /// under the sentinel its `type_id`, while the block stays sized by THIS
+    /// descr — and the collector then walks the foreign type's GC offsets
+    /// straight off the end of the block.
     pub fn resolve_gc_tid(&self) -> u32 {
         if let BhDescr::Array { gc_type_id, .. } = self
             && *gc_type_id != 0
@@ -2077,16 +2085,20 @@ impl BhDescr {
             return *gc_type_id;
         }
         let raw = self.get_type_id();
-        let resolved = match self {
-            BhDescr::Size { .. } => majit_ir::descr::gc_cache()
-                .lock()
-                .expect("gc_cache poisoned")
-                .resolve_struct_tid(raw),
-            BhDescr::Array { .. } => majit_ir::descr::gc_cache()
-                .lock()
-                .expect("gc_cache poisoned")
-                .resolve_array_tid(raw),
-            _ => None,
+        let resolved = if raw == 0 {
+            None
+        } else {
+            match self {
+                BhDescr::Size { .. } => majit_ir::descr::gc_cache()
+                    .lock()
+                    .expect("gc_cache poisoned")
+                    .resolve_struct_tid(raw),
+                BhDescr::Array { .. } => majit_ir::descr::gc_cache()
+                    .lock()
+                    .expect("gc_cache poisoned")
+                    .resolve_array_tid(raw),
+                _ => None,
+            }
         };
         resolved.unwrap_or(raw as u32)
     }
@@ -2102,16 +2114,20 @@ impl BhDescr {
             return Some(*gc_type_id);
         }
         let raw = self.get_type_id();
-        let resolved = match self {
-            BhDescr::Size { .. } => majit_ir::descr::gc_cache()
-                .lock()
-                .expect("gc_cache poisoned")
-                .resolve_struct_tid(raw),
-            BhDescr::Array { .. } => majit_ir::descr::gc_cache()
-                .lock()
-                .expect("gc_cache poisoned")
-                .resolve_array_tid(raw),
-            _ => None,
+        let resolved = if raw == 0 {
+            None
+        } else {
+            match self {
+                BhDescr::Size { .. } => majit_ir::descr::gc_cache()
+                    .lock()
+                    .expect("gc_cache poisoned")
+                    .resolve_struct_tid(raw),
+                BhDescr::Array { .. } => majit_ir::descr::gc_cache()
+                    .lock()
+                    .expect("gc_cache poisoned")
+                    .resolve_array_tid(raw),
+                _ => None,
+            }
         };
         if matches!(self, BhDescr::Size { .. })
             && resolved.is_some_and(|tid| majit_ir::descr::struct_tid_is_unresolved(raw, tid))
@@ -2422,6 +2438,54 @@ mod tests {
             // both resolve to `false` and the layout comparison is unaffected.
             is_class_word: None,
         }
+    }
+
+    fn size_descr_with_key(size: usize, type_id: u64) -> BhDescr {
+        BhDescr::Size {
+            size,
+            type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        }
+    }
+
+    #[test]
+    fn a_keyless_size_descr_does_not_inherit_the_sentinel_slots_tid() {
+        // Publish a real group under the no-identity key, the way a STRUCT
+        // that stays out of both name registries used to.
+        let planted = majit_ir::descr::make_size_descr_full(0, 328, 31);
+        majit_ir::descr::gc_cache()
+            .lock()
+            .expect("gc_cache poisoned")
+            .register_keyed_size(majit_ir::descr::LLType::Struct(0), planted);
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_struct_tid(0),
+            Some(31),
+            "the plant must occupy the sentinel slot, or this test proves nothing"
+        );
+
+        // A descr that carries no STRUCT identity must not be sized by itself
+        // and headered by the planted group: the collector would read 328
+        // bytes of GC offsets out of a 24-byte block.
+        assert_eq!(size_descr_with_key(24, 0).resolve_gc_tid(), 0);
+        assert_eq!(
+            size_descr_with_key(24, 0).resolved_gc_tid_checked(),
+            Some(0)
+        );
+
+        // A descr that does carry one still resolves through the cache.
+        let key = majit_ir::descr::path_hash("jitcode_tests::KeyedStruct");
+        let keyed = majit_ir::descr::make_size_descr_full(0, 24, 9);
+        majit_ir::descr::gc_cache()
+            .lock()
+            .expect("gc_cache poisoned")
+            .register_keyed_size(majit_ir::descr::LLType::Struct(key), keyed);
+        assert_eq!(size_descr_with_key(24, key).resolve_gc_tid(), 9);
     }
 
     #[test]

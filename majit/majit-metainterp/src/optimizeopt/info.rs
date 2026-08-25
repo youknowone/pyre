@@ -44,6 +44,12 @@ pub(crate) fn resolve_gc_tid(
     if stamped_tid != 0 {
         return Some(stamped_tid);
     }
+    // Zero is the no-STRUCT-identity sentinel, not a key: resolving it would
+    // certify this descr against whichever group was published under the
+    // sentinel, and the guard would then pin a layout nothing here has.
+    if cache_key == 0 {
+        return None;
+    }
     let cache = majit_ir::descr::gc_cache().lock().ok()?;
     resolve(&cache, cache_key).filter(|&tid| tid != 0)
 }
