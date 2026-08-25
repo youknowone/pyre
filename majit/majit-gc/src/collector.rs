@@ -9776,6 +9776,13 @@ mod tests {
         gc.roots.clear();
     }
 
+    /// The max-heap tests read and write the process-global eval-breaker bit,
+    /// and each one starts by normalising it. Ownership of an armed
+    /// `MemoryError` is per-thread now, so a normalising call no longer clears
+    /// one a concurrently running test armed — serialise them instead, the way
+    /// the destructor and shadow-stack tests serialise their own shared state.
+    static MAX_HEAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
     /// major collection over `max_heap_size` signals OOM the first time
     /// (`oom_pending` so the triggering allocation returns NULL) and aborts on
@@ -9783,6 +9790,7 @@ mod tests {
     /// threshold bounded, so the decision fires on an otherwise empty heap.
     #[test]
     fn bounded_max_heap_size_signals_oom_then_aborts() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut gc = test_gc(4096);
         // PYPY_GC_MAX = 1 byte (below min_heap_size), so set_major_threshold_from
         // caps at 1 and reports `bounded`.
@@ -9836,6 +9844,7 @@ mod tests {
     /// about.
     #[test]
     fn a_breach_while_the_memory_error_is_still_owed_is_not_a_second_arrival() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(4096));
         let obj = gc.alloc_with_type(tid, 4096);
@@ -9881,6 +9890,7 @@ mod tests {
     /// program's only sign of a full heap becomes the abort on the next one.
     #[test]
     fn a_breach_with_no_allocation_waiting_defers_to_the_dispatch_loop() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut gc = test_gc(4096);
         // What separates this from the test above: no allocation is waiting, so
         // `threshold_reached(0)` decides on the heap as it stands, and the heap
@@ -9914,6 +9924,7 @@ mod tests {
     /// so a completed major collection leaves the OOM signals untouched.
     #[test]
     fn unbounded_heap_never_signals_oom() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut gc = test_gc(4096);
         assert_eq!(gc.max_heap_size, 0.0);
         gc.pending_reserving_size = 4096;
