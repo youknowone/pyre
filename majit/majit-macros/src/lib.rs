@@ -1805,6 +1805,14 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 /// harvest_immutable_fields_from_llbcs` reads it back into
 /// `SemanticProgram.immutable_fields` — the analog of RPython's
 /// translator reading `cls._immutable_fields_` off the class object.
+///
+/// The proc-macro front end has no such extraction step, so the same
+/// list is published a second way: an inherent associated const
+/// `__MAJIT_IMMUTABLE_FIELDS`, shadowing the empty default on
+/// `majit_metainterp::MajitImmutableFields`.  `jitcode_lower` reads it
+/// at each `register_struct_layout` emit site.  Both publications carry
+/// the entry list verbatim and neither splits it, so the suffix grammar
+/// stays in one place (`majit_translate::model::ImmutableRank::parse`).
 #[proc_macro_attribute]
 pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream {
     let entries = parse_macro_input!(attr as ImmutableFieldList);
@@ -1816,12 +1824,25 @@ pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream
     // harvester does the splitting, so the suffix grammar stays in one
     // place (`majit_translate::model::ImmutableRank::parse`).
     let joined = entries.0.join(",");
+    // The same declaration, published a second way for the proc-macro front
+    // end.  That path has no Charon extraction to harvest the marker const, so
+    // it reads the ranks straight off the type at the layout emit site;
+    // `majit_metainterp::MajitImmutableFields` supplies the empty default this
+    // shadows, which is what lets a site name a struct that declared nothing.
+    let ident = &item_struct.ident;
+    let (impl_generics, ty_generics, where_clause) = item_struct.generics.split_for_impl();
     quote! {
         #item_struct
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
         #vis const #const_name: &'static str = #joined;
+
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, dead_code)]
+            pub const __MAJIT_IMMUTABLE_FIELDS: &'static str = #joined;
+        }
     }
     .into()
 }
