@@ -13,6 +13,7 @@ pub mod boolobject;
 pub mod buffer;
 pub mod bufferview;
 pub mod bytearrayobject;
+pub mod bytes_array;
 pub mod bytesobject;
 pub mod celldict;
 pub mod complexobject;

@@ -2058,7 +2058,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
     //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
     // The parity-field pair is `(length, items)`. `strategy` +
-    // `int_items` / `float_items` are pyre-only PRE-EXISTING-
+    // `int_items` / `float_items` / `bytes_items` are pyre-only PRE-EXISTING-
     // ADAPTATIONs for the PyPy interp-level strategy split.
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_ListObject>(),
@@ -2199,6 +2199,29 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(W_ListObject, allocated),
                 std::mem::size_of::<isize>(),
                 Type::Int,
+                false,
+                false,
+                false,
+            ),
+            // listobject.py `BytesListStrategy` stores erased `rpython str`
+            // pointers in its own GcArray(GCREF).  Keep these entries at the
+            // end so the established descriptor indices above remain stable.
+            (
+                "bytes_items.len",
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "bytes_items.block",
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -3529,7 +3552,8 @@ pub fn int_mutable_cell_value_descr() -> DescrRef {
 
 /// Size descriptor for `W_ListObject` allocation via NewWithVtable.
 /// vtable = &LIST_TYPE; the Object-strategy fields `length` / `items` /
-/// `strategy` are SetField'd after.  `int_items.block` / `float_items.block`
+/// `strategy` are SetField'd after. `int_items.block` / `float_items.block` /
+/// `bytes_items.block`
 /// are GC-pointer fields of this descr, so `rewrite.py:498-504
 /// clear_gc_fields` zeroes them behind the allocation (== empty, never read
 /// under the Object strategy); their `len` halves are plain ints and stay at
@@ -4089,7 +4113,7 @@ pub fn w_object_object_size_descr() -> DescrRef {
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
-/// strategy. Under Integer/Float strategies this field is 0 and
+/// strategy. Under Integer/Float/Bytes strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.
 pub fn list_length_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 0)
@@ -4128,6 +4152,14 @@ pub fn list_int_items_block_descr() -> DescrRef {
 /// (`float_gcarray_descr`) for `GetarrayitemGcF` / `SetarrayitemGc`.
 pub fn list_float_items_block_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 6)
+}
+
+pub fn list_bytes_items_len_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
+}
+
+pub fn list_bytes_items_block_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 11)
 }
 
 pub fn list_w_class_descr() -> DescrRef {
@@ -6099,7 +6131,7 @@ mod tests {
     }
 
     #[test]
-    fn make_descr_from_bh_bridges_codewriter_int_items_leaves_to_group() {
+    fn make_descr_from_bh_bridges_codewriter_strategy_items_leaves_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
 
@@ -6111,6 +6143,18 @@ mod tests {
         for (name, expected, ty) in [
             ("int_items.len", list_int_items_len_descr(), Type::Int),
             ("int_items.block", list_int_items_block_descr(), Type::Ref),
+            ("float_items.len", list_float_items_len_descr(), Type::Int),
+            (
+                "float_items.block",
+                list_float_items_block_descr(),
+                Type::Ref,
+            ),
+            ("bytes_items.len", list_bytes_items_len_descr(), Type::Int),
+            (
+                "bytes_items.block",
+                list_bytes_items_block_descr(),
+                Type::Ref,
+            ),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset: 0,
@@ -6140,7 +6184,8 @@ mod tests {
         use majit_ir::descr::ArrayFlag;
         use majit_translate::jitcode::BhDescr;
 
-        // A bare `int_items` / `float_items` read (the `w_list_append` body
+        // A bare `int_items` / `float_items` / `bytes_items` read (the
+        // `w_list_append` body
         // reads the typed-storage struct base before reaching `.ptr`/`.len`)
         // must bridge to the same canonical `.block` group entry as the dotted
         // `.block` leaf — a populated parent_descr and the `.block` offset, not
@@ -6148,6 +6193,7 @@ mod tests {
         for (name, expected) in [
             ("int_items", list_int_items_block_descr()),
             ("float_items", list_float_items_block_descr()),
+            ("bytes_items", list_bytes_items_block_descr()),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset: 0,
@@ -6227,6 +6273,10 @@ mod tests {
             .map(|field| field.offset())
             .collect();
         assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
+        assert!(list_gc_offsets.contains(
+            &(std::mem::offset_of!(W_ListObject, bytes_items)
+                + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET)
+        ));
     }
 
     #[test]
@@ -7377,6 +7427,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "int_items.block" => return list_int_items_block_descr(),
                     "float_items.len" => return list_float_items_len_descr(),
                     "float_items.block" => return list_float_items_block_descr(),
+                    "bytes_items.len" => return list_bytes_items_len_descr(),
+                    "bytes_items.block" => return list_bytes_items_block_descr(),
                     // A bare `int_items` / `float_items` read addresses the
                     // typed-storage struct base, which is its first field
                     // (`block`, `INT_ARRAY_BLOCK_OFFSET == 0`) — the same
@@ -7386,6 +7438,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     // `.block` group entry so the read resolves a parent_descr.
                     "int_items" => return list_int_items_block_descr(),
                     "float_items" => return list_float_items_block_descr(),
+                    "bytes_items" => return list_bytes_items_block_descr(),
                     // The `w_list_append` body's `match list.strategy` reads the
                     // header `strategy` field directly.  The codewriter resolves
                     // its offset but produces a `SimpleFieldDescr` with no

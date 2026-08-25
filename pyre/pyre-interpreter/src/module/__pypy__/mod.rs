@@ -107,8 +107,8 @@ fn hidden_applevel(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// dict, list, set, or mapdict-backed instance.
 ///
 /// This is intentionally a diagnostic of the representation pyre actually
-/// uses.  In particular, bytes/ascii lists and integer sets currently report
-/// their Object strategies; that makes those remaining PyPy strategy ports
+/// uses. In particular, ascii lists and integer sets currently report their
+/// Object strategies; that makes those remaining PyPy strategy ports
 /// visible instead of hiding them behind a missing `__pypy__` function.
 fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let obj = args[0];

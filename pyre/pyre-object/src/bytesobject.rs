@@ -276,6 +276,37 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     w_bytes
 }
 
+/// Wrap an existing PyPy `rpython str` payload for
+/// `BytesListStrategy.wrap`. The immutable block is shared; only the
+/// `W_BytesObject` wrapper is newly allocated.
+#[majit_macros::dont_look_inside]
+pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
+    let data = crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock;
+    let body = W_BytesObject {
+        ob_header: PyObject {
+            ob_type: &BYTES_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
+        data,
+        len: unsafe { (*data).length },
+        ctypes_keepalive_refs: 0,
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    };
+    if raw.is_null() {
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_BytesObject, body) };
+        raw as PyObjectRef
+    }
+}
+
 /// Allocate a bytes-subclass instance in the managed heap.  PyPy's
 /// `W_BytesObject` user subclasses carry mapdict state and therefore
 /// participate in cycle collection; only exact immutable bytes may use the
@@ -414,6 +445,11 @@ pub unsafe fn w_bytes_data(obj: PyObjectRef) -> &'static [u8] {
         let b = obj as *const W_BytesObject;
         bytes_block_chars((*b).data)
     }
+}
+
+/// Return the erased `rpython str` stored by PyPy's BytesListStrategy.
+pub unsafe fn w_bytes_block(obj: PyObjectRef) -> *const BytesBlock {
+    unsafe { (*(obj as *const W_BytesObject)).data }
 }
 
 /// bytes.find(sub, start) — find first occurrence of byte value.

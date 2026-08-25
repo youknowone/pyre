@@ -4648,8 +4648,9 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         }
         // `W_AbstractBytesObject.is_w` (bytesobject.py): for distinct
         // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
-        // identity) — distinct `bytes` never share their backing buffer, so
-        // `false`; `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
+        // identity); BytesListStrategy re-wraps the same erased rpython string,
+        // so distinct wrappers may deliberately share that backing block.
+        // `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
         // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::bytesobject::BYTES_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::bytesobject::BYTES_TYPE)
@@ -4657,7 +4658,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let len1 = pyre_object::bytesobject::w_bytes_len(w_one);
             let len2 = pyre_object::bytesobject::w_bytes_len(w_two);
             if len2 > 1 {
-                return false;
+                return pyre_object::bytesobject::w_bytes_block(w_one)
+                    == pyre_object::bytesobject::w_bytes_block(w_two);
             }
             if len2 == 0 {
                 return len1 == 0;
