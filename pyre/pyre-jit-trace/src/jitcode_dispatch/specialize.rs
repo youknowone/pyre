@@ -4995,7 +4995,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
 /// self-consistent, but a side exit hands a real pair — inline `value0` /
 /// `value1`, no `wrappeditems` block — to whatever consumer the trace picked
 /// for the canonical layout, and
-/// [`try_walker_specialize_subscr_specialised_pair`] then reads a field that is
+/// [`try_walker_orthodox_subscr_tuple_item`] then reads a field that is
 /// not there.
 ///
 /// Returns `Ok(Some(()))` when folded; `Ok(None)` falls through to the opaque
@@ -6645,21 +6645,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         });
     }
 
-    // The arity-2 specialisations reach the same `getitem`, but their items
-    // are the inline `value0`/`value1` slots, so they need their own reader —
-    // which is why the gate above is `ob_type == &TUPLE_TYPE` and not
-    // `is_tuple()`. No `w_class` guard: only a specialisation carries its own
-    // `ob_type`, so a tuple subclass (which keeps `&TUPLE_TYPE`) can never
-    // pass the class guard below.
-    if let Some(pair_kind) = specialised_pair_kind(unsafe { (*list_obj).ob_type }) {
-        return spec_gate("subscr_specialised_pair", || {
-            try_walker_specialize_subscr_specialised_pair(
-                ctx, op_pc, list_op, key_op, list_obj, key_obj, pair_kind, allboxes, call_descr,
-                dst, dst_bank,
-            )
-        });
-    }
-
     // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
     // SUBCLASS shares `ob_type == &DICT_TYPE` but retags `w_class` and reaches
     // `__missing__` on a miss, and a str SUBCLASS key may override `__hash__` /
@@ -7118,7 +7103,8 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
 /// receiver class and item index are both known at trace time, instead of
 /// re-emitting that body's length test and field reads by hand.
 ///
-/// This is the orthodox shape `subscr_specialised_pair` stands in for:
+/// This is the orthodox shape, and it replaced the hand-written
+/// `subscr_specialised_pair` reader that stood in for it:
 /// upstream's `getitem` is an ordinary graph the tracer inlines
 /// (`specialisedtupleobject.py`, whose `getitem` unrolls `iter_n` to the
 /// matching `value%s`), and the callee's `ob_type` chain folds against the
@@ -7364,81 +7350,6 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw)?;
     Ok(Some(()))
 }
-
-/// SUBSCRIPT arm for the arity-2 tuple specialisations
-/// (`specialisedtupleobject.py getitem`), the analogue of
-/// [`try_walker_specialize_subscr_tuple`] for a receiver whose items are the
-/// inline `value0` / `value1` slots instead of a `wrappeditems` block.
-///
-/// Upstream `getitem` normalises a negative index against the constant
-/// `typelen` and then runs the unrolled `index == i` chain to pick the slot,
-/// so the recorded slot is pinned here with a single `guard_value` on the
-/// unboxed index: it re-proves both the sign test and the comparison at once,
-/// and a literal subscript makes it constant, which the optimizer drops.
-///
-/// The caller matched `ob_type` against one of the three specialisation
-/// classes, which is also why no `w_class` guard follows: a tuple subclass
-/// instance keeps the canonical `ob_type == &TUPLE_TYPE`, so it can neither
-/// reach this arm nor pass the class guard below.
-///
-/// A slice key, a non-int key, or an out-of-range index falls through to the
-/// generic residual (`Ok(None)`), which raises `IndexError` the way `getitem`
-/// does.
-#[allow(clippy::too_many_arguments)]
-fn try_walker_specialize_subscr_specialised_pair<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    key_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    pair_kind: SpecialisedPairKind,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    const TYPELEN: i64 = 2;
-    // `bool` shares int's `intval`, so it indexes through its own &BOOL_TYPE
-    // guard in the unbox below.
-    let raw_key = unsafe {
-        if !pyre_object::is_int(key_obj) {
-            return Ok(None);
-        }
-        pyre_object::w_int_get_value(key_obj)
-    };
-    let index = if raw_key < 0 {
-        raw_key + TYPELEN
-    } else {
-        raw_key
-    };
-    if !(0..TYPELEN).contains(&index) {
-        return Ok(None);
-    }
-
-    let spec_type = unsafe { (*seq_obj).ob_type };
-    walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
-
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(raw_index, majit_ir::Value::Int(raw_key));
-    let expected = ctx.trace_ctx.const_int(raw_key);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[raw_index, expected])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(raw_index, expected);
-
-    let Some(item) = walker_emit_specialised_pair_item(
-        ctx, op_pc, seq_op, pair_kind, index, allboxes, call_descr,
-    )?
-    else {
-        return Ok(None);
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
-    Ok(Some(()))
-}
-
 fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
     if callable.is_null() || !unsafe { pyre_interpreter::is_function(callable) } {
         return false;
