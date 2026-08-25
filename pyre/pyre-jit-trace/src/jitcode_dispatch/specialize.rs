@@ -7329,13 +7329,15 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
         &[seq_op, index_raw],
         &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        // The helper's own `#[majit_macros::elidable]`: pure but allocating,
-        // so the call carries a gcmap and the trailing `GuardNoException`
-        // makes the allocation's raise leg observable.  Recording it pure lets
-        // the optimizer share one call between two `s[i]` sites on the same
-        // pair; which object a fresh box returns is not a guarantee anything
-        // may read, the same trade the `str(int)` arm makes.
-        majit_metainterp::ELIDABLE_EFFECT_INFO,
+        // The helper's own `#[majit_macros::elidable_or_memerror]`: pure but
+        // allocating, so the call carries a gcmap and the trailing
+        // `GuardNoException` makes the allocation's raise leg observable.
+        // Recording it pure lets the optimizer share one call between two
+        // `s[i]` sites on the same pair, which is unobservable for this
+        // result: it is a single code point, and `is_w` unique-ifies a `str`
+        // of `_len() <= 1` by WTF-8 equality, so two separate allocations
+        // already answer `is` exactly as one shared box does.
+        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
         &[
             majit_ir::Value::Int(helper as usize as i64),
             majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
