@@ -325,6 +325,17 @@ pub fn fbw_debug_abort_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
 }
 
+/// Whether `PYRE_FBW_IMPORT_RESIDUAL_LOCALS` is set.  Experimental probe, not
+/// a production knob: when on, a may-force residual that wrote the forced
+/// frame's fastlocals has those slots copied back into the walk's concrete
+/// shadow before the walk reads them again.  The recorded IR is left alone, so
+/// this is only sound for one recording and exists to answer whether the
+/// shadow's staleness is what loses the write.  Default OFF.
+pub fn fbw_import_residual_locals_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_IMPORT_RESIDUAL_LOCALS").is_some())
+}
+
 /// Clear any stashed Finish payload before a walk begins.  Also clears the
 /// concrete-return cell so a stale value from a prior aborted walk cannot leak
 /// into this one.

@@ -2679,6 +2679,14 @@ impl TraceCtx {
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_values` can propagate to the live PyFrame without
     /// routing back through MetaInterp (pyjitpl.py write_boxes target).
+    /// The object `refresh_virtualizable_shadow_from_heap` and
+    /// `synchronize_virtualizable` read and write.  Diagnostic only: a caller
+    /// that needs to know whether the frame it just mutated is the one the
+    /// shadow tracks has no other way to ask.
+    pub fn diag_virtualizable_heap_ptr(&self) -> usize {
+        self.virtualizable_heap_ptr.map_or(0, |p| p as usize)
+    }
+
     pub fn set_virtualizable_heap_ptr(&mut self, ptr: *const u8) {
         self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
     }

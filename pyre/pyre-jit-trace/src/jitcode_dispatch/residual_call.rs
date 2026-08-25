@@ -1691,6 +1691,108 @@ fn capture_escape_flush_undo(frame: usize) {
 /// user Python can touch the region, so any later difference from this image
 /// is that user code's own write.  A second flush for the same frame supersedes
 /// the image: the restore must undo the flush that is actually standing.
+/// Report what the post-residual shadow refresh left behind, and optionally
+/// import the residual's own fastlocals writes into the shadow.
+///
+/// Every point that publishes walk state to the frame -- the escape flush, the
+/// walk-end flush, the resume image, the undo restore -- writes the shadow over
+/// the locals region.  So a fastlocals write made by the residual survives only
+/// if the shadow learned about it first.  `flush_image` is the region as the
+/// flush left it, so a slot that has moved since is exactly one the residual
+/// wrote.
+///
+/// The import is gated on [`fbw_import_residual_locals_enabled`] because it
+/// updates the concrete half alone: the recorded IR still names the box the
+/// walk was holding, which is wrong for anything but this one recording.  It is
+/// here to answer whether the shadow is the channel, not to ship.
+fn report_post_residual_shadow<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    live_frame: usize,
+    before: Option<&[pyre_object::PyObjectRef]>,
+) {
+    let diag = fbw_debug_abort_enabled();
+    let import = fbw_import_residual_locals_enabled();
+    if !diag && !import {
+        return;
+    }
+    let base = match ctx.trace_ctx.virtualizable_info() {
+        Some(info) => info.num_static_extra_boxes,
+        None => return,
+    };
+    let heap = ctx.trace_ctx.diag_virtualizable_heap_ptr();
+    // Baseline for "what the residual wrote".  A force inside the call rewrote
+    // the locals region from the shadow, so once there is a flush image that is
+    // the only sound baseline: measuring from before the call would report the
+    // flush's own stores as the residual's.  With no flush the frame was never
+    // rewritten, so the pre-call image is exact.
+    let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
+        let slot = slot.borrow();
+        slot.as_ref()
+            .filter(|undo| undo.frame == live_frame && !undo.flush_image.is_empty())
+            .map(|undo| undo.flush_image.clone())
+    });
+    let baseline: &[pyre_object::PyObjectRef] = match (flushed.as_deref(), before) {
+        (Some(image), _) => image,
+        (None, Some(image)) => image,
+        (None, None) => {
+            if diag {
+                eprintln!("[fbw-post-residual] skip=no-baseline frame={live_frame:#x}");
+            }
+            return;
+        }
+    };
+    let origin = if flushed.is_some() {
+        "flush"
+    } else {
+        "pre-call"
+    };
+    if live_frame == 0 {
+        if diag {
+            eprintln!("[fbw-post-residual] skip=no-live-frame origin={origin}");
+        }
+        return;
+    }
+    let frame = live_frame;
+    let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+    let live = locals_w!(pf).as_slice();
+    let n = live.len().min(baseline.len());
+    let moved: Vec<(usize, pyre_object::PyObjectRef)> = (0..n)
+        .filter(|&i| live[i] != baseline[i])
+        .map(|i| (i, live[i]))
+        .collect();
+    if moved.is_empty() {
+        return;
+    }
+    if diag {
+        let stale: Vec<usize> = moved
+            .iter()
+            .filter(|(abs, live)| {
+                ctx.trace_ctx
+                    .virtualizable_entry_at(base + abs)
+                    .is_none_or(|(_, v)| {
+                        crate::state::boxed_slot_value_for_type(majit_ir::Type::Ref, &v) != *live
+                    })
+            })
+            .map(|(abs, _)| *abs)
+            .collect();
+        eprintln!(
+            "[fbw-post-residual] origin={origin} heap={heap:#x} frame={frame:#x} same={} moved={:?} shadow_stale={stale:?}",
+            heap == frame,
+            moved.iter().map(|(abs, _)| *abs).collect::<Vec<_>>(),
+        );
+    }
+    if import {
+        for (abs, live) in moved {
+            let Some((opref, _)) = ctx.trace_ctx.virtualizable_entry_at(base + abs) else {
+                continue;
+            };
+            let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
+            ctx.trace_ctx
+                .set_virtualizable_entry_at(base + abs, opref, value);
+        }
+    }
+}
+
 fn record_escape_flush_image(frame: usize) {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -3579,6 +3681,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // same user-frame signal Finding #1 uses, generalized past FOR_ITER.
     let heap_write_odometer_before =
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
+    // Probe support: the live frame's locals as they stood before the residual
+    // ran.  A residual that writes fastlocals writes THIS object while the walk
+    // reads its own copy, so the diff taken afterwards names exactly the slots
+    // the shadow has to learn about.  Sampled only when a probe is on.
+    let residual_locals_before = ((fbw_debug_abort_enabled()
+        || fbw_import_residual_locals_enabled())
+        && is_may_force
+        && live_frame != 0)
+        .then(|| unsafe {
+            let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
+            locals_w!(pf).as_slice().to_vec()
+        });
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
         // Latch the operand-stack mirror for the escape flush: at force time
@@ -3967,6 +4081,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // state after a cancelled commit has to re-read it after the
             // walk-end restore, not here.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            report_post_residual_shadow(ctx, live_frame, residual_locals_before.as_deref());
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
                 // `debug_print('vable escaped during a call in %s')`: name the

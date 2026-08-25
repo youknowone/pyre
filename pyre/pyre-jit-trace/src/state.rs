@@ -5880,6 +5880,33 @@ fn flush_walk_end_state_to_frame_inner(
 /// Resume-pc authority stays with the full flush — this writes state only, so
 /// the caller keeps the escape-flush undo armed and a legacy replay from the
 /// trace entry still re-enters the pre-flush frame.
+/// Report-only: the locals slots a shadow->frame publication is about to give a
+/// different value.
+///
+/// A residual that writes fastlocals writes the frame the interpreter holds,
+/// while the walk reads its own copy of the virtualizable, so a slot listed
+/// here names a write this publication DESTROYS.  Empty unless
+/// `PYRE_FBW_DEBUG_ABORT` is set, so a production build pays one bool.
+fn clobbered_locals_slots(
+    ctx: &TraceCtx,
+    arr_ptr: *const pyre_object::FixedObjectArray,
+    base: usize,
+    nlocals: usize,
+) -> Vec<usize> {
+    if !crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        return Vec::new();
+    }
+    (0..nlocals)
+        .filter(|&abs| {
+            ctx.virtualizable_entry_at(base + abs)
+                .is_some_and(|(_, v)| {
+                    let live = unsafe { (*arr_ptr).as_slice()[abs] };
+                    live != boxed_slot_value_for_type(Type::Ref, &v)
+                })
+        })
+        .collect()
+}
+
 pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
     if frame == 0 {
         return false;
@@ -5917,6 +5944,7 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return false;
     }
+    let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
@@ -5930,7 +5958,7 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
         frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-        eprintln!("[fbw-flush] locals-region written: nlocals={nlocals}");
+        eprintln!("[fbw-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}");
     }
     true
 }
@@ -6028,6 +6056,7 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     // Commit the locals from the shadow, re-reading per slot.
+    let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
@@ -6044,6 +6073,11 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
         pf.last_instr = call_py_pc as isize - 1;
     }
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-outer-call-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}"
+        );
+    }
     true
 }
 
