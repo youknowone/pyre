@@ -1662,7 +1662,7 @@ pub(super) fn find_dispatch_loop_body<'b>(
 }
 
 /// Returns `true` if `stmt` is a `jit_merge_point!()` macro invocation.
-pub(super) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
+pub(crate) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
     let Stmt::Macro(mac_stmt) = stmt else {
         return false;
     };

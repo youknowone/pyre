@@ -7,7 +7,7 @@ use syn::{Block, Expr, ExprMatch, ItemFn, Stmt};
 
 use super::JitInterpConfig;
 use super::classify::classify_arms;
-use super::jitcode_lower::{self, LowererConfig};
+use super::jitcode_lower::{self, LowererConfig, is_jit_merge_point_macro};
 
 pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
@@ -304,11 +304,62 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 }
 
 pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch> {
-    // Select the match with the most arms — the dispatch match has many
-    // opcode arms while pre-dispatch branch matches have only a few.
+    // The dispatch match is the one in the portal loop's body, after the merge
+    // point. That is the shape the rest of this machinery already walks —
+    // `find_dispatch_loop_body`, `lower_pre_dispatch_stmts` and
+    // `bind_pre_merge_point_stmts` all locate the same loop — so search there
+    // rather than over the whole function.
+    //
+    // The rule used to be "the match with the most arms, anywhere", on the
+    // reasoning that a dispatch has many opcode arms and a setup match only a
+    // few. Arm count is not a property of being the dispatch: a five-arm
+    // `let x = match ..` in front of a three-opcode dispatch takes its place,
+    // and then `classify_arms` reads that match's arms as the opcodes while
+    // the two pre-dispatch walkers, which find their loop by the dispatch
+    // match it contains, find no loop and silently lower nothing. The portal
+    // compiles a loop that runs none of the interpreter and answers with it.
+    if let Some(body) = portal_loop_body(block) {
+        let mut after_merge_point = Vec::new();
+        let mut seen_merge_point = false;
+        for stmt in &body.stmts {
+            if is_jit_merge_point_macro(stmt) {
+                seen_merge_point = true;
+            } else if seen_merge_point {
+                collect_matches_in_stmt(stmt, &mut after_merge_point);
+            }
+        }
+        if let Some(dispatch) = after_merge_point.into_iter().max_by_key(|m| m.arms.len()) {
+            return Some(dispatch);
+        }
+    }
+
+    // No portal loop this reads, or none of its statements after the merge
+    // point holds a match. Fall back to the old search so a shape outside the
+    // rule above keeps whatever it did before.
     let mut all = Vec::new();
     collect_all_matches(block, &mut all);
     all.into_iter().max_by_key(|m| m.arms.len())
+}
+
+/// The portal loop: a `while`/`loop` statement of the function body whose own
+/// statements open a merge point. `find_dispatch_loop_body` accepts the same
+/// statement positions, recognising the loop by the dispatch match inside it
+/// instead — which is why it cannot be the one to choose that match.
+fn portal_loop_body(func_block: &syn::Block) -> Option<&syn::Block> {
+    func_block.stmts.iter().find_map(|stmt| {
+        let Stmt::Expr(expr, _) = stmt else {
+            return None;
+        };
+        let body = match expr {
+            Expr::While(while_expr) => &while_expr.body,
+            Expr::Loop(loop_expr) => &loop_expr.body,
+            _ => return None,
+        };
+        body.stmts
+            .iter()
+            .any(is_jit_merge_point_macro)
+            .then_some(body)
+    })
 }
 
 fn collect_all_matches<'a>(block: &'a syn::Block, out: &mut Vec<&'a syn::ExprMatch>) {

@@ -19,7 +19,7 @@ pub(crate) use api::{
 };
 #[allow(unused_imports)]
 pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
-pub(crate) use dispatch::lower_dispatch_body;
+pub(crate) use dispatch::{is_jit_merge_point_macro, lower_dispatch_body};
 pub(crate) use helpers::classify_param_type;
 pub(super) use helpers::helper_policy_path;
 
