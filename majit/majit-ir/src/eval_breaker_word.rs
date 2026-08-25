@@ -164,6 +164,16 @@ pub fn set_memory_error() {
     EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
 }
 
+/// Whether a `MemoryError` armed by [`set_memory_error`] is still owed.
+///
+/// [`take_memory_error`] clears the bit as it delivers, so this reads true for
+/// exactly the window between arming the exception and a dispatch loop raising
+/// it. The collector reads it to tell a breach that arrives inside that window
+/// from one that arrives after the program has had its exception.
+pub fn memory_error_armed() -> bool {
+    EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_MEMORY_ERROR != 0
+}
+
 /// Consume the owed `MemoryError`, reporting whether one was pending.
 ///
 /// Like [`take_gc`], clearing is unconditional: the bit is in

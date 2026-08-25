@@ -1035,6 +1035,12 @@ pub struct MiniMarkGC {
     /// (`out_of_memory`, minimarkpage.py -> fatalerror) instead of raising
     /// another MemoryError. Only reachable when `max_heap_size > 0`
     /// (`PYPY_GC_MAX` set), so it stays false in the default unbounded config.
+    ///
+    /// Upstream sets this immediately before the raise, so it reads as "the
+    /// program has already been given a MemoryError". Pyre's channels deliver
+    /// later, so the flag alone would read as "one has been armed"; the fatal
+    /// rung restores the original meaning by also requiring that neither
+    /// channel is still holding an undelivered one.
     max_heap_size_already_raised: bool,
     /// Set by `finish_incremental_cycle` when a bounded major collection leaves
     /// the heap over `max_heap_size`. The allocation that triggered the
@@ -6602,7 +6608,22 @@ impl MiniMarkGC {
         // whichever channel went undelivered latched onto the *next* breach:
         // an `oom_pending` no allocation was waiting for is taken by the next
         // unrelated one, failing an allocation that breached nothing.
+        //
+        // The fatal rung asks whether the program has already had its
+        // `MemoryError`. Upstream raises here, so setting the flag and handing
+        // the program its exception are one event and the question answers
+        // itself. Deferring delivery pulls them apart, and a breach that lands
+        // in between is the same arrival, not a second one: taking the fatal
+        // rung there ends the process without the program ever seeing the
+        // exception the rung above promised it. `do_collect_full` completes two
+        // cycles per call with no dispatch between them, so an explicit
+        // `gc.collect()` on a heap at its limit reaches exactly that. Both
+        // channels clear as they deliver, so an armed one is the whole test.
         if bounded && self.threshold_reached(reserving_size) {
+            if self.oom_pending || majit_ir::eval_breaker_word::memory_error_armed() {
+                self.gc_state = GcState::Scanning;
+                return;
+            }
             if self.max_heap_size_already_raised {
                 panic!("using too much memory, aborting");
             }
@@ -9767,7 +9788,7 @@ mod tests {
             "first bounded breach records max_heap_size_already_raised"
         );
         assert!(
-            gc.oom_pending,
+            std::mem::take(&mut gc.oom_pending),
             "first bounded breach asks the allocation to fail (NULL)"
         );
         // The allocation is waiting and will take `oom_pending` the moment this
@@ -9779,12 +9800,61 @@ mod tests {
         );
 
         // Second bounded breach aborts (out_of_memory -> fatalerror == panic).
+        // The take above is what the waiting allocation does the moment the
+        // collection returns, and it is what makes this a second arrival.
         gc.pending_reserving_size = 4096;
         gc.gc_state = GcState::Sweeping;
         let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gc.finish_incremental_cycle();
         }));
         assert!(second.is_err(), "second bounded breach aborts the process");
+    }
+
+    /// A breach that lands while the previous `MemoryError` is still owed is
+    /// the same arrival, not a second one.
+    ///
+    /// Upstream cannot reach this state: it raises where it sets the flag, so
+    /// the program holds the exception before any further collection can run.
+    /// Pyre's channels deliver later, and a driver that completes two cycles
+    /// without returning to a dispatch — `do_collect_full`, i.e. an explicit
+    /// `gc.collect()` — puts a whole second cycle inside that window. Aborting
+    /// there would end the process on a heap limit the program was never told
+    /// about.
+    #[test]
+    fn a_breach_while_the_memory_error_is_still_owed_is_not_a_second_arrival() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(4096));
+        let obj = gc.alloc_with_type(tid, 4096);
+        assert!(!obj.is_null());
+        gc.max_heap_size = 1.0;
+        gc.pending_reserving_size = 0;
+        majit_ir::eval_breaker_word::take_memory_error();
+
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert!(gc.max_heap_size_already_raised);
+
+        // Same breach again with the bit still armed: no abort, and the bit is
+        // left alone for the dispatch loop that has yet to run.
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert!(
+            majit_ir::eval_breaker_word::take_memory_error(),
+            "the undelivered MemoryError is still owed after the second breach"
+        );
+
+        // Delivered now, so the next breach is a genuine second arrival.
+        gc.gc_state = GcState::Sweeping;
+        let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc.finish_incremental_cycle();
+        }));
+        assert!(
+            third.is_err(),
+            "a breach after delivery takes the fatal rung"
+        );
+        // Whatever that breach armed on its way out belongs to no one now.
+        majit_ir::eval_breaker_word::take_memory_error();
     }
 
     /// The other half of the same policy: a collection with no allocation

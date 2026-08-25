@@ -16,16 +16,29 @@
 //! unit test can assert the raise, and both can pass while nothing joins them.
 //!
 //! What is asserted, and what is deliberately not. The middle rung's promise is
-//! that the limit *becomes a Python exception*; it is not a promise that the
-//! program survives one. After the first breach the live set is by definition
-//! at the limit, so a handler that allocates before it frees can reach the rung
-//! below — upstream says as much where it raises, and aborts on the second
-//! arrival for exactly that reason. Whether any particular handler fits in the
-//! remaining headroom is a question about collection scheduling, not about the
-//! raise, and it is not stable enough to gate: sweeping the limit over
-//! 80/96/112/128 MiB moves a surviving handler to an aborting one and back.
-//! The two properties below were stable over every limit and both dispatch
-//! loops when measured, so they are what this pins.
+//! that the limit *becomes a Python exception the program can act on*; it is
+//! not a promise that the program survives one. After the first breach the live
+//! set is by definition at the limit, so a handler that allocates before it
+//! frees can reach the rung below — upstream says as much where it raises, and
+//! aborts on the second arrival for exactly that reason. Whether any particular
+//! handler fits in the remaining headroom is a question about collection
+//! scheduling, not about the raise, and it is not stable enough to gate.
+//!
+//! The interpreter's own traceback printer is such a handler, which is why the
+//! scripts below carry an `except MemoryError` and report through it rather
+//! than leaving the exception to unwind and be printed. `eprint_exception`
+//! renders the whole report into a buffer and writes nothing until it is
+//! complete, and for a `-c` program the filename is `<string>`, so
+//! `read_registered_source_line` fetches each frame's line by calling
+//! app-level `linecache` — a nested dispatch loop whose first safepoint drives
+//! `do_collect_oldgen_nonmoving`, a whole major cycle, over a heap the breach
+//! left at its limit. The abort unwinds out of the half-built buffer and stderr
+//! receives nothing at all. Measured: the same program read from a file prints
+//! its traceback (the filesystem branch runs no Python), and a `-c` run of it
+//! prints nothing — while both raise, deliver and reach the top-level handler
+//! identically. A handler that frees before it reports has that headroom
+//! because the next cycle sweeps what it dropped, and it was clean on both
+//! dispatch loops and both allocation paths.
 //!
 //! `--heapsize` rather than `PYPY_GC_MAX` because it also covers the launcher
 //! plumbing (`take_heapsize_option` -> `gc_set_max_heap_size`), which the env
@@ -69,11 +82,19 @@ const ROUNDS_LARGE: usize = 2_000;
 
 /// Keeps every object reachable, so the live set really does grow — a dead one
 /// would be reclaimed and the limit never reached.
+///
+/// The handler drops the live set before it reports, so what it prints is
+/// evidence that the exception arrived, not evidence about how much headroom
+/// was left over after it.
 const GROW: &str = "\
 data = []
-for _ in range(ROUNDS):
-    data.append([0] * WORDS)
-print('completed')
+try:
+    for _ in range(ROUNDS):
+        data.append([0] * WORDS)
+    print('completed')
+except MemoryError:
+    data = None
+    print('caught')
 ";
 
 fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
@@ -109,6 +130,35 @@ fn report(what: &str, out: &Output) -> String {
     )
 }
 
+/// Assert a `--heapsize` arm reached the middle rung: the loop did not finish,
+/// and the handler ran.
+fn assert_caught(what: &str, out: &Output) {
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("completed"),
+        "{}",
+        report(
+            &format!("{what}: the limited run was not bounded at all"),
+            out
+        )
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("caught"),
+        "{}",
+        report(
+            &format!("{what}: the limit never became a Python exception"),
+            out
+        )
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        report(
+            &format!("{what}: the handler ran but the process still died"),
+            out
+        )
+    );
+}
+
 /// The control. Without a limit the same program runs to completion, so a
 /// `MemoryError` in the limited arms is attributable to the limit and not to
 /// the allocation volume, the host's memory, or the script.
@@ -125,26 +175,15 @@ fn the_same_program_completes_when_the_heap_is_unbounded() {
 
 /// The middle rung, on the JIT dispatch loop (the default).
 ///
-/// The program has no handler, so the exception it is owed unwinds its frames
-/// and is reported. That report is the whole point: before the breach was
-/// routed to a dispatch loop, this run's only sign of the limit was
+/// Reaching the handler is the whole point: before the breach was routed to a
+/// dispatch loop, this run's only sign of the limit was
 /// `out_of_memory("using too much memory, aborting")` on the *second* breach,
 /// with the rung that names a Python exception skipped entirely.
 #[test]
 fn a_bounded_heap_reports_a_memory_error_rather_than_only_aborting() {
     let limit = HEAP_LIMIT.to_string();
     let out = run(&[], &["--heapsize", &limit]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("completed"),
-        "{}",
-        report("the limited run was not bounded at all", &out)
-    );
-    assert!(
-        stderr.contains("MemoryError"),
-        "{}",
-        report("the limit never became a Python exception", &out)
-    );
+    assert_caught("jit loop", &out);
 }
 
 /// Objects past `large_object_threshold` are not exempt from the limit.
@@ -180,28 +219,12 @@ fn objects_over_the_large_object_threshold_are_bounded_too() {
     let limit = HEAP_LIMIT.to_string();
     for env in [&[][..], &[("PYRE_JIT", "0")][..]] {
         let out = run_shape(env, &["--heapsize", &limit], ROUNDS_LARGE, WORDS_LARGE);
-        let stderr = String::from_utf8_lossy(&out.stderr);
         let what = if env.is_empty() {
             "large objects, jit loop"
         } else {
             "large objects, plain loop"
         };
-        assert!(
-            !String::from_utf8_lossy(&out.stdout).contains("completed"),
-            "{}",
-            report(
-                &format!("{what}: the limited run was not bounded at all"),
-                &out
-            )
-        );
-        assert!(
-            stderr.contains("MemoryError"),
-            "{}",
-            report(
-                &format!("{what}: the limit never became a Python exception"),
-                &out
-            )
-        );
+        assert_caught(what, &out);
     }
 }
 
@@ -214,15 +237,5 @@ fn objects_over_the_large_object_threshold_are_bounded_too() {
 fn the_plain_evaluator_reports_it_too() {
     let limit = HEAP_LIMIT.to_string();
     let out = run(&[("PYRE_JIT", "0")], &["--heapsize", &limit]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("completed"),
-        "{}",
-        report("the limited run was not bounded at all", &out)
-    );
-    assert!(
-        stderr.contains("MemoryError"),
-        "{}",
-        report("the limit never became a Python exception", &out)
-    );
+    assert_caught("plain loop", &out);
 }
