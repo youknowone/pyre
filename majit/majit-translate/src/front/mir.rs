@@ -8318,6 +8318,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Atomic*::from_ptr(p)` creates a borrowed atomic view over
+                // the same address; it neither allocates nor changes the
+                // pointer representation.  The translated object model keeps
+                // these slots as their upstream scalar fields (for example
+                // unicode `hash`, `rstr.py:411-412`), so alias the view to the
+                // field pointer exactly like the raw-pointer casts above.
+                if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<Atomic*>::load(&self, ordering)` — a relaxed read of a
                 // layout-transparent atomic.  `&self` already aliases the
                 // inner field read, so alias the destination to it (the
@@ -11029,6 +11042,20 @@ impl<'a> Lowering<'a> {
                         .next()
                         .is_some_and(|leaf| leaf.starts_with("Atomic"))
             })
+        })
+    }
+
+    /// `core::sync::atomic::Atomic*::from_ptr(p)` is a layout-transparent
+    /// pointer view.  Match the exact core associated function and require an
+    /// atomic output wrapper so unrelated `from_ptr` constructors (notably
+    /// `CStr::from_ptr`) keep their own semantics.
+    fn is_atomic_from_ptr_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
+                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
         })
     }
 
@@ -28601,6 +28628,31 @@ mod tests {
                 .collect();
             assert_eq!(fields, expected_fields, "{name}: source field order");
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn atomic_from_ptr_lowers_to_an_identity_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "hash_slot").expect("lower hash_slot");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("from_ptr"))
+            }),
+            "AtomicI64::from_ptr must not survive as a graph-less core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "hash")
+            }),
+            "the identity view must retain its underlying unicode hash-field read"
+        );
     }
 
     /// PyPy's `_match_keywords` indexes its small signature and argument
