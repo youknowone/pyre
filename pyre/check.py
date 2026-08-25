@@ -1941,13 +1941,10 @@ def synth_selfcheck_interpreted(path):
     `settrace_local_tracer_armed_before_entry`) guard interpreter-level
     behaviour and compile nothing their assertion is about.
 
-    It declares the empty set rather than turning a threshold off. What
-    `selfcheck-compiles` names is censused per compiled trace by arm and name
-    (`PYRE_LOOP_CENSUS=1`), so carrying this marker no longer means "some
-    unrelated loop in the file may clear the bar for me" — it means the fixture
-    asks for nothing compiled, and a bookkeeping loop that happens to compile
-    is neither required nor forbidden. A fixture that does reach the JIT, but
-    only as a root trace, declares `root:<name>` rather than this.
+    It declares the empty set rather than turning a threshold off: a
+    bookkeeping loop that happens to compile is neither required nor
+    forbidden. A fixture that does reach the JIT, but only as a root trace,
+    declares `selfcheck-compiles=root:<name>` rather than this.
 
     An opt-out rather than an opt-in, so a fixture that quietly stops being
     compiled is reported rather than passing on in silence.
@@ -1967,37 +1964,19 @@ def synth_selfcheck_compiles(path):
     Each entry is a code object name — what `get_printable_location`
     (interp_jit.py) puts first in the string it renders for a green key —
     optionally prefixed by the compile arm that has to mint it. A bare name
-    means `loop`. The run is asked whether each named shape compiled, by name,
-    not how many traces compiled anywhere.
+    means `loop`.
 
     The arm is part of the declaration because `loops_compiled` is not a count
-    of loops. It is bumped at five places in `majit-metainterp/src/pyjitpl.rs`
-    and only three of them close one: `finish_and_compile` attaches a root
-    trace that ends in FINISH with no LABEL, and says so in its own comment.
-    Measured on `wrapper_subclass_load_method_self`: eight bumps, seven `loop`
-    arms and one `root`. So `root:` is not a weaker form of the same claim —
-    it says the guarded shape reaches the JIT as a root trace, which is a
-    different fact about it, and a fixture whose loop degrades into one is
-    still reported.
+    of loops: measured on `wrapper_subclass_load_method_self`, eight bumps are
+    seven `loop` arms and one `root` (`majit_metainterp::loop_census` says
+    which arm is which). So `root:` is not a weaker form of the same claim,
+    and a fixture whose loop degrades into one is still reported.
 
     This replaces a bare number, `selfcheck-loops=8`, read off
-    `loops_compiled`. That number could not answer the question it was asked in
-    two independent ways: it counted non-loops, as above, and it was a
-    whole-process figure, so any hot loop in the file cleared the floor — which
-    is why `settrace_local_tracer_armed_before_entry` had to count its own
-    events with `list.count` instead of a `for` loop. Both are the same
-    failure: the gate read an aggregate because nothing named the parts.
-
-    `PYRE_LOOP_CENSUS=1` names them, through the JitDriver hook pyre had
-    already ported for parity and never called. The census rides the selfcheck
-    run itself rather than a second process, so per-backend coverage is kept:
-    a shape admitted on dynasm and declined on wasm is a wasm failure here,
-    which a single native census run could not see.
-
-    Required, not optional, for the same reason the floor was: a fixture that
-    quietly stops being compiled must be reported rather than inheriting a weak
-    default. `selfcheck-interpreted` is how a fixture says its invariant is not
-    about compiled code at all.
+    `loops_compiled`, which was also a whole-process figure — any hot loop in
+    the file cleared the floor, which is why
+    `settrace_local_tracer_armed_before_entry` had to count its own events
+    with `list.count` instead of a `for` loop.
     """
     found = _header_directive(path, "# pyre-check: selfcheck-compiles=")
     if found is None:
@@ -2136,10 +2115,9 @@ def spec_fold_census(binary, path, timeout_s, wasm=False):
     return {m.group(1): int(m.group(2)) for m in SPEC_CENSUS_FOLD_RE.finditer(err)}, 0
 
 
-# The arms `majit_metainterp::loop_census` tags a compile with, which are the
-# five places `pyjitpl.rs` bumps `loops_compiled`. Spelled out here so a typo
-# in a fixture header is an authoring error rather than a shape that silently
-# never matches.
+# The arms `majit_metainterp::loop_census` tags a compile with. Spelled out
+# here so a typo in a fixture header is an authoring error rather than a shape
+# that silently never matches.
 SELFCHECK_COMPILE_ARMS = frozenset({"loop", "retrace", "root", "entry-bridge"})
 
 SELFCHECK_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)", re.M)
@@ -2148,10 +2126,8 @@ SELFCHECK_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)", re.M)
 def selfcheck_compiled_census(stderr):
     """`(kind, name)` for every trace `PYRE_LOOP_CENSUS=1` saw compiled.
 
-    *kind* is the compile arm — `loop`, `retrace`, `root`, `entry-bridge` —
-    and it is carried because `loops_compiled` counts all four alike while
-    only some of them close a loop. *name* is the code object the green key
-    points at.
+    *kind* is the compile arm ([`SELFCHECK_COMPILE_ARMS`]); *name* is the code
+    object the green key points at.
 
     One line per compiled trace, so a name repeats when a function is compiled
     more than once; the caller only asks whether a pair is present. A trace
@@ -2496,11 +2472,10 @@ def digest_input_paths(paths):
     return digest.hexdigest()
 
 
-# The one input `cargo` itself rewrites during a build. It is left out of a
-# window comparison only when [`settle_cargo_resolution`] could not run the
-# resolution up front, because a lock the build resolved is the build doing its
-# job rather than the tree moving underneath it — and the witness alone cannot
-# tell that apart from an external rewrite.
+# The one input `cargo` itself rewrites during a build: a lock the build
+# resolved is the build doing its job, not the tree moving underneath it.
+# Excluded from a window comparison only when [`settle_cargo_resolution`]
+# could not settle it up front.
 CARGO_WRITTEN_INPUTS = ("Cargo.lock",)
 
 # What `inputs` says in a stamp whose artefact was built over a tree that

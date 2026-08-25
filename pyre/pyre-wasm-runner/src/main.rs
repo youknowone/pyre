@@ -1384,11 +1384,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             Err(_) => eprintln!("[jit-stats] guard_census=unexported"),
         }
     }
-    // The compile census armed before the run, printed verbatim: these are the
-    // same `[loop-census] <arm> <name>` lines a native run puts on stderr, and
-    // `check.py` parses one shape for every backend. A module predating the
-    // export says so rather than reading as a run that compiled nothing, which
-    // is the answer a selfcheck fixture would be failed on.
+    // The compile census armed before the run, printed verbatim: the same
+    // `[loop-census]` lines a native run puts on stderr. A module predating
+    // the export says so rather than reading as a run that compiled nothing,
+    // which is what a selfcheck fixture would be failed on.
     if std::env::var_os("PYRE_LOOP_CENSUS").is_some() {
         match instance.get_typed_func::<(), u64>(&mut store, "pyre_loop_census") {
             Ok(census) => {

@@ -260,12 +260,11 @@ pub mod loop_census {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    /// `interp_jit.py:34 get_printable_location(next_instr, is_being_profiled,
-    /// bytecode)`. The green tuple reaches majit as raw words, so the code
-    /// object arrives as its address and the front end casts it back.
-    /// `w_pycode` is the green tuple's `pycode` slot as majit carries it: the
-    /// `w_code` object address (`green_key_raw: (w_code as usize, pc)`), not
-    /// the inner `CodeObject` — the front end dereferences it.
+    /// `get_printable_location(next_instr, is_being_profiled, bytecode)`
+    /// (interp_jit.py). `w_pycode` is that `bytecode` green as majit carries
+    /// it: the `w_code` object address (`green_key_raw: (w_code as usize,
+    /// pc)`), not the inner `CodeObject` — the front end casts it back and
+    /// dereferences it.
     pub type LocationPrinter =
         fn(next_instr: usize, is_being_profiled: bool, w_pycode: usize) -> String;
 
@@ -277,8 +276,6 @@ pub mod loop_census {
         let _ = PRINTER.set(printer);
     }
 
-    /// Armed by [`enable`] for an embedder whose environment the census cannot
-    /// read, and which collects the lines rather than reading a stderr.
     static ARMED: AtomicBool = AtomicBool::new(false);
 
     /// The lines recorded since the last [`report`], for that embedder.

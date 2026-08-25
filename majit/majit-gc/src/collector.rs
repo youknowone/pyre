@@ -2586,29 +2586,10 @@ impl MiniMarkGC {
     /// resident for as many iterations as it takes the major threshold to
     /// arrive.
     ///
-    /// Two restrictions:
-    ///
-    /// * A type carrying the weakref flag falls back to the born-old birth,
-    ///   which is upstream's own contract: `malloc_fixedsize`'s large arm opens
-    ///   with `ll_assert(not contains_weakptr, "'contains_weakptr' specified
-    ///   for a large object")`. `invalidate_young_weakrefs` decides survival by
-    ///   reading the forwarding header, and a non-moving object never forwards,
-    ///   so the assertion is what keeps that read well-defined. A weakref
-    ///   payload is a single `weakptr` slot, so nothing of that type approaches
-    ///   the large-object threshold to begin with.
-    ///
-    ///   A destructor is *not* a restriction. The large arm is reached only
-    ///   after the heavy-finalizer branch
-    ///   (`needs_finalizer and not is_finalizer_light`) has returned, so a
-    ///   light destructor falls through to it, takes `alloc_young=True`, and is
-    ///   appended to `young_objects_with_destructors`; `TypeInfo.destructor` is
-    ///   that light kind. `deal_with_young_objects_with_destructors` reads
-    ///   GCFLAG_VISITED_RMY for such a member instead of a forwarding pointer —
-    ///   the same witness `free_young_rawmalloced_objects` reads a few steps
-    ///   later in the same minor, and final by the time either runs.
-    /// * `MAJIT_GC_YOUNG_RAWMALLOC=0` turns the whole path off, so a defect
-    ///   that only appears once these objects can die at a minor can be
-    ///   bisected against the born-old behaviour without rebuilding.
+    /// Refused for a weakref type (see
+    /// [`type_alloc_may_be_young`](Self::type_alloc_may_be_young)) and under
+    /// `MAJIT_GC_YOUNG_RAWMALLOC=0` (see [`young_rawmalloc_enabled`]). A
+    /// destructor is *not* refused.
     ///
     /// Returns `None` for either refusal and for an allocation failure; the
     /// caller falls back to `alloc_in_oldgen_clear`.
@@ -2828,11 +2809,7 @@ impl MiniMarkGC {
         self.surviving_pinned_objects.clear();
         self.pinned_objects_in_nursery = 0;
         self.any_pinned_object_kept = false;
-        // incminimark.py:1787-1789: before everything else, drop the young
-        // arrays from the remembered set. An entry naming an object this
-        // collection may free is one the drain below would dereference after
-        // the free; upstream removes them here, ahead of the re-gray and every
-        // root walk.
+        // incminimark.py:1787-1789: ahead of the re-gray and every root walk.
         if self.oldgen.has_young_rawmalloced() {
             self.remove_young_arrays_from_remembered_set();
         }
@@ -8714,15 +8691,6 @@ mod tests {
     /// `deal_with_young_objects_with_finalizers` is already written for a
     /// raw-malloced member: it stamps GCFLAG_VISITED_RMY instead of copying the
     /// object out, then hands it to the old deque itself.
-    ///
-    /// Pyre routes an object it considers already old straight to the old
-    /// deque, which is sound for a born-old allocation. `oldgen.contains` is
-    /// not that question though: both raw-malloc births share
-    /// `try_rawmalloc_block`, so a YOUNG raw-malloced object sits in
-    /// `rawmalloced_payloads` as well and answers yes. Filing it as old skips
-    /// the stamp, and `free_young_rawmalloced_objects` then releases the block
-    /// at the end of that same minor while the old deque still holds its
-    /// address.
     #[test]
     fn a_young_large_finalizer_registration_survives_its_first_minor() {
         fn trigger() {}
@@ -8789,12 +8757,6 @@ mod tests {
 
     /// A young raw-malloced object greyed by the non-moving major must leave
     /// it with the flags it arrived with.
-    ///
-    /// The major marks the nursery in place and clears those marks as its
-    /// strictly-last step, but that pass is keyed on `is_in_nursery`. A young
-    /// raw-malloced block is not in the nursery and is not on the list the
-    /// oldgen sweep clears either, so nothing clears the `VISITED` the marking
-    /// stamped on it.
     #[test]
     fn a_young_rawmalloced_object_leaves_a_nonmoving_major_with_its_flags_pristine() {
         let mut gc = test_gc(4096);
@@ -8908,7 +8870,6 @@ mod tests {
         );
         assert_eq!(unsafe { *(holder.0 as *const GcRef) }.0, child.0);
 
-        // Drop the edge and the next minor cannot free it any more — it is old.
         gc.roots.clear();
     }
 

@@ -3,15 +3,8 @@
 # pyre-check: spec-folds=frame_lasti
 # The `root:` arm is measured, not a relaxation: this fixture's loop aborts
 # five times with ABORT_ESCAPE and what reaches the JIT is the root trace
-# `finish_and_compile` attaches. The declining arm is the positive-depth-at-
-# an-inline-level preflight in `try_walker_specialize_sys_getframe`, whose
-# `!next_op_is_f_locals_for_getframe_result(..)` disjunct admits only a result
-# consumed immediately by `f_locals`; binding the frame to a name puts a
-# STORE_FAST in between, so this fixture misses it twice over. Widening it
-# would fall the follow-on getter through to the generic heap getter, measured
-# returning three different `f_lasti` values for one program point.
-# ⚠ `[getframe-decline] non-vref hop` in the log is NOT this: it fires once
-# against five aborts, from a different walk that compiles.
+# `finish_and_compile` attaches. It declines through the same arm as
+# `frame_caller_image_from_inlined_callee_regression.py`, which records it.
 # Self-checking guard for the `f_lasti` coordinate on the two frames a walk
 # owns that are NOT the loop's own portal: the frame of an inlined callee, and
 # the caller's frame read from inside one.

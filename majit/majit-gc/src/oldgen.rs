@@ -162,10 +162,8 @@ impl OldGen {
         Some(header_ptr)
     }
 
-    /// The `arena_malloc` half both rawmalloc births share: the block, its
-    /// cleared card bytes, the payload membership entry and the byte
-    /// accounting.  Which list the returned record joins is what separates a
-    /// young birth from an old one.
+    /// The `arena_malloc` half both rawmalloc births share.  Which list the
+    /// returned record joins is what separates a young birth from an old one.
     fn try_rawmalloc_block(
         &mut self,
         alloc_size: usize,

@@ -1741,9 +1741,6 @@ impl GcRewriterImpl {
             0,
             "rewrite.py:785 `assert (size & (WORD-1)) == 0` — size must be word-aligned"
         );
-        // The old-generation twin takes the same arguments, so only the callee
-        // address changes — the shape `gen_malloc_array` already uses for
-        // `non_moving`.
         let fn_ref = st.const_int(if non_moving {
             self.malloc_big_fixedsize_oldgen_fn
         } else {
