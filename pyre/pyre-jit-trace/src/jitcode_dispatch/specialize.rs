@@ -12822,6 +12822,156 @@ pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
+/// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
+///
+/// Publishes the call-site resume coordinate the enclosing full-body walk needs
+/// to rebuild this frame, mirrors the virtualizable's `last_instr` /
+/// `valuestackdepth` when the enclosing frame owns the shadow, swaps in the
+/// callee's GLOBAL descr pool for the duration, runs the walk, then restores
+/// every field it moved.  A build-time canonical body carries no per-fn descr
+/// pool, so its `d` / `j` operands resolve through `all_descr_refs()` /
+/// `RawDescrPool::Global` -- not the parent loop's per-fn pool, which
+/// mis-resolves the first `residual_call` descr.
+///
+/// Returns the walk outcome together with the trace position taken immediately
+/// before the walk, for a caller that has to reason about which ops the callee
+/// contributed.  The position is captured after the resume mirroring above, so
+/// it names the callee's first op and not the mirror's.
+///
+/// `fallback_label` names this site in the empty-twin coordinate note;
+/// `call_site_label` names it in the active-box collection.
+#[allow(clippy::too_many_arguments)]
+fn run_orthodox_helper_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    sym: &Sym,
+    sub_body: &SubJitCodeBody,
+    fallback_label: &'static str,
+    call_site_label: &'static str,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
+        let jc = &*sym.jitcode();
+        let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op_pc);
+        // Forward py twin first (#73 phase-3): equals the containing
+        // coordinate plus trivia normalization by construction; the containing
+        // lookup survives for the empty-twin class, and the trivia skip below
+        // is an identity on the twin path.
+        let mut py = jc
+            .payload
+            .forward_py_pc_for_jitcode_pc(op_pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::note_empty_twin_fallback(fallback_label, jc.index, op_pc as i32);
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
+            });
+        if jc.payload.code_ptr.is_null() {
+            (py, sym.valuestackdepth() as i64, jc_index, marker)
+        } else {
+            let codeobj = &*jc.payload.code_ptr;
+            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+            // Read the depth off the jitcode-pc-keyed trivia twin, which equals
+            // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op_pc))]`
+            // by construction; fall back to the py_pc-keyed static-liveness read
+            // where the twin is unpopulated (skeleton / fixture install).
+            let depth = if jc.payload.depth_trivia_populated() {
+                jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+            } else {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py as usize)
+                    .copied()
+            };
+            let vsd = match depth {
+                Some(d) => (sym.nlocals() + d as usize) as i64,
+                None => sym.valuestackdepth() as i64,
+            };
+            (py, vsd, jc_index, marker)
+        }
+    };
+    if sym.owns_virtualizable_shadow() {
+        let li = call_site_py_pc as i64 - 1;
+        let li_op = ctx.trace_ctx.const_int(li);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            li_op,
+            Value::Int(li),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+    let call_site_word = call_site_marker
+        .map(|marker| marker as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    let active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        outer_jitcode_index,
+        false,
+        call_site_word,
+        op_pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
+        call_site_label,
+        None,
+        &[],
+        // Not a branch-guard reconstruction: this is the pre-call site
+        // snapshot, so there is no kept operand-stack slot to report as
+        // unsourced.
+        None,
+    );
+
+    let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.outer_active_boxes = active;
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+
+    let walk_start = ctx.trace_ctx.get_trace_position();
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.inline_subwalk = true;
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op_pc,
+        sub_body,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    Ok((walk_result?, walk_start))
+}
+
 /// Commit core of the #171 orthodox list-append fold, shared by the
 /// method-call (`try_walker_orthodox_list_append`) and LIST_APPEND-opcode
 /// (`try_walker_orthodox_list_append_opcode`) forms.  Stamps the receiver
@@ -12977,135 +13127,20 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        // Forward py twin first (#73 phase-3): equals the containing
-        // coordinate plus trivia normalization by construction; the containing
-        // lookup survives for the empty-twin class, and the trivia skip below
-        // is an identity on the twin path.
-        let mut py = jc
-            .payload
-            .forward_py_pc_for_jitcode_pc(op.pc)
-            .unwrap_or_else(|| {
-                crate::py_coord::note_empty_twin_fallback(
-                    "list_append_commit",
-                    jc.index,
-                    op.pc as i32,
-                );
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
-            });
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
-        } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            // Read the depth off the jitcode-pc-keyed trivia twin, which equals
-            // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op.pc))]`
-            // by construction; fall back to the py_pc-keyed static-liveness read
-            // where the twin is unpopulated (skeleton / fixture install).
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = match depth {
-                Some(d) => (sym.nlocals() + d as usize) as i64,
-                None => sym.valuestackdepth() as i64,
-            };
-            (py, vsd, jc_index, marker)
-        }
-    };
-    if sym.owns_virtualizable_shadow() {
-        let li = call_site_py_pc as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
-    }
-    let call_site_word = match call_site_marker {
-        Some(m) => m as i32,
-        None => majit_ir::resumedata::NO_JITCODE_PC,
-    };
-    let active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        // As above, entry metadata is keyed by the append op itself; its
-        // liveness-bank query remains keyed by the resume marker.
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "w_list_append_call_site",
-        None,
-        &[],
-        None,
-    );
-
-    // Swap in the call-site resume context + the callee's GLOBAL descr pool
-    // for the sub-walk, restore after.  `w_list_append` is a build-time
-    // canonical body with no per-fn descr pool, so its `d`/`j` operands
-    // resolve through `all_descr_refs()` / `RawDescrPool::Global` — NOT the
-    // parent loop's per-fn pool (which mis-resolves the first residual_call
-    // descr → `ResidualCallDescrNotCallDescr`).
-    let saved_entry = ctx.entry_py_pc;
-    let saved_marker = ctx.outer_resume_marker_jit_pc;
-    let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
-    let saved_descr_refs = ctx.descr_refs;
-    let saved_raw_descrs = ctx.raw_descrs;
-    let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
-    ctx.outer_resume_marker_jit_pc = call_site_marker;
-    ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
-    ctx.raw_descrs = RawDescrPool::Global;
-    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
-
-    let self_concrete = ConcreteValue::Ref(inner_self);
-    let value_concrete = ConcreteValue::Ref(value);
-    let saved_fbw_mode = ctx.fbw_mode;
-    ctx.fbw_mode.inline_subwalk = true;
-    let walk_result = run_sub_jitcode_walk(
+    let (walk_outcome, _walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,
+        sym,
         sub_body,
+        "list_append_commit",
+        "w_list_append_call_site",
         &[],
         &[],
         &[self_ref, value_op],
-        &[self_concrete, value_concrete],
-        &[],
-    );
-    ctx.fbw_mode = saved_fbw_mode;
+        &[ConcreteValue::Ref(inner_self), ConcreteValue::Ref(value)],
+    )?;
 
-    ctx.entry_py_pc = saved_entry;
-    ctx.outer_resume_marker_jit_pc = saved_marker;
-    ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
-    ctx.descr_refs = saved_descr_refs;
-    ctx.raw_descrs = saved_raw_descrs;
-    ctx.sub_jitcode_lookup = saved_lookup;
-
-    match walk_result? {
+    match walk_outcome {
         DispatchOutcome::SubReturn { result } => {
             if finish_inline_callee_return(ctx, result).is_some() {
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
@@ -13124,7 +13159,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
     // symbolic-tagged funcbox — is declined by `try_execute_residual_call_via_executor`
-    // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
+    // (`OrthodoxSubWalkTraceUnsupported`) and the sub-walk helper propagates that
     // abort before this point (graceful interpreter fallback, never a wrong
     // trace).  The descr-pool wiring above (strategy/header field descrs) is
     // exercised on the way in.
@@ -13354,119 +13389,20 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        let mut py = jc
-            .payload
-            .forward_py_pc_for_jitcode_pc(op.pc)
-            .unwrap_or_else(|| {
-                crate::py_coord::note_empty_twin_fallback(
-                    "list_pop_commit",
-                    jc.index,
-                    op.pc as i32,
-                );
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
-            });
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
-        } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = match depth {
-                Some(d) => (sym.nlocals() + d as usize) as i64,
-                None => sym.valuestackdepth() as i64,
-            };
-            (py, vsd, jc_index, marker)
-        }
-    };
-    if sym.owns_virtualizable_shadow() {
-        let li = call_site_py_pc as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
-    }
-    let call_site_word = call_site_marker
-        .map(|marker| marker as i32)
-        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-    let active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "w_list_pop_end_call_site",
-        None,
-        &[],
-        // Not a branch-guard reconstruction: this is the pre-call site
-        // snapshot, so there is no kept operand-stack slot to report as
-        // unsourced.
-        None,
-    );
-
-    let saved_entry = ctx.entry_py_pc;
-    let saved_marker = ctx.outer_resume_marker_jit_pc;
-    let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
-    let saved_descr_refs = ctx.descr_refs;
-    let saved_raw_descrs = ctx.raw_descrs;
-    let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
-    ctx.outer_resume_marker_jit_pc = call_site_marker;
-    ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
-    ctx.raw_descrs = RawDescrPool::Global;
-    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
-
-    let walk_start = ctx.trace_ctx.get_trace_position();
-    let saved_fbw_mode = ctx.fbw_mode;
-    ctx.fbw_mode.inline_subwalk = true;
-    let walk_result = run_sub_jitcode_walk(
+    let (walk_outcome, walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,
+        sym,
         sub_body,
+        "list_pop_commit",
+        "w_list_pop_end_call_site",
         &[],
         &[],
         &[self_ref],
         &[ConcreteValue::Ref(inner_self)],
-        &[],
-    );
-    ctx.fbw_mode = saved_fbw_mode;
-    ctx.entry_py_pc = saved_entry;
-    ctx.outer_resume_marker_jit_pc = saved_marker;
-    ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
-    ctx.descr_refs = saved_descr_refs;
-    ctx.raw_descrs = saved_raw_descrs;
-    ctx.sub_jitcode_lookup = saved_lookup;
+    )?;
 
-    let result = match walk_result? {
+    let result = match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
