@@ -4352,6 +4352,15 @@ fn load_part(
                 &pathname,
                 pyre_object::gc_roots::shadow_stack_get(module_slot),
             )?;
+            // `_bootstrap._load` writes `sys.modules[spec.name]` between
+            // `create_module` and `exec_module`, and the single-phase branch of
+            // the load above has already registered its own module.  Registering
+            // here is what lets a slot that imports its own module find it,
+            // which is why the source loader does the same before executing.
+            set_sys_module(
+                modulename,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            );
             // `_imp.create_dynamic` leaves the second PEP 489 phase to
             // importlib's `_imp.exec_dynamic`; this importer runs both, so the
             // exec slots run here, after `__spec__` is in place.
@@ -4396,6 +4405,11 @@ fn load_part(
                 unsafe { pyre_object::w_module_get_w_dict(module) },
                 "__path__",
                 pyre_object::gc_roots::shadow_stack_get(list_slot),
+            );
+            // Registered before the exec phase, as in the file branch above.
+            set_sys_module(
+                modulename,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
             );
             // The exec phase runs after `__spec__` and `__path__`, for the same
             // reason it does in the file branch above.

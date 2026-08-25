@@ -533,11 +533,10 @@ pub fn load_extension_module(
     match init_result {
         // `create_cpyext_module` returns straight from the multi-phase branch:
         // the definition, not a copied dictionary, is what a later import
-        // rebuilds the module from.
-        InitResult::MultiPhase(_) => crate::importing::set_sys_module(
-            name,
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-        ),
+        // rebuilds the module from, and `sys.modules` is the importer's to
+        // write -- a caller that only creates the module and executes it
+        // itself must not find the name there.
+        InitResult::MultiPhase(_) => {}
         InitResult::SinglePhase(_) => fixup_extension(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             name,
