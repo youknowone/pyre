@@ -12698,6 +12698,7 @@ impl<'a> Lowering<'a> {
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
         Some(crate::front::slice_first::SliceFirstSite {
             result_var: result_var.clone(),
+            index: None,
             option_owner,
             some_owner,
             payload_ty,
@@ -28671,6 +28672,33 @@ mod tests {
         assert!(
             !residuals.contains("unicodeobject::w_str_get_hash"),
             "the ordinary scalar memo read remains visible to the generated JIT"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn deque_compare_scalar_slice_get_lowers_to_a_guarded_item_read() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "deque_compare").expect("lower deque_compare");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core".to_string(), "slice".to_string(), "<Impl>".to_string(), "get".to_string()])
+            }),
+            "scalar slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "the successful get arm must read the guarded element"
         );
     }
 
