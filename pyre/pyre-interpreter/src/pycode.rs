@@ -2164,11 +2164,13 @@ pub unsafe fn line_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         let end = bounds.ar_end;
         line_iter_store(it, bounds.cursor());
-        Some(w_tuple_new(vec![
-            w_int_new(start as i64),
-            w_int_new(end as i64),
-            source_offset_converter(line),
-        ]))
+        // Each field is freshly allocated and the next one allocates again,
+        // so they are pinned as they arrive (`build_list_storage`).
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_int_new(start as i64));
+        fields.push(w_int_new(end as i64));
+        fields.push(source_offset_converter(line));
+        Some(w_tuple_new(fields.take()))
     }
 }
 
@@ -2232,12 +2234,12 @@ pub unsafe fn positions_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         it.ar_line = saved.ar_line as i64;
         it.computed_line = saved.computed_line as i64;
         it.offset = it.offset.wrapping_add(2);
-        Some(w_tuple_new(vec![
-            source_offset_converter(it.ar_line as i32),
-            source_offset_converter(it.end_line as i32),
-            source_offset_converter(it.column as i32),
-            source_offset_converter(it.end_column as i32),
-        ]))
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(source_offset_converter(it.ar_line as i32));
+        fields.push(source_offset_converter(it.end_line as i32));
+        fields.push(source_offset_converter(it.column as i32));
+        fields.push(source_offset_converter(it.end_column as i32));
+        Some(w_tuple_new(fields.take()))
     }
 }
 
@@ -2297,7 +2299,11 @@ pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 
 /// `int_triple` — the `(a, b, c)` tuple every branch row is reported as.
 fn int_triple(a: i64, b: i64, c: i64) -> PyObjectRef {
-    w_tuple_new(vec![w_int_new(a), w_int_new(b), w_int_new(c)])
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_int_new(a));
+    fields.push(w_int_new(b));
+    fields.push(w_int_new(c));
+    w_tuple_new(fields.take())
 }
 
 /// `branchesiter_next` — the next branch instruction's

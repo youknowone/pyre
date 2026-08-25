@@ -4434,8 +4434,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // names the failure.
                 let names = fdlistdir(resolved.as_fd)
                     .map_err(|errno| errno_err_with_filename(errno, resolved.w_path()))?;
-                let items = names.iter().map(|n| fs_name_obj(false, n)).collect();
-                return Ok(pyre_object::w_list_new(items));
+                // Each name is freshly allocated and the next one allocates
+                // again, so they are pinned as they arrive.
+                let mut items = pyre_object::gc_roots::RootedItems::new();
+                for n in &names {
+                    items.push(fs_name_obj(false, n));
+                }
+                return Ok(pyre_object::w_list_new(items.take()));
             }
             let bytes_mode = unsafe { resolved.is_bytes() };
             let path = resolved.as_bytes.as_slice();
@@ -4444,23 +4449,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             {
                 let names = crate::host_seam::ops::listdir(path)
                     .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, w_path()))?;
-                let items = names
-                    .into_iter()
-                    .map(|n| fs_name_obj(bytes_mode, &n))
-                    .collect();
-                return Ok(pyre_object::w_list_new(items));
+                let mut items = pyre_object::gc_roots::RootedItems::new();
+                for n in names {
+                    items.push(fs_name_obj(bytes_mode, &n));
+                }
+                return Ok(pyre_object::w_list_new(items.take()));
             }
             #[cfg(not(feature = "sandbox"))]
             {
                 let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                     .map_err(|e| fs_err_with_filename(e, w_path()))?;
-                let mut items = Vec::new();
+                let mut items = pyre_object::gc_roots::RootedItems::new();
                 for entry in entries {
                     let entry = entry.map_err(|e| fs_err_with_filename(e, w_path()))?;
                     let name = entry.file_name();
                     items.push(fs_name_obj(bytes_mode, name.as_encoded_bytes()));
                 }
-                Ok(pyre_object::w_list_new(items))
+                Ok(pyre_object::w_list_new(items.take()))
             }
         }),
     );
@@ -12552,12 +12557,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             names: std::io::Result<Vec<std::ffi::OsString>>,
         ) -> Result<PyObjectRef, crate::PyError> {
             let names = names.map_err(|e| fs_err_with_filename(e, pyre_object::PY_NULL))?;
-            Ok(pyre_object::w_list_new(
-                names
-                    .iter()
-                    .map(|name| fs_name_obj(false, name.as_encoded_bytes()))
-                    .collect(),
-            ))
+            // Each name is freshly allocated and the next one allocates again,
+            // so they are pinned as they arrive.
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for name in &names {
+                items.push(fs_name_obj(false, name.as_encoded_bytes()));
+            }
+            Ok(pyre_object::w_list_new(items.take()))
         }
         crate::module_ns_store(
             ns,

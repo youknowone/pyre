@@ -795,7 +795,10 @@ fn init_string_module(ns: PyObjectRef) {
             let parsed = FormatString::from_str(body)
                 .map_err(|_| crate::PyError::value_error("bad format string"))?;
 
-            let mut tuples = Vec::new();
+            // Every tuple, and every string inside it, is freshly allocated and
+            // the next allocation can collect, so each is pinned as it arrives;
+            // the conversion is built last so the pin order is the element order.
+            let mut tuples = pyre_object::gc_roots::RootedItems::new();
             let mut pending: Option<Wtf8Buf> = None;
             for part in parsed.format_parts {
                 match part {
@@ -806,28 +809,36 @@ fn init_string_module(ns: PyObjectRef) {
                         format_spec,
                     } => {
                         let literal = pending.take().unwrap_or_default();
-                        let conversion = match conversion_spec {
-                            Some(c) => pyre_object::w_str_new(&c.to_char_lossy().to_string()),
-                            None => pyre_object::w_none(),
+                        // The tuple's own bracket closes before `tuples` takes
+                        // it: both address the same shadow stack, so an inner
+                        // set still open holds the slots the outer one claims.
+                        let entry = {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_str_from_wtf8(literal));
+                            fields.push(pyre_object::w_str_from_wtf8(field_name));
+                            fields.push(pyre_object::w_str_from_wtf8(format_spec));
+                            fields.push(match conversion_spec {
+                                Some(c) => pyre_object::w_str_new(&c.to_char_lossy().to_string()),
+                                None => pyre_object::w_none(),
+                            });
+                            pyre_object::w_tuple_new(fields.take())
                         };
-                        tuples.push(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_str_from_wtf8(literal),
-                            pyre_object::w_str_from_wtf8(field_name),
-                            pyre_object::w_str_from_wtf8(format_spec),
-                            conversion,
-                        ]));
+                        tuples.push(entry);
                     }
                 }
             }
             if let Some(text) = pending {
-                tuples.push(pyre_object::w_tuple_new(vec![
-                    pyre_object::w_str_from_wtf8(text),
-                    pyre_object::w_none(),
-                    pyre_object::w_none(),
-                    pyre_object::w_none(),
-                ]));
+                let entry = {
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_str_from_wtf8(text));
+                    fields.push(pyre_object::w_none());
+                    fields.push(pyre_object::w_none());
+                    fields.push(pyre_object::w_none());
+                    pyre_object::w_tuple_new(fields.take())
+                };
+                tuples.push(entry);
             }
-            Ok(pyre_object::w_list_new(tuples))
+            Ok(pyre_object::w_list_new(tuples.take()))
         }),
     );
     crate::module_ns_store(

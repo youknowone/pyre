@@ -185,15 +185,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::grp::getgrall()
-                        .iter()
-                        .map(make_struct_group)
-                        .collect();
-                    Ok(pyre_object::w_list_new(items))
+                    // Each struct_group is freshly allocated and building the
+                    // next one allocates again, so they are pinned as they
+                    // arrive.
+                    let groups = rustpython_host_env::grp::getgrall();
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for g in groups.iter() {
+                        items.push(make_struct_group(g));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 unsafe {
-                    let mut items: Vec<pyre_object::PyObjectRef> = Vec::new();
+                    // Each struct_group is freshly allocated and the next
+                    // `getgrent` entry allocates again, so they are pinned as
+                    // they arrive.
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
                     libc::setgrent();
                     loop {
                         let g = libc::getgrent();
@@ -203,7 +210,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         items.push(make_struct_group_libc(g));
                     }
                     libc::endgrent();
-                    return Ok(pyre_object::w_list_new(items));
+                    return Ok(pyre_object::w_list_new(items.take()));
                 }
             },
             0,

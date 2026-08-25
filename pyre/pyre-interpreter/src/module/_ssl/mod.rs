@@ -278,23 +278,37 @@ fn dict_from_pairs(items: &[(&str, PyObjectRef)]) -> PyObjectRef {
 
 fn decoded_name(cert: *const pyre_native::ssl::DecodedCertificate, subject: bool) -> PyObjectRef {
     let rdn_count = unsafe { pyre_native::ssl::certificate_name_rdn_count(cert, subject) };
-    let mut rdns = Vec::with_capacity(rdn_count);
+    // Every tuple here is freshly allocated and the next allocation can collect,
+    // so each level is pinned as it is produced; an inner bracket closes before
+    // its tuple joins the level above, whose slots would otherwise sit inside it.
+    let mut rdns = pyre_object::gc_roots::RootedItems::new();
     for rdn in 0..rdn_count {
         let attribute_count =
             unsafe { pyre_native::ssl::certificate_name_attribute_count(cert, subject, rdn) };
-        let mut attributes = Vec::with_capacity(attribute_count);
-        for attribute in 0..attribute_count {
-            let key = unsafe {
-                pyre_native::ssl::certificate_name_attribute_key(cert, subject, rdn, attribute)
-            };
-            let value = unsafe {
-                pyre_native::ssl::certificate_name_attribute_value(cert, subject, rdn, attribute)
-            };
-            attributes.push(w_tuple_new(vec![w_str_new(&key), w_str_new(&value)]));
-        }
-        rdns.push(w_tuple_new(attributes));
+        let rdn_tuple = {
+            let mut attributes = pyre_object::gc_roots::RootedItems::new();
+            for attribute in 0..attribute_count {
+                let key = unsafe {
+                    pyre_native::ssl::certificate_name_attribute_key(cert, subject, rdn, attribute)
+                };
+                let value = unsafe {
+                    pyre_native::ssl::certificate_name_attribute_value(
+                        cert, subject, rdn, attribute,
+                    )
+                };
+                let attribute_tuple = {
+                    let mut pair = pyre_object::gc_roots::RootedItems::new();
+                    pair.push(w_str_new(&key));
+                    pair.push(w_str_new(&value));
+                    w_tuple_new(pair.take())
+                };
+                attributes.push(attribute_tuple);
+            }
+            w_tuple_new(attributes.take())
+        };
+        rdns.push(rdn_tuple);
     }
-    w_tuple_new(rdns)
+    w_tuple_new(rdns.take())
 }
 
 fn decoded_directory_name(
@@ -302,25 +316,38 @@ fn decoded_directory_name(
     san: usize,
 ) -> PyObjectRef {
     let rdn_count = unsafe { pyre_native::ssl::certificate_san_directory_rdn_count(cert, san) };
-    let mut rdns = Vec::with_capacity(rdn_count);
+    // Same nesting as `decoded_name`: each level is pinned as it is produced and
+    // an inner bracket closes before its tuple joins the level above.
+    let mut rdns = pyre_object::gc_roots::RootedItems::new();
     for rdn in 0..rdn_count {
         let count =
             unsafe { pyre_native::ssl::certificate_san_directory_attribute_count(cert, san, rdn) };
-        let mut attributes = Vec::with_capacity(count);
-        for attribute in 0..count {
-            let key = unsafe {
-                pyre_native::ssl::certificate_san_directory_attribute_key(cert, san, rdn, attribute)
-            };
-            let value = unsafe {
-                pyre_native::ssl::certificate_san_directory_attribute_value(
-                    cert, san, rdn, attribute,
-                )
-            };
-            attributes.push(w_tuple_new(vec![w_str_new(&key), w_str_new(&value)]));
-        }
-        rdns.push(w_tuple_new(attributes));
+        let rdn_tuple = {
+            let mut attributes = pyre_object::gc_roots::RootedItems::new();
+            for attribute in 0..count {
+                let key = unsafe {
+                    pyre_native::ssl::certificate_san_directory_attribute_key(
+                        cert, san, rdn, attribute,
+                    )
+                };
+                let value = unsafe {
+                    pyre_native::ssl::certificate_san_directory_attribute_value(
+                        cert, san, rdn, attribute,
+                    )
+                };
+                let attribute_tuple = {
+                    let mut pair = pyre_object::gc_roots::RootedItems::new();
+                    pair.push(w_str_new(&key));
+                    pair.push(w_str_new(&value));
+                    w_tuple_new(pair.take())
+                };
+                attributes.push(attribute_tuple);
+            }
+            w_tuple_new(attributes.take())
+        };
+        rdns.push(rdn_tuple);
     }
-    w_tuple_new(rdns)
+    w_tuple_new(rdns.take())
 }
 
 fn decoded_urls(
@@ -368,17 +395,25 @@ fn decoded_certificate_dict(cert: *mut pyre_native::ssl::DecodedCertificate) -> 
     }
     let san_count = unsafe { pyre_native::ssl::certificate_san_count(cert) };
     if san_count != 0 {
-        let mut names = Vec::with_capacity(san_count);
+        // Each name tuple is freshly allocated and the next entry allocates
+        // again, so both the pair and the tuples are pinned as they arrive.
+        let mut names = pyre_object::gc_roots::RootedItems::new();
         for index in 0..san_count {
             let kind = unsafe { pyre_native::ssl::certificate_san_kind(cert, index) };
-            let value = if kind == "DirName" {
-                decoded_directory_name(cert, index)
-            } else {
-                w_str_new(&unsafe { pyre_native::ssl::certificate_san_value(cert, index) })
+            let entry = {
+                let mut pair = pyre_object::gc_roots::RootedItems::new();
+                pair.push(w_str_new(kind));
+                let value = if kind == "DirName" {
+                    decoded_directory_name(cert, index)
+                } else {
+                    w_str_new(&unsafe { pyre_native::ssl::certificate_san_value(cert, index) })
+                };
+                pair.push(value);
+                w_tuple_new(pair.take())
             };
-            names.push(w_tuple_new(vec![w_str_new(kind), value]));
+            names.push(entry);
         }
-        unsafe { w_dict_setitem_str(dict, "subjectAltName", w_tuple_new(names)) };
+        unsafe { w_dict_setitem_str(dict, "subjectAltName", w_tuple_new(names.take())) };
     }
     unsafe { pyre_native::ssl::certificate_free(cert) };
     dict
@@ -998,7 +1033,9 @@ mod context_methods {
             #[default(false)] binary_form: bool,
         ) -> Result<PyObjectRef, crate::PyError> {
             let certs = unsafe { pyre_native::ssl::context_ca_certs(self.backend) };
-            let mut result = Vec::with_capacity(certs.len());
+            // Each entry is freshly allocated and decoding the next one allocates
+            // again, so they are pinned as they arrive.
+            let mut result = pyre_object::gc_roots::RootedItems::new();
             for cert in certs {
                 result.push(if binary_form {
                     w_bytes_from_bytes(&cert)
@@ -1007,7 +1044,7 @@ mod context_methods {
                     decoded_certificate_dict(decoded)
                 });
             }
-            Ok(w_list_new(result))
+            Ok(w_list_new(result.take()))
         }
 
         fn set_ciphers(&mut self, cipherlist: PyObjectRef) -> Result<(), crate::PyError> {
@@ -1023,7 +1060,9 @@ mod context_methods {
         /// filter is visible to configuration auditing rather than only to
         /// connection creation.
         fn get_ciphers(&self) -> PyObjectRef {
-            let mut ciphers = Vec::with_capacity(pyre_native::ssl::cipher_count());
+            // Each dict is freshly allocated and building the next one allocates
+            // again, so they are pinned as they arrive.
+            let mut ciphers = pyre_object::gc_roots::RootedItems::new();
             for index in 0..pyre_native::ssl::cipher_count() {
                 if !unsafe { pyre_native::ssl::context_cipher_enabled(self.backend, index) } {
                     continue;
@@ -1050,7 +1089,7 @@ mod context_methods {
                     ("auth", w_str_new(pyre_native::ssl::cipher_auth(index))),
                 ]));
             }
-            w_list_new(ciphers)
+            w_list_new(ciphers.take())
         }
 
         fn session_stats(&self) -> PyObjectRef {
@@ -2007,9 +2046,13 @@ mod ssl_socket_methods {
             if chain.is_empty() {
                 return Ok(w_none());
             }
-            Ok(w_list_new(
-                chain.into_iter().map(allocate_certificate).collect(),
-            ))
+            // Each certificate object is freshly allocated and the next one
+            // allocates again, so they are pinned as they arrive.
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for der in chain {
+                items.push(allocate_certificate(der));
+            }
+            Ok(w_list_new(items.take()))
         }
 
         /// PyPy `_cffi_ssl/_stdssl/__init__.py:get_verified_chain`: return the
@@ -2025,9 +2068,13 @@ mod ssl_socket_methods {
             if chain.is_empty() {
                 return Ok(w_none());
             }
-            Ok(w_list_new(
-                chain.into_iter().map(allocate_certificate).collect(),
-            ))
+            // Each certificate object is freshly allocated and the next one
+            // allocates again, so they are pinned as they arrive.
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for der in chain {
+                items.push(allocate_certificate(der));
+            }
+            Ok(w_list_new(items.take()))
         }
 
         fn get_channel_binding(

@@ -115,11 +115,19 @@ fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_list_new(
-        oparg::BinaryOperator::iter()
-            .map(|value| w_tuple_new(vec![w_str_new(value.desc()), w_str_new(&value.to_string())]))
-            .collect(),
-    ))
+    // Each name string and each pair tuple is freshly allocated, so both levels
+    // pin as they arrive; the inner bracket closes before its tuple is pinned.
+    let mut rows = pyre_object::gc_roots::RootedItems::new();
+    for value in oparg::BinaryOperator::iter() {
+        let row = {
+            let mut names = pyre_object::gc_roots::RootedItems::new();
+            names.push(w_str_new(value.desc()));
+            names.push(w_str_new(&value.to_string()));
+            w_tuple_new(names.take())
+        };
+        rows.push(row);
+    }
+    Ok(w_list_new(rows.take()))
 }
 
 fn special_method_names_impl() -> PyObjectRef {

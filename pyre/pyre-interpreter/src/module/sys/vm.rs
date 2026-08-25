@@ -2409,17 +2409,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         pending
     };
     module_ns_store(ns, "argv", argv);
-    // sys.warnoptions
-    module_ns_store(
-        ns,
-        "warnoptions",
-        w_list_new(
-            crate::importing::warnoptions()
-                .iter()
-                .map(|option| crate::gateway::fsdecode_os_str(option))
-                .collect(),
-        ),
-    );
+    // sys.warnoptions — each decoded option is freshly allocated and the next
+    // decode allocates again, so they are pinned as they arrive
+    // (`build_list_storage`).
+    {
+        let mut warnoptions = pyre_object::gc_roots::RootedItems::new();
+        for option in crate::importing::warnoptions() {
+            warnoptions.push(crate::gateway::fsdecode_os_str(&option));
+        }
+        module_ns_store(ns, "warnoptions", w_list_new(warnoptions.take()));
+    }
     // sys.builtin_module_names — tuple of names of modules compiled into
     // the interpreter. PyPy: pypy/module/sys/state.py get_builtin_module_names,
     // which reads the same registry `import` resolves against, so the

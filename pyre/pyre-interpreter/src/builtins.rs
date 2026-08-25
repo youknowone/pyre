@@ -9340,9 +9340,18 @@ fn exception_group_derive_and_copy(
     // _derive_and_copy_attrs: construct the sub-result through the overridable
     // `derive` method so a subclass can control reconstruction (e.g. thread
     // extra constructor args), then copy the metadata attrs onto it.
-    let derive = crate::baseobjspace::getattr_str(w_self, "derive")?;
-    let list = pyre_object::w_list_new(exceptions);
-    let group = crate::call::call_function_impl_result(derive, &[list])?;
+    //
+    // `derive` is a fresh bound method that has to survive building the
+    // argument list, and the group it answers has to survive the attribute
+    // copy, which allocates in turn.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(w_self, "derive")?);
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(exceptions));
+    let derive = pyre_object::gc_roots::shadow_stack_get(sp);
+    let list = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    let group =
+        pyre_object::gc_roots::pin_root(crate::call::call_function_impl_result(derive, &[list])?);
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     if !crate::baseobjspace::isinstance(group, base_group)? {
         return Err(crate::PyError::type_error(
@@ -9350,7 +9359,7 @@ fn exception_group_derive_and_copy(
         ));
     }
     exception_group_copy_attrs(w_self, group)?;
-    Ok(group)
+    Ok(pyre_object::gc_roots::shadow_stack_get(sp + 2))
 }
 
 fn exception_group_subgroup_inner(
@@ -9362,7 +9371,9 @@ fn exception_group_subgroup_inner(
     }
     let (_, exceptions) = exception_group_fields(w_self)?;
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    let mut selected = Vec::new();
+    // A selected child can be a freshly derived subgroup and the next child
+    // allocates again, so each is pinned as it arrives (`build_list_storage`).
+    let mut selected = pyre_object::gc_roots::RootedItems::new();
     let mut modified = false;
     for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
         if crate::baseobjspace::isinstance(exc, base_group)? {
@@ -9384,7 +9395,7 @@ fn exception_group_subgroup_inner(
     } else if selected.is_empty() {
         Ok(pyre_object::w_none())
     } else {
-        exception_group_derive_and_copy(w_self, selected)
+        exception_group_derive_and_copy(w_self, selected.take())
     }
 }
 
@@ -9397,34 +9408,52 @@ fn exception_group_split_inner(
     }
     let (_, exceptions) = exception_group_fields(w_self)?;
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    let mut matching = Vec::new();
-    let mut nonmatching = Vec::new();
+    // Either side can hold a freshly derived subgroup while a later child is
+    // still recursing and allocating, so every kept child is pinned as it
+    // arrives; both sides share one bracket, because two open brackets pin onto
+    // the same shadow stack and would read each other's slots back
+    // (`build_list_storage`).
+    let mut kept = pyre_object::gc_roots::RootedItems::new();
+    let mut matching_at = Vec::new();
+    let mut nonmatching_at = Vec::new();
     for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
         if crate::baseobjspace::isinstance(exc, base_group)? {
             let (yes, no) = exception_group_split_inner(exc, condition)?;
             if !unsafe { pyre_object::is_none(yes) } {
-                matching.push(yes);
+                matching_at.push(kept.len());
+                kept.push(yes);
             }
             if !unsafe { pyre_object::is_none(no) } {
-                nonmatching.push(no);
+                nonmatching_at.push(kept.len());
+                kept.push(no);
             }
         } else if condition.matches(exc)? {
-            matching.push(exc);
+            matching_at.push(kept.len());
+            kept.push(exc);
         } else {
-            nonmatching.push(exc);
+            nonmatching_at.push(kept.len());
+            kept.push(exc);
         }
     }
-    let yes = if matching.is_empty() {
+    let kept_items = kept.take();
+    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept_items[i]).collect() };
+    // Deriving one side allocates, so the group derived for the other side is
+    // pinned across it.
+    let mut derived = pyre_object::gc_roots::RootedItems::new();
+    let yes = if matching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self, matching)?
+        exception_group_derive_and_copy(w_self, side(&matching_at))?
     };
-    let no = if nonmatching.is_empty() {
+    derived.push(yes);
+    let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self, nonmatching)?
+        exception_group_derive_and_copy(w_self, side(&nonmatching_at))?
     };
-    Ok((yes, no))
+    derived.push(no);
+    let sides = derived.take();
+    Ok((sides[0], sides[1]))
 }
 
 pub(crate) fn exception_group_match(
@@ -17429,7 +17458,9 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if args.is_empty() {
         return Err(crate::PyError::type_error("readlines() requires self"));
     }
-    let mut lines = Vec::new();
+    // Every line is freshly allocated and the next `readline` allocates again,
+    // so they are pinned as they arrive (`build_list_storage`).
+    let mut lines = pyre_object::gc_roots::RootedItems::new();
     loop {
         let line = file_method_readline(args)?;
         // readline returns `bytes` in binary mode and `str` otherwise; an
@@ -17446,7 +17477,7 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         }
         lines.push(line);
     }
-    Ok(w_list_new(lines))
+    Ok(w_list_new(lines.take()))
 }
 
 /// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
