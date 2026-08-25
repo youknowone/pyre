@@ -1500,3 +1500,44 @@ The comparable quantity in the post is its own JIT-over-no-JIT ratio,
 `rustc -O` had already optimized, where the post's denominator was RPython
 translated to C. The absolute rows are not comparable across the two machines
 and sixteen years, and `main.rs` says so where it prints them.
+
+## The filed findings, closed (`f47e7c32fbb`, `4bfc01c34aa`)
+
+Both were recorded above as out of scope for the example. Neither is any more.
+
+**`call_returns` through a wrapped ref policy.** The tail of `lower_call_value`
+now asks `call_returns` when the result is a ref, and the three lookups share
+one `declared_return_struct`. Measured on `jit_interp_call_returns_ref.rs`,
+which is the first fixture in this corpus to use `call_returns` or any ref call
+policy at all — which is why the gap survived. The subject arm went through
+`residual_ref_wrapped` and the control through `residual_ref`, same callee
+shape, same declaration:
+
+| | before | after |
+|---|---|---|
+| `OP_PLAIN` (control) | lowered | lowered |
+| `OP_WRAPPED` (subject) | abort stub | lowered |
+| `BC_GETFIELD_GC_I` in the portal's bodies | 1 | 2 |
+| the answer | 14 | 14 |
+
+The answer is the point: the concrete path reads the same declaration through
+`RefFieldRewriter`, so the degraded arm still computed the right sum and only
+the arm census could see the loss. The plan's estimate — "a ~5-line hoist of
+that lookup into the shared tail" — was right.
+
+**A `ref(T)` state field bound to a local.** Found while writing the fixture
+above, and two-sided rather than silent. `state.sel.value` lowers as one
+expression because that path resolves the pointee from the `ref(T)`
+declaration itself; `let n = state.sel; n.value` reached neither walk's copy of
+it. `RefFieldRewriter` recorded a local ref only for a ref-kind field of a ref
+base or a `call_returns` call, so the concrete arm did not compile at all
+(`usize` has no fields); the JIT read discarded the struct path
+`state_ref_scalars` already holds. One line each, gated by
+`jit_interp_ref_local_binding.rs`: with only the concrete side fixed, the
+local-binding arm degraded to a stub and the bodies carried 1 `BC_GETFIELD_GC_I`
+where 2 were due.
+
+`lower_state_field_assign` still discards that path deliberately — it consumes
+a ref, it does not produce one.
+
+Still open from the plan: "let a matchless portal lower".
