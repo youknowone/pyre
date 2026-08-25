@@ -4815,8 +4815,9 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
-/// mapdict side table, etc.).  Called on first eval entry, after the
-/// interpreter is initialized.
+/// mapdict side table, etc.).  Registration stores fn pointers only, so it
+/// runs at the tail of `init_gc_subsystem`, before anything the walkers
+/// answer for has been allocated.
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
@@ -5091,6 +5092,16 @@ pub fn init_gc_subsystem() {
     // because it allocates and so needs this thread to hold the GIL.
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
+    // The root walkers belong to the same bootstrap as the collector they feed:
+    // interpreter startup builds every builtin type object and its namespace
+    // dict before the first Python frame exists, and `walk_builtin_type_dicts_gc`
+    // is the only path to those young dicts. Installed at first eval instead,
+    // a collection in that window reclaims a namespace dict whose type object
+    // still points at it — measured under `MAJIT_GC_STRESS=1`, which faults in
+    // `w_dict_items` while `retag_classmethod_descriptors` sweeps the registry.
+    // Placed after `initialize_rbigint_parts_cache` so the first walk finds
+    // that cache built rather than manufacturing it from inside the walker.
+    init_gc_root_walkers();
 }
 
 /// Guards the one-time install of the process-global pyre-object GC hooks.
@@ -5101,8 +5112,9 @@ thread_local! {
 }
 
 /// Phase B of GC init: register root walkers that touch interpreter
-/// state (immortal dicts, mapdict side table, etc.).  Must run after
-/// the interpreter is initialized — called on first eval entry.
+/// state (immortal dicts, mapdict side table, etc.).  Called from
+/// `init_gc_subsystem` once the collector is installed, and again on the
+/// first eval entry for the paths that reach an eval loop without it.
 /// Idempotent.
 pub fn init_gc_root_walkers() {
     if GC_ROOT_WALKERS_INSTALLED.with(|c| c.get()) {
@@ -8482,9 +8494,10 @@ fn eval_with_jit_inner(
     // through the frame — compiled, JIT eval loop, or declined to the plain
     // evaluator — passes exactly once.
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
-    // Phase B of GC init: register root walkers that reference
-    // interpreter state.  Safe here — the interpreter is initialized.
-    // Phase A (GC build + backend install) ran at boot in init_jit_hooks.
+    // Phase B of GC init: register root walkers that reference interpreter
+    // state.  `init_gc_subsystem` already installs them on the path that
+    // builds the collector; this covers a thread that reaches an eval loop
+    // without having run that bootstrap itself.
     init_gc_root_walkers();
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
