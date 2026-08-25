@@ -24,6 +24,11 @@ const HASH: &str = "d9b2992606c82b29c531f4f4d6a42e43808564620ab63d781eba135f9307
 // swapped the two, cannot pass. `fail_if_llbc_stale` splits stale from warning
 // on exactly that pair, so the binding is what these tests have to pin.
 const CLOSURE_HASH: &str = "1de0e0c0e50a19e0ea1eb03c8ed0da4b8f3c78dfd3a86d5f6f65f2d0d9f7c4a1";
+// One `artefacts=` line in the producer's encoding: `<file>=<size>:<sha256>`,
+// space-separated and `shlex`-quoted.  Kept opaque by the consumer, so what
+// these tests pin is that it is REQUIRED and passed through verbatim.
+const ARTEFACTS: &str = "artefacts=pyre-object.ullbc=67998098:\
+                         f1c317ad3657d8fed8ef70214c13c196e078195d86b62f67a84149d8e7ca64af";
 
 /// Walk up from this crate until the extraction driver is found.
 fn repo_root() -> Option<std::path::PathBuf> {
@@ -96,18 +101,28 @@ fn real_driver_output_parses() {
 }
 
 #[test]
-fn parses_the_current_three_field_output() {
-    let stdout = format!("source={HASH}\nclosure={CLOSURE_HASH}\nexternal=\n");
+fn parses_the_current_four_field_output() {
+    let stdout = format!("source={HASH}\nclosure={CLOSURE_HASH}\nexternal=\n{ARTEFACTS}\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
-    let fields = parse_fingerprint_fields(&stdout).expect("three-field output must parse");
+    let fields = parse_fingerprint_fields(&stdout).expect("four-field output must parse");
     assert_eq!(fields.source, HASH);
     assert_eq!(fields.closure, CLOSURE_HASH);
     assert_eq!(fields.external, "");
+    assert_eq!(fields.artefacts, ARTEFACTS.trim_start_matches("artefacts="));
+}
+
+/// `artefacts=` is the field the build-time gate needs to see a truncated or
+/// swapped artefact at all, so an output missing it is an unmodelled shape
+/// rather than one to read as "the bytes are fine".
+#[test]
+fn output_without_artefacts_is_rejected() {
+    let stdout = format!("source={HASH}\nclosure={CLOSURE_HASH}\nexternal=\n");
+    assert_eq!(parse_fingerprint_fields(&stdout), None);
 }
 
 #[test]
 fn field_order_does_not_matter() {
-    let stdout = format!("external=\nclosure={CLOSURE_HASH}\nsource={HASH}\n");
+    let stdout = format!("{ARTEFACTS}\nexternal=\nclosure={CLOSURE_HASH}\nsource={HASH}\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
     let fields = parse_fingerprint_fields(&stdout).expect("reordered output must parse");
     assert_eq!(fields.source, HASH);
@@ -116,7 +131,8 @@ fn field_order_does_not_matter() {
 
 #[test]
 fn an_unknown_trailing_field_is_ignored() {
-    let stdout = format!("source={HASH}\nclosure={HASH}\nexternal=\nsomething_new=42\n");
+    let stdout =
+        format!("source={HASH}\nclosure={HASH}\nexternal=\n{ARTEFACTS}\nsomething_new=42\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
 }
 
@@ -148,13 +164,13 @@ fn empty_output_is_rejected() {
 
 #[test]
 fn output_without_closure_is_rejected() {
-    let stdout = format!("source={HASH}\nexternal=\n");
+    let stdout = format!("source={HASH}\nexternal=\n{ARTEFACTS}\n");
     assert_eq!(parse_fingerprint_fields(&stdout), None);
 }
 
 #[test]
 fn a_non_hash_closure_is_rejected() {
-    let stdout = format!("source={HASH}\nclosure=unknown\nexternal=\n");
+    let stdout = format!("source={HASH}\nclosure=unknown\nexternal=\n{ARTEFACTS}\n");
     assert_eq!(parse_fingerprint_fields(&stdout), None);
 }
 

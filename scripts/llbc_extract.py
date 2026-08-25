@@ -1428,10 +1428,21 @@ def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     return platform_key, charon_dest, charon_dest / charon_exe
 
 
-def llbc_dest(out_dir: Path, root: Path) -> Path:
+def llbc_dest_path(out_dir: Path, root: Path) -> Path:
+    """Where artefacts live, without creating it.
+
+    Split from `llbc_dest` for `--fingerprint`, which now reports on those
+    files: a read-only instrument that silently creates a directory is one
+    whose answer is no longer about the tree it was asked about.
+    """
     dest = Path(os.environ.get("LLBC_DEST", out_dir))
     if not dest.is_absolute():
         dest = root / dest
+    return dest
+
+
+def llbc_dest(out_dir: Path, root: Path) -> Path:
+    dest = llbc_dest_path(out_dir, root)
     dest.mkdir(parents=True, exist_ok=True)
     return dest
 
@@ -3557,10 +3568,24 @@ def run_cli(
             if args.per_crate
             else [("", crates)]
         )
+        dest_dir = llbc_dest_path(eng.out_dir, eng.root)
         for suffix, group in groups:
             print(f"source{suffix}={source_fingerprint(eng, group, cargo_features)}")
             print(f"closure{suffix}={closure_fingerprint(eng, group, cargo_features)}")
             print(f"external{suffix}={external_fingerprint(eng, group, cargo_features)}")
+            # The one field here that describes an OUTPUT.  Without it the
+            # build-time gate -- which asks this subcommand and nothing else --
+            # accepts a truncated or swapped artefact whose sources have not
+            # moved, which is the case `artefacts=` was written for.  Absent
+            # files answer `missing`, so asking before extraction (the CI cache
+            # key does) costs nothing and reads as "not there yet".
+            print(
+                f"artefacts{suffix}="
+                + " ".join(
+                    artefacts_fingerprint(eng, eng.spec(crate), dest_dir)
+                    for crate in group
+                )
+            )
         return
     if args.per_crate:
         parser.error("--per-crate only applies with --fingerprint")
