@@ -3362,11 +3362,11 @@ fn link_extravar_to_hlvalue(
 /// position order.
 ///
 /// Resolution order per inputarg `vid`:
-/// 1. `legacy.variable(vid).annotation` — minimal fixtures supply
-///    Variable-shape annotations explicitly via
+/// 1. Matching `OpKind::Input { ty, class_root }` op result == `vid` at the
+///    startblock — the source-typed production graph from `front::mir`.
+/// 2. `legacy.variable(vid).annotation` — fallback for minimal fixtures that
+///    have no production-shape Input op and explicitly seed the Variable via
 ///    `legacy_annotator::setbinding(&var, ty)`.
-/// 2. Matching `OpKind::Input { ty }` op result == `vid` at the
-///    startblock — production graphs from `front::mir`.
 ///
 /// Errors:
 ///
@@ -3415,15 +3415,12 @@ pub(crate) fn derive_subject_inputcells(
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
     for (idx, var) in startblock.inputargs.iter().enumerate() {
-        // 1. Explicit SomeValue seed published onto
-        //    `var.annotation` (test fixtures seed via
-        //    `legacy_annotator::setbinding(&var, ty)` before invoking
-        //    this function).
-        if let Some(rc) = var.annotation.borrow().as_ref() {
-            cells.push((**rc).clone());
-            continue;
-        }
-        // 2. Front-end Input op at the startblock.
+        // 1. Front-end Input op at the startblock.  This is the source-type
+        // authority, just as RPython seeds a function from its signature and
+        // then lets call propagation widen that cell.  In particular, do not
+        // let a classdef-less annotation left on the legacy graph erase a
+        // richer `PyObjectRef`/W_Root class_root: that stale slot is an input
+        // from the transitional walker, not an RPython annotation source.
         if let Some(&(ty, class_root)) = input_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
@@ -3577,6 +3574,13 @@ pub(crate) fn derive_subject_inputcells(
                 }
             }
             cells.push(shell);
+            continue;
+        }
+        // 2. Explicit SomeValue fallback published onto `var.annotation`.
+        // Production front graphs always took the Input arm above; only
+        // hand-built fixtures without Input ops rely on this path.
+        if let Some(rc) = var.annotation.borrow().as_ref() {
+            cells.push((**rc).clone());
             continue;
         }
         // No further fallback: every typed parameter emits the Input
@@ -4725,6 +4729,47 @@ mod tests {
             "z: Ref -> SomeInstance(classdef=None), got {:?}",
             cells[2],
         );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_prefers_source_root_over_legacy_shell() {
+        let mut graph = LegacyGraph::new("set_locals_w");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, value.clone());
+
+        // Transitional legacy annotation loses the pointee class.  The
+        // source Input still says PyObjectRef, corresponding to W_Root in
+        // PyPy, and must be the authoritative initial cell.
+        setbinding(&value, ValueType::Ref(None));
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_pyre_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("source-typed PyObject input must seed a concrete class");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!("PyObjectRef must seed SomeInstance, got {:?}", cells[0])
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("source class_root must replace the classdef-less legacy shell");
+        assert_eq!(classdef.borrow().name, "PyObject");
     }
 
     #[test]

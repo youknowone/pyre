@@ -4710,6 +4710,20 @@ impl<'a> Lowering<'a> {
         }) else {
             return value;
         };
+        self.narrow_value_to_instance_root(bb_id, value, &root)
+    }
+
+    /// Re-express a GC-reference value at a statically-known RPython
+    /// instance boundary.  Rust raw pointers erase the pointee in
+    /// [`ValueType::Ref(None)`], while the corresponding RPython value keeps
+    /// its `SomeInstance(classdef)` (for example `PyObjectRef` is W_Root).
+    /// The marker is a same-bank identity and rtypes to `cast_opaque_ptr`.
+    fn narrow_value_to_instance_root(
+        &mut self,
+        bb_id: BlockId,
+        value: LinkArg,
+        root: &str,
+    ) -> LinkArg {
         let LinkArg::Value(value) = value else {
             // Ref-kind constants are materialized calls in this frontend;
             // only scalar constants can remain inline in a FieldWrite.
@@ -4722,10 +4736,10 @@ impl<'a> Lowering<'a> {
             result: Some(narrowed.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__pyre_cast_instance".to_string(), root.clone()],
+                    segments: vec!["__pyre_cast_instance".to_string(), root.to_string()],
                 },
                 args: vec![value],
-                result_ty: ValueType::Ref(Some(root)),
+                result_ty: ValueType::Ref(Some(root.to_string())),
             },
         });
         LinkArg::Value(narrowed)
@@ -4877,6 +4891,15 @@ impl<'a> Lowering<'a> {
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    // The Rust-only current-address adapter is erased as a
+                    // whole GCREF identity.  Its `ptr -> usize -> ptr`
+                    // round-trip exists only to call the host GC query; once
+                    // that query is replaced by RPython's root-reload model,
+                    // retaining either bank crossing would manufacture an
+                    // address integer absent from the upstream graph.
+                    if self.is_gc_current_object_address_adapter_graph() {
+                        return Ok((None, arg));
+                    }
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
                     // — aliasing keeps the source `r_uint` annotation on the
                     // signed destination, tripping the SomeInteger signedness
@@ -8189,12 +8212,23 @@ impl<'a> Lowering<'a> {
                 // annotator.  The call returns `()`; its dead destination
                 // binds to a fresh Void var.
                 if args.len() == 3 && self.is_object_array_set_ref_call(&reg) {
+                    // `FixedObjectArray._items` is `[PyObjectRef; 0]`, the
+                    // Rust storage spelling of PyPy's fixed `[W_Root]` list.
+                    // Preserve that external item annotation before the
+                    // setitem generalizes its ListDef.  The internal list
+                    // repr remains GCREF and rlist's recast lowers this marker
+                    // to the same `cast_opaque_ptr` PyPy emits.
+                    let value = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(args[2].clone()),
+                        "PyObject",
+                    );
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::ArrayWrite {
                             base: args[0].clone(),
                             index: args[1].clone(),
-                            value: LinkArg::Value(args[2].clone()),
+                            value,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
@@ -8500,6 +8534,24 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.local_var[dest_local] = Some(args[0].clone());
                     }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `try_gc_current_object_address(p)` is a Rust-interpreter
+                // adapter for the root reload RPython inserts after a
+                // collecting call (`gc_pop_roots` -> `gc_restore_root`,
+                // `memory/gctransform/shadowcolor.py`).  The translated JIT
+                // graph already carries `p` as a GC reference whose backend
+                // root map is rewritten when an object moves, so tracing the
+                // forwarding-stub query would duplicate the GC transform and
+                // expose a Rust-only `majit_gc` helper that has no PyPy graph
+                // counterpart.  Erase only the adapter's own one-call body;
+                // integer/raw-address uses elsewhere must keep their runtime
+                // normalization.
+                if args.len() == 1 && self.is_gc_current_object_address_adapter(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11427,6 +11479,29 @@ impl<'a> Lowering<'a> {
                 }
                 _ => None,
             })
+    }
+
+    /// Whether this is the sole Rust-only forwarding query inside
+    /// `pyre_object::gc_hook::try_gc_current_object_address`.
+    ///
+    /// RPython never emits such a source-level helper: its GC transformer
+    /// reloads every live GC variable from the shadow stack after a safepoint.
+    /// Keep the match graph-scoped so runtime consumers that deliberately
+    /// normalize a stored raw address are not rewritten as identities.
+    fn is_gc_current_object_address_adapter(&self, reg: &RegularCall) -> bool {
+        if !self.is_gc_current_object_address_adapter_graph() {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "majit_gc::gc_current_object_address")
+    }
+
+    fn is_gc_current_object_address_adapter_graph(&self) -> bool {
+        self.graph.name == "pyre_object::gc_hook::try_gc_current_object_address"
     }
 
     /// `*items_block_items_base(block).add(idx)` — a list / tuple
@@ -28650,6 +28725,34 @@ mod tests {
             array_writes >= 1,
             "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
         );
+        let typed_store = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                let Some(cast_result) = ops[0].result.as_ref() else {
+                    return false;
+                };
+                matches!(
+                    &ops[0].kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "__pyre_cast_instance".to_string(),
+                        "PyObject".to_string(),
+                    ]
+                ) && matches!(
+                    &ops[1].kind,
+                    OpKind::ArrayWrite {
+                        value: crate::model::LinkArg::Value(value),
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if value == cast_result && array_type_id == super::PYOBJECT_GCARRAY_TYPE_ID
+                )
+            })
+        });
+        assert!(
+            typed_store,
+            "set_locals_w: PyObjectRef store must preserve the W_Root external item repr"
+        );
     }
 
     /// PyPy's frame stack clears store `None` into a `W_Root` list.  The Rust
@@ -29379,6 +29482,59 @@ mod tests {
             dead_storage_reads, 0,
             "the owner alias must let the ordinary dead-op pass remove the \
              interior chars/length shell; graph: {graph:#?}"
+        );
+    }
+
+    /// The Rust interpreter reloads a possibly-moved pointer explicitly;
+    /// RPython's translated graph instead gets the updated GCREF from
+    /// `gc_restore_root`.  The source adapter must therefore lower to an
+    /// identity graph and must not leak the `majit_gc` query into annotation.
+    /// Loads the real pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn gc_current_object_address_adapter_folds_to_identity() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "try_gc_current_object_address")
+            .expect("lower try_gc_current_object_address");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str)
+                            == Some("gc_current_object_address")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residual.is_empty(),
+            "the RPython-shaped graph reloads its GCREF from the root map; \
+             residual forwarding queries: {residual:#?}; graph: {graph:#?}"
+        );
+
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("adapter input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("adapter return link");
+        assert!(
+            matches!(returned, LinkArg::Value(value) if value == input),
+            "the adapter must return its input GCREF unchanged; graph: {graph:#?}"
         );
     }
 
