@@ -1183,14 +1183,22 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
 #[majit_macros::elidable]
 pub extern "C" fn jit_str_getitem(s: i64, index: i64) -> i64 {
     let obj = s as PyObjectRef;
-    if obj.is_null() || index < 0 {
+    // The index is a machine int, 64-bit on every target, while `usize` is
+    // 32 bits on the wasm guest.  Converting is what declines a negative
+    // index and one past `usize::MAX` alike: an `as` cast would truncate
+    // `2**32` to `0` and answer `s[0]` where the interpreter raises
+    // `IndexError`.
+    let Ok(index) = usize::try_from(index) else {
+        return PY_NULL as i64;
+    };
+    if obj.is_null() {
         return PY_NULL as i64;
     }
     unsafe {
         if !crate::pyobject::is_exact_type(obj, &crate::pyobject::STR_TYPE) {
             return PY_NULL as i64;
         }
-        match w_str_codepoint_at(obj, index as usize) {
+        match w_str_codepoint_at(obj, index) {
             Some(code_point) => w_str_from_codepoint(code_point.to_u32()) as i64,
             None => PY_NULL as i64,
         }

@@ -29,6 +29,10 @@
 #   * a NEGATIVE index counts from the end, and an out-of-range one raises
 #     `IndexError` -- both belong to the interpreter, so the helper declines
 #     them with `PY_NULL` and the non-null guard carries that back.
+#   * an index past `usize::MAX` is out of range on the 32-bit wasm guest for
+#     a reason the other backends never see: the machine int is 64-bit
+#     everywhere, so `2**32` reaches the helper as a valid operand and only
+#     the width conversion refuses it.
 #   * a `bool` index shares `int`'s `intval` but carries its own type, and a
 #     `__index__` object is not an int at all.
 class Prefixed(str):
@@ -60,6 +64,10 @@ def declined_shapes(n, plain, wide, sub):
             plain[99]
         except IndexError:
             acc = (acc * 31 + 7) & 0xFFFFFFFFFF
+        try:
+            plain[4294967296]
+        except IndexError:
+            acc = (acc * 31 + 11) & 0xFFFFFFFFFF
     return acc
 
 
