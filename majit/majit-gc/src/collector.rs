@@ -1049,6 +1049,17 @@ pub struct MiniMarkGC {
     /// raises `MemoryError` (incminimark.py:2603-2615 `raise MemoryError`,
     /// lowered to the NULL-return the backend already understands).
     oom_pending: bool,
+    /// Whether the step now running signalled a max-heap `MemoryError`, on
+    /// either channel.
+    ///
+    /// Upstream raises where the two channels are armed, so its
+    /// `major_collection_step` never reaches the collect-step hook on a breach.
+    /// Suppressing that hook therefore needs a record of the arming rather than
+    /// a reading of a channel: `oom_pending` alone answers for one channel
+    /// only, and the eval-breaker bit is process-global and may be armed by a
+    /// breach this step had nothing to do with. Cleared at the top of every
+    /// `major_collection_step`.
+    oom_signalled_this_step: bool,
     /// Byte size of the allocation that triggered the current nursery-full
     /// collection, carried across `do_collect_nursery` so
     /// `finish_incremental_cycle` can pass it to `threshold_reached`
@@ -1236,6 +1247,7 @@ impl MiniMarkGC {
             max_delta,
             max_heap_size_already_raised: false,
             oom_pending: false,
+            oom_signalled_this_step: false,
             pending_reserving_size: 0,
             // incminimark.py:568-569 — both initialized to min_heap_size,
             // then refined by set_major_threshold_from(0.0) below.
@@ -5749,7 +5761,7 @@ impl MiniMarkGC {
     fn major_collection_step(&mut self) {
         let start = GcClock::start();
         let old_state = self.gc_state.encoded();
-        let oom_was_pending = self.oom_pending;
+        self.oom_signalled_this_step = false;
         self.debug_check_consistency();
 
         // incminimark.py:2406-2436: each state-machine step grants half a
@@ -5780,9 +5792,10 @@ impl MiniMarkGC {
         }
 
         // incminimark.py:2634-2644. A max-heap MemoryError exits upstream
-        // before this site; pyre communicates it through `oom_pending`, so
-        // suppress the transition event when this step newly raised it.
-        if self.oom_pending == oom_was_pending {
+        // before this site; pyre defers it instead, so suppress the transition
+        // event when this step armed one — on either channel, since both stand
+        // for the same raise.
+        if !self.oom_signalled_this_step {
             let duration = start.elapsed_secs();
             self.total_gc_time += duration;
             self.hooks
@@ -6628,6 +6641,7 @@ impl MiniMarkGC {
                 panic!("using too much memory, aborting");
             }
             self.max_heap_size_already_raised = true;
+            self.oom_signalled_this_step = true;
             if reserving_size > 0 {
                 self.oom_pending = true;
             } else {
