@@ -1782,14 +1782,53 @@ fn report_post_residual_shadow<Sym: WalkSym>(
         );
     }
     if import {
-        for (abs, live) in moved {
-            let Some((opref, _)) = ctx.trace_ctx.virtualizable_entry_at(base + abs) else {
-                continue;
-            };
-            let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
-            ctx.trace_ctx
-                .set_virtualizable_entry_at(base + abs, opref, value);
+        adopt_residual_locals_writes(ctx, base, &moved);
+    }
+}
+
+/// Adopt into the walk the fastlocals a residual wrote to the live frame.
+///
+/// The walk holds each local as a box and reads it straight out of the
+/// virtualizable shadow (`pyjitpl.py _opimpl_getarrayitem_vable`, standard
+/// leg), so a residual that writes the frame's fastlocals behind the walk's
+/// back -- an `f_locals` write-through from the callee is the reachable case --
+/// leaves every later read, and the values the loop closes on, holding what the
+/// local was before the call.
+///
+/// The array is authoritative at exactly this point and nowhere else: the force
+/// inside the call wrote the whole locals region out of the shadow just before
+/// the callee ran, and the callee's write landed on top of it.  That is why the
+/// standing objection to re-reading a standard virtualizable mid-trace -- the
+/// array holds values the trace never wrote -- does not apply here.
+///
+/// The re-read is RECORDED, not folded to the value seen now: compiled code has
+/// to perform the same load after its own force, so this emits
+/// `GETARRAYITEM_GC_R` off the frame's `locals_cells_stack_w` and hands the
+/// shadow that OpRef.  Folding the concrete value in would bake one recording's
+/// answer into every execution.
+fn adopt_residual_locals_writes<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    base: usize,
+    moved: &[(usize, pyre_object::PyObjectRef)],
+) {
+    if moved.is_empty() || ctx.fbw_mode.snapshot_sym.is_null() {
+        return;
+    }
+    let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).frame() };
+    if frame.is_none() {
+        return;
+    }
+    let array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame);
+    for &(abs, live) in moved {
+        if ctx.trace_ctx.virtualizable_entry_at(base + abs).is_none() {
+            continue;
         }
+        let index = ctx.trace_ctx.const_int(abs as i64);
+        let item = crate::state::trace_array_getitem_value(ctx.trace_ctx, array, index);
+        let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
+        ctx.trace_ctx.set_opref_concrete(item, value);
+        ctx.trace_ctx
+            .set_virtualizable_entry_at(base + abs, item, value);
     }
 }
 
