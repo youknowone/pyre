@@ -712,6 +712,28 @@ fn m73_lastinstr_audit(
     }
 }
 
+/// `quasiimmut.py make_invalidation_function._invalidate_now` for the hidden
+/// mutate field at `field_addr`: unlink the instance and flip every loop flag
+/// it recorded.
+///
+/// This is the host half of `majit_metainterp::quasiimmut`'s
+/// `do_force_quasi_immutable`.  Upstream reads a `GCREF` out of the field and
+/// invalidates what it points at; pyre embeds the state in the owner, so
+/// unlinking and sweeping is one call at the field's own address.
+pub(crate) extern "C" fn force_quasi_immutable(field_addr: i64) {
+    if field_addr == 0 {
+        return;
+    }
+    // Safety: the only caller is `do_force_quasi_immutable`, which derives the
+    // address from a live struct pointer plus the mutate field descr's offset;
+    // that field is a `QuasiImmutField` embedded in the owner.
+    unsafe {
+        pyre_object::quasiimmut::sweep_quasi_immut_field(
+            field_addr as *const pyre_object::quasiimmut::QuasiImmutField,
+        )
+    };
+}
+
 pub(crate) extern "C" fn record_caught_blackhole_traceback(
     exc_value: i64,
     frame_value: i64,

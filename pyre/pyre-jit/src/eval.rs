@@ -5090,6 +5090,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_metainterp::set_resolve_exception_context_hook(Some(
         crate::call_jit::resolve_exception_context,
     ));
+    // `quasiimmut.py do_force_quasi_immutable`'s host half — the blackhole
+    // computes the hidden mutate field's address, pyre unlinks the instance
+    // and flips every loop flag it recorded.
+    majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
     d.set_virtualizable_info(info.clone());

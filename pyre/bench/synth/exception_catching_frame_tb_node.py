@@ -11,9 +11,17 @@
 # trace records the node it is the recording pass alone that ever applies it
 # and the chain comes out missing its outermost frame.
 #
-# The dict lookup in the loop is load-bearing: it keeps the module-level loop
-# from completing a trace of its own, so `shape` is compiled as a func-entry
-# trace instead of being inlined into the caller.
+# The module-level loop compiles with `shape` inlined into it, and with
+# `raise_mid` and `raise_leaf` inlined in turn, so the whole raise-and-catch
+# chain sits in one trace and the handler runs as compiled code. pypy compiles
+# the same arrangement: a 688-op `<module>` loop whose merge points read
+# `shape, raise_mid, raise_leaf, shape, frame_names`. The dict lookup in the
+# loop stays because it is what the recorded counters were measured against.
+#
+# wasm reads the same three loops but serves one bridge fewer and fails guards
+# 4.5x as often as the native backends on the identical trace. Nothing in the
+# bridge-decline census is nonzero on either side and the guest prints no
+# `mc_diag`, so that reading is recorded rather than explained.
 N = 4000
 
 

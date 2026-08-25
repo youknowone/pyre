@@ -4985,26 +4985,23 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
         return None;
     }
     let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-    let w_globals = frame.get_w_globals();
-    if w_globals.is_null() {
+    // A `*_NAME` opcode writes `getorcreatedebug().w_locals`, a `*_GLOBAL` one
+    // writes `w_globals`.  Module-level code aliases the two; a class body's
+    // locals are the `newdict(module=True)` namespace `build_class` bound, and
+    // `celldict.py setitem_str` reaches `version?` through either of them.
+    let w_ns = if matches!(helper, K::StoreName | K::DeleteName) {
+        frame.get_w_locals()
+    } else {
+        frame.get_w_globals()
+    };
+    if w_ns.is_null() {
         return None;
-    }
-    // A `*_NAME` opcode writes `get_or_create_w_locals`; only a module frame —
-    // where `w_locals` aliases `w_globals` — touches the namespace the folds
-    // pin.  An absent `w_locals` is a fresh throwaway mapping, not globals, so
-    // it declines rather than forcing for a write that never reaches here.
-    if matches!(helper, K::StoreName | K::DeleteName) {
-        let w_locals = frame.get_w_locals();
-        if !std::ptr::eq(w_locals, w_globals) {
-            return None;
-        }
     }
     // A plain `W_DictObject` for globals (`exec(src, {})`,
     // `FunctionType(code, {})`) has no `version?` field at all, so
     // `hook_setfield` (rclass.py) emits no `jit_force_quasi_immutable`
     // for its write and there is nothing to abandon the trace for.
-    let strategy =
-        unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(w_globals) };
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(w_ns) };
     // `mutatebox.nonnull()` — nothing is watching, so there is nothing to
     // abandon the trace for. The write still runs its own invalidation.
     if !unsafe {
@@ -5015,7 +5012,7 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    let slot = crate::state::module_dict_cell_slot_direct(w_globals, name);
+    let slot = crate::state::module_dict_cell_slot_direct(w_ns, name);
     let bumps = if is_store {
         let &value_opref = r_args.get(2)?;
         let Some(majit_ir::Value::Ref(majit_ir::GcRef(value_ptr))) =
@@ -5026,7 +5023,7 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
         if value_ptr == 0 {
             return None;
         }
-        let cell = slot.and_then(|s| crate::state::module_dict_cell_value_direct(w_globals, s));
+        let cell = slot.and_then(|s| crate::state::module_dict_cell_value_direct(w_ns, s));
         unsafe {
             pyre_object::celldict::store_would_bump_version(
                 cell,
@@ -5053,6 +5050,89 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
         fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
     }
     Some(())
+}
+
+/// The `CodeObject` of the frame the walk is currently in.
+///
+/// Every `__build_class__` the walker meets is reached with an empty
+/// `WalkSession::framestack` — a class statement is never inside an inlined
+/// callee sub-walk — so the portal jitcode's own code object is the code
+/// running the statement.
+fn walker_portal_py_code<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<&'static pyre_interpreter::CodeObject> {
+    let sym = ctx.fbw_mode.snapshot_sym;
+    if sym.is_null() {
+        return None;
+    }
+    // SAFETY: identical contract to the other `snapshot_sym` readers — the
+    // pointer is set only for the lifetime of the full-body walk.
+    let sym = unsafe { &*sym };
+    if sym.jitcode().is_null() {
+        return None;
+    }
+    let jitcode = unsafe { &*sym.jitcode() };
+    let code_ptr = jitcode.payload.code_ptr;
+    (!code_ptr.is_null()).then(|| unsafe { &*code_ptr })
+}
+
+/// Tracer-side `pyjitpl.py opimpl_jit_force_quasi_immutable` for the store a
+/// class statement performs.
+///
+/// `compiling.py build_class` runs the class body in `newdict(module=True)`,
+/// and `celldict.py setitem_str` reads `ModuleDictStrategy.version?` through
+/// `getdictvalue_no_unwrapping` before `mutated()` writes it — so the body's
+/// very first `STORE_NAME` installs the quasi-immutable and immediately forces
+/// it, and upstream abandons every trace that executes a class body
+/// (`PYPYLOG=jit-summary` reports the count as `abort: force quasi-immut`).
+///
+/// pyre's whole `__build_class__` is one residual — its `BuiltinCode.func` has
+/// no generated gateway, so `try_walker_inline_builtin_call` cannot enter it —
+/// and the body runs a frame of its own inside that call.  The walk therefore
+/// never meets the store and asks the same question at the boundary, the way
+/// [`try_walker_force_quasi_immut_namespace_write`] does for the `*_NAME`
+/// helper.
+///
+/// No `record_quasiimmut_field` and no force accompany the abort.  Both act on
+/// the namespace this call has not created yet, and the `QuasiImmut` upstream
+/// mints there watches a mapping that is garbage the moment the attempt is
+/// abandoned, so neither has an effect to reproduce.
+fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    ref_operand_offset: usize,
+    r_args: &[OpRef],
+) -> bool {
+    if r_args.len() < 2 {
+        return false;
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
+    let mut callable = match arg_concretes.first() {
+        Some(ConcreteValue::Ref(value)) => *value,
+        _ => std::ptr::null_mut(),
+    };
+    if callable.is_null()
+        && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[0])
+        && r != majit_ir::GcRef::NO_CONCRETE
+        && r.as_usize() != 0
+    {
+        callable = r.as_usize() as pyre_object::PyObjectRef;
+    }
+    if !pyre_interpreter::builtins::is_build_class_builtin(callable) {
+        return false;
+    }
+    // Index 1 is the CALL's null-or-self slot; the builtin's own
+    // `&[PyObjectRef]` starts after it, exactly the tail
+    // `try_walker_inline_builtin_call` copies into its wrapper array.
+    let mut args = Vec::with_capacity(arg_concretes.len().saturating_sub(2));
+    for concrete in arg_concretes.iter().skip(2) {
+        let ConcreteValue::Ref(value) = *concrete else {
+            return false;
+        };
+        args.push(value);
+    }
+    pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args)
 }
 
 /// Opt-in until the `ForceQuasiImmutable` flush leg in `trace.rs` re-delivers
@@ -5598,6 +5678,35 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // A class statement's body store is hidden inside this residual; ask its
+    // `jit_force_quasi_immutable` question before anything applies the call, so
+    // the abort resumes the interpreter at this opcode with the class not yet
+    // built.
+    //
+    // `opimpl_jit_force_quasi_immutable` raises only under `mutatebox.nonnull()`
+    // — nothing watching, nothing to abandon the trace for.  That test cannot be
+    // asked here: the namespace does not exist until the residual runs.  What
+    // stands in for it is the frame the statement runs in.  The abort earns its
+    // cost when the fresh class reaches the caller's trace and is promoted
+    // there, and a frame whose every return is a constant hands nothing back,
+    // so the question is not asked for one.  This reads the return value only;
+    // a class stored to a global, a cell or a container still escapes unseen,
+    // which loses the brake rather than applying a wrong one.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+        && walker_portal_py_code(ctx)
+            .is_none_or(|portal| !pyre_interpreter::code_returns_only_constants(portal))
+        && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
+    {
+        // Carry the reason to the `abort_trace` that follows, the way upstream
+        // carries it on the `SwitchToBlackhole` instance, and stamp the abort
+        // coordinate at the raise point.
+        crate::state::note_force_quasi_immut_abort();
+        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+        return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
     // BuiltinCode.func is an indirect PBC target exactly like RPython's

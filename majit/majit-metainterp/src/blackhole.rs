@@ -163,8 +163,19 @@ pub enum DispatchError {
     /// Normal return from frame (RPython: LeaveFrame).
     LeaveFrame,
     /// Exception raised — must call handle_exception_in_frame.
-    /// Carries the exception value (GcRef pointer as i64).
-    RaiseException(i64),
+    ///
+    /// `exc` is the exception value (GcRef pointer as i64).  `resume_position`
+    /// is the first byte past the raising instruction, which
+    /// [`BlackholeInterpreter::dispatch_step`] stores into `self.position`
+    /// before the error propagates: `blackhole.py` `_get_method` wraps every
+    /// `bhimpl_*` in `except Exception`, advances `position` past the result
+    /// register byte, assigns `self.position = position` and only then
+    /// re-raises, so `handle_exception_in_frame` reads the coordinate of the
+    /// instruction *after* the one that raised.  The field is part of the
+    /// variant rather than a convention each producer remembers, because a
+    /// producer that forgot it left `self.position` naming an operand byte and
+    /// the handler search started one instruction short.
+    RaiseException { exc: i64, resume_position: usize },
     /// blackhole.py:1068-1069: raise ContinueRunningNormally(*args)
     /// Bottommost blackhole reached the merge point — restart portal.
     ContinueRunningNormally(Box<MergePointArgs>),
@@ -441,30 +452,54 @@ impl Default for BlackholeInterpreter {
 }
 
 impl BlackholeInterpreter {
+    /// The `self.position = position` that closes `blackhole.py setposition`,
+    /// plus the two pyre-only diagnostic cursors derived from the same
+    /// coordinate.
+    ///
+    /// Nothing else: upstream's `setposition` assigns `jitcode` and `position`
+    /// and touches no other state.  `aborted` / `abort_permanent_bail` /
+    /// `got_exception` are reset where an interpreter is handed back
+    /// ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
+    /// fresh one, and `exception_last_value` is cleared by
+    /// [`Self::cleanup_registers`] — which is upstream's owner for it too.
+    /// Clearing it here dropped the exception a caller had already been
+    /// handed whenever a frame was re-seated before its handler ran.
     fn reset_position_state(&mut self, position: usize) {
         self.position = position;
-        self.aborted = false;
-        self.abort_permanent_bail = false;
-        self.got_exception = false;
         self.last_opcode_position = position;
         self.entry_position = position;
-        self.exception_last_value = 0;
     }
 
+    /// `blackhole.py setposition`'s per-bank half:
+    ///
+    /// ```python
+    /// if num_regs_and_consts_i:
+    ///     if self.registers_i is None or len(self.registers_i) < num_regs_and_consts_i:
+    ///         self.registers_i = [default_i] * num_regs_and_consts_i
+    ///     self.copy_constants(self.registers_i, jitcode.constants_i, jitcode.num_regs_i())
+    /// ```
+    ///
+    /// Two properties the earlier unconditional `clear()` + `resize()` did not
+    /// have.  A bank already wide enough is reused rather than rebuilt, so the
+    /// registers it holds survive — only `copy_constants` overwrites, and only
+    /// the constants area.  And a jitcode that declares no registers of a kind
+    /// leaves that bank alone instead of emptying it.
     fn init_register_file_from_i64s(
         regs: &mut Vec<i64>,
         num_regs_and_consts: usize,
         target_index: usize,
         constants: impl IntoIterator<Item = i64>,
     ) {
-        if num_regs_and_consts > 0 {
+        if num_regs_and_consts == 0 {
+            return;
+        }
+        if regs.len() < num_regs_and_consts {
             regs.clear();
             regs.resize(num_regs_and_consts, 0);
-            for (i, c) in constants.into_iter().enumerate() {
-                regs[target_index + i] = c;
-            }
-        } else {
-            regs.clear();
+        }
+        // `copy_constants(registers, constants, jitcode.num_regs_*())`.
+        for (i, c) in constants.into_iter().enumerate() {
+            regs[target_index + i] = c;
         }
     }
 
@@ -952,12 +987,12 @@ impl BlackholeInterpreter {
         }
 
         if self.aborted {
-            // Abort is treated as an infrastructure error, not a normal exit.
-            // The caller should not treat this as DoneWithThisFrame.
-            if self.nextblackholeinterp.is_none() {
-                return Err(JitException::DoneWithThisFrameVoid);
-            }
-            return Ok(0);
+            // No upstream counterpart — see `JitException::BailToInterpreter`.
+            // The abort leaves this frame unfinished at every level, so it
+            // propagates instead of being absorbed: `Ok(0)` would have popped
+            // to the caller and resumed it right after the call whose callee
+            // bailed, with the result register never written.
+            return Err(JitException::BailToInterpreter);
         }
 
         // blackhole.py:1633 — pass the frame's return value to the caller
@@ -1062,18 +1097,22 @@ impl BlackholeInterpreter {
     /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
     /// Returns a Vec of register values looked up from the appropriate
     /// register file (registers_i for 'I', registers_r for 'R').
+    /// Every index in the list names a register the jitcode declared, so the
+    /// bank is indexed directly: upstream's `self.registers_i[index]` raises
+    /// on an out-of-range index, and its untranslated builds seed the bank
+    /// with `MissingValue()` so that even an in-range-but-never-written slot
+    /// is caught at the read.  Substituting `0` instead turned a codewriter
+    /// bug — a list built against a different register allocation — into a
+    /// call made with a zero argument.
     fn _get_list_of_values_i(&mut self) -> Vec<i64> {
         let length = self.next_u8() as usize;
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
             if crate::bh_debug_enabled() {
-                eprintln!(
-                    "[bh-getlist] i{index} -> {}",
-                    self.registers_i.get(index).copied().unwrap_or(0)
-                );
+                eprintln!("[bh-getlist] i{index} -> {}", self.registers_i[index]);
             }
-            values.push(self.registers_i.get(index).copied().unwrap_or(0));
+            values.push(self.registers_i[index]);
         }
         values
     }
@@ -1084,7 +1123,7 @@ impl BlackholeInterpreter {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
-            values.push(self.registers_r.get(index).copied().unwrap_or(0));
+            values.push(self.registers_r[index]);
         }
         values
     }
@@ -1094,7 +1133,7 @@ impl BlackholeInterpreter {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
-            values.push(self.registers_f.get(index).copied().unwrap_or(0));
+            values.push(self.registers_f[index]);
         }
         values
     }
@@ -1224,7 +1263,13 @@ impl BlackholeInterpreter {
             // across the handoff.
             self.exception_last_value = exc;
             BH_LAST_EXC_VALUE.with(|c| c.set(0));
-            return Err(DispatchError::RaiseException(exc));
+            // `abort_permanent/` carries no operand bytes, so the position the
+            // dispatch loop already advanced past the opcode byte is the end of
+            // the instruction.
+            return Err(DispatchError::RaiseException {
+                exc,
+                resume_position: self.position,
+            });
         }
         self.aborted = true;
         self.abort_permanent_bail = true;
@@ -1242,6 +1287,25 @@ impl BlackholeInterpreter {
 
     /// blackhole.py handle_exception_in_frame: check if the current
     /// position has an immediately-following `catch_exception/L`.
+    ///
+    /// Upstream inspects exactly one instruction — the resume `-live-` is
+    /// skipped and whatever follows it either is the `catch_exception` or is
+    /// not.  The two scans below are pyre's, and they are not a fallback for a
+    /// position this interpreter left wrong: every entry from
+    /// [`Self::run_inner`] arrives with `self.position` naming the end of the
+    /// raising instruction, which [`Self::dispatch_step`] stores out of
+    /// [`DispatchError::RaiseException`] exactly as upstream's `_get_method`
+    /// wrapper does, so the direct case answers all of them.
+    ///
+    /// They exist for the OTHER two entries, which do not come from a
+    /// dispatched instruction at all: [`Self::resume_mainloop`]'s prologue and
+    /// the guard-failure chain walk both arrive with a *resume coordinate*
+    /// taken from a guard descr, and pyre's descr for a post-call
+    /// `GUARD_NO_EXCEPTION` names the successor block's entry `-live-` rather
+    /// than the call's own trailing one (`pc_map[fallthrough_pc]`; the catch
+    /// sits between the two and no Python PC resolves onto it).  Retiring the
+    /// scans is therefore a change to what `capture_resumedata` stamps, not to
+    /// anything in this file.
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
         let mut position = self.position;
@@ -1631,7 +1695,7 @@ impl BlackholeInterpreter {
                     }
                     return Some(*args);
                 }
-                Err(DispatchError::RaiseException(exc)) => {
+                Err(DispatchError::RaiseException { exc, .. }) => {
                     // blackhole.py: except Exception → handle_exception_in_frame
                     if trace {
                         crate::debug::log_one(
@@ -1708,9 +1772,28 @@ impl BlackholeInterpreter {
         // `Arc::clone` is a single atomic increment.
         let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
         let code: &[u8] = &jitcode_arc.code;
-        let new_pos = handler(self, code, self.position)?;
-        self.position = new_pos;
-        Ok(())
+        match handler(self, code, self.position) {
+            Ok(new_pos) => {
+                self.position = new_pos;
+                Ok(())
+            }
+            // `blackhole.py` `_get_method`: the wrapper assigns
+            // `self.position` and only then re-raises, so a raising
+            // instruction leaves the frame pointing past itself.  Only
+            // `RaiseException` carries a coordinate because only it is read
+            // again — `handle_exception_in_frame` is the sole consumer of
+            // `self.position` on an error path, and the two control-flow
+            // errors end the frame without another dispatch.
+            Err(err) => {
+                if let DispatchError::RaiseException {
+                    resume_position, ..
+                } = err
+                {
+                    self.position = resume_position;
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Read call arguments from bytecode (kind:u8, reg:u8 per arg).
@@ -2536,6 +2619,8 @@ fn handle_jitexception_dispatch(
         }
         // warmspot.py:998-1005
         JitException::ExitFrameWithExceptionRef(_) => Err(exc),
+        // Not a result: a portal level has nothing to install for it.
+        JitException::BailToInterpreter => Err(exc),
         // warmspot.py:970-983
         JitException::ContinueRunningNormally(_) => {
             // warmspot.py:976-978: result = portal_ptr(*args)
@@ -2643,6 +2728,19 @@ fn handle_jitexception(
     on_leave_level: Option<&dyn Fn(i64)>,
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
+    // A bail is not an outcome any portal level can absorb — there is no
+    // result to install and no exception to deliver, only a frame the
+    // interpreter has to take back — so it leaves `_run_forever` directly
+    // instead of walking to a portal.  Upstream has no such exit; the walk
+    // below is `blackhole.py _handle_jitexception`, which only ever sees the
+    // five real jitexc classes.
+    if matches!(exc, JitException::BailToInterpreter) {
+        if let Some(terminal_out) = terminal_out {
+            *terminal_out = Some(BlackholeTerminalImage::take_from(&mut bh));
+        }
+        builder.release_chain(Some(bh));
+        return Err(exc);
+    }
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
@@ -2878,7 +2976,10 @@ pub fn convert_and_run_from_pyjitpl(
 
     let Some(first_bh_box) = next_bh else {
         majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
-        return JitException::DoneWithThisFrameVoid;
+        // An empty framestack converted nothing, so no frame ran and none
+        // returned; `blackhole.py convert_and_run_from_pyjitpl` is always
+        // handed at least the portal level.
+        return JitException::BailToInterpreter;
     };
     let mut first_bh = *first_bh_box;
 
@@ -2940,7 +3041,10 @@ pub fn resume_in_blackhole(
     );
 
     let Some((bh, _virtualizable_ptr)) = bh else {
-        return JitException::DoneWithThisFrameVoid;
+        // `resume.py blackhole_from_resumedata` always yields an interpreter;
+        // reaching here means the resume data could not be decoded, which is
+        // not a frame that returned.
+        return JitException::BailToInterpreter;
     };
 
     // blackhole.py:1794
@@ -4888,7 +4992,7 @@ mod tests {
             let outcome = bh.bhimpl_abort_permanent();
 
             assert!(
-                matches!(outcome, Err(super::DispatchError::RaiseException(e)) if e == EXC),
+                matches!(outcome, Err(super::DispatchError::RaiseException { exc, .. }) if exc == EXC),
                 "a pending TLS exception must route through RaiseException"
             );
             assert_eq!(
@@ -7820,55 +7924,51 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
     (values, pos + 1 + count)
 }
 
-/// blackhole.py `BlackholeInterpreter.run` exception path: after a
-/// residual call, route a non-zero `BH_LAST_EXC_VALUE` either into the next
-/// `catch_exception` handler in the current frame (returning `Ok(target)`),
-/// or out of the frame as `LeaveFrame` so the outer `run()` propagates.
+/// blackhole.py `_get_method`'s `except Exception` for every opcode that
+/// reaches host code: turn a non-zero `BH_LAST_EXC_VALUE` into a
+/// [`DispatchError::RaiseException`] carrying the post-call coordinate.
 ///
-/// Mirrors the legacy direct-dispatch arms in this file
-/// which already perform the same handshake; the wired
-/// `dispatch_table` handlers must do the same so the table path does not
-/// silently swallow exceptions raised by `cpu.bh_call_*`.
+/// Upstream wraps *every* `bhimpl_*` this way, so `residual_call_*`,
+/// `inline_call_*`, `call_assembler_*` and `cond_call_*` all owe the check —
+/// a family that skips it writes the callee's uninitialised result into its
+/// destination register and runs on with a live exception in the cell.
 ///
-/// `next_pos` is the position of the opcode immediately following the
-/// residual call (the handler's normal return value).  The dispatch loop
-/// has not advanced `bh.position` past the call's operands yet, so the
-/// catch lookup must be primed at the post-call coordinate — the call's
-/// own post-call `-live-`/`catch_exception` sits there, exactly where
-/// RPython's already-advanced `self.position` points when `cpu.bh_call_*`
-/// raises (`blackhole.py:83-100` advances position before executing the
-/// instruction).  Leaving `bh.position` at the operand start makes
-/// `handle_exception_in_frame` scan backward past the pre-call `-live-`
-/// and miss the catch, so a value-guard deopt that re-executes a raising
-/// residual call (e.g. `int_floordiv` by zero) escapes its try-block.
+/// The exception travels through the cell rather than through Rust
+/// unwinding, so this test is where the `except` clause lands; the handler
+/// search and the `got_exception` propagation stay in the dispatch loop,
+/// exactly as upstream leaves them to `run`.
+///
+/// `next_pos` is the position of the opcode immediately following the call
+/// (the handler's normal return value), which is where the codewriter
+/// emitted the can-raise opcode's `-live-`/`catch_exception` adjacency
+/// (`pyre-jit`'s `codewriter.rs` `transform_graph_to_jitcode`).  Starting
+/// the search at the operand start instead made `handle_exception_in_frame`
+/// scan backward past the pre-call `-live-` and miss the catch, so a
+/// value-guard deopt that re-executes a raising residual call (e.g.
+/// `int_floordiv` by zero) escaped its try-block.
 #[inline]
 fn check_residual_call_exception_after(
     bh: &mut BlackholeInterpreter,
     next_pos: usize,
-) -> Result<Option<usize>, DispatchError> {
+) -> Result<(), DispatchError> {
     let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
     if exc_val == 0 {
-        return Ok(None);
+        return Ok(());
     }
-    // `dispatch_step` stores the handler's return value into `self.position`
-    // only *after* the handler returns, so right now `self.position` still
-    // points at this residual call's first operand byte.  Advance it to
-    // `next_pos` — the post-call position the handler is about to return,
-    // where the codewriter emitted the can-raise opcode's `-live-` /
-    // `catch_exception` adjacency (`pyre-jit`'s `codewriter.rs`
-    // `transform_graph_to_jitcode`).  Without this,
-    // `handle_exception_in_frame`'s forward case inspects an operand byte
-    // (never a `catch_exception`) and the backward scan stops at the
-    // *pre*-call `-live-`, so a residual call executed directly during the
-    // walk escapes its enclosing `try` even though the catch sits right
-    // after it.
-    bh.position = next_pos;
-    if bh.handle_exception_in_frame(exc_val) {
-        return Ok(Some(bh.position));
-    }
-    bh.exception_last_value = exc_val;
-    bh.got_exception = true;
-    Err(DispatchError::LeaveFrame)
+    // A raise inside the callee reaches this side through the cell rather
+    // than through Rust unwinding, so this is where `blackhole.py`
+    // `_get_method`'s `except Exception` sits for pyre.  Everything after it
+    // — advancing the position, the handler search, the `got_exception`
+    // propagation — belongs to the dispatch loop, exactly as upstream leaves
+    // it to `run`.  `next_pos` is the post-call position the handler is about
+    // to return, where the codewriter emitted the can-raise opcode's
+    // `-live-` / `catch_exception` adjacency (`pyre-jit`'s `codewriter.rs`
+    // `transform_graph_to_jitcode`); starting the search at the pre-call
+    // operand byte instead let a residual call escape its enclosing `try`.
+    Err(DispatchError::RaiseException {
+        exc: exc_val,
+        resume_position: next_pos,
+    })
 }
 
 /// Refuse to jump to a `residual_call_*` funcptr that is a
@@ -7958,9 +8058,7 @@ fn handler_residual_call_irf_i(
     // blackhole.py → bhimpl_residual_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
 }
@@ -7983,9 +8081,7 @@ fn handler_residual_call_irf_r(
     // blackhole.py → bhimpl_residual_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
@@ -8008,9 +8104,7 @@ fn handler_residual_call_irf_f(
     // blackhole.py → bhimpl_residual_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_f[dst] = result.to_bits() as i64;
     Ok(p + 1)
 }
@@ -8033,9 +8127,7 @@ fn handler_residual_call_irf_v(
     // which forwards to cpu.bh_call_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_irf_v(func, &ai, &ar, &af, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 // residual_call_ir_*
@@ -8057,9 +8149,7 @@ fn handler_residual_call_ir_i(
     // blackhole.py → bhimpl_residual_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
 }
@@ -8081,9 +8171,7 @@ fn handler_residual_call_ir_r(
     // blackhole.py → bhimpl_residual_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
@@ -8104,9 +8192,7 @@ fn handler_residual_call_ir_v(
     // blackhole.py → bhimpl_residual_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 // residual_call_r_*
@@ -8127,9 +8213,7 @@ fn handler_residual_call_r_i(
     // blackhole.py → bhimpl_residual_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
 }
@@ -8150,9 +8234,7 @@ fn handler_residual_call_r_r(
     // blackhole.py → bhimpl_residual_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
@@ -8172,9 +8254,7 @@ fn handler_residual_call_r_v(
     // blackhole.py → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
-    if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
-        return Ok(handler_pc);
-    }
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 
@@ -9821,11 +9901,22 @@ bhhandler_r_v!(
     handler_hint_force_virtualizable,
     bhimpl_hint_force_virtualizable
 );
+/// RPython `blackhole.py bhimpl_guard_class`:
+/// ```python
+/// @arguments("cpu", "r", returns="i")
+/// def bhimpl_guard_class(cpu, struct):
+///     return cpu.bh_classof(struct)
+/// ```
+/// The guard has already failed by the time the blackhole reaches this op,
+/// so it produces the receiver's class pointer and does not branch.
 fn handler_guard_class(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let cpu = bh.cpu.expect("cpu not set");
+    let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
+    bh.registers_i[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
 /// `vtable_method_ptr` reaches the blackhole only when a `dyn Trait`
@@ -9864,12 +9955,24 @@ fn handler_record_quasiimmut_field(
     let (_, p) = read_descr(bh, code, p);
     Ok(p)
 }
+/// blackhole.py:
+/// ```python
+/// @arguments("cpu", "r", "d")
+/// def bhimpl_jit_force_quasi_immutable(cpu, struct, mutatefielddescr):
+///     from rpython.jit.metainterp import quasiimmut
+///     quasiimmut.do_force_quasi_immutable(cpu, struct, mutatefielddescr)
+/// ```
+/// Skipping past the operands without running the force left every loop that
+/// folded a read of the field valid across the write that invalidates it.
 fn handler_jit_force_quasi_immutable(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(p + 3)
+    let struct_ptr = bh.registers_r[code[p] as usize];
+    let (mutatefielddescr, p) = read_descr(bh, code, p + 1);
+    crate::quasiimmut::do_force_quasi_immutable(struct_ptr, mutatefielddescr);
+    Ok(p)
 }
 fn handler_record_known_result_i_ir_v(
     bh: &mut BlackholeInterpreter,
@@ -9957,22 +10060,22 @@ fn handler_raise(
         exc != 0,
         "blackhole.py:1002 raise: excvalue must be non-null"
     );
-    // RPython blackhole.py `_get_method` stores the decoded position
-    // back to `self.position` before invoking the bhimpl_*. Required here
-    // because `run_inner`'s RaiseException arm calls
-    // `handle_exception_in_frame`, which reads `self.position` to find
-    // the immediately-following `catch_exception/L` (blackhole.py).
-    // Without this update the search would start one byte short of the
-    // post-operand position.
-    bh.position = p + 1;
-    Err(DispatchError::RaiseException(exc))
+    Err(DispatchError::RaiseException {
+        exc,
+        resume_position: p + 1,
+    })
 }
 fn handler_reraise(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
-    _p: usize,
+    p: usize,
 ) -> Result<usize, DispatchError> {
-    Err(DispatchError::RaiseException(bh.exception_last_value))
+    // `reraise/` decodes no operands, so `p` is already the end of the
+    // instruction.
+    Err(DispatchError::RaiseException {
+        exc: bh.exception_last_value,
+        resume_position: p,
+    })
 }
 /// RPython `blackhole.py:987-991`:
 /// ```python
@@ -9996,13 +10099,13 @@ fn handler_last_exception(
         exc_obj != 0,
         "blackhole.py:990 last_exception: exception_last_value must be non-null"
     );
-    // RPython: ptr2int(real_instance.typeptr) — get class pointer
-    let typeptr = if let Some(cpu) = bh.cpu {
-        cpu.bh_classof(exc_obj)
-    } else {
-        exc_obj // fallback: use object pointer as-is if no cpu
-    };
-    bh.registers_i[code[p] as usize] = typeptr;
+    // RPython: ptr2int(real_instance.typeptr) — get class pointer.
+    // `cpu` is a builder field every interpreter is born with
+    // (`BlackholeInterpBuilder::acquire_interp`), so an unset one is a
+    // construction bug; standing the exception object in for its own class
+    // makes every later `bh_issubclass` compare an instance against a vtable
+    // and answer "no match" for a handler that does match.
+    bh.registers_i[code[p] as usize] = bh.cpu().bh_classof(exc_obj);
     Ok(p + 1)
 }
 /// RPython `blackhole.py:993-997`:
@@ -10053,18 +10156,12 @@ fn handler_goto_if_exception_mismatch(
         exc_obj != 0,
         "blackhole.py:981 goto_if_exception_mismatch: exception_last_value must be non-null"
     );
-    let exc_typeptr = if let Some(cpu) = bh.cpu {
-        cpu.bh_classof(exc_obj)
-    } else {
-        exc_obj
-    };
+    // See `handler_last_exception` on why an unset `cpu` is not answered
+    // with a substitute here.
+    let exc_typeptr = bh.cpu().bh_classof(exc_obj);
     // RPython: rclass.ll_issubclass(real_instance.typeptr, bounding_class).
     // Uses Backend::bh_issubclass for the subclass check.
-    let is_match = if let Some(cpu) = bh.cpu {
-        cpu.bh_issubclass(exc_typeptr, bounding_vtable)
-    } else {
-        exc_typeptr == bounding_vtable
-    };
+    let is_match = bh.cpu().bh_issubclass(exc_typeptr, bounding_vtable);
     if is_match {
         Ok(pc) // match → fall through
     } else {
@@ -10099,11 +10196,21 @@ fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
 
 bhhandler_r_i!(handler_cast_ptr_to_int, bhimpl_cast_ptr_to_int);
 bhhandler_i_r!(handler_cast_int_to_ptr, bhimpl_cast_int_to_ptr);
+/// blackhole.py:
+/// ```python
+/// @arguments(returns="i")
+/// def bhimpl_current_trace_length():
+///     return -1
+/// ```
+/// The constant is what tells `rlib/jit.py current_trace_length()` that no
+/// trace is being recorded; skipping the write left the result register
+/// holding whatever the previous instruction put there.
 fn handler_current_trace_length(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    bh.registers_i[code[p] as usize] = -1;
     Ok(p + 1)
 }
 
@@ -11136,9 +11243,12 @@ fn handler_inline_call_irf_i(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_irf_i.
-    bh.registers_i[code[p] as usize] =
-        bh.bhimpl_inline_call_irf_i(fnaddr, &ai, &ar, &af, &calldescr);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_irf_i(fnaddr, &ai, &ar, &af, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_i[dst] = result;
     Ok(p + 1)
 }
 fn handler_inline_call_irf_r(
@@ -11153,10 +11263,12 @@ fn handler_inline_call_irf_r(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_irf_r.
-    bh.registers_r[code[p] as usize] = bh
-        .bhimpl_inline_call_irf_r(fnaddr, &ai, &ar, &af, &calldescr)
-        .0 as i64;
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_irf_r(fnaddr, &ai, &ar, &af, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_irf_f(
@@ -11171,10 +11283,12 @@ fn handler_inline_call_irf_f(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_irf_f.
-    bh.registers_f[code[p] as usize] = bh
-        .bhimpl_inline_call_irf_f(fnaddr, &ai, &ar, &af, &calldescr)
-        .to_bits() as i64;
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_irf_f(fnaddr, &ai, &ar, &af, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_f[dst] = result.to_bits() as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_irf_v(
@@ -11190,7 +11304,9 @@ fn handler_inline_call_irf_v(
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
     // blackhole.py → bhimpl_inline_call_irf_v.
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_irf_v(fnaddr, &ai, &ar, &af, &calldescr);
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 fn handler_inline_call_ir_i(
@@ -11204,8 +11320,12 @@ fn handler_inline_call_ir_i(
     }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_ir_i.
-    bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_ir_i(fnaddr, &ai, &ar, &calldescr);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_ir_i(fnaddr, &ai, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_i[dst] = result;
     Ok(p + 1)
 }
 fn handler_inline_call_ir_r(
@@ -11219,9 +11339,12 @@ fn handler_inline_call_ir_r(
     }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_ir_r.
-    bh.registers_r[code[p] as usize] =
-        bh.bhimpl_inline_call_ir_r(fnaddr, &ai, &ar, &calldescr).0 as i64;
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_ir_r(fnaddr, &ai, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_ir_v(
@@ -11236,7 +11359,9 @@ fn handler_inline_call_ir_v(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py → bhimpl_inline_call_ir_v.
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_ir_v(fnaddr, &ai, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 fn handler_inline_call_r_i(
@@ -11249,8 +11374,12 @@ fn handler_inline_call_r_i(
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     }
     let (ar, p) = read_list_r(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_r_i.
-    bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_r_i(fnaddr, &ar, &calldescr);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_r_i(fnaddr, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_i[dst] = result;
     Ok(p + 1)
 }
 fn handler_inline_call_r_r(
@@ -11263,8 +11392,12 @@ fn handler_inline_call_r_r(
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     }
     let (ar, p) = read_list_r(bh, code, p);
+    let dst = code[p] as usize;
     // blackhole.py → bhimpl_inline_call_r_r.
-    bh.registers_r[code[p] as usize] = bh.bhimpl_inline_call_r_r(fnaddr, &ar, &calldescr).0 as i64;
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_inline_call_r_r(fnaddr, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
 }
 fn handler_inline_call_r_v(
@@ -11278,7 +11411,9 @@ fn handler_inline_call_r_v(
     }
     let (ar, p) = read_list_r(bh, code, p);
     // blackhole.py → bhimpl_inline_call_r_v.
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, &calldescr);
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 
@@ -11313,16 +11448,7 @@ fn handler_call_assembler_int_pyre(
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
-    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc_val != 0 {
-        bh.position = p;
-        if bh.handle_exception_in_frame(exc_val) {
-            return Ok(bh.position);
-        }
-        bh.exception_last_value = exc_val;
-        bh.got_exception = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    check_residual_call_exception_after(bh, p)?;
     bh.registers_i[dst] = result;
     Ok(p)
 }
@@ -11351,16 +11477,7 @@ fn handler_call_assembler_ref_pyre(
     // helper here keeps the call site readable as `bh_call_r` and
     // gives a single switch point if the ref ABI ever diverges.
     let result = call_ref_function(target.concrete_ptr, &args);
-    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc_val != 0 {
-        bh.position = p;
-        if bh.handle_exception_in_frame(exc_val) {
-            return Ok(bh.position);
-        }
-        bh.exception_last_value = exc_val;
-        bh.got_exception = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    check_residual_call_exception_after(bh, p)?;
     bh.registers_r[dst] = result;
     Ok(p)
 }
@@ -11391,16 +11508,7 @@ fn handler_call_assembler_float_pyre(
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
-    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc_val != 0 {
-        bh.position = p;
-        if bh.handle_exception_in_frame(exc_val) {
-            return Ok(bh.position);
-        }
-        bh.exception_last_value = exc_val;
-        bh.got_exception = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    check_residual_call_exception_after(bh, p)?;
     bh.registers_f[dst] = result;
     Ok(p)
 }
@@ -11422,16 +11530,7 @@ fn handler_call_assembler_void_pyre(
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     call_void_function(target.concrete_ptr, &args);
-    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc_val != 0 {
-        bh.position = p;
-        if bh.handle_exception_in_frame(exc_val) {
-            return Ok(bh.position);
-        }
-        bh.exception_last_value = exc_val;
-        bh.got_exception = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
 
@@ -11486,16 +11585,7 @@ fn handler_cond_call_void_pyre(
         let target = bh.jitcode.call_target(fn_ptr_idx);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         call_void_function(target.concrete_ptr, &args);
-        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-        if exc_val != 0 {
-            bh.position = p_end;
-            if bh.handle_exception_in_frame(exc_val) {
-                return Ok(bh.position);
-            }
-            bh.exception_last_value = exc_val;
-            bh.got_exception = true;
-            return Err(DispatchError::LeaveFrame);
-        }
+        check_residual_call_exception_after(bh, p_end)?;
     }
     Ok(p_end)
 }
@@ -11516,16 +11606,7 @@ fn handler_cond_call_value_int_pyre(
         let target = bh.jitcode.call_target(fn_ptr_idx);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         let r = call_int_function(target.concrete_ptr, &args);
-        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-        if exc_val != 0 {
-            bh.position = p_end + 1;
-            if bh.handle_exception_in_frame(exc_val) {
-                return Ok(bh.position);
-            }
-            bh.exception_last_value = exc_val;
-            bh.got_exception = true;
-            return Err(DispatchError::LeaveFrame);
-        }
+        check_residual_call_exception_after(bh, p_end + 1)?;
         r
     } else {
         value
@@ -11553,16 +11634,7 @@ fn handler_cond_call_value_ref_pyre(
         // → `cpu.bh_call_r(...)` (ref ABI).  See note on
         // `handler_call_assembler_ref_pyre`.
         let r = call_ref_function(target.concrete_ptr, &args);
-        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-        if exc_val != 0 {
-            bh.position = p_end + 1;
-            if bh.handle_exception_in_frame(exc_val) {
-                return Ok(bh.position);
-            }
-            bh.exception_last_value = exc_val;
-            bh.got_exception = true;
-            return Err(DispatchError::LeaveFrame);
-        }
+        check_residual_call_exception_after(bh, p_end + 1)?;
         r
     } else {
         value
@@ -11714,16 +11786,14 @@ fn handler_inline_call_pyre_nested(
         return Err(DispatchError::LeaveFrame);
     }
     if callee.got_exception {
-        bh.position = p;
         let exc_val = callee.exception_last_value;
-        // `handle_exception_in_frame` peeks at `bh.position` to look
-        // for an immediately-following `catch_exception/L`; on a
-        // successful handler dispatch it moves `bh.position` to the
-        // catch target — propagate that.
-        if exc_val != 0 && bh.handle_exception_in_frame(exc_val) {
-            return Ok(bh.position);
+        if exc_val != 0 {
+            return Err(DispatchError::RaiseException {
+                exc: exc_val,
+                resume_position: p,
+            });
         }
-        bh.exception_last_value = exc_val;
+        bh.position = p;
         bh.got_exception = true;
         return Err(DispatchError::LeaveFrame);
     }

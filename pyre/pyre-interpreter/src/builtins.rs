@@ -3039,9 +3039,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function("dir", builtin_dir)
     });
     crate::module_ns_get_or_insert_with(ns, "__build_class__", || {
-        make_module_builtin_function("__build_class__", |args| {
-            crate::call::real_build_class(args)
-        })
+        make_module_builtin_function("__build_class__", builtin_build_class)
     });
     // bytearrayobject.py W_BytearrayObject — register the real type
     // (callable as a constructor and usable in isinstance(x, bytearray)).
@@ -9907,6 +9905,23 @@ fn builtin_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// Get a reference to the `__build_class__` builtin function.
 pub fn get_build_class_func() -> PyObjectRef {
     make_builtin_function("__build_class__", builtin_build_class)
+}
+
+/// Is `obj` the `__build_class__` builtin?
+///
+/// Every producer wraps the same `BuiltinCode.func`, so the function address
+/// recognizes both the copy in the builtins namespace and any fresh one
+/// [`get_build_class_func`] hands out.
+pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !unsafe { crate::function::is_function(obj) } {
+        return false;
+    }
+    let code = unsafe { crate::function::function_get_code(obj) } as PyObjectRef;
+    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    let func = unsafe { crate::gateway::builtin_code_get(code) };
+    std::ptr::fn_addr_eq(func, builtin_build_class as crate::gateway::BuiltinCodeFn)
 }
 
 /// `str(obj)` → convert to string

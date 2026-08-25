@@ -132,6 +132,8 @@ pub use pyjitpl::{
     active_backend_jit_exc_value_peek, install_active_backend_gc_standalone,
     set_active_backend_jitframe_gc_type_id,
 };
+pub mod quasiimmut;
+pub use quasiimmut::set_force_quasi_immutable_hook;
 pub mod recorder;
 pub mod resoperation;
 pub mod resume;

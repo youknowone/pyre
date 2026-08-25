@@ -4399,6 +4399,44 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     )
 }
 
+/// Will the class body of `__build_class__(func, name, *bases, **kwds)` bind
+/// its names in a module-strategy namespace?
+///
+/// `compiling.py build_class` runs the body in whatever `__prepare__` returned
+/// and `descr___prepare__` answers `newdict(module=True)`, so only a metaclass
+/// carrying its own `__prepare__` can land the body somewhere else.
+/// [`real_build_class`] already spells the default-metaclass winner as an
+/// absent `w_metaclass`: no `metaclass=` keyword, and every base a type whose
+/// own class is `type`.  Recognizing exactly that shape answers the question
+/// without running `_update_bases`, `_calculate_metaclass` or `__prepare__` —
+/// none of which a tracing-time question may execute.  Every other shape is
+/// left undecided and answers `false`.
+pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
+    if args.len() < 2 {
+        return false;
+    }
+    let mut base_args = &args[2..];
+    if let Some(&last) = base_args.last() {
+        let is_kwds = unsafe { pyre_object::is_dict(last) }
+            && unsafe {
+                pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
+                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
+            };
+        if is_kwds {
+            if unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") }.is_some() {
+                return false;
+            }
+            base_args = &base_args[..base_args.len() - 1];
+        }
+    }
+    let w_type_type = crate::typedef::w_type();
+    base_args.iter().all(|&base| unsafe {
+        // A non-type base reaches `__mro_entries__`, which runs Python and can
+        // replace it; the metaclass set is not knowable from here.
+        pyre_object::is_type(base) && std::ptr::eq((*base).w_class, w_type_type)
+    })
+}
+
 /// `bases` and `w_orig_bases` are borrowed, not owned: the only caller,
 /// `real_build_class`, keeps both pinned for the whole of this call.  They are
 /// tuples, so they never move and the raw copies below stay valid addresses;
@@ -4532,7 +4570,22 @@ fn build_class_inner(
         let _ = pyre_object::gc_roots::pin_root(w_namespace);
         root
     });
-    let class_ns = pyre_object::w_dict_new();
+    // The body executes in the namespace `__prepare__` returned, and
+    // `descr___prepare__` answers `newdict(module=True)`; the default metaclass
+    // reaches here with no prepared namespace at all, since `real_build_class`
+    // spells that winner as an absent `w_metaclass`.  Only a `__prepare__` that
+    // produced a plain dict keeps the body out of a module-strategy mapping.
+    let prepared_plain_dict = w_namespace_root
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .is_some_and(|w_namespace| unsafe {
+            pyre_object::is_dict(w_namespace)
+                && !pyre_object::dictmultiobject::is_module_dict(w_namespace)
+        });
+    let class_ns = if prepared_plain_dict {
+        pyre_object::w_dict_new()
+    } else {
+        pyre_object::w_module_dict_new()
+    };
     let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
     let class_ns = pyre_object::gc_roots::pin_root(class_ns);
     if let Some(w_namespace_root) = w_namespace_root {

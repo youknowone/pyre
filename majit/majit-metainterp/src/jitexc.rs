@@ -23,6 +23,21 @@ pub enum JitException {
     ExitFrameWithExceptionRef(GcRef),
     /// jitexc.py ContinueRunningNormally
     ContinueRunningNormally(Box<ContinueRunningNormallyArgs>),
+    /// pyre-only: the blackhole stopped without finishing the frame.
+    ///
+    /// Reached from a pyre `abort_permanent` marker and from the two
+    /// unresolved-callee refusals (`reject_symbolic_residual_call`,
+    /// `reject_unresolved_inline_call`), none of which upstream has: RPython's
+    /// jitcodes cover every operation the codewriter accepted, so a blackhole
+    /// frame always ends in one of the variants above.
+    ///
+    /// It is deliberately NOT `DoneWithThisFrameVoid`.  That variant says the
+    /// frame ran to its `return` and produced no value, which is a result the
+    /// caller installs and the program observes; a bail says the opposite —
+    /// the frame is mid-execution, its resume coordinate is already stamped
+    /// into the interpreter frame, and the interpreter has to take it back.
+    /// Spelling one as the other turned an abort into a Python-visible `None`.
+    BailToInterpreter,
 }
 
 #[derive(Debug, Clone, PartialEq)]

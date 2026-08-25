@@ -2352,6 +2352,16 @@ fn seed_loop_entry_ref_slots(
     }
 }
 
+/// The pc the interpreter resumes `frame` at, read back out of the frame the
+/// blackhole left: `pyframe.py next_instr` reads `last_instr + 1`.
+///
+/// Used by the bail arms, which have no green list to take a coordinate from
+/// and do not need one — the frame already carries its own.
+fn frame_resume_py_pc(frame: usize) -> usize {
+    let last_instr = unsafe { (*(frame as *const pyre_interpreter::PyFrame)).last_instr };
+    (last_instr + 1).max(0) as usize
+}
+
 /// Hand a blackhole `ContinueRunningNormally` back the way upstream does:
 /// resume on the frame the blackhole has been writing, not on one rebuilt from
 /// the terminal register banks.
@@ -2798,6 +2808,7 @@ fn try_adopt_single_frame_blackhole(
                     "DoneWithThisFrameFloat",
                 majit_metainterp::jitexc::JitException::ExitFrameWithExceptionRef(_) =>
                     "ExitFrameWithExceptionRef",
+                majit_metainterp::jitexc::JitException::BailToInterpreter => "BailToInterpreter",
             }
         );
     }
@@ -2814,6 +2825,26 @@ fn try_adopt_single_frame_blackhole(
             let resume_py_pc = resume_py_pc as usize;
             adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
             sfdbg!("adopted with green resume_py_pc={resume_py_pc}");
+            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+        }
+        // pyre-only (`JitException::BailToInterpreter`): the chain stopped
+        // on an `abort_permanent` marker or on a callee whose address never
+        // resolved.  The frame produced no value and must not be given one —
+        // routing this through the void arm made the aborted statement's
+        // result a Python-visible `None`.
+        //
+        // Every abort that can reach a running blackhole stops on a Python
+        // opcode boundary with the frame's own resume coordinate already
+        // stamped (`call_jit.rs` states the same invariant for the
+        // guard-failure resume path), so the frame is resumable as it stands
+        // and the handoff is the CRN one with the coordinate read back out of
+        // the frame instead of out of the green list.  Declining is not
+        // available after the drive — see this path's note on post-drive
+        // declines.
+        majit_metainterp::jitexc::JitException::BailToInterpreter => {
+            let resume_py_pc = frame_resume_py_pc(forwarded_root_addr);
+            adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
+            sfdbg!("adopted bail with resume_py_pc={resume_py_pc}");
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
         }
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
@@ -3425,6 +3456,25 @@ fn try_adopt_multi_frame_blackhole(
             // terminal image, the out-of-range terminal jitcode index, and the
             // register-image rebuild's own rejection — each of which handed a
             // chain that had already run back to a replay.
+            adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
+            WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
+        }
+        // pyre-only (`JitException::BailToInterpreter`): the chain stopped
+        // on an `abort_permanent` marker or on a callee whose address never
+        // resolved.  The frame produced no value and must not be given one —
+        // routing this through the void arm made the aborted statement's
+        // result a Python-visible `None`.
+        //
+        // Every abort that can reach a running blackhole stops on a Python
+        // opcode boundary with the frame's own resume coordinate already
+        // stamped (`call_jit.rs` states the same invariant for the
+        // guard-failure resume path), so the frame is resumable as it stands
+        // and the handoff is the CRN one with the coordinate read back out of
+        // the frame instead of out of the green list.  Declining is not
+        // available after the drive — see this path's note on post-drive
+        // declines.
+        majit_metainterp::jitexc::JitException::BailToInterpreter => {
+            let resume_py_pc = frame_resume_py_pc(root_addr);
             adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
         }

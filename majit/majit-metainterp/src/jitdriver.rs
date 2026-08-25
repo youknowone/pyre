@@ -2435,6 +2435,19 @@ impl<S: JitState> JitDriver<S> {
             // exception out to `warmspot.py handle_jitexception` — so
             // ending the dispatch loop is the closest non-replaying answer.
             // A frontend that wants the exception implements the hook.
+            // The chain stopped without finishing the frame
+            // (`JitException::BailToInterpreter`).  The frame's own resume
+            // coordinate is stamped, but this driver resumes at a GREEN pc and
+            // the bail reports a jitcode one, so there is no pc to hand back.
+            // End the dispatch loop for the same reason the no-surface
+            // exception arm below does: the chain has already executed the
+            // aborted opcodes' tails against the real heap, so the `None`
+            // source-pc handoff would run them twice.
+            crate::jitexc::JitException::BailToInterpreter => {
+                writeback(state, usize::MAX);
+                self.meta.single_pass_finish = true;
+                Some(usize::MAX)
+            }
             crate::jitexc::JitException::ExitFrameWithExceptionRef(exc) => {
                 let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
                     eprintln!(
@@ -5623,8 +5636,10 @@ impl<S: JitState> JitDriver<S> {
                                 // The bottommost frame always raises
                                 // (done_with_this_frame / exit_frame_with_
                                 // exception), so an `Ok` with no caller is
-                                // unreachable; treat it as a void completion.
-                                None => break crate::jitexc::JitException::DoneWithThisFrameVoid,
+                                // unreachable.  Nothing returned a result on
+                                // this route, so name it a bail rather than a
+                                // void completion the caller would install.
+                                None => break crate::jitexc::JitException::BailToInterpreter,
                             },
                             Err(jit_exc) => break jit_exc,
                         }
@@ -5811,6 +5826,26 @@ impl<S: JitState> JitDriver<S> {
                         // interpreter's handler pc, or `None` when it has no
                         // exception machinery — then the crude fallback runs,
                         // but an exception-less interpreter never reaches here.
+                        // See the twin arm in the tracing-abort adoption
+                        // above: a bail names a jitcode coordinate this
+                        // driver cannot resume at, and the chain has already
+                        // run, so ending the dispatch loop is the closest
+                        // non-replaying answer.  The banked state is restored
+                        // first because the blackhole registers hold what the
+                        // chain computed before it stopped.
+                        crate::jitexc::JitException::BailToInterpreter => {
+                            let layout = state.state_field_layout();
+                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                            state.restore_banked3(
+                                &compiled_meta,
+                                &bh.registers_i[int_base..],
+                                &bh.registers_r[ref_base..],
+                                &bh.registers_f[float_base..],
+                            );
+                            Some(usize::MAX)
+                        }
                         crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
                             state.deliver_blackhole_exception(exc_ref)
                         }
