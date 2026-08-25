@@ -1620,7 +1620,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "pyre_jit",
         "jit_call_host",
         |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-            if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32) {
+            if let Err(e) =
+                jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32, "host")
+            {
                 eprintln!("[jit_call_host] {e:?}");
             }
         },
@@ -1771,9 +1773,12 @@ fn jit_compile_trace(
     let jit_call = Func::wrap(
         &mut *caller,
         |mut inner: Caller<'_, Host>, frame_ptr: i32| {
-            if let Err(e) =
-                jit_call_trampoline(&mut inner, frame_ptr as u32, CALL_RESULT_OFS as u32)
-            {
+            if let Err(e) = jit_call_trampoline(
+                &mut inner,
+                frame_ptr as u32,
+                CALL_RESULT_OFS as u32,
+                "trace",
+            ) {
                 eprintln!("[jit_call] {e:?}");
             }
         },
@@ -1781,7 +1786,8 @@ fn jit_compile_trace(
     let jit_call_compact = Func::wrap(
         &mut *caller,
         |mut inner: Caller<'_, Host>, frame_ptr: i32, call_area_ofs: i32| {
-            if let Err(e) = jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32)
+            if let Err(e) =
+                jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32, "trace")
             {
                 eprintln!("[jit_call_compact] {e:?}");
             }
@@ -1963,8 +1969,9 @@ fn report_dead_call_slot(func_ptr: u32) {
 
 /// Dispatch a residual call requested by a running trace.
 // PROBE(PYRE_WASM_CALL_HIST): temporary per-callee crossing histogram.
-static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
-    std::sync::Mutex::new(None);
+static PROBE_CALL_HIST: std::sync::Mutex<
+    Option<std::collections::BTreeMap<(&'static str, u32), u64>>,
+> = std::sync::Mutex::new(None);
 
 /// Whether `PYRE_WASM_CALL_HIST` was set, read once.
 ///
@@ -2080,14 +2087,14 @@ pub(crate) fn probe_call_hist_dump() {
     v.sort_by(|a, b| b.1.cmp(a.1));
     eprintln!("[probe] call_hist total={total} distinct={}", v.len());
     let names = probe_call_hist_slot_names();
-    for (slot, n) in v.into_iter().take(15) {
+    for ((source, slot), n) in v.into_iter().take(15) {
         let pct = if total > 0 {
             *n as f64 * 100.0 / total as f64
         } else {
             0.0
         };
         let name = names.get(slot).map(String::as_str).unwrap_or("?");
-        eprintln!("[probe] call_hist slot={slot} n={n} pct={pct:.1} name={name}");
+        eprintln!("[probe] call_hist src={source} slot={slot} n={n} pct={pct:.1} name={name}");
     }
 }
 
@@ -2102,6 +2109,7 @@ fn jit_call_trampoline(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
+    source: &'static str,
 ) -> Result<()> {
     let host = caller.data_mut();
     let outer_child_ns = std::mem::take(&mut host.jit_call_child_ns);
@@ -2109,7 +2117,7 @@ fn jit_call_trampoline(
     host.jit_call_depth += 1;
     host.jit_call_depth_max = host.jit_call_depth_max.max(host.jit_call_depth);
     let entered = std::time::Instant::now();
-    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs);
+    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs, source);
     let elapsed = entered.elapsed().as_nanos();
     let host = caller.data_mut();
     host.jit_call_depth -= 1;
@@ -2122,6 +2130,7 @@ fn jit_call_trampoline_inner(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
+    source: &'static str,
 ) -> Result<()> {
     caller.data_mut().jit_call_count += 1;
     let memory = caller.data().memory.context("memory")?;
@@ -2132,7 +2141,7 @@ fn jit_call_trampoline_inner(
     if probe_call_hist_enabled() {
         let mut g = PROBE_CALL_HIST.lock().unwrap();
         *g.get_or_insert_with(Default::default)
-            .entry(func_ptr)
+            .entry((source, func_ptr))
             .or_insert(0) += 1;
     }
 
