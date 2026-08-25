@@ -71,12 +71,12 @@ jobs:
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: build/llbc
-        key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+        key: llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
         # A miss with no prefix to fall back on restores nothing and re-extracts
         # all four crates. A loose restore is safe: `extract-llbc.py` re-judges
         # each crate against the tree and re-extracts the ones that moved.
         restore-keys: |
-          llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+          llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Extract LLBC
       if: steps.llbc-cache.outputs.cache-hit != 'true'
       shell: bash

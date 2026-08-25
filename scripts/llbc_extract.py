@@ -1118,7 +1118,7 @@ def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) ->
 
     `shlex.quote` per entry, space-separated: a root label is a filesystem path
     and may hold a space or a quote, and the value has to survive as ONE line
-    of a line-oriented stamp. `parse_external` is the inverse.
+    of a line-oriented stamp. `parse_packed` is the inverse.
 
     One stamp KEY, not one key per root. `STAMP_KEYS` is a fixed schema and
     `check` refuses a stamp missing any member of it; deriving the key set from
@@ -1133,11 +1133,13 @@ def external_fingerprint(eng: Engine, crates: list[str], cargo_features: str) ->
     )
 
 
-def parse_external(value: str) -> dict[str, str]:
-    """Split an `external=` stamp value into `{root label: digest}`.
+def parse_packed(value: str) -> dict[str, str]:
+    """Split a packed `<label>=<value>` stamp field into its entries.
 
-    Inverse of `external_fingerprint`'s encoding. `rpartition`, not `partition`:
-    a label may contain `=`, and the hex digest that follows never does.
+    Two fields pack a list into one line this way, `external=` and
+    `artefacts=`; this is the inverse of both encodings. `rpartition`, not
+    `partition`: a label may contain `=`, and the value that follows never
+    does.
     """
     entries: dict[str, str] = {}
     for token in shlex.split(value):
@@ -1155,8 +1157,8 @@ def external_diff(crate: str, recorded: str, expected: str) -> list[str]:
     the repo changed" — a guard that fires without informing, which is the
     shape this field is structured to avoid.
     """
-    was = parse_external(recorded)
-    now = parse_external(expected)
+    was = parse_packed(recorded)
+    now = parse_packed(expected)
     lines: list[str] = []
     for label in sorted(set(was) | set(now)):
         if label not in now:
@@ -1181,6 +1183,107 @@ def external_diff(crate: str, recorded: str, expected: str) -> list[str]:
             f"engine"
         )
     return lines
+
+
+def artefact_token(path: Path) -> str:
+    """One artefact's contribution to `artefacts=`: its size and its digest.
+
+    `missing` rather than a raise. Both sides of the comparison run this, and
+    the side reading the tree has to be able to say "the file the stamp
+    describes is not there" instead of ending the run.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "missing"
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return f"{size}:{digest.hexdigest()}"
+
+
+def describe_artefact(token: str) -> str:
+    """Render one `artefacts=` token for a reader.
+
+    The size is spelled out and the digest abbreviated: a digest pair says
+    only "these differ", where a size pair usually says how.
+    """
+    if token == "missing":
+        return "not there"
+    size, sep, digest = token.partition(":")
+    if not sep:
+        return f"{token!r}, which is not a token this engine writes"
+    return f"{size} bytes, sha256 {digest[:12]}"
+
+
+def artefact_diff(crate: str, recorded: str, expected: str) -> list[str]:
+    """Name WHICH artefact moved, rather than printing two packed lists."""
+    was = parse_packed(recorded)
+    now = parse_packed(expected)
+    lines: list[str] = []
+    for name in sorted(set(was) | set(now)):
+        if name not in now:
+            lines.append(
+                f"{crate}: artefacts: {name!r} is no longer one of this "
+                f"crate's artefacts, but the stamp was written over it"
+            )
+        elif name not in was:
+            lines.append(
+                f"{crate}: artefacts: {name!r} is an artefact the stamp never "
+                f"covered"
+            )
+        elif was[name] != now[name]:
+            lines.append(
+                f"{crate}: artefacts: {name}: stamped "
+                f"{describe_artefact(was[name])}, on disk "
+                f"{describe_artefact(now[name])}"
+            )
+    if not lines:
+        # The packed values differ while every artefact agrees: an encoding
+        # this engine did not write. Reporting nothing here would turn a
+        # mismatch into a silent pass.
+        lines.append(
+            f"{crate}: artefacts: {recorded!r} does not match {expected!r} "
+            f"although every artefact agrees — the value was not written by "
+            f"this engine"
+        )
+    return lines
+
+
+def artefacts_fingerprint(eng: Engine, spec: CrateSpec, dest_dir: Path) -> str:
+    """`artefacts=`'s stamp value: the bytes this stamp was written beside.
+
+    Every other field describes an INPUT, and together they answer "would a
+    fresh extraction write different bytes here". None of them answers "are
+    these still the bytes that extraction wrote". Charon writes its artefact
+    straight to its final path and `write_layout_sidecar` writes the reduced
+    sidecar the same way, so a run killed part-way through either leaves a
+    short file behind — while the previous run's stamp, describing sources
+    that have not moved, stays on disk and goes on reading current. The
+    0-byte test in `check` catches only the kill that landed before the first
+    byte.
+
+    Cost, since `check` recomputes this on every run and a build script runs
+    one: 0.5 s of CPU, 0.7 s of wall clock, over the 980 MB the four pyre
+    artefacts and their sidecars occupy, against the 2.6 s of CPU a check
+    costs without it. Measured with the artefacts in the page cache; a cold
+    read adds its own time.
+    """
+    names = [spec.output_name]
+    names += [spec.layout_sidecar_name(t) for t in crate_layout_targets(eng, spec)]
+    # `shlex.quote` per entry for the same reason `external=` does it: the
+    # value has to survive as ONE line of a line-oriented stamp, and
+    # `parse_packed` splits it back with `shlex.split`.
+    return " ".join(
+        shlex.quote(f"{name}={artefact_token(dest_dir / name)}") for name in names
+    )
+
+
+# The two fields that pack a list into one value. Printing either as an opaque
+# string would hand the reader kilobytes and no answer, so each has a renderer
+# that names the entry that moved.
+PACKED_FIELD_DIFFS = {"external": external_diff, "artefacts": artefact_diff}
 
 
 def _repo_fingerprint(
@@ -1427,6 +1530,7 @@ def stamp_for(
     charon_flags: list[str],
     layout_targets: list[str],
     layout_flags: list[str],
+    artefacts: str,
 ) -> str:
     return "\n".join(
         [
@@ -1455,6 +1559,10 @@ def stamp_for(
             # checkout changed" call for different actions, and collapsing
             # them would repeat the mistake this field exists to fix.
             f"external={external_fingerprint(eng, [crate], cargo_features)}",
+            # The one field about the OUTPUT rather than its inputs: the
+            # artefact bytes, and the layout sidecars beside them, as they
+            # stood when this stamp was written. See `artefacts_fingerprint`.
+            f"artefacts={artefacts}",
         ]
     )
 
@@ -1477,6 +1585,7 @@ STAMP_KEYS = (
     "source",
     "closure",
     "external",
+    "artefacts",
 )
 
 
@@ -2267,6 +2376,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             charon_flags=charon_flags,
             layout_targets=crate_layout_targets(eng, spec),
             layout_flags=layout_flags,
+            artefacts=artefacts_fingerprint(eng, spec, dest_dir),
         )
 
         sidecars = [
@@ -2585,6 +2695,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             charon_flags=charon_flags,
             layout_targets=crate_layout_targets(eng, spec),
             layout_flags=layout_flags,
+            artefacts=artefacts_fingerprint(eng, spec, dest_dir),
         )
         before = parse_stamp(stamp)
         after = parse_stamp(current_stamp)
@@ -2623,6 +2734,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
 
 def check(eng: Engine, args: argparse.Namespace) -> None:
     """Refuse an artefact whose stamp does not match the tree it sits beside.
+
+    Or whose own bytes are not the ones that stamp was written beside: a
+    Charon pass writes straight to the artefact's final path, so a run killed
+    part-way leaves a short file under a stamp that still describes unmoved
+    sources. See `artefacts_fingerprint`.
 
     `extract` already computes this comparison — it is the `skipping <crate>
     (fingerprint unchanged)` test — but only a caller who runs the extractor
@@ -2713,6 +2829,10 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         # most useful on exactly the paths that refuse.
         report_provenance(dest)
 
+        # `artefacts=` covers these too, and says more about them, but this
+        # line is the one that names what a reader loses — and the only one
+        # that survives the arms below, each of which `continue`s on a stamp
+        # that cannot be compared at all.
         for target in crate_layout_targets(eng, spec):
             sidecar = dest_dir / spec.layout_sidecar_name(target)
             if not sidecar.exists() or sidecar.stat().st_size == 0:
@@ -2785,6 +2905,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             charon_flags=charon_crate_flags(spec, features),
             layout_targets=crate_layout_targets(eng, spec),
             layout_flags=crate_layout_flags(spec, features, flags),
+            artefacts=artefacts_fingerprint(eng, spec, dest_dir),
         )
         if text == expected + "\n":
             print(f"    fingerprint matches the tree (source={recorded['source']})")
@@ -2818,17 +2939,37 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
             )
             continue
         for key in differing:
-            if key == "external":
-                # Two packed per-root lists, not two hashes: printing them as
-                # opaque values would hand the reader kilobytes and no answer.
-                stale.extend(
-                    external_diff(crate, recorded[key], want.get(key, ""))
-                )
+            render = PACKED_FIELD_DIFFS.get(key)
+            if render is not None:
+                stale.extend(render(crate, recorded[key], want.get(key, "")))
                 continue
             stale.append(
                 f"{crate}: {key}: artefact says {recorded[key]!r}, "
                 f"tree says {want.get(key)!r}"
             )
+
+    # Files in the artefact directory that no crate claims. Reported, never
+    # gated: nothing reads them, so they cannot make a read unsound — but the
+    # directory is what a person browses, and a sidecar left behind by a
+    # retired layout target sits beside the live ones looking every bit as
+    # current. Scanned against EVERY spec's names rather than the requested
+    # crates, so checking one crate does not report the other three's
+    # artefacts as strays.
+    claimed = set()
+    for spec in eng.specs.values():
+        claimed.add(spec.output_name)
+        claimed.update(
+            spec.layout_sidecar_name(target)
+            for target in crate_layout_targets(eng, spec)
+        )
+    strays = sorted(
+        path.name for path in dest_dir.glob("*.ullbc") if path.name not in claimed
+    )
+    if strays:
+        print()
+        print(f"    NOTE: {len(strays)} file(s) under {dest_dir} no crate claims:")
+        for name in strays:
+            print(f"        {name}")
 
     # Exit 0 requires a positive match for every requested crate, and at least
     # one crate to have been requested. Both halves matter: an empty list has no
@@ -3003,6 +3144,42 @@ def self_test_readfiles_rooting() -> None:
         else:
             raise SystemExit("self-test FAILED: a crate-rooted read set was accepted")
     print("  read-set rooting and cross-target merge: ok")
+
+
+def self_test_artefact_tokens() -> None:
+    """Drive `artefact_token` over states a live artefact cannot be caught in.
+
+    The failure `artefacts=` exists for — a write cut short — leaves a file
+    that is neither absent nor 0 bytes, and that is the one state the artefact
+    checks around it cannot tell from a complete extraction.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "probe.ullbc"
+        path.write_bytes(b"x" * 4096)
+        whole = artefact_token(path)
+        path.write_bytes(b"x" * 4095)
+        short = artefact_token(path)
+        path.write_bytes(b"y" * 4096)
+        swapped = artefact_token(path)
+        path.unlink()
+        gone = artefact_token(path)
+    if gone != "missing":
+        raise SystemExit(
+            f"self-test FAILED: artefact_token reports {gone!r} for a file "
+            f"that is not there"
+        )
+    if len({whole, short, swapped, gone}) != 4:
+        raise SystemExit(
+            f"self-test FAILED: artefact_token does not separate {whole!r} "
+            f"(whole), {short!r} (truncated), {swapped!r} (same size, other "
+            f"bytes) and {gone!r} (absent)"
+        )
+    if describe_artefact(short) == describe_artefact(swapped):
+        raise SystemExit(
+            f"self-test FAILED: a truncated and a swapped artefact both read "
+            f"as {describe_artefact(short)!r}"
+        )
+    print("  artefact tokens separate whole/truncated/swapped/absent: ok")
 
 
 def self_test_provenance_rendering() -> None:
@@ -3395,6 +3572,9 @@ def run_cli(
         # parser and the stamp: folding the cross-target tables in, and
         # refusing names that do not resolve from the repository root.
         self_test_readfiles_rooting()
+        # Same reason, and the only cover `artefacts=` can have: every artefact
+        # this repository has stamped was written whole.
+        self_test_artefact_tokens()
         # Same reason, one artefact along: `--check` renders provenance on every
         # run and exercises neither of its conditional lines, because ordinary
         # sidecars describe steady, complete extractions.
