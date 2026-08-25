@@ -2511,6 +2511,22 @@ fn new_builtin_typeobject(
     layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
+    // `typeobject.py ensure_common_attributes` runs for every PyPy TypeDef,
+    // not only for types which spell these entries in their rawdict.  Keep
+    // the same common preparation at the single builtin construction point:
+    // every type owns a `__doc__` entry, and `ensure_hash` prevents a type
+    // defining equality from silently inheriting an unrelated hash.
+    let ns = dict_ptr as PyObjectRef;
+    unsafe {
+        if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
+        }
+        if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()
+            && pyre_object::w_dict_getitem_str(ns, "__hash__").is_none()
+        {
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__hash__", pyre_object::w_none());
+        }
+    }
     let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
     let w_metatype = match w_metatype.is_null() {
         true => w_type(),
@@ -15080,6 +15096,26 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                 }
                 function_descr_call_impl(positional, kwargs, descr)
             }),
+        );
+        // [3.14-spec] PyPy keeps slot functions as
+        // `FunctionWithFixedCode`, while CPython's `PyWrapperDescr_Type`
+        // publishes its own `__repr__` slot.  The public descriptor type is
+        // already the CPython projection; route the slot through the same
+        // exact-carrier formatter used by `space.repr` rather than duplicating
+        // its text here.
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let descr = slot_wrapper_receiver(args[0], "__repr__")?;
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                        crate::display::py_repr_wtf8(descr)?
+                    }))
+                },
+                1,
+            ),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,

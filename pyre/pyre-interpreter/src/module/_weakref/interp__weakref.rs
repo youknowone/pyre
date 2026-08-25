@@ -249,6 +249,11 @@ impl Drop for InstanceRoot {
 /// )
 /// ```
 fn init_weakref_type(ns: PyObjectRef) {
+    // [3.14-spec] PyPy `W_Weakref.typedef` supplies a descriptive string,
+    // while CPython 3.14 `_PyWeakref_RefType.tp_doc` is null.  Leave the key
+    // to `ensure_common_attributes`, which publishes the observable
+    // `ReferenceType.__dict__["__doc__"] is None` without changing PyPy's
+    // weakref payload or ownership.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,

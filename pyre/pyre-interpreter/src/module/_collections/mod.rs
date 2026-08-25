@@ -865,7 +865,14 @@ pub(crate) fn deque_repeat(
     }
 }
 
-#[crate::pyre_methods(weakrefable, unhashable)]
+// [3.14-spec] PyPy `W_Deque.typedef` owns the older constructor-oriented doc;
+// CPython 3.14 `_collectionsmodule.c` `deque_init__doc__` is the observable
+// type doc.  Keep PyPy's TypeDef owner and project only that string.
+#[crate::pyre_methods(
+    doc = "A list-like sequence optimized for data accesses near its endpoints.",
+    weakrefable,
+    unhashable
+)]
 impl W_Deque {
     // `deque_new` allocates an empty unbounded payload; the construction
     // arguments (`iterable`, `maxlen`) are consumed by `__init__`, so they

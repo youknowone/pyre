@@ -1400,8 +1400,78 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
 // Type / module registration.
 // ──────────────────────────────────────────────────────────────────────
 
+// CPython 3.14 `arraymodule.c` `arraytype_doc`.  PyPy's
+// `W_ArrayBase.typedef` leaves its TypeDef doc empty; the public 3.14 value is
+// observable through both `array.array.__doc__` and the type dictionary, so
+// only this metadata string departs from the PyPy owner/implementation shape.
+const ARRAY_TYPE_DOC: &str = concat!(
+    "array(typecode [, initializer]) -> array\n",
+    "\n",
+    "Return a new array whose items are restricted by typecode, and\n",
+    "initialized from the optional initializer value, which must be a list,\n",
+    "string or iterable over elements of the appropriate type.\n",
+    "\n",
+    "Arrays represent basic values and behave very much like lists, except\n",
+    "the type of objects stored in them is constrained. The type is specified\n",
+    "at object creation time by using a type code, which is a single character.\n",
+    "The following type codes are defined:\n",
+    "\n",
+    "    Type code   C Type             Minimum size in bytes\n",
+    "    'b'         signed integer     1\n",
+    "    'B'         unsigned integer   1\n",
+    "    'u'         Unicode character  2 (see note)\n",
+    "    'h'         signed integer     2\n",
+    "    'H'         unsigned integer   2\n",
+    "    'i'         signed integer     2\n",
+    "    'I'         unsigned integer   2\n",
+    "    'l'         signed integer     4\n",
+    "    'L'         unsigned integer   4\n",
+    "    'q'         signed integer     8 (see note)\n",
+    "    'Q'         unsigned integer   8 (see note)\n",
+    "    'f'         floating-point     4\n",
+    "    'd'         floating-point     8\n",
+    "\n",
+    "NOTE: The 'u' typecode corresponds to Python's unicode character. On\n",
+    "narrow builds this is 2-bytes on wide builds this is 4-bytes.\n",
+    "\n",
+    "NOTE: The 'q' and 'Q' type codes are only available if the platform\n",
+    "C compiler used to build Python supports 'long long', or, on Windows,\n",
+    "'__int64'.\n",
+    "\n",
+    "Methods:\n",
+    "\n",
+    "append() -- append a new item to the end of the array\n",
+    "buffer_info() -- return information giving the current memory info\n",
+    "byteswap() -- byteswap all the items of the array\n",
+    "count() -- return number of occurrences of an object\n",
+    "extend() -- extend array by appending multiple elements from an iterable\n",
+    "fromfile() -- read items from a file object\n",
+    "fromlist() -- append items from the list\n",
+    "frombytes() -- append items from the string\n",
+    "index() -- return index of first occurrence of an object\n",
+    "insert() -- insert a new item into the array at a provided position\n",
+    "pop() -- remove and return item (default last)\n",
+    "remove() -- remove first occurrence of an object\n",
+    "reverse() -- reverse the order of the items in the array\n",
+    "tofile() -- write all items to a file object\n",
+    "tolist() -- return the array converted to an ordinary list\n",
+    "tobytes() -- return the array converted to a string\n",
+    "\n",
+    "Attributes:\n",
+    "\n",
+    "typecode -- the typecode character used to create the array\n",
+    "itemsize -- the length in bytes of one array item\n",
+);
+
 /// Register all `array.array` methods/getsets into the type namespace.
 pub fn init_array_type(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new(ARRAY_TYPE_DOC),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
