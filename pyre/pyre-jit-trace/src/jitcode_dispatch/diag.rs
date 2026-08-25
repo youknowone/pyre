@@ -304,7 +304,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 73] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 74] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -350,6 +350,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 73] = [
     ("float_call",                "residual_call", "-"),
     ("str_call",                  "residual_call", "-"),
     ("builtin_divmod",            "residual_call", "-"),
+    ("set_add_method",            "residual_call", "-"),
     ("store_attr_direct",         "residual_call", "-"),
     ("store_attr_residual",       "residual_call", "store_attr_direct"),
     ("load_attr",                 "residual_call", "-"),
@@ -409,12 +410,30 @@ static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED: std::sync::atomic::AtomicU6
 static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Set by [`spec_census_enable`], for a host that has no environment to read
+/// `PYRE_FBW_SPEC_CENSUS` from.
+static SPEC_CENSUS_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the specialization census without an environment variable.
+///
+/// The wasm guest reads no environment, so the switch has to arrive as a
+/// call. It must precede the first gated dispatch:
+/// [`fbw_spec_census_enabled`] latches on first read, and a census armed
+/// after that read stays off — the same ordering contract
+/// `pyre_jit_guard_census_enable` carries.
+pub fn spec_census_enable() {
+    SPEC_CENSUS_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `PYRE_FBW_SPEC_CENSUS`: per-fold consulted/fired tallies for the
 /// hand-written trace-time specializations.  Off by default; the gated branch
 /// is the only added work on the dispatch path.
 pub(crate) fn fbw_spec_census_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some()
+            || SPEC_CENSUS_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 pub(crate) fn spec_census_record_instance_next_route_guard_keyed() {

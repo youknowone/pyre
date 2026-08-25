@@ -148,6 +148,9 @@ struct Host {
 /// read back through the `pyre_fbw_census` export, and `MAJIT_GUARD_CENSUS`'s
 /// per-guard deopt census is `PYRE_WASM_GUARD_CENSUS`, armed through
 /// `pyre_jit_guard_census_enable` and read through `pyre_jit_guard_census`.
+/// `PYRE_FBW_SPEC_CENSUS`'s per-fold tallies are `PYRE_WASM_SPEC_CENSUS`,
+/// armed through `pyre_fbw_spec_census_enable` and read through
+/// `pyre_fbw_spec_census`.
 /// `PYRE_WASM_TRACE_ENTRY_CENSUS` similarly arms the emitted-module entry
 /// census before tracing starts.
 ///
@@ -557,6 +560,16 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     if std::env::var_os("PYRE_WASM_GUARD_CENSUS").is_some()
         && let Ok(arm) =
             instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_guard_census_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    // The specialization census counts nothing until armed -- an unarmed run
+    // is meant to do no extra work on the dispatch path -- so this must
+    // precede the run rather than only the readout. `PYRE_FBW_SPEC_CENSUS` is
+    // inert here for the usual reason.
+    if std::env::var_os("PYRE_WASM_SPEC_CENSUS").is_some()
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_fbw_spec_census_enable")
     {
         arm.call(&mut store, ())?;
     }
@@ -1306,6 +1319,32 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         })();
         if let Err(err) = census_result {
             eprintln!("pyre-wasm-runner: fbw census failed: {err}");
+        }
+    }
+    // The specialization census armed before the run, printed in the shape
+    // `pyrex` prints it natively so a fold's `fired` count compares directly
+    // across backends. Without this the walker's specializations are
+    // unobservable on wasm: the arm lives in the shared walker, but "it must
+    // have fired here too" is an inference, and `check.py`'s `spec-folds`
+    // gate has nothing to read.
+    if std::env::var_os("PYRE_WASM_SPEC_CENSUS").is_some()
+        && let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_spec_census")
+    {
+        let census_result: Result<()> = (|| {
+            let packed = census.call(&mut store, ())?;
+            let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+            if clen != 0 {
+                let mut bytes = vec![0u8; clen as usize];
+                memory.read(&store, ptr as usize, &mut bytes)?;
+                dealloc.call(&mut store, (ptr, clen))?;
+                eprint!("{}", String::from_utf8_lossy(&bytes));
+            } else {
+                eprintln!("[spec-census] (census not armed)");
+            }
+            Ok(())
+        })();
+        if let Err(err) = census_result {
+            eprintln!("pyre-wasm-runner: spec census failed: {err}");
         }
     }
     // The per-guard deopt census armed before the run, printed in the shape

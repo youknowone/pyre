@@ -218,9 +218,11 @@ unset variable suppresses none. It is a measurement instrument — suppressing a
 fold is how the descent wall behind it is made to print — so it retires with
 the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
-consulted/fired tallies.
+consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
+wasm backend, where the guest reads no environment and the runner has to arm
+it through the `pyre_fbw_spec_census_enable` export instead.
 
-### §6c — Default-OFF diagnostics, censuses and probes (71): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (72): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -254,7 +256,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
-`PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`,
+`PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
 `PYRE_WASM_TRACE_ENTRY_CENSUS`.
 
 `PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`

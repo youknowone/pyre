@@ -27216,6 +27216,53 @@ fn set_op_inplace_xor(
     Ok(args[0])
 }
 
+/// `setobject.py W_BaseSetObject.descr_add`, exposed through `interp2app`.
+///
+/// This must be a named gateway wrapper, not an inline closure passed to
+/// `make_builtin_function_with_arity`: `BuiltinCode.func` is a PBC holding the
+/// generated interp2app function graphs, and only a member of that family has
+/// a jitcode. Without one, a traced `s.add(x)` declines
+/// `try_walker_inline_builtin_call` with `no jitcode for address` and is left
+/// as a generic `bh_call_fn` residual, while the `SET_ADD` opcode the same
+/// operation reaches from a set comprehension lowers to the direct `set_add`
+/// helper. Publishing the descriptor below gives the source translator the
+/// candidate graph and lets the call descend to `w_set_add_hashed_checked`,
+/// the way upstream's tracer descends through `descr_add` into
+/// `W_BaseSetObject.add`.
+pub fn __pyre_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver(args, "add", true)?;
+    crate::type_methods::arity_exact(args, "add", 1)?;
+    // `try_hash_value` may run a user `__hash__` that allocates and triggers
+    // a moving minor collection; root `self` and the element across it, then
+    // reload. Its digest keys the store, so the element is hashed once.
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args[0]);
+        let _ = pyre_object::gc_roots::pin_root(args[1]);
+        let hash = crate::builtins::try_hash_value(args[1]).map_err(|err| {
+            crate::baseobjspace::wrap_set_element_hash_error(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                err,
+            )
+        })?;
+        let set = pyre_object::gc_roots::shadow_stack_get(sp);
+        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+        pyre_object::w_set_add_hashed_checked(set, item, hash)
+            .map_err(crate::baseobjspace::map_set_update_error)?;
+    }
+    Ok(pyre_object::w_none())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_set_descr_add: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__pyre_wrap_set_descr_add)),
+        func: __pyre_wrap_set_descr_add,
+    };
+
 fn init_set_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::w_dict_setitem_str(
@@ -27266,36 +27313,7 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "add",
-            make_builtin_function_with_arity(
-                "add",
-                |args| {
-                    crate::type_methods::require_set_receiver(args, "add", true)?;
-                    crate::type_methods::arity_exact(args, "add", 1)?;
-                    // `try_hash_value` may run a user `__hash__` that
-                    // allocates and triggers a moving minor collection;
-                    // root `self` and the element across it, then reload.
-                    // Its digest keys the store, so the element is hashed
-                    // once.
-                    unsafe {
-                        let _roots = pyre_object::gc_roots::push_roots();
-                        let sp = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(args[0]);
-                        let _ = pyre_object::gc_roots::pin_root(args[1]);
-                        let hash = crate::builtins::try_hash_value(args[1]).map_err(|err| {
-                            crate::baseobjspace::wrap_set_element_hash_error(
-                                pyre_object::gc_roots::shadow_stack_get(sp + 1),
-                                err,
-                            )
-                        })?;
-                        let set = pyre_object::gc_roots::shadow_stack_get(sp);
-                        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                        pyre_object::w_set_add_hashed_checked(set, item, hash)
-                            .map_err(crate::baseobjspace::map_set_update_error)?;
-                    }
-                    Ok(pyre_object::w_none())
-                },
-                2,
-            ),
+            make_builtin_function_with_arity("add", __pyre_wrap_set_descr_add, 2),
         )
     };
     unsafe {

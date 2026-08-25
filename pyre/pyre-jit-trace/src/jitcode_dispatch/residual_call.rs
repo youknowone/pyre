@@ -2618,6 +2618,20 @@ pub(crate) fn last_declined_symbolic_site()
     DECLINED_SYMBOLIC_SITE.with(|c| c.get())
 }
 
+/// Helper kinds whose residual mutates live heap while RETURNING a value, so
+/// the `Void`-result write proxy the same discriminator opens with cannot see
+/// them.  A kind missing from here is a store the executed-effect odometer does
+/// not count, and a nested abort behind it rewinds and runs it twice.
+pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::PyreHelperKind) -> bool {
+    matches!(
+        helper,
+        majit_ir::PyreHelperKind::StoreSubscr
+            | majit_ir::PyreHelperKind::SetCurrentException
+            | majit_ir::PyreHelperKind::StoreDeref
+            | majit_ir::PyreHelperKind::SetAddMethod
+    )
+}
+
 pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
@@ -3275,12 +3289,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || observed_exact_int_index;
     let writes_live_heap = call_descr.result_type() == majit_ir::Type::Void
         || (helper == majit_ir::PyreHelperKind::CallFn && !replay_safe_tuple_from_list)
-        || matches!(
-            helper,
-            majit_ir::PyreHelperKind::StoreSubscr
-                | majit_ir::PyreHelperKind::SetCurrentException
-                | majit_ir::PyreHelperKind::StoreDeref
-        );
+        || helper_kind_writes_live_heap(helper);
     // Inside an inline sub-walk, decline before any residual that is not
     // provably side-effect-free.  Ref-result getters/dunders/user `__next__`
     // can mutate live heap through user frames while `writes_live_heap` is
@@ -5511,7 +5520,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             pc: op.pc,
             descr_index,
         })?;
-    let descr_key = descr.index();
     // Void shape `_r_v/iRd` (`pyjitpl.py opimpl_residual_call_r_v =
     // _opimpl_residual_call1`) has no trailing `>X` dst byte. The
     // result OpRef is discarded by `write_residual_call_result_to_dst`'s
@@ -6563,6 +6571,50 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+
+    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
+    // the direct `set_add` store the SET_ADD accumulator opcode records
+    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
+    // fold — the call is still a MayForce residual, still guarded and still
+    // concrete-executed by the shared tail below, so the force/exception
+    // guards, the heapcache invalidation and the `None` writeback are the ones
+    // the generic path already emits.  A decline leaves every binding
+    // untouched.
+    //
+    // The substituted descr carries `PyreHelperKind::SetAddMethod` for one
+    // reason: `writes_live_heap` below reads the helper tag and the result
+    // type, and the generic call it replaces arrived tagged `CallFn`.  An
+    // untagged `MOST_GENERAL` descr with a `Ref` result matches neither, so the
+    // substitution would quietly stop bumping the executed-effect odometer and
+    // stop setting `body_effect_candidate` -- and a nested walk that aborted
+    // behind a completed insert would rewind and run it again.  The set table
+    // survives that (adding the same element twice is one insert), but the
+    // element's `__hash__` need not be Python: a cpyext `tp_hash` runs native
+    // code, moves no frame-entry odometer, and can do anything.  Keeping the
+    // marker is what makes the substitution invisible to the rollback rules
+    // rather than merely survivable by them.
+    let set_add_subst = if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
+    {
+        spec_gate("set_add_method", || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args)
+        })?
+    } else {
+        None
+    };
+    let (funcptr, descr, allboxes) = match set_add_subst {
+        Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),
+        None => (funcptr, descr, allboxes),
+    };
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+    let descr_key = descr.index();
+    let ei = call_descr.get_extra_info();
 
     // pyjitpl.py forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`

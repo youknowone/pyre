@@ -12813,6 +12813,173 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// The substituted residual [`try_walker_specialize_set_add_method`] hands
+/// back: the funcbox, the minted `(Ref, Ref) -> Ref` MayForce call descr, and
+/// the `[funcbox, receiver, value]` arglist.  The generic residual path
+/// records and executes it exactly as it would the call it replaces, so the
+/// force/exception guards, the heapcache invalidation and the result
+/// writeback all stay where they are.
+pub(crate) struct SetAddDirectResidual {
+    pub(crate) funcptr: OpRef,
+    pub(crate) descr: DescrRef,
+    pub(crate) allboxes: Vec<OpRef>,
+}
+
+/// `s.add(x)`: record the direct `set_add` residual the SET_ADD accumulator
+/// opcode records, in place of the generic `bh_call_fn` dispatch the
+/// bound-method spelling otherwise leaves behind.
+///
+/// `pyopcode.py SET_ADD` is `space.call_method(w_set, 'add', w_value)`, so the
+/// two spellings name one operation.  The codewriter lowers the opcode to a
+/// `set_add` residual (`bh_set_add_fn`), while the method call reaches the
+/// same store through `bh_call_fn`, which re-reads the bound method's
+/// function, rejects keywords and rebuilds the argument vector on every
+/// iteration.  This arm pins the callable to the `set.add` builtin and the
+/// receiver to an exact `set`, then hands `(receiver, value)` to
+/// [`pyre_interpreter::runtime_ops::jit_set_add_method`] — the same
+/// `set_add_value` store, entered directly.  Measured on a 3M-iteration
+/// `s.add(i & 3)` loop, that is the whole difference between the method-call
+/// form and the comprehension: 0.220s -> 0.130s against `list.append`'s
+/// 0.040s.
+///
+/// The insert stays a MayForce residual, and deliberately so: `set_add_value`
+/// hashes the element, which can run a user `__hash__`.  That is the other
+/// half of the gap against `list.append` (`GuardNotForced`, which even the
+/// dispatch-free comprehension carries), and this arm does not claim it.
+///
+/// Recognition declines before emitting IR, and what it admits is deliberately
+/// the builtin's own predicate: `require_set_receiver` is `is_set`, an
+/// `ob_type == &SET_TYPE` layout test, so a `set` subclass that inherits `add`
+/// passes both it and the class guard below and is substituted — the builtin
+/// would have run this identical body.  A subclass that OVERRIDES `add` is
+/// excluded instead by the `GuardValue` pinning the bound function, and a
+/// frozenset receiver by the layout guard, which matters because
+/// [`pyre_interpreter::opcode_ops::set_add_value`] itself accepts
+/// `is_set_or_frozenset` and would mutate one.  Anything else falls through to
+/// the generic residual, which still runs the builtin's receiver and arity
+/// checks.
+pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+) -> Result<Option<SetAddDirectResidual>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
+        return Ok(None);
+    }
+
+    // Recognition: the callable must be the bound builtin `set.add`, over the
+    // receiver `require_set_receiver` accepts.  `is_set` is that predicate
+    // verbatim, and the class guard below is emitted in the same spelling, so
+    // recognition and guard admit the same set of receivers.  It excludes a
+    // frozenset, which `set_add_value` would otherwise mutate.
+    let inner_func = unsafe {
+        if !pyre_object::function::is_method(callable) {
+            return Ok(None);
+        }
+        let inner_func = pyre_object::function::w_method_get_func(callable);
+        let inner_self = pyre_object::function::w_method_get_self(callable);
+        if inner_func.is_null() || !pyre_object::setobject::is_set(inner_self) {
+            return Ok(None);
+        }
+        let set_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+        if pyre_interpreter::lookup_in_type(set_type, "add") != Some(inner_func) {
+            return Ok(None);
+        }
+        inner_func
+    };
+
+    // ── tentative commit ──
+    // Pin the callable to `set.add`: guard_class METHOD + guard_value on the
+    // stable function slot, both resuming at the call site so a deopt
+    // re-executes the call generically.
+    let callable_op = r_args[0];
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
+        let type_const = ctx.trace_ctx.const_int(method_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(callable_op, method_type_addr);
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, func_const);
+
+    // The receiver the substituted call takes is the bound method's `w_self`.
+    let self_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    );
+    let set_type_addr = &pyre_object::setobject::SET_TYPE as *const _ as i64;
+    if !self_ref.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(self_ref) {
+        let type_const = ctx.trace_ctx.const_int(set_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[self_ref, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(self_ref, set_type_addr);
+
+    let funcptr = ctx
+        .trace_ctx
+        .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
+    Ok(Some(SetAddDirectResidual {
+        funcptr,
+        descr: set_add_method_descr(),
+        allboxes: vec![funcptr, self_ref, r_args[2]],
+    }))
+}
+
+/// The descr the `s.add(x)` substitution installs: `(Ref, Ref) -> Ref`,
+/// `MOST_GENERAL`, tagged [`majit_ir::PyreHelperKind::SetAddMethod`].
+///
+/// The EI `bind(..., CallFlavor::MayForce)` gives the SET_ADD residual this one
+/// stands in for: `EffectInfo::MOST_GENERAL`, not the analyzer-empty forcing
+/// shape.  Hashing the element runs arbitrary Python, so no write set was ever
+/// computed for it and an empty one would assert something false
+/// (`effect_info_for_call_flavor`).
+///
+/// `SetAddMethod` on top of it: the call inserts into the live set and returns
+/// `None`, so the `Void`-result write proxy in `writes_live_heap` misses it and
+/// the helper tag is all that discriminator has left to read.  The generic
+/// `bh_call_fn` this stands in for was counted through its own `CallFn` tag;
+/// dropping to an untagged descr would take a completed insert out of the
+/// executed-effect odometer, which is what a nested abort consults before
+/// rewinding.  Built here rather than inline so that invariant is testable.
+pub(crate) fn set_add_method_descr() -> DescrRef {
+    majit_metainterp::make_call_descr_with_effect(
+        &[Type::Ref, Type::Ref],
+        Type::Ref,
+        majit_ir::EffectInfo {
+            pyre_helper: majit_ir::PyreHelperKind::SetAddMethod,
+            ..default_effect_info()
+        },
+    )
+}
+
 /// Shared recognition for the #171 orthodox list-append fold: the receiver
 /// must be a list with spare capacity whose storage strategy matches the
 /// value's strict type predicate (Integer / Object / Float).  Returns the

@@ -2033,15 +2033,21 @@ def synth_spec_folds(path):
 SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
 
 
-def spec_fold_census(binary, path, timeout_s):
+def spec_fold_census(binary, path, timeout_s, wasm=False):
     """`({label: fired}, returncode)` for every fold the run registered.
 
     The binary owns the label set, so a declared name absent from this map is
     a typo rather than a fold that stayed quiet, and the caller reports the
     two differently.
+
+    The wasm guest reads no environment, so `PYRE_FBW_SPEC_CENSUS` cannot
+    reach it; `pyre-wasm-runner` arms the same census through the
+    `pyre_fbw_spec_census_enable` export and prints the identical
+    `[spec-census]` lines, so one parser serves both. Setting the name the
+    other backend ignores would only earn the runner's inert-knob warning.
     """
     env = pyre_env()
-    env["PYRE_FBW_SPEC_CENSUS"] = "1"
+    env["PYRE_WASM_SPEC_CENSUS" if wasm else "PYRE_FBW_SPEC_CENSUS"] = "1"
     _, _, code, err = run_timed([binary, path], timeout_s=timeout_s, env=env)
     if code != 0:
         return None, code
@@ -2525,6 +2531,47 @@ def require_fresh_artefacts(artefacts, reason, remedy):
             continue
         print(f"ERROR: {reason}, but {artefact}\n       {fault}\n       {remedy}")
         sys.exit(1)
+
+
+def require_fresh_llbc():
+    """Refuse to measure when `build/llbc/` no longer matches the tree.
+
+    Field offsets are read out of those artefacts, so one that predates an edit
+    names the wrong bytes — and a miscompiled field access returns a NUMBER
+    rather than an error, which makes an unsound run indistinguishable from a
+    real one. `pyre-jit-trace`'s `build.rs` refuses on exactly that, but it can
+    only refuse while a build is running. `--no-build` is the path where
+    nothing else asks, and it is the path a moving tree lands in: a branch that
+    moves after the binaries were built leaves them measurable and the offsets
+    they read stale, with nothing in the output saying so.
+
+    The artefact stamps `require_fresh_artefacts` reads answer a different
+    question — whether *this script* produced the binary from these sources —
+    and an artefact built by a bare `cargo build` carries no stamp at all, so
+    that gate notes and continues. This one does not depend on who built what:
+    it asks the extractor whether what is on disk describes the tree that is on
+    disk.
+    """
+    script = Path(__file__).resolve().parent / "scripts" / "extract-llbc.py"
+    if not script.is_file():
+        return
+    proc = subprocess.run(
+        [sys.executable, str(script), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return
+    print(red("LLBC artefacts under build/llbc/ are STALE."))
+    for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
+        if line.startswith("  ") and ": artefact says" in line:
+            print(line)
+    print("Field offsets come from them, so a run on this tree would measure "
+          "the wrong bytes.")
+    print("Re-extract, then re-run this script:")
+    print("    python3 pyre/scripts/extract-llbc.py "
+          "majit-rlib pyre-object pyre-interpreter pyre-jit")
+    sys.exit(1)
 
 
 # Relative tolerance for wasm float outputs ONLY (see `wasm_outputs_match`).
@@ -4191,9 +4238,16 @@ class Check:
         """True if every fold the fixture declares fired; else record and report.
 
         The census reads the same on every backend that shares the trace
-        walker, so this runs once on a native backend rather than per backend.
-        A wasm-only run has no walker to census and says so instead of passing
-        quietly, which would make the gate vacuous exactly where it is not run.
+        walker, so this runs once rather than per backend, preferring a native
+        one: it needs no export lookup and its stderr carries no runner
+        chatter. A wasm-only run reads the census back through the guest's
+        `pyre_fbw_spec_census` export instead of skipping, which would leave
+        the gate vacuous exactly where nothing else observes the walker.
+
+        Because the backend is chosen here rather than by the caller, *timeout*
+        is the fixture's own unscaled budget: the scale belongs to a backend,
+        and which one that is is not known until the line above. A caller that
+        hands over its own already-scaled figure squares the scale.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
@@ -4201,9 +4255,16 @@ class Check:
             (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
         )
         if backend is None:
-            print(dim("skip (no native backend enabled)"))
-            return True
-        census, code = spec_fold_census(default_binary(backend), path, timeout)
+            if not self.enabled("wasm"):
+                print(dim("skip (no backend enabled)"))
+                return True
+            backend = "wasm"
+        census, code = spec_fold_census(
+            self._pyre(backend),
+            path,
+            scaled_timeout(timeout, self._timeout_scale(backend)),
+            wasm=backend == "wasm",
+        )
         if census is None:
             detail = f"spec-folds census run failed (exit {code})"
             print(f"{red('FAIL')}  {detail}")
@@ -4309,7 +4370,7 @@ class Check:
             return
 
         if spec_folds and not self._check_spec_folds(
-            name, path, spec_folds, effective_timeout, t_cpython, t_pypy,
+            name, path, spec_folds, timeout, t_cpython, t_pypy,
         ):
             return
 
@@ -4708,6 +4769,28 @@ def main():
     chk = Check(args)
 
     backends = args.backends
+
+    # Once per run, before any backend is measured: the check is over the tree,
+    # not over a backend.
+    #
+    # The offsets in `build/llbc/` describe an artefact only if that artefact
+    # was built from them, so the question is per leg and it is about the thing
+    # the leg *executes*. For a native backend that is the binary, and a
+    # positional one names a binary built somewhere else — the reason
+    # `require_fresh_artefacts` skips its stamp on the same argument. For wasm
+    # it is the module, not the binary: `pyre-wasm-runner` has no build.rs and
+    # no pyre dependency, so the host carries no generated offset and an
+    # external one changes nothing, while `PYRE_WASM_MODULE` can point the run
+    # at a module built elsewhere. A module that does not exist answers
+    # `same_file` False and is left to the existence check below, which says
+    # far more about it than a stale-LLBC message would.
+    def leg_reads_local_llbc(backend):
+        if backend == "wasm":
+            return same_file(effective_wasm_module(), WASM_MODULE_PATH)
+        return not args.pyre_path
+
+    if args.no_build and any(leg_reads_local_llbc(b) for b in backends):
+        require_fresh_llbc()
 
     for backend in backends:
         if not args.no_build:

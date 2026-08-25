@@ -12,6 +12,285 @@ fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     assert!(!session.claim_abort_coordinate(false));
 }
 
+/// One `residual_call_r_i/iRd>i` with an empty argument varlist, whose funcbox
+/// operand names the Int-bank slot `funcbox`.
+fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("`residual_call_r_i/iRd>i` must be in insns table");
+    vec![byte, funcbox, 0, 0, 0, 0]
+}
+
+fn goto_if_not(cond: u8, target: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not/iL")
+        .expect("`goto_if_not/iL` must be in insns table");
+    vec![byte, cond, target as u8, (target >> 8) as u8]
+}
+
+/// One `inline_call_r_v/dR` with an empty argument varlist, naming descriptor
+/// `descr`.  The callee is whatever the `callee_summary` closure answers for
+/// that index, which is how a callee's verdict is stated without a jitcode
+/// table.
+fn inline_call_with_descr(descr: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("inline_call_r_v/dR")
+        .expect("`inline_call_r_v/dR` must be in insns table");
+    vec![byte, descr as u8, (descr >> 8) as u8, 0]
+}
+
+fn void_return() -> Vec<u8> {
+    vec![
+        *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table"),
+    ]
+}
+
+/// The generated `__pyre_wrap_*` gateways all put their un-lowerable call — the
+/// `#[dont_look_inside]` arity-error formatter — on the arm the argument-count
+/// check rejects into.  The walk is execution-driven, so a call with the right
+/// count never steps there; declining the wrapper for it refuses a body the
+/// walk would have recorded.  The blocker is still reported, on the leg that
+/// says a rewind covers it.
+#[test]
+fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = goto_if_not(0, 11);
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    code.extend(void_return());
+    assert_eq!(code.len(), 12, "the reject arm ends at the second return");
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(
+        summary.blocker_after_effect, None,
+        "nothing ran before the blocker, so the descent rolls back"
+    );
+    assert!(!summary.may_execute_effect);
+}
+
+/// The same blocker behind an executed residual call is a decline: that call
+/// applied an effect the rollback cannot undo, so an abort there would re-run
+/// the Python call and apply it twice.
+#[test]
+fn a_blocker_behind_an_executed_call_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(!majit_translate::codewriter::call::is_symbolic_fnaddr(real));
+
+    let mut code = residual_call_with_funcbox(1);
+    code.extend(goto_if_not(0, 17));
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    code.extend(void_return());
+    assert_eq!(code.len(), 18);
+
+    let summary =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "the blocker belongs to one leg, and recording it on both would let a \
+         decline read as a rewind"
+    );
+    assert!(summary.may_execute_effect);
+    assert!(!summary.body_not_walked);
+}
+
+/// A callee's blocker is judged by what has run in the caller, not by what had
+/// run in the callee: the same body reached with an effect behind it holds a
+/// blocker no rollback covers.
+#[test]
+fn a_callees_rewindable_blocker_is_not_rewindable_behind_an_effect() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let callee = majit_translate::codewriter::jitcode::DescentBlockerSummary {
+        blocker_effect_free: Some(symbolic),
+        ..Default::default()
+    };
+
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+    let clean = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(clean.blocker_effect_free, Some(symbolic));
+    assert_eq!(
+        clean.blocker_after_effect, None,
+        "nothing ran before the descent entered the callee"
+    );
+
+    let mut code = residual_call_with_funcbox(0);
+    code.extend(inline_call_with_descr(7));
+    code.extend(void_return());
+    let behind = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(behind.blocker_after_effect, Some(symbolic));
+    assert_eq!(behind.blocker_effect_free, None);
+}
+
+fn raise_r(reg: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    vec![byte, reg]
+}
+
+/// `live/` carries no argcodes but dispatch skips `liveness::OFFSET_SIZE`
+/// bytes of offset, so the encoding is one opcode plus that many zeroes.
+fn live() -> Vec<u8> {
+    let mut v = vec![
+        *insns_opname_to_byte()
+            .get("live/")
+            .expect("`live/` must be in insns table"),
+    ];
+    v.extend(std::iter::repeat_n(
+        0u8,
+        majit_translate::liveness::OFFSET_SIZE,
+    ));
+    v
+}
+
+fn catch_exception(target: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("catch_exception/L")
+        .expect("`catch_exception/L` must be in insns table");
+    vec![byte, target as u8, (target >> 8) as u8]
+}
+
+/// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
+/// skips the `live/` and takes the `catch_exception/L` behind it, so the handler
+/// runs forward over bytes no fallthrough reaches — treating the raise as
+/// terminal would leave that whole region, and any blocker in it, unwalked.
+#[test]
+fn a_raise_caught_in_this_frame_reaches_its_handler() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = raise_r(0);
+    code.extend(live());
+    let handler = (code.len() + 3 + 1) as u16;
+    code.extend(catch_exception(handler));
+    code.extend(void_return());
+    assert_eq!(code.len(), handler as usize, "the handler follows the exit");
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(
+        summary.blocker_after_effect,
+        Some(symbolic),
+        "the handler is entered with the join of every state in the region, so \
+         its blocker is one no rollback covers"
+    );
+    assert!(
+        !summary.may_execute_effect,
+        "the handler's seeded effect classifies the blocker behind it; the body \
+         itself still executes none"
+    );
+    assert!(!summary.body_not_walked);
+}
+
+/// The join a handler is entered with makes its registers unknown, but not the
+/// constant slots behind them: nothing writes those, so a funcbox read straight
+/// out of one holds at every point the handler can be entered from.  Blanking
+/// the whole Int bank instead would leave every blocker in every handler
+/// unnamed, which reads as a body that has none.
+#[test]
+fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let handler = 3 + 1;
+    let mut code = catch_exception(handler);
+    code.extend(void_return());
+    assert_eq!(
+        code.len(),
+        handler as usize,
+        "the handler follows the fallthrough"
+    );
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "the handler runs behind whatever raised into it"
+    );
+    assert!(!summary.body_not_walked);
+}
+
+/// An `inline_call` whose descr does not resolve to a JitCode is the same
+/// condition one level down: a callee the scan holds nothing about.  Falling
+/// through would read it as executing no effect and holding no blocker — the
+/// most permissive answer there is, reached by not looking — and would let the
+/// blocker behind it be classified as effect-free, which says a rewind covers
+/// it.
+#[test]
+fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = inline_call_with_descr(7);
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert!(summary.body_not_walked);
+    assert_eq!(
+        summary.blocker_effect_free, None,
+        "an unresolved callee may have executed an effect, so nothing behind \
+         it is rewindable"
+    );
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(summary.may_execute_effect);
+}
+
+/// A body the decoder cannot read to the end declines on that alone.  The
+/// instruction starts would otherwise name a prefix, and the `push!` gate drops
+/// targets that are not starts — so every path out of the undecodable byte
+/// would be missing from the graph, and a path the scan never walks reports no
+/// blocker.  Naming none is what an all-`None` summary already means, hence the
+/// separate flag.
+#[test]
+fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = residual_call_with_funcbox(0);
+    let goto = goto_if_not(0, 5);
+    code.extend(&goto[..goto.len() - 1]);
+    assert_eq!(code.len(), 9, "the branch is one byte short of its label");
+
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert!(summary.body_not_walked);
+    assert!(summary.may_execute_effect);
+    assert_eq!(summary.blocker_effect_free, None);
+    assert_eq!(
+        summary.blocker_after_effect, None,
+        "the decline is the unread region, so there is no blocker to name"
+    );
+}
+
+/// The `s.add(x)` substitution replaces a residual the executed-effect odometer
+/// counts (`CallFn`) with one it judges by descr shape alone.  A `Ref` result
+/// clears the `Void` write proxy, so the helper tag is the only thing left
+/// saying an insert happened — and the element's `__hash__` cannot stand in for
+/// it, since a cpyext `tp_hash` runs native code and moves no frame-entry
+/// odometer.  Drop the tag and a nested abort rewinds past a completed insert.
+#[test]
+fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
+    let descr = super::specialize::set_add_method_descr();
+    let call_descr = descr
+        .as_call_descr()
+        .expect("the substitution installs a call descr");
+    assert_eq!(
+        call_descr.result_type(),
+        Type::Ref,
+        "`set.add` returns None, so the Void write proxy cannot see this store"
+    );
+    assert!(
+        super::residual_call::helper_kind_writes_live_heap(call_descr.get_extra_info().pyre_helper),
+        "an untagged descr takes the insert out of the executed-effect odometer"
+    );
+}
+
 #[test]
 fn specialised_pair_unpack_recognises_the_float_layout() {
     use super::specialize::{SpecialisedPairKind, specialised_pair_kind};

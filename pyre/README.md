@@ -41,7 +41,7 @@ Reading the table: the printed times are user CPU time — `check.py`'s `run_tim
 
 On execution-only time the default backend is at 2.0x of PyPy or better on eight of the ten, and within 2.5x on all ten. `float_loop` beats PyPy on all three backends, and `int_loop` and `raise_catch` reach parity on dynasm. `fannkuch` is the widest gap. Cranelift trails dynasm on eight of the ten — widest on `fannkuch` (~2.0x) and `raise_catch` (~1.9x) — and matches it only on `fib_loop` and `inline_helper`. Where CPython was measured, pyre runs `fannkuch` ~3.4x and `fib_recursive` ~2.9x faster than it, and `fib_loop` ~1.2x.
 
-Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--no-build` to skip the Cargo build phase.
+Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--no-build` to skip the Cargo build phase; it still checks that `build/llbc/` describes the current tree, because the field offsets the benchmarks measure come from there and a build is what normally asks.
 
 ## Installation
 
