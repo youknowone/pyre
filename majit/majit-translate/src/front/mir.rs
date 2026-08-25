@@ -12598,6 +12598,10 @@ impl<'a> Lowering<'a> {
         result_var: &Variable,
     ) -> Option<crate::front::bool_then::BoolThenSite> {
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         // Closure env ADT → its `name_path` is the `call_once` inherent
         // method owner (`resolve_impl_owner_adt_def_id_free` records the
         // same spelling for the closure's transparent `call_once` body).
@@ -12610,6 +12614,8 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -12625,12 +12631,18 @@ impl<'a> Lowering<'a> {
         result_var: &Variable,
     ) -> Option<crate::front::bool_then::BoolThenSite> {
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner: None,
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -28417,6 +28429,87 @@ mod tests {
         assert_eq!(
             residual, 0,
             "fixed throw arities must not leave an array index"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn clear_references_niche_bool_then_has_no_option_aggregate() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "clear_references").expect("lower clear_references");
+        let option_aggregate_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } => name == "Option<*mut PyObject>",
+                OpKind::FieldWrite { field, .. } => {
+                    field.name == "__discriminant"
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.contains("Option<*mut PyObject>"))
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            option_aggregate_ops, 0,
+            "bool::then producing Option<PyObjectRef> must use RPython's nullable-pointer \
+             representation (Some(ptr)=ptr, None=null), not an Option aggregate"
+        );
+        let is_pyobject_narrow = |op: &crate::model::SpaceOperation| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["__pyre_cast_instance", "PyObject"]
+            )
+        };
+        let join = graph.blocks.iter().find_map(|block| {
+            let has_call_once = block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "call_once"
+                )
+            });
+            (has_call_once && block.operations.iter().any(is_pyobject_narrow))
+                .then(|| block.exits.first().map(|link| link.target))
+                .flatten()
+        });
+        assert!(
+            join.is_some(),
+            "the niche Some payload must retain PyObject/W_Root class identity across call_once"
+        );
+        let narrowed_none = graph.blocks.iter().any(|block| {
+            block.exits.first().map(|link| link.target) == join
+                && block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["core", "ptr", "null_mut"]
+                    )
+                })
+                && block.operations.iter().any(is_pyobject_narrow)
+        });
+        assert!(
+            narrowed_none,
+            "the niche None arm must be the same nullable PyObject/W_Root repr as the Some arm"
         );
     }
 

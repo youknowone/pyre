@@ -364,6 +364,10 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
 /// registers no finalizer here, so there is nothing for it to withhold.  `_io`
 /// wants the other guard and carries its own
 /// (`_io::maybe_unregister_rpython_finalizer_io`).
+// `rgc.py:743-750` puts `@jit.dont_look_inside` on this exact helper.  Its
+// collector hook is runtime state, so the translated trace must retain one
+// residual call instead of reading the process-global hook while translating.
+#[majit_macros::dont_look_inside]
 pub fn may_ignore_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_ignore_finalizer(obj);
 }

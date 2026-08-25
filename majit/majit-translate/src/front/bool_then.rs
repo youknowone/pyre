@@ -83,6 +83,16 @@ pub(crate) struct BoolThenSite {
     /// `call_once` result kind (`then`) or the captured value kind
     /// (`then_some`), and the `Some::__pos_0` field kind.
     pub payload_ty: ValueType,
+    /// True when the result is a one-word nullable pointer.  RPython's
+    /// `SomePtr(can_be_None=True)` carries no Option aggregate: `Some(x)` is
+    /// `x` itself and `None` is null.  The consumer folds use this same flag,
+    /// so the producer must choose the identical representation.
+    pub niche: bool,
+    /// Concrete pointee class carried by a niche pointer payload.  Rust's raw
+    /// pointer spelling otherwise erases to a classless `Ref`; RPython keeps
+    /// the corresponding `SomeInstance(W_Root-subclass)` across the closure
+    /// call, so restore that annotation before forwarding `Some(payload)`.
+    pub payload_narrow_root: Option<String>,
 }
 
 /// Rewrite every recorded `bool::then` call site into the short-circuit
@@ -227,13 +237,23 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
         }
         None => env_in_then,
     };
-    let some_var = emit_option_variant(
+    let payload = crate::front::option_map_or::emit_narrow(
         graph,
         then_bb,
-        &site.option_owner,
-        1,
-        Some((&site.some_owner, payload, site.payload_ty.clone())),
+        payload,
+        &site.payload_narrow_root,
     );
+    let some_var = if site.niche {
+        payload
+    } else {
+        emit_option_variant(
+            graph,
+            then_bb,
+            &site.option_owner,
+            1,
+            Some((&site.some_owner, payload, site.payload_ty.clone())),
+        )
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &opt_val,
@@ -245,7 +265,12 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     close_goto_mixed(graph, then_bb, b_target, then_link_args);
 
     // `else_bb`: opt = None.
-    let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+    let none_var = if site.niche {
+        let null = graph.push_null_mut_ptr(else_bb);
+        crate::front::option_map_or::emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+    } else {
+        emit_option_variant(graph, else_bb, &site.option_owner, 0, None)
+    };
     let else_link_args = reproduce_exit_args(
         &saved_exit,
         &opt_val,

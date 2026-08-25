@@ -1781,6 +1781,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_collect_oldgen",
         pyre_object::gc_hook::try_gc_collect_oldgen,
     );
+    // `rgc.may_ignore_finalizer` is itself `@jit.dont_look_inside`; publish
+    // the matching interpreter helper so its opaque graph becomes a real
+    // residual call rather than a symbolic placeholder.
+    pa1(
+        &mut entries,
+        "pyre_interpreter::executioncontext::may_ignore_finalizer",
+        "pyre_interpreter::may_ignore_finalizer",
+        crate::executioncontext::may_ignore_finalizer,
+    );
     pa0(
         &mut entries,
         "pyre_object::object_array::itemsblock_gc_enabled",
@@ -4589,6 +4598,21 @@ mod tests {
         let safepoint = pyre_object::gc_interp::safepoint as *const () as usize as i64;
         assert_eq!(bindings["pyre_object::gc_interp::safepoint"], safepoint);
         assert_eq!(bindings["pyre_object::safepoint"], safepoint);
+    }
+
+    /// `rgc.py:743-750` keeps `may_ignore_finalizer` opaque.  Both names the
+    /// LLBC call-path resolver can produce must therefore bind the live helper
+    /// address or the residual call would carry an unpatchable symbolic hash.
+    #[test]
+    fn jit_trace_fnaddrs_covers_may_ignore_finalizer() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::executioncontext::may_ignore_finalizer as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::executioncontext::may_ignore_finalizer"],
+            expected
+        );
+        assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
