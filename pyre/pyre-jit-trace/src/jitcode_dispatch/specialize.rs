@@ -7195,7 +7195,7 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
         &[ConcreteValue::Int(raw_key)],
         &[seq_op],
         &[ConcreteValue::Ref(seq_obj)],
-        );
+    );
     let (walk_outcome, _walk_start) = match walk {
         Ok(pair) => pair,
         // The body reached a helper this build did not lower.  Nothing is
