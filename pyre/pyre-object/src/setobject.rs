@@ -126,7 +126,17 @@ pub struct W_SetObject {
 pub const W_SET_GC_TYPE_ID: u32 = 30;
 
 /// GC-managed element table shared by `set` and `frozenset` bodies.
-pub type SetItemsStorage = indexmap::IndexMap<crate::dictmultiobject::ObjectKey, ()>;
+///
+/// Keyed with [`ObjectKeyBuildHasher`](crate::dictmultiobject::ObjectKeyBuildHasher),
+/// the same hasher `ObjectDictStorage` uses: `ObjectKey.hash` already *is*
+/// `space.hash_w(obj)`, so the default `RandomState` would SipHash a digest
+/// that is itself the hash. `rordereddict` feeds the cached integer straight
+/// into the table; the multiply only spreads it into hashbrown's control bits.
+pub type SetItemsStorage = indexmap::IndexMap<
+    crate::dictmultiobject::ObjectKey,
+    (),
+    crate::dictmultiobject::ObjectKeyBuildHasher,
+>;
 
 /// Remove the entry at `index` in O(1).
 ///
@@ -280,13 +290,13 @@ fn set_write_barrier(obj: PyObjectRef) {
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_dict_new` twin: the body builds the host `SetItemsStorage`
 /// (`IndexMap<ObjectKey, ()>`) box before the object is allocated, so the
-/// foreign `IndexMap::new` construction is an unported host container op.
+/// foreign `IndexMap::default` construction is an unported host container op.
 /// Tracing into it carries that op into the caller; residualising the whole
 /// constructor models it by signature — a plain `PyObjectRef` GCREF.
 #[majit_macros::dont_look_inside]
 pub fn w_set_new() -> PyObjectRef {
     let items =
-        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
     let header = PyObject {
         ob_type: &SET_TYPE as *const PyType,
         w_class: get_instantiate(&SET_TYPE),
@@ -327,12 +337,12 @@ pub fn w_set_new() -> PyObjectRef {
 ///
 /// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
 /// into `ob_type`; see that constructor for the GC old-gen rationale.
-/// `#[dont_look_inside]` for the same `IndexMap::new` storage-box reason as
+/// `#[dont_look_inside]` for the same `IndexMap::default` storage-box reason as
 /// [`w_set_new`].
 #[majit_macros::dont_look_inside]
 pub fn w_frozenset_new() -> PyObjectRef {
     let items =
-        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
     let header = PyObject {
         ob_type: &FROZENSET_TYPE as *const PyType,
         w_class: get_instantiate(&FROZENSET_TYPE),
@@ -662,7 +672,7 @@ pub unsafe fn w_set_clear(obj: PyObjectRef) {
     let _set_guard = w_set_lock(obj);
     let s = &mut *(obj as *mut W_SetObject);
     s.items =
-        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::new(), set_items_gc_type_id());
+        crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
     s.len = 0;
     s.hash = -1;
     set_write_barrier(obj);
