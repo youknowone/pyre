@@ -1732,7 +1732,8 @@ mod tests {
         let mut reg = StructFieldRegistry::default();
         let base = vec![("__discriminant".to_string(), "i64".to_string())];
         let variant = vec![("w_obj".to_string(), "PyObjectRef".to_string())];
-        reg.fields.insert("buffer::Buffer".to_string(), base.clone());
+        reg.fields
+            .insert("buffer::Buffer".to_string(), base.clone());
         reg.fields.insert("Buffer".to_string(), base);
         reg.fields
             .insert("buffer::Buffer::Array".to_string(), variant.clone());

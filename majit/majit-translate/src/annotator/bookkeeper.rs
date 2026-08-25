@@ -4592,15 +4592,18 @@ mod tests {
         );
         bk.set_struct_fields(Rc::new(reg));
 
-        let SomeValue::List(array) = bk.project_struct_field_type(
-            "*mut pyre_object::object_array::FixedObjectArray",
-        ) else {
+        let SomeValue::List(array) =
+            bk.project_struct_field_type("*mut pyre_object::object_array::FixedObjectArray")
+        else {
             panic!("qualified FixedObjectArray pointer must project to its item list")
         };
         let SomeValue::Instance(item) = array.listdef.s_value() else {
             panic!("FixedObjectArray item must be a PyObject instance")
         };
-        assert!(item.classdef.is_some(), "PyObject item must keep its ClassDef");
+        assert!(
+            item.classdef.is_some(),
+            "PyObject item must keep its ClassDef"
+        );
     }
 
     #[test]

@@ -6159,6 +6159,40 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 let segments = self.global_segments(mir_bb, id)?;
+                // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
+                // the `None` stored in PyPy's `locals_cells_stack_w` slots
+                // (`pyframe.py`: `[None] * size`, plus the pop/drop clears).
+                // Preserve the high-level W_Root boundary: construct the
+                // repr-adaptive nullable pointer, then narrow it to the
+                // declared `PyObjectRef` pointee class.  Leaving the computed
+                // const to `const_eval_global` produces a bare nullable
+                // `SomeInstance(None)`; unioning that into the fixed object
+                // array erases its `PyObject` external item repr, whereas
+                // upstream's `SomeNone ∪ SomeInstance(W_Root)` keeps W_Root
+                // and only sets `can_be_None`.
+                if fmt_path_ends_with(&segments, &["pyobject", "PY_NULL"])
+                    && tyref_class_root(&place_ty, self.llbc).as_deref() == Some("PyObject")
+                {
+                    let bb_id = self.block_id[mir_bb];
+                    let raw = self.graph.push_null_mut_ptr(bb_id);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "__pyre_cast_instance".to_string(),
+                                    "PyObject".to_string(),
+                                ],
+                            },
+                            args: vec![raw],
+                            result_ty: ValueType::Ref(Some("PyObject".to_string())),
+                        },
+                    });
+                    return Ok(res);
+                }
                 // A class-singleton static (`&SLICE_TYPE`, `&CEL_INT_CLASS`):
                 // narrow the raw address through
                 // `__cast_instance_intrinsic[<root>]` so the read types
@@ -27465,6 +27499,21 @@ mod tests {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let value_input_root = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Input {
+                    name, class_root, ..
+                } if name == "value" => class_root.as_deref(),
+                _ => None,
+            });
+        assert_eq!(
+            value_input_root,
+            Some("PyObject"),
+            "PyObjectRef input must retain the W_Root-equivalent class identity"
+        );
         let residual = graph
             .blocks
             .iter()
@@ -27490,6 +27539,45 @@ mod tests {
         assert!(
             array_writes >= 1,
             "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
+        );
+    }
+
+    /// PyPy's frame stack clears store `None` into a `W_Root` list.  The Rust
+    /// sentinel `PY_NULL` must therefore retain the `PyObject` class boundary
+    /// while becoming nullable; a classdef-less null would widen the shared
+    /// `FixedObjectArray` item to the erased top reference.
+    #[test]
+    #[ignore]
+    fn popvalue_py_null_narrows_to_nullable_pyobject() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::pyframe::<Impl>::popvalue_maybe_none",
+        )
+        .expect("lower PyFrame::popvalue_maybe_none");
+        let has_nullable_pyobject = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                matches!(
+                    &ops[0].kind,
+                    OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
+                ) && matches!(
+                    &ops[1].kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.as_slice()
+                        == ["__pyre_cast_instance".to_string(), "PyObject".to_string()]
+                )
+            })
+        });
+        assert!(
+            has_nullable_pyobject,
+            "PY_NULL stack clear must lower as null_mut followed by a PyObject narrow"
         );
     }
 
@@ -27773,11 +27861,9 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
-        let graph = super::lower_function(
-            &llbc,
-            "pyre_interpreter::eval::<Impl>::load_local_value",
-        )
-        .expect("lower eval::<Impl>::load_local_value");
+        let graph =
+            super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::load_local_value")
+                .expect("lower eval::<Impl>::load_local_value");
         let has_pyobject_narrow = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
                 &op.kind,
@@ -28265,12 +28351,12 @@ mod tests {
     /// to Charon and blocks the dispatcher from two-phase translation.
     #[test]
     #[ignore]
-    fn call_function_impl_result_has_no_residual_array_index() {
+    fn get_and_call_function_has_no_residual_array_index() {
         use crate::model::OpKind;
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "call_function_impl_result")
-            .expect("lower call_function_impl_result");
+        let graph = super::lower_function(&llbc, "get_and_call_function")
+            .expect("lower get_and_call_function");
         let calls_path = |want: &[&str]| -> usize {
             let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
             graph
@@ -28297,6 +28383,40 @@ mod tests {
             calls_path(&["__getslice_rangeto"]),
             0,
             "no RangeTo getslice call is planted without an immutability proof"
+        );
+    }
+
+    /// The generator throw producer validates its preserved positional count
+    /// as 1..=3.  Delegation must keep those fixed call shapes visible rather
+    /// than routing them through `<[T; 3]>::index(&args, ..argc)`.
+    #[test]
+    #[ignore]
+    fn throw_yield_from_has_no_residual_array_index() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "throw_yield_from").expect("lower throw_yield_from");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["core", "array", "<Impl>", "index"]
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "fixed throw arities must not leave an array index"
         );
     }
 

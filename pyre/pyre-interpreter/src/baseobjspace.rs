@@ -1370,7 +1370,9 @@ pub(crate) unsafe fn get_and_call_function(
     _roots.normalize(base, 3 + args_w.len());
     let w_impl = unsafe { get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2)) }?
         .unwrap_or_else(|| _roots.get(base));
-    // One `Vec` at every arity, the shape the fast path above already builds:
+    // PyPy `descroperation.py:get_and_call_function` constructs
+    // `Arguments(space, list(args_w))`. One `Vec` at every arity preserves
+    // that shape and matches the fast path above:
     // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
     // `[PY_NULL; N]` leg this replaced ended in `<[T; N]>::index(&array,
     // ..len)` — a RangeTo subslice stays an inherent-impl call where a scalar
@@ -10913,8 +10915,10 @@ unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
 /// `typeobject.py:1322` — identity anchor for the canonical
 /// `W_TypeObject.descr_getattribute` wrapper installed on `type`.
 unsafe fn is_type_getattribute_descr(w_descr: PyObjectRef) -> bool {
-    lookup_in_type_where(crate::typedef::w_type(), "__getattribute__")
-        .is_some_and(|d| std::ptr::eq(w_descr, d))
+    match lookup_in_type_where(crate::typedef::w_type(), "__getattribute__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
 }
 
 /// module.py `Module.descr_getattribute` is the default attribute slot for
@@ -10924,9 +10928,13 @@ unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
     let w_module_type =
         crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
             .map_or(PY_NULL, |p| p.as_ptr());
-    !w_module_type.is_null()
-        && lookup_in_type_where(w_module_type, "__getattribute__")
-            .is_some_and(|d| std::ptr::eq(w_descr, d))
+    if w_module_type.is_null() {
+        return false;
+    }
+    match lookup_in_type_where(w_module_type, "__getattribute__") {
+        Some(d) => std::ptr::eq(w_descr, d),
+        None => false,
+    }
 }
 
 /// Module-specialized companion of `getattribute_if_not_from_object`.
@@ -18637,8 +18645,15 @@ fn throw_yield_from(
     };
     if let Some((args, argc)) = throw_args {
         // PEP 380 delegation forwards exactly the original positional throw
-        // arguments, rather than a synthesized exception instance.
-        return crate::call::call_function_impl_result(throw, &args[..argc]);
+        // arguments, rather than a synthesized exception instance.  The
+        // producer validates `argc` as 1..=3; spell those fixed call shapes
+        // directly so translation does not detour through Rust's opaque
+        // `<[T; 3]>::index(&args, ..argc)` helper.
+        return match argc {
+            1 => crate::call::call_function_impl_result(throw, &[args[0]]),
+            2 => crate::call::call_function_impl_result(throw, &[args[0], args[1]]),
+            _ => crate::call::call_function_impl_result(throw, &args),
+        };
     }
     let w_exc = err.to_exc_object();
     let w_type = crate::typedef::r#type(w_exc).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
