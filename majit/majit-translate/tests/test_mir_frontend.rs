@@ -1434,3 +1434,69 @@ fn a_scalar_element_indexes_to_an_int_banked_array_read() {
         got.array_reads,
     );
 }
+
+/// A borrowed primitive banks by its container, not by its own type.
+///
+/// `charon-corpus` §10's three shapes each put a shared borrow of a primitive
+/// in a payload position, and all three serialize that borrow identically, so
+/// no predicate over the payload's own type separates them:
+///
+/// | shape                        | payload         | reached through            |
+/// |------------------------------|-----------------|----------------------------|
+/// | `slice_get_tag_dispatch`     | `Option<&u8>`   | `<[T]>::get` then `?`      |
+/// | `range_start_index`          | `Bound<&usize>` | `RangeBounds::start_bound` |
+/// | `borrowed_byte_fields_alias` | `&u8`           | a struct field             |
+///
+/// The first two are enum-variant payloads, reached by matching on them, so
+/// the borrow belongs to the match rather than to the program — and a sibling
+/// arm supplying the merged value by value (`Bound::Unbounded => 0`) forces
+/// one bank across the merge.  The third is a reference the program declared
+/// and stores, which `ptr::eq` compares by address, so it keeps the ref bank.
+///
+/// Each shape falls to a different wrong answer, which is why all three are
+/// asserted together: never peeling types the first `Ref`; peeling only the
+/// `?`-desugaring shells types the second `Ref`, because `Bound` is not one;
+/// peeling every borrowed primitive types the third `Unsigned`.
+#[test]
+fn a_borrowed_primitive_banks_by_its_container() {
+    use majit_translate::model::{OpKind, ValueType};
+    let llbc = load_corpus();
+
+    // `__discriminant` is the tag read the match itself needs, not a payload.
+    let payloads = |name: &str| -> Vec<(String, ValueType)> {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name != "__discriminant" => {
+                    Some((field.owner_root.clone().unwrap_or_default(), ty.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        payloads("slice_get_tag_dispatch"),
+        vec![("core::option::Option::Some".to_string(), ValueType::Unsigned)],
+        "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",
+    );
+    assert_eq!(
+        payloads("range_start_index"),
+        vec![
+            ("Bound::Included".to_string(), ValueType::Unsigned),
+            ("Bound::Excluded".to_string(), ValueType::Unsigned),
+        ],
+        "a `Bound` payload is an enum variant's too, though no `?` produces it",
+    );
+    assert_eq!(
+        payloads("borrowed_byte_fields_alias"),
+        vec![
+            ("BorrowedByte".to_string(), ValueType::Ref(None)),
+            ("BorrowedByte".to_string(), ValueType::Ref(None)),
+        ],
+        "a struct's `&u8` field is a pointer the program stores and compares",
+    );
+}

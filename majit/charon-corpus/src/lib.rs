@@ -405,3 +405,51 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
         None => 0,
     }
 }
+
+// 10. Register bank of a borrowed primitive, by container.
+//
+// Three shapes one peel decision has to answer together.  The payload's own
+// type cannot separate them: an enum variant's `&u8`, another enum's `&usize`
+// and a struct's `&u8` field all serialize as the same shared-borrow node, so
+// the decision reads the container rather than the payload.
+
+/// `<[T]>::get` hands the element back by reference, so the `?` payload is a
+/// `&u8` and the switch operand is the byte behind it.  Banking that borrow as
+/// a GC ref reaches `codewriter/flatten.rs` as a ref-kinded `SwitchInt`
+/// (`switch exitswitch must be int`).
+#[inline(never)]
+pub fn slice_get_tag_dispatch(code: &[u8], pc: usize) -> Option<i64> {
+    let tag = *code.get(pc)?;
+    Some(match tag {
+        0 => 10,
+        1 => 20,
+        _ => 30,
+    })
+}
+
+/// `RangeBounds::start_bound` yields `Bound<&usize>`, an enum no `?`
+/// desugaring produces.  `Unbounded` supplies the merged value by value while
+/// the other arms supply it through a borrow, so typing the payload as a
+/// pointer leaves sibling arms in different banks and the merge reaches
+/// `encode_regorconst_source` as a cross-bank move.
+#[inline(never)]
+pub fn range_start_index(range: core::ops::Range<usize>) -> usize {
+    use core::ops::{Bound, RangeBounds};
+    match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n + 1,
+        Bound::Unbounded => 0,
+    }
+}
+
+/// A `&u8` a struct declares and stores is a pointer the program can compare,
+/// so it keeps its own bank.  Peeling every borrowed primitive — rather than
+/// only an enum variant's — answers this one with the byte's value instead.
+pub struct BorrowedByte<'a> {
+    pub p: &'a u8,
+}
+
+#[inline(never)]
+pub fn borrowed_byte_fields_alias(a: &BorrowedByte<'_>, b: &BorrowedByte<'_>) -> bool {
+    core::ptr::eq(a.p, b.p)
+}

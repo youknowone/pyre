@@ -1434,8 +1434,8 @@ fn rewire_one_call_site(
     // value itself.
     let continue_target = continue_link.target;
     for pos in payload_positions {
-        if let Some(payload_ty) = collapse_pos0_read(graph, continue_target, pos, &name)? {
-            narrow_call_result_ty(graph, a, r, payload_ty);
+        if collapse_pos0_read(graph, continue_target, pos, &name)?.is_some() {
+            narrow_call_result_ty(graph, a, r, payload_ty.clone());
         }
     }
 
@@ -2855,6 +2855,15 @@ fn verify_break_arm_is_reraise(
 /// `checked_arith` keeps the same invariant by replacing its residual
 /// `checked_*()` call outright with an `Int`-stamped `BinOp`, and
 /// [`widen_unit_return_to_void`] is the `T = ()` case of the same rule.
+///
+/// `payload_ty` is the callee's own `Ok` type, not the kind the collapsed
+/// `__pos_0` read declared.  The two differ where the callee hands back a
+/// shared borrow of a primitive — `<[u8]>::get(..).ok_or_else(..)?` is
+/// `Result<&u8, E>` — because the variant's FIELD is a reference while the
+/// value it carries is the byte (`front::mir`
+/// `tyref_enum_payload_value_type`).  `r` is the value, so it takes the
+/// value's kind; leaving the field's would hand `codewriter/flatten.rs` a
+/// ref-kinded `SwitchInt` operand.
 fn narrow_call_result_ty(
     graph: &mut FunctionGraph,
     block: usize,
@@ -2877,11 +2886,14 @@ fn narrow_call_result_ty(
 /// `pos` collapses: the inherited value already *is* the payload.
 /// Deletes the read and renames its result to the inputarg.
 ///
-/// Returns the collapsed read's type, or `None` when the arm discarded
-/// the payload and there was no read to collapse.  The carrier inputarg
-/// carries the payload from here on, so a caller whose substituted value
-/// still declares the enclosing `Result` / `Option` type must narrow that
-/// declaration to the returned type — see [`narrow_call_result_ty`].
+/// `Some(ty)` reports the collapsed read's declared kind, `None` that the
+/// arm discarded the payload and there was no read to collapse.  The
+/// carrier inputarg carries the payload from here on, so a caller whose
+/// substituted value still declares the enclosing `Result` / `Option` type
+/// must narrow that declaration — from the CALLEE's payload type, not from
+/// `ty`: `ty` is the shell FIELD's kind, which reads a `&P` payload as a
+/// reference where the value is the primitive (see
+/// [`narrow_call_result_ty`]).
 pub(crate) fn collapse_pos0_read(
     graph: &mut FunctionGraph,
     target: crate::model::BlockId,

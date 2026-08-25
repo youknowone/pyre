@@ -5878,6 +5878,11 @@ impl<'a> Lowering<'a> {
                         &inner.kind,
                         PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
                     );
+                    // Whether this read projects an enum variant's payload,
+                    // read off the container before the base resolve
+                    // consumes `inner`.  It selects the payload projection
+                    // below.
+                    let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
@@ -5910,7 +5915,19 @@ impl<'a> Lowering<'a> {
                     // the substituted use-site type, so prefer it; keep
                     // the decl ty for the rare place shapes whose
                     // post-projection type the reader cannot resolve.
-                    let ty = match tyref_to_value_type(&place_ty, self.llbc) {
+                    //
+                    // A shell variant's payload takes the shell projection:
+                    // the `&P` a slice accessor hands back through
+                    // `Option`/`Result`/`ControlFlow` is the primitive, not
+                    // a pointer the program stores.  Every other container's
+                    // `&P` field is a reference the program declared and
+                    // keeps its own bank.
+                    let declared = if container_is_enum {
+                        tyref_enum_payload_value_type(&place_ty, self.llbc)
+                    } else {
+                        tyref_to_value_type(&place_ty, self.llbc)
+                    };
+                    let ty = match declared {
                         ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
                         resolved => resolved,
                     };
@@ -9852,7 +9869,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
             );
             let payload_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
-                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .map(|ty| tyref_enum_payload_value_type(&ty, self.llbc))
                 .unwrap_or(ValueType::Ref(None));
             self.result_exc_call_results
                 .push((result_var.clone(), suffix, payload_ty));
@@ -12251,7 +12268,10 @@ impl<'a> Lowering<'a> {
             TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
         };
         let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
-        Some(self.type_node_to_value_type(inner))
+        Some(tyref_enum_payload_value_type(
+            &TyRef::Other(inner.clone()),
+            self.llbc,
+        ))
     }
 
     /// The per-instantiation `Option` enum root for a residual-call
@@ -12351,39 +12371,6 @@ impl<'a> Lowering<'a> {
             let pointee = obj.get("Ref")?.as_array()?.get(1)?;
             return adt_node_class_root(strip_ty_wrappers(pointee, self.llbc)?, self.llbc);
         }
-    }
-
-    /// Project a raw Charon type node (a `generics.types` entry) to a
-    /// [`ValueType`], first peeling the `HashConsedValue` / `Deduplicated`
-    /// wrappers the entry may carry so [`tyref_to_value_type`]'s primitive
-    /// match sees the inline literal shape.  Non-primitive pointees fall
-    /// back to `Ref`, the same projection any non-primitive shape takes.
-    fn type_node_to_value_type(&self, node: &serde_json::Value) -> ValueType {
-        let mut v = node.clone();
-        loop {
-            let Some(obj) = v.as_object() else {
-                return ValueType::Ref(None);
-            };
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                match self.llbc.dedup_body(id) {
-                    Some(b) => {
-                        v = b.clone();
-                        continue;
-                    }
-                    None => return ValueType::Ref(None),
-                }
-            }
-            if let Some(arr) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && arr.len() == 2
-            {
-                v = arr[1].clone();
-                continue;
-            }
-            break;
-        }
-        tyref_to_value_type(&TyRef::Other(v), self.llbc)
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -17189,34 +17176,6 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // The same statement, one type family over: a SHARED borrow of a
-    // primitive carries no representation of its own either.  `lltype.py`
-    // `class Ptr.__new__` raises `TypeError("can only point to a Container
-    // type")`, so `Ptr(Signed)` / `Ptr(Char)` do not exist upstream and a
-    // `&u8` has no lltype to be — the only representable model is the byte.
-    //
-    // `resolve_place` already agrees: it collapses an Atom `Deref` to the
-    // base, so `*p` and `p` are one value there.  Banking the borrow as a GC
-    // ref while collapsing its deref is the inconsistency, and it surfaces as
-    // a ref-kinded `SwitchInt` operand that `codewriter/flatten.rs` rejects
-    // (`switch exitswitch must be int`).  `let tag = *code.get(pc)?; match tag
-    // { .. }` over a `&[u8]` is the shape that hits it: `<[T]>::get` hands the
-    // `&u8` back inside an `Option`, so the byte arrives as an ADT payload
-    // rather than through `Index::index` — which is why the indexed spelling
-    // `code[pc]` was already fine ([`tyref_deref_value_type`] covers it) and
-    // this one was not.
-    //
-    // SHARED ONLY, and not by conservatism.  `&mut P` must stay a reference
-    // because a write through it is a real operation on a real pointer
-    // (`__deref_write` takes the reference as an argument); handing that an
-    // integer would corrupt the store.  `*const P` / `*mut P` stay references
-    // for the reason the fieldless-enum arm above already gives — a raw
-    // pointer is a value other code may compare, offset or null-check.  A
-    // shared borrow of a primitive is none of those: it cannot be written
-    // through, and a primitive has no interior mutability to hide behind one.
-    if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
-        return tyref_to_value_type(&TyRef::Other(pointee), llbc);
-    }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
     // rpy_string in the value model (`tyref_is_string_value`), matching
     // upstream's one string type (`rstr.py`).  A bare string-family value
@@ -17244,6 +17203,73 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return ValueType::Ref(None);
     };
     tyref_to_value_type(&TyRef::Other(node.clone()), llbc)
+}
+
+/// Register-bank kind of an enum variant's payload — `Option<T>`,
+/// `Result<T, E>`, `ControlFlow<T, _>`, `Bound<T>`.
+///
+/// A slice accessor that hands the element back BY REFERENCE puts a `&P`
+/// there for a primitive `P`: `<[u8]>::get` returns `Option<&u8>`, so
+/// `let tag = *code.get(pc)?; match tag { .. }` reaches the switch through
+/// the variant payload rather than through `Index::index` (which
+/// [`tyref_deref_value_type`] already covers).  That borrow carries no
+/// representation of its own — `lltype.py` `class Ptr.__new__` raises
+/// `TypeError("can only point to a Container type")`, so `Ptr(Signed)` /
+/// `Ptr(Char)` do not exist and the byte is the only representable model —
+/// and `resolve_place` already collapses its `Deref` to the base.  Banking
+/// it as a GC ref while collapsing the deref hands `codewriter/flatten.rs`
+/// a ref-kinded `SwitchInt` operand (`switch exitswitch must be int`).
+///
+/// Peels EXACTLY ONE level and only here.  [`tyref_to_value_type`] must
+/// stay non-peeling for its other consumers: a caller that already
+/// unwrapped one reference — [`iterator_payload_element`], which takes
+/// `&[&i64]`'s `Option<&&i64>` payload down to the `&i64` element — holds
+/// a pointer that IS the value, and a second peel would put it in the
+/// integer bank.  A `&&i64` reaching here peels to nothing for the same
+/// reason [`tyref_shared_borrow_primitive_pointee`] declines it: its
+/// pointee is another reference, not a primitive.
+fn tyref_enum_payload_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
+        return tyref_to_value_type(&TyRef::Other(pointee), llbc);
+    }
+    // A payload slot read straight out of `generics.types` may still carry
+    // the `HashConsedValue` / `Deduplicated` wrappers that
+    // [`tyref_to_value_type`]'s primitive match does not walk (it resolves a
+    // `TyRef::Dedup`, not a node reached through one), so strip them the way
+    // the peel above already does internally.
+    match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
+        Some(node) => tyref_to_value_type(&TyRef::Other(node.clone()), llbc),
+        None => ValueType::Ref(None),
+    }
+}
+
+/// `ty` resolves to an enum, whose variant payloads
+/// [`tyref_enum_payload_value_type`] projects through.
+///
+/// Gates that projection at a field read, where the peel and the ordinary
+/// answer are the SAME type node: a `&u8` variant payload and a struct's own
+/// `&u8` field both serialize as `{"Ref": [_, {"Literal": ..}, "Shared"]}`, so
+/// nothing in the field's type tells them apart.  The container does — a
+/// variant payload is reached by matching on it, so the borrow belongs to the
+/// match, and sibling arms that supply the same value by value force one bank
+/// across all of them.  A struct's `&P` field is a reference the program wrote
+/// down and stores.
+///
+/// Keyed on enum-ness rather than on a list of named shells: `<[T]>::get`
+/// hands a `&P` back through `Option` and `RangeBounds::start_bound` through
+/// `Bound`, and only the first is a `?` desugaring.  A named list types the
+/// unnamed one's payload as a pointer, which then merges with an integer
+/// sibling arm and reaches the assembler as `Move(dst=%i2, src=%r2)`.
+///
+/// Peels `Ref` on the way in ([`strip_ty_wrappers`]) so a `match *slot { .. }`
+/// whose base is a borrow answers the same as a by-value one: the borrow adds
+/// no variant and no payload.
+fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
 }
 
 /// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
@@ -17318,23 +17344,25 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 ///
 /// Charon writes a reference as `{"Ref": [region, pointee, kind]}` with `kind`
 /// one of `"Shared"` / `"Mut"`, and a primitive as `{"Literal": ...}`.  Both
-/// are required: this fires only on `Shared`, because [`tyref_to_value_type`]'s
-/// caller documents why a mutable or raw pointer must keep its own
-/// representation.
+/// are required.
 ///
-/// Peels `Ref` exactly ONCE.  `&&u8` peels to `&u8`, which is itself a
-/// primitive borrow; the caller re-enters [`tyref_to_value_type`] on the
-/// pointee, so the outer layers unwrap one call at a time and terminate.
-/// Peeling greedily here would instead collapse `&&u8` in one step and hide
-/// which layer was answered.
+/// SHARED ONLY, and not by conservatism.  `&mut P` must stay a reference
+/// because a write through it is a real operation on a real pointer
+/// (`__deref_write` takes the reference as an argument); handing that an
+/// integer would corrupt the store.  `*const P` / `*mut P` stay references
+/// for the reason [`tyref_is_borrowed_fieldless_enum_free`] already gives —
+/// a raw pointer is a value other code may compare, offset or null-check.  A
+/// shared borrow of a primitive is none of those: it cannot be written
+/// through, and a primitive has no interior mutability to hide behind one.
+///
+/// Peels one level and the pointee must itself be the primitive, so `&&u8`
+/// is DECLINED rather than peeled twice.  That is what makes the answer
+/// independent of how many levels the caller already unwrapped.
 ///
 /// Deliberately NOT written in terms of [`strip_ty_wrappers`], which also
 /// peels owning wrappers (`Box`, `Rc`, …).  Those are real heap references
 /// with representations of their own; only a borrow is the identity.
-fn tyref_shared_borrow_primitive_pointee(
-    ty: &TyRef,
-    llbc: &Llbc,
-) -> Option<serde_json::Value> {
+fn tyref_shared_borrow_primitive_pointee(ty: &TyRef, llbc: &Llbc) -> Option<serde_json::Value> {
     let mut v: &serde_json::Value = match ty {
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
