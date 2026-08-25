@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=40
+# pyre-check: spec-folds=binary_op_int,truth_bool,compare_op_int
+# The three folds that carry most of the corpus's fold traffic, and nothing
+# declared any of them, so switching one off was a silent change. This fixture
+# fires them 398/69/65 times, the widest margin of any fixture firing all three.
 # Memoized vs plain recursion with post-warm-up branch divergence. The
 # memo-dict store (memo[n] = r) once died with a TypeError after warm-up
 # (an empty-string type name from a clobbered class read on the dict-store

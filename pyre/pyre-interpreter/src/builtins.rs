@@ -4670,7 +4670,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 ///
 /// # Safety
 /// `obj` must point to a valid object whose header is readable.
-unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
+pub(crate) unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
     let w_class = unsafe { (*obj).w_class };
     if w_class.is_null() {
         return true;

@@ -1,3 +1,6 @@
+# pyre-check: spec-folds=load_attr
+# The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
+# pickle drives it 122 times here, more than any other fixture.
 # Pure-Python pickle terminates its unpickler loop by raising the private
 # `_Stop` exception from `load_stop`.  The JIT's after-residual guard snapshot
 # must resume from the emitted post-call `-live-` anchor even though the

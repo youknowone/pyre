@@ -1393,28 +1393,19 @@ pub(crate) unsafe fn get_and_call_function(
         )
     }?
     .unwrap_or_else(|| shadow_stack_get(base));
-    // The same stack-array-or-`Vec` split as the fast path above, and for the
-    // same reason: a `Vec::with_capacity` on the common arity is an opaque
-    // residual the walker cannot descend through.
-    const INLINE_ARGS: usize = 8;
-    let mut inline_args = [pyre_object::PY_NULL; INLINE_ARGS];
-    let mut wide_args;
-    let reloaded: &[PyObjectRef] = if args_w.len() <= INLINE_ARGS {
-        // The index loop lowers to `setarrayitem`; iterator adapters are
-        // residual calls.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..args_w.len() {
-            inline_args[i] = shadow_stack_get(args_base + i);
-        }
-        &inline_args[..args_w.len()]
-    } else {
-        wide_args = Vec::with_capacity(args_w.len());
-        for i in 0..args_w.len() {
-            wide_args.push(shadow_stack_get(args_base + i));
-        }
-        &wide_args
-    };
-    crate::call::call_function_impl_result(w_impl, reloaded)
+    // One `Vec` at every arity, the shape the fast path above already builds:
+    // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
+    // `[PY_NULL; N]` leg this replaced ended in `<[T; N]>::index(&array,
+    // ..len)` — a RangeTo subslice stays an inherent-impl call where a scalar
+    // index would be a place projection — and that call has no registry
+    // entry, so this graph and every dunder dispatch reaching one through it
+    // dropped to the legacy walker.  `with_capacity` reserves the exact
+    // length, so no push reallocates between the shadow-stack reads.
+    let mut reloaded = Vec::with_capacity(args_w.len());
+    for i in 0..args_w.len() {
+        reloaded.push(shadow_stack_get(args_base + i));
+    }
+    crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
 }
 
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy

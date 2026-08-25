@@ -1,3 +1,6 @@
+# pyre-check: spec-folds=load_bound_method_attr
+# The bound-method fold, 267 firings across the corpus and undeclared. The str
+# method calls below drive it 22 times, more than any other fixture.
 # Every str surface that converts between a code point index and a byte offset:
 # find/rfind/index/rindex and count take code point bounds and report a code
 # point result, startswith/endswith slice by them, and the width methods read

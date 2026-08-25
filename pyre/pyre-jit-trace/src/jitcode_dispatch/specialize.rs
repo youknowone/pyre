@@ -6608,6 +6608,22 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
             )
     };
+    // Serve the arity-2 specialisations from the real reader.  The canonical
+    // layout is deliberately NOT routed here: its items are an array, so the
+    // descent inlines the whole reader at every subscript, and inside a
+    // recursive bridge that overruns the bridge's trace budget --
+    // `selfrec_bridge_nontail_promote` loses a bridge to `abrt_bridge` and runs
+    // 2.4x slower.  `try_walker_specialize_subscr_tuple` keeps that arm.
+    if specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
+        if let Some(hit) = spec_gate("subscr_tuple_descent", || {
+            try_walker_orthodox_subscr_tuple_item(
+                ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
+            )
+        })? {
+            return Ok(Some(hit));
+        }
+    }
+
     if tuple_canonical {
         return spec_gate("subscr_tuple", || {
             try_walker_specialize_subscr_tuple(
@@ -7085,6 +7101,125 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Descend `w_tuple_getitem`'s compiled body for a tuple subscript whose
+/// receiver class and item index are both known at trace time, instead of
+/// re-emitting that body's length test and field reads by hand.
+///
+/// This is the orthodox shape `subscr_specialised_pair` stands in for:
+/// upstream's `getitem` is an ordinary graph the tracer inlines
+/// (`specialisedtupleobject.py`, whose `getitem` unrolls `iter_n` to the
+/// matching `value%s`), and the callee's `ob_type` chain folds against the
+/// pinned class down to the one specialisation this trace saw.
+///
+/// The trace-time range check here is a decline gate, not the trace's safety
+/// argument: it keeps an out-of-range subscript on the generic residual instead
+/// of tracing a raising path.  What holds for the *next* receiver is the
+/// callee's own length test, which is why this enters at `w_tuple_getitem`
+/// rather than at the `_known` reader it wraps -- the reader is documented
+/// "known-in-bounds" and carries no test to record.
+fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    // Arity-2 specialisations only -- see the caller for why the canonical
+    // layout keeps its own arm.
+    let spec_type = unsafe { (*seq_obj).ob_type };
+    if specialised_pair_kind(spec_type).is_none() {
+        return Ok(None);
+    }
+    // Exact int keys only: a slice, a bool or an int subclass reaches a
+    // different objspace path, and the callee takes a machine index.
+    if !unsafe { pyre_object::is_int(key_obj) } {
+        return Ok(None);
+    }
+    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
+    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
+    let index = if raw_key < 0 { raw_key + len } else { raw_key };
+    if !(0..len).contains(&index) {
+        return Ok(None);
+    }
+
+    // Resolve every possible decline before recording a guard.
+    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Only a specialisation carries its own `ob_type`, so the class guard below
+    // is the whole precondition: a tuple subclass keeps `&TUPLE_TYPE` and can
+    // never reach these arms, and each specialisation's length is 2 by
+    // construction.
+    walker_guard_specialised_pair_class(ctx, op_pc, seq_op, spec_type)?;
+
+    // Freeze the key: the two slots are separate fields, so the callee's
+    // `match idx` folds to one of them only against a constant.
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
+    let index_arg = ctx.trace_ctx.const_int(raw_key);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_index, index_arg])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(key_index, index_arg);
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        "subscr_tuple_item_commit",
+        "w_tuple_getitem_known_call_site",
+        &[index_arg],
+        &[ConcreteValue::Int(raw_key)],
+        &[seq_op],
+        &[ConcreteValue::Ref(seq_obj)],
+    );
+    let (walk_outcome, _walk_start) = match walk {
+        Ok(pair) => pair,
+        // The body reached a helper this build did not lower.  Nothing is
+        // committed yet -- the read has no effect to undo -- so cut the
+        // tentative IR and let the generic residual serve the subscript.
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] SUBSCR-TUPLE-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 /// SUBSCRIPT arm for the arity-2 tuple specialisations
 /// (`specialisedtupleobject.py getitem`), the analogue of
 /// [`try_walker_specialize_subscr_tuple`] for a receiver whose items are the
@@ -7156,95 +7291,6 @@ fn try_walker_specialize_subscr_specialised_pair<Sym: WalkSym>(
         return Ok(None);
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, item)?;
-    Ok(Some(()))
-}
-
-/// Builtin `type(x)`:
-///
-/// ```python
-/// # pypy/objspace/std/objspace.py:441-443
-/// jit.promote(w_obj.__class__)
-/// return w_obj.getclass(self)
-/// ```
-///
-/// Pyre's generic `bh_call_fn` otherwise enters `type_descr_call_impl`, which
-/// performs the complete type-constructor protocol for every loop iteration.
-/// Pin the callable and the argument's physical/Python class, then return the
-/// promoted class object.  The generic-exception representation is declined:
-/// its observable class can come from `ExcKind` even when physical type and
-/// `w_class` match, so it needs a separate kind guard.
-pub(crate) fn try_walker_specialize_builtin_type<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
-    else {
-        return Ok(None);
-    };
-    if concrete_callable.is_null() || !null_or_self.is_null() || obj.is_null() {
-        return Ok(None);
-    }
-    let builtin_type = pyre_object::get_instantiate(&pyre_object::pyobject::TYPE_TYPE);
-    if builtin_type.is_null() || !std::ptr::eq(concrete_callable, builtin_type) {
-        return Ok(None);
-    }
-
-    let tagged =
-        pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj);
-    let (physical_type, stored_w_class) = if tagged {
-        (
-            &pyre_object::pyobject::INT_TYPE as *const _ as i64,
-            pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
-        )
-    } else {
-        let physical_type = unsafe { (*obj).ob_type } as i64;
-        let stored_w_class = unsafe { (*obj).w_class };
-        if unsafe { pyre_object::is_exception(obj) } {
-            let generic_exception =
-                pyre_object::get_instantiate(&pyre_object::interp_exceptions::EXCEPTION_TYPE);
-            if stored_w_class.is_null() || std::ptr::eq(stored_w_class, generic_exception) {
-                return Ok(None);
-            }
-        }
-        (physical_type, stored_w_class)
-    };
-    let Some(result_type) = pyre_interpreter::typedef::r#type(obj) else {
-        return Ok(None);
-    };
-    let result_type = result_type.as_ptr();
-
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
-
-    let obj_op = r_args[2];
-    walker_guard_class(ctx, op.pc, obj_op, physical_type)?;
-    // A tagged int has no dereferenceable `w_class` field; GuardClass's boxed
-    // leg is enough because both representations return the canonical int
-    // class.  Every other populated `w_class` is the live promoted field.
-    if !tagged && !stored_w_class.is_null() {
-        walker_guard_exact_w_class(ctx, op.pc, obj_op, stored_w_class)?;
-    }
-    let result = ctx.trace_ctx.const_ref(result_type as i64);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
     Ok(Some(()))
 }
 
@@ -7830,290 +7876,6 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-fn walker_isinstance_exact_type_hit(
-    obj: pyre_object::PyObjectRef,
-    cls: pyre_object::PyObjectRef,
-) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
-    let obj_type = pyre_interpreter::typedef::r#type(obj)?;
-    if !std::ptr::eq(obj_type.as_ptr(), cls) {
-        return None;
-    }
-    walker_isinstance_obj_type_guard_info(obj, cls)
-}
-
-fn walker_isinstance_obj_type_guard_info(
-    obj: pyre_object::PyObjectRef,
-    obj_type: pyre_object::PyObjectRef,
-) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
-    let physical_type = unsafe { (*obj).ob_type as i64 };
-    let stored_w_class = unsafe { (*obj).w_class };
-    if stored_w_class.is_null() {
-        Some((physical_type, None))
-    } else if std::ptr::eq(stored_w_class, obj_type) {
-        Some((physical_type, Some(stored_w_class)))
-    } else {
-        None
-    }
-}
-
-fn walker_isinstance_tuple_element_can_precede_hit(item: pyre_object::PyObjectRef) -> bool {
-    pyre_interpreter::typedef::r#type(item)
-        .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), pyre_interpreter::typedef::w_type()))
-}
-
-fn walker_guard_ref_value<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    opref: OpRef,
-    expected_obj: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
-    if !opref.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(expected_obj as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[opref, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(opref, expected);
-    }
-    Ok(())
-}
-
-struct WalkerIsinstanceFold {
-    physical_type: i64,
-    exact_w_class: Option<pyre_object::PyObjectRef>,
-    guarded_cls: pyre_object::PyObjectRef,
-    pinned_obj_type: Option<pyre_object::PyObjectRef>,
-    result: bool,
-}
-
-/// `isinstance(obj, cls)` in the quick exact-type cases from
-/// `abstractinst.py` `abstract_isinstance_w`: before union recursion or
-/// `__instancecheck__` lookup, `type(obj) is cls` returns `True`; for tuple
-/// classinfo the interpreter loops the tuple and recurses into that same test.
-///
-/// A scalar miss where `type(cls) is type` can also fold through
-/// `p_recursive_isinstance_type_w`: a positive `issubtype_w(type(obj), cls)`
-/// never reads `obj.__class__`; a negative answer is folded only when the
-/// receiver type resolves `__class__` to the stock `object.__class__`
-/// descriptor.
-pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    // Plain `bh_call_fn(callable, PY_NULL, obj, cls)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(obj),
-        ConcreteValue::Ref(cls),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
-    else {
-        return Ok(None);
-    };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
-    // prepends as arg0, not a plain `isinstance(obj, cls)` call.
-    if concrete_callable.is_null() || !null_or_self.is_null() || obj.is_null() || cls.is_null() {
-        return Ok(None);
-    }
-    if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
-        return Ok(None);
-    }
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        return Ok(None);
-    }
-    let fold = unsafe {
-        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cls) {
-            return Ok(None);
-        }
-        if std::ptr::eq((*cls).ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
-            let tuple_class =
-                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
-            if !std::ptr::eq((*cls).w_class, tuple_class) {
-                return Ok(None);
-            }
-            let n = pyre_object::w_tuple_len(cls);
-            for i in 0..n {
-                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
-                    return Ok(None);
-                };
-                if pyre_object::is_tuple(item) {
-                    return Ok(None);
-                }
-            }
-            let mut hit = None;
-            for i in 0..n {
-                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
-                    return Ok(None);
-                };
-                if let Some(proof) = walker_isinstance_exact_type_hit(obj, item) {
-                    hit = Some(proof);
-                    break;
-                }
-                if !walker_isinstance_tuple_element_can_precede_hit(item) {
-                    return Ok(None);
-                }
-            }
-            let Some((physical_type, exact_w_class)) = hit else {
-                return Ok(None);
-            };
-            WalkerIsinstanceFold {
-                physical_type,
-                exact_w_class,
-                guarded_cls: cls,
-                pinned_obj_type: None,
-                result: true,
-            }
-        } else {
-            if let Some((physical_type, exact_w_class)) = walker_isinstance_exact_type_hit(obj, cls)
-            {
-                WalkerIsinstanceFold {
-                    physical_type,
-                    exact_w_class,
-                    guarded_cls: cls,
-                    pinned_obj_type: None,
-                    result: true,
-                }
-            } else {
-                if !pyre_object::is_type(cls) {
-                    return Ok(None);
-                }
-                let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
-                    return Ok(None);
-                };
-                if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
-                    return Ok(None);
-                }
-                let Some(obj_type) = pyre_interpreter::typedef::r#type(obj) else {
-                    return Ok(None);
-                };
-                let obj_type = obj_type.as_ptr();
-                if !pyre_object::is_type(obj_type) {
-                    return Ok(None);
-                }
-                let version_tag = pyre_object::typeobject::w_type_get_version_tag(obj_type);
-                if version_tag == 0 {
-                    return Ok(None);
-                }
-                let Some((physical_type, exact_w_class)) =
-                    walker_isinstance_obj_type_guard_info(obj, obj_type)
-                else {
-                    return Ok(None);
-                };
-                let result = pyre_interpreter::baseobjspace::jit_issubtype_w(obj_type, cls);
-                if !result
-                    && !pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure(
-                        obj_type,
-                    )
-                {
-                    return Ok(None);
-                }
-                WalkerIsinstanceFold {
-                    physical_type,
-                    exact_w_class,
-                    guarded_cls: cls,
-                    pinned_obj_type: Some(obj_type),
-                    result,
-                }
-            }
-        }
-    };
-
-    // --- emit the specialized IR (walker-native) ---
-    // Pin the callable identity (LOAD_GLOBAL `isinstance` is usually already
-    // constant via the namespace cell fold).
-    let callable_op = r_args[0];
-    walker_guard_ref_value(ctx, op.pc, callable_op, concrete_callable)?;
-    let obj_op = r_args[2];
-    walker_guard_class(ctx, op.pc, obj_op, fold.physical_type)?;
-    if let Some(exact_w_class) = fold.exact_w_class {
-        walker_guard_exact_w_class(ctx, op.pc, obj_op, exact_w_class)?;
-    }
-    let cls_op = r_args[3];
-    walker_guard_ref_value(ctx, op.pc, cls_op, fold.guarded_cls)?;
-    if let Some(obj_type) = fold.pinned_obj_type {
-        let obj_type_const = ctx.trace_ctx.const_ref(obj_type as i64);
-        walker_pin_type_version_tag(ctx, op.pc, obj_type_const)?;
-    }
-    walker_write_const_bool_result(ctx, op.pc, fold.result, dst, 'r')?;
-    Ok(Some(()))
-}
-
-pub(crate) fn try_walker_specialize_builtin_issubclass<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    // Plain `bh_call_fn(callable, PY_NULL, derived, cls)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(derived),
-        ConcreteValue::Ref(cls),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
-    else {
-        return Ok(None);
-    };
-    if concrete_callable.is_null() || !null_or_self.is_null() || derived.is_null() || cls.is_null()
-    {
-        return Ok(None);
-    }
-    if !pyre_interpreter::builtins::is_builtin_issubclass_function(concrete_callable) {
-        return Ok(None);
-    }
-
-    let result = unsafe {
-        if pyre_object::is_generic_alias(derived)
-            || !pyre_object::is_type(derived)
-            || !pyre_object::is_type(cls)
-            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(derived)
-            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(cls)
-        {
-            return Ok(None);
-        }
-        let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
-            return Ok(None);
-        };
-        if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
-            return Ok(None);
-        }
-        let version_tag = pyre_object::typeobject::w_type_get_version_tag(derived);
-        if version_tag == 0 {
-            return Ok(None);
-        }
-        pyre_interpreter::baseobjspace::jit_issubtype_w(derived, cls)
-    };
-
-    walker_guard_ref_value(ctx, op.pc, r_args[0], concrete_callable)?;
-    walker_guard_ref_value(ctx, op.pc, r_args[2], derived)?;
-    walker_guard_ref_value(ctx, op.pc, r_args[3], cls)?;
-    let derived_const = ctx.trace_ctx.const_ref(derived as i64);
-    walker_pin_type_version_tag(ctx, op.pc, derived_const)?;
-    walker_write_const_bool_result(ctx, op.pc, result, dst, 'r')?;
-    Ok(Some(()))
-}
-
 /// Fold plain `getattr(type, name)` when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
 /// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
@@ -8325,144 +8087,6 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
-    Ok(Some(()))
-}
-
-/// `hasattr(obj, "name")` — settled by the instance shape, without a read.
-///
-/// [`builtin_hasattr`] answers False only for the `AttributeError` its lookup
-/// raises, and the map `guard_value` below proves the attribute is present on
-/// this exact shape.  So the guards alone decide the call: the result is a
-/// constant True and the attribute's value is never loaded, which is strictly
-/// less work than the `getattr` fold does for the same receiver.
-///
-/// Absence is a different proof, and `getattr_absent_fast_path` is the one that
-/// carries it: the two pins keep `name` off both the type and the receiver's
-/// own storage, and with no `__getattr__` left to run the access ends in the
-/// `AttributeError` this builtin reports as False.  Neither hit resolver can
-/// stand in for it — they decline a name they cannot *place*, which is not the
-/// same claim as "not here".
-pub(crate) fn try_walker_specialize_builtin_hasattr<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    // `hasattr` takes exactly two application arguments, so the residual is
-    // `bh_call_fn(callable, PY_NULL, obj, name)` and nothing else.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
-    else {
-        return Ok(None);
-    };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `hasattr(obj, name)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || concrete_obj.is_null()
-        || concrete_name.is_null()
-    {
-        return Ok(None);
-    }
-    if !pyre_interpreter::builtins::is_builtin_hasattr_function(concrete_callable) {
-        return Ok(None);
-    }
-    // `checkattrname` rejects a non-string name with TypeError, which is not an
-    // answer this fold may replace with a bool.
-    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
-        return Ok(None);
-    }
-    let Ok(name) = (unsafe { pyre_object::w_str_get_wtf8(concrete_name) }).as_str() else {
-        return Ok(None);
-    };
-    // Decide before emitting: every decline below this point would have to
-    // rewind guards for a fold that is no longer there.
-    //
-    // Presence is a property of the map, so either resolution answers it and
-    // neither storage kind changes the answer — an int attribute lands in an
-    // unboxed slot, which the boxed resolution alone declines.  Both twins run
-    // the same refusals first (custom `__getattribute__`, an `INVALID`
-    // classify, an uncacheable `version_tag`), so a `Some` from either means
-    // the lookup this fold replaces cannot raise.
-    //
-    // Absence is its own proof, not the failure of these two:
-    // `getattr_absent_fast_path` reports it only when the same two pins keep
-    // `name` off both the type and the receiver's storage AND there is no
-    // `__getattr__` left to run, which is exactly when the access ends in the
-    // AttributeError this builtin reports as False.
-    let Some((w_type, version_tag, map, answer)) = (unsafe {
-        pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name)
-            .map(|(w_type, version_tag, map, _storageindex)| (w_type, version_tag, map, true))
-            .or_else(|| {
-                pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
-                    concrete_obj,
-                    name,
-                )
-                .map(
-                    |(w_type, version_tag, map, _storageindex, _listindex, _unbox)| {
-                        (w_type, version_tag, map, true)
-                    },
-                )
-            })
-            .or_else(|| {
-                pyre_interpreter::objspace::std::mapdict::getattr_absent_fast_path(
-                    concrete_obj,
-                    name,
-                )
-                .map(|(w_type, version_tag, map)| (w_type, version_tag, map, false))
-            })
-    }) else {
-        return Ok(None);
-    };
-
-    let obj_ref = r_args[2];
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
-    let name_ref = r_args[3];
-    if !name_ref.is_constant() {
-        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[name_ref, name_const],
-        )?;
-    }
-    walker_guard_mapdict_instance_shape(
-        ctx,
-        op.pc,
-        obj_ref,
-        concrete_obj,
-        w_type,
-        version_tag,
-        map,
-    )?;
-    walker_write_const_bool_result(ctx, op.pc, answer, dst, 'r')?;
     Ok(Some(()))
 }
 
@@ -13333,6 +12957,156 @@ pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
+/// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
+///
+/// Publishes the call-site resume coordinate the enclosing full-body walk needs
+/// to rebuild this frame, mirrors the virtualizable's `last_instr` /
+/// `valuestackdepth` when the enclosing frame owns the shadow, swaps in the
+/// callee's GLOBAL descr pool for the duration, runs the walk, then restores
+/// every field it moved.  A build-time canonical body carries no per-fn descr
+/// pool, so its `d` / `j` operands resolve through `all_descr_refs()` /
+/// `RawDescrPool::Global` -- not the parent loop's per-fn pool, which
+/// mis-resolves the first `residual_call` descr.
+///
+/// Returns the walk outcome together with the trace position taken immediately
+/// before the walk, for a caller that has to reason about which ops the callee
+/// contributed.  The position is captured after the resume mirroring above, so
+/// it names the callee's first op and not the mirror's.
+///
+/// `fallback_label` names this site in the empty-twin coordinate note;
+/// `call_site_label` names it in the active-box collection.
+#[allow(clippy::too_many_arguments)]
+fn run_orthodox_helper_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    sym: &Sym,
+    sub_body: &SubJitCodeBody,
+    fallback_label: &'static str,
+    call_site_label: &'static str,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
+        let jc = &*sym.jitcode();
+        let jc_index = jc.index as u32;
+        let marker = jc.payload.resume_marker_for_jitcode_pc(op_pc);
+        // Forward py twin first (#73 phase-3): equals the containing
+        // coordinate plus trivia normalization by construction; the containing
+        // lookup survives for the empty-twin class, and the trivia skip below
+        // is an identity on the twin path.
+        let mut py = jc
+            .payload
+            .forward_py_pc_for_jitcode_pc(op_pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::note_empty_twin_fallback(fallback_label, jc.index, op_pc as i32);
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
+            });
+        if jc.payload.code_ptr.is_null() {
+            (py, sym.valuestackdepth() as i64, jc_index, marker)
+        } else {
+            let codeobj = &*jc.payload.code_ptr;
+            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+            // Read the depth off the jitcode-pc-keyed trivia twin, which equals
+            // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op_pc))]`
+            // by construction; fall back to the py_pc-keyed static-liveness read
+            // where the twin is unpopulated (skeleton / fixture install).
+            let depth = if jc.payload.depth_trivia_populated() {
+                jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+            } else {
+                crate::liveness::liveness_for(jc.payload.code_ptr)
+                    .depth_at_py_pc()
+                    .get(py as usize)
+                    .copied()
+            };
+            let vsd = match depth {
+                Some(d) => (sym.nlocals() + d as usize) as i64,
+                None => sym.valuestackdepth() as i64,
+            };
+            (py, vsd, jc_index, marker)
+        }
+    };
+    if sym.owns_virtualizable_shadow() {
+        let li = call_site_py_pc as i64 - 1;
+        let li_op = ctx.trace_ctx.const_int(li);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            li_op,
+            Value::Int(li),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+    let call_site_word = call_site_marker
+        .map(|marker| marker as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    let active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        outer_jitcode_index,
+        false,
+        call_site_word,
+        op_pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
+        call_site_label,
+        None,
+        &[],
+        // Not a branch-guard reconstruction: this is the pre-call site
+        // snapshot, so there is no kept operand-stack slot to report as
+        // unsourced.
+        None,
+    );
+
+    let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.outer_active_boxes = active;
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+
+    let walk_start = ctx.trace_ctx.get_trace_position();
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.inline_subwalk = true;
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op_pc,
+        sub_body,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    Ok((walk_result?, walk_start))
+}
+
 /// Commit core of the #171 orthodox list-append fold, shared by the
 /// method-call (`try_walker_orthodox_list_append`) and LIST_APPEND-opcode
 /// (`try_walker_orthodox_list_append_opcode`) forms.  Stamps the receiver
@@ -13488,135 +13262,20 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        // Forward py twin first (#73 phase-3): equals the containing
-        // coordinate plus trivia normalization by construction; the containing
-        // lookup survives for the empty-twin class, and the trivia skip below
-        // is an identity on the twin path.
-        let mut py = jc
-            .payload
-            .forward_py_pc_for_jitcode_pc(op.pc)
-            .unwrap_or_else(|| {
-                crate::py_coord::note_empty_twin_fallback(
-                    "list_append_commit",
-                    jc.index,
-                    op.pc as i32,
-                );
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
-            });
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
-        } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            // Read the depth off the jitcode-pc-keyed trivia twin, which equals
-            // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op.pc))]`
-            // by construction; fall back to the py_pc-keyed static-liveness read
-            // where the twin is unpopulated (skeleton / fixture install).
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = match depth {
-                Some(d) => (sym.nlocals() + d as usize) as i64,
-                None => sym.valuestackdepth() as i64,
-            };
-            (py, vsd, jc_index, marker)
-        }
-    };
-    if sym.owns_virtualizable_shadow() {
-        let li = call_site_py_pc as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
-    }
-    let call_site_word = match call_site_marker {
-        Some(m) => m as i32,
-        None => majit_ir::resumedata::NO_JITCODE_PC,
-    };
-    let active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        // As above, entry metadata is keyed by the append op itself; its
-        // liveness-bank query remains keyed by the resume marker.
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "w_list_append_call_site",
-        None,
-        &[],
-        None,
-    );
-
-    // Swap in the call-site resume context + the callee's GLOBAL descr pool
-    // for the sub-walk, restore after.  `w_list_append` is a build-time
-    // canonical body with no per-fn descr pool, so its `d`/`j` operands
-    // resolve through `all_descr_refs()` / `RawDescrPool::Global` — NOT the
-    // parent loop's per-fn pool (which mis-resolves the first residual_call
-    // descr → `ResidualCallDescrNotCallDescr`).
-    let saved_entry = ctx.entry_py_pc;
-    let saved_marker = ctx.outer_resume_marker_jit_pc;
-    let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
-    let saved_descr_refs = ctx.descr_refs;
-    let saved_raw_descrs = ctx.raw_descrs;
-    let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
-    ctx.outer_resume_marker_jit_pc = call_site_marker;
-    ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
-    ctx.raw_descrs = RawDescrPool::Global;
-    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
-
-    let self_concrete = ConcreteValue::Ref(inner_self);
-    let value_concrete = ConcreteValue::Ref(value);
-    let saved_fbw_mode = ctx.fbw_mode;
-    ctx.fbw_mode.inline_subwalk = true;
-    let walk_result = run_sub_jitcode_walk(
+    let (walk_outcome, _walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,
+        sym,
         sub_body,
+        "list_append_commit",
+        "w_list_append_call_site",
         &[],
         &[],
         &[self_ref, value_op],
-        &[self_concrete, value_concrete],
-        &[],
-    );
-    ctx.fbw_mode = saved_fbw_mode;
+        &[ConcreteValue::Ref(inner_self), ConcreteValue::Ref(value)],
+    )?;
 
-    ctx.entry_py_pc = saved_entry;
-    ctx.outer_resume_marker_jit_pc = saved_marker;
-    ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
-    ctx.descr_refs = saved_descr_refs;
-    ctx.raw_descrs = saved_raw_descrs;
-    ctx.sub_jitcode_lookup = saved_lookup;
-
-    match walk_result? {
+    match walk_outcome {
         DispatchOutcome::SubReturn { result } => {
             if finish_inline_callee_return(ctx, result).is_some() {
                 return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
@@ -13635,7 +13294,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // build time.  Any residual that does NOT lower —
     // e.g. a stale build-time jitcode whose tuple ctor kept a symbolic
     // symbolic-tagged funcbox — is declined by `try_execute_residual_call_via_executor`
-    // (`OrthodoxSubWalkTraceUnsupported`) and `walk_result?` propagates that
+    // (`OrthodoxSubWalkTraceUnsupported`) and the sub-walk helper propagates that
     // abort before this point (graceful interpreter fallback, never a wrong
     // trace).  The descr-pool wiring above (strategy/header field descrs) is
     // exercised on the way in.
@@ -13865,119 +13524,20 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = unsafe {
-        let jc = &*sym.jitcode();
-        let jc_index = jc.index as u32;
-        let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
-        let mut py = jc
-            .payload
-            .forward_py_pc_for_jitcode_pc(op.pc)
-            .unwrap_or_else(|| {
-                crate::py_coord::note_empty_twin_fallback(
-                    "list_pop_commit",
-                    jc.index,
-                    op.pc as i32,
-                );
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
-            });
-        if jc.payload.code_ptr.is_null() {
-            (py, sym.valuestackdepth() as i64, jc_index, marker)
-        } else {
-            let codeobj = &*jc.payload.code_ptr;
-            py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-            let depth = if jc.payload.depth_trivia_populated() {
-                jc.payload.depth_trivia_for_jitcode_pc(op.pc)
-            } else {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py as usize)
-                    .copied()
-            };
-            let vsd = match depth {
-                Some(d) => (sym.nlocals() + d as usize) as i64,
-                None => sym.valuestackdepth() as i64,
-            };
-            (py, vsd, jc_index, marker)
-        }
-    };
-    if sym.owns_virtualizable_shadow() {
-        let li = call_site_py_pc as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
-    }
-    let call_site_word = call_site_marker
-        .map(|marker| marker as i32)
-        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-    let active = collect_outer_active_boxes(
-        sym,
-        ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        outer_jitcode_index,
-        false,
-        call_site_word,
-        op.pc as i32,
-        OuterActiveBoxesEntryTwin::Plain,
-        "w_list_pop_end_call_site",
-        None,
-        &[],
-        // Not a branch-guard reconstruction: this is the pre-call site
-        // snapshot, so there is no kept operand-stack slot to report as
-        // unsourced.
-        None,
-    );
-
-    let saved_entry = ctx.entry_py_pc;
-    let saved_marker = ctx.outer_resume_marker_jit_pc;
-    let saved_oji = ctx.outer_jitcode_index;
-    let saved_active = std::mem::take(&mut ctx.outer_active_boxes);
-    let saved_descr_refs = ctx.descr_refs;
-    let saved_raw_descrs = ctx.raw_descrs;
-    let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
-    ctx.outer_resume_marker_jit_pc = call_site_marker;
-    ctx.outer_jitcode_index = outer_jitcode_index;
-    ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
-    ctx.raw_descrs = RawDescrPool::Global;
-    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
-
-    let walk_start = ctx.trace_ctx.get_trace_position();
-    let saved_fbw_mode = ctx.fbw_mode;
-    ctx.fbw_mode.inline_subwalk = true;
-    let walk_result = run_sub_jitcode_walk(
+    let (walk_outcome, walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,
+        sym,
         sub_body,
+        "list_pop_commit",
+        "w_list_pop_end_call_site",
         &[],
         &[],
         &[self_ref],
         &[ConcreteValue::Ref(inner_self)],
-        &[],
-    );
-    ctx.fbw_mode = saved_fbw_mode;
-    ctx.entry_py_pc = saved_entry;
-    ctx.outer_resume_marker_jit_pc = saved_marker;
-    ctx.outer_jitcode_index = saved_oji;
-    ctx.outer_active_boxes = saved_active;
-    ctx.descr_refs = saved_descr_refs;
-    ctx.raw_descrs = saved_raw_descrs;
-    ctx.sub_jitcode_lookup = saved_lookup;
+    )?;
 
-    let result = match walk_result? {
+    let result = match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),

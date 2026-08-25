@@ -5684,33 +5684,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `isinstance(obj, cls)` exact-type hit: inline the first
-    // `abstractinst.py` `abstract_isinstance_w` check (`type(obj) is cls`) as
-    // callable/class guards plus a constant `True`.  All non-quick cases fall
-    // through to the residual so tuple/union recursion and `__instancecheck__`
-    // lookup stay unchanged.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("builtin_isinstance", || {
-            try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("builtin_issubclass", || {
-            try_walker_specialize_builtin_issubclass(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // A class statement's body store is hidden inside this residual; ask its
     // `jit_force_quasi_immutable` question before anything applies the call, so
     // the abort resumes the interpreter at this opcode with the class not yet
@@ -6267,20 +6240,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // `type(x)` is `space.type(w_obj)` upstream: promote `w_obj.__class__`
-    // and return `w_obj.getclass(space)`.  Lower that directly instead of
-    // residualizing the builtin type object's full `descr_call`.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("builtin_type", || {
-            try_walker_specialize_builtin_type(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // Exact `dict.get(identity_key)` follows the promoted strategy-entry
     // shape produced by tracing `DictStrategy.getitem`: pin the key-set
     // iterator state and read the resolved entry value live.
@@ -6318,19 +6277,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && spec_gate("builtin_getattr", || {
             try_walker_specialize_builtin_getattr(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // `hasattr(obj, "name")` on the same receiver: the shape guards answer it
-    // outright, so it folds to a constant without reading the attribute.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("builtin_hasattr", || {
-            try_walker_specialize_builtin_hasattr(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {

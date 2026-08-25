@@ -558,6 +558,10 @@ pub struct WalkSession {
     pub recording_jitcode_index: i32,
     /// Last opcode executed by the root recording frame.
     pub recording_opcode_position: usize,
+    /// Nested `run_sub_jitcode_walk` activations currently on the host stack.
+    /// Bounded by [`fbw_max_subwalk_depth`]; see that function for why the
+    /// walker needs a bound RPython's heap-allocated framestack does not.
+    pub subwalk_depth: usize,
 }
 
 impl Default for WalkSession {
@@ -574,6 +578,7 @@ impl Default for WalkSession {
             recording_frame_ptr: 0,
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
+            subwalk_depth: 0,
         }
     }
 }
@@ -2275,6 +2280,11 @@ pub enum DispatchError {
         provided: usize,
         callee_num_regs_f: usize,
     },
+    /// A canonical-helper descent would have pushed a `walk()` activation past
+    /// [`fbw_max_subwalk_depth`]. Refused before the callee's register banks
+    /// are allocated and before any of its body runs, so the enclosing frame
+    /// resumes at its own CALL with nothing to undo.
+    SubWalkDepthExceeded { pc: usize, depth: usize },
     /// `inline_call_r_r/dR>r`'s callee surfaced
     /// `SubReturn { result: None }`. RPython parity: the `_r_r` variant
     /// is wired (in `assembler.py:gen_inline_call`) to a callee whose
@@ -2723,6 +2733,7 @@ impl DispatchError {
             Self::InlineCallArityMismatch { .. } => "InlineCallArityMismatch",
             Self::InlineCallIntArityMismatch { .. } => "InlineCallIntArityMismatch",
             Self::InlineCallFloatArityMismatch { .. } => "InlineCallFloatArityMismatch",
+            Self::SubWalkDepthExceeded { .. } => "SubWalkDepthExceeded",
             Self::UnexpectedVoidSubReturn { .. } => "UnexpectedVoidSubReturn",
             Self::UnexpectedNonVoidSubReturn { .. } => "UnexpectedNonVoidSubReturn",
             Self::ReraiseWithoutLastExcValue { .. } => "ReraiseWithoutLastExcValue",
@@ -2810,6 +2821,7 @@ impl DispatchError {
             | Self::InlineCallArityMismatch { pc, .. }
             | Self::InlineCallIntArityMismatch { pc, .. }
             | Self::InlineCallFloatArityMismatch { pc, .. }
+            | Self::SubWalkDepthExceeded { pc, .. }
             | Self::UnexpectedVoidSubReturn { pc, .. }
             | Self::UnexpectedNonVoidSubReturn { pc, .. }
             | Self::ReraiseWithoutLastExcValue { pc, .. }
@@ -2888,6 +2900,7 @@ impl DispatchError {
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }
+                | Self::SubWalkDepthExceeded { .. }
                 | Self::LoopBearingCalleeInlineUnsupported {
                     blackhole_required: true,
                     ..
