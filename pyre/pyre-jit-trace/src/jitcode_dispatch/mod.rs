@@ -10794,9 +10794,10 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
 ///
 /// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
-/// read goes through the portal frame's `execution_context`.  Both reads are
-/// registered with the heapcache, so a run of merge points with no intervening
-/// call collapses to one pair, and both are loop-invariant.
+/// read goes through the portal's own `ec` red (`interp_jit.py reds =
+/// ['frame', 'ec']`) rather than a frame field.  The read is registered with
+/// the heapcache, so a run of merge points with no intervening call collapses
+/// to one, and it is loop-invariant.
 ///
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
@@ -10818,26 +10819,8 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     if ec.is_null() || !unsafe { (*ec).w_tracefunc }.is_null() {
         return Ok(());
     }
-    let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
-    };
-    let ec_descr = crate::descr::pyframe_execution_context_descr();
-    let ec_descr_index = ec_descr.index();
-    let ec_box = match ctx
-        .trace_ctx
-        .heapcache_getfield_cached(frame_box, ec_descr_index)
-    {
-        Some(cached) => cached,
-        None => {
-            let read =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], ec_descr);
-            ctx.trace_ctx
-                .heapcache_getfield_now_known(frame_box, ec_descr_index, read);
-            ctx.trace_ctx
-                .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(ec as usize)));
-            read
-        }
     };
     let descr = crate::descr::ec_w_tracefunc_descr();
     let descr_index = descr.index();

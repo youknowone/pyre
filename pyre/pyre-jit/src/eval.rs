@@ -8749,7 +8749,7 @@ fn eval_with_jit_inner(
 /// order.  `?` on any of the three would flatten the nesting and drop the hooks
 /// after it.
 fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
-    let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
+    let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
     if ec.is_null() {
         // No execution context is no hook to owe, and no `leave` either.
         return portal_runner_dispatch(frame_root);
