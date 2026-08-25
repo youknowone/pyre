@@ -83,6 +83,7 @@ pub mod _ssl;
 pub mod _stat;
 #[allow(non_snake_case)]
 pub mod _statistics;
+pub mod _suggestions;
 #[allow(non_snake_case)]
 pub mod _symtable;
 #[allow(non_snake_case)]

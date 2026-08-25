@@ -2752,6 +2752,25 @@ pub fn blackhole_resume_via_rd_numb(
             {
                 let (frame_reg, _) =
                     pyre_jit_trace::state::portal_red_regs_at(jitcode_index as i32);
+                // #1311: the admission below is a bare `!= 0`, and a word that
+                // is neither zero nor a frame has reached it — one dump held an
+                // aligned heap address that was not a `PyFrame`, another the
+                // tagged word `2`, and `record_application_traceback` then
+                // dereferenced it.  Which frame of the chain contributes the bad
+                // red, and whether the register is the wrong one for this
+                // jitcode or was simply never filled, are questions the whole
+                // bank answers and the admitted value alone does not, so report
+                // it beside the index read from it.  A report and not a test:
+                // rejecting the word here would exchange the fault for a
+                // silently missing traceback node while the wrong word kept
+                // flowing.
+                if majit_metainterp::bh_debug_enabled() {
+                    eprintln!(
+                        "[bh-chain] frame={frame_index} jitcode={jitcode_index} \
+                         frame_reg={frame_reg} registers_r={:x?}",
+                        frame.registers_r,
+                    );
+                }
                 if frame_reg != u16::MAX {
                     if let Some(&frame_ptr) = frame.registers_r.get(frame_reg as usize) {
                         if frame_ptr != 0 {

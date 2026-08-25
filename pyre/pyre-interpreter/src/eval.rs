@@ -4412,8 +4412,8 @@ impl OpcodeStepExecutor for PyFrame {
         validate_check_eg_match_class(exc_type)?;
         let exc_value = self.pop();
         let anchor = FrameAnchor::new(self);
-        let (matching, rest) = if unsafe { pyre_object::is_none(exc_value) } {
-            (pyre_object::w_none(), pyre_object::w_none())
+        let (matching, rest, wrapped_naked) = if unsafe { pyre_object::is_none(exc_value) } {
+            (pyre_object::w_none(), pyre_object::w_none(), false)
         } else {
             crate::builtins::exception_group_match(exc_value, exc_type)?
         };
@@ -4421,6 +4421,22 @@ impl OpcodeStepExecutor for PyFrame {
         Self::push_anchored(&anchor, matching)?;
         if !unsafe { pyre_object::is_none(matching) } {
             set_current_exception(matching);
+        }
+        if wrapped_naked {
+            // The wrapper this opcode just built has an empty traceback, and the
+            // exception inside it keeps its own chain, so nothing else ever names
+            // this frame on the group.  A group re-raised out of the `except*`
+            // clause reports only the frames it passes through afterwards without
+            // the entry made here.  Both values are on the value stack already,
+            // so the node allocation cannot collect them.
+            let frame = unsafe { &mut *anchor.live() };
+            unsafe {
+                crate::pytraceback::record_application_traceback(
+                    matching,
+                    frame as *mut PyFrame,
+                    frame.last_instr as i64,
+                );
+            }
         }
         Ok(())
     }

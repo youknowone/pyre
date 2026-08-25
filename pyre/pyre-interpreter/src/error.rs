@@ -2390,6 +2390,72 @@ pub fn write_exception<W: Write>(
     writer.write_all(b"\n")
 }
 
+/// `pythonrun.c _PyErr_Display`'s first attempt, which runs before the printer
+/// [`write_exception_from_parts`] is.  The stdlib renderer is where a report
+/// gains what only Python-level code produces: `_find_keyword_typos` rewrites a
+/// bare `invalid syntax` into one naming the keyword the author meant, reading
+/// the `_metadata` the parser hangs on the exception, and nothing in this file
+/// offers that.
+///
+/// `false` says the module was not reachable, the attribute was absent or not
+/// callable, or the call raised -- upstream's `fallback:` label, where the
+/// pending failure is dropped and the caller prints the exception itself.  A
+/// shutdown that has already taken `traceback` apart arrives as that same
+/// `false`, which is what keeps a late report printable at all.
+///
+/// The traceback is installed on the exception first because that is the only
+/// place the stdlib renderer looks for it; [`write_exception_from_parts`]
+/// performs the same install, and doing it twice writes the slot once.
+pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObjectRef) -> bool {
+    if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
+        return false;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc_value);
+    if !exc_tb.is_null()
+        && !unsafe { pyre_object::is_none(exc_tb) }
+        && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
+        && unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_value).is_null() }
+    {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_traceback(exc_value, exc_tb);
+        }
+    }
+    let ec = crate::call::getexecutioncontext();
+    let Ok(module) = crate::importing::importhook(
+        "traceback",
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        0,
+        ec,
+    ) else {
+        return false;
+    };
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
+    let Ok(printer) = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        "_print_exception_bltin",
+    ) else {
+        return false;
+    };
+    if printer.is_null() || !crate::baseobjspace::callable_w(printer) {
+        return false;
+    }
+    let printer_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(printer);
+    let result = crate::baseobjspace::call_function(
+        pyre_object::gc_roots::shadow_stack_get(printer_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(exc_slot)],
+    );
+    if result.is_null() {
+        let _ = crate::call::take_call_error();
+        return false;
+    }
+    true
+}
+
 /// CPython 3.14 `_PyErr_Display(file, exc_type, exc_value, exc_tb)` shape used
 /// by `_thread._excepthook`.
 ///
@@ -3141,23 +3207,31 @@ fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
 }
 
 pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
-    if candidates.len() > MAX_SUGGESTION_CANDIDATES
-        || wrong_name.chars().count() > MAX_SUGGESTION_STRING_SIZE
-    {
+    if candidates.len() >= MAX_SUGGESTION_CANDIDATES {
         return None;
     }
     let wrong_len = wrong_name.chars().count();
-    let mut best_distance = wrong_len;
+    // No candidate has been measured yet, so nothing caps the first one but
+    // its own ratio test below.  A name longer than `MAX_SUGGESTION_STRING_SIZE`
+    // is not rejected here: `suggestion_distance` applies that limit to what is
+    // left after the common affixes are trimmed, so a long name still matches a
+    // candidate it mostly shares.
+    let mut best_distance = usize::MAX;
     let mut suggestion = None;
     for candidate in candidates {
         if candidate == wrong_name {
             continue;
         }
         let candidate_len = candidate.chars().count();
+        // No more than 1/3 of the involved characters should need changed.
         let mut max_distance = (candidate_len + wrong_len + 3) * SUGGESTION_MOVE_COST / 6;
-        max_distance = max_distance.min(best_distance);
+        // Don't take matches we've already beaten.
+        max_distance = max_distance.min(best_distance.saturating_sub(1));
         let distance = suggestion_distance(wrong_name, candidate, max_distance);
-        if distance <= max_distance && (suggestion.is_none() || distance < best_distance) {
+        if distance > max_distance {
+            continue;
+        }
+        if suggestion.is_none() || distance < best_distance {
             suggestion = Some(candidate.clone());
             best_distance = distance;
         }
@@ -3838,6 +3912,76 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
             crate::host_seam::emit_stderr(text.as_bytes());
         }
     }
+}
+
+/// `pythonrun.c _PyErr_Print` for a caller holding the exception rather than
+/// the thread's indicator: every top-level run reports through `sys.excepthook`,
+/// so an application's own hook is what reports the failure it was installed
+/// for, and the default hook is what carries the report to the stdlib renderer
+/// -- which is where a `SyntaxError` gains the misspelled-keyword suggestion
+/// that no printer in this file produces.
+///
+/// `false` says there was no hook to reach, which is `_PyErr_PrintEx`'s
+/// `sys.excepthook is missing` arm, and the caller prints the exception itself.
+/// A hook that runs and fails has still reported: its own failure is named as
+/// unraisable, exactly as upstream does, and this answers `true` rather than
+/// printing the exception a second time.
+pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
+    let Some(sys) = crate::importing::get_sys_module("sys") else {
+        return false;
+    };
+    // A missing name is a hook that is not there; `None` is a hook that is,
+    // and calling it is what reports it.
+    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "excepthook") else {
+        return false;
+    };
+    if hook.is_null() {
+        return false;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(hook);
+    // Materialising the instance is what gives the hook something to report;
+    // the `PyError`'s own fields are raw and this collector does not scan them,
+    // so each of the three arguments is pinned as it is taken.
+    let exc = err.to_exc_object();
+    if exc.is_null() {
+        return false;
+    }
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let w_type = crate::baseobjspace::exception_getclass(exc);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(if w_type.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_type
+    });
+    let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(if w_tb.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_tb
+    });
+    let arguments = [
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        pyre_object::gc_roots::shadow_stack_get(tb_slot),
+    ];
+    let reported = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        &arguments,
+    );
+    if let Err(mut failure) = reported {
+        failure.write_unraisable(
+            pyre_object::w_none(),
+            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
+            pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        );
+    }
+    true
 }
 
 pub fn eprint_exception(err: &PyError, include_traceback: bool) {

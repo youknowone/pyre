@@ -655,6 +655,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!(_opcode);
+    pyre_install_module!(_suggestions);
     pyre_install_module!("_imp"(imp));
 
     // importlib package and its submodules load their real source from disk:

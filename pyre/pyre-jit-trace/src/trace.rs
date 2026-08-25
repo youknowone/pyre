@@ -2844,6 +2844,14 @@ fn try_adopt_single_frame_blackhole(
         // available after the drive — see this path's note on post-drive
         // declines.
         majit_metainterp::jitexc::JitException::BailToInterpreter => {
+            // Reported on the way through, alongside the multi-frame arm's
+            // report of the same handoff: a census that speaks only when the
+            // coordinate is wrong cannot separate `never wrong` from `never
+            // reached`, and only the single-frame arm can say the chain had one
+            // level and therefore no coordinate to get wrong.
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] single-frame bail");
+            }
             let resume_py_pc = frame_resume_py_pc(forwarded_root_addr);
             adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
             sfdbg!("adopted bail with resume_py_pc={resume_py_pc}");
@@ -3487,6 +3495,11 @@ fn try_adopt_multi_frame_blackhole(
         // the same shape, and the same reporting, as the portal CRN/frame
         // identity mismatch `eval.rs pyre_portal_runner` logs.
         majit_metainterp::jitexc::JitException::BailToInterpreter => {
+            // The arrival, ahead of the mismatch report below, so a run that
+            // never mismatches still says whether it ever got here.
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] multi-frame bail");
+            }
             if majit_metainterp::majit_log_enabled()
                 && let Some(image) = mf_terminal.as_ref()
                 && let Ok(index) = i32::try_from(image.jitcode_index)
