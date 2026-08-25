@@ -597,12 +597,21 @@ impl<'c> Lowerer<'c> {
                 Pat::Wild(_) => {
                     default_arm = Some(&arm.body);
                 }
-                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+                // syn parses `OP_NOP => ..` and `other => ..` identically, so
+                // the name is all there is to go on.  A constant is upper case
+                // (rustc's own `non_upper_case_globals` says so), and reading
+                // one as a binding is the silent failure: the arm becomes the
+                // catch-all, its guard is never emitted, and the jitcode
+                // computes whichever constant arm came last no matter what the
+                // discriminant is, while the concrete path stays right.
+                Pat::Ident(pat_ident)
+                    if pat_ident.subpat.is_none() && !is_const_ident(&pat_ident.ident) =>
+                {
                     default_arm = Some(&arm.body);
                 }
                 _ => {
-                    let literals = extract_pat_literals(&arm.pat)?;
-                    guarded_arms.push((literals, &arm.body));
+                    let values = extract_pat_value_tokens(&arm.pat)?;
+                    guarded_arms.push((values, &arm.body));
                 }
             }
         }
@@ -616,12 +625,12 @@ impl<'c> Lowerer<'c> {
 
         let disc_reg = discriminant.reg;
 
-        for (literals, body) in &guarded_arms {
+        for (values, body) in &guarded_arms {
             let next_label = self.alloc_label();
             self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
-            if literals.len() == 1 {
-                let value = literals[0];
+            if values.len() == 1 {
+                let value = &values[0];
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
                 self.emit_op(
@@ -642,7 +651,7 @@ impl<'c> Lowerer<'c> {
                 );
                 self.emit_conditional_guard(eq_reg, &next_label);
             } else {
-                let first_val = literals[0];
+                let first_val = &values[0];
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
@@ -661,7 +670,7 @@ impl<'c> Lowerer<'c> {
                     ),
                     quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
                 );
-                for &lit_val in &literals[1..] {
+                for lit_val in &values[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();

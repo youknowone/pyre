@@ -125,6 +125,17 @@ pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
     }
 }
 
+/// True when an identifier reads as a constant rather than a binding.
+///
+/// syn parses `OP_NOP => ..` and `other => ..` as the same `Pat::Ident`, and
+/// nothing at proc-macro time can resolve which one it is. Rust's own
+/// convention decides it: `non_upper_case_globals` puts constants in upper
+/// case, so an identifier holding no lower-case letter is one.
+pub(super) fn is_const_ident(ident: &syn::Ident) -> bool {
+    let name = ident.to_string();
+    !name.chars().any(|c| c.is_lowercase())
+}
+
 /// Case emitters for `switch_dispatch`.
 ///
 /// Literal/path/or arms become direct `cases.push((key, label))` statements.
