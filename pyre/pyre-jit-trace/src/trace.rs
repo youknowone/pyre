@@ -779,6 +779,12 @@ fn try_commit_midbody_abort_inner(
     payload: &crate::jitcode_dispatch::MidBodyPayload,
     words: MidBodyFlushWords,
 ) -> Result<(), MidBodyDecline> {
+    // Read out of a CLONE of the carrier, which the collector does not visit,
+    // and everything below here can allocate: root the copy for the whole
+    // commit, the way `below_owned` is rooted across the callee's run.
+    let mut ctor_instance = payload.constructor_instance;
+    let _ctor_instance_root =
+        (!ctor_instance.is_null()).then(|| ObjectSlotRoot::new(&mut ctor_instance));
     // An expression-position call sits on top of operands the payload does not
     // record — it counts only the call's own `[callable, null_or_self, args…]`.
     // The entry fallback's `reconstructed_all_ref_call_stack` is the caller's
@@ -1011,6 +1017,18 @@ fn try_commit_midbody_abort_inner(
     let ran = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
         frame.execute_frame(None, None)
+    };
+    // `type_descr_call_impl`'s tail, which this leg has no frame for: discard
+    // `__init__`'s result, raise unless it was `None`, and hand the caller the
+    // instance.  The recording path substitutes it at the CALL
+    // (`inline_call.rs`) and `crate::ctor_continuation` plays the same tail for
+    // the blackhole resume; the rebuild resumes the callee directly on the
+    // caller, so the caller would otherwise receive `__init__`'s `None`.
+    let ran = match ran {
+        Ok(retval) if !ctor_instance.is_null() => {
+            pyre_interpreter::call::check_init_returned_none(retval).map(|()| ctor_instance)
+        }
+        other => other,
     };
     let below_now = &below_owned[..];
     match ran {

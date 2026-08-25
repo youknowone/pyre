@@ -6512,6 +6512,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         }
                         *dst = Some(value);
                     }
+                    // A constructor's CALL result is the instance, and the
+                    // rebuild delivers the callee's own return.  Carry the
+                    // instance so the flush can play `type_descr_call_impl`'s
+                    // tail; without a concrete Ref to carry there is nothing to
+                    // substitute and `__init__`'s `None` would reach the
+                    // caller, so refuse the rebuild instead.
+                    let constructor_instance = match constructor_result {
+                        None => pyre_object::PY_NULL,
+                        Some((_, ConcreteValue::Ref(instance))) if !instance.is_null() => instance,
+                        Some(_) => return Err("constructor instance has no concrete Ref"),
+                    };
                     Ok(MidBodyPayload {
                         abort_kind,
                         outer_jitcode_index,
@@ -6525,6 +6536,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         live_locals,
                         live_stack,
                         return_value: pyre_object::PY_NULL,
+                        constructor_instance,
                         // Attached later by `fbw_set_abort_call_resume`, which
                         // runs in the Err arm below under the entry latch's own
                         // zero-delta gate.
