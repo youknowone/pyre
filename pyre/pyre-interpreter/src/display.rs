@@ -488,6 +488,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || std::ptr::eq(tp, &STR_TYPE as *const PyType)
             || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
             || pyre_object::is_tuple(obj)
+            || pyre_object::is_set_or_frozenset(obj)
             || std::ptr::eq(
                 tp,
                 &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
@@ -551,6 +552,63 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             return Ok(Some(r));
         }
         Err(dunder_returned_non_string(name, r))
+    }
+}
+
+/// `setobject.py W_BaseSetObject.descr_repr` / `setrepr`.
+///
+/// This is the native descriptor body, separate from `space.repr`'s special
+/// method dispatch.  In particular, `set.__repr__(subclass_instance)` must
+/// format the backing set instead of redispatching the subclass override that
+/// called it.  The copied item vector is rooted because each recursive repr
+/// can collect and move every item still waiting in it.
+pub(crate) unsafe fn set_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+
+        let is_frozen = pyre_object::is_frozenset(current_obj());
+        let is_exact_set =
+            pyre_object::is_exact_type(current_obj(), &pyre_object::setobject::SET_TYPE);
+        let class_name = crate::typedef::r#type(current_obj())
+            .map(|w_type| pyre_object::w_type_get_name(w_type.as_ptr()).to_string())
+            .unwrap_or_else(|| {
+                if is_frozen {
+                    "frozenset".to_string()
+                } else {
+                    "set".to_string()
+                }
+            });
+        let Some(_guard) = ReprGuard::enter(current_obj()) else {
+            return Ok(Wtf8Buf::from_string(format!("{class_name}(...)")));
+        };
+        let items = pyre_object::w_set_items(current_obj());
+        let item_base = pyre_object::gc_roots::pin_roots(&items);
+        let mut out = Wtf8Buf::new();
+        if items.is_empty() {
+            out.push_str(&class_name);
+            out.push_str("()");
+            return Ok(out);
+        }
+        if !is_exact_set {
+            out.push_str(&class_name);
+            out.push_str("(");
+        }
+        out.push_str("{");
+        for index in 0..items.len() {
+            if index != 0 {
+                out.push_str(", ");
+            }
+            let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
+            out.push_wtf8(&py_repr_wtf8(item)?);
+        }
+        out.push_str("}");
+        if !is_exact_set {
+            out.push_str(")");
+        }
+        Ok(out)
     }
 }
 
@@ -850,41 +908,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 body
             }
         } else if pyre_object::is_set_or_frozenset(obj) {
-            // `pypy/objspace/std/setobject.py W_BaseSetObject.descr_repr`
-            // → `'%s({%s})' % (typename, items_repr_joined)` for
-            // frozenset and `'{%s}' % items_repr_joined` for set.  Empty
-            // set keeps the `set()` constructor form.
-            let is_frozen = pyre_object::is_frozenset(obj);
-            let is_exact_set = pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE);
-            let class_name = crate::typedef::r#type(obj)
-                .map(|w_type| pyre_object::w_type_get_name(w_type.as_ptr()))
-                .unwrap_or(if is_frozen { "frozenset" } else { "set" });
-            let Some(_guard) = ReprGuard::enter(obj) else {
-                return Ok(Wtf8Buf::from_string(format!("{class_name}(...)")));
-            };
-            let items = pyre_object::w_set_items(obj);
-            let mut out = Wtf8Buf::new();
-            if items.is_empty() {
-                out.push_str(class_name);
-                out.push_str("()");
-                return Ok(out);
-            }
-            if !is_exact_set {
-                out.push_str(class_name);
-                out.push_str("(");
-            }
-            out.push_str("{");
-            for (i, &item) in items.iter().enumerate() {
-                if i != 0 {
-                    out.push_str(", ");
-                }
-                out.push_wtf8(&py_repr_wtf8(item)?);
-            }
-            out.push_str("}");
-            if !is_exact_set {
-                out.push_str(")");
-            }
-            return Ok(out);
+            return set_repr_wtf8(obj);
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
             format_wtf8_repr(pyre_object::w_str_get_wtf8(obj))
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {

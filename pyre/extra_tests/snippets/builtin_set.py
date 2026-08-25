@@ -90,6 +90,15 @@ class S(set):
 assert repr(S()) == "S()"
 assert repr(S([1, 2, 3])) == "S({1, 2, 3})"
 
+
+class SetCustomRepr(set):
+    def __repr__(self):
+        return "<custom " + set.__repr__(self) + ">"
+
+
+assert repr(SetCustomRepr()) == "<custom SetCustomRepr()>"
+assert repr(SetCustomRepr([1, 2, 3])) == "<custom SetCustomRepr({1, 2, 3})>"
+
 recursive = S()
 recursive.add(Hashable(recursive))
 assert repr(recursive) == "S({S(...)})"
@@ -445,6 +454,17 @@ class FS(frozenset):
 
 assert repr(FS()) == "FS()"
 assert repr(FS([1, 2, 3])) == "FS({1, 2, 3})"
+
+
+class FrozenSetCustomRepr(frozenset):
+    def __repr__(self):
+        return "<custom " + frozenset.__repr__(self) + ">"
+
+
+assert repr(FrozenSetCustomRepr()) == "<custom FrozenSetCustomRepr()>"
+assert repr(FrozenSetCustomRepr([1, 2, 3])) == (
+    "<custom FrozenSetCustomRepr({1, 2, 3})>"
+)
 
 
 class MutatingSetKey:

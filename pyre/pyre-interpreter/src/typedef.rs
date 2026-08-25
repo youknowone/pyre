@@ -25922,7 +25922,7 @@ fn setlike_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         Ok(pyre_object::w_str_from_wtf8_managed(
-            crate::display::py_repr_wtf8(args[0])?,
+            crate::display::set_repr_wtf8(args[0])?,
         ))
     }
 }
