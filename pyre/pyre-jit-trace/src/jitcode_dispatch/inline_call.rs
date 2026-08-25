@@ -124,36 +124,37 @@ unsafe fn positional_defaults_for_inline(
     })
 }
 
-/// One keyword-only parameter's binding: the interned name the lookup keys
-/// on, its hash, the entry index the record-time lookup settled on, and the
-/// value that entry held.
+/// One keyword-only parameter's binding: the namespace slot's stored
+/// value-or-cell, and the value that unwraps to.
 struct KwonlyDefaultInline {
-    key: pyre_object::PyObjectRef,
-    hash: i64,
-    index: i64,
+    stored: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
 }
 
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
 /// the emit so it re-establishes the same shape instead of re-deriving it.
 struct KwonlyDefaultsInline {
-    dict: pyre_object::PyObjectRef,
-    canonical_dict: pyre_object::PyObjectRef,
+    mapping: pyre_object::PyObjectRef,
+    strategy: *mut pyre_object::celldict::ModuleDictStrategy,
     values: Vec<KwonlyDefaultInline>,
 }
 
 /// The `w_kw_defs` entry `_match_signature` fills each keyword-only
-/// parameter, in slot order.  A parameter the dict holds no entry for has no
-/// default at all and the call would raise `TypeError`, so the whole inline
+/// parameter, in slot order.  A parameter the mapping holds no entry for has
+/// no default at all and the call would raise `TypeError`, so the whole inline
 /// declines rather than reproduce a raise.
 ///
-/// The interned name is the only thing this carries into the trace as a
-/// constant.  The dict, the entry index and the value are each re-derived live
-/// by the emitting half, and that is what keeps an in-place
-/// `f.__kwdefaults__[name] = ...` visible — every runtime observes such a
-/// write immediately, while an ordinary dict has no version the walker can pin
-/// (`walker_pin_namespace_version` wants a module dict's strategy box), so a
-/// baked value would be the constant nothing watches that it refuses to make.
+/// A definition installs these through `function.py init_kwdefaults_dict`,
+/// which builds the namespace mapping precisely so each entry is normally
+/// constant.  That is what is read here: the slot's stored cell, baked, with
+/// the mapping's version pinned.  A rebind, a `del`, a new key or a storage
+/// switch all bump that version and revoke the constant, while an in-place
+/// `f.__kwdefaults__[name] = ...` is absorbed by the cell and stays visible
+/// because the fold reads the cell's field live.
+///
+/// An ordinary dict here is an assigned `f.__kwdefaults__` — the setter leaves
+/// what it is given unconverted, matching `fset_func_kwdefaults` — and has no
+/// version to pin, so it declines.
 ///
 /// # Safety
 /// `callable` must be the live `Function` and `w_code` its code object.
@@ -167,21 +168,15 @@ unsafe fn kwonly_defaults_for_inline(
     if dict.is_null() {
         return None;
     }
-    let canonical_dict = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    let canonical_str = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    if canonical_dict.is_null() || canonical_str.is_null() {
-        return None;
-    }
-    // The three tests the `dict.lookup` fold gates on, for the same reasons: a
-    // dict SUBCLASS shares `ob_type` but reaches `__missing__` on a miss, and
-    // the unicode strategy is what makes the probe non-raising by proving
-    // every stored key is an exact str compared by WTF-8 bytes.
-    if unsafe {
-        !std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
-            || !std::ptr::eq((*dict).w_class, canonical_dict)
-            || pyre_object::dictmultiobject::w_dict_get_strategy(dict).strategy_kind()
-                != pyre_object::dictmultiobject::StrategyKind::Unicode
-    } {
+    // The version lives on the strategy box, so that is what the pin names and
+    // what has to exist.  An ordinary dict has none.
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
+    // The strategy box and every cell under it are baked, and a freshly minted
+    // `ConstPtr` sits in the walker's `registers_r` until it is recorded, which
+    // no registered root area walks.  Take only addresses a collection cannot
+    // move -- a definition's mapping is young, unlike the module namespaces the
+    // same fold usually runs against.
+    if strategy.is_null() || majit_gc::can_move(majit_ir::GcRef(strategy as usize)) {
         return None;
     }
     let raw = unsafe {
@@ -197,49 +192,26 @@ unsafe fn kwonly_defaults_for_inline(
     }
     let mut out = Vec::with_capacity(kwonly_count);
     for slot in arg_count..arg_count + kwonly_count {
-        let key = pyre_object::unicodeobject::intern_str_value(varnames[slot].as_str());
-        if key.is_null()
-            || unsafe {
-                !std::ptr::eq((*key).ob_type, &pyre_object::pyobject::STR_TYPE)
-                    || !std::ptr::eq((*key).w_class, canonical_str)
-            }
-        {
+        let Some(cell_slot) =
+            crate::state::module_dict_cell_slot_direct(dict, varnames[slot].as_str())
+        else {
             return None;
-        }
-        // The key is baked, and a freshly minted `ConstPtr` sits in the
-        // walker's `registers_r` until it is recorded, which no registered
-        // root area walks.  Take only a name a collection cannot move.
-        if majit_gc::can_move(majit_ir::GcRef(key as usize)) {
-            return None;
-        }
-        let hash = unsafe { pyre_object::dictmultiobject::w_dict_unicode_key_hash(key) };
-        let index = unsafe {
-            pyre_object::dictmultiobject::w_dict_unicode_lookup_index(dict, key, hash, 0)
         };
-        if index < 0 {
+        let Some(stored) = crate::state::module_dict_cell_value_direct(dict, cell_slot) else {
+            return None;
+        };
+        if stored.is_null() || majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
             return None;
         }
-        let value = unsafe {
-            pyre_object::dictmultiobject::w_dict_unicode_value_at_checked(
-                dict,
-                index as usize,
-                key,
-                hash,
-            )
-        };
+        let value = unsafe { pyre_object::celldict::unwrap_cell(stored) };
         if value.is_null() {
             return None;
         }
-        out.push(KwonlyDefaultInline {
-            key,
-            hash,
-            index,
-            value,
-        });
+        out.push(KwonlyDefaultInline { stored, value });
     }
     Some(KwonlyDefaultsInline {
-        dict,
-        canonical_dict,
+        mapping: dict,
+        strategy,
         values: out,
     })
 }
@@ -4214,9 +4186,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if callable_guard_value != callable {
             return resolved_inline_decline(op.pc, line!());
         }
-        let Some(resolved) =
-            (unsafe { kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count) })
-        else {
+        // Seeding from baked cells stands on a `GuardValue` that `w_kw_defs`
+        // still holds the mapping those cells belong to, so the callee has to
+        // be a function that outlived the recording.  A callee this trace
+        // allocated itself is a fresh function every iteration, and the walker
+        // reads the slot off its raw address: the allocator hands the next
+        // incarnation the same address, so the peeled body's load disagrees
+        // with what the heap cache holds for that address and trips
+        // `_opimpl_getfield_gc_any_pureornot`'s sanity check.  Same test the
+        // `set_function_attribute` fold uses to tell the two apart.
+        if ctx.trace_ctx.heap_cache().is_unescaped(callable_guard_op) {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        let resolved: Option<KwonlyDefaultsInline> =
+            crate::jitcode_dispatch::diag::spec_gate(
+                crate::jitcode_dispatch::diag::SpecFold::KwonlyDefaultsInline,
+                || {
+                    Ok::<_, DispatchError>(unsafe {
+                        kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count)
+                    })
+                },
+            )?;
+        let Some(resolved) = resolved else {
             return resolved_inline_decline(op.pc, line!());
         };
         Some(resolved)
@@ -5408,146 +5399,44 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `scope_w[i] = space.finditem_str(w_kw_defs, name)` (`_match_signature`),
     // replacing the keyword-only placeholders pushed above.
     //
-    // Every part of the read is live.  The dict comes off the guarded
-    // function, the entry index is re-derived by the same elidable
-    // `w_dict_unicode_lookup_index` the `dict.lookup` fold emits — so the
-    // optimizer may hoist it while a store that moves the entry invalidates it
-    // — and the value is read through `jit_dict_value_at`, which re-validates
-    // the index against the key it came from.  That last read is what keeps an
-    // in-place `f.__kwdefaults__[name] = ...` visible on the very next call,
-    // which is what every runtime does.
+    // Nothing is read at run time.  Two pins stand in for the read: the
+    // callee's `w_kw_defs` slot, which a `f.__kwdefaults__ = {...}` rebind
+    // fails, and the mapping's own strategy version, which a `del`, a new
+    // key, a replaced entry or a storage switch revokes.  What is left --
+    // storing over an entry that is already there -- is absorbed by the cell
+    // without a version bump, and the fold below reads that cell's field live,
+    // so it is observed on the very next call the way every runtime does it.
     if let Some(resolved) = kwonly_defaults {
-        let kw_defs_op = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
+        // Taken off `callable_guard_op`, which the resolve proved names
+        // `callable`.  `function.py` does not list `w_kw_defs` among the
+        // `_immutable_fields_`, and `fset_func_kwdefaults` is a plain store, so
+        // there is no invalidation to record against -- the cells baked below
+        // are this mapping's, and only pinning the slot that holds it makes
+        // that true on every later execution.  A `f.__kwdefaults__ = {...}`
+        // rebind fails the guard, and so does a callee defined inside the loop,
+        // whose next iteration builds a mapping of its own.  `defs_w` carries
+        // the same shape for the positional defaults.
+        walker_guard_function_field(
+            ctx,
+            op.pc,
             callable_guard_op,
             crate::descr::function_w_kw_defs_descr(),
-        );
-        ctx.trace_ctx.try_set_opref_concrete(
-            kw_defs_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(resolved.dict as usize)),
-        );
-        // Which shape the mapping was read with is all that trace time
-        // decided; the entry itself is read live below.
-        //
-        // With the function guarded live, re-check that shape directly, and a
-        // later `f.__kwdefaults__ = {...}` is picked up by the field read
-        // itself.  With it baked, the read comes off a `ConstPtr` — sound
-        // here only because the arm above proved the callee cannot move — and
-        // nothing watches the slot, so pin the mapping by identity instead:
-        // that is what a rebind has to trip.  An in-place
-        // `f.__kwdefaults__[name] = ...` keeps the same object and stays
-        // visible through the live entry read, which is what it must do.
-        if guards_the_callee_function {
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[kw_defs_op])?;
-            walker_guard_class(
-                ctx,
-                op.pc,
-                kw_defs_op,
-                &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
-            )?;
-            // A dict SUBCLASS shares `ob_type` and reaches `__missing__`.  The
-            // resolve established this `w_class` and is what proved it
-            // non-null.
-            walker_guard_exact_w_class(ctx, op.pc, kw_defs_op, resolved.canonical_dict)?;
-        } else {
-            let dict_expected = ctx.trace_ctx.const_ref(resolved.dict as i64);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardValue, &[kw_defs_op, dict_expected], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        }
-        // The strategy is guarded either way: it is what proves every stored
-        // key is an exact str compared by WTF-8 bytes, so the probes below
-        // cannot run user code, and pinning the mapping by identity does not
-        // pin that — storing a non-str key switches the same dict off it.
-        let strategy = crate::state::opimpl_getfield_gc_i(
+            resolved.mapping as i64,
+        )?;
+        // `walker_pin_namespace_version`'s body, opened up: the resolve already
+        // read the strategy box and proved it immovable, and there is no way
+        // back from here to act on the `Ok(false)` the wrapper would return.
+        let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+        crate::state::record_quasiimmut_field(
             ctx.trace_ctx,
-            kw_defs_op,
-            crate::descr::dict_strategy_word_descr(),
+            strategy_const,
+            crate::descr::module_dict_version_descr(),
         );
-        let unicode_strategy_const = ctx
-            .trace_ctx
-            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[strategy, unicode_strategy_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, unicode_strategy_const);
-
-        let hash_fn = {
-            let f: extern "C" fn(i64) -> i64 =
-                pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash;
-            f as *const ()
-        };
-        let lookup_fn: extern "C" fn(i64, i64, i64, i64) -> i64 =
-            pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_lookup_index;
+        // One guard drains both markers: it asks whether anything recorded
+        // this epoch was invalidated, not which.
+        walker_flush_guard_not_invalidated(ctx, op.pc)?;
         for (offset, kwonly) in resolved.values.into_iter().enumerate() {
-            let key_op = ctx.trace_ctx.const_ref(kwonly.key as i64);
-            let hash_op = ctx.trace_ctx.call_typed_with_effect_pure(
-                OpCode::CallI,
-                hash_fn,
-                &[key_op],
-                &[majit_ir::Type::Ref],
-                majit_ir::Type::Int,
-                majit_ir::EffectInfo::new(
-                    majit_ir::ExtraEffect::ElidableCannotRaise,
-                    majit_ir::OopSpecIndex::None,
-                ),
-                &[
-                    majit_ir::Value::Int(hash_fn as i64),
-                    majit_ir::Value::Ref(majit_ir::GcRef(kwonly.key as usize)),
-                ],
-                majit_ir::Value::Int(kwonly.hash),
-            );
-            let mut lookup_effect = majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::DictLookup,
-            );
-            lookup_effect.extradescrs = Some(vec![
-                crate::descr::dict_lookup_namespace_descr(),
-                crate::descr::dict_lookup_entries_array_descr(),
-            ]);
-            let lookup_flag = ctx.trace_ctx.const_int(0);
-            let index_op = ctx.trace_ctx.call_typed_with_effect(
-                OpCode::CallI,
-                lookup_fn as *const (),
-                &[kw_defs_op, key_op, hash_op, lookup_flag],
-                &[
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Int,
-                ],
-                majit_ir::Type::Int,
-                lookup_effect,
-            );
-            ctx.trace_ctx
-                .set_opref_concrete(index_op, majit_ir::Value::Int(kwonly.index));
-            let zero = ctx.trace_ctx.const_int(0);
-            let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[index_op, zero]);
-            ctx.trace_ctx
-                .set_opref_concrete(nonneg, majit_ir::Value::Int(1));
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonneg])?;
-
-            let value_op = ctx.trace_ctx.call_ref_typed_with_effect(
-                crate::helpers::jit_dict_value_at as *const (),
-                &[kw_defs_op, index_op, key_op, hash_op],
-                &[
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                ],
-                majit_ir::EffectInfo::new(
-                    majit_ir::ExtraEffect::CannotRaise,
-                    majit_ir::OopSpecIndex::None,
-                ),
-            );
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[value_op])?;
-            ctx.trace_ctx.set_opref_concrete(
-                value_op,
-                majit_ir::Value::Ref(majit_ir::GcRef(kwonly.value as usize)),
-            );
+            let (value_op, _) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)?;
             callee_args[nparams + offset] = value_op;
         }
     }

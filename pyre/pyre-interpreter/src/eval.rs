@@ -4303,7 +4303,7 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::function_set_defaults(func, attr);
             },
             MakeFunctionFlag::KwOnlyDefaults => unsafe {
-                crate::function_set_kwdefaults(func, attr);
+                crate::function::function_set_kwdefaults_from_definition(func, attr);
             },
             MakeFunctionFlag::Annotations => {
                 // `pypy/interpreter/function.py:553-559

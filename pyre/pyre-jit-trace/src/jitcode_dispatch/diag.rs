@@ -414,6 +414,7 @@ spec_folds! {
     LoadDeref            => ("load_deref",               "residual_call", "-"),
     FrameLineno          => ("frame_lineno",             "specialize",    "load_attr"),
     BareSuperCall        => ("bare_super_call",          "residual_call", "-"),
+    KwonlyDefaultsInline => ("kwonly_defaults_inline",   "inline_call",   "-"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();

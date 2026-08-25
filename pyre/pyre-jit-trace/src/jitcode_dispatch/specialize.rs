@@ -6100,7 +6100,53 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
         _ => return Ok(None),
     };
 
+    // `KwOnlyDefaults` is the one flag whose stored value is not the operand:
+    // a definition's keyword-only defaults are rebuilt into the namespace
+    // mapping (`function.py init_kwdefaults_dict`), whose entries a trace can
+    // fold.  Record time reaches that rebuild through
+    // `jit_set_function_attribute` below, so the store emitted for the compiled
+    // path has to install the same flavour or the two views of
+    // `Function.w_kw_defs` disagree.
+    //
+    // Run the rebuild here, while declining is still possible: it allocates,
+    // and the function this is stamping is a fresh allocation of the traced
+    // iteration, so a collection under it moves the object `w_func` names.  The
+    // trace's own concrete is forwarded, so re-reading it off `func_op` is what
+    // recovers the current address.
+    let (w_attr, w_func) = if flag == MakeFunctionFlag::KwOnlyDefaults as i64 {
+        let w_converted = unsafe { pyre_interpreter::function::init_kwdefaults_dict(w_attr) };
+        let Some(w_func) = walker_concrete_ref_object(ctx, func_op) else {
+            return Ok(None);
+        };
+        (w_converted, w_func)
+    } else {
+        (w_attr, w_func)
+    };
+
     // --- commit to the fold: emit IR (no further declines) ---
+    // The rebuild is a residual because it allocates — but it takes only the
+    // mapping.  `func_op` is not an argument and stays unescaped, which is what
+    // keeps the `defaults` store emitted behind this one foldable.  Rebuilding
+    // an already-rebuilt mapping is a no-op, so the execution call below needs
+    // no special case for having been handed the rebuilt one.
+    let attr_op = if flag == MakeFunctionFlag::KwOnlyDefaults as i64 {
+        let converted_op = ctx.trace_ctx.call_ref_typed_with_effect(
+            crate::helpers::jit_init_kwdefaults_dict as *const (),
+            &[attr_op],
+            &[majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            converted_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(w_attr as usize)),
+        );
+        converted_op
+    } else {
+        attr_op
+    };
     let null_op = ctx.trace_ctx.const_null();
     for (descr, carries_operand) in stores {
         let value = if carries_operand { attr_op } else { null_op };
