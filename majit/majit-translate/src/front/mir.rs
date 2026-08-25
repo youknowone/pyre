@@ -7540,14 +7540,34 @@ impl<'a> Lowering<'a> {
                 // escape guard (a failing shape stays residual — safe).  The
                 // read leaf (`index`, a value copy) needs no such guard.
                 let workspace_index = self.is_workspace_index_call(&reg);
+                // `ArrayRead` addresses its element as `base + index *
+                // itemsize`, and the descr the unfenced legs mint carries one
+                // target word as that itemsize.  RPython can leave it implicit
+                // — every non-primitive there IS a one-word GC pointer — but a
+                // Rust `Vec<T>` stores `T` inline, so a `Vec<u8>` strides 1 and
+                // a `Vec<String>` strides 24 while both read 8.  Admit only an
+                // element whose type proves the stride
+                // ([`json_ty_is_word_sized_array_element`]); anything else
+                // falls through to the residual call, where Rust computes the
+                // address.  The workspace arm needs no proof: its `pyre_` fence
+                // admits exactly the three element banks named below, all of
+                // them one word.
+                let element_is_one_word = tyref_index_element_node(&call.dest.ty, self.llbc)
+                    .is_some_and(|elem| json_ty_is_word_sized_array_element(elem, self.llbc));
                 if args.len() == 2
                     && (workspace_index
-                        || (self.is_vec_index_call(&reg)
-                            && (!is_vec_index_mut_regular(&reg, self.llbc)
-                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
-                        || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
-                            && (!self.is_slice_scalar_index_mut_call(&reg)
-                                || add_dest_used_only_as_single_deref(self.body, dest_local))))
+                        || (element_is_one_word
+                            && ((self.is_vec_index_call(&reg)
+                                && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                    || add_dest_used_only_as_single_deref(
+                                        self.body, dest_local,
+                                    )))
+                                || (self
+                                    .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                                    && (!self.is_slice_scalar_index_mut_call(&reg)
+                                        || add_dest_used_only_as_single_deref(
+                                            self.body, dest_local,
+                                        ))))))
                 {
                     let res = self
                         .graph
@@ -17682,6 +17702,101 @@ fn strip_ty_indirections<'l>(
     None
 }
 
+/// The array element type behind an `Index::index` / `IndexMut::index_mut`
+/// destination — exactly one reference level off its `&T` / `&mut T`.
+///
+/// [`strip_ty_wrappers`] cannot do this: it peels `Ref` repeatedly, so over a
+/// `Vec<&i64>`'s `&&i64` it answers `i64`, the element type of neither the
+/// vector nor the borrow.
+fn tyref_index_element_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?
+        .as_object()?
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.get(1))
+}
+
+/// `true` only when an array element of this type provably occupies one target
+/// word — the shape the identity-less array descr minted by the `Vec` and
+/// slice index legs actually describes.
+///
+/// [`ValueType`] cannot answer it. `Unsigned` is width-less, one variant
+/// spanning `u8` through `usize`, and every non-primitive shape — `()` and an
+/// unresolved dedup id included — flattens to `Ref(None)`. A `Vec<u8>` and a
+/// `Vec<String>` are indistinguishable there while striding 1 and 24 bytes, so
+/// the element type has to answer, and only a positive answer counts: a shape
+/// this cannot name stays residual, where Rust computes the address itself.
+fn json_ty_is_word_sized_array_element(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    // A pointer element — `{"Ref": [region, ty, kind]}` / `{"RawPtr": [ty,
+    // kind]}` — is one word only while it is thin, so it inherits the
+    // question: a pointer to an unsized pointee carries a length or a vtable
+    // beside the address.
+    if let Some(pointee) = obj
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.get(1))
+        .or_else(|| {
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+        })
+    {
+        return json_ty_is_statically_sized(pointee, llbc);
+    }
+    // Pointer-width scalars. A narrower one strides 1, 2 or 4 while the descr
+    // reads it eight bytes at a time.
+    let Some(lit) = obj.get("Literal").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    matches!(
+        lit.get("UInt").and_then(serde_json::Value::as_str),
+        Some("Usize" | "U64")
+    ) || matches!(
+        lit.get("Int").and_then(serde_json::Value::as_str),
+        Some("Isize" | "I64")
+    ) || matches!(
+        lit.get("Float").and_then(serde_json::Value::as_str),
+        Some("F64")
+    )
+}
+
+/// `true` when `node` names a type of compile-time-known size, which is what
+/// makes a pointer to it thin.
+///
+/// Recognition is positive-only, and deliberately so: `[T]`, `str` and
+/// `dyn Trait` each have two Charon spellings — a top-level `{"Slice": elem}`
+/// and the `{"Adt": {"id": {"Builtin": "Slice"}}}` form
+/// [`charon_builtin_adt_to_ast_string`] renders — so a list of the unsized
+/// shapes would answer "sized" for whichever spelling it forgot. A whitelist
+/// answers `false` for both, and for an unresolved trait projection too.
+fn json_ty_is_statically_sized(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    // A scalar, a fixed-length array, and any pointer (thin or fat) are all
+    // sized values.
+    if obj.contains_key("Literal")
+        || obj.contains_key("Array")
+        || obj.contains_key("Ref")
+        || obj.contains_key("RawPtr")
+    {
+        return true;
+    }
+    let Some(id) = obj
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|adt| adt.get("id"))
+    else {
+        return false;
+    };
+    // The tuple atom and a named `{"Adt": def_id}`; the `Builtin` ids stay
+    // out, so `Slice` and `Str` decline with the top-level spellings.
+    id.as_str() == Some("Tuple") || id.as_object().is_some_and(|m| m.contains_key("Adt"))
+}
+
 /// Does the iterator ADT named by `path` hand back a reference *it* added,
 /// rather than the element itself?
 ///
@@ -22303,8 +22418,8 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr,
+        fn_ptr_family_for, json_ty_is_word_sized_array_element, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -25177,6 +25292,74 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    /// The identity-less array descr the `Vec` and slice index legs mint
+    /// describes a one-target-word element, so only an element type that
+    /// proves that width may reach it.  RPython can leave the width implicit
+    /// because every non-primitive there is a one-word GC pointer; a Rust
+    /// `Vec<T>` stores `T` inline, so `Vec<u8>` strides 1 and `Vec<String>`
+    /// strides 24 while the descr reads 8 from both.
+    #[test]
+    fn only_a_word_sized_element_reaches_the_identity_less_array_descr() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let admits = |ty: serde_json::Value| json_ty_is_word_sized_array_element(&ty, &llbc);
+        let uint = |w: &str| serde_json::json!({"Literal": {"UInt": w}});
+        let int = |w: &str| serde_json::json!({"Literal": {"Int": w}});
+        let named_adt = serde_json::json!({"Adt": {"id": {"Adt": 7}, "generics": {"types": []}}});
+        let borrow =
+            |pointee: serde_json::Value| serde_json::json!({"Ref": ["_", pointee, "Shared"]});
+
+        // Pointer-width scalars, and a thin borrow or raw pointer.
+        assert!(admits(int("I64")));
+        assert!(admits(int("Isize")));
+        assert!(admits(uint("Usize")));
+        assert!(admits(serde_json::json!({"Literal": {"Float": "F64"}})));
+        assert!(admits(borrow(named_adt.clone())));
+        assert!(admits(
+            serde_json::json!({"RawPtr": [named_adt.clone(), "Mut"]})
+        ));
+
+        // Narrower scalars — the `bytearray` / `rbigint` digit population,
+        // which `ValueType::Unsigned` cannot distinguish from `usize`.
+        for w in ["U8", "U16", "U32"] {
+            assert!(!admits(uint(w)), "{w} strides narrower than a word");
+        }
+        assert!(!admits(serde_json::json!({"Literal": {"Bool": null}})));
+
+        // A named ADT is the element itself, not a pointer to one, so its
+        // size is whatever the struct is — `String` is three words.
+        assert!(!admits(named_adt));
+    }
+
+    /// `[T]`, `str` and `dyn Trait` each have two Charon spellings — a
+    /// top-level `{"Slice": elem}` and the `{"Adt": {"id": {"Builtin":
+    /// "Slice"}}}` form.  A pointer to any of them is fat, and the width
+    /// proof has to decline BOTH spellings: a list of the unsized shapes
+    /// would answer "sized" for whichever one it forgot.
+    #[test]
+    fn both_charon_spellings_of_an_unsized_pointee_decline() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let borrow = |pointee: serde_json::Value| {
+            json_ty_is_word_sized_array_element(
+                &serde_json::json!({"Ref": ["_", pointee, "Shared"]}),
+                &llbc,
+            )
+        };
+        let u8_ty = serde_json::json!({"Literal": {"UInt": "U8"}});
+        let builtin = |name: &str, args: serde_json::Value| serde_json::json!({"Adt": {"id": {"Builtin": name}, "generics": {"types": args}}});
+
+        assert!(!borrow(serde_json::json!({"Slice": u8_ty.clone()})));
+        assert!(!borrow(builtin(
+            "Slice",
+            serde_json::json!([u8_ty.clone()])
+        )));
+        assert!(!borrow(serde_json::json!({"Str": null})));
+        assert!(!borrow(builtin("Str", serde_json::json!([]))));
+        assert!(!borrow(serde_json::json!({"DynTrait": {}})));
+
+        // A fixed-length array IS sized, so a pointer to one stays thin.
+        assert!(borrow(serde_json::json!({"Array": [u8_ty, "14"]})));
     }
 
     #[test]
