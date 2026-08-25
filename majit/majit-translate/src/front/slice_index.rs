@@ -1195,7 +1195,7 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn range_feeds_only_index(
+pub(crate) fn range_feeds_only_index(
     graph: &FunctionGraph,
     range_result: &Variable,
     index_result: &Variable,

@@ -7524,6 +7524,16 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // A literal scalar index (`slice.get(1)`) has no Place type to retain
+        // in `second_arg_ty`.  Charon still records the method's `I` type in
+        // the regular-call generics, so classify the `get` before consuming
+        // `call.func`.  This is the same two-source type test used for
+        // `SliceIndex::index` below and keeps Range* implementations on the
+        // separate getslice lowering.
+        let slice_get_index_is_scalar = match &call.func {
+            CallFunc::Regular(reg) => self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref()),
+            _ => false,
+        };
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
@@ -10293,6 +10303,32 @@ impl<'a> Lowering<'a> {
         {
             self.slice_get_sites.push(site);
         }
+        // `<[T]>::get(slice, start..)` returns an Option subslice.  Preserve
+        // that Option shape with the same guarded diamond as scalar `get`, but
+        // make the successful payload RPython's `getslice(start, None)`.  The
+        // RangeFrom aggregate was captured at construction time; exact value
+        // identity keeps this arm separate from arbitrary SliceIndex impls.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && !slice_get_index_is_scalar
+            && let Some(range_site) = self
+                .slice_index_rangefrom_sites
+                .iter()
+                .find(|range_site| range_site.range_result == args[1])
+                .cloned()
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            site.access = crate::front::slice_first::SliceAccess::RangeFrom {
+                range: range_site.range_result,
+                start: range_site.start,
+            };
+            self.slice_first_sites.push(site);
+        }
         // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
         // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
         // foreign leaf (its `Self` is a primitive integer, so `lower_call`
@@ -10975,6 +11011,31 @@ impl<'a> Lowering<'a> {
                 .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
                 .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc));
         is_index && callsite_index_is_scalar
+    }
+
+    /// `<[T]>::get::<I>(slice, index)` with a scalar `I`.  For a local index,
+    /// MIR supplies the type through the operand Place; for a literal index it
+    /// only survives in Charon's method generics (`[T, I]`).  Preserve that
+    /// distinction so `get(1)` takes the guarded-item Option diamond while
+    /// `get(1..)` continues through `front::slice_index` as a subslice.
+    fn is_slice_get_scalar_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_get = self
+            .llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::get");
+        let callsite_index_is_scalar = index_ty
+            .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc))
+            || reg
+                .generics
+                .get("types")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.get(1))
+                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+                .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc));
+        is_get && callsite_index_is_scalar
     }
 
     fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
@@ -12785,23 +12846,23 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized `<[T]>::first(slice)` call into a
     /// [`crate::front::slice_first::SliceFirstSite`] — the `Option` enum root +
     /// `Some` variant owners the length-checked diamond post-pass spells its
-    /// arms with.  Gated on [`Self::option_residual_narrow_root`] returning
-    /// `Some`: that is exactly the shape `lower_call` appends a trailing
-    /// `__cast_instance_intrinsic` narrowing to (the cast the post-pass absorbs and
-    /// re-applies per arm), and it declines a value-slice `Option<u8>` /
-    /// `Option<i64>` (no registered pointee root) cleanly, leaving the residual
-    /// call for the census Skip.  `None` when the destination is not a
-    /// resolvable narrow-root `Option`.
+    /// arms with.  The post-pass accepts both representations that
+    /// `lower_call` can produce: a reference-payload result followed by
+    /// `__cast_instance_intrinsic`, and a value-payload `Option<u8>` / `Option<i64>`
+    /// with no trailing cast.  Reuse the consumer-owner spelling so unsigned
+    /// payloads stay on the bare `Option` root used by checked arithmetic,
+    /// while other payloads keep their per-instantiation class.  `None` when
+    /// the destination is not a resolvable `Option`.
     fn recognize_slice_first_site(
         &self,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::slice_first::SliceFirstSite> {
-        self.option_residual_narrow_root(dest_ty)?;
-        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(dest_ty)?;
         Some(crate::front::slice_first::SliceFirstSite {
             result_var: result_var.clone(),
-            index: None,
+            access: crate::front::slice_first::SliceAccess::First,
             option_owner,
             some_owner,
             payload_ty,
@@ -28973,6 +29034,78 @@ mod tests {
                 .flat_map(|b| &b.operations)
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "the successful get arm must read the guarded element"
+        );
+    }
+
+    /// Slice `get` is not object-pointer-specific, and a literal index has no
+    /// Place type.  This production helper exercises both the generalized
+    /// Option payload recognizer and its generic-type fallback for `get(1)`.
+    #[test]
+    #[ignore]
+    fn slice_get_constant_index_lowers_to_a_guarded_item_read() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let name = "pyre_interpreter::module::unicodedata::char_and_default";
+        let graph = super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core", "slice", "<Impl>", "get"])
+            }),
+            "{name}: scalar slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "{name}: successful get arm must read the guarded item"
+        );
+    }
+
+    /// `args.get(1..).unwrap_or(&[])` is Rust's checked spelling of PyPy's
+    /// ordinary `args[1:]`.  Keep `get`'s Option semantics in a `start <= len`
+    /// diamond and materialize the successful payload as the deferred
+    /// `getslice(start, None)` marker.
+    #[test]
+    #[ignore]
+    fn slice_get_rangefrom_lowers_to_a_guarded_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let name = "pyre_interpreter::module::unicodedata::ucd_method_args";
+        let graph = super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core", "slice", "<Impl>", "get"])
+            }),
+            "{name}: RangeFrom slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["__getslice_rangefrom"])
+            }),
+            "{name}: successful get arm must carry the deferred getslice"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "le")),
+            "{name}: RangeFrom get must guard start <= len"
         );
     }
 

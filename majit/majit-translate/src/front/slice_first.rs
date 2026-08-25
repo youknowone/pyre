@@ -1,4 +1,4 @@
-//! `<[T]>::first(slice)` → length-checked `Option<&T>` diamond.
+//! `<[T]>::first/get(slice, index)` → length-checked `Option` diamond.
 //!
 //! ## Positioning
 //!
@@ -29,21 +29,20 @@
 //!
 //! `first` returns `Option<&T>`, but the `Some` payload is materialised by
 //! `OpKind::ArrayRead` (element 0), which yields the element VALUE, not a
-//! pointer-to-slot.  In the list model a `&T` and a `T` are the same one GC
-//! pointer word, and no consumer derefs a slot-pointer (there is no `copied`
-//! pass that would; the front has no pointer-to-slot op at all).  So the
-//! `&T`-vs-`T` distinction collapses harmlessly, and the value payload is both
-//! the only representable and the correct choice.  The receiver is a
-//! `SomeList`-modelled slice (its `Input` op carries the list-container
-//! `class_root`), so `__len` and the element read repr-dispatch to
+//! pointer-to-slot.  RPython's list model likewise returns the item value from
+//! `getitem`; no surviving consumer dereferences a Rust slot pointer.  This is
+//! true for both GC-reference items and scalar items (`u8`, `i64`, …), and the
+//! site's `payload_ty` keeps their register bank exact.  The receiver is a
+//! `SomeList`-modelled slice, so `__len` and the element read repr-dispatch to
 //! `arraylen_gc` / `getarrayitem` on the underlying length-prefixed GcArray.
 //!
 //! ## The rewrite (`rewire_one_slice_first_site`)
 //!
 //! Block A holds the residual `first` call producing `opt`.  Because
-//! `Option<&PyObjectRef>` triggers `option_residual_narrow_root`, `lower_call`
-//! appends a trailing `__cast_instance_intrinsic` after the call, so the call is NOT
-//! A's last op — the block-A skeleton absorbs that optional cast, exactly as
+//! A reference-payload `Option<&PyObjectRef>` may append a trailing
+//! `__cast_instance_intrinsic` after the call, so the call is not A's last op; a
+//! scalar-payload `Option<u8>` has no such cast.  The block-A skeleton accepts
+//! both shapes and absorbs the optional cast, exactly as
 //! [`crate::front::option_map_or`] does.  The rewrite:
 //! 1. drops the `first` call (+ absorbed cast) and closes A with a
 //!    `bool(len(slice) > 0)` branch to two fresh arms;
@@ -74,6 +73,10 @@ pub(crate) struct SliceFirstSite {
     /// The `first` call result (the `Option<&T>` value) — locates block A.  The
     /// slice operand is read from that located call's `args[0]`.
     pub result_var: Variable,
+    /// The access performed in the successful arm.  `RangeFrom` retains both
+    /// the transparent range shell (for its exclusive-consumer proof/removal)
+    /// and its scalar start bound (for the RPython `getslice(start, None)`).
+    pub access: SliceAccess,
     /// The `Option` enum root `name_path` (per-instantiation, suffixed) — the
     /// ctor owner for the `Some`/`None` aggregates.
     pub option_owner: String,
@@ -83,6 +86,13 @@ pub(crate) struct SliceFirstSite {
     /// The `Option`'s payload `&T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind (`Ref(None)` for `Option<&PyObjectRef>`).
     pub payload_ty: ValueType,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SliceAccess {
+    First,
+    Index(Variable),
+    RangeFrom { range: Variable, start: Variable },
 }
 
 /// Rewrite every recorded `<[T]>::first` call site into the length-checked
@@ -168,15 +178,32 @@ fn rewire_one_slice_first_site(
         ));
     };
 
-    // Capture the slice receiver operand.
-    let slice = match &graph.blocks[a].operations[ci].kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
+    // Capture the slice receiver and validate the recorded access operand.
+    let slice = match (&graph.blocks[a].operations[ci].kind, &site.access) {
+        (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => args[0].clone(),
+        (OpKind::Call { args, .. }, SliceAccess::Index(recorded))
+            if args.len() == 2 && args[1] == *recorded =>
+        {
+            args[0].clone()
+        }
+        (OpKind::Call { args, .. }, SliceAccess::RangeFrom { range, .. })
+            if args.len() == 2 && args[1] == *range =>
+        {
+            args[0].clone()
+        }
         other => {
             return Err(format!(
-                "{name}: slice::first producer op is not a 1-arg call: {other:?}"
+                "{name}: slice first/get producer does not match its recorded operands: {other:?}"
             ));
         }
     };
+    if let SliceAccess::RangeFrom { range, .. } = &site.access
+        && !crate::front::slice_index::range_feeds_only_index(graph, range, &site.result_var, false)
+    {
+        return Err(format!(
+            "{name}: RangeFrom value has a non-get consumer — declining"
+        ));
+    }
 
     // A's single exit → B (the continuation consuming the Option).  Must be a
     // plain goto — `lower_call` closes with exactly this shape.
@@ -215,35 +242,68 @@ fn rewire_one_slice_first_site(
     if !then_sources.contains(&slice) {
         then_sources.push(slice.clone());
     }
+    let success_operand = match &site.access {
+        SliceAccess::First => None,
+        SliceAccess::Index(index) => Some(index),
+        SliceAccess::RangeFrom { start, .. } => Some(start),
+    };
+    if let Some(operand) = success_operand
+        && !then_sources.contains(operand)
+    {
+        then_sources.push(operand.clone());
+    }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(carried.len());
 
-    // `then_bb`: elem = slice[0]; opt = Some(elem).
+    // `then_bb`: item = slice[0/i] or slice[start..]; opt = Some(item).
     let slice_in_then = map_source(&then_sources, &then_inputs, &slice)
         .ok_or_else(|| format!("{name}: slice not threaded into Some arm"))?;
-    let idx0 = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(idx0.clone()),
-        kind: OpKind::ConstInt(0),
-    });
-    let elem = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(elem.clone()),
-        kind: OpKind::ArrayRead {
-            base: slice_in_then,
-            // The element read and the `Some::__pos_0` field write below
-            // consume the same `elem`, so the read's declared element type
-            // must be the payload type the field carries (`site.payload_ty`,
-            // `Ref(None)` for `Option<&PyObjectRef>`) — a hardcoded `Ref(None)`
-            // would disagree for any instantiation whose payload projects to
-            // another `ValueType`.
-            item_ty: site.payload_ty.clone(),
-            index: idx0,
-            array_type_id: None,
-            nolength: false,
-            pure: false,
-        },
-    });
+    let elem = match &site.access {
+        SliceAccess::First | SliceAccess::Index(_) => {
+            let item_index = if let SliceAccess::Index(index) = &site.access {
+                map_source(&then_sources, &then_inputs, index)
+                    .ok_or_else(|| format!("{name}: slice index not threaded into Some arm"))?
+            } else {
+                let idx0 = graph.alloc_value_var();
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(idx0.clone()),
+                    kind: OpKind::ConstInt(0),
+                });
+                idx0
+            };
+            let elem = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(elem.clone()),
+                kind: OpKind::ArrayRead {
+                    base: slice_in_then,
+                    // The element read and the `Some::__pos_0` field write
+                    // consume the same value, so their register banks match.
+                    item_ty: site.payload_ty.clone(),
+                    index: item_index,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: false,
+                },
+            });
+            elem
+        }
+        SliceAccess::RangeFrom { start, .. } => {
+            let start_in_then = map_source(&then_sources, &then_inputs, start)
+                .ok_or_else(|| format!("{name}: RangeFrom start not threaded into Some arm"))?;
+            let subslice = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(subslice.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_rangefrom".to_string()],
+                    },
+                    args: vec![slice_in_then, start_in_then],
+                    result_ty: site.payload_ty.clone(),
+                },
+            });
+            subslice
+        }
+    };
     let some_var = emit_option_variant(
         graph,
         then_bb,
@@ -296,21 +356,73 @@ fn rewire_one_slice_first_site(
             result_ty: ValueType::Int,
         },
     });
-    let zero = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(zero.clone()),
-        kind: OpKind::ConstInt(0),
-    });
     let cond = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(cond.clone()),
-        kind: OpKind::BinOp {
-            op: "gt".to_string(),
-            lhs: len,
-            rhs: zero,
-            result_ty: ValueType::Int,
-        },
-    });
+    if let SliceAccess::Index(index) | SliceAccess::RangeFrom { start: index, .. } = &site.access {
+        // Rust's scalar slice index is `usize`.  Compare it with an unsigned
+        // view of the RPython list length, then let `rtype_getitem` perform
+        // its ordinary index conversion for the guarded element read.
+        let len_u = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(len_u.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "rpython".to_string(),
+                        "rlib".to_string(),
+                        "rarithmetic".to_string(),
+                        "r_uint".to_string(),
+                    ],
+                },
+                args: vec![len],
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(cond.clone()),
+            kind: OpKind::BinOp {
+                op: if matches!(&site.access, SliceAccess::RangeFrom { .. }) {
+                    "le".to_string()
+                } else {
+                    "lt".to_string()
+                },
+                lhs: index.clone(),
+                rhs: len_u,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else {
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(cond.clone()),
+            kind: OpKind::BinOp {
+                op: "gt".to_string(),
+                lhs: len,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+    }
+    if let SliceAccess::RangeFrom { range, .. } = &site.access {
+        for block in &mut graph.blocks {
+            block.operations.retain(|op| {
+                let is_field_write =
+                    matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == range);
+                let is_ctor = op.result.as_ref() == Some(range)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { .. },
+                            ..
+                        }
+                    );
+                !(is_field_write || is_ctor)
+            });
+        }
+    }
     graph.set_branch(a_id, cond, then_bb, then_sources, else_bb, carried);
     Ok(())
 }
@@ -323,6 +435,7 @@ mod tests {
     fn slice_first_site(result_var: Variable) -> SliceFirstSite {
         SliceFirstSite {
             result_var,
+            access: SliceAccess::First,
             option_owner: "core::option::Option".into(),
             some_owner: "core::option::Option::Some".into(),
             payload_ty: ValueType::Ref(None),
@@ -410,6 +523,80 @@ mod tests {
             })
             .count();
         assert_eq!(disc_writes, 2, "both arms write a discriminant");
+    }
+
+    /// A scalar slice item uses the integer register bank throughout the
+    /// guarded diamond.  This is the ordinary RPython `getitem` result shape,
+    /// not a pointer-to-slot and not a classed-instance-only special case.
+    #[test]
+    fn rewrite_lifts_scalar_get_with_unsigned_payload() {
+        let mut g = FunctionGraph::new("test_slice_get_u8");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "get".into(),
+                        ],
+                    },
+                    args: vec![slice, index.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Index(index);
+        site.payload_ty = ValueType::Unsigned;
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("get")
+                ))
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Unsigned,
+                        ..
+                    }
+                ))
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldWrite {
+                        field,
+                        ty: ValueType::Unsigned,
+                        ..
+                    } if field.name == "__pos_0"
+                ))
+        );
     }
 
     /// The production shape: an `Option<&RegisteredStruct>` result appends a
