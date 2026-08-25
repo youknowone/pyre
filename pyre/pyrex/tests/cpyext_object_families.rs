@@ -272,6 +272,13 @@ eq('an object with no buffer to export', kind, 'TypeError')
 # is readable, and every operation that would read or write a single element
 # refuses.  `adjust_fmt` is reached before the dimension and before the
 # writability check, so the format is what each of them reports.
+# Three formats one word wide that differ only in signedness.  A reader that
+# takes the item's width and ignores its code answers a word with the top bit
+# set as -1 for all three.
+eq('a signed word', m.mv_word_format('n').tolist(), [-1, 1])
+eq('an unsigned word', m.mv_word_format('N').tolist(), [18446744073709551615, 1])
+eq('a pointer word', m.mv_word_format('P').tolist(), [18446744073709551615, 1])
+
 compound = m.mv_compound_format()
 eq('compound geometry',
    (compound.format, compound.itemsize, compound.nbytes, compound.ndim),

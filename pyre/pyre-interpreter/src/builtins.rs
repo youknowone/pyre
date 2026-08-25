@@ -782,8 +782,11 @@ pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     unsafe { pyre_object::memoryview::is_w_memoryview(obj).then(|| memoryview_gather_bytes(obj)) }
 }
 
-/// Little-endian unsigned unpack of one `itemsize`-wide element at byte
-/// offset `base` — the fallback for formats the shared decoder rejects.
+/// Little-endian unpack of one `itemsize`-wide element at byte offset `base`
+/// — the fallback for formats the shared decoder rejects.  A narrower item is
+/// unsigned; a full-word one is the signed reading of those bytes, so a format
+/// whose width is a word and whose values are not signed needs an arm of its
+/// own rather than this.
 ///
 /// `itemsize` is at most the width of the result; a wider item has no integer
 /// to fold into, and the caller answers with its bytes instead.
@@ -823,7 +826,8 @@ fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
 /// Box one `itemsize`-wide element at byte offset `base` per the view's
 /// format (`buffer.py value_from_bytes`).  Numeric typecodes route through
 /// the shared array decoder (`unpack_value`); `c` yields a length-1 bytes,
-/// `?` a bool, and any code the decoder rejects falls back to unsigned LE.
+/// `?` a bool, and any code the decoder rejects falls back to a little-endian
+/// read that is signed once the item is a full word wide.
 unsafe fn memoryview_unpack_element(
     fmt: &str,
     data: &[u8],
@@ -839,6 +843,16 @@ unsafe fn memoryview_unpack_element(
             w_float_new(crate::module::r#struct::unpack_half(bits))
         }
         tc => {
+            // `unpack_single` reads `n` as `Py_ssize_t` and `N` and `P` as
+            // `size_t` and `void *`, each one 64-bit word wide here, as
+            // `memoryview_pack_value` writes them.  The array decoder carries
+            // only the codes `array.array` accepts, and the width fallback
+            // below builds a signed value.
+            let tc = match tc {
+                b'n' => b'q',
+                b'N' | b'P' => b'Q',
+                other => other,
+            };
             let w = pyre_object::interp_array::unpack_value(tc, buf);
             if w != pyre_object::PY_NULL {
                 w
