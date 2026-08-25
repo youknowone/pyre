@@ -4518,16 +4518,29 @@ pub fn rbigint_pair_item1_descr() -> DescrRef {
     field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 1)
 }
 
+/// Address a `FrameDebugData` field by its byte offset rather than by its
+/// position in the group's list: a field added at the head re-points every
+/// later index, and the reader that keeps a stale one then guards a
+/// neighbouring slot instead of its own.
+fn frame_debug_data_field_descr_at(offset: usize) -> DescrRef {
+    let index = FRAME_DEBUG_DATA_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .expect("FrameDebugData descr group has no field at requested offset");
+    field_descr_from_group(&*FRAME_DEBUG_DATA_DESCR_GROUP, index)
+}
+
 /// `FrameDebugData.w_locals` — the mapping `getorcreatedebug().w_locals`
 /// reads at the head of `fast2locals` (pyframe.py).
 pub fn frame_debug_data_w_locals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 1)
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET)
 }
 
 /// Rare per-frame globals override installed when one PyCode is executed in
 /// a namespace other than its first-seen globals.
 pub fn frame_debug_data_w_globals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET)
 }
 
 /// `FrameDebugData.w_extra_locals` — the dict `framelocalsproxy_setitem`
@@ -4536,7 +4549,9 @@ pub fn frame_debug_data_w_globals_descr() -> DescrRef {
 /// `locals()` / `vars()` / `dir()` hand back, so a fold that rebuilds that
 /// mapping from fastlocals alone has to see it.
 pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 2)
+    frame_debug_data_field_descr_at(
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
+    )
 }
 
 /// `FrameDebugData.w_f_trace` — the frame's own trace function, the slot
@@ -4546,7 +4561,7 @@ pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
 /// block, which is the state every frame is in once a trace function has been
 /// called on it.
 pub fn frame_debug_data_w_f_trace_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 2)
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET)
 }
 
 /// `len(bytes)` returns the byte count.  `bytesobject.py` reads it as
