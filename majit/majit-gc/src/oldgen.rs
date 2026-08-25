@@ -337,14 +337,13 @@ impl OldGen {
             self.raw_malloc_might_sweep.is_empty(),
             "raw_malloc_might_sweep must be empty"
         );
-        // incminimark.py:1312-1313 `debug_check_consistency`:
-        // `ll_assert(not self.young_rawmalloced_objects, "young raw-malloced
-        // objects in a major collection")`.  Every major runs a minor first,
-        // and that minor's last act is to empty this list.
-        debug_assert!(
-            self.young_rawmalloced_objects.is_empty(),
-            "young raw-malloced objects in a major collection"
-        );
+        // incminimark.py:1312-1313 `debug_check_consistency` asserts
+        // `not self.young_rawmalloced_objects` here, on the premise that every
+        // major runs a minor first and that minor's last act empties the list.
+        // Pyre has one major for which the premise is false by design —
+        // `do_collect_oldgen_nonmoving` deliberately skips the leading minor —
+        // so the check lives at the collector's call site, which knows which
+        // entry it is on. See `MiniMarkGC::sweep_step_prepare`.
         std::mem::swap(
             &mut self.raw_malloc_might_sweep,
             &mut self.old_rawmalloced_objects,

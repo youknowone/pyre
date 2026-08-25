@@ -972,15 +972,20 @@ pub struct MiniMarkGC {
     /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
     /// / `seed_major_root` set `flags::VISITED` on reachable nursery objects
     /// that no sweep then clears (the sweep only walks old-gen). While this is
-    /// set, every nursery object greyed this cycle is recorded in
-    /// `oldgen_nonmoving_nursery_marks` so VISITED can be cleared as the
+    /// set, every *young* object greyed this cycle is recorded in
+    /// `oldgen_nonmoving_young_marks` so VISITED can be cleared as the
     /// strictly-last step — otherwise `copy_nursery_object` would memcpy a
     /// stale VISITED bit into the next minor's promoted copy.
+    ///
+    /// Young raw-malloced blocks are in that set for the same reason and a
+    /// worse consequence: they are promoted in place rather than copied, so a
+    /// stale bit is not merely inherited, it is the same header the next major
+    /// reads. See [`Self::note_nonmoving_young_mark`].
     oldgen_nonmoving_active: bool,
     /// Nursery payload addresses greyed during the current non-moving major
     /// (only populated while `oldgen_nonmoving_active`). Drained by the final
     /// VISITED-clear pass.
-    oldgen_nonmoving_nursery_marks: Vec<usize>,
+    oldgen_nonmoving_young_marks: Vec<usize>,
     /// incminimark.py:3160,3175-3182 — the raw-refcount lists, identity tables
     /// and dead queue, empty until the embedder calls
     /// [`rawrefcount_init`](MiniMarkGC::rawrefcount_init).
@@ -1207,7 +1212,7 @@ impl MiniMarkGC {
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
-            oldgen_nonmoving_nursery_marks: Vec::new(),
+            oldgen_nonmoving_young_marks: Vec::new(),
             rrc: rawrefcount::RawRefCount::default(),
             config,
             minor_collections: 0,
@@ -4664,7 +4669,7 @@ impl MiniMarkGC {
             if unsafe { !(*hdr).has_flag(flags::VISITED) && !(*hdr).has_flag(flags::PINNED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.more_gray_stack.push(gcref.0);
-                self.note_nonmoving_nursery_mark(gcref.0);
+                self.note_nonmoving_young_mark(gcref.0);
             }
         }
     }
@@ -4895,7 +4900,7 @@ impl MiniMarkGC {
         };
         if newly_marked {
             self.incr_state.gray_stack.push(gcref.0);
-            self.note_nonmoving_nursery_mark(gcref.0);
+            self.note_nonmoving_young_mark(gcref.0);
 
             // incminimark.py:1322-1340 requires marking worklists to
             // contain no nursery objects after a minor. Pyre JITFRAME
@@ -4937,7 +4942,7 @@ impl MiniMarkGC {
     ///
     /// The non-moving oldgen major is the one mode that marks the nursery in
     /// place — it leaves those bytes untouched by contract, and
-    /// [`Self::note_nonmoving_nursery_mark`] clears the marks afterwards.
+    /// [`Self::note_nonmoving_young_mark`] clears the marks afterwards.
     ///
     /// A young raw-malloced object is admitted, as upstream admits it, and the
     /// entry cannot outlive the object: it is only reachable from a root, which
@@ -4949,14 +4954,24 @@ impl MiniMarkGC {
         self.oldgen_nonmoving_active || !self.is_in_nursery(addr)
     }
 
-    /// Record a nursery object greyed during a non-moving major so its
-    /// stale `flags::VISITED` is cleared as the strictly-last collection step.
-    /// No-op (just a range check) outside a non-moving major; the normal
-    /// incremental path runs after a minor so the nursery is empty here.
+    /// Record a *young* object greyed during a non-moving major so its stale
+    /// `flags::VISITED` is cleared as the strictly-last collection step.
+    /// No-op (just two range checks) outside a non-moving major; the normal
+    /// incremental path runs after a minor, so nothing young survives to here.
+    ///
+    /// Both young shapes qualify and for the same reason: this major marks
+    /// them in place and never sweeps them, so the mark has no owner to clear
+    /// it. A raw-malloced one is the easier to miss — it is not in the nursery
+    /// and not on the list the oldgen sweep clears, so keying this on the
+    /// nursery bound alone leaves its `VISITED` set. The next major then reads
+    /// that as "already greyed", never pushes it, and never traces its
+    /// children.
     #[inline]
-    fn note_nonmoving_nursery_mark(&mut self, addr: usize) {
-        if self.oldgen_nonmoving_active && self.is_in_nursery(addr) {
-            self.oldgen_nonmoving_nursery_marks.push(addr);
+    fn note_nonmoving_young_mark(&mut self, addr: usize) {
+        if self.oldgen_nonmoving_active
+            && (self.is_in_nursery(addr) || self.is_young_rawmalloced(addr))
+        {
+            self.oldgen_nonmoving_young_marks.push(addr);
         }
     }
 
@@ -6086,7 +6101,7 @@ impl MiniMarkGC {
             if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.gray_stack.push(addr);
-                self.note_nonmoving_nursery_mark(addr);
+                self.note_nonmoving_young_mark(addr);
             }
         }
     }
@@ -6423,6 +6438,17 @@ impl MiniMarkGC {
         // pages to old_* lists, and OldGen swaps old_rawmalloced_objects into
         // raw_malloc_might_sweep. Promotions between sweep steps therefore
         // allocate into fresh lists and are not candidates in this cycle.
+        //
+        // incminimark.py:1312-1313 `debug_check_consistency` asserts the young
+        // raw-malloc list is empty by now, which holds for every major that ran
+        // a minor first. `do_collect_oldgen_nonmoving` runs no minor — the
+        // interpreter has no shadow-stack pass, so a minor there would relocate
+        // nursery objects held only on the Rust stack — and marks the young
+        // block in place instead, exactly as it marks the nursery in place.
+        debug_assert!(
+            self.oldgen_nonmoving_active || !self.oldgen.has_young_rawmalloced(),
+            "young raw-malloced objects in a major collection"
+        );
         self.oldgen.sweep_prepare();
 
         // incminimark.py: dead old parents must leave the pin-parent
@@ -6977,7 +7003,7 @@ impl MiniMarkGC {
             None
         };
         self.oldgen_nonmoving_active = true;
-        self.oldgen_nonmoving_nursery_marks.clear();
+        self.oldgen_nonmoving_young_marks.clear();
 
         if self.gc_state == GcState::Scanning {
             self.start_incremental_cycle();
@@ -6986,13 +7012,14 @@ impl MiniMarkGC {
         // MARKING or SWEEPING, but always returns after the complete cycle.
         self.gc_step_until_scanning();
 
-        // Strictly-last: clear VISITED on every nursery object greyed this
-        // cycle (the oldgen sweep already cleared it on old-gen survivors).
-        let marks = std::mem::take(&mut self.oldgen_nonmoving_nursery_marks);
+        // Strictly-last: clear VISITED on every young object greyed this cycle
+        // (the oldgen sweep already cleared it on old-gen survivors).
+        let marks = std::mem::take(&mut self.oldgen_nonmoving_young_marks);
         for addr in marks {
-            // Nothing moved, so each addr is still nursery-resident; the
-            // guard is defensive against a duplicate already cleared.
-            if self.is_in_nursery(addr) {
+            // Nothing moved and nothing young was freed, so each addr is still
+            // where it was noted; the guard is defensive against a duplicate
+            // already cleared.
+            if self.is_in_nursery(addr) || self.is_young_rawmalloced(addr) {
                 let hdr = unsafe { header_of(addr) };
                 unsafe { (*hdr).clear_flag(flags::VISITED) };
             }
@@ -8758,6 +8785,95 @@ mod tests {
         gc.roots.clear();
         gc.do_collect_nursery();
         assert!(gc.oldgen.rawmalloced_bytes() > baseline);
+    }
+
+    /// A young raw-malloced object greyed by the non-moving major must leave
+    /// it with the flags it arrived with.
+    ///
+    /// The major marks the nursery in place and clears those marks as its
+    /// strictly-last step, but that pass is keyed on `is_in_nursery`. A young
+    /// raw-malloced block is not in the nursery and is not on the list the
+    /// oldgen sweep clears either, so nothing clears the `VISITED` the marking
+    /// stamped on it.
+    #[test]
+    fn a_young_rawmalloced_object_leaves_a_nonmoving_major_with_its_flags_pristine() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+
+        let mut obj = gc.alloc_with_type(tid, large);
+        let addr = obj.0;
+        unsafe { gc.roots.add(&mut obj) };
+        assert!(gc.is_young_rawmalloced(addr));
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert!(
+            gc.is_young_rawmalloced(addr),
+            "the non-moving major neither moves nor promotes a young block"
+        );
+        let hdr = unsafe { header_of(addr) };
+        assert!(
+            unsafe { !(*hdr).has_flag(flags::VISITED) },
+            "and it leaves no mark behind: a VISITED that survives the cycle \
+             is read by the NEXT major as `already greyed`, which skips the \
+             object and leaves its children untraced"
+        );
+    }
+
+    /// The consequence of that leak, two collections downstream.
+    ///
+    /// `grey_child` pushes only when `VISITED` is clear, so an object carrying
+    /// a stale one is never traced by the next major and a child reachable
+    /// solely through it is swept while live. The parent is reached AS A CHILD
+    /// here — a rooted parent is greyed by the root walk, which does not
+    /// consult the flag, so rooting it would test nothing. The child is
+    /// allocated after the non-moving major on purpose: one reachable during
+    /// it would carry the same stale flag and survive for the wrong reason.
+    #[test]
+    fn a_stale_visited_from_a_nonmoving_major_does_not_strand_the_next_majors_children() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let ptr_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let large = gc.config.large_object_threshold + 64;
+
+        // An old, rooted grandparent, so the parent below is reached through
+        // `grey_child` rather than through the root walk.
+        let mut grandparent = gc.alloc_with_type(ptr_tid, ptr_size);
+        unsafe { *(grandparent.0 as *mut GcRef) = GcRef::NULL };
+        unsafe { gc.roots.add(&mut grandparent) };
+        gc.do_collect_nursery();
+        let grandparent_addr = grandparent.0;
+        assert!(!gc.is_in_nursery(grandparent_addr));
+
+        let parent = gc.alloc_with_type(ptr_tid, large);
+        let parent_addr = parent.0;
+        unsafe { *(parent_addr as *mut GcRef) = GcRef::NULL };
+        assert!(gc.is_young_rawmalloced(parent_addr));
+        gc.do_write_barrier(grandparent);
+        unsafe { *(grandparent_addr as *mut GcRef) = parent };
+
+        // The cycle that stamps the parent. Its child does not exist yet.
+        gc.do_collect_oldgen_nonmoving();
+
+        let child = gc.alloc_with_type(ptr_tid, large);
+        unsafe { *(child.0 as *mut GcRef) = GcRef::NULL };
+        let with_child = gc.oldgen.rawmalloced_bytes();
+        unsafe { *(parent_addr as *mut GcRef) = child };
+
+        // Promote both. The parent carries whatever the major left on it.
+        gc.do_collect_nursery();
+        assert!(!gc.is_young_rawmalloced(parent_addr));
+
+        // The next major, with the parent as the child's only route.
+        gc.do_collect(2);
+
+        assert_eq!(
+            gc.oldgen.rawmalloced_bytes(),
+            with_child,
+            "the child is reachable only through the parent, so a major that \
+             skipped greying the parent frees it while it is live"
+        );
     }
 
     /// The write barrier is the only route by which an old parent keeps a
