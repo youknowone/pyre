@@ -713,6 +713,23 @@ pub enum HotResult {
     RunCompiled,
 }
 
+/// What the function-entry door should do, from one walk of the cell chain.
+///
+/// [`WarmEnterState::function_entry_step`] answers all three of the door's
+/// questions at once; the variants are the three answers `maybe_compile_and_run`
+/// arrives at.
+pub enum FunctionEntryStep {
+    /// A runnable procedure token was on the cell. Handed back so the door can
+    /// enter it without resolving the cell a second time.
+    RunCompiled(Arc<JitCellToken>),
+    /// The gate did not decline: start tracing. Either the counter fired or the
+    /// door never asked it (a trace is already running, or a `DONT_TRACE_HERE`
+    /// cell that has never seen a token is due its immediate retry).
+    Proceed,
+    /// Keep interpreting.
+    NotHot,
+}
+
 impl WarmEnterState {
     /// warmstate.py: a `JC_DONT_TRACE_HERE` cell that has never seen
     /// a procedure token is retried — immediately the first time
@@ -2099,9 +2116,62 @@ impl WarmEnterState {
     /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
     ///
     /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
+    ///
+    /// The bool half of [`Self::function_entry_step`], kept as its own name
+    /// because the mc_diag legend and the tests below are written about it.
+    /// `has_compiled_meta` false is what makes the step run this whole body:
+    /// with no frontend meta there is no runnable loop to return early for.
     pub fn should_trace_function_entry(&mut self, cell_key: u64) -> bool {
+        matches!(
+            self.function_entry_step(cell_key, || false, false),
+            FunctionEntryStep::Proceed
+        )
+    }
+
+    /// The function-entry door's whole answer, from ONE walk of the cell chain.
+    ///
+    /// `warmstate.py maybe_compile_and_run` matches the cell once and then
+    /// reads `procedure_token = cell.get_procedure_token()` off it, taking the
+    /// counter path only when that token is absent. The door used to ask three
+    /// separate questions of the same chain — `has_runnable_compiled_loop`
+    /// before the gate, `should_trace_function_entry` inside it, and
+    /// `has_runnable_compiled_loop` again to decide the run — so a call that
+    /// refused walked the chain three times to learn one thing.
+    ///
+    /// `has_compiled_meta` is the frontend half of `has_runnable_compiled_loop`
+    /// (`compiled_loops`, a map the warm state does not own); the cell half is
+    /// read here. Both together are what makes a token runnable, so a bare
+    /// `compile_tmp_callback` token falls through to the counter exactly as it
+    /// did. It is a closure because the cell half is the cheaper question and
+    /// answers no for most calls: `warmstate.py` likewise reaches
+    /// `procedure_token` first and consults nothing else until it is there.
+    ///
+    /// `engine_is_tracing` is `MetaInterp::is_tracing` — one global Option, not
+    /// a per-cell flag. The door consulted it to skip the counter gate entirely
+    /// while a trace runs, and [`FunctionEntryStep::Proceed`] is that skip: it
+    /// says "the gate did not decline", not "the counter fired".
+    pub fn function_entry_step(
+        &mut self,
+        cell_key: u64,
+        has_compiled_meta: impl FnOnce() -> bool,
+        engine_is_tracing: bool,
+    ) -> FunctionEntryStep {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
+            // The token read `maybe_compile_and_run` performs before it asks
+            // the counter anything. Only a runnable one returns here; the
+            // `is_compiled` / `is_tracing` census below still sees every other
+            // cell, which is what keeps slots 23/64/65 counting what they did.
+            if let Some(token) = cell
+                .get_procedure_token()
+                .filter(|token| token.has_compiled_code())
+                && has_compiled_meta()
+            {
+                return FunctionEntryStep::RunCompiled(token);
+            }
+            if engine_is_tracing {
+                return FunctionEntryStep::Proceed;
+            }
             // Slot 23 is the total; 64/65 are its two terms, evaluated
             // independently rather than short-circuited so a cell that is both
             // reaches both tallies. `is_compiled()` fires on every probe of
@@ -2152,7 +2222,7 @@ impl WarmEnterState {
                         crate::mc_diag_bump(66);
                     }
                 }
-                return false;
+                return FunctionEntryStep::NotHot;
             }
             // An invalidated procedure token — one the cell saw and no longer
             // holds — has to reach `cleanup_chain` below rather than take any
@@ -2171,7 +2241,7 @@ impl WarmEnterState {
             // counter would never re-arm.
             if !dead_token && cell.abort_count >= MAX_TRACE_ABORT_COUNT {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
-                return false;
+                return FunctionEntryStep::NotHot;
             }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
@@ -2180,26 +2250,37 @@ impl WarmEnterState {
                     // the cleanup gate below (warmstate.py:483-491) rather than
                     // re-entering the never-traced retry.
                     if cell.get_procedure_token().is_some() {
-                        return false;
+                        return FunctionEntryStep::NotHot;
                     }
                 } else if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
-                    return true;
+                    return FunctionEntryStep::Proceed;
                 }
             }
             if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
+        // A cell the walk did not find takes the same skip the one it found
+        // takes above: while a trace runs the door never asked the counter.
+        if engine_is_tracing {
+            return FunctionEntryStep::Proceed;
+        }
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — function-entry warmup must see an
             // invalidated token as a removed cell and re-count from cold.
             crate::mc_diag_bump(24);
             self.cleanup_chain(self.bucket_of(cell_key));
-            return false;
+            return FunctionEntryStep::NotHot;
         }
         crate::mc_diag_bump(25);
-        self.counter
+        if self
+            .counter
             .tick(self.bucket_of(cell_key), self.increment_function_threshold)
+        {
+            FunctionEntryStep::Proceed
+        } else {
+            FunctionEntryStep::NotHot
+        }
     }
 
     /// Check if inlining is allowed at the given depth.
@@ -4874,6 +4955,65 @@ mod tests {
             ws.get_cell(key).is_none(),
             "a dead token at the abort ceiling must reach cleanup_chain"
         );
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+    }
+
+    /// The three answers [`WarmEnterState::function_entry_step`] gives, against
+    /// the three separate reads of the same chain the door used to compute them
+    /// from.
+    ///
+    /// `has_compiled_meta` is the caller's half of
+    /// `JitDriver::has_runnable_compiled_loop`. A token WITHOUT frontend meta is
+    /// a bare `compile_tmp_callback` and was never runnable, so only both halves
+    /// together produce [`FunctionEntryStep::RunCompiled`]; with one half the
+    /// same cell falls through to the census that declines it.
+    #[test]
+    fn function_entry_step_answers_the_whole_door_from_one_walk() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = 0xD011;
+
+        // Cold, no trace running: the counter gate, unchanged.
+        assert!(matches!(
+            ws.function_entry_step(key, || false, false),
+            FunctionEntryStep::NotHot
+        ));
+        assert!(matches!(
+            ws.function_entry_step(key, || false, false),
+            FunctionEntryStep::Proceed
+        ));
+
+        ws.force_start_tracing(key);
+        ws.finish_tracing(key);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive(&mut ws, key, token);
+
+        assert!(matches!(
+            ws.function_entry_step(key, || true, false),
+            FunctionEntryStep::RunCompiled(_)
+        ));
+        assert!(matches!(
+            ws.function_entry_step(key, || false, false),
+            FunctionEntryStep::NotHot
+        ));
+    }
+
+    /// While a trace runs the door never reached the counter, and
+    /// [`FunctionEntryStep::Proceed`] is that skip rather than a counter hit:
+    /// the calls made during the trace must leave the key as cold as it was.
+    #[test]
+    fn function_entry_step_does_not_tick_while_the_engine_is_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = 0xD012;
+
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.function_entry_step(key, || false, true),
+                FunctionEntryStep::Proceed
+            ));
+        }
         assert!(!ws.should_trace_function_entry(key));
         assert!(ws.should_trace_function_entry(key));
     }

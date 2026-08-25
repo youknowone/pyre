@@ -28,6 +28,7 @@ use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
 use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
+use majit_metainterp::warmstate::FunctionEntryStep;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
 /// Host tracer registered with majit-gc so `walk_jf_roots` can reach
@@ -10849,7 +10850,12 @@ fn bound_reached(
     {
         return None;
     }
-    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
+    // `warmstate.py maybe_compile_and_run` reads `procedure_token =
+    // cell.get_procedure_token()` once and both decides and runs on that one
+    // object. Read it once here too: the decision below and the run further
+    // down used to walk the cell chain separately for the same answer.
+    let procedure_token = driver.runnable_procedure_token(green_key);
+    if procedure_token.is_none() && !driver.is_tracing() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -10867,7 +10873,10 @@ fn bound_reached(
     // reaches the same traces.
     let _topframeref_guard =
         TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
-    let outcome = if driver.has_runnable_compiled_loop(green_key) {
+    // The token stays bound for the whole run, which is what
+    // `EnterJitAssembler(procedure_token, ...)` does with it upstream; the run
+    // resolves the key itself, so it is only the pin.
+    let outcome = if procedure_token.is_some() {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -11069,19 +11078,18 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
-    // RPython warmstate.py maybe_compile_and_run fast path:
-    // if no runnable compiled loop and not tracing, just tick the counter.
-    // A bare `compile_tmp_callback` token (has_compiled_loop true, no
-    // `compiled_loops` meta) is treated as not-yet-runnable so the counter
-    // keeps ticking toward compiling the real loop.
-    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
-        let should_trace = driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .should_trace_function_entry(green_key);
-        if !should_trace {
-            return None;
-        }
+    // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
+    // token, and only when it is absent ask the counter. A bare
+    // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
+    // not runnable, so it keeps ticking toward compiling the real loop.
+    //
+    // One call, one walk of the cell chain. The three questions this replaces --
+    // `has_runnable_compiled_loop`, the counter gate, then
+    // `has_runnable_compiled_loop` again to decide the run -- walked it three
+    // times to learn one thing, on every call that refused.
+    let step = driver.function_entry_step(green_key);
+    if matches!(step, FunctionEntryStep::NotHot) {
+        return None;
     }
 
     // RPython warmstate.py: per-cell JC_TRACING.
@@ -11091,7 +11099,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     )) {
         return None;
     }
-    if driver.has_runnable_compiled_loop(green_key) {
+    // `warmstate.py maybe_compile_and_run` carries the token the cell read
+    // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;
+    // holding it here is what keeps it alive across the run the way upstream's
+    // reference does. The run resolves the key itself, so it is only the pin.
+    if let FunctionEntryStep::RunCompiled(_procedure_token) = step {
         // Same gate as maybe_compile_and_run: only enter compiled code
         // when a runnable compiled loop (frontend meta present, not a bare
         // tmp callback) exists for this green_key.
