@@ -4733,12 +4733,47 @@ where
                     .wrapping_add(base_size)
                     .wrapping_add((index_value as usize).wrapping_mul(itemsize));
                 let concrete = unsafe { *(item_addr as *const i64) };
-                let opref = if let Some(cached) = cached {
+                let (opref, reg_concrete) = if let Some(cached) = cached {
                     ctx.profiler().count_ops(
                         OpCode::GetarrayitemGcR,
                         crate::pyjitpl::counters::HEAPCACHED_OPS,
                     );
-                    cached
+                    // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
+                    // freshly executed load against the cached box's
+                    // `tobox.getref_base()`. Same structure as the int/float
+                    // arm above: a mismatch records a fallback op whose result
+                    // is discarded, asserts in debug, and still answers with
+                    // the stale cached box.
+                    let expected = match ctx.box_value(cached) {
+                        Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
+                        _ => None,
+                    };
+                    let stale = matches!(expected, Some(exp) if exp != concrete);
+                    if stale {
+                        ctx.heapcache_invalidate_caches_varargs(
+                            OpCode::GetarrayitemGcR,
+                            None,
+                            &[array_opref, index_opref],
+                        );
+                        ctx.profiler()
+                            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
+                        let _ = ctx.record_op_with_descr(
+                            OpCode::GetarrayitemGcR,
+                            &[array_opref, index_opref],
+                            descr,
+                        );
+                        debug_assert!(
+                            false,
+                            "GetarrayitemGcR sanity check failed: \
+                             cached={expected:?} concrete={concrete}",
+                        );
+                    }
+                    let reg_concrete = if stale {
+                        expected.expect("stale only set when expected is Some")
+                    } else {
+                        concrete
+                    };
+                    (cached, reg_concrete)
                 } else {
                     ctx.profiler()
                         .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
@@ -4756,9 +4791,9 @@ where
                         descr_index,
                         opref,
                     );
-                    opref
+                    (opref, concrete)
                 };
-                self.set_ref_reg(dst, Some(opref), Some(concrete));
+                self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
             }
             // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
             // SetarrayitemGc (a single op-kind whose descr carries the item
