@@ -1482,13 +1482,13 @@ proved constant zero has no comparison left to make.
 
 ## Stage 5's table, filled
 
-Release build, 1,048,576-character non-matching input, three runs:
+Release build, 1,048,576-character non-matching input, five runs:
 
 | row | chars/s |
 |---|---|
-| Rust interp over `NodeRec`, no JIT | 8,712,202 – 9,082,961 |
-| **majit JIT, regex promoted** | **47,506,708 – 47,751,626** |
-| ratio | **5.2 – 5.5x** |
+| Rust interp over `NodeRec`, no JIT | 8,712,202 – 9,263,315 |
+| **majit JIT, regex promoted** | **46,710,465 – 47,751,626** |
+| ratio | **5.0 – 5.5x** |
 
 The Rust-interp row supersedes this document's earlier 1,705,377 – 2,582,170.
 That figure came from the scratchpad probe built with a bare `rustc`, i.e.
@@ -1496,7 +1496,7 @@ unoptimized; the row above is `--release` and is the one the JIT number is
 divided by.
 
 The comparable quantity in the post is its own JIT-over-no-JIT ratio,
-16,500,000 / 720,000 = 22.9x. Ours is 5.2 – 5.5x against a matcher that
+16,500,000 / 720,000 = 22.9x. Ours is 5.0 – 5.5x against a matcher that
 `rustc -O` had already optimized, where the post's denominator was RPython
 translated to C. The absolute rows are not comparable across the two machines
 and sixteen years, and `main.rs` says so where it prints them.
