@@ -341,35 +341,75 @@ layers, unevenly:
   tracked generation defect whose convergence target is majit-translate's
   codewriter.
 
-**Measured cost, 2026-08-22.** Installing `sys.setprofile`, `sys.settrace` or
-`cProfile` costs **1168–2836×** on a hot loop where PyPy 7.3.20 pays
-**1.1–4.6×** and stays compiled. It is a total outage, not a reuse failure:
-warming *under* the profiler never compiles at all. Event counts match CPython
-exactly, so this is a cliff and not a wrong answer. Stated plainly: **a profile
-taken on pyre measures the interpreter, not the JIT**, and pdb and coverage.py
-are in the same position.
+**Measured cost, re-measured 2026-08-26** (dynasm release binary, best-of-3
+`time.process_time()`, one million iterations, both loop shapes run against
+CPython 3.14 and PyPy 7.3.20 on the same machine). The cliff moved rather than
+vanished. On a **call-free** hot loop pyre now pays nothing for either hook —
+0.0034 s profiled against 0.0047 s bare. On a loop that **calls** a small
+function every iteration it pays two orders of magnitude: 272–328× for
+`sys.setprofile` and 178–215× for `sys.settrace` across runs, where CPython
+pays 2.6–3.3× and PyPy pays about 1× and stays compiled. The charge is
+therefore per *call event*, not per profiled frame, and the earlier
+1168–2836× figure is superseded — it was taken before the bracket below
+landed.
 
-**The root is a missing bracket, not the folded green.** Upstream brackets the
-portal itself: `PyFrame.execute_frame` wraps `dispatch` — the function that
-carries the merge point and nothing else — in `ExecutionContext.enter`,
-`call_trace`, then `return_trace` and `leave` in `finally` clauses. pyre put
-that bracket *inside* the plain dispatch body (`eval_frame_plain_with_resume`)
-and left the JIT dispatch body bare: `eval_with_jit_inner` substitutes
-`install_current_frame`, which performs only `enter`'s topframeref/f_backref
-half, and `CurrentFrameGuard`'s drop, which performs only `leave`'s
-topframeref half. Neither emits an event, and `pyre-jit` contains no
-`call_trace` or `return_trace` call at all.
+Event counts still match, which is what licenses the comparison: at a million
+iterations all three runtimes report the same `call` / `return` / `c_call`
+multiset. pyre additionally reports 28 `importlib._bootstrap` weakref-callback
+frames that reference counting had already reclaimed before the profiled
+window opened — a collector-timing difference outside the loop body, 0.003% of
+the events, and not JIT-attributable, since it survives `PYRE_NO_JIT=1`.
 
-A JIT-activated frame therefore emits no `call` and no `return` event, and the
-only thing hiding that is the refusal itself — `frame_tracing_active` sends
-every traced or profiled frame down `execute_frame_plain`, which is the
-bracketed path. `run_with_jit` states the dependency in the affirmative: it
-routes non-JIT-eligible frames through `execute_frame` "so `call_trace` /
-`return_trace` frame events still fire". **The gate is not a performance
-concession; it is the whole implementation of frame events for JIT-eligible
-frames**, and the measured event parity above is produced by it. Restoring the
-bracket above the portal is a prerequisite for touching the gate, and it needs
-no green.
+**The missing bracket is restored, and the falsification below came back
+clean.** Upstream brackets the portal itself: `PyFrame.execute_frame` wraps
+`dispatch` — the function that carries the merge point and nothing else — in
+`ExecutionContext.enter`, `call_trace`, then `return_trace` and `leave` in
+`finally` clauses. pyre had put that bracket *inside* the plain dispatch body
+(`eval_frame_plain_with_resume`) and left the JIT dispatch body bare. It no
+longer does: `eval_with_jit_inner` now calls `call_trace` and `return_trace`
+around the portal, and `frame_tracing_active` — the gate that had been sending
+every traced or profiled frame down `execute_frame_plain` — is narrowed to the
+per-frame `!frame.get_w_f_trace().is_null()`. The global `profilefunc` and
+tracefunc disjuncts are gone and no events went missing, which is exactly what
+this entry predicted. **The gate is no longer the implementation of frame
+events for JIT-eligible frames**, and a profiled call-free loop now measures
+the JIT.
+
+**The two hooks now fail for different reasons, and neither is the bracket.**
+Under `MAJIT_STATS=1` on the call-bearing loop:
+
+- `sys.setprofile` **loses the compilation**: `loops_compiled` falls 4 → 1 and
+  `loops_aborted` rises 0 → 5. The five are `abrt_bridge`, but the three
+  `giveup_*` splits that decompose that slot all read 0 and
+  `abrt_unclassified_default` reads 5, so no bridge is involved — these are
+  the aborts that stage no reason at all, which is the case that slot exists to
+  separate. `MAJIT_LOG` puts them one line after `init-sym` with no recorded
+  op in between: the callee compiles, the caller never starts. After the fifth
+  the green key is banned (`abort_ceiling_banned=1`) and the next 174,776
+  attempts are refused outright, so the loop is interpreted for the rest of the
+  run.
+
+  The abort has a location even though it has no name. A breakpoint on
+  `MetaInterp::abort_trace` never fires, so these five do not come from it;
+  they come from the other site that bumps the same slot, `jitdriver.rs`'s
+  reason ladder inside `merge_point`, which does the live-cleanup and
+  accounting halves itself. Its backtrace runs through the *callee's* own
+  activation — `call_user_function_with_ctx` → `eval_with_jit` →
+  `eval_loop_jit` → `maybe_compile_and_run` → `bound_reached` →
+  `compile_and_run_once` → `merge_point` — so the outer loop's trace is
+  discarded from inside the residual call, at the point the callee's own entry
+  threshold fires, and not at the outer loop's merge point. Upstream carries a
+  `Counters.ABORT_*` on every `SwitchToBlackhole`, so an abort that stages no
+  reason has no counterpart there at all; staging one here is the first
+  concrete task, and it is parity work rather than new diagnostics.
+- `sys.settrace` **keeps it**: `loops_compiled=4`, `loops_aborted=0`,
+  `guard_failures=3`, `back_edge_polls=0` — the whole summary line is
+  byte-identical to the bare arm's.
+  Nothing is lost to compilation or deoptimisation, so the whole 178–215× is
+  executed per-call event dispatch inside compiled code.
+
+Two mechanisms, one shared shape: the per-call profile/trace dispatch is not
+folded. That is the work this entry now tracks.
 
 **What upstream does not do.** It does not fold the tracing state away.
 `ExecutionContext` declares `_immutable_fields_` with `profilefunc?` and
@@ -387,13 +427,26 @@ Where the green does pay is the profiled-call dispatch: `call_valuestack` and
 its keyword/ex siblings branch on `get_is_being_profiled()` before
 `call_args_and_c_profile`, and a real green folds those branches to nothing in
 the unprofiled trace while giving the profiled state its own cell, counter and
-procedure token. That is the last step of the repair, not the first.
+procedure token. With the bracket landed and the call-free shape flat, this is
+now the remaining step rather than the last one, and the measurement above says
+which half to take first: `settrace` keeps its compilation, so its cost is
+entirely in that unfolded branch; `setprofile` aborts the recording before the
+branch can matter.
 
-**Falsification.** Restoring the activation bracket should leave event counts
-unchanged with the gate still in place, and should let the gate's
-`profilefunc`/global-tracefunc disjuncts be dropped without losing events. If
-events go missing once the bracket is above the portal, the bracket is not what
-the gate was standing in for and this entry is wrong.
+**Falsification, run 2026-08-26 — passed.** The prediction was that restoring
+the activation bracket would leave event counts unchanged with the gate still
+in place, and would then let the gate's `profilefunc`/global-tracefunc
+disjuncts be dropped without losing events. Both held: the gate now reads only
+the per-frame `w_f_trace` and the `call`/`return`/`c_call` multisets are
+unchanged, so the bracket was what the gate was standing in for.
+
+The successor claim, which this entry now stands or falls by: the residual
+cliff is the unfolded per-call dispatch and nothing else. It is wrong if
+folding `get_is_being_profiled()` out of the unprofiled trace leaves the
+call-bearing loop more than an order of magnitude off its bare arm, or if the
+`setprofile` aborts survive a recorder that admits the profiled call — either
+would mean a third mechanism is in play that neither the bracket nor the green
+accounts for.
 
 ---
 
