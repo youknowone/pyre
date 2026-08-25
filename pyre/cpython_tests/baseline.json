@@ -613,7 +613,7 @@
       "dynasm": "PASS"
     },
     "test.test_importlib": {
-      "cranelift": "PASS",
+      "cranelift": "FAIL",
       "dynasm": "FAIL"
     },
     "test.test_index": {
