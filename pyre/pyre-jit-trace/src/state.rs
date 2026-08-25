@@ -1018,6 +1018,7 @@ pub fn install_jitcodes(jitcodes: Vec<std::sync::Arc<crate::PyJitCode>>) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         r.borrow_mut().set_jitcodes_from_make_result(jitcodes);
+        patch_build_const_refs(&r.borrow());
     });
 }
 
@@ -1398,13 +1399,17 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 /// from `jitcode.constants_r` (`init_register_files_from_runtime_jitcode`),
 /// so a constant boxed object reachable only from a jitcode and swept by a
 /// major collection between trace executions leaves the next guard-failure
-/// resume reading a freed pointer.  The constant pool is immutable after
-/// build.  With tagged ints disabled, its objects are non-moving —
-/// interpreter-routed int/float consts live in the non-moving old-gen and
-/// build-time consts are `malloc_typed`-immortal — so the pyre-jit root-area
-/// wrapper skips this walk for minor collections and marks the slots in place
-/// during major marking.  The tagged-int configuration retains the minor walk
-/// because normalization can materialize a moving `W_IntObject`.
+/// resume reading a freed pointer.
+///
+/// The pool's VALUES are immutable after build; their ADDRESSES are not.  A
+/// `residual_call` whose ref argument is a constant bakes whatever object the
+/// tracer read, and that object is non-moving only when it happens to be an
+/// old-generation number or a `malloc_typed`-immortal build-time constant.
+/// `MAKE_FUNCTION` bakes the frame's globals dict
+/// (`jit_make_function_from_globals(globals, code)`), and a frame running
+/// under `exec(code, {...})` carries an ordinary collectable one.  So this
+/// walk writes the visitor's answer back into the slot instead of marking a
+/// copy of it, and the pyre-jit root area runs it for minor collections too.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_constants_refs_in(&state.borrow(), visitor);
@@ -1429,11 +1434,11 @@ pub unsafe fn walk_jitcode_constants_refs_area(
     walk_jitcode_constants_refs_in(sd, visitor);
 }
 
-/// Relocation probe for the non-moving invariant stated on
-/// [`walk_jitcode_constants_refs`] above.  `drag_out_root` relocates a root
-/// only when it is a nursery object start, so a slot whose value the visitor
-/// CHANGES is proof that a movable object entered the pool and that marking
-/// in place without forwarding leaves a stale address behind.
+/// Forwarding probe for [`walk_jitcode_constants_refs`] above.
+/// `drag_out_root` relocates a root only when it is a nursery object start, so
+/// a slot whose value the visitor CHANGES is one where a movable object entered
+/// the pool and the walk had to write the new address back.  Before that
+/// write-back existed the same count named relocations the walk DISCARDED.
 ///
 /// `WALKS`/`SLOTS` are the arming witnesses: `RELOCATED == 0` means nothing
 /// moved only when `SLOTS > 0`.  With `SLOTS == 0` the walker observed
@@ -1460,6 +1465,116 @@ pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::
 fn probe14_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PYRE_PROBE14").as_deref() == Ok("1"))
+}
+
+/// `(address the pool holds, address the collector last reported)`.
+type BuildConstRefs = Vec<(usize, usize)>;
+
+thread_local! {
+    /// Ref constants recorded while a `make_jitcodes` drain is still running.
+    ///
+    /// A pool becomes reachable to [`walk_jitcode_constants_refs`] only when
+    /// `install_jitcodes` publishes its jitcode, which happens once at the END
+    /// of the drain.  `CallControl.jitcodes` — the store `publish_jitcode`
+    /// fills in place — is a different one and is not walked.  So for the whole
+    /// drain a freshly baked constant has no root at all, and a collection
+    /// there both frees it and leaves the pool naming the old address.
+    ///
+    /// The assembler records every young constant here as it bakes it.  The
+    /// pair's second half IS a root (see [`walk_build_const_refs_in`]), so the
+    /// collector keeps the object alive and reports where it moved to;
+    /// [`patch_build_const_refs`] then rewrites the pools that recorded the
+    /// first half, and drops the list.
+    ///
+    /// Only young constants are recorded: an old-generation or immortal
+    /// constant is already at an address nothing will change, so rooting one
+    /// would buy nothing.
+    static BUILD_CONST_REFS: RefCell<BuildConstRefs> = const { RefCell::new(Vec::new()) };
+}
+
+/// Record a ref constant the assembler is about to bake into a pool, so it is
+/// rooted for the rest of the drain.  No-op for anything the collector will
+/// not move.
+pub fn note_build_const_ref(value: i64) {
+    if value == 0 || !majit_gc::gc_is_nursery_object(value as usize) {
+        return;
+    }
+    BUILD_CONST_REFS.with(|cell| {
+        let mut refs = cell.borrow_mut();
+        if refs.iter().any(|&(recorded, _)| recorded == value as usize) {
+            return;
+        }
+        refs.push((value as usize, value as usize));
+    });
+}
+
+fn walk_build_const_refs_in(
+    refs: &mut BuildConstRefs,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    for (_, current) in refs.iter_mut() {
+        let mut gcref = majit_ir::GcRef(*current);
+        visitor(&mut gcref);
+        *current = gcref.0;
+    }
+}
+
+pub fn capture_build_const_refs_area() -> *const () {
+    BUILD_CONST_REFS.with(|cell| cell as *const _ as *const ())
+}
+
+/// # Safety
+/// `data` must come from [`capture_build_const_refs_area`], and the owning
+/// thread must be quiesced.
+pub unsafe fn walk_build_const_refs_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const RefCell<BuildConstRefs>) };
+    // Same reasoning as `walk_jitcode_code_roots_area`: read through
+    // `as_ptr` so a borrow the interrupted owner still holds does not drop
+    // every root this area owns.
+    let refs = unsafe { &mut *cell.as_ptr() };
+    walk_build_const_refs_in(refs, visitor);
+}
+
+/// Rewrite every pool slot that named a constant the collector has since
+/// moved, then drop the build-window roots.
+///
+/// Runs after `install_jitcodes`, so a constant that never moved is by then
+/// reachable through [`walk_jitcode_constants_refs`] and does not need this
+/// list any more.  Clearing is unconditional: an entry no published pool names
+/// belongs to a JitCode `try_finish` declined, and nothing will ever read it.
+/// That also bounds the list, which is not reset per drain — a drain that
+/// publishes nothing keeps its entries only until the next one that does.
+fn patch_build_const_refs(sd: &MetaInterpStaticData) {
+    BUILD_CONST_REFS.with(|cell| {
+        let mut refs = cell.borrow_mut();
+        let moved: Vec<(usize, usize)> = refs
+            .iter()
+            .copied()
+            .filter(|&(recorded, current)| recorded != current)
+            .collect();
+        refs.clear();
+        if moved.is_empty() {
+            return;
+        }
+        for jc in sd.jitcodes.iter() {
+            let jitcode = &jc.payload.jitcode;
+            let len = jitcode.constants_r.len();
+            let base = jitcode.constants_r.as_ptr() as *mut i64;
+            for slot in 0..len {
+                // SAFETY: `slot < len`; the pool is not reallocated here.
+                let cell = unsafe { &mut *base.add(slot) };
+                if let Some(&(_, current)) = moved
+                    .iter()
+                    .find(|&&(recorded, _)| recorded == *cell as usize)
+                {
+                    *cell = current as i64;
+                }
+            }
+        }
+    });
 }
 
 fn walk_jitcode_constants_refs_in(

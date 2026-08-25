@@ -4609,7 +4609,7 @@ pub fn import_name(
 
     let w_locals = import_locals(frame);
     let w_globals = frame.get_w_globals();
-    crate::call::call_callable(
+    crate::call::call_args_in_frame(
         frame,
         w_import,
         &[w_modulename, w_globals, w_locals, w_fromlist, w_flag],

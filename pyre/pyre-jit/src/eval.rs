@@ -4824,6 +4824,11 @@ fn register_thread_root_areas() {
             "jitcode_constants",
         );
         register(
+            build_const_refs_root_walker_area,
+            pyre_jit_trace::state::capture_build_const_refs_area(),
+            "jitcode_build_const_refs",
+        );
+        register(
             fbw_store_journal_root_walker_area,
             pyre_jit_trace::jitcode_dispatch::capture_fbw_store_journal_root_area(),
             "fbw_store_journal",
@@ -5676,6 +5681,15 @@ unsafe fn jitcode_code_root_walker_area(
         return;
     }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
+}
+
+/// Ref constants baked into a pool that `install_jitcodes` has not published
+/// yet — see `pyre_jit_trace::state::note_build_const_ref`.
+unsafe fn build_const_refs_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::state::walk_build_const_refs_area(data, visitor) };
 }
 
 unsafe fn fbw_store_journal_root_walker_area(
@@ -8395,15 +8409,28 @@ fn eval_with_jit_inner(
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame_plain(resume);
     }
-    // A traced frame runs interpreted: `call_trace` / `return_trace` /
-    // `bytecode_trace` are driven from the plain eval path, so a frame the JIT
-    // takes over reports no events at all.
+    // A profiled frame runs interpreted, and `c_call` / `c_return` are the
+    // whole of why.  The frame-level events would survive the JIT: measured
+    // with this test narrowed to `f_trace` alone and the arms below carrying
+    // `execute_frame`'s `call_trace` / `return_trace` bracket plus `leave`'s
+    // `_trace('leaveframe')`, a 2000-iteration tail entered with a hook
+    // installed reported `call` and `return` exactly, for the loop frame and
+    // for its callee alike, matching cpython 3.14.6.  Every builtin's `c_call`
+    // stopped at 1041, the entry threshold — `len`, `ord`, `divmod`, `hex`,
+    // `sorted`, `max` and `round` alike — and nothing about that is a missing
+    // check on a call path: probed at `call::c_profile_frame`, compiled code
+    // does not reach the interpreter's builtin call doors at all, folded or
+    // residual.  `is_being_profiled` is a green, so upstream's compiled loop
+    // carries the reporting it traced through `call_args`; this walker decides
+    // rather than traces, so a profiled trace would have to be RECORDED with
+    // the reporting in it.  Until it is, a profiled frame is served correctly
+    // and slowly rather than quickly and silently.
     //
-    // Narrowing this to line tracing alone is not enough on its own: measured,
-    // a profiled frame that reaches the portal still does not compile, and the
-    // calls a compiled trace inlines and the builtins it folds stop reporting
-    // (`call` 1042 against CPython's 3001, `c_call` 2085 against 6001). Both
-    // have to be answered before the profile half can be let through.
+    // A frame that arrives with its own `f_trace` already armed runs
+    // interpreted too.  One that gets it armed by the bracket below is past
+    // this test, and is kept off compiled code by `try_function_entry_jit` and
+    // by the portal merge point's debugdata guard instead, so its `line`
+    // events keep arriving from `eval_loop_jit`'s `bytecode_trace`.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
         return frame.execute_frame_plain(resume);
     }
@@ -8487,10 +8514,49 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    if let Some(result) = try_function_entry_jit(frame_root.frame()) {
+    // `pyframe.py execute_frame` brackets the eval loop with
+    // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
+    // upstream's merge point sits inside that bracket: the jitdriver is
+    // applied to `PyFrame.dispatch` (`interp_jit.py`), which `execute_frame`
+    // calls between the two hooks.  pyre's portal is this function instead,
+    // one level up, so the arms below enter the frame at its first bytecode,
+    // past the bracket, and a frame the JIT took over reported neither its
+    // `call` nor its `return` event.  Every declining path above returns
+    // through `execute_frame_plain`, which reaches the bracket in
+    // `eval::eval_frame_plain_with_resume`, so these two arms are the only
+    // ones that owe one.
+    //
+    // Both hooks carry their own test — `call_trace` fires on
+    // `gettrace() is not None or profilefunc is not None`, `return_trace` on
+    // `gettrace() is not None` — so an untraced activation pays one null read
+    // per hook.  Both run application-level Python and may move the frame, so
+    // each takes its argument from the root rather than from a saved word.
+    let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
+    if !ec.is_null() {
+        unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame)? };
+    }
+    let result = match try_function_entry_jit(frame_root.frame()) {
+        Some(result) => result,
+        None => handle_jitexception(frame_root.frame()),
+    };
+    if ec.is_null() {
         return result;
     }
-    handle_jitexception(frame_root.frame())
+    // Upstream runs `return_trace` from a `finally`, so it runs on the raising
+    // path too — with `w_exitvalue` still the `None` the bracket opened with —
+    // and a failure of its own replaces the pending exception.
+    let w_exitvalue = match &result {
+        Ok(value) => *value,
+        Err(_) => w_none(),
+    };
+    let live = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
+    // `setprofile`'s `return` is not `return_trace`'s — that one tests
+    // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
+    // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
+    // this arm never reaches `leave`: the declining paths above return through
+    // `execute_frame_plain`, which does, and these two do not.
+    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, live)? };
+    result.map(|_| live)
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
@@ -10758,6 +10824,20 @@ fn dump_bytecode_enabled() -> bool {
 
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let mut frame_root = FrameRoot::new(frame);
+    // A frame carrying its own `f_trace` owes a `line` event at every
+    // instruction that can start one, and those are fired by
+    // `ec.bytecode_trace` from the dispatch loop.  Compiled code has no route
+    // to that call, and this door runs the WHOLE frame compiled rather than a
+    // loop inside it, so it has no merge point for
+    // `record_portal_debugdata_guard` to place its guard at.  Measured on a
+    // callee whose `f_trace` is armed by the `ec.call_trace` at the portal:
+    // the `line` events stop at the 1239th call — the entry threshold — and
+    // never resume, at any length of tail, while `call` and `return` keep
+    // arriving from the bracket.  Leave such a frame to `eval_loop_jit`, whose
+    // per-opcode `bytecode_trace` fires them.
+    if !frame_root.frame().get_w_f_trace().is_null() {
+        return None;
+    }
     // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {

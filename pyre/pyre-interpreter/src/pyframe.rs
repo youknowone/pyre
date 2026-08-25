@@ -1756,21 +1756,27 @@ pub fn report_stack_underflow(frame: &PyFrame) {
     );
 }
 
-/// True when a `sys.settrace` / `sys.setprofile` hook is installed on the
-/// execution context this frame runs under.
+/// True when this frame owes trace events no path the JIT takes can emit.
 ///
-/// `executioncontext.py:296-298` keeps the JIT on and widens `trace_limit`
-/// instead, because upstream's traces carry the per-bytecode hook calls.
-/// pyre's traces do not, so a frame that is being traced runs interpreted —
-/// `call_trace` / `bytecode_trace` are driven from the plain eval path.
-/// A frame carrying its own `f_trace` also runs interpreted.
+/// Only a frame carrying its own `f_trace` does.  Such a frame owes a `line`
+/// event at every instruction that can start one, fired by `ec.bytecode_trace`
+/// from the dispatch loop, and compiled code has no route to that call.
+///
+/// Neither hook that installs globally is here, and both are deliberate.
+/// `executioncontext.py settrace` keeps the JIT on and widens `trace_limit`
+/// rather than turning it off, and what it owes is answered per event
+/// elsewhere: this frame's own `call` / `return` by the bracket the portal
+/// carries (`eval::eval_with_jit_inner`), a callee's by the walker declining
+/// to enter one while a hook is installed
+/// (`jitcode_dispatch::ec_hook_installed`), and a frame that arms local
+/// tracing by `record_portal_debugdata_guard` keeping it from compiling.
+/// `setprofile` owes the same frame-level pair, from the same bracket plus
+/// `leave`'s `_trace('leaveframe')`, and owes `c_call` / `c_return` on top —
+/// which the walker answers by declining a profiled trace at the call itself
+/// (`DispatchError::ProfiledResidualCall`) rather than by refusing the frame.
+/// A profiled loop that calls nothing therefore compiles and reports.
 pub fn frame_tracing_active(frame: &PyFrame) -> bool {
-    let ec = frame.execution_context;
-    if ec.is_null() {
-        return false;
-    }
-    let ec = unsafe { &*ec };
-    !ec.gettrace().is_null() || ec.profilefunc.is_some() || !frame.get_w_f_trace().is_null()
+    !frame.get_w_f_trace().is_null()
 }
 
 #[repr(C)]
@@ -1841,6 +1847,14 @@ pub const FRAME_DEBUG_DATA_W_LOCALS_OFFSET: usize = std::mem::offset_of!(FrameDe
 /// Byte offset of `w_extra_locals` in `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET: usize =
     std::mem::offset_of!(FrameDebugData, w_extra_locals);
+
+/// Byte offset of `w_f_trace` in `FrameDebugData`, for the JIT's
+/// GETFIELD_GC_R lowering of `pyframe.py get_w_f_trace`.  A trace recorded on
+/// a frame that already carries a debug block — every frame does once a trace
+/// function has been called on it — pins the slot NULL with a guard, so arming
+/// local tracing leaves compiled code instead of running the tail silent.
+pub const FRAME_DEBUG_DATA_W_F_TRACE_OFFSET: usize =
+    std::mem::offset_of!(FrameDebugData, w_f_trace);
 
 /// Allocated size of a `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_SIZE: usize = std::mem::size_of::<FrameDebugData>();

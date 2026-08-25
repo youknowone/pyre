@@ -4992,15 +4992,26 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Run `f` with the typed greenkey `[next_instr, is_being_profiled=0,
+    /// Run `f` with the typed greenkey `[next_instr, is_being_profiled,
     /// pycode]` that matches `make_green_key` (warmstate.py:584-593),
     /// reusing a thread-local `GreenKey` so the warmup-hot decision path
     /// does not allocate the key's value/type vectors per back-edge.
-    /// `is_being_profiled` folds to 0 (the JIT path is not profiled;
-    /// trace-side keys have no frame). Returns `None` for synthetic call
-    /// sites with no raw `(code, pc)` (e.g. [`Self::on_back_edge`]), which
-    /// keep the legacy u64 hash path. On install, `ensure_cell_for_key`
-    /// clones the key into the cell's `comparekey`, so reuse is safe.
+    /// `is_being_profiled` is the one green the raw `(code, pc)` pair does not
+    /// carry, and a `setprofile` hook does flip it — `executioncontext.py
+    /// call_trace` writes it onto the frame's debug block, and the portal
+    /// green is read off the frame from there (`eval.rs make_green_key`), so a
+    /// profiled portal owns a cell of its own.  It is recovered from the
+    /// bucket hash the caller already computed rather than threaded down every
+    /// back-edge signature: the green is two-valued once `pc` and `code_ptr`
+    /// are fixed, so the spelling that reproduces `green_key` IS the caller's.
+    /// A key that reproduced neither would name a bucket the caller's hash
+    /// does not, so it keeps the unprofiled spelling this function has always
+    /// used and leaves that mismatch where it was.
+    ///
+    /// Returns `None` for synthetic call sites with no raw `(code, pc)` (e.g.
+    /// [`Self::on_back_edge`]), which keep the legacy u64 hash path. On
+    /// install, `ensure_cell_for_key` clones the key into the cell's
+    /// `comparekey`, so reuse is safe.
     fn with_typed_decision_key<R>(
         green_key: u64,
         green_key_raw: (usize, usize),
@@ -5017,16 +5028,16 @@ impl<M: Clone> MetaInterp<M> {
                     vec![Type::Int, Type::Int, Type::Ref],
                 ));
         }
+        let profiled = majit_ir::pypyjit_greenkey_uhash(pc, true, code_ptr as u64) == green_key;
+        debug_assert!(
+            profiled || majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64) == green_key,
+            "typed decision key must bucket to make_green_key(green_key_raw)"
+        );
         Some(DECISION_KEY.with(|cell| {
             let mut key = cell.borrow_mut();
             key.values[0] = pc as i64;
-            key.values[1] = 0;
+            key.values[1] = profiled as i64;
             key.values[2] = code_ptr as i64;
-            debug_assert_eq!(
-                key.get_uhash(),
-                green_key,
-                "typed decision key must bucket to make_green_key(green_key_raw)"
-            );
             f(&key)
         }))
     }

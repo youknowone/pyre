@@ -1232,9 +1232,10 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// swapped slot still hashes to something, just not to the same cell.
 ///
 /// `is_being_profiled` is a real green, and pyre's callers pass a live value:
-/// both green-key construction sites read
-/// `executioncontext::current_is_being_profiled()`, so a profiled portal does
-/// not share cells with the unprofiled one.
+/// every green-key construction site reads it off the frame
+/// (`call_jit.rs` and `eval.rs` hand `frame.get_is_being_profiled()`, which is
+/// `debugdata.is_being_profiled`), so a profiled portal does not share cells
+/// with the unprofiled one.
 ///
 /// What that separation buys a `setprofile` armed on an ALREADY-COMPILED loop
 /// is a re-warmup, and only that: the green flips, the cell the back edge
@@ -1248,10 +1249,13 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// and not the green.  It is also not what protects a profiler installed
 /// BEFORE the frame is entered — measured, such a frame never reaches a trace
 /// at all (`loops_compiled = 0`, `loops_aborted = 0`), because
-/// `eval_with_jit_inner` routes it to `execute_frame_plain`.  Tracing has no
-/// green of its own and so gets neither: the mid-loop case is answered instead
-/// by the `debugdata` guard `pyopcode.py dispatch_bytecode`'s
-/// `jit.we_are_jitted()` arm records.
+/// `eval_with_jit_inner` routes it to `execute_frame_plain`.  The green is
+/// still live at a back edge even so: `setprofile` runs `force_all_frames(True)`,
+/// which sets `is_being_profiled` on every frame ALREADY running, and one of
+/// those can be sitting in a compiled loop.  Tracing has no green of its own
+/// and so gets neither: the mid-loop case is answered instead by the
+/// `debugdata` guard `pyopcode.py dispatch_bytecode`'s `jit.we_are_jitted()`
+/// arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
     GreenKey::with_types(
         vec![pc as i64, is_being_profiled as i64, code_ptr as i64],

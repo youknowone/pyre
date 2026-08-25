@@ -1429,6 +1429,16 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if !ctx.is_authoritative_executor {
         return Ok(None);
     }
+    // A `CALL_ASSEMBLER` jumps straight into the callee's own compiled trace,
+    // which begins at the callee's first bytecode — past `pyframe.py
+    // execute_frame` and so past the `ec.call_trace` / `ec.return_trace` it
+    // brackets the eval loop with.  While a hook is installed there is nothing
+    // that can report those events from here, so the call stays a residual and
+    // reaches `execute_frame`.  Same test and same reason as the inline
+    // decline in `try_walker_inline_resolved_user_call_inner`.
+    if super::ec_hook_installed() {
+        return Ok(None);
+    }
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // Only a genuine `call_fn` residual is a candidate — every
     // container/builtin helper carries a distinct tag.
@@ -2918,19 +2928,25 @@ fn walker_ec_enter(
 /// be missed.  This walker inlines neither, so an inlined callee reports
 /// nothing for as long as the loop stays compiled.
 ///
-/// Two things currently keep that from being observable, and neither is the
-/// green: `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routes any frame for
-/// which `frame_tracing_active` holds to `execute_frame_plain`, so a hooked
-/// frame never reaches the portal at all — measured, a profiled loop reads
-/// `loops_compiled = 0`, `loops_aborted = 0`; and a tracer armed mid-run on an
-/// already-compiled frame fails the portal frame's own `debugdata` guard
-/// (`record_portal_debugdata_guard`), which stops that frame running compiled
-/// at all.  Neither is a correctness argument for this omission.  The first is
-/// a compilation gate: the moment it is narrowed so a hooked frame can compile,
-/// this becomes a reporting bug for the profile half.  The second is about the
-/// CALLER's frame: it says nothing about a callee whose own `call_trace` /
-/// `return_trace` this walker declines to inline, and it does not fire at all
-/// for a global tracer that leaves the caller's `f_trace` unset.
+/// What keeps the omission sound is that there is no inlined callee to lose
+/// events for while a hook is installed:
+/// `try_walker_inline_resolved_user_call_inner` declines the inline outright
+/// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
+/// residual call and reaches the interpreter's own `execute_frame`, which runs
+/// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
+/// was recorded is answered by `record_portal_tracefunc_guard`
+/// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
+/// profiler.
+///
+/// ⛔ Neither of the two gates that USED to hide this is a correctness
+/// argument for it, and neither should be cited as one.
+/// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
+/// which `frame_tracing_active` holds to `execute_frame_plain` is a
+/// compilation gate, not a reporting one.  And the portal frame's `debugdata`
+/// guard (`record_portal_debugdata_guard`) is about the CALLER's frame: it
+/// says nothing about a callee whose own `call_trace` / `return_trace` this
+/// walker declines to inline, and it does not fire at all for a global tracer
+/// that leaves the caller's `f_trace` unset.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as
@@ -4097,6 +4113,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         return resolved_inline_decline(op.pc, line!());
     };
     if body_facts.has_abort_permanent {
+        return resolved_inline_decline(op.pc, line!());
+    }
+    // `pyframe.py execute_frame` brackets the callee's eval loop with
+    // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
+    // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
+    // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
+    // frame-chain half of that bracket and nothing else, and the walker has no
+    // route to record `_trace` — it calls back into app-level Python with the
+    // callee frame as an argument.  So while a hook is installed there is no
+    // shape of this inline that can report what the callee owes, and the
+    // answer is the one `codewriter/policy.py look_inside_graph` gives for a
+    // graph it will not look inside: decline, and let the residual call reach
+    // the interpreter's own `execute_frame`, which runs both.
+    //
+    if super::ec_hook_installed() {
         return resolved_inline_decline(op.pc, line!());
     }
     // The callee body resolves its `d`/`j` descr operands through its OWN
