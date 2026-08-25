@@ -303,8 +303,12 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// identical `consulted` and `suppressed` counts and only `fired` is split;
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
+///
+/// Spelled as a slice rather than an array so that adding a row cannot leave a
+/// hand-written length behind it: `SPEC_FOLD_COUNT` reads `len()`, which is a
+/// `const fn`, and every other reader iterates.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 76] = [
+pub const SPEC_FOLD_ROWS: &[(&str, &str, &str)] = &[
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
