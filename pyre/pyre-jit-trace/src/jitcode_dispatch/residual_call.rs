@@ -5320,15 +5320,29 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     Some(())
 }
 
-/// The `CodeObject` of the frame the walk is currently in.
+/// The `CodeObject` of the frame the walk is currently in: the innermost
+/// inlined callee while a sub-walk is in progress, else the portal frame.
 ///
-/// Every `__build_class__` the walker meets is reached with an empty
-/// `WalkSession::framestack` — a class statement is never inside an inlined
-/// callee sub-walk — so the portal jitcode's own code object is the code
-/// running the statement.
-fn walker_portal_py_code<Sym: WalkSym>(
+/// A sub-walk inherits `FbwWalkMode::snapshot_sym` from its parent, so that
+/// field names the walk's outermost frame however deep the descent is. A
+/// helper holding a class statement is an ordinary inline candidate — the
+/// admission that declines one today is the generic replay-safety screen, not
+/// a rule about `__build_class__` — so reading the snapshot root would decide
+/// a callee's class statement by its caller's returns. `WalkSession::framestack`
+/// carries the callee levels, and its top is the frame executing the opcode;
+/// this is the same derivation `ActiveResumeFrame::current` performs, so the
+/// gate and the snapshot encoder name one consistent active frame.
+fn walker_active_py_code<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<&'static pyre_interpreter::CodeObject> {
+    // Bound before the branch so the session borrow ends with this statement.
+    let innermost = super::fbw_state::fbw_innermost_inline_callee_key(ctx);
+    if let Some(callee_w_code) = innermost {
+        let index = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)?;
+        let code_ptr = payload.code_ptr;
+        return (!code_ptr.is_null()).then(|| unsafe { &*code_ptr });
+    }
     let sym = ctx.fbw_mode.snapshot_sym;
     if sym.is_null() {
         return None;
@@ -5980,8 +5994,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && walker_portal_py_code(ctx)
-            .is_none_or(|portal| !pyre_interpreter::code_returns_only_constants(portal))
+        && walker_active_py_code(ctx)
+            .is_none_or(|active| !pyre_interpreter::code_returns_only_constants(active))
         && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
     {
         // Carry the reason to the `abort_trace` that follows, the way upstream

@@ -1,10 +1,13 @@
 # CPython-suite gap: the suite has no hot loop where a branch arm holds more
 # than one suppressing `with`, so nothing exercises a second `__exit__` on a
 # compiled path.
-# parity-tests reason: this guards the blackhole's `guard_class` result, which
-# a resumed exception match reads to pick the handler. With that register left
-# unwritten the second block's `__exit__` was never reached and the raise
-# escaped the loop.
+# parity-tests reason: this is the shape a resumed exception match picks a
+# handler on. It was written from a repro whose second `__exit__` was never
+# reached, at a tree where `Backend::bh_classof` answered 0 and
+# `goto_if_exception_mismatch` compared that against the bounding vtable.
+# Reverting that commit no longer reproduces the escape here -- nor does it in
+# the repro itself -- so what this file pins is the shape's parity, not that
+# one register.
 
 """A second suppressing `with` in a branch arm still runs its `__exit__`.
 
@@ -16,6 +19,13 @@ are kept here as the boundary.
 Counting happens in the loop and the assertions run after it -- an assertion
 inside the body reads the counters and stops the loop compiling, which would
 leave the compiled path untested.
+
+Every loop here is a `while`. `for_iter_body_op_is_jit_safe` is an allowlist
+naming neither `LoadSpecial` nor `WithExceptStart`, so a `with` inside a `for`
+body declines the whole region: on `for` these shapes compiled two loops, took
+no guard failure at all and entered no blackhole, while on `while` they compile
+six loops and seven bridges, take 1595 guard failures and run the blackhole's
+`_run_forever` 1588 times.
 """
 
 ROUNDS = 20000
@@ -47,7 +57,8 @@ def two_blocks_in_a_branch():
     cm = Suppress(log)
     taken = 0
     escaped = 0
-    for i in range(ROUNDS):
+    i = 0
+    while i < ROUNDS:
         if i % 100 - 50 > 0:
             taken += 1
         else:
@@ -58,6 +69,7 @@ def two_blocks_in_a_branch():
                     raise ValueError(2)
             except ValueError:
                 escaped += 1
+        i += 1
     return taken, escaped, len(log)
 
 
@@ -65,18 +77,19 @@ def three_blocks_in_a_branch():
     log = []
     cm = Suppress(log)
     escaped = 0
-    for i in range(ROUNDS):
-        if i % 100 - 50 > 0:
-            continue
-        try:
-            with cm:
-                raise ValueError(1)
-            with cm:
-                raise ValueError(2)
-            with cm:
-                raise ValueError(3)
-        except ValueError:
-            escaped += 1
+    i = 0
+    while i < ROUNDS:
+        if i % 100 - 50 <= 0:
+            try:
+                with cm:
+                    raise ValueError(1)
+                with cm:
+                    raise ValueError(2)
+                with cm:
+                    raise ValueError(3)
+            except ValueError:
+                escaped += 1
+        i += 1
     return escaped, len(log)
 
 
@@ -84,19 +97,20 @@ def branch_arm_hands_back_to_an_outer_handler():
     """A non-suppressing `__exit__` must still reach the enclosing `except`."""
     cm = Reraise()
     caught = 0
-    for i in range(ROUNDS):
-        if i % 100 - 50 > 0:
-            continue
-        try:
-            with cm:
-                raise ValueError(1)
-        except ValueError:
-            caught += 1
-        try:
-            with cm:
-                raise ValueError(2)
-        except ValueError:
-            caught += 1
+    i = 0
+    while i < ROUNDS:
+        if i % 100 - 50 <= 0:
+            try:
+                with cm:
+                    raise ValueError(1)
+            except ValueError:
+                caught += 1
+            try:
+                with cm:
+                    raise ValueError(2)
+            except ValueError:
+                caught += 1
+        i += 1
     return caught
 
 
@@ -105,14 +119,15 @@ def one_block_in_a_branch():
     log = []
     cm = Suppress(log)
     escaped = 0
-    for i in range(ROUNDS):
-        if i % 100 - 50 > 0:
-            continue
-        try:
-            with cm:
-                raise ValueError(1)
-        except ValueError:
-            escaped += 1
+    i = 0
+    while i < ROUNDS:
+        if i % 100 - 50 <= 0:
+            try:
+                with cm:
+                    raise ValueError(1)
+            except ValueError:
+                escaped += 1
+        i += 1
     return escaped, len(log)
 
 
@@ -121,7 +136,8 @@ def two_blocks_without_a_branch():
     log = []
     cm = Suppress(log)
     escaped = 0
-    for _ in range(ROUNDS):
+    i = 0
+    while i < ROUNDS:
         try:
             with cm:
                 raise ValueError(1)
@@ -129,6 +145,7 @@ def two_blocks_without_a_branch():
                 raise ValueError(2)
         except ValueError:
             escaped += 1
+        i += 1
     return escaped, len(log)
 
 

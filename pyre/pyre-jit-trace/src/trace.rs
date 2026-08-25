@@ -3475,7 +3475,37 @@ fn try_adopt_multi_frame_blackhole(
         // the frame instead of out of the green list.  Declining is not
         // available after the drive — see this path's note on post-drive
         // declines.
+        //
+        // The coordinate is the ROOT's.  Unlike the raise arm below, a bail
+        // does not walk the chain to the portal before taking its terminal
+        // image (`blackhole.rs handle_jitexception` refuses one ahead of that
+        // walk), so the terminal is whichever level stopped — and a level
+        // below the root leaves the root stamped at its own CALL.  Resuming
+        // there re-enters a callee that has already run part of its body.
+        // Handing the chain back instead of the root alone is a handoff pyre
+        // does not have, so the mismatch is reported rather than repaired:
+        // the same shape, and the same reporting, as the portal CRN/frame
+        // identity mismatch `eval.rs pyre_portal_runner` logs.
         majit_metainterp::jitexc::JitException::BailToInterpreter => {
+            if majit_metainterp::majit_log_enabled()
+                && let Some(image) = mf_terminal.as_ref()
+                && let Ok(index) = i32::try_from(image.jitcode_index)
+                && let Some(terminal) = crate::state::pyjitcode_for_jitcode_index(index)
+                && !terminal.code_ptr.is_null()
+                && !std::ptr::eq(terminal.code_ptr as *const (), unsafe {
+                    (*(root_addr as *const pyre_interpreter::PyFrame)).pycode
+                })
+            {
+                eprintln!(
+                    "[blackhole-resume] bail terminal is not the root frame: \
+                     terminal jitcode={} code={:p} root code={:p} — the root's \
+                     stamped coordinate names its own CALL, not where the chain \
+                     stopped",
+                    image.jitcode_index,
+                    terminal.code_ptr,
+                    unsafe { (*(root_addr as *const pyre_interpreter::PyFrame)).pycode },
+                );
+            }
             let resume_py_pc = frame_resume_py_pc(root_addr);
             adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
