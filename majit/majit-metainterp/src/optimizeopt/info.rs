@@ -2105,8 +2105,8 @@ mod tests {
         let mut cache = gc_cache()
             .lock()
             .expect("test GC cache must not be poisoned");
-        cache._cache_size.remove(&LLType::Struct(key));
-        cache._cache_array.remove(&LLType::Array(key));
+        cache._cache_size.shift_remove(&LLType::Struct(key));
+        cache._cache_array.shift_remove(&LLType::Array(key));
     }
 
     #[test]
