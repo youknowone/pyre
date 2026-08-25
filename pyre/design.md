@@ -34,7 +34,7 @@ Rust, and a PyPy-equivalent (pyre) on top of that.**
 | RPython translator (flowspace → annotator → rtyper) | **majit-translate** (`front/ast` → `flowspace/` → `annotator/` → `rtyper/`) over **Charon LLBC** artifacts | Same pipeline, same module names, run at `cargo build` time over extracted `.ullbc` instead of live bytecode. |
 | `jtransform`/codewriter → JitCode | **majit-translate `codewriter/`** → JitCode | Same role, at `cargo build` time. pyre additionally runs a *second*, hand-written codewriter over user `CodeObject`s at runtime; see §3.7. |
 | `warmspot` — translation-time portal generator | **split**: build-time derivation in majit-translate, hand-written warm entry in pyre-jit | Not a port. `apply_jit` is unwired and `warmspot.rs` is a `pub use` namespace; see §3.7. |
-| metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. |
+| metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. The history, optimizer, resume and blackhole halves are what production runs; the `pyjitpl` MIFrame *tracer* is not — `mod pyjitpl` is private, `cpu.rs` calls that tracer retired, and pyre records through the hand-written full-body walker in `pyre-jit-trace/src/jitcode_dispatch/`. That walker is A1 debt of the same class §3.7 tracks. |
 | x86/ARM/… hand-written backends (~300k LOC) | **majit-backend-dynasm / -cranelift / -wasm** | Three thin backends behind one trait, current primary dynasm; see §3.4. |
 | incminimark GC | **majit-gc** (nursery + oldgen + incremental + card marking) | Port of the winner, not of Boehm/refcount/mark-sweep. |
 | sandbox transform | **rsandbox** | Compile-time sandbox aspect. |
@@ -293,9 +293,14 @@ configuration. pyre keeps:
 
 - **One blessed default configuration** that is always green and always
   benchmarked (this is what CI and check.py gate).
-- Experimental behavior behind `PYRE_*` env gates or features, default-off,
-  each with an owner-issue and an intended flip-or-delete decision. A gate is
-  a staging area, not a home.
+- Experimental behavior behind `PYRE_*` / `MAJIT_*` env gates or features.
+  Default-off is the norm; a gate may be default-**ON** where its reason for
+  existing is to keep the switched-off arm reachable as a one-binary A/B, and
+  then its registry row has to name the trigger that retires it. Either
+  polarity carries an owner-issue and an intended flip-or-delete decision. A
+  gate is a staging area, not a home. The registries are `pyre/gate-triage.md`
+  and `majit/gate-triage.md`; a gate read from the environment with no row
+  there fails `gate_triage_complete`.
 - Aspect combinations (e.g. wasm × JIT × GC modes) are individually declared
   supported or unsupported; silence means unsupported.
 
