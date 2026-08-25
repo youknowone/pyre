@@ -21,6 +21,27 @@ use crate::{
 /// glibc does neither. So `<function f at 0x000001B7AF7FFCC0>` and
 /// `<function f at 0x1b7af7ffcc0>` are the same repr, each on its own platform,
 /// and Rust's `{:p}` is only ever the second one.
+///
+/// The *value* is a raw address, where `getaddrstring` renders `space.id(self)`
+/// — the same number `builtin_id` answers, which since #1316 goes through
+/// `gc_identity_hash` so a nursery move preserves it.  The two spellings can
+/// therefore disagree for a young object, whose id is the shadow address it is
+/// about to be moved to rather than the one it currently occupies.
+///
+/// They do not disagree in practice, and that was measured rather than assumed:
+/// for `object()`, an instance, a function and a generator — the classes whose
+/// repr carries an address at all — the repr address equals `hex(id(x))` at
+/// birth and again after a collection, at the default nursery, at 1MB and at
+/// 512KB, and under `MAJIT_GC_STRESS=1`.  The classes that do move, list and
+/// dict, print no address.  So the sets do not overlap and there is nothing to
+/// observe.
+///
+/// Closing the gap anyway would mean routing the callers through the hook, and
+/// they are not uniform: several pass a `*const` to a Rust struct
+/// (`PyFrame`, the thread lock types) rather than a GC handle, and one already
+/// holds a `usize` computed elsewhere.  It would also put a shadow-allocating
+/// call — i.e. a collection point — inside every address-printing repr.  Take
+/// that on with a witness in hand, not on the strength of the spelling.
 pub(crate) fn repr_addr(addr: usize) -> String {
     if cfg!(windows) {
         format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)

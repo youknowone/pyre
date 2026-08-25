@@ -160,6 +160,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let _ = roots.pin_root(pyre_object::w_dict_new());
         let field_types_slot = dict_slot + 1;
         let _ = roots.pin_root(pyre_object::w_dict_new());
+        // `make_type` builds ONE tuple of field names and binds it to both
+        // `_fields` and `__match_args__`, so `Expr._fields is
+        // Expr.__match_args__`.  It is pinned here, beside the two namespace
+        // dicts, because the first store of it allocates a key string and can
+        // grow the dict it lands in.
+        let fields_slot = field_types_slot + 1;
+        let _ = roots.pin_root(tuple_of_names(node_fields(name)));
         // The value arrives already built.  Call arguments evaluate left to
         // right, so reading a dict slot inline with an allocating value
         // expression would read the slot first and hand over a pre-move word.
@@ -182,6 +189,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let _ = roots.pin_root(tuple_of_names(node_fields(name)));
         put(dict_slot, "_fields", roots.get(fields_slot))
             .expect("set _fields on _ast type namespace");
+        // Without this name a class pattern carrying positional sub-patterns
+        // raises `TypeError: Expr() accepts 0 positional sub-patterns`.
+        // `traceback._extract_caret_anchors_from_line_segment` is written as
+        // `case ast.Expr(expr)` over `ast.BinOp` / `ast.Subscript` /
+        // `ast.Call`, so every traceback printed through `traceback.py` loses
+        // its `~`/`^` anchors without it.
         put(dict_slot, "__match_args__", roots.get(fields_slot))
             .expect("set __match_args__ on _ast type namespace");
         put(

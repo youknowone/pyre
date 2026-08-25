@@ -1978,33 +1978,28 @@ pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_glob
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
-/// Whether a line table records no position for any instruction.
-///
-/// A `None`-kind entry is the spelling for "this instruction has no line",
-/// which `co_positions()` reports as `None`; every other kind carries one,
-/// `NoColumns` included, which drops the columns and keeps the line.  A
-/// `None` entry has no payload, so a table made only of them can be walked a
-/// byte at a time and any other kind ends the walk at its first byte.
-fn linetable_records_no_position(linetable: &[u8]) -> bool {
-    linetable.iter().all(|&byte| {
-        byte & 0x80 != 0
-            && (byte >> 3) & 0x0f == crate::bytecode::PyCodeLocationInfoKind::None as u8
-    })
-}
-
 /// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
 /// Matches RPython: negative `stopat` means "frame not yet started", returns
 /// first-line.
 ///
-/// The same row lookup as [`crate::pycode::w_code_addr2line`], which takes the
-/// byte offset `tb_lasti` carries rather than an instruction index and reports
-/// a miss instead of clamping.  This one clamps to the first line, so it can
-/// never express the `None` a `tb_lineno` read answers.
+/// [`crate::pycode::w_code_addr2line`] with the instruction index converted to
+/// the byte offset `tb_lasti` carries.  `-1` is its miss, the value upstream
+/// returns from the same zero-length walk and the value both readers of a line
+/// number render as `None`; it is also `LINENO_NOT_COMPUTED`, so a traceback
+/// node stamped with it resolves lazily and answers `None` there too.
+///
+/// The `PyCode` wrapper is the argument, not the bare `CodeObject`, because
+/// the walk is seeded with `co_firstlineno` and only the wrapper carries it
+/// as the signed integer app-level set: `CodeObject.first_line_number` is an
+/// `Option<OneIndexed>` and cannot hold the zero and negative values
+/// `CodeType(...)` accepts.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode`.
 #[inline]
-pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
+pub unsafe fn offset2lineno(w_code: PyObjectRef, stopat: isize) -> isize {
     let addrq = (stopat as i64).saturating_mul(2);
-    crate::pycode::w_code_addr2line(code, addrq)
-        .unwrap_or_else(|| code.first_line_number.map_or(1, |n| n.get()))
+    unsafe { crate::pycode::w_code_addr2line(w_code, addrq) as isize }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2183,23 +2178,43 @@ fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
 
 /// `frameobject.c marklines` — the source line that starts at each
 /// instruction-unit index (`-1` where no line change begins).
-fn mark_lines(code: &CodeObject, len: usize) -> Vec<i32> {
-    let mut lines = vec![-1i32; len];
-    let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
-    let locations = crate::pycode::code_locations(code);
+///
+/// ```c
+/// while (_PyLineTable_NextAddressRange(&bounds)) {
+///     assert(bounds.ar_start / (int)sizeof(_Py_CODEUNIT) < len);
+///     if (bounds.ar_line != last_line && bounds.ar_line != -1) {
+///         linestarts[bounds.ar_start / (int)sizeof(_Py_CODEUNIT)] = bounds.ar_line;
+///         last_line = bounds.ar_line;
+///     }
+/// }
+/// ```
+///
+/// Only the **start** unit of a range is a jump target, and a `NO_LOCATION`
+/// range contributes none: `ar_line` is `-1` there and the second test drops
+/// it.  `code_locations` cannot express either — it holds one `SourceLocation`
+/// per unit whose `line` is a `OneIndexed`, so a range carrying line `0` or no
+/// line at all reads back as `1` and turns the module `RESUME` into a legal
+/// target for `f_lineno = 1`.
+///
+/// `firstlineno` is `co->co_firstlineno` as app-level set it; the assert is a
+/// bounds check here because a replaced `co_linetable` can describe ranges past
+/// `len`, which upstream would write out of bounds in a release build.
+fn mark_lines(code: &CodeObject, firstlineno: i32, len: usize) -> Vec<i32> {
+    let mut linestarts = vec![-1i32; len];
+    let mut bounds = crate::pycode::PyCodeAddressRange::new(&code.linetable, firstlineno);
     let mut last_line = -1i32;
-    for i in 0..len {
-        // `locations[i].0` is the start SourceLocation of unit `i`.
-        let line = locations
-            .get(i)
-            .map(|(start, _)| start.line.get() as i32)
-            .unwrap_or(first);
-        if line != last_line && line != -1 {
-            lines[i] = line;
-            last_line = line;
+    while bounds.advance() {
+        if bounds.ar_line != last_line && bounds.ar_line != -1 {
+            if let Some(slot) = usize::try_from(bounds.ar_start / 2)
+                .ok()
+                .and_then(|index| linestarts.get_mut(index))
+            {
+                *slot = bounds.ar_line;
+            }
+            last_line = bounds.ar_line;
         }
     }
-    lines
+    linestarts
 }
 
 /// `frameobject.c first_line_not_before` — the smallest line `>= line`
@@ -4230,6 +4245,28 @@ impl PyFrame {
     }
 
     /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
+    ///
+    /// `-1` is `PyFrame_GetLineNumber`'s no-line answer, which
+    /// [`PyFrame::fget_f_lineno`] renders as `None`.  It reaches here for a
+    /// replacement `co_linetable` that describes no range covering
+    /// `last_instr` — including an empty one — and for the `NO_LOCATION`
+    /// ranges a compiler-generated cleanup sits in.
+    ///
+    /// A frame that has not run an instruction resolves against its first
+    /// `RESUME`, not against `PyCode_Addr2Line`'s `addrq < 0` arm.  Upstream
+    /// has no "not started" offset to resolve: `_PyInterpreterFrame_LASTI` is
+    /// `_co_firsttraceable` while the frame sits on that `RESUME`, so
+    /// `frame_getlineno` answers the instruction's own line.  That differs from
+    /// `co_firstlineno` for a module body, whose `RESUME` carries line **0**
+    /// while `co_firstlineno` is 1 — and the gap is observable, because
+    /// `_trace` seeds the last-traced line from here on the `call` event, so
+    /// answering `co_firstlineno` made the `RESUME`'s own line look like a
+    /// change and fired a `line` event upstream does not have.
+    ///
+    /// It differs from instruction **0** too, and only for a code object with a
+    /// prologue: `COPY_FREE_VARS` and `MAKE_CELL` are stamped with no line at
+    /// all, so a closure resolved at 0 answers `-1` and reports `f_lineno` as
+    /// `None` where the `RESUME` two units later carries the `def` line.
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
         self.get_lineno_at(self.last_instr)
@@ -4244,23 +4281,12 @@ impl PyFrame {
     /// coordinate answers this read without one.
     #[inline]
     pub fn get_lineno_at(&self, last_instr: isize) -> isize {
-        // A line table that records no position at all reports ``f_lineno is
-        // None`` rather than the code object's first line number.  The decoded
-        // `locations` cannot answer this: a `SourceLocation` always carries a
-        // line, so an entry that records none is padded out to the same value
-        // an entry that records a line without columns produces.  The raw
-        // table separates them.
-        if linetable_records_no_position(&self.code().linetable) {
-            return -1;
-        }
-        // CPython exposes ``None`` when a code object's line table has no
-        // usable entry for the current instruction.  Ruff's decoded
-        // zero-line entries reach us as line 0; preserve the frame getter's
-        // existing -1 sentinel instead of leaking that implementation value.
-        match offset2lineno(self.code(), last_instr) {
-            0 => -1,
-            lineno => lineno as isize,
-        }
+        let stopat = if last_instr < 0 {
+            crate::pycode::first_traceable_index(self.code()) as isize
+        } else {
+            last_instr
+        };
+        unsafe { offset2lineno(self.pycode as PyObjectRef, stopat) }
     }
 
     /// pycode.py `_get_lineno_for_pc_tracing(frame.last_instr)` — the line a
@@ -4291,8 +4317,19 @@ impl PyFrame {
 
     /// pyframe.py fget_f_lineno — the line currently executing.
     ///
-    /// `None` when an untraced frame's line table yields no entry; the
-    /// `f_trace` test only selects the -1 fallback.
+    /// ```c
+    /// int lineno = PyFrame_GetLineNumber(f);
+    /// if (lineno < 0) {
+    ///     Py_RETURN_NONE;
+    /// }
+    /// return PyLong_FromLong(lineno);
+    /// ```
+    ///
+    /// `frame_getlineno` reads the same number whether or not the frame is
+    /// traced, so the `f_trace` test that used to substitute the code
+    /// object's first line for a missing one is gone: it stood in for a
+    /// resolver that answered `-1` only for a line table it could not decode,
+    /// and the resolver now answers `-1` wherever `PyCode_Addr2Line` does.
     #[inline]
     pub fn fget_f_lineno(&self) -> PyObjectRef {
         self.f_lineno_at(self.last_instr)
@@ -4302,25 +4339,15 @@ impl PyFrame {
     /// terms as [`Self::get_lineno_at`].
     ///
     /// The whole getter body stays here rather than being split across the
-    /// caller: the `f_trace` test, the `-1` sentinel and the `first_line_number`
-    /// fallback are one decision, and a caller reproducing part of it would
-    /// answer a differently-shaped read.
+    /// caller: the `-1` sentinel and the `None` it renders as are one
+    /// decision, and a caller reproducing part of it would answer a
+    /// differently-shaped read.
     #[inline]
     pub fn f_lineno_at(&self, last_instr: isize) -> PyObjectRef {
         let lineno = self.get_lineno_at(last_instr);
-        if self.get_w_f_trace().is_null() {
-            if lineno == -1 {
-                return pyre_object::w_none();
-            }
-            return pyre_object::w_int_new(lineno as i64);
+        if lineno < 0 {
+            return pyre_object::w_none();
         }
-        let lineno = if lineno == -1 {
-            self.code()
-                .first_line_number
-                .map_or(-1, |n| n.get() as isize)
-        } else {
-            lineno
-        };
         pyre_object::w_int_new(lineno as i64)
     }
 
@@ -4395,7 +4422,11 @@ impl PyFrame {
 
         let code = self.code();
         let len = code.instructions.len();
-        let first_line = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+        // `if (new_lineno < f->f_frame->f_code->co_firstlineno)` — the bound
+        // is the code object's own first line, which app-level can set to
+        // zero or below, not a `OneIndexed` floor of 1.
+        let first_line =
+            unsafe { crate::pycode::w_code_firstlineno_raw(self.pycode as PyObjectRef) };
 
         let mut new_lineno = new_f_lineno as i32;
         if new_lineno < first_line {
@@ -4404,7 +4435,7 @@ impl PyFrame {
             )));
         }
 
-        let lines = mark_lines(code, len);
+        let lines = mark_lines(code, first_line, len);
         new_lineno = mark_first_line_not_before(&lines, new_lineno);
         if new_lineno < 0 {
             return Err(crate::PyError::value_error(format!(
@@ -4457,11 +4488,17 @@ impl PyFrame {
             cur_stack = mark_pop_value(cur_stack);
         }
         while cur_stack > best_stack {
-            let popped = self.popvalue();
             if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
                 // The popped value is the saved previous exception; make
                 // it current again.
-                crate::eval::set_current_exception(popped);
+                crate::eval::set_current_exception(self.popvalue());
+            } else {
+                // `PyStackRef_XCLOSE(_PyFrame_StackPop(f->f_frame))` — the
+                // `X` is load-bearing.  A slot below the jump target can be
+                // unbound, which is what a jump out of the body of a `with`
+                // pops: the block's `__exit__` slot is NULL until the
+                // cleanup runs.
+                self.popvalue_maybe_none();
             }
             cur_stack = mark_pop_value(cur_stack);
         }
@@ -5698,10 +5735,13 @@ mod tests {
     fn mark_lines_and_first_line_not_before() {
         let code = crate::compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile");
         let len = code.instructions.len();
-        let lines = mark_lines(&code, len);
         let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
-        // The earliest recorded line is the first source line.
-        let min_line = lines.iter().copied().filter(|&l| l >= 0).min().unwrap();
+        let lines = mark_lines(&code, first, len);
+        // A module body opens with a `RESUME` whose range carries line 0,
+        // below `co_firstlineno`; it is a range start, so it is marked.
+        assert_eq!(lines[0], 0);
+        // The earliest recorded statement line is the first source line.
+        let min_line = lines.iter().copied().filter(|&l| l > 0).min().unwrap();
         assert_eq!(min_line, first);
         // A request before the code resolves to the first line.
         assert_eq!(mark_first_line_not_before(&lines, first), first);

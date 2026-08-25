@@ -31,16 +31,16 @@ impl From<BytecodeCorruption> for crate::PyError {
 /// object implementation.  This reads the authoritative `co_linetable`;
 /// `CodeObject.locations` is an execution-oriented expansion which cannot
 /// represent a missing line or column.
-struct PyCodeAddressRange<'a> {
-    ar_start: i32,
-    ar_end: i32,
-    ar_line: i32,
+pub(crate) struct PyCodeAddressRange<'a> {
+    pub(crate) ar_start: i32,
+    pub(crate) ar_end: i32,
+    pub(crate) ar_line: i32,
     computed_line: i32,
     reader: LineTableReader<'a>,
 }
 
 impl<'a> PyCodeAddressRange<'a> {
-    fn new(linetable: &'a [u8], first_line: i32) -> Self {
+    pub(crate) fn new(linetable: &'a [u8], first_line: i32) -> Self {
         Self {
             ar_start: 0,
             ar_end: 0,
@@ -50,7 +50,7 @@ impl<'a> PyCodeAddressRange<'a> {
         }
     }
 
-    fn advance(&mut self) -> bool {
+    pub(crate) fn advance(&mut self) -> bool {
         let Some(first_byte) = self.reader.read_byte() else {
             return false;
         };
@@ -61,14 +61,20 @@ impl<'a> PyCodeAddressRange<'a> {
         // `co_linetable=b"\0"` report no ranges where one entry is decoded.
         let code = (first_byte >> 3) & 0x0f;
         let length = ((first_byte & 0x07) + 1) as i32;
-        self.computed_line += self.get_line_delta(code);
+        let line_delta = get_line_delta(&self.reader, code);
+        // Both accumulators wrap. `co_linetable` and `co_firstlineno` are
+        // both writable from app-level, so a line delta chain can carry
+        // `computed_line` past `i32` and a length chain can carry `ar_end`
+        // there; upstream is built with `-fwrapv` and keeps walking, where a
+        // plain `+` panics in a debug build.
+        self.computed_line = self.computed_line.wrapping_add(line_delta);
         self.ar_line = if first_byte >> 3 == 0x1f {
             -1
         } else {
             self.computed_line
         };
         self.ar_start = self.ar_end;
-        self.ar_end += length * 2;
+        self.ar_end = self.ar_end.wrapping_add(length * 2);
 
         // Every payload byte has bit 7 clear; the next header has it set.
         while self.reader.peek_byte().is_some_and(|byte| byte & 0x80 == 0) {
@@ -77,38 +83,222 @@ impl<'a> PyCodeAddressRange<'a> {
         true
     }
 
-    fn get_line_delta(&mut self, code: u8) -> i32 {
-        let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
-            return 0;
-        };
-        match kind {
-            PyCodeLocationInfoKind::None => 0,
-            PyCodeLocationInfoKind::Long => {
-                let delta = self.reader.read_signed_varint();
-                self.reader.read_varint();
-                self.reader.read_varint();
-                self.reader.read_varint();
-                delta
+    /// `_PyCode_CheckLineNumber` — the line the byte offset `lasti` sits on,
+    /// or `-1` when the walk runs out of ranges before reaching it.
+    ///
+    /// ```c
+    /// while (bounds->ar_end <= lasti) {
+    ///     if (!advance(bounds)) {
+    ///         return -1;
+    ///     }
+    /// }
+    /// while (bounds->ar_start > lasti) {
+    ///     if (!retreat(bounds)) {
+    ///         return -1;
+    ///     }
+    /// }
+    /// return bounds->ar_line;
+    /// ```
+    ///
+    /// The retreat loop has no counterpart here: a range built by
+    /// [`PyCodeAddressRange::new`] starts before the first offset and this is
+    /// the only walker, so `ar_start` never runs past `lasti`.
+    ///
+    /// `-1` covers two answers upstream also conflates: an offset past the
+    /// last range, and an offset inside a `NO_LOCATION` range, which
+    /// [`PyCodeAddressRange::advance`] reports by leaving `ar_line` at `-1`.
+    fn check_line_number(&mut self, lasti: i32) -> i32 {
+        while self.ar_end <= lasti {
+            if !self.advance() {
+                return -1;
             }
-            PyCodeLocationInfoKind::NoColumns => self.reader.read_signed_varint(),
-            PyCodeLocationInfoKind::OneLine0
-            | PyCodeLocationInfoKind::OneLine1
-            | PyCodeLocationInfoKind::OneLine2 => {
-                self.reader.read_byte();
-                self.reader.read_byte();
-                kind.one_line_delta().unwrap_or(0)
-            }
-            _ if kind.is_short() => {
-                self.reader.read_byte();
-                0
-            }
-            _ => 0,
         }
+        self.ar_line
+    }
+
+    /// The whole walk state except the table it reads.
+    ///
+    /// Upstream keeps `PyCodeAddressRange` inline in the two iterator objects,
+    /// which own a reference to the code object.  A Rust borrow of
+    /// `co_linetable` cannot outlive the call that took it, so the cursor
+    /// travels between calls instead of the range, and the range is rebuilt on
+    /// the same table each time.
+    pub(crate) fn cursor(&self) -> LineTableCursor {
+        LineTableCursor {
+            pos: self.reader.pos,
+            ar_start: self.ar_start,
+            ar_end: self.ar_end,
+            ar_line: self.ar_line,
+            computed_line: self.computed_line,
+        }
+    }
+
+    pub(crate) fn restore(&mut self, cursor: LineTableCursor) {
+        self.reader.pos = cursor.pos;
+        self.ar_start = cursor.ar_start;
+        self.ar_end = cursor.ar_end;
+        self.ar_line = cursor.ar_line;
+        self.computed_line = cursor.computed_line;
+    }
+
+    pub(crate) fn resume(linetable: &'a [u8], cursor: LineTableCursor) -> Self {
+        let mut range = Self::new(linetable, 0);
+        range.restore(cursor);
+        range
+    }
+
+    /// `advance_with_locations(bounds, endline, column, endcolumn)` — the
+    /// walk `positionsiter_next` steps, which decodes the full location and
+    /// not just the line.
+    ///
+    /// ```c
+    /// int first_byte = *bounds->opaque.lo_next++;
+    /// int code = (first_byte >> 3) & 15;
+    /// bounds->ar_start = bounds->ar_end;
+    /// bounds->ar_end = bounds->ar_start + ((first_byte & 7) + 1) * sizeof(_Py_CODEUNIT);
+    /// switch(code) { ... }
+    /// ```
+    ///
+    /// This one really does read the payload through the cursor and stops
+    /// where the payload ends: there is no bit-7 scan, because upstream has
+    /// none here.  `co_lines()` and `co_positions()` are therefore two
+    /// separate walks that a hand-written `co_linetable` can make disagree,
+    /// and both are reproduced rather than folded into one.
+    ///
+    /// The four values are returned instead of written through out-params.
+    /// `-1` in any of them is the missing-offset marker
+    /// [`source_offset_converter`] renders as `None`.
+    fn advance_with_locations(&mut self) -> Option<(i32, i32, i32, i32)> {
+        let first_byte = self.reader.read_byte()?;
+        let code = (first_byte >> 3) & 0x0f;
+        self.ar_start = self.ar_end;
+        self.ar_end = self
+            .ar_start
+            .wrapping_add(((first_byte & 0x07) as i32 + 1) * 2);
+        let (end_line, column, end_column) = match PyCodeLocationInfoKind::from_code(code) {
+            Some(PyCodeLocationInfoKind::None) => {
+                self.ar_line = -1;
+                (-1, -1, -1)
+            }
+            Some(PyCodeLocationInfoKind::Long) => {
+                self.computed_line = self
+                    .computed_line
+                    .wrapping_add(self.reader.read_signed_varint());
+                self.ar_line = self.computed_line;
+                let end_line = self.ar_line.wrapping_add(self.reader.read_varint() as i32);
+                let column = (self.reader.read_varint() as i32).wrapping_sub(1);
+                let end_column = (self.reader.read_varint() as i32).wrapping_sub(1);
+                (end_line, column, end_column)
+            }
+            Some(PyCodeLocationInfoKind::NoColumns) => {
+                self.computed_line = self
+                    .computed_line
+                    .wrapping_add(self.reader.read_signed_varint());
+                self.ar_line = self.computed_line;
+                (self.ar_line, -1, -1)
+            }
+            Some(
+                kind @ (PyCodeLocationInfoKind::OneLine0
+                | PyCodeLocationInfoKind::OneLine1
+                | PyCodeLocationInfoKind::OneLine2),
+            ) => {
+                self.computed_line = self
+                    .computed_line
+                    .wrapping_add(kind.one_line_delta().unwrap_or(0));
+                self.ar_line = self.computed_line;
+                let column = self.reader.read_byte().unwrap_or(0) as i32;
+                let end_column = self.reader.read_byte().unwrap_or(0) as i32;
+                (self.ar_line, column, end_column)
+            }
+            // Short forms. `from_code` covers every value `(byte >> 3) & 15`
+            // can take, so the `None` arm is unreachable and shares this one.
+            _ => {
+                let second_byte = self.reader.read_byte().unwrap_or(0);
+                self.ar_line = self.computed_line;
+                let column = ((code as i32) << 3) | ((second_byte >> 4) as i32);
+                (self.ar_line, column, column + (second_byte & 0x0f) as i32)
+            }
+        };
+        Some((self.ar_line, end_line, column, end_column))
+    }
+}
+
+/// `get_line_delta(ptr)` — the entry's line delta, read **without moving**
+/// the cursor.
+///
+/// ```c
+/// static int
+/// get_line_delta(const uint8_t *ptr)
+/// {
+///     int code = ((*ptr) >> 3) & 15;
+///     switch (code) {
+///         ...
+///         case PY_CODE_LOCATION_INFO_LONG: return scan_signed_varint(ptr+1);
+/// ```
+///
+/// `advance` moves solely by the byte scan that follows this call, stopping
+/// at the next byte with bit 7 set. Consuming the payload here instead makes
+/// the two disagree the moment a payload's declared varints run past that
+/// byte — which `code.replace(co_linetable=...)` can store. `b"\x00\x80"`
+/// is the shortest witness: the second byte is a `Short0` payload by length
+/// and an entry header by its marker, and only the marker decides.
+/// `co_lines()` reports one `(0, 4, ...)` range there, not `(0, 2, ...)`.
+///
+/// `reader` sits one byte past the header, where `ptr + 1` does, and `code`
+/// is the caller's already-decoded `(*ptr >> 3) & 15`.
+/// `_source_offset_converter(int *value)` — the marker `-1`, and only that
+/// value, is the missing offset `co_positions()` reports as `None`.
+///
+/// ```c
+/// static PyObject *
+/// _source_offset_converter(int *value) {
+///     if (*value == -1) {
+///         Py_RETURN_NONE;
+///     }
+///     return PyLong_FromLong(*value);
+/// }
+/// ```
+///
+/// It runs on all four members of the tuple, so a line that *computes* to
+/// `-1` is reported as `None` exactly like a `NO_LOCATION` range's is.
+fn source_offset_converter(value: i32) -> PyObjectRef {
+    if value == -1 {
+        pyre_object::w_none()
+    } else {
+        w_int_new(value as i64)
+    }
+}
+
+fn get_line_delta(reader: &LineTableReader<'_>, code: u8) -> i32 {
+    let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
+        return 0;
+    };
+    let mut reader = *reader;
+    match kind {
+        PyCodeLocationInfoKind::None => 0,
+        PyCodeLocationInfoKind::Long => reader.read_signed_varint(),
+        PyCodeLocationInfoKind::NoColumns => reader.read_signed_varint(),
+        PyCodeLocationInfoKind::OneLine0 => 0,
+        PyCodeLocationInfoKind::OneLine1 => 1,
+        PyCodeLocationInfoKind::OneLine2 => 2,
+        _ => 0,
     }
 }
 
 /// RustPython `LineTableReader`, matching CPython's 6-bit little-endian
 /// location-table varints.
+/// A suspended [`PyCodeAddressRange`] — every field of it but the borrowed
+/// `co_linetable`.  See [`PyCodeAddressRange::cursor`].
+#[derive(Clone, Copy)]
+pub(crate) struct LineTableCursor {
+    pos: usize,
+    ar_start: i32,
+    ar_end: i32,
+    ar_line: i32,
+    computed_line: i32,
+}
+
+#[derive(Clone, Copy)]
 struct LineTableReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -170,10 +360,6 @@ impl<'a> LineTableReader<'a> {
         } else {
             (value >> 1) as i32
         }
-    }
-
-    fn at_end(&self) -> bool {
-        self.pos >= self.data.len()
     }
 }
 
@@ -1415,8 +1601,16 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
         // `ar_line`, so a NO_LOCATION range does not manufacture a -1 delta.
         let next_line = range.computed_line as i64;
         if next_line != line {
+            // `int bdelta = bounds.ar_start - code_offset;` is signed and
+            // wraps upstream. A hand-written `co_linetable` can carry
+            // `ar_end` past `i32` and hand back a start below the previous
+            // one; saturating keeps the byte-delta loop below finite.
             let offset = range.ar_start as usize;
-            encode_pair(offset - start_offset, next_line - line, &mut out);
+            encode_pair(
+                offset.saturating_sub(start_offset),
+                next_line - line,
+                &mut out,
+            );
             line = next_line;
             start_offset = offset;
         }
@@ -1813,195 +2007,402 @@ pub unsafe fn code_varname_from_oparg(
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "co_positions")? };
-    let mut rows = Vec::new();
-    let mut reader = LineTableReader::new(&code.linetable);
-    let mut line = unsafe { (*(obj as *const PyCode)).co_firstlineno_raw };
-
-    while !reader.at_end() {
-        let Some(first_byte) = reader.read_byte() else {
-            break;
-        };
-        // Decoded as a header regardless of bit 7, for the reason given on
-        // `PyCodeAddressRange::advance`.
-        let code = (first_byte >> 3) & 0x0f;
-        let length = ((first_byte & 0x07) + 1) as usize;
-        let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
-            break;
-        };
-        let (line_delta, end_line_delta, column, end_column) = match kind {
-            PyCodeLocationInfoKind::None => (0, 0, None, None),
-            PyCodeLocationInfoKind::Long => {
-                let delta = reader.read_signed_varint();
-                let end_line_delta = reader.read_varint() as i32;
-                let column = match reader.read_varint() {
-                    0 => None,
-                    value => Some((value - 1) as i32),
-                };
-                let end_column = match reader.read_varint() {
-                    0 => None,
-                    value => Some((value - 1) as i32),
-                };
-                (delta, end_line_delta, column, end_column)
-            }
-            PyCodeLocationInfoKind::NoColumns => (reader.read_signed_varint(), 0, None, None),
-            PyCodeLocationInfoKind::OneLine0
-            | PyCodeLocationInfoKind::OneLine1
-            | PyCodeLocationInfoKind::OneLine2 => {
-                let column = reader.read_byte().unwrap_or(0) as i32;
-                let end_column = reader.read_byte().unwrap_or(0) as i32;
-                (
-                    kind.one_line_delta().unwrap_or(0),
-                    0,
-                    Some(column),
-                    Some(end_column),
-                )
-            }
-            _ if kind.is_short() => {
-                let column_data = reader.read_byte().unwrap_or(0);
-                let column_group = kind.short_column_group().unwrap_or(0);
-                let column = ((column_group as i32) << 3) | ((column_data >> 4) as i32);
-                let end_column = column + (column_data & 0x0f) as i32;
-                (0, 0, Some(column), Some(end_column))
-            }
-            _ => (0, 0, None, None),
-        };
-        line += line_delta;
-
-        for _ in 0..length {
-            let (line_obj, end_line_obj) = if kind == PyCodeLocationInfoKind::None {
-                (pyre_object::w_none(), pyre_object::w_none())
-            } else {
-                (
-                    w_int_new(line as i64),
-                    w_int_new((line + end_line_delta) as i64),
-                )
-            };
-            rows.push(w_tuple_new(vec![
-                line_obj,
-                end_line_obj,
-                column.map_or_else(pyre_object::w_none, |value| w_int_new(value as i64)),
-                end_column.map_or_else(pyre_object::w_none, |value| w_int_new(value as i64)),
-            ]));
-        }
-    }
-    let n = rows.len();
-    Ok(w_seq_iter_new(w_list_new(rows), n))
+/// `lineiterator` — the object `co_lines()` returns.
+///
+/// The walk is lazy, as upstream's is: `next()` decodes one range (plus the
+/// lookahead the merge needs) and no more.  Materializing the whole table up
+/// front made a single `co_lines()` call on a large code object cost time
+/// proportional to the table, and `traceback._get_code_position` calls
+/// `co_positions()` for every frame it renders.
+#[crate::pyre_class("line_iterator", static_name = "LINE_ITER")]
+pub struct W_LineIterObject {
+    /// `li_code` — the code object whose `co_linetable` the walk reads, held
+    /// so the table outlives the iterator.
+    pub w_code: PyObjectRef,
+    /// `li_line`, suspended.  See [`PyCodeAddressRange::cursor`].
+    pub pos: i64,
+    pub ar_start: i64,
+    pub ar_end: i64,
+    pub ar_line: i64,
+    pub computed_line: i64,
 }
 
+/// `positionsiterator` — the object `co_positions()` returns.
+#[crate::pyre_class("positions_iterator", static_name = "POSITIONS_ITER")]
+pub struct W_PositionsIterObject {
+    /// `pi_code`.
+    pub w_code: PyObjectRef,
+    /// `pi_range`, suspended.
+    pub pos: i64,
+    pub ar_start: i64,
+    pub ar_end: i64,
+    pub ar_line: i64,
+    pub computed_line: i64,
+    /// `pi_offset`, and the three locations `advance_with_locations` writes
+    /// through its out-params.
+    pub offset: i64,
+    pub end_line: i64,
+    pub column: i64,
+    pub end_column: i64,
+}
+
+/// `branchesiterator` — the object `co_branches()` returns.
+///
+/// `_PyBranchesIterator` reports `line_iterator` as its `tp_name`, the same
+/// string `_PyLineIterator` carries, so the two distinct types are
+/// indistinguishable by name; only `type(a) is type(b)` tells them apart.
+#[crate::pyre_class("line_iterator", static_name = "BRANCHES_ITER")]
+pub struct W_BranchesIterObject {
+    /// `bi_code` — the code object whose bytecode the walk reads, held so it
+    /// outlives the iterator.
+    pub w_code: PyObjectRef,
+    /// `bi_offset`, in code units.
+    pub offset: i64,
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_line_iter(obj: PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && std::ptr::eq(unsafe { (*obj).ob_type }, &LINE_ITER_TYPE)
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_positions_iter(obj: PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && std::ptr::eq(unsafe { (*obj).ob_type }, &POSITIONS_ITER_TYPE)
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_branches_iter(obj: PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    !obj.is_null() && std::ptr::eq(unsafe { (*obj).ob_type }, &BRANCHES_ITER_TYPE)
+}
+
+/// Whether `obj` is an instance of *a* type named `line_iterator`.
+///
+/// The owner a builtin method reports its receiver against is keyed by type
+/// name, and two types answer to `line_iterator`, so the name-keyed test
+/// admits either; each method body still checks the one layout it reads.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_named_line_iterator(obj: PyObjectRef) -> bool {
+    unsafe { is_line_iter(obj) || is_branches_iter(obj) }
+}
+
+/// The `co_linetable` an iterator walks, or `None` once its code object is
+/// gone.
+///
+/// # Safety
+/// `w_code` must be null or a live `PyCode`.
+unsafe fn iter_linetable<'a>(w_code: PyObjectRef) -> Option<&'a [u8]> {
+    if w_code.is_null() {
+        return None;
+    }
+    let code = unsafe { w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    if code.is_null() {
+        return None;
+    }
+    Some(unsafe { &(*code).linetable })
+}
+
+/// `lineiter_next` — one merged `(start, end, line)` range.
+///
+/// ```c
+/// if (!_PyLineTable_NextAddressRange(bounds)) { return NULL; }
+/// int start = bounds->ar_start;
+/// int line = bounds->ar_line;
+/// while (_PyLineTable_NextAddressRange(bounds)) {
+///     if (bounds->ar_line != line) {
+///         _PyLineTable_PreviousAddressRange(bounds);
+///         break;
+///     }
+/// }
+/// return Py_BuildValue("iiO&", start, bounds->ar_end,
+///                      _source_offset_converter, &line);
+/// ```
+///
+/// The lookahead is undone by restoring the saved cursor rather than by
+/// `retreat`: restoring is the exact inverse of the `advance` it undoes, where
+/// `retreat` re-derives the previous entry's line and extent by scanning
+/// backwards and is a second decoder to keep in step.
+///
+/// # Safety
+/// `obj` must be a live [`W_LineIterObject`].
+pub unsafe fn line_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let it = &mut *(obj as *mut W_LineIterObject);
+        let linetable = iter_linetable(it.w_code)?;
+        let mut bounds = PyCodeAddressRange::resume(linetable, line_iter_cursor(it));
+        if !bounds.advance() {
+            return None;
+        }
+        let start = bounds.ar_start;
+        let line = bounds.ar_line;
+        loop {
+            let saved = bounds.cursor();
+            if !bounds.advance() {
+                break;
+            }
+            if bounds.ar_line != line {
+                bounds.restore(saved);
+                break;
+            }
+        }
+        let end = bounds.ar_end;
+        line_iter_store(it, bounds.cursor());
+        Some(w_tuple_new(vec![
+            w_int_new(start as i64),
+            w_int_new(end as i64),
+            source_offset_converter(line),
+        ]))
+    }
+}
+
+fn line_iter_cursor(it: &W_LineIterObject) -> LineTableCursor {
+    LineTableCursor {
+        pos: it.pos as usize,
+        ar_start: it.ar_start as i32,
+        ar_end: it.ar_end as i32,
+        ar_line: it.ar_line as i32,
+        computed_line: it.computed_line as i32,
+    }
+}
+
+fn line_iter_store(it: &mut W_LineIterObject, cursor: LineTableCursor) {
+    it.pos = cursor.pos as i64;
+    it.ar_start = cursor.ar_start as i64;
+    it.ar_end = cursor.ar_end as i64;
+    it.ar_line = cursor.ar_line as i64;
+    it.computed_line = cursor.computed_line as i64;
+}
+
+/// `positionsiter_next` — one `(line, end_line, column, end_column)` tuple per
+/// code unit, re-decoding only when the offset reaches the end of the range.
+///
+/// ```c
+/// if (pi->pi_offset >= pi->pi_range.ar_end) {
+///     if (at_end(&pi->pi_range)) { return NULL; }
+///     advance_with_locations(&pi->pi_range, &pi->pi_endline, &pi->pi_column,
+///                            &pi->pi_endcolumn);
+/// }
+/// pi->pi_offset += 2;
+/// ```
+///
+/// # Safety
+/// `obj` must be a live [`W_PositionsIterObject`].
+pub unsafe fn positions_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let it = &mut *(obj as *mut W_PositionsIterObject);
+        let linetable = iter_linetable(it.w_code)?;
+        let cursor = LineTableCursor {
+            pos: it.pos as usize,
+            ar_start: it.ar_start as i32,
+            ar_end: it.ar_end as i32,
+            ar_line: it.ar_line as i32,
+            computed_line: it.computed_line as i32,
+        };
+        let mut bounds = PyCodeAddressRange::resume(linetable, cursor);
+        if it.offset as i32 >= bounds.ar_end {
+            let Some((line, end_line, column, end_column)) = bounds.advance_with_locations() else {
+                return None;
+            };
+            it.ar_line = line as i64;
+            it.end_line = end_line as i64;
+            it.column = column as i64;
+            it.end_column = end_column as i64;
+        }
+        let saved = bounds.cursor();
+        it.pos = saved.pos as i64;
+        it.ar_start = saved.ar_start as i64;
+        it.ar_end = saved.ar_end as i64;
+        it.ar_line = saved.ar_line as i64;
+        it.computed_line = saved.computed_line as i64;
+        it.offset = it.offset.wrapping_add(2);
+        Some(w_tuple_new(vec![
+            source_offset_converter(it.ar_line as i32),
+            source_offset_converter(it.end_line as i32),
+            source_offset_converter(it.column as i32),
+            source_offset_converter(it.end_column as i32),
+        ]))
+    }
+}
+
+/// `code_positionsiterator` — `co_positions()`.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { require_code(obj, "co_positions")? };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
+    let first_line = unsafe { (*(obj as *const PyCode)).co_firstlineno_raw };
+    Ok(W_PositionsIterObject::allocate_stable(
+        W_PositionsIterObject {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_code: obj,
+            pos: 0,
+            ar_start: -1,
+            ar_end: 0,
+            ar_line: -1,
+            computed_line: first_line as i64,
+            offset: 0,
+            end_line: -1,
+            column: -1,
+            end_column: -1,
+        },
+    ))
+}
+
+/// `code_linesiterator` — `co_lines()`.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "co_lines")? };
-    let mut rows = Vec::new();
+    unsafe { require_code(obj, "co_lines")? };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let first_line = unsafe { (*(obj as *const PyCode)).co_firstlineno_raw };
-    let mut range = PyCodeAddressRange::new(&code.linetable, first_line);
-    let mut pending: Option<(i32, i32, i32)> = None;
-
-    while range.advance() {
-        let start = range.ar_start;
-        let end = range.ar_end;
-        let line = range.ar_line;
-        if let Some((previous_start, _, previous_line)) = pending {
-            if previous_line == line {
-                pending = Some((previous_start, end, previous_line));
-            } else {
-                rows.push(w_tuple_new(vec![
-                    w_int_new(previous_start as i64),
-                    w_int_new(start as i64),
-                    if previous_line == -1 {
-                        pyre_object::w_none()
-                    } else {
-                        w_int_new(previous_line as i64)
-                    },
-                ]));
-                pending = Some((start, end, line));
-            }
-        } else {
-            pending = Some((start, end, line));
-        }
-    }
-    if let Some((start, end, line)) = pending {
-        rows.push(w_tuple_new(vec![
-            w_int_new(start as i64),
-            w_int_new(end as i64),
-            if line == -1 {
-                pyre_object::w_none()
-            } else {
-                w_int_new(line as i64)
-            },
-        ]));
-    }
-    let n = rows.len();
-    Ok(w_seq_iter_new(w_list_new(rows), n))
+    Ok(W_LineIterObject::allocate_stable(W_LineIterObject {
+        ob: pyre_object::PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        w_code: obj,
+        pos: 0,
+        ar_start: -1,
+        ar_end: 0,
+        ar_line: -1,
+        computed_line: first_line as i64,
+    }))
 }
 
+/// `int_triple` — the `(a, b, c)` tuple every branch row is reported as.
+fn int_triple(a: i64, b: i64, c: i64) -> PyObjectRef {
+    w_tuple_new(vec![w_int_new(a), w_int_new(b), w_int_new(c)])
+}
+
+/// `branchesiter_next` — the next branch instruction's
+/// `(instruction, not-taken target, taken target)` triple, in byte offsets.
+///
+/// The scan resumes at `bi_offset` and stops at the branch it reports, so a
+/// caller that reads one row does not pay for the rest of the bytecode.
+///
+/// # Safety
+/// `obj` must be a live [`W_BranchesIterObject`].
+pub unsafe fn branches_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe {
+        let it = &mut *(obj as *mut W_BranchesIterObject);
+        if it.w_code.is_null() {
+            return None;
+        }
+        let code = w_code_get_ptr(it.w_code) as *const crate::CodeObject;
+        if code.is_null() {
+            return None;
+        }
+        let code = &*code;
+        let mut offset = usize::try_from(it.offset).ok()?;
+        let mut op_arg = 0usize;
+        while offset < code.instructions.len() {
+            let op = code.instructions.read_op(offset).deoptimize();
+            let next_offset = offset + 1 + op.cache_entries();
+            let arg = u8::from(code.instructions.read_arg(offset)) as usize;
+            match op {
+                crate::bytecode::Instruction::ExtendedArg => {
+                    op_arg = (op_arg << 8) | arg;
+                }
+                crate::bytecode::Instruction::ForIter { .. } => {
+                    op_arg = (op_arg << 8) | arg;
+                    it.offset = next_offset as i64;
+                    // Skips END_FOR and POP_ITER.
+                    let target = next_offset + op_arg + 2;
+                    return Some(int_triple(
+                        (offset * 2) as i64,
+                        (next_offset * 2) as i64,
+                        (target * 2) as i64,
+                    ));
+                }
+                crate::bytecode::Instruction::PopJumpIfFalse { .. }
+                | crate::bytecode::Instruction::PopJumpIfTrue { .. }
+                | crate::bytecode::Instruction::PopJumpIfNone { .. }
+                | crate::bytecode::Instruction::PopJumpIfNotNone { .. } => {
+                    op_arg = (op_arg << 8) | arg;
+                    // Skip NOT_TAKEN, which Python 3.14 emits at the
+                    // fallthrough edge so branch instrumentation can tell the
+                    // untaken path apart.
+                    let not_taken = next_offset + 1;
+                    it.offset = not_taken as i64;
+                    return Some(int_triple(
+                        (offset * 2) as i64,
+                        (not_taken * 2) as i64,
+                        ((next_offset + op_arg) * 2) as i64,
+                    ));
+                }
+                crate::bytecode::Instruction::EndAsyncFor => {
+                    op_arg = (op_arg << 8) | arg;
+                    let src_offset = next_offset - op_arg;
+                    it.offset = next_offset as i64;
+                    debug_assert!(matches!(
+                        code.instructions.read_op(src_offset).deoptimize(),
+                        crate::bytecode::Instruction::EndSend
+                    ));
+                    debug_assert!(matches!(
+                        code.instructions.read_op(src_offset + 1).deoptimize(),
+                        crate::bytecode::Instruction::NotTaken
+                    ));
+                    let not_taken = src_offset + 2;
+                    return Some(int_triple(
+                        (src_offset * 2) as i64,
+                        (not_taken * 2) as i64,
+                        (next_offset * 2) as i64,
+                    ));
+                }
+                _ => op_arg = 0,
+            }
+            offset = next_offset;
+        }
+        it.offset = offset as i64;
+        None
+    }
+}
+
+/// `_PyInstrumentation_BranchesIterator` — `co_branches()`.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let code = unsafe { require_code(obj, "co_branches")? };
-    let mut rows = Vec::new();
-    let mut index = 0usize;
-    let mut op_arg = 0usize;
-    while index < code.instructions.len() {
-        let op = code.instructions.read_op(index).deoptimize();
-        let next = index + 1 + op.cache_entries();
-        let arg = u8::from(code.instructions.read_arg(index)) as usize;
-        match op {
-            crate::bytecode::Instruction::ExtendedArg => {
-                op_arg = (op_arg << 8) | arg;
-            }
-            crate::bytecode::Instruction::ForIter { .. } => {
-                op_arg = (op_arg << 8) | arg;
-                rows.push(w_tuple_new(vec![
-                    w_int_new((index * 2) as i64),
-                    w_int_new((next * 2) as i64),
-                    w_int_new(((next + op_arg + 2) * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            crate::bytecode::Instruction::PopJumpIfFalse { .. }
-            | crate::bytecode::Instruction::PopJumpIfTrue { .. }
-            | crate::bytecode::Instruction::PopJumpIfNone { .. }
-            | crate::bytecode::Instruction::PopJumpIfNotNone { .. } => {
-                op_arg = (op_arg << 8) | arg;
-                // Python 3.14 inserts NOT_TAKEN at the fallthrough edge so
-                // branch instrumentation can distinguish the untaken path.
-                let not_taken = next + 1;
-                rows.push(w_tuple_new(vec![
-                    w_int_new((index * 2) as i64),
-                    w_int_new((not_taken * 2) as i64),
-                    w_int_new(((next + op_arg) * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            crate::bytecode::Instruction::EndAsyncFor => {
-                op_arg = (op_arg << 8) | arg;
-                let source = next - op_arg;
-                debug_assert!(matches!(
-                    code.instructions.read_op(source).deoptimize(),
-                    crate::bytecode::Instruction::EndSend
-                ));
-                debug_assert!(matches!(
-                    code.instructions.read_op(source + 1).deoptimize(),
-                    crate::bytecode::Instruction::NotTaken
-                ));
-                rows.push(w_tuple_new(vec![
-                    w_int_new((source * 2) as i64),
-                    w_int_new(((source + 2) * 2) as i64),
-                    w_int_new((next * 2) as i64),
-                ]));
-                op_arg = 0;
-            }
-            _ => op_arg = 0,
-        }
-        index = next.max(index + 1);
-    }
-    let n = rows.len();
-    Ok(w_seq_iter_new(w_list_new(rows), n))
+    unsafe { require_code(obj, "co_branches")? };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(obj);
+    Ok(W_BranchesIterObject::allocate_stable(
+        W_BranchesIterObject {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_code: obj,
+            offset: 0,
+        },
+    ))
 }
 
 /// `code.replace(**kwds)` — `pypy/interpreter/pycode.py` applevel
@@ -2957,7 +3358,7 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 }
 
 /// `PyCode_Addr2Line` — the source line the byte offset `addrq` sits on, or
-/// `None` when the offset names no line.
+/// `-1` when the offset names no line.
 ///
 /// ```c
 /// if (addrq < 0) {
@@ -2968,28 +3369,106 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// ```
 ///
 /// `location.py offset2lineno(c, stopat)` is the same resolver upstream, down
-/// to the byte-offset convention: it answers `c.co_firstlineno` for `-1` and
-/// halves `stopat` before walking the line table.  `pyframe::offset2lineno`
-/// carries the name but takes an instruction index, so this is the one a
-/// `tb_lasti` reaches.
+/// to the byte-offset convention: it halves `stopat` before walking the line
+/// table.  `pyframe::offset2lineno` carries the name but takes an instruction
+/// index, so this is the one a `tb_lasti` reaches.
 ///
-/// `addrq` counts bytes, two per instruction, so the row index is `addrq / 2`
-/// — the same conversion `traceback._get_code_position` makes app-level.  A
-/// negative offset names the code object's first line, which is the answer for
-/// a frame that has not run an instruction yet.
+/// `addrq` counts bytes, two per instruction — the same unit
+/// `traceback._get_code_position` works in app-level.
 ///
-/// An offset past the last row answers `None`, and `tb_lineno` hands that back
-/// as `None`.  `_PyCode_CheckLineNumber` also answers `-1` for an in-range
-/// instruction that carries no line at all; pyre's rows cannot spell that,
-/// because `SourceLocation::line` is a `OneIndexed`.
-pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
-    if addrq < 0 {
-        return Some(code.first_line_number.map_or(1, |line| line.get()));
+/// EVERY negative offset names the code object's first line, which is the
+/// answer for a frame that has not run an instruction yet.  Upstream tests
+/// `stopat == -1` alone, so `-2` reaches `_offset2lineno(..., -1)`, walks a
+/// zero-length range and answers `-1`.  Measured with a traceback rebuilt at
+/// each offset:
+///
+/// | `tb_lasti` | 3.14.2 | PyPy 7.3.20 |
+/// |---|---|---|
+/// | `-1` | `co_firstlineno` | `co_firstlineno` |
+/// | `-2`, `-3` | `co_firstlineno` | `-1` |
+///
+/// The `addrq < 0` arm above is 3.14's, and `traceback_lineno_sentinel.py`
+/// pins it.
+///
+/// The answer is signed and is **not** narrowed to "a line or nothing":
+/// `_PyCode_CheckLineNumber`'s `-1` and a genuinely negative line are one
+/// value upstream too, and the two readers that render it as `None` —
+/// `tb_lineno_get` and `frame_getlineno` — test `< 0` themselves.  `repr` of
+/// a frame does not, and prints whatever came back, so a code object whose
+/// table spells line `-8` has to reach `frame_repr` as `-8`.  `-1` therefore
+/// also covers an offset past the last range AND an offset inside a
+/// `NO_LOCATION` range — the compiler-generated cleanup a `with` or a
+/// `try`/`finally` leaves at the end of a code object, which `co_positions`
+/// reports with a `None` line.
+///
+/// The walk goes through [`PyCodeAddressRange`], not [`code_locations`]: the
+/// expanded array holds a `SourceLocation` per instruction and its `line` is a
+/// `OneIndexed`, so a `NO_LOCATION` range comes back carrying whatever line
+/// preceded it.  Reading `linetable` directly also takes no lock, where the
+/// array is behind a process-global mutex once `w_code_new` releases it.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode`.
+pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
+    unsafe {
+        let code = w_code_get_ptr(w_code) as *const crate::CodeObject;
+        if code.is_null() {
+            return -1;
+        }
+        code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq)
     }
-    let index = usize::try_from(addrq / 2).ok()?;
-    code_locations(code)
-        .get(index)
-        .map(|(start, _)| start.line.get())
+}
+
+/// `PyCode_Addr2Line`'s body, split from the object it reads its two inputs
+/// from so a bare `CodeObject` and a first line number can be walked directly.
+///
+/// `firstlineno` is `co->co_firstlineno`, which `_PyCode_InitAddressRange`
+/// seeds `computed_line` with whatever its sign.  It has to come from the
+/// `PyCode` wrapper's `co_firstlineno_raw` stamp: `CodeObject
+/// .first_line_number` is an `Option<OneIndexed>`, `None` for every value
+/// `OneIndexed` cannot spell, and `CodeType(...)` accepts the negative ones —
+/// only `code.replace(co_firstlineno=...)` rejects them.  Reconstructing the
+/// integer from the option therefore reads `0` for a code object whose
+/// `co_firstlineno` is `-1`, and decodes the table against a different first
+/// line than `co_lines()` and `co_positions()` do.
+fn code_addr2line(code: &crate::CodeObject, firstlineno: i32, addrq: i64) -> i32 {
+    if addrq < 0 {
+        return firstlineno;
+    }
+    let lasti = i32::try_from(addrq).unwrap_or(i32::MAX);
+    let mut bounds = PyCodeAddressRange::new(&code.linetable, firstlineno);
+    bounds.check_line_number(lasti)
+}
+
+/// Specialization rewrites the opcode byte in place (`RESUME` becomes
+/// `RESUME_CHECK`), so every read asks about the family.
+fn base_op(code: &crate::CodeObject, index: usize) -> Option<crate::bytecode::Instruction> {
+    let op = code.instructions.get(index)?.op;
+    Some(op.to_base().unwrap_or(op))
+}
+
+/// `code->_co_firsttraceable` — the index of the first `RESUME`, which is where
+/// a frame that has not run an instruction is reported to be.
+///
+/// `init_code` (`Objects/codeobject.c`) scans for it once and stores it; this
+/// walks instead, which costs the prologue's length because it stops at that
+/// `RESUME` — within a handful of units of the start for every code object the
+/// compiler produces.  Everything ahead of it is what the compiler inserts:
+/// `COPY_FREE_VARS`, `MAKE_CELL`, and a generator's `RETURN_GENERATOR` /
+/// `POP_TOP` pair.  A code object with no `RESUME` at all leaves the index past
+/// the end, so it starts no line anywhere — what `init_code`'s scan does with
+/// one too.
+pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
+    use crate::bytecode::Instruction;
+
+    let mut index = 0;
+    while let Some(op) = base_op(code, index) {
+        if matches!(op, Instruction::Resume { .. }) {
+            break;
+        }
+        index += 1;
+    }
+    index
 }
 
 /// Whether the instruction at `pc` may be reported to a trace function as the
@@ -3018,28 +3497,8 @@ pub fn w_code_addr2line(code: &crate::CodeObject, addrq: i64) -> Option<usize> {
 pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool {
     use crate::bytecode::Instruction;
 
-    // Specialization rewrites the opcode byte in place (`RESUME` becomes
-    // `RESUME_CHECK`), so every read below asks about the family.
-    fn base_op(code: &crate::CodeObject, index: usize) -> Option<Instruction> {
-        let op = code.instructions.get(index)?.op;
-        Some(op.to_base().unwrap_or(op))
-    }
-
-    // `i < code->_co_firsttraceable`, resolved by walking to the first
-    // `RESUME`.  This costs the prologue's length rather than `pc`, because it
-    // stops at that `RESUME` — which sits within a handful of units of the
-    // start for every code object the compiler produces.  A code object with no
-    // `RESUME` at all leaves `_co_firsttraceable` past the end and so traces no
-    // lines, which is what `init_code`'s scan does with one too.
-    let mut index = 0;
-    while index <= pc {
-        match base_op(code, index) {
-            Some(Instruction::Resume { .. }) => break,
-            Some(_) => index += 1,
-            None => return false,
-        }
-    }
-    if index > pc {
+    // `i < code->_co_firsttraceable`.
+    if pc < first_traceable_index(code) {
         return false;
     }
 
@@ -3745,32 +4204,59 @@ mod tests {
         assert_eq!(result, pyre_object::pyobject::PY_NULL);
     }
 
-    /// `PyCode_Addr2Line` on a real code object: the byte offset halves into a
-    /// row index, a negative offset names the first line, and an offset past
-    /// the last row reports no line at all.
+    /// `PyCode_Addr2Line` on a real code object: a negative offset names the
+    /// first line, an in-range offset names the line its range carries, and an
+    /// offset past the last range reports no line at all.
     #[test]
     fn w_code_addr2line_halves_the_offset_and_reports_a_miss() {
         let code = compile_exec("a = 1\nb = 2\nc = 3\n").expect("compile failed");
-        let firstlineno = code.first_line_number.map_or(1, |line| line.get());
-        assert_eq!(w_code_addr2line(&code, -1), Some(firstlineno));
-        assert_eq!(w_code_addr2line(&code, -2), Some(firstlineno));
+        let firstlineno = code.first_line_number.map_or(1, |line| line.get()) as i32;
+        assert_eq!(code_addr2line(&code, firstlineno, -1), firstlineno);
+        assert_eq!(code_addr2line(&code, firstlineno, -2), firstlineno);
 
-        let rows: Vec<usize> = code_locations(&code)
-            .iter()
-            .map(|(start, _)| start.line.get())
+        let count = code.instructions.len();
+        assert!(count > 0);
+        let lines: Vec<i32> = (0..count)
+            .map(|index| code_addr2line(&code, firstlineno, index as i64 * 2))
             .collect();
-        assert!(!rows.is_empty());
-        for (index, line) in rows.iter().copied().enumerate() {
-            let addrq = index as i64 * 2;
-            assert_eq!(w_code_addr2line(&code, addrq), Some(line));
+        for (index, line) in lines.iter().copied().enumerate() {
             // The odd byte inside an instruction reads that instruction's row.
-            assert_eq!(w_code_addr2line(&code, addrq + 1), Some(line));
+            assert_eq!(
+                code_addr2line(&code, firstlineno, index as i64 * 2 + 1),
+                line
+            );
         }
         // Each of the three statements contributes at least one instruction.
-        assert!(rows.contains(&(firstlineno + 2)), "{rows:?}");
+        for statement in 0..3 {
+            assert!(lines.contains(&(firstlineno + statement)), "{lines:?}");
+        }
 
-        assert_eq!(w_code_addr2line(&code, rows.len() as i64 * 2), None);
-        assert_eq!(w_code_addr2line(&code, 1 << 30), None);
+        assert_eq!(code_addr2line(&code, firstlineno, 1 << 30), -1);
+        // An empty line table describes no range, so nothing resolves against
+        // it — `linetable_to_locations` instead expands one first-line row per
+        // instruction, which is why this reads `linetable` directly.
+        let mut blank = compile_exec("a = 1\n").expect("compile failed");
+        blank.linetable = Vec::new().into_boxed_slice();
+        assert_eq!(code_addr2line(&blank, 1, 0), -1);
+        assert_eq!(code_addr2line(&blank, 1, 2), -1);
+        // A negative `co_firstlineno` is answered as-is, not clamped: only
+        // `code.replace` rejects one, `CodeType(...)` stores it.
+        assert_eq!(code_addr2line(&blank, -8, -1), -8);
+        assert_eq!(code_addr2line(&blank, 0, -1), 0);
+    }
+
+    /// The entry payload is peeked, not consumed: `advance` moves by the
+    /// bit-7 scan alone, so a byte that is a payload by length and a header by
+    /// its marker starts the next range.
+    #[test]
+    fn advance_stops_at_the_marker_a_short_payload_would_swallow() {
+        let table = [0x00u8, 0x80u8];
+        let mut bounds = PyCodeAddressRange::new(&table, 3);
+        assert!(bounds.advance());
+        assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (0, 2, 3));
+        assert!(bounds.advance());
+        assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (2, 4, 3));
+        assert!(!bounds.advance());
     }
 
     #[test]

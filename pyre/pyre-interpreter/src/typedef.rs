@@ -776,6 +776,34 @@ pub fn init_typeobjects() {
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(none_type, false) };
         reg.insert(&NONE_TYPE as *const PyType as usize, none_type as usize);
 
+        // `_PyLineIterator` / `_PyPositionsIterator` /
+        // `_PyBranchesIterator` — the three walks over a code object.  All
+        // three carry `Py_TPFLAGS_BASETYPE` and have no `tp_new`: only
+        // `co_lines()`, `co_positions()` and `co_branches()` produce one.
+        // The branches iterator answers to `line_iterator` as well, so the
+        // two are distinguishable only by identity.
+        for (name, init, tp) in [
+            (
+                "line_iterator",
+                init_line_iterator_type as fn(PyObjectRef),
+                &crate::pycode::LINE_ITER_TYPE as *const PyType as usize,
+            ),
+            (
+                "positions_iterator",
+                init_positions_iterator_type as fn(PyObjectRef),
+                &crate::pycode::POSITIONS_ITER_TYPE as *const PyType as usize,
+            ),
+            (
+                "line_iterator",
+                init_branches_iterator_type as fn(PyObjectRef),
+                &crate::pycode::BRANCHES_ITER_TYPE as *const PyType as usize,
+            ),
+        ] {
+            let w_type = new_typeobject_with_base(name, init, object_type);
+            unsafe { pyre_object::w_type_set_disallow_instantiation(w_type) };
+            reg.insert(tp, w_type as usize);
+        }
+
         // setobject.py W_SetIterObject.typedef. Python 3.14 exposes the
         // concrete name as `set_iterator` (PyPy 3.11 used `setiterator`).
         let set_iterator_type =
@@ -2075,6 +2103,10 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "set" => pyre_object::is_set,
         "frozenset" => pyre_object::is_frozenset,
         "set_iterator" => pyre_object::is_set_iterator,
+        // Two types report `line_iterator`; the name-keyed owner admits
+        // either and each method body checks the layout it reads.
+        "line_iterator" => crate::pycode::is_named_line_iterator,
+        "positions_iterator" => crate::pycode::is_positions_iter,
         "range" => pyre_object::functional::is_w_range,
         "slice" => pyre_object::is_slice,
         "memoryview" => pyre_object::memoryview::is_w_memoryview,
@@ -7797,6 +7829,25 @@ fn init_dict_view_items_type(ns: PyObjectRef) {
 /// traceback constructor.  `args[0]` is the class; the four positional
 /// arguments follow.  `tb_next` is a traceback or `None`; `tb_frame`
 /// must be a `frame`; `tb_lasti` / `tb_lineno` are ints, stored as given.
+/// `PyLong_AsInt` — the argument converter behind a clinic `int` parameter.
+///
+/// It goes through `__index__`, so the TypeError for anything else is
+/// `'X' object cannot be interpreted as an integer` rather than a
+/// signature-shaped one, and a value outside the C `int` range raises
+/// instead of being truncated into the slot.
+///
+/// A value past `i64` reaches this as `space_index_w`'s own OverflowError,
+/// whose message names `int` rather than `C int`.
+fn traceback_c_int_arg(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let value = crate::builtins::space_index_w(obj)?;
+    if i32::try_from(value).is_err() {
+        return Err(crate::PyError::overflow_error(
+            "Python int too large to convert to C int",
+        ));
+    }
+    Ok(value)
+}
+
 fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 5 {
         return Err(crate::PyError::type_error(format!(
@@ -7832,22 +7883,11 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let frame = w_frame as *mut crate::pyframe::PyFrame;
 
-    // tb_lasti / tb_lineno: integers, stored as given
-    // (`pytraceback.py descr_new`).
-    if !unsafe { pyre_object::is_int(w_lasti) } {
-        return Err(crate::PyError::type_error(format!(
-            "an integer is required (got type {})",
-            type_name_of(w_lasti)
-        )));
-    }
-    if !unsafe { pyre_object::is_int(w_lineno) } {
-        return Err(crate::PyError::type_error(format!(
-            "an integer is required (got type {})",
-            type_name_of(w_lineno)
-        )));
-    }
-    let lasti = unsafe { pyre_object::w_int_get_value(w_lasti) };
-    let lineno = unsafe { pyre_object::w_int_get_value(w_lineno) };
+    // tb_lasti / tb_lineno: both are declared `int` in the signature, so the
+    // converter Argument Clinic emits is `PyLong_AsInt` — it reduces through
+    // `__index__` and refuses a value the C `int` cannot hold.
+    let lasti = traceback_c_int_arg(w_lasti)?;
+    let lineno = traceback_c_int_arg(w_lineno)?;
     let w_code = unsafe { (*frame).fget_f_code() };
 
     Ok(crate::pytraceback::w_pytraceback_new(
@@ -27603,6 +27643,125 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             state,
         ]))
     }
+}
+
+/// `_PyLineIterator` — `tp_iter` is `PyObject_SelfIter`, `tp_iternext` is
+/// `lineiter_next`, and `tp_methods` is empty.
+fn init_line_iterator_type(ns: PyObjectRef) {
+    init_line_table_iterator_type(ns, line_iter_self, line_iter_next);
+}
+
+/// `_PyPositionsIterator`, the same shape over `positionsiter_next`.
+fn init_positions_iterator_type(ns: PyObjectRef) {
+    init_line_table_iterator_type(ns, positions_iter_self, positions_iter_next);
+}
+
+/// `_PyBranchesIterator`, the same shape over `branchesiter_next`.
+fn init_branches_iterator_type(ns: PyObjectRef) {
+    init_line_table_iterator_type(ns, branches_iter_self, branches_iter_next);
+}
+
+fn init_line_table_iterator_type(
+    ns: PyObjectRef,
+    self_fn: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    next_fn: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
+    let entries = [
+        (
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", self_fn, 1),
+        ),
+        (
+            "__next__",
+            make_builtin_function_with_arity("__next__", next_fn, 1),
+        ),
+    ];
+    for (name, value) in entries {
+        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+}
+
+fn line_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_line_table_iterator(
+        args,
+        "__iter__",
+        "line_iterator",
+        crate::pycode::is_line_iter,
+    )
+}
+
+fn line_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = require_line_table_iterator(
+        args,
+        "__next__",
+        "line_iterator",
+        crate::pycode::is_line_iter,
+    )?;
+    unsafe { crate::pycode::line_iter_next(receiver) }.ok_or_else(crate::PyError::stop_iteration)
+}
+
+fn positions_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_line_table_iterator(
+        args,
+        "__iter__",
+        "positions_iterator",
+        crate::pycode::is_positions_iter,
+    )
+}
+
+fn positions_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = require_line_table_iterator(
+        args,
+        "__next__",
+        "positions_iterator",
+        crate::pycode::is_positions_iter,
+    )?;
+    unsafe { crate::pycode::positions_iter_next(receiver) }
+        .ok_or_else(crate::PyError::stop_iteration)
+}
+
+fn branches_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    require_line_table_iterator(
+        args,
+        "__iter__",
+        "line_iterator",
+        crate::pycode::is_branches_iter,
+    )
+}
+
+fn branches_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = require_line_table_iterator(
+        args,
+        "__next__",
+        "line_iterator",
+        crate::pycode::is_branches_iter,
+    )?;
+    unsafe { crate::pycode::branches_iter_next(receiver) }
+        .ok_or_else(crate::PyError::stop_iteration)
+}
+
+/// The receiver check every unbound `line_iterator` / `positions_iterator`
+/// method needs: each reads its payload at its own layout, so an unchecked
+/// receiver reaches those accessors as type confusion.
+fn require_line_table_iterator(
+    args: &[PyObjectRef],
+    name: &str,
+    type_name: &str,
+    is_receiver: unsafe fn(PyObjectRef) -> bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' of '{type_name}' object needs an argument"
+        )));
+    };
+    if !unsafe { is_receiver(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '{name}' requires a '{type_name}' object but received a '{received}'"
+        )));
+    }
+    Ok(receiver)
 }
 
 fn init_set_iterator_type(ns: PyObjectRef) {

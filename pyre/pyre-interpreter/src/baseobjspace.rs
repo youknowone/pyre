@@ -14583,25 +14583,21 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
 ///         return self.type(w_function).getname(self) + ' object'
 /// ```
 ///
-/// `object_functionstr` uses small private helpers instead of the
-/// public `findattr` / `display::py_str` shortcuts because PyPy's
-/// control flow is intentionally narrow here:
+/// The two `try/except OperationError: pass` blocks above are NOT ported, and
+/// neither is the `getname(self) + ' object'` answer the last one falls back
+/// to.  `_PyObject_FunctionStr` propagates every fault instead — a raising
+/// `__qualname__` descriptor, a raising `__module__` one, a raising or
+/// non-string `__str__` on either name, and a raising `__eq__` on the module.
+/// Its fallback for an ABSENT `__qualname__` is `PyObject_Str`, and that one
+/// is kept.  Upstream also requires `__module__` to be a non-empty `str`,
+/// where the C code rich-compares the object and renders it with `%S`, so
+/// `__module__ = 42` prefixes `42.` there and is dropped here.
+/// `functionstr_propagates.py` pins the seven cells.
 ///
-/// - `findattr` suppresses ordinary `OperationError` and returns
-///   `None`, but **re-raises** SystemExit / KeyboardInterrupt
-///   (`baseobjspace.py:881-884 if e.async(self): raise`).
-/// - the final fallback calls `space.str(w_function)` once, then
-///   `space.text_w(...)`; it does not try `repr()` after a failing or
-///   non-string `__str__`.
-///
-/// The async-propagation contract is preserved: the `__qualname__`
-/// findattr lives outside the inner try, so any async error there
-/// surfaces as `Err(PyError)` to `raise_type_error`, which then
-/// returns the async error in place of the TypeError prefix.  The
-/// `__module__` findattr and the `text_w(...)` calls live inside the
-/// PyPy try/except OperationError block — async OR ordinary errors
-/// there fall through to the `str(w_function)` fallback, matching
-/// PyPy's `except OperationError: pass`.
+/// `text_w` gave way to `display::py_str_wtf8`, which IS `PyObject_Str`: it
+/// tries `__str__` and falls back to `__repr__`, and reports a non-string
+/// return as `__str__ returned non-string (type X)` rather than reading it as
+/// "no name".
 ///
 /// `function.py` initialises `self.qualname = qualname or self.name`,
 /// so `w_function.qualname` returns the dotted form (e.g.
@@ -14614,6 +14610,12 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyE
     // `FunctionWithFixedCode` and `BuiltinFunction`, both subclasses
     // of `Function` per function.py).  Pyre's `is_function`
     // unifies all three over `FUNCTION_TYPE` + `BUILTIN_FUNCTION_TYPE`.
+    //
+    // `_PyObject_FunctionStr` has no fast path — it reads both names off the
+    // object — and the two agree for a function, whose `__qualname__` is a
+    // `str` the slot already holds.  Only the module part has to run the
+    // general rule, which is why it goes through the same helper the generic
+    // path below uses.
     if !w_function.is_null() && unsafe { crate::function::is_function(w_function) } {
         // function.py:2108 `qualname = w_function.qualname` — match
         // PyPy's stored `qualname` field via the helper that walks
@@ -14621,16 +14623,12 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyE
         // The qualname is WTF-8 and this text becomes a TypeError's
         // `args[0]` prefix, so `format!` (which would render it through
         // `Display` and substitute U+FFFD) is not usable here.
+        // `function_get_qualname` hands back owned bytes and runs no Python, so
+        // reading it first is unobservable — and it keeps the function off the
+        // live set across `object_functionstr_prefix`, which can collect.
         let qualname = unsafe { crate::function::function_get_qualname(w_function) };
-        let mut out = Wtf8Buf::new();
         let w_module = unsafe { crate::function::fget___module__(w_function) };
-        if !is_w(w_module, w_none()) && unsafe { pyre_object::is_str(w_module) } {
-            let module = unsafe { pyre_object::w_str_get_wtf8(w_module) };
-            if !module.is_empty() && module.as_str() != Ok("builtins") {
-                out.push_wtf8(module);
-                out.push_str(".");
-            }
-        }
+        let mut out = object_functionstr_prefix(w_module)?;
         out.push_wtf8(&qualname);
         out.push_str("()");
         return Ok(out);
@@ -14641,171 +14639,98 @@ pub fn object_functionstr(w_function: PyObjectRef) -> Result<Wtf8Buf, crate::PyE
         let inner = unsafe { pyre_object::function::w_method_get_func(w_function) };
         return object_functionstr(inner);
     }
-    // baseobjspace.py — `w_qualname = self.findattr(...)`.  This
-    // findattr lives **outside** the inner try/except, so an async
-    // exception (SystemExit/KeyboardInterrupt) here is propagated to
-    // the caller via `Err(...)` matching `findattr`'s `e.async(self):
-    // raise` re-raise (`baseobjspace.py:881-884`).
-    let w_qualname_opt = object_functionstr_findattr(w_function, "__qualname__")?;
-    // baseobjspace.py:2125-2135 — `try/except OperationError: pass`.
-    // Every fault inside this block (text_w(qualname), findattr(module),
-    // text_w(module)) must fall through to the `str(w_function)`
-    // fallback rather than propagate.  In particular the second
-    // `findattr(__module__)` is **inside** the try, so async errors
-    // there are also suppressed — matches PyPy literally.
-    'qualname: {
-        let Some(w_qualname) = w_qualname_opt else {
-            break 'qualname;
-        };
-        let Ok(qualname) = object_functionstr_text_w(w_qualname) else {
-            break 'qualname;
-        };
-        let w_module = match object_functionstr_findattr(w_function, "__module__") {
-            Ok(opt) => opt,
-            // try/except OperationError: pass — async findattr suppressed too.
-            Err(_) => break 'qualname,
-        };
-        // The dotted prefix is optional; the qualname and the trailing `()`
-        // are not, so build the one and prepend the other.
-        let bare = |qualname: &Wtf8Buf| {
-            let mut out = qualname.clone();
-            out.push_str("()");
-            out
-        };
-        match w_module {
-            // No `__module__` or `__module__ is None`: bare `qualname()`.
-            None => return Ok(bare(&qualname)),
-            Some(w_module) if is_w(w_module, w_none()) => return Ok(bare(&qualname)),
-            Some(w_module) => {
-                // text_w(w_module) — non-string raises in PyPy → except →
-                // fall through (do NOT return `qualname()` here, which
-                // would mask the OperationError).
-                let Ok(module) = object_functionstr_text_w(w_module) else {
-                    break 'qualname;
-                };
-                if !module.is_empty() && module.as_str() != Ok("builtins") {
-                    let mut out = module;
-                    out.push_str(".");
-                    out.push_wtf8(&qualname);
-                    out.push_str("()");
-                    return Ok(out);
-                }
-                // module empty or 'builtins': bare qualname().
-                return Ok(bare(&qualname));
-            }
-        }
-    }
-    // baseobjspace.py — `text_w(str(w_function))` fallback,
-    // else `type(w_function).getname() + ' object'`.  Both calls live
-    // in `try/except OperationError: pass`, so any error (including
-    // async) here is swallowed in PyPy — keep the same shape.  PyPy
-    // calls `space.str(w_function)`, which dispatches to `__str__`
-    // ALONE via `descroperation.str` (it does NOT fall back to
-    // `__repr__` — that would require `space.repr(...)`).  Routing
-    // through `display::py_str` would mask a failing/non-string
-    // `__str__` by calling `__repr__`, producing a different message
-    // than upstream.
-    if let Ok(w_s) = object_functionstr_str(w_function)
-        && unsafe { pyre_object::is_str(w_s) }
-    {
-        // `str(w_function)`'s own text: another `w_str_get_value` that would
-        // panic on a lone surrogate rather than answer.
-        return Ok(unsafe { pyre_object::w_str_get_wtf8(w_s).to_wtf8_buf() });
-    }
-    Ok(Wtf8Buf::from_string(format!(
-        "{} object",
-        object_functionstr_type_name(w_function)
-    )))
+    // The generic path is `_PyObject_FunctionStr`:
+    //
+    // ```c
+    // int ret = PyObject_GetOptionalAttr(x, &_Py_ID(__qualname__), &qualname);
+    // if (qualname == NULL) {
+    //     if (ret < 0) { return NULL; }
+    //     return PyObject_Str(x);
+    // }
+    // ret = PyObject_GetOptionalAttr(x, &_Py_ID(__module__), &module);
+    // if (module != NULL && module != Py_None) { ... }
+    // else if (ret < 0) { goto done; }
+    // result = PyUnicode_FromFormat("%S()", qualname);
+    // ```
+    //
+    // Upstream wraps the second lookup and both text conversions in a
+    // `try/except OperationError: pass` that falls through to the
+    // `str(w_function)` answer; there is no such block here, because 3.14
+    // propagates every one of those faults.  Measured, a callable whose
+    // `__qualname__` descriptor raises `TypeError('boom')` and is then called
+    // as `f(*1)` reports `TypeError: boom` on 3.14.2 and the
+    // "argument after * must be an iterable" message on PyPy 7.3.20 —
+    // `functionstr_propagates.py` pins that and the six other faults.
+    //
+    // The lookups are `findattr`, which is `PyObject_GetOptionalAttr`: only a
+    // missing name reads as absent.
+    let Some(w_qualname) = findattr(w_function, "__qualname__")? else {
+        return unsafe { crate::display::py_str_wtf8(w_function) };
+    };
+    // `PyUnicode_FromFormat("%S.%S()", module, qualname)` converts the module
+    // first, so a raising `__str__` on it wins over one on the qualname —
+    // measured, a callable whose module and qualname both raise from `__str__`
+    // reports the module's.  That leaves the qualname object live across the
+    // second lookup and the whole prefix, both of which run Python and can
+    // collect, so it waits on the shadow stack rather than in a local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_qualname);
+    let w_module = findattr(w_function, "__module__")?.unwrap_or(pyre_object::PY_NULL);
+    let mut out = object_functionstr_prefix(w_module)?;
+    let w_qualname = pyre_object::gc_roots::shadow_stack_get(qualname_slot);
+    out.push_wtf8(&unsafe { crate::display::py_str_wtf8(w_qualname) }?);
+    out.push_str("()");
+    Ok(out)
 }
 
-/// `space.str(w_obj)` — `__str__`-only fast path for
-/// `object_functionstr`'s final fallback.
+/// The `module.` prefix `_PyObject_FunctionStr` puts in front of a qualname,
+/// or the empty string when there is none to put there.
 ///
-/// `pypy/objspace/descroperation.py str(self, space, w_obj)` does
-/// `lookup(w_obj, '__str__')` then `space.get_and_call_function(...)`.
-/// `__repr__` is never tried here — that would be `space.repr(...)`.
-/// Returning `Err` for any of: missing `__str__` slot, descriptor
-/// invocation failure, non-string return — caller suppresses to the
-/// `<Type> object` fallback per PyPy's `except OperationError`.
-fn object_functionstr_str(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    if w_obj.is_null() {
-        return Err(crate::PyError::type_error("NULL object"));
-    }
-    unsafe {
-        if pyre_object::is_str(w_obj) {
-            return Ok(w_obj);
-        }
-        let Some(w_descr) = lookup(w_obj, "__str__") else {
-            return Err(crate::PyError::type_error(format!(
-                "'{}' object has no __str__",
-                object_functionstr_type_name(w_obj),
-            )));
-        };
-        crate::call::call_function_impl_result(w_descr, &[w_obj])
-    }
-}
-
-/// `object_functionstr`-local version of
-/// `baseobjspace.py findattr`.
-///
-/// ```python
-/// def findattr(self, w_object, w_name):
-///     try:
-///         return self.getattr(w_object, w_name)
-///     except OperationError as e:
-///         # a PyPy extension: let SystemExit and KeyboardInterrupt go through
-///         if e.async(self):
-///             raise
-///         return None
+/// ```c
+/// if (module != NULL && module != Py_None) {
+///     ret = PyObject_RichCompareBool(module, &_Py_ID(builtins), Py_NE);
+///     if (ret < 0) { goto done; }
+///     if (ret > 0) { result = PyUnicode_FromFormat("%S.%S()", module, qualname); }
+/// }
 /// ```
 ///
-/// `Err(_)` carries the propagated async exception, asked through
-/// `PyError::async`.  Ordinary `OperationError`s
-/// (AttributeError, NameError, TypeError from descriptors) collapse to
-/// `Ok(None)`, matching the `return None` arm.
+/// The test is a rich comparison against the object, not a check that it is a
+/// string, so `__module__ = 42` prefixes `42.` and `__module__ = ''` prefixes
+/// a bare `.`; upstream instead requires a non-empty `str` and drops the
+/// prefix for both.
 ///
-/// This one keeps upstream's swallow set rather than the narrower 3.14 rule
-/// [`findattr`] takes, because the surrounding `object_functionstr` is a
-/// port of upstream's try/except layout and the two have to agree on which
-/// faults reach the `str(w_function)` fallback.  The residual divergence is
-/// upstream's own: `_PyObject_FunctionStr` propagates any non-AttributeError
-/// from either lookup, so a raising `__qualname__` descriptor stops it where
-/// this falls through.
-fn object_functionstr_findattr(
-    obj: PyObjectRef,
-    name: &str,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    if unsafe { is_none(obj) } {
-        return Ok(None);
+/// The comparison is `Py_NE`, so it reaches `__ne__` and not `__eq__` — a
+/// module whose type defines only a raising `__ne__` stops the message with
+/// that error.  Two *exact* `str`s compare by value without running Python,
+/// which covers every module a real import produces; a `str` SUBCLASS may
+/// override `__ne__` and so has to take the general route, which allocates,
+/// so the module is rooted across it.
+fn object_functionstr_prefix(w_module: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    if w_module.is_null() || unsafe { is_none(w_module) } {
+        return Ok(Wtf8Buf::new());
     }
-    match getattr_str(obj, name) {
-        Ok(value) if value.is_null() => Ok(None),
-        Ok(value) => Ok(Some(value)),
-        Err(mut e) => {
-            if e.r#async(w_none()) {
-                Err(e)
-            } else {
-                Ok(None)
-            }
-        }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_module = pyre_object::gc_roots::pin_root(w_module);
+    let exact_str = unsafe {
+        pyre_object::is_exact_type(w_module, &pyre_object::STR_TYPE)
+            && pyre_object::is_str(w_module)
+    };
+    let differs = if exact_str {
+        unsafe { pyre_object::w_str_get_wtf8(w_module) }.as_str() != Ok("builtins")
+    } else {
+        let w_builtins = unsafe { pyre_object::w_str_new("builtins") };
+        let w_module = pyre_object::gc_roots::shadow_stack_get(slot);
+        is_true(compare(w_module, w_builtins, CompareOp::Ne)?)?
+    };
+    if !differs {
+        return Ok(Wtf8Buf::new());
     }
-}
-
-/// `space.text_w(w_obj)` for the `object_functionstr` try blocks.
-fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
-    unsafe {
-        if pyre_object::is_str(w_obj) {
-            // `text_w` is the surrogate-preserving spelling upstream, and
-            // `w_str_get_value` would panic outright on a `__qualname__`
-            // carrying a lone surrogate rather than return its text.
-            Ok(pyre_object::w_str_get_wtf8(w_obj).to_wtf8_buf())
-        } else {
-            Err(crate::PyError::type_error(format!(
-                "expected str, got {} object",
-                object_functionstr_type_name(w_obj),
-            )))
-        }
-    }
+    let w_module = pyre_object::gc_roots::shadow_stack_get(slot);
+    let mut out = unsafe { crate::display::py_str_wtf8(w_module) }?;
+    out.push_str(".");
+    Ok(out)
 }
 
 pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
