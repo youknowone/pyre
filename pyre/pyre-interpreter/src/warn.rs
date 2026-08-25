@@ -44,6 +44,31 @@ pub fn warn_category(
     warn_category_w(pyre_object::w_str_new(msg), category_name, stacklevel)
 }
 
+/// `PyErr_ResourceWarning(source, stacklevel, format, ...)` -- the same warning
+/// carrying the object it is about.
+///
+/// `_py_warnings._formatwarnmsg_impl` reads `msg.source`: with it the message
+/// gains the object's allocation traceback, or the "Enable tracemalloc to get
+/// the object allocation traceback" line when tracing is off.  A warning
+/// raised with no source gets neither line, so every finalizer that reports an
+/// unclosed resource passes itself.
+pub fn warn_category_source(
+    msg: &str,
+    category_name: &str,
+    stacklevel: i64,
+    source: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let source_slot = crate::module::_warnings::pin_root_slot(source);
+    let msg_slot = crate::module::_warnings::pin_root_slot(pyre_object::w_str_new(msg));
+    warn_category_w_source(
+        pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        category_name,
+        stacklevel,
+        pyre_object::gc_roots::shadow_stack_get(source_slot),
+    )
+}
+
 /// `space.warn(w_msg, w_warningcls, stacklevel)` — hands the message to
 /// `_warnings.do_warn` with `stacklevel - 1`, so the filters, the module
 /// `__warningregistry__` and `warnings.catch_warnings(record=True)` all
@@ -52,6 +77,15 @@ pub fn warn_category_w(
     w_msg: PyObjectRef,
     category_name: &str,
     stacklevel: i64,
+) -> Result<(), crate::PyError> {
+    warn_category_w_source(w_msg, category_name, stacklevel, pyre_object::PY_NULL)
+}
+
+fn warn_category_w_source(
+    w_msg: PyObjectRef,
+    category_name: &str,
+    stacklevel: i64,
+    source: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // Upstream reaches the filters and the once-registry through
     // `space.fromcache(State)`, which exists from space construction and which
@@ -70,7 +104,7 @@ pub fn warn_category_w(
         warn(&text, category_name);
         return Ok(());
     };
-    crate::module::_warnings::do_warn(w_msg, category, stacklevel - 1, pyre_object::PY_NULL, &[])
+    crate::module::_warnings::do_warn(w_msg, category, stacklevel - 1, source, &[])
 }
 
 /// `do_warn_explicit`'s stderr format without the location prefix, for

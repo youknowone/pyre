@@ -3619,10 +3619,11 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
                 if !rffi::is_invalid(fd) {
                     if let Ok(repr) = unsafe { crate::display::py_repr_wtf8(obj) } {
-                        let _ = crate::warn::warn_category(
+                        let _ = crate::warn::warn_category_source(
                             &format!("unclosed {}", repr.to_string_lossy()),
                             "ResourceWarning",
                             1,
+                            obj,
                         );
                     }
                     let _ = unsafe { rffi::close(fd) };
