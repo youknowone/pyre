@@ -3720,17 +3720,30 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // same user-frame signal Finding #1 uses, generalized past FOR_ITER.
     let heap_write_odometer_before =
         (!provably_side_effect_free).then(pyre_interpreter::call::frame_entry_count);
-    // Probe support: the live frame's locals as they stood before the residual
-    // ran.  A residual that writes fastlocals writes THIS object while the walk
-    // reads its own copy, so the diff taken afterwards names exactly the slots
-    // the shadow has to learn about.  Sampled only when a probe is on.
-    let residual_locals_before = ((fbw_debug_abort_enabled()
+    // The live frame's locals as they stood before the residual ran.  A
+    // residual that writes fastlocals writes THIS object while the walk reads
+    // its own copy, so the diff taken afterwards names exactly the slots the
+    // shadow has to learn about.
+    //
+    // The copies live in real shadow-stack slots rather than in a plain `Vec`
+    // (`gctransform/framework.py` push_roots/pop_roots around a collection
+    // point).  The residual IS a collection point, and a minor collection
+    // forwards the frame's own array in place while copies taken outside the
+    // root stack keep their pre-collection words.  Diffing against those reads
+    // every moved slot as a write, and the adoption below would then put the
+    // array's value over a box the walk holds and the frame was never told
+    // about.
+    let residual_locals_roots = ((fbw_debug_abort_enabled()
         || fbw_import_residual_locals_enabled())
         && is_may_force
         && live_frame != 0)
         .then(|| unsafe {
             let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
-            locals_w!(pf).as_slice().to_vec()
+            let snapshot = locals_w!(pf).as_slice().to_vec();
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&snapshot);
+            roots.normalize(base, snapshot.len());
+            (roots, base, snapshot.len())
         });
     let exec_result = {
         let escape_frame = if is_may_force { live_frame } else { 0 };
@@ -4120,6 +4133,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // state after a cancelled commit has to re-read it after the
             // walk-end restore, not here.
             ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
+            // Read the pre-call image back out of the root slots: a collection
+            // inside the residual forwarded them alongside the frame's array,
+            // so these words and `locals_w!` name the same objects.
+            let residual_locals_before =
+                residual_locals_roots.as_ref().map(|(roots, base, len)| {
+                    (0..*len)
+                        .map(|k| roots.get(*base + k))
+                        .collect::<Vec<pyre_object::PyObjectRef>>()
+                });
             report_post_residual_shadow(ctx, live_frame, residual_locals_before.as_deref());
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
