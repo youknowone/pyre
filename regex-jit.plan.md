@@ -1540,4 +1540,61 @@ where 2 were due.
 `lower_state_field_assign` still discards that path deliberately — it consumes
 a ref, it does not produce one.
 
+## Three more, found by pulling on the dispatch lowerer (0825)
+
+Each was found the same way: write the fixture the corpus never had, then read
+the instrument rather than the answer.
+
+**The dispatch default arm's edge.** `lower_dispatch_chain` sent every
+unmatched opcode to `default_label`, bound at the portal function's trailing
+return. That is the `_ => break` reading, and it is what 55 of this corpus's
+default arms plus 30 ending in a divergent macro mean — so nothing here
+witnessed the other two spellings. `_ => {}` means "go round again" and
+`_ => { .. }` means "run this"; both got the return, the walk reported a
+finished frame, and the portal answered partway through. Neither
+`degraded_dispatch_arms()` nor the arm census saw it: from the lowerer's side
+nothing had refused, the arm was simply never emitted.
+
+| default arm | cold | warm |
+|---|---|---|
+| `_ => {}` | 1200 | 27 |
+| `_ => { acc += 100 }` | 41200 | 827 |
+
+Fixed by classifying the arm and routing the edge three ways — the return
+label, the loop-start label, or a label bound at the arm itself, lowered as an
+arm with no opcode test in front of it. `tests/jit_interp_default_arm_edge.rs`
+covers all three plus the same body under `switch_dispatch = true`, which had
+no coverage at all: the one machine here that sets it writes `_ => break`.
+
+braininterp and dualtape were the machines to check, since both write
+`_ => { pc += 1; }`. Neither changed: `pc += 1` off a constant-folded green is
+carryable, and their degraded set stays exactly `["b'['", "b']'"]`, whose
+`pc = target` from `find_matching_open` is the shape that genuinely cannot be.
+
+**Which `match` is the dispatch.** `find_dispatch_match` answered "the one with
+the most arms", over every match anywhere in the portal function. Arm count is
+not a property of being the dispatch. A five-arm `let x = match ..` beside a
+three-opcode dispatch takes its place, `classify_arms` reads that match's arms
+as the opcodes, and the two pre-dispatch walkers — which locate their loop by
+asking which one holds the dispatch match — find no loop and lower nothing.
+Measured: cold 1200, warm 24, compiling clean with no degraded arm and no
+warning. Fixed by searching the portal loop's body after its merge point, which
+is the region the rest of the machinery already walks; the whole-function search
+stays as a fallback for shapes outside that rule.
+`tests/jit_interp_dispatch_match_choice.rs` runs one interpreter with the setup
+match in four positions and reads the arm census as well as the answer.
+
+**A macro invocation is opaque to the unknown-local walk.** `lower_local`'s last
+resort emits an initialiser it could not lower verbatim into the `__builder`
+block and loads it as a constant. The guard on that contract —
+`expr_references_unknown_local` — reads a bare lowercase identifier as a user
+local and refuses. It had no `Expr::Macro` arm, so a macro fell to the catch-all
+and reported no reference, which it cannot know: the tokens are opaque to it.
+`let bump = pick!(sel);` ahead of the merge point therefore put
+`match sel { .. }` inside `__dispatch_jitcode_*`, whose parameters are the
+assembler and the driver index, and the build failed at a line where `sel`
+plainly is in scope. The sibling `stmt_contains_call` already scores a macro as
+a hit for the same reason. Gated by `tests/jit_interp_macro_init_is_opaque.rs`,
+whose compiling at all is the gate.
+
 Still open from the plan: "let a matchless portal lower".
