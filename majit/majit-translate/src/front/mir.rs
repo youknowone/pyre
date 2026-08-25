@@ -8917,6 +8917,17 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_i64_to_i32_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_num_from(
                     mir_bb,
                     &reg.kind,
@@ -14003,6 +14014,129 @@ impl<'a> Lowering<'a> {
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower the fallible `i32::try_from(i64)` core shell to the checked
+    /// narrowing shape PyPy writes directly in
+    /// `ObjSpace.c_int_w` (`baseobjspace.py:2082-2088`): the value succeeds
+    /// exactly when `INT_MIN <= value <= INT_MAX`. Rust carries the two
+    /// branches in a `Result<i32, TryFromIntError>`, so preserve that source
+    /// CFG by materializing `Ok=0` / `Err=1` and leaving the caller's match
+    /// arms untouched.
+    ///
+    /// The payload aliases the i64 carrier. Narrow integer widths do not have
+    /// a distinct JIT register bank, and it is read only on the proven-in-range
+    /// Ok arm; this is the same value-preserving representation rule used by
+    /// [`Self::try_lower_usize_try_from`]. Other source/destination pairs stay
+    /// residual until their own bounds and signedness rules are ported.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_i64_to_i32_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "try_from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if self.tyref_literal_int_atom(&success_ty) != Some("I32") {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let min = push_op(&mut self.graph, OpKind::ConstInt(i32::MIN as i64));
+        let below = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "lt".to_string(),
+                lhs: arg.clone(),
+                rhs: min,
+                result_ty: ValueType::Int,
+            },
+        );
+        let max = push_op(&mut self.graph, OpKind::ConstInt(i32::MAX as i64));
+        let above = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "gt".to_string(),
+                lhs: arg.clone(),
+                rhs: max,
+                result_ty: ValueType::Int,
+            },
+        );
+        // The predicates are mutually exclusive, so their sum is exactly the
+        // Result discriminant: 0 in range (Ok), 1 out of range (Err).
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: below,
+                rhs: above,
+                result_ty: ValueType::Int,
+            },
+        );
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            dest_local,
+            target,
+        )?;
         Ok(true)
     }
 
@@ -26165,6 +26299,54 @@ mod tests {
             }),
             "u32 destination must not use the i64 fits/discriminant lowering"
         );
+    }
+
+    /// PyPy's `ObjSpace.c_int_w` performs the same signed 32-bit bounds
+    /// check explicitly. Anchor Rust's `i32::try_from(i64)` spelling in both
+    /// the interpreter helper and the int-or-float list strategy: neither may
+    /// retain an opaque core call, and both must keep a runtime Result tag.
+    #[test]
+    #[ignore]
+    fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        for (relpath, fname) in [
+            ("/../../build/llbc/pyre-interpreter.ullbc", "index_c_int_w"),
+            (
+                "/../../build/llbc/pyre-object.ullbc",
+                "int_or_float_encode_int",
+            ),
+        ] {
+            let path = format!("{}{relpath}", env!("CARGO_MANIFEST_DIR"));
+            let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load {fname} LLBC: {e}"));
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["convert", "num", "<Impl>", "try_from"],
+                        ))
+                }),
+                "{fname}: checked narrowing must not remain an opaque core call"
+            );
+            for expected in ["lt", "gt", "add"] {
+                assert!(
+                    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                        matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected)
+                    }),
+                    "{fname}: missing checked-narrowing {expected} op"
+                );
+            }
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::FieldWrite { field, .. }
+                        if field.name == "__discriminant")
+                }),
+                "{fname}: Result discriminant must remain runtime data"
+            );
+        }
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
