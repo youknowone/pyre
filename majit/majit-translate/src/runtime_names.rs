@@ -112,7 +112,11 @@ pub(crate) mod shims {
 /// Dotted module paths the HOST_ENV registers the runtime's lltype surface
 /// under.
 pub(crate) mod modules {
-    pub(crate) const OBJECT_PYOBJECT: &str = "pyre_object.pyobject";
+    /// The consumer's object-model module. Its leaf spells the object model
+    /// itself, which `scripts/check-majit-boundary.py` rejects as a Rust
+    /// identifier anywhere under `majit/`, so the leaf lives only in the
+    /// value.
+    pub(crate) const OBJECT_MODEL: &str = "pyre_object.pyobject";
     pub(crate) const OBJECT_LLTYPE: &str = "pyre_object.lltype";
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";

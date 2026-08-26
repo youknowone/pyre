@@ -2315,7 +2315,7 @@ impl HostEnv {
         // (`rbuiltin.rs lookup_typer`), so a fresh
         // `new_builtin_callable` with the same qualname would miss the
         // registered typer.
-        let object_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_PYOBJECT);
+        let object_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_MODEL);
         object_module.module_set(
             "PY_NULL",
             core_ptr
@@ -2390,7 +2390,7 @@ impl HostEnv {
         mods.insert("RootScope".into(), root_scope);
         mods.insert("IntArray".into(), int_array);
         mods.insert(
-            crate::runtime_names::modules::OBJECT_PYOBJECT.into(),
+            crate::runtime_names::modules::OBJECT_MODEL.into(),
             object_module,
         );
         mods.insert(
