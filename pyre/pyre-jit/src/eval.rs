@@ -8681,7 +8681,28 @@ fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
     // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
     // this arm never reaches `leave`: the declining paths return through
     // `execute_frame_plain`, which does, and the portal arms do not.
-    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
+    let leave_result =
+        unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) };
+    // `leave`'s frame-chain half, which the portal owed as much as the hook.  It
+    // is the `finally` of `leave`'s own `try`, so a profile hook that raised
+    // does not skip it, and it runs while `topframeref` still names this frame.
+    //
+    // The narrow form, not `leave`'s own: this closes a scope whose body ran as
+    // compiled code, so it is the same situation as a blackhole resume and is
+    // shared with it.  `leave_compiled_frame_chain` states why the identity
+    // guard and the absence of a force are load-bearing there.
+    //
+    // `got_exception` is `execute_frame`'s flag: false only when the body AND
+    // `return_trace` both completed, which is exactly `outer_result.is_ok()`.
+    // Without this a compiled frame that left escaped, or with an exception,
+    // returns to a caller that was never marked escaped — and `escaped()` is
+    // what the walker reads to decide whether that caller has to be
+    // materialised.
+    crate::call_jit::leave_portal_frame_chain(
+        frame_root.frame() as *mut PyFrame,
+        outer_result.is_err(),
+    );
+    let live = leave_result?;
     outer_result.map(|_| live)
 }
 
