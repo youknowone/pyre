@@ -4100,10 +4100,12 @@ impl MiniMarkGC {
     /// whose all-ones flag region fakes every flag (IGNORE_FINALIZER
     /// included), so a raw read there would silently drop a finalizer entry.
     ///
-    /// Latent today: every finalizer-queue registrant (instances, generators)
-    /// is stable-allocated, so a queued object is never in the nursery. It
-    /// becomes load-bearing when instance allocation converges back to the
-    /// movable nursery (see `alloc_instance_object`).
+    /// Load-bearing today. Instances and generators are stable-allocated, but
+    /// `list_descr_new` takes its header from `w_list_new` — the collecting
+    /// *nursery* arm — and then calls `maybe_register_finalizer` for a
+    /// builtin-layout subclass, so a `class L(list)` with `__del__` puts a
+    /// nursery header on the queue. It gets more so when instance allocation
+    /// converges back to the movable nursery (see `alloc_instance_object`).
     fn get_possibly_forwarded_header(&self, obj_addr: usize) -> *const GcHeader {
         let hdr = unsafe { header_of(obj_addr) };
         if self.is_nursery_object_start(obj_addr) && unsafe { (*hdr).is_forwarded() } {
@@ -6316,9 +6318,11 @@ impl MiniMarkGC {
     /// and are therefore born black.
     ///
     /// pyre's stack root sets are mutated with no write barrier and hold
-    /// pre-cycle objects: a JitFrame lives in the old gen so its pointer stays
-    /// valid across a collecting call while compiled code stores Refs into its
-    /// gcmap slots, the blackhole register banks and resume-construction roots
+    /// pre-cycle objects: an off-GC JitFrame is `alloc_zeroed` memory outside
+    /// the heap entirely, so its pointer stays valid across a collecting call
+    /// while compiled code stores Refs into its gcmap slots (the nursery-built
+    /// frames get their pointer back from `_reload_frame_if_necessary`
+    /// instead), the blackhole register banks and resume-construction roots
     /// are plain slices, and `seed_major_root` arms a newly seeded old root
     /// into the remembered set only once — the next minor drains that set and
     /// nothing re-arms it. A black root can therefore come to hold the only

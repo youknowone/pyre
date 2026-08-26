@@ -291,9 +291,10 @@ pub fn would_collect() -> bool {
 /// the suspended frame's live refs by expanding each jitframe on the JF shadow
 /// stack through `trace_libc_jitframe`. That is the same basis on which
 /// upstream collects with compiled frames on the stack. The safepoint fires
-/// only at the outermost eval activation ([`at_outermost_activation`]) so a
-/// Python callback nested inside native module code — whose Rust-stack roots
-/// the pyframe walker cannot see — never triggers it.
+/// at the first two eval activations and no deeper
+/// ([`at_outermost_activation`]), so a Python callback re-entered from inside
+/// an opcode handler — whose Rust-stack roots the pyframe walker cannot see —
+/// never triggers it.
 ///
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing

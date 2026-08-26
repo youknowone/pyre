@@ -2223,9 +2223,11 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     // user code (a side-effecting getter / dunder / module top level).
     crate::call::bump_frame_entry_count();
     // Count this interpreter activation so the JIT eval loop's GC safepoint
-    // fires only at the outermost activation (PYRE_GC_INTERP root-completeness):
-    // a nested `eval_loop_jit` running under this one observes depth > 1 and
-    // skips collection. No-op when the flag is off.
+    // stops firing once the nesting is deep enough to hide a root
+    // (PYRE_GC_INTERP root-completeness): module level and one called
+    // function's loop still collect, and an `eval_loop_jit` re-entered from
+    // inside an opcode handler observes depth >= 3 and skips collection.
+    // No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     if _eval_activation.armed() {
         // Publish the process-stable configuration in the breaker word once
