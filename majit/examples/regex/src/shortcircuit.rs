@@ -71,16 +71,30 @@
 //! every failure in the run reported `tid=1` — the one compiled loop. Now the
 //! failures spread across trace ids 1 through 11, the loop and its ten
 //! bridges, which is what a bridge failing its OWN guard looks like: the loop
-//! covers one path through
-//! the mark pattern, a bridge covers the next, that bridge exits at a guard of
-//! its own, and the next bridge grows off THAT. `must_compile` fires 10 times
-//! and all 10 reach `compile_trace`; none abort.
+//! covers one path through the mark pattern, a bridge covers the next, that
+//! bridge exits at a guard of its own, and the next bridge grows off THAT.
+//! `must_compile` fires 10 times and all 10 reach `compile_trace`; none abort.
+//!
+//! Ten is not a ceiling the bridge tree ran into; it is a rate, and eight
+//! times the input is what tells those apart:
+//!
+//! ```text
+//!  4,096 chars:  4,080 guard failures, 10 bridges
+//! 32,768 chars: 32,676 guard failures, 84 bridges
+//! ```
+//!
+//! 8.0x the failures, 8.4x the bridges, and the failures stay at 0.997 per
+//! character at both lengths. `trace_eagerness` is 200 — `PARAMETERS` carries
+//! `rlib/jit.py`'s own default — so one guard must fail 200 times before it is
+//! worth a bridge, which caps a pass of `n` characters at about `n / 200` of
+//! them no matter how many distinct mark patterns the tree has. Bridging here
+//! is not converging on the pattern and stopping; it is trailing it at a fixed
+//! rate that the deopt outruns.
 //!
 //! So the post's "you get a lot of assembler code generated" IS what happens
 //! here, once the bridges can be built at all — and it does not pay for
-//! itself over 4096 characters, because the number of distinct mark patterns a
-//! 93-node tree can be in is far larger than the number of bridges one pass
-//! can grow. The interpreter round trip per character stays.
+//! itself: the interpreter round trip per character stays, at every length
+//! measured.
 //!
 //! ## What it took to get there, and what it says about majit
 //!
@@ -798,6 +812,8 @@ mod tests {
         // is the multi-frame resume regressing back to a give-up, and a run
         // whose failures collapse is the bridge tree finally covering the mark
         // pattern, which would make the timing row wrong rather than stale.
+        // Why ten and not more is measured next door, in
+        // `the_bridge_count_is_set_by_trace_eagerness_not_by_a_ceiling`.
         assert!(
             sc.bridges.unwrap_or(0) > 0,
             "no bridge was compiled. Every guard here fails inside the
@@ -810,6 +826,40 @@ mod tests {
             Some(0),
             "a bridge attempt was abandoned; `MAJIT_BRIDGE_DEBUG=1` names the \
              decline on the `[bridgeB] DECLINE` line",
+        );
+    }
+
+    /// How many bridges a pass grows, and what sets that number.
+    ///
+    /// The finding next door is that ten bridges do not move the deopt rate.
+    /// The obvious reading — "the bridge tree saturates" — is wrong, and this
+    /// is the measurement that says so: the count is not a ceiling, it is a
+    /// rate. `trace_eagerness` is 200 (`rlib/jit.py`'s own default, carried in
+    /// `PARAMETERS`), so ONE guard has to fail 200 times before it is worth a
+    /// bridge, and a pass of `n` characters can therefore grow at most about
+    /// `n / 200` of them however many distinct mark patterns the tree has.
+    ///
+    /// Eight times the input is what separates a rate from a ceiling, so that
+    /// is what this runs. A saturating tree would answer the same count twice.
+    #[test]
+    fn the_bridge_count_is_set_by_trace_eagerness_not_by_a_ceiling() {
+        let short = nonmatching(4096, 20, 42);
+        let long = nonmatching(4096 * 8, 20, 42);
+        let a = measure(lower(&bench_regex(20)), &short);
+        let b = measure(lower(&bench_regex(20)), &long);
+        let (ab, bb) = (a.bridges.unwrap_or(0), b.bridges.unwrap_or(0));
+        println!(
+            "[shortcircuit] bridges: {} chars -> {ab}, {} chars -> {bb}; \
+             guard failures {:?} -> {:?}",
+            short.len(),
+            long.len(),
+            a.guard_failures,
+            b.guard_failures,
+        );
+        assert!(
+            bb > ab,
+            "8x the input grew no more bridges ({ab} -> {bb}), so the count is \
+             a ceiling after all and the module doc's explanation is wrong",
         );
     }
 

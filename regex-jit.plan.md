@@ -1760,10 +1760,24 @@ Measured on the same 4096-character run, both backends identically:
 
 The deopt rate barely moves, and that is the honest result rather than a
 disappointment: a bridge covers one more path through the mark pattern, the
-bridge then exits at a guard of its own and grows the next bridge off that, and
-a 93-node tree has far more mark patterns than one 4096-character pass can
-bridge. What changed is that the post's "you get a lot of assembler code
-generated" now actually happens here.
+bridge then exits at a guard of its own, and the next bridge grows off that.
+
+Ten is a rate, not a ceiling, and eight times the input is what tells those
+apart — `the_bridge_count_is_set_by_trace_eagerness_not_by_a_ceiling` measures
+it, identically on both backends:
+
+| input | guard failures | bridges |
+|---:|---:|---:|
+| 4,096 | 4,080 | 10 |
+| 32,768 | 32,676 | 84 |
+
+8.0x the failures, 8.4x the bridges, and 0.997 failures per character at both
+lengths. `trace_eagerness` is 200, so one guard must fail 200 times to be worth
+a bridge and a pass of `n` characters can grow at most about `n / 200` of them
+however many mark patterns the tree has. Bridging is not converging on the
+pattern and stopping; it is trailing it at a fixed rate the deopt outruns.
+What changed is that the post's "you get a lot of assembler code generated" now
+actually happens here.
 
 Two things were wrong in the tally on the way to that answer, and both are
 fixed. The bridge give-ups called `abort_trace` without staging a reason, so
