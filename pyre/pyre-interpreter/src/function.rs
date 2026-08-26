@@ -3040,6 +3040,10 @@ pub fn find(_identifier: &str) -> PyObjectRef {
 /// Not the same predicate as `gateway::is_builtin_code`, which asks whether
 /// the object handed to it *is* a builtin code.  This one is asked about a
 /// callable, which is why it has to reach the code through `getcode` first.
+///
+/// `getcode`, not the `code` field: it is the accessor that promotes a
+/// changeable code and takes the elidable one otherwise, and a profiled call
+/// reaches this while a trace records.
 #[inline]
 pub fn is_builtin_code(w_func: PyObjectRef) -> bool {
     unsafe {
@@ -3050,7 +3054,7 @@ pub fn is_builtin_code(w_func: PyObjectRef) -> bool {
         if w_func.is_null() || !crate::is_function(w_func) {
             return false;
         }
-        let code = crate::function_get_code(w_func) as PyObjectRef;
+        let code = crate::getcode(w_func) as PyObjectRef;
         !code.is_null() && crate::gateway::is_builtin_code(code)
     }
 }
