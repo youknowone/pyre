@@ -996,7 +996,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "bridge_abort_permanent",
                 "guard_resume_decline_no_state",
                 "guard_resume_decline_foreign_jitcode",
-                "guard_resume_decline_pendingfields",
+                "guard_resume_decline_replay_incomplete",
                 "guard_resume_decline_regcount",
                 "guard_resume_decline_unreadable_reg",
             ];

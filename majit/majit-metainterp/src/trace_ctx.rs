@@ -719,6 +719,14 @@ pub struct TraceCtx {
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
     /// that only receive `TraceCtx`.
     pub(crate) bridge_source_is_exception_guard: bool,
+    /// Set when a bridge-entry resume replay ran as the applying reader and
+    /// met a write it could not apply. The trace then holds recorded writes
+    /// whose heap half did not happen, so the entry that asked for that reader
+    /// must decline rather than resume against a heap it half-described.
+    ///
+    /// Only `resume.py`'s box reader can raise it: the recording-only walk has
+    /// nothing to apply and leaves it false.
+    pub(crate) bridge_replay_incomplete: bool,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1767,6 +1775,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_replay_incomplete: false,
         }
     }
 
@@ -1863,6 +1872,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_replay_incomplete: false,
         }
     }
 
@@ -2049,6 +2059,18 @@ impl TraceCtx {
     /// wrapping the same producer `Rc`.
     pub fn operand_for(&self, opref: OpRef) -> majit_ir::operand::Operand {
         self.recorder.box_for_operand(opref)
+    }
+
+    /// Report that the applying half of the bridge-entry replay could not
+    /// finish. See [`TraceCtx::bridge_replay_incomplete`].
+    pub fn mark_bridge_replay_incomplete(&mut self) {
+        self.bridge_replay_incomplete = true;
+    }
+
+    /// Whether [`TraceCtx::mark_bridge_replay_incomplete`] fired for this
+    /// bridge entry.
+    pub fn bridge_replay_incomplete(&self) -> bool {
+        self.bridge_replay_incomplete
     }
 
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {

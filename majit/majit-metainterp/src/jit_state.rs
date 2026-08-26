@@ -382,6 +382,14 @@ pub trait JitState: Sized {
     /// decode the resume stream into per-callee recipes and stash a
     /// `BridgeInlineCarrier` on `ctx` (drained by `trace_bytecode` right
     /// before `interpret()`).
+    ///
+    /// `executing` selects which half of `resume.py`'s reader pair this entry
+    /// needs. `Some(allocator)` is `ResumeDataBoxReader`, whose
+    /// `allocate_with_vtable` / `setfield` go through `execute_and_record` and
+    /// so apply each write as well as recording it — the reader upstream uses
+    /// for an entry no direct reader preceded. `None` records only, which is
+    /// sound exactly when a direct reader has already applied this guard's
+    /// writes.
     fn setup_bridge_sym(
         _sym: &mut Self::Sym,
         _ctx: &mut crate::trace_ctx::TraceCtx,
@@ -389,6 +397,7 @@ pub trait JitState: Sized {
         _rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         _fail_values: &[i64],
         _fail_types: &[Type],
+        _executing: Option<&dyn crate::resume::BlackholeAllocator>,
     ) {
     }
 

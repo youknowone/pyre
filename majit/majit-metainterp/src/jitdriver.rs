@@ -1810,10 +1810,9 @@ enum GuardResumeDecline {
     /// offset into the jitcode the frame NAMES, so entering a different one
     /// there lands mid-instruction in unrelated code.
     ForeignJitcode,
-    /// The guard's deferred heap writes have not been applied. Only the
-    /// blackhole applies them, so entering here resumes against a heap that is
-    /// missing half of whatever the guard deferred.
-    PendingFields,
+    /// The applying reader met a write it has no applying twin for, so the
+    /// trace records a store the heap did not receive.
+    ReplayIncomplete,
     /// The register-index count and the rebuilt-value count disagree, so the
     /// two sides read different liveness and no per-register pairing off them
     /// is trustworthy.
@@ -1830,7 +1829,7 @@ impl GuardResumeDecline {
         match self {
             GuardResumeDecline::NoResumeState => 83,
             GuardResumeDecline::ForeignJitcode => 84,
-            GuardResumeDecline::PendingFields => 85,
+            GuardResumeDecline::ReplayIncomplete => 85,
             GuardResumeDecline::RegCountMismatch => 86,
             GuardResumeDecline::UnreadableRegister => 87,
         }
@@ -5003,7 +5002,9 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc) {
+        // No blackhole runs before this entry, so its replay is the one that
+        // owes the guard's deferred writes to the heap.
+        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true) {
             return None;
         }
         // From here the trace session is LIVE, so a decline has to tear it
@@ -5027,23 +5028,38 @@ impl<S: JitState> JitDriver<S> {
                 return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
-            // heap writes through `execute_and_record` — it applies them to the
-            // heap AND puts them in the trace. majit's replay
-            // (`replay_pending_fields`) only records: the applying half was the
-            // blackhole's, because until now a bridge was only ever started
-            // after the blackhole had run. Entering at the guard skips the
-            // blackhole, so nothing applies them, and the interpreter resumes
-            // against a heap where the elided half of a push is missing — a
-            // committed size with a null chain.
+            // heap writes through `execute_and_record`, which applies them to
+            // the heap AND puts them in the trace. This entry asked for that
+            // applying reader, so a guard carrying deferred writes is served
+            // here rather than declined — but only as far as the reader has an
+            // applying twin for what it meets. Where it did not, it recorded a
+            // write it could not perform, and resuming would run against a heap
+            // that half-describes what the trace says.
             //
-            // Decline while that half is missing. The blackhole arm is then the
-            // answer for these guards, which is where they were already served.
+            // Decline exactly there. The blackhole arm applies all of them,
+            // which is where these guards were served before.
+            if self
+                .meta
+                .tracing
+                .as_ref()
+                .is_some_and(|ctx| ctx.bridge_replay_incomplete())
+            {
+                return Err(Decline::ReplayIncomplete);
+            }
+            // OPEN: applying the writes is necessary but not sufficient. A
+            // guard carrying deferred writes is one this entry has never run
+            // for, and serving it here makes a self-interpreting workload
+            // produce a short answer with every write applied and no rung
+            // raised, so something else on this path does not hold for these
+            // guards. Keep declining them until that is named; the applying
+            // reader above is what makes the entry survivable at all, and the
+            // blackhole arm keeps serving them meanwhile.
             if resume
                 .storage
                 .as_ref()
                 .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
             {
-                return Err(Decline::PendingFields);
+                return Err(Decline::ReplayIncomplete);
             }
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
@@ -6237,8 +6253,17 @@ impl<S: JitState> JitDriver<S> {
                             && !portal_crn_handled
                             && pc != usize::MAX
                         {
-                            let bridge_ok =
-                                self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
+                            let bridge_ok = self.start_bridge_tracing(
+                                &descr_arc,
+                                state,
+                                env,
+                                &raw_values,
+                                pc,
+                                // The blackhole above already applied this
+                                // guard's writes; recording is the whole
+                                // job here.
+                                false,
+                            );
                             if crate::majit_log_enabled() {
                                 eprintln!(
                                     "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
@@ -7991,6 +8016,10 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         raw_fail_values: &[i64],
         resume_pc: usize,
+        // Which half of `resume.py`'s reader pair the entry needs: true for an
+        // entry no direct reader preceded, so the replay must apply each write
+        // as `execute_and_record` does as well as record it.
+        execute_replay: bool,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // Same reason as the primary trace entry: the bridge compile decodes
@@ -8371,6 +8400,16 @@ impl<S: JitState> JitDriver<S> {
                 .sym
                 .as_mut()
                 .expect("bridge: sym must be live after S::create_sym");
+            // `Send` is the driver's storage bound, not the reader's, so drop
+            // it here rather than push it onto the `JitState` contract.
+            let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> = if execute_replay
+            {
+                self.blackhole_allocator
+                    .as_deref()
+                    .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+            } else {
+                None
+            };
             let ctx = self
                 .meta
                 .tracing
@@ -8379,6 +8418,12 @@ impl<S: JitState> JitDriver<S> {
             if let Some(idx) = bridge_reg_indices {
                 ctx.set_bridge_reg_indices(idx);
             }
+            // An entry that asked to apply and has no allocator to apply
+            // through cannot fall back to recording only: nothing else will
+            // write this guard's deferred stores.
+            if execute_replay && replay_allocator.is_none() {
+                ctx.mark_bridge_replay_incomplete();
+            }
             S::setup_bridge_sym(
                 sym,
                 ctx,
@@ -8386,6 +8431,7 @@ impl<S: JitState> JitDriver<S> {
                 retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
                 &raw_values,
                 &retrace.fail_types,
+                replay_allocator,
             );
         }
         self.bridge_body_start_op_count = self.meta.tracing.as_ref().map(|ctx| ctx.num_ops());
@@ -9818,8 +9864,14 @@ mod tests {
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 
-        let started =
-            driver.start_bridge_tracing(&descr_arc, &mut NonTraceableState, &(), &fail_values, 0);
+        let started = driver.start_bridge_tracing(
+            &descr_arc,
+            &mut NonTraceableState,
+            &(),
+            &fail_values,
+            0,
+            false,
+        );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
     }

@@ -1827,8 +1827,9 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // ambiguity these slots exist to remove. 83 = nothing to enter at (no
     // rebuilt resume data, no frame, no position, or no live session); 84 =
     // the frame names a jitcode other than the dispatch one, whose positions
-    // are offsets into different code; 85 = the guard's deferred heap writes
-    // are still pending and only the blackhole applies them; 86 = the
+    // are offsets into different code; 85 = the applying reader met a write it
+    // has no applying twin for, so the trace records a store the heap did not
+    // receive; 86 = the
     // register-index count and the rebuilt-value count disagree; 87 = a live
     // register holds a virtual or nothing at all, and the walk executes.
     //
@@ -1838,7 +1839,7 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // reading as a defect rather than as a workload property.
     "guard_resume_decline_no_state",
     "guard_resume_decline_foreign_jitcode",
-    "guard_resume_decline_pendingfields",
+    "guard_resume_decline_replay_incomplete",
     "guard_resume_decline_regcount",
     "guard_resume_decline_unreadable_reg",
 ];
