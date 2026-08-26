@@ -870,6 +870,26 @@ fn copy_endian(raw: &[u8], out: &mut [u8], bigendian: bool) {
 
 /// `do_unpack` / `_unpack` — unpack the whole of `buf` (which must be
 /// exactly `calcsize(format)` bytes) according to `format`.
+/// `struct_get_unpacker` — whether an unpacker can be built for `format` at
+/// all.  A format the struct module cannot parse makes two memoryviews
+/// unequal rather than raising, so the caller needs the question answered
+/// separately from unpacking.
+pub(crate) fn format_is_supported(format: &str) -> bool {
+    parse_format(format).is_ok()
+}
+
+/// `struct_unpack_single` — one item's fields, unwrapped when the format
+/// names exactly one of them.
+pub(crate) fn unpack_single(format: &str, item: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+    let unpacked = do_unpack(format, item)?;
+    unsafe {
+        match pyre_object::w_tuple_len(unpacked) {
+            1 => Ok(pyre_object::w_tuple_getitem(unpacked, 0).expect("length checked")),
+            _ => Ok(unpacked),
+        }
+    }
+}
+
 fn do_unpack(format: &str, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;

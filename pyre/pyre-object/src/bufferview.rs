@@ -28,6 +28,10 @@ fn copy_base(full: &[u8], base: i64, isz: usize, out: &mut Vec<u8>) {
 /// `_copy_rec` — recursive C-order copy of dimension `idim`.  The innermost
 /// dimension walks `shape[ndim-1]` elements by `strides[ndim-1]`; an outer
 /// dimension recurses `shape[idim]` times, advancing `off` by `strides[idim]`.
+///
+/// A stride of zero addresses the same element at every index of that
+/// dimension, so it is copied `shape[idim]` times rather than skipped:
+/// `_copy_base` stops early only because `range(off, off, 0)` is not a walk.
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -45,9 +49,6 @@ fn copy_rec(
     let dimshape = shape.get(idim as usize).copied().unwrap_or(0);
     let dimstride = strides.get(idim as usize).copied().unwrap_or(0);
     if idim == ndim - 1 {
-        if dimstride == 0 {
-            return;
-        }
         for _ in 0..dimshape {
             copy_base(full, off, isz, out);
             off += dimstride;
@@ -57,6 +58,103 @@ fn copy_rec(
             copy_rec(full, shape, strides, ndim, idim + 1, off, isz, out);
             off += dimstride;
         }
+    }
+}
+
+/// `ADJUST_PTR` — follow the pointer stored at `ptr` when dimension `dim`
+/// carries a non-negative suboffset, and leave it alone otherwise.  An empty
+/// slice is identity, exactly as the macro is for a NULL `suboffsets`.
+///
+/// # Safety
+/// When dimension `dim` has a non-negative suboffset, `ptr` must address a
+/// live pointer that the exporter published.
+unsafe fn adjust_ptr(ptr: *const u8, suboffsets: &[i64], dim: usize) -> *const u8 {
+    match suboffsets.get(dim) {
+        Some(&suboffset) if suboffset >= 0 => unsafe {
+            (*ptr.cast::<*const u8>()).offset(suboffset as isize)
+        },
+        _ => ptr,
+    }
+}
+
+/// `init_strides_from_shape` / `init_fortran_strides_from_shape` — the byte
+/// steps of a block laid out contiguously in the requested order.
+pub fn contiguous_strides(shape: &[i64], itemsize: i64, fortran: bool) -> Vec<i64> {
+    let mut strides = vec![0i64; shape.len()];
+    let mut step = itemsize;
+    if fortran {
+        for (dim, &extent) in shape.iter().enumerate() {
+            strides[dim] = step;
+            step *= extent;
+        }
+    } else {
+        for (dim, &extent) in shape.iter().enumerate().rev() {
+            strides[dim] = step;
+            step *= extent;
+        }
+    }
+    strides
+}
+
+/// `copy_rec` for a view whose dimensions carry suboffsets.  The cursor is a
+/// raw pointer because a suboffset dereferences it, so no byte index into the
+/// backing describes the element; the address is chained one dimension at a
+/// time and the stride advances the *un*adjusted cursor.
+///
+/// The source is always walked outermost dimension first, because a pointer
+/// chain has to be followed in the order it was built.  A Fortran-order
+/// result therefore comes from the *destination* steps `dest_strides`
+/// carries, which is how `buffer_to_contiguous` produces one.
+///
+/// # Safety
+/// The geometry must be the one its exporter published, every pointer a
+/// suboffset reaches must be live, and `out` must be `product(shape) * isz`
+/// bytes long.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The source geometry, the destination geometry and both cursors are each a separate argument; grouping them would hide which side an argument belongs to"
+)]
+unsafe fn copy_rec_indirect(
+    shape: &[i64],
+    strides: &[i64],
+    suboffsets: &[i64],
+    dest_strides: &[i64],
+    idim: usize,
+    ptr: *const u8,
+    dest: i64,
+    isz: usize,
+    out: &mut [u8],
+) {
+    let dimshape = shape.get(idim).copied().unwrap_or(0);
+    let dimstride = strides.get(idim).copied().unwrap_or(0);
+    let deststride = dest_strides.get(idim).copied().unwrap_or(0);
+    let mut cursor = ptr;
+    let mut at = dest;
+    for _ in 0..dimshape {
+        let element = unsafe { adjust_ptr(cursor, suboffsets, idim) };
+        if idim + 1 == shape.len() {
+            let to = at.max(0) as usize;
+            if to + isz <= out.len() {
+                out[to..to + isz]
+                    .copy_from_slice(unsafe { std::slice::from_raw_parts(element, isz) });
+            }
+        } else {
+            unsafe {
+                copy_rec_indirect(
+                    shape,
+                    strides,
+                    suboffsets,
+                    dest_strides,
+                    idim + 1,
+                    element,
+                    at,
+                    isz,
+                    out,
+                )
+            };
+        }
+        cursor = unsafe { cursor.offset(dimstride as isize) };
+        at += deststride;
     }
 }
 
@@ -75,9 +173,6 @@ fn copy_rec_fortran(
     let dimshape = shape.get(idim as usize).copied().unwrap_or(0);
     let dimstride = strides.get(idim as usize).copied().unwrap_or(0);
     if idim == 0 {
-        if dimstride == 0 {
-            return;
-        }
         for _ in 0..dimshape {
             copy_base(full, off, isz, out);
             off += dimstride;
@@ -106,6 +201,33 @@ unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
         }
         dims
     }
+}
+
+/// The `[low, high)` byte window a strided geometry can address, relative to
+/// element zero: `low` is the sum of the negative extents a reversed stride
+/// reaches below element zero, `high` the sum of the positive ones plus one
+/// element.  An empty extent addresses nothing, so the window is `(0, 0)`.
+///
+/// This has no upstream twin — `get_offset` and `ADJUST_PTR` both index raw
+/// pointers, which need no window.  It exists because [`Buffer::as_bytes`]
+/// hands out a *bounded* slice and [`copy_base`] drops any element outside
+/// it, so a foreign export whose strides reach below its `buf` must have its
+/// storage lowered to `low` and the shift carried in the view's offset.
+pub fn addressable_window(shape: &[i64], strides: &[i64], itemsize: i64) -> (i64, i64) {
+    if shape.iter().any(|&extent| extent == 0) {
+        return (0, 0);
+    }
+    let mut low = 0;
+    let mut high = itemsize;
+    for (&extent, &stride) in shape.iter().zip(strides) {
+        let span = stride * (extent - 1);
+        if span < 0 {
+            low += span;
+        } else {
+            high += span;
+        }
+    }
+    (low, high)
 }
 
 /// A view of a [`Buffer`]'s bytes with offset / shape / stride geometry and a
@@ -177,6 +299,33 @@ pub enum BufferView {
         ndim: i64,
         w_shape: PyObjectRef,
         w_strides: PyObjectRef,
+    },
+    /// `CPyBuffer` (`pypy/module/cpyext/buffer.py`) — a foreign `Py_buffer`'s
+    /// own geometry over the storage its exporter handed over.  A root view:
+    /// it holds the storage rather than a parent, exactly as `CPyBuffer`
+    /// holds `self.ptr` / `self.size` instead of subclassing `IndirectView`.
+    /// The backing is that export's block, or the in-heap copy a contiguous
+    /// materialisation made of it.
+    ///
+    /// `shape` / `strides` ride as native vectors, as `CPyBuffer` stores
+    /// them as lists, and both have `ndim` entries once `init_shape_strides`
+    /// has reconstructed the ones the exporter left NULL.  `length` is
+    /// `Py_buffer.len` verbatim (`CPyBuffer.size`), which for a 0-dimensional
+    /// or PIL-style export is not `product(shape) * itemsize`.  `offset` is
+    /// the byte position of element zero within `backing`, non-zero when a
+    /// negative stride forced the storage down to the lowest addressable
+    /// byte (see [`addressable_window`]).  An empty `suboffsets` is NULL.
+    CBuffer {
+        backing: Buffer,
+        w_obj: PyObjectRef,
+        w_fmt: PyObjectRef,
+        itemsize: i64,
+        length: i64,
+        ndim: i64,
+        offset: i64,
+        shape: Vec<i64>,
+        strides: Vec<i64>,
+        suboffsets: Vec<i64>,
     },
     /// `ReadonlyWrapper` (`buffer.py`) — `toreadonly`'s wrapper: every
     /// read delegates to the wrapped view, `readonly` is forced true.
@@ -250,6 +399,29 @@ impl BufferView {
                 w_shape: *w_shape,
                 w_strides: *w_strides,
             },
+            BufferView::CBuffer {
+                backing,
+                w_fmt,
+                itemsize,
+                length,
+                ndim,
+                offset,
+                shape,
+                strides,
+                suboffsets,
+                ..
+            } => BufferView::CBuffer {
+                backing: backing.clone(),
+                w_obj: new_obj,
+                w_fmt: *w_fmt,
+                itemsize: *itemsize,
+                length: *length,
+                ndim: *ndim,
+                offset: *offset,
+                shape: shape.clone(),
+                strides: strides.clone(),
+                suboffsets: suboffsets.clone(),
+            },
             BufferView::Readonly { view, .. } => BufferView::Readonly {
                 view: view.clone(),
                 w_obj: new_obj,
@@ -261,7 +433,9 @@ impl BufferView {
     #[inline]
     pub fn backing(&self) -> &Buffer {
         match self {
-            BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => backing,
+            BufferView::Simple { backing, .. }
+            | BufferView::Raw { backing, .. }
+            | BufferView::CBuffer { backing, .. } => backing,
             BufferView::Slice { parent, .. }
             | BufferView::View1D { parent, .. }
             | BufferView::ViewND { parent, .. } => parent.backing(),
@@ -277,6 +451,7 @@ impl BufferView {
             | BufferView::Slice { w_obj, .. }
             | BufferView::View1D { w_obj, .. }
             | BufferView::ViewND { w_obj, .. }
+            | BufferView::CBuffer { w_obj, .. }
             | BufferView::Readonly { w_obj, .. } => *w_obj,
         }
     }
@@ -291,9 +466,9 @@ impl BufferView {
         unsafe {
             match self {
                 BufferView::Simple { .. } => "B",
-                BufferView::Raw { w_fmt, .. } | BufferView::View1D { w_fmt, .. } => {
-                    crate::w_str_get_value(*w_fmt)
-                }
+                BufferView::Raw { w_fmt, .. }
+                | BufferView::View1D { w_fmt, .. }
+                | BufferView::CBuffer { w_fmt, .. } => crate::w_str_get_value(*w_fmt),
                 BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
                     parent.format_str()
                 }
@@ -335,6 +510,7 @@ impl BufferView {
                     parent, itemsize, ..
                 } => vec![parent.length() / *itemsize],
                 BufferView::ViewND { w_shape, .. } => read_dims(*w_shape),
+                BufferView::CBuffer { shape, .. } => shape.clone(),
                 BufferView::Readonly { view, .. } => view.native_shape(),
             }
         }
@@ -363,7 +539,27 @@ impl BufferView {
                     strides
                 }
                 BufferView::ViewND { w_strides, .. } => read_dims(*w_strides),
+                BufferView::CBuffer { strides, .. } => strides.clone(),
                 BufferView::Readonly { view, .. } => view.native_strides(),
+            }
+        }
+    }
+    /// The per-dimension suboffsets (`getsuboffsets`).  Empty is NULL: only a
+    /// foreign export carries any, and every derived view reports its
+    /// parent's.
+    ///
+    /// # Safety
+    /// The view's stored geometry objects must be live.
+    #[inline]
+    pub unsafe fn native_suboffsets(&self) -> Vec<i64> {
+        unsafe {
+            match self {
+                BufferView::Simple { .. } | BufferView::Raw { .. } => Vec::new(),
+                BufferView::CBuffer { suboffsets, .. } => suboffsets.clone(),
+                BufferView::Slice { parent, .. }
+                | BufferView::View1D { parent, .. }
+                | BufferView::ViewND { parent, .. } => parent.native_suboffsets(),
+                BufferView::Readonly { view, .. } => view.native_suboffsets(),
             }
         }
     }
@@ -384,6 +580,9 @@ impl BufferView {
                 } => crate::tupleobject::w_tuple_getitem(*w_strides, 0)
                     .map(|s| crate::intobject::w_int_get_value(s))
                     .unwrap_or_else(|| parent.itemsize()),
+                BufferView::CBuffer {
+                    strides, itemsize, ..
+                } => strides.first().copied().unwrap_or(*itemsize),
                 BufferView::Readonly { view, .. } => view.stride0(),
             }
         }
@@ -391,7 +590,9 @@ impl BufferView {
     #[inline]
     pub fn itemsize(&self) -> i64 {
         match self {
-            BufferView::Raw { itemsize, .. } | BufferView::View1D { itemsize, .. } => *itemsize,
+            BufferView::Raw { itemsize, .. }
+            | BufferView::View1D { itemsize, .. }
+            | BufferView::CBuffer { itemsize, .. } => *itemsize,
             BufferView::Simple { .. } => 1,
             BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
                 parent.itemsize()
@@ -405,6 +606,7 @@ impl BufferView {
             BufferView::Simple { .. } | BufferView::Raw { .. } | BufferView::View1D { .. } => 1,
             BufferView::Slice { parent, .. } => parent.ndim(),
             BufferView::ViewND { ndim, .. } => *ndim,
+            BufferView::CBuffer { ndim, .. } => *ndim,
             BufferView::Readonly { view, .. } => view.ndim(),
         }
     }
@@ -427,6 +629,7 @@ impl BufferView {
                 BufferView::View1D { parent, .. } | BufferView::ViewND { parent, .. } => {
                     parent.offset()
                 }
+                BufferView::CBuffer { offset, .. } => *offset,
                 BufferView::Readonly { view, .. } => view.offset(),
             }
         }
@@ -441,8 +644,16 @@ impl BufferView {
     pub unsafe fn length(&self) -> i64 {
         unsafe {
             match self {
-                BufferView::Simple { length, .. } | BufferView::Raw { length, .. } => *length,
-                BufferView::Slice { parent, length, .. } => *length * parent.itemsize(),
+                BufferView::Simple { length, .. }
+                | BufferView::Raw { length, .. }
+                | BufferView::CBuffer { length, .. } => *length,
+                // `init_len` — `product(shape) * itemsize`, so a slice of an
+                // N-dimensional parent keeps the trailing extents.  `length`
+                // is `shape[0]` alone (`BufferSlice.getlength`), which
+                // under-reports by their product.
+                BufferView::Slice { parent, .. } => {
+                    self.native_shape().iter().product::<i64>() * parent.itemsize()
+                }
                 BufferView::View1D { parent, .. } => parent.length(),
                 BufferView::ViewND {
                     parent, w_shape, ..
@@ -467,9 +678,9 @@ impl BufferView {
     #[inline]
     pub fn readonly(&self) -> bool {
         match self {
-            BufferView::Simple { backing, .. } | BufferView::Raw { backing, .. } => {
-                backing.readonly()
-            }
+            BufferView::Simple { backing, .. }
+            | BufferView::Raw { backing, .. }
+            | BufferView::CBuffer { backing, .. } => backing.readonly(),
             BufferView::Slice { parent, .. }
             | BufferView::View1D { parent, .. }
             | BufferView::ViewND { parent, .. } => parent.readonly(),
@@ -534,12 +745,62 @@ impl BufferView {
                 step: pstep * step,
                 length: slicelength,
             },
+            // A foreign export wraps like any other non-specialised parent:
+            // `Slice::offset` is `parent.offset() + start * parent.stride0()`
+            // and `Slice::native_strides` rescales dimension 0 only, which is
+            // `adjust_buf` plus `strides[dim] *= step` at `dim == 0`.  The arm
+            // is spelled out rather than left to the fallback so the
+            // suboffset case has a place to land.
+            BufferView::CBuffer { .. } => wrap(self),
             // A slice of a read-only wrapper stays wrapped (buffer.py:462).
             BufferView::Readonly { w_obj, .. } => BufferView::Readonly {
                 view: Box::new(wrap(self)),
                 w_obj: *w_obj,
             },
             other => wrap(other),
+        }
+    }
+
+    /// `ptr_from_index` / `ptr_from_tuple` — the address of the element at
+    /// `indices`, one wrapped index per dimension.  The address is *chained*
+    /// rather than summed: each dimension's stride advances the cursor and
+    /// `ADJUST_PTR` may then follow a pointer stored there.
+    ///
+    /// # Safety
+    /// `indices` must already be bounds-checked against the shape, and the
+    /// backing export must be live.
+    pub unsafe fn element_ptr(&self, indices: &[i64]) -> *const u8 {
+        unsafe {
+            let base = self.backing().as_bytes().as_ptr();
+            self.walk_to(base, indices)
+        }
+    }
+
+    /// [`element_ptr`](Self::element_ptr) over writable storage, or `None`
+    /// when the backing refuses one.
+    ///
+    /// # Safety
+    /// As [`element_ptr`](Self::element_ptr).
+    pub unsafe fn element_ptr_mut(&self, indices: &[i64]) -> Option<*mut u8> {
+        unsafe {
+            let base = self.backing().as_bytes_mut()?.as_mut_ptr();
+            Some(self.walk_to(base as *const u8, indices) as *mut u8)
+        }
+    }
+
+    /// # Safety
+    /// As [`element_ptr`](Self::element_ptr).
+    unsafe fn walk_to(&self, base: *const u8, indices: &[i64]) -> *const u8 {
+        unsafe {
+            let strides = self.native_strides();
+            let suboffsets = self.native_suboffsets();
+            let mut ptr = base.offset(self.offset() as isize);
+            for (dim, &index) in indices.iter().enumerate() {
+                let stride = strides.get(dim).copied().unwrap_or(0);
+                ptr = ptr.offset((stride * index) as isize);
+                ptr = adjust_ptr(ptr, &suboffsets, dim);
+            }
+            ptr
         }
     }
 
@@ -585,7 +846,8 @@ impl BufferView {
                 BufferView::Readonly { view, .. } => view.as_contiguous_bytes(),
                 BufferView::Slice { .. }
                 | BufferView::View1D { .. }
-                | BufferView::ViewND { .. } => None,
+                | BufferView::ViewND { .. }
+                | BufferView::CBuffer { .. } => None,
             }
         }
     }
@@ -619,6 +881,26 @@ impl BufferView {
                 0
             };
             let mut out = Vec::with_capacity(count.max(0) as usize * isz);
+            let suboffsets = self.native_suboffsets();
+            if !suboffsets.is_empty() {
+                // No byte index into the backing describes an element behind a
+                // suboffset, so the walk carries an address instead.  The
+                // bounds clamp `copy_base` applies goes with the index: the
+                // exporter's pointers are the only description of the target.
+                let mut block = vec![0u8; count.max(0) as usize * isz];
+                copy_rec_indirect(
+                    &shape,
+                    &strides,
+                    &suboffsets,
+                    &contiguous_strides(&shape, itemsize, fortran),
+                    0,
+                    full.as_ptr().offset(offset as isize),
+                    0,
+                    isz,
+                    &mut block,
+                );
+                return block;
+            }
             if fortran {
                 copy_rec_fortran(full, &shape, &strides, ndim - 1, offset, isz, &mut out);
             } else {
@@ -752,6 +1034,210 @@ mod tests {
         unsafe {
             assert_eq!(s2.offset(), 2);
             assert_eq!(s2.native_strides(), vec![2]);
+        }
+    }
+
+    fn cbuffer(shape: Vec<i64>, strides: Vec<i64>, itemsize: i64, offset: i64) -> BufferView {
+        let length = shape.iter().product::<i64>() * itemsize;
+        BufferView::CBuffer {
+            backing: Buffer::External {
+                w_obj: fake(0x3000),
+                address: 0x40000,
+                size: length.max(0) as usize,
+                readonly: false,
+            },
+            w_obj: fake(0x3000),
+            w_fmt: fake(0x3004),
+            itemsize,
+            length,
+            ndim: shape.len() as i64,
+            offset,
+            shape,
+            strides,
+            suboffsets: vec![],
+        }
+    }
+
+    #[test]
+    fn cbuffer_reports_its_stored_geometry() {
+        // A foreign export answers from its own vectors rather than deriving
+        // any of them from a parent, and `length` is `Py_buffer.len` verbatim.
+        let view = cbuffer(vec![2, 3], vec![12, 4], 4, 0);
+        unsafe {
+            assert_eq!(view.native_shape(), vec![2, 3]);
+            assert_eq!(view.native_strides(), vec![12, 4]);
+            assert_eq!(view.stride0(), 12);
+            assert_eq!(view.offset(), 0);
+            assert_eq!(view.length(), 24);
+            assert!(view.as_contiguous_bytes().is_none());
+        }
+        assert_eq!(view.itemsize(), 4);
+        assert_eq!(view.ndim(), 2);
+        assert!(!view.readonly());
+    }
+
+    #[test]
+    fn cbuffer_negative_stride_window_lowers_the_base() {
+        // A reversed dimension addresses bytes below element zero, so the
+        // window starts there and the view's offset carries the shift.
+        assert_eq!(addressable_window(&[4], &[-4], 4), (-12, 4));
+        assert_eq!(addressable_window(&[2, 3], &[12, 4], 4), (0, 24));
+        assert_eq!(addressable_window(&[2, 3], &[12, -4], 4), (-8, 16));
+        // An empty extent addresses nothing whatever the strides say.
+        assert_eq!(addressable_window(&[0, 3], &[12, 4], 4), (0, 0));
+        // A zero-dimensional export still addresses its one element.
+        assert_eq!(addressable_window(&[], &[], 8), (0, 8));
+    }
+
+    /// A `CBuffer` over `block`, whose address the geometry-only helper above
+    /// never dereferences but these two tests do.
+    fn cbuffer_over(
+        block: *const u8,
+        size: usize,
+        shape: Vec<i64>,
+        strides: Vec<i64>,
+        suboffsets: Vec<i64>,
+        itemsize: i64,
+    ) -> BufferView {
+        BufferView::CBuffer {
+            backing: Buffer::External {
+                w_obj: fake(0x3000),
+                address: block as usize,
+                size,
+                readonly: true,
+            },
+            w_obj: fake(0x3000),
+            w_fmt: fake(0x3004),
+            itemsize,
+            length: shape.iter().product::<i64>() * itemsize,
+            ndim: shape.len() as i64,
+            offset: 0,
+            shape,
+            strides,
+            suboffsets,
+        }
+    }
+
+    #[test]
+    fn indirect_gather_follows_the_row_pointers() {
+        // `ADJUST_PTR`: dimension 0 holds a table of row pointers and its
+        // suboffset is zero, so the walk dereferences the table entry and
+        // continues into the row; dimension 1's -1 leaves the cursor alone.
+        let row0: [u8; 3] = [1, 2, 3];
+        let row1: [u8; 3] = [4, 5, 6];
+        let table: [*const u8; 2] = [row0.as_ptr(), row1.as_ptr()];
+        let view = cbuffer_over(
+            table.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&table),
+            vec![2, 3],
+            vec![std::mem::size_of::<*const u8>() as i64, 1],
+            vec![0, -1],
+            1,
+        );
+        assert_eq!(unsafe { view.gather() }, vec![1, 2, 3, 4, 5, 6]);
+        // Fortran order reads dimension 0 fastest through the same table.
+        assert_eq!(unsafe { view.gather_order(true) }, vec![1, 4, 2, 5, 3, 6]);
+        // One element, addressed by chaining rather than summing.
+        assert_eq!(unsafe { *view.element_ptr(&[1, 2]) }, 6);
+    }
+
+    #[test]
+    fn direct_gather_is_unchanged_when_suboffsets_are_empty() {
+        // The pointer walk is entered only for a view that has suboffsets;
+        // an empty vector keeps the byte-index walk, strides and all.
+        let block: [u8; 6] = [1, 2, 3, 4, 5, 6];
+        let view = cbuffer_over(
+            block.as_ptr(),
+            block.len(),
+            vec![2, 3],
+            vec![3, 1],
+            vec![],
+            1,
+        );
+        assert_eq!(unsafe { view.gather() }, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(unsafe { view.gather_order(true) }, vec![1, 4, 2, 5, 3, 6]);
+        assert_eq!(unsafe { *view.element_ptr(&[1, 2]) }, 6);
+        // A reversed dimension 0 walks backwards from element zero, which
+        // `acquire` makes addressable by lowering the storage to the window's
+        // low end and carrying the shift in the view's offset.
+        let (low, high) = addressable_window(&[2, 3], &[-3, 1], 1);
+        assert_eq!((low, high), (-3, 3));
+        let reversed = BufferView::CBuffer {
+            backing: Buffer::External {
+                w_obj: fake(0x3000),
+                address: unsafe { block.as_ptr().offset(3).offset(low as isize) } as usize,
+                size: (high - low) as usize,
+                readonly: true,
+            },
+            w_obj: fake(0x3000),
+            w_fmt: fake(0x3004),
+            itemsize: 1,
+            length: 6,
+            ndim: 2,
+            offset: -low,
+            shape: vec![2, 3],
+            strides: vec![-3, 1],
+            suboffsets: vec![],
+        };
+        assert_eq!(unsafe { reversed.gather() }, vec![4, 5, 6, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cbuffer_backing_stays_the_external_export() {
+        // `release_view` ends a foreign export only for a view whose backing
+        // is the `External` block the export handed over; a variant that
+        // stopped answering with one would silently never be released.
+        let view = cbuffer(vec![2, 3], vec![12, 4], 4, 0);
+        assert!(matches!(view.backing(), Buffer::External { .. }));
+    }
+
+    #[test]
+    fn slice_of_a_cbuffer_shifts_the_base_and_rescales_dim0() {
+        // The wrapper composes: dimension 0 takes the slice's extent and its
+        // stride is multiplied by the step, later dimensions ride along.
+        let s = unsafe { cbuffer(vec![4, 3], vec![12, 4], 4, 0).new_slice(1, 2, 2) };
+        assert!(matches!(s, BufferView::Slice { .. }));
+        unsafe {
+            assert_eq!(s.native_shape(), vec![2, 3]);
+            assert_eq!(s.native_strides(), vec![24, 4]);
+            assert_eq!(s.offset(), 12);
+            assert_eq!(s.length(), 24);
+        }
+        assert_eq!(s.ndim(), 2);
+        assert_eq!(s.itemsize(), 4);
+    }
+
+    #[test]
+    fn slice_of_an_nd_view_reports_product_shape_nbytes() {
+        // `init_len` is `product(shape) * itemsize`, so a dimension-0 slice
+        // of an N-dimensional view keeps the trailing extents; reporting
+        // `shape[0]` alone under-reports by their product.
+        let exporter = crate::bytesobject::w_bytes_from_bytes(&[0u8; 10]);
+        let flat = BufferView::Simple {
+            backing: Buffer::String { w_obj: exporter },
+            w_obj: exporter,
+            length: 10,
+        };
+        let dims = |extents: [i64; 2]| {
+            crate::tupleobject::w_tuple_new(
+                extents
+                    .iter()
+                    .map(|&extent| crate::intobject::w_int_new(extent))
+                    .collect(),
+            )
+        };
+        let nd = BufferView::ViewND {
+            parent: Box::new(flat),
+            w_obj: exporter,
+            ndim: 2,
+            w_shape: dims([2, 5]),
+            w_strides: dims([5, 1]),
+        };
+        let s = unsafe { nd.new_slice(0, 2, 1) };
+        unsafe {
+            assert_eq!(s.native_shape(), vec![1, 5]);
+            assert_eq!(s.native_strides(), vec![10, 1]);
+            assert_eq!(s.length(), 5);
         }
     }
 
