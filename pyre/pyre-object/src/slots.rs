@@ -1,30 +1,18 @@
 //! Shared `__slots__` storage helpers for native subclasses (float, complex).
 //!
 //! Each host object stores its `__slots__` values in a list held by a
-//! `w_slots: PyObjectRef` field.  Callers pass an accessor that yields that
-//! field's address from the object pointer, so a single implementation serves
-//! every layout without duplicating the GC-rooting dance.
+//! `w_slots: PyObjectRef` field. Reads and deletes take that storage value
+//! directly, like mapdict's `getslotvalue`. Growing writes use a compile-time
+//! expansion so each concrete layout reloads its own field after a GC move;
+//! no runtime function-pointer dispatch exists in the translated graph.
 
 use crate::pyobject::*;
-
-/// Field accessor: given an object pointer, return the address of its
-/// `w_slots` field.
-///
-/// # Safety
-/// The accessor is called only with a pointer to the concrete host struct it
-/// was written for.
-pub type SlotsField = unsafe fn(PyObjectRef) -> *mut PyObjectRef;
 
 /// Read slot `index`, or `None` when unset (null list or null entry).
 ///
 /// # Safety
-/// `obj` must be a valid pointer to the host struct `slots_field` targets.
-pub unsafe fn slot_get(
-    obj: PyObjectRef,
-    index: usize,
-    slots_field: SlotsField,
-) -> Option<PyObjectRef> {
-    let slots = unsafe { *slots_field(obj) };
+/// `slots` must be null or a valid slot-storage list.
+pub unsafe fn slot_get(slots: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     if slots.is_null() {
         return None;
     }
@@ -32,54 +20,54 @@ pub unsafe fn slot_get(
         .filter(|value| !value.is_null())
 }
 
-/// Store `value` into slot `index`, growing (or creating) the backing list as
-/// needed.  Creating or growing the list allocates, and `w_list_new` /
-/// `w_list_append` are GC safepoints that can relocate `obj`, `value`, and the
-/// list itself, so pin them and reload the receiver after every allocation
-/// before storing through it.
+/// Expand mapdict-style slot storage into a concrete host layout.
 ///
-/// # Safety
-/// `obj` must be a valid pointer to the host struct `slots_field` targets.
-pub unsafe fn slot_set(
-    obj: PyObjectRef,
-    index: usize,
-    value: PyObjectRef,
-    slots_field: SlotsField,
-) {
-    let slots = unsafe { *slots_field(obj) };
-    if !slots.is_null() && unsafe { crate::listobject::w_list_len(slots) } > index {
-        unsafe { crate::listobject::w_list_setitem(slots, index as i64, value) };
-        return;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(obj);
-    let _ = crate::gc_roots::pin_root(value);
-    if slots.is_null() {
-        let new_slots = crate::listobject::w_list_new(vec![PY_NULL; index + 1]);
-        let obj = crate::gc_roots::shadow_stack_get(root_base);
-        unsafe { *slots_field(obj) = new_slots };
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    } else {
-        let mut slots = slots;
-        while unsafe { crate::listobject::w_list_len(slots) } <= index {
-            unsafe { crate::listobject::w_list_append(slots, PY_NULL) };
-            let obj = crate::gc_roots::shadow_stack_get(root_base);
-            slots = unsafe { *slots_field(obj) };
+/// PyPy's `BaseUserClassMapdict` implementation accesses one known storage
+/// field directly. Pyre currently has several native host layouts carrying
+/// that field, so a Rust function-pointer accessor would add an indirect call
+/// absent upstream. This macro is the static equivalent of the common base
+/// method: after expansion Charon sees only direct `$field` reads/writes on
+/// `$ty`, including the required reload after each allocating list grow.
+#[macro_export]
+macro_rules! slot_set_direct {
+    ($obj:expr, $index:expr, $value:expr, $ty:ty, $field:ident) => {{
+        let obj = $obj;
+        let index = $index;
+        let value = $value;
+        let slots = unsafe { (*(obj as *const $ty)).$field };
+        if !slots.is_null() && unsafe { $crate::listobject::w_list_len(slots) } > index {
+            unsafe { $crate::listobject::w_list_setitem(slots, index as i64, value) };
+        } else {
+            let _roots = $crate::gc_roots::push_roots();
+            let root_base = $crate::gc_roots::shadow_stack_len();
+            let _ = $crate::gc_roots::pin_root(obj);
+            let _ = $crate::gc_roots::pin_root(value);
+            if slots.is_null() {
+                let new_slots = $crate::listobject::w_list_new(vec![$crate::PY_NULL; index + 1]);
+                let obj = $crate::gc_roots::shadow_stack_get(root_base);
+                unsafe { (*(obj as *mut $ty)).$field = new_slots };
+                $crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+            } else {
+                let mut slots = slots;
+                while unsafe { $crate::listobject::w_list_len(slots) } <= index {
+                    unsafe { $crate::listobject::w_list_append(slots, $crate::PY_NULL) };
+                    let obj = $crate::gc_roots::shadow_stack_get(root_base);
+                    slots = unsafe { (*(obj as *const $ty)).$field };
+                }
+            }
+            let obj = $crate::gc_roots::shadow_stack_get(root_base);
+            let slots = unsafe { (*(obj as *const $ty)).$field };
+            let value = $crate::gc_roots::shadow_stack_get(root_base + 1);
+            unsafe { $crate::listobject::w_list_setitem(slots, index as i64, value) };
         }
-    }
-    let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let slots = unsafe { *slots_field(obj) };
-    let value = crate::gc_roots::shadow_stack_get(root_base + 1);
-    unsafe { crate::listobject::w_list_setitem(slots, index as i64, value) };
+    }};
 }
 
 /// Clear slot `index`, returning whether it held a value beforehand.
 ///
 /// # Safety
-/// `obj` must be a valid pointer to the host struct `slots_field` targets.
-pub unsafe fn slot_del(obj: PyObjectRef, index: usize, slots_field: SlotsField) -> bool {
-    let slots = unsafe { *slots_field(obj) };
+/// `slots` must be null or a valid slot-storage list.
+pub unsafe fn slot_del(slots: PyObjectRef, index: usize) -> bool {
     if slots.is_null() || unsafe { crate::listobject::w_list_len(slots) } <= index {
         return false;
     }

@@ -114,7 +114,23 @@ pub(crate) fn long_box_residual_path(segments: &[String]) -> Option<Vec<String>>
 
 /// Bare-payload residual for scalar RBigInt queries. The caller has already
 /// proved exact RBigInt receiver identity.
-pub(crate) fn scalar_residual_for_method(leaf: &str) -> Option<(Vec<String>, ScalarResult)> {
+pub(crate) fn scalar_residual_for_method(
+    leaf: &str,
+    inside_dont_look_inside: bool,
+) -> Option<(Vec<String>, ScalarResult)> {
+    // `rbigint.py:_AsDouble` is itself `@jit.dont_look_inside`, but
+    // GraphAnalyzer still walks its untranslated graph to compute effects.
+    // Keep the original `RBigInt.bit_length()` / `bit_count()` calls in such
+    // a graph.  Retargeting them to the interpreter-facing residual wrappers
+    // would add `jit_publish_exception(PyError(...).to_exc_object())` and its
+    // GC write barrier to a source graph where upstream carries only the
+    // ordinary OverflowError control-flow edge.  That false write then makes
+    // an enclosing elidable bigint helper fail `getcalldescr` with
+    // EF_RANDOM_EFFECTS.  Trace-visible callers still need the residual ABI,
+    // so only the effect-analysis body of an opaque caller declines it.
+    if inside_dont_look_inside && matches!(leaf, "bit_length" | "bit_count") {
+        return None;
+    }
     let (module, residual, result) = match leaf {
         "get_sign" => (
             RESIDUAL_MODULE.as_slice(),
@@ -506,7 +522,7 @@ mod tests {
     #[test]
     fn maps_scalar_queries_with_their_result_bank() {
         assert_eq!(
-            scalar_residual_for_method("get_sign"),
+            scalar_residual_for_method("get_sign", false),
             Some((
                 segs(&[
                     crate::runtime_names::crates::OBJECT,
@@ -517,7 +533,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            scalar_residual_for_method("is_zero"),
+            scalar_residual_for_method("is_zero", false),
             Some((
                 segs(&[
                     crate::runtime_names::crates::OBJECT,
@@ -528,7 +544,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            scalar_residual_for_method("bit_length"),
+            scalar_residual_for_method("bit_length", false),
             Some((
                 segs(&[
                     crate::runtime_names::crates::INTERPRETER,
@@ -539,7 +555,10 @@ mod tests {
                 ScalarResult::Int
             ))
         );
-        assert!(scalar_residual_for_method("add").is_none());
+        assert_eq!(scalar_residual_for_method("bit_length", true), None);
+        assert_eq!(scalar_residual_for_method("bit_count", true), None);
+        assert!(scalar_residual_for_method("get_sign", true).is_some());
+        assert!(scalar_residual_for_method("add", false).is_none());
     }
 
     #[test]

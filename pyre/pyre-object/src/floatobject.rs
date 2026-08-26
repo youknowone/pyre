@@ -141,33 +141,27 @@ pub unsafe fn w_float_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Address of `W_FloatObject::w_slots` for the shared slot helpers.
-///
-/// # Safety
-/// `obj` must point to a valid `W_FloatObject`.
-unsafe fn float_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_FloatObject)).w_slots }
-}
-
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { crate::slots::slot_get(obj, index, float_slots_field) }
+    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
 }
 
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { crate::slots::slot_set(obj, index, value, float_slots_field) }
+    crate::slot_set_direct!(obj, index, value, W_FloatObject, w_slots)
 }
 
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_float_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { crate::slots::slot_del(obj, index, float_slots_field) }
+    let slots = unsafe { (*(obj as *const W_FloatObject)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 #[majit_macros::dont_look_inside]

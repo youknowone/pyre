@@ -12,7 +12,7 @@ use majit_translate::{
         llbc_hints::harvest_hints_from_llbcs,
         mir::{
             build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
+            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
         },
     },
     model::{CallTarget, OpKind, ValueType},
@@ -56,6 +56,40 @@ fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
         Llbc::load(RLIB_LLBC).expect("load majit-rlib.ullbc"),
         Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"),
     ])
+}
+
+#[test]
+fn as_double_effect_graph_keeps_upstream_bit_length_call() {
+    let Some(llbcs) = load_rbigint_llbcs() else {
+        return;
+    };
+    let graph = lower_function(&llbcs[0], "rbigint::_AsDouble")
+        .or_else(|_| lower_function(&llbcs[0], "_AsDouble"))
+        .expect("lower rbigint::_AsDouble");
+    let calls: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } => segments.last().cloned(),
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        calls.iter().any(|name| name == "bit_length"),
+        "_AsDouble must retain upstream RBigInt::bit_length for effect analysis: {calls:?}",
+    );
+    assert!(
+        calls.iter().all(|name| name != "jit_bigint_bit_length"),
+        "_AsDouble must not acquire the interpreter exception-publishing wrapper: {calls:?}",
+    );
 }
 
 fn assert_source_order(source: &str, fragments: &[&str]) {

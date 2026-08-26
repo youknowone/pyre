@@ -405,6 +405,33 @@ pub fn get_eval_fn() -> EvalFn {
     }
 }
 
+/// Execute a newly-created frame through the process-selected evaluator using
+/// the one-word residual ABI.
+///
+/// PyPy's translated `Function.call_args` calls `new_frame.run()` directly;
+/// pyre's lower interpreter crate instead receives the JIT-aware evaluator
+/// through [`EVAL_OVERRIDE`]. That dependency seam is host plumbing, not a
+/// source-level PBC. Keep it opaque to the translated caller and publish the
+/// ordinary result/exception split through the same pending-error channel as
+/// the other bare-`PyObjectRef` call boundaries.
+///
+/// The native helper may enter `eval_with_jit`, and therefore the portal,
+/// while executing a residual call. This is the RPython
+/// `cpu.bh_call_r(translated_func, ...)` behavior: residual means opaque to
+/// the enclosing trace, not that nested translated execution has its JIT
+/// disabled.
+#[majit_macros::dont_look_inside]
+pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
+    clear_call_error();
+    match get_eval_fn()(frame, None) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
+
 // ── JIT parameter injection ──────────────────────────────────────
 //
 // `pypy/interpreter/executioncontext.py settrace` invokes
@@ -947,7 +974,12 @@ pub fn call_user_function_with_ctx(
     };
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    get_eval_fn()(&mut func_frame, None)
+    let result = eval_current_frame_raw(&mut func_frame);
+    if result.is_null() {
+        Err(take_call_error().unwrap_or_else(|| crate::PyError::value_error("call failed")))
+    } else {
+        Ok(result)
+    }
 }
 
 /// Call a user function with pre-resolved args (scope already packed by

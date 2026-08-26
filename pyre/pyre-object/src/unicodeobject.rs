@@ -589,7 +589,8 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { crate::slots::slot_get(obj, index, str_slots_field) }
+    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
 }
 
 /// Write one app-level `__slots__` entry on a `str` subclass.
@@ -597,7 +598,7 @@ pub unsafe fn w_str_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectR
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { crate::slots::slot_set(obj, index, value, str_slots_field) }
+    crate::slot_set_direct!(obj, index, value, W_UnicodeObject, w_slots)
 }
 
 /// Clear one app-level `__slots__` entry on a `str` subclass.
@@ -605,15 +606,8 @@ pub unsafe fn w_str_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef)
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_str_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { crate::slots::slot_del(obj, index, str_slots_field) }
-}
-
-/// Address of `W_UnicodeObject::w_slots` for the shared slot helpers.
-///
-/// # Safety
-/// `obj` must point to a valid `W_UnicodeObject`.
-unsafe fn str_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_UnicodeObject)).w_slots }
+    let slots = unsafe { (*(obj as *const W_UnicodeObject)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 /// FNV-1a over the key bytes, the digest the type-lookup method cache already

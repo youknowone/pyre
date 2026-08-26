@@ -563,7 +563,7 @@ pub mod deque_rev_iter {
 fn extend_from_iterable(
     self_obj: PyObjectRef,
     iterable: PyObjectRef,
-    append: fn(PyObjectRef, PyObjectRef),
+    is_extend_right: bool,
 ) -> Result<(), crate::PyError> {
     let items = crate::builtins::collect_iterable(iterable)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -571,10 +571,17 @@ fn extend_from_iterable(
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let item_base = pyre_object::gc_roots::pin_roots(&items);
     for index in 0..items.len() {
-        append(
-            pyre_object::gc_roots::shadow_stack_get(deque_slot),
-            pyre_object::gc_roots::shadow_stack_get(item_base + index),
-        );
+        let deque = pyre_object::gc_roots::shadow_stack_get(deque_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
+        // interp_deque.py:_extend keeps `is_extend_right` as the green
+        // direction and performs the direct append/appendleft dispatch in
+        // the loop.  Preserve that shape instead of passing a Rust function
+        // pointer, which invents an indirect call that RPython never has.
+        if is_extend_right {
+            append_right(deque, item);
+        } else {
+            append_left(deque, item);
+        }
     }
     Ok(())
 }
@@ -963,7 +970,7 @@ impl W_Deque {
             clear_blocks(self_obj);
         }
         if let Some(it) = iterable {
-            extend_from_iterable(self_obj, it, append_right)?;
+            extend_from_iterable(self_obj, it, true)?;
         }
         Ok(())
     }
@@ -989,13 +996,13 @@ impl W_Deque {
     }
     fn extend(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        extend_from_iterable(self_obj, iterable, append_right)
+        extend_from_iterable(self_obj, iterable, true)
     }
     fn extendleft(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         // Each element is appended on the left, so the result is
         // the reverse of `iterable`.
-        extend_from_iterable(self_obj, iterable, append_left)
+        extend_from_iterable(self_obj, iterable, false)
     }
     fn count(&self, x: PyObjectRef) -> Result<i64, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;

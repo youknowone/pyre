@@ -1801,6 +1801,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::bump_frame_entry_count",
         crate::call::bump_frame_entry_count,
     );
+    p1(
+        &mut entries,
+        "pyre_interpreter::call::eval_current_frame_raw",
+        crate::call::eval_current_frame_raw,
+    );
     p0(
         &mut entries,
         "pyre_interpreter::call::py_recursion_depth",
