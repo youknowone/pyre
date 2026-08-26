@@ -835,6 +835,36 @@ pub fn state_is_readable() -> bool {
     !state_ns().is_null()
 }
 
+/// Publish the `State` by creating the module that owns it, for a startup that
+/// never imports `_warnings`.
+///
+/// `moduledef.py setup_after_space_initialization` runs for every space, so
+/// upstream's `space.fromcache(State)` is populated before any code runs.
+/// pyre publishes it from this module's own init, which makes it depend on
+/// something importing `_warnings`.  The native startup does, through the
+/// importlib bootstrap; a build that runs no bootstrap does not, and reaches
+/// user code with `sys.modules` holding `__main__` and `sys` alone — so every
+/// warning it raises takes the unfiltered stderr fallback, for the whole
+/// process rather than for the window the fallback was written for.
+///
+/// Goes through `create_builtin_module`, so the module lands in `sys.modules`
+/// and a later `import _warnings` binds this one.  A private second namespace
+/// would carry a second `filters` list, and the interpreter would keep
+/// matching against the one the application never touched.
+///
+/// Attempted once.  A failure leaves the State absent, which the caller
+/// already handles; retrying would pay a whole module init per warning.  The
+/// `extra_init` that publishes the State runs inside this call, so a warning
+/// raised from within it finds the flag already set and falls back instead of
+/// re-entering.
+pub fn install_state() {
+    static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let _ = crate::importing::create_builtin_module("_warnings", std::ptr::null());
+}
+
 /// `interp_warnings.do_warn` — the interpreter-level entry point.
 ///
 /// `category` must already be a `Warning` subclass; `_warnings.warn` runs
