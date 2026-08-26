@@ -5582,6 +5582,22 @@ pub fn invert(a: PyObjectRef) -> PyResult {
             crate::warn::warn_category_w(bool_invert_deprecation_text(), "DeprecationWarning", 2)?;
             return Ok(w_int_new(!int_value(a)));
         }
+        invert_inner(a)
+    }
+}
+
+/// [`invert`] past its `__invert__` override probe and its bool slot.
+///
+/// Split out so that a trace can descend this body rather than re-emit it by
+/// hand.  The two arms left behind are what stop such a descent: the probe's
+/// `needs_numeric_unaryop_dispatch` is `dont_look_inside` and is the second
+/// operation the body executes, and the bool slot's deprecation warning
+/// reaches `lookup_exc_class`.  A caller that has already proven an exact
+/// `int` receiver takes neither, so entering here records the integer arm
+/// alone.  Every other caller reaches this through [`invert`] and is
+/// unaffected.
+pub fn invert_inner(a: PyObjectRef) -> PyResult {
+    unsafe {
         if is_int(a) {
             return Ok(w_int_new(!int_value(a)));
         }
