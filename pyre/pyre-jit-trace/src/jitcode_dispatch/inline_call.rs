@@ -127,6 +127,9 @@ unsafe fn positional_defaults_for_inline(
 /// One keyword-only parameter's binding: the namespace slot's stored
 /// value-or-cell, and the value that unwraps to.
 struct KwonlyDefaultInline {
+    /// Where the entry sits in the mapping, kept so the emit can read it
+    /// again once the version marker is installed.
+    slot: usize,
     stored: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
 }
@@ -207,7 +210,11 @@ unsafe fn kwonly_defaults_for_inline(
         if value.is_null() {
             return None;
         }
-        out.push(KwonlyDefaultInline { stored, value });
+        out.push(KwonlyDefaultInline {
+            slot: cell_slot,
+            stored,
+            value,
+        });
     }
     Some(KwonlyDefaultsInline {
         mapping: dict,
@@ -5445,6 +5452,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // this epoch was invalidated, not which.
         walker_flush_guard_not_invalidated(ctx, op.pc)?;
         for (offset, kwonly) in resolved.values.into_iter().enumerate() {
+            // The resolve read this cell before the markers above stood, so a
+            // store from another thread in between bumped a version nothing
+            // was watching and owes no invalidation for it.  Ask the mapping
+            // again now that the watcher is installed: agreeing means the
+            // markers answer for what is about to be baked.
+            if crate::state::module_dict_cell_value_direct(resolved.mapping, kwonly.slot)
+                != Some(kwonly.stored)
+            {
+                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+            }
             let (value_op, _) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)?;
             callee_args[nparams + offset] = value_op;
         }
