@@ -14,7 +14,7 @@
 //!
 //! [`SourceProvider`]: crate::importing::SourceProvider
 
-use pyre_object::PyObjectRef;
+use pyre_object::{PyObjectRef, is_none};
 
 /// `S_IFREG` / `S_IFDIR` — the two file types the seam can tell apart.  It
 /// answers `is_dir` and a byte length and nothing else, so a symlink, a device
@@ -84,6 +84,39 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
     crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
 }
 
+/// `posix.listdir(path)` — the entry names the seam reports, in its order.
+///
+/// `os.listdir` defaults its argument to the current directory, which this
+/// target does not have; a call with no path is refused rather than answered
+/// about some invented one.
+fn listdir(w_path: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if w_path.is_null() || unsafe { is_none(w_path) } {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::ENOENT,
+            pyre_object::PY_NULL,
+        ));
+    }
+    let bytes = crate::gateway::fsencode_bytes_w(w_path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let path = std::path::Path::new(text.as_ref());
+    let entries = crate::importing::source_list_dir(path).map_err(|_| {
+        crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::ENOENT,
+            pyre_object::w_str_new(&text),
+        )
+    })?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names: Vec<PyObjectRef> = entries
+        .iter()
+        .map(|name| pyre_object::w_str_new(&name.to_string_lossy()))
+        .collect();
+    let first = pyre_object::gc_roots::pin_roots(&names);
+    let rooted = (0..names.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(first + index))
+        .collect();
+    Ok(pyre_object::w_list_new(rooted))
+}
+
 pub fn register_module(ns: PyObjectRef) {
     // `os._createenviron` reads this dict directly and wraps it, so `os.environ`
     // is a live view of it.  The guest is started with no environment — the
@@ -113,6 +146,28 @@ pub fn register_module(ns: PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "lstat",
             |args| stat(args.first().copied().unwrap_or(pyre_object::w_none())),
+            1,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "listdir",
+        crate::make_builtin_function_with_arity(
+            "listdir",
+            |args| listdir(args.first().copied().unwrap_or(pyre_object::PY_NULL)),
+            1,
+        ),
+    );
+    // `_bootstrap_external` reads `_os.fspath`, not `os.fspath`, so the
+    // pure-Python fallback `os.py` installs when `posix` lacks it does not
+    // stand in for the import machinery.  The protocol itself touches no
+    // filesystem, so both arms publish the one implementation.
+    crate::module_ns_store(
+        ns,
+        "fspath",
+        crate::make_builtin_function_with_arity(
+            "fspath",
+            |args| super::fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
     );

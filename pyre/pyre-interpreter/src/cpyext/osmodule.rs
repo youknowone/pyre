@@ -7,7 +7,7 @@ pub unsafe extern "C" fn PyOS_FSPath(path: *mut CPyObject) -> *mut CPyObject {
     let Some(path) = super::object::argument(path) else {
         return std::ptr::null_mut();
     };
-    super::object::result(crate::module::posix::interp_posix::fspath(path))
+    super::object::result(crate::module::posix::fspath(path))
 }
 
 pub(super) fn ensure_linked() {

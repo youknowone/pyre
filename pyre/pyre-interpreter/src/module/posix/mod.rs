@@ -98,3 +98,74 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
         ) as usize
     }) as PyObjectRef
 }
+
+/// `posix_fspath` / `PyOS_FSPath` — `str` and `bytes` pass through unchanged
+/// (the protocol's identity case); any other object has `type(path).__fspath__`
+/// bound before it is called.
+pub(crate) fn fspath(
+    arg: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    // `str` and `bytes` only — a `bytearray` is a readable buffer and not a
+    // path, so it goes on to be rejected below.
+    unsafe {
+        if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes(arg) {
+            return Ok(arg);
+        }
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let arg = pyre_object::gc_roots::pin_root(arg);
+    let path_type = crate::typedef::r#type(arg);
+    if let Some(pt) = path_type
+        && let Some(fspath_descr) =
+            unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
+    {
+        let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(fspath_descr);
+        // PyPy's `interp_posix._fspath` binds `__fspath__` before calling it;
+        // a non-descriptor is its own value.
+        let fspath_fn = unsafe {
+            crate::baseobjspace::get(
+                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
+                pt.as_ptr(),
+            )?
+        }
+        .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
+        let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+        // A `None` left on the type switches the protocol off the way
+        // `__hash__ = None` does, so the object is turned away as not
+        // path-like and named by its own type.  `_fspath` instead calls what
+        // it found, which reports `NoneType` as not callable.
+        if unsafe { pyre_object::is_none(fspath_fn) } {
+            return Err(crate::PyError::type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                crate::gateway::short_type_name(arg)
+            )));
+        }
+        pyre_object::gc_roots::shadow_stack_set(fspath_slot, fspath_fn);
+        let result = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+            &[],
+        )?;
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        let result = pyre_object::gc_roots::pin_root(result);
+        // The protocol is only satisfied by what a path can be, so an answer
+        // that is neither names the object that gave it and the type it gave.
+        if unsafe { pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result) } {
+            return Ok(result);
+        }
+        return Err(crate::PyError::type_error(format!(
+            "expected {}.__fspath__() to return str or bytes, not {}",
+            crate::gateway::short_type_name(pyre_object::gc_roots::shadow_stack_get(arg_slot)),
+            crate::gateway::short_type_name(result)
+        )));
+    }
+    let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+    let error = crate::PyError::type_error(format!(
+        "expected str, bytes or os.PathLike object, not {}",
+        crate::gateway::short_type_name(arg)
+    ));
+    drop(roots);
+    Err(error)
+}

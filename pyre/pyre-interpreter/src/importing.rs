@@ -126,6 +126,20 @@ pub trait SourceProvider: Send + Sync {
     fn file_size(&self, path: &Path) -> std::io::Result<u64> {
         Ok(self.read_to_bytes(path)?.len() as u64)
     }
+    /// Entry names of the directory at `path`, in the order the seam reports
+    /// them.
+    ///
+    /// Defaults to refusing: enumeration is the one filesystem question a
+    /// provider built to answer `import`'s probes need not be able to answer,
+    /// and `posix.listdir` turns the refusal into the OSError its caller
+    /// expects rather than inventing an empty directory.
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this source provider cannot list a directory",
+        ))
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -175,6 +189,11 @@ pub fn source_is_dir(path: &Path) -> bool {
 #[cfg(feature = "host_env")]
 pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
     with_source_provider(|p| p.file_size(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    with_source_provider(|p| p.list_dir(path))
 }
 
 /// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
@@ -238,6 +257,11 @@ impl SourceProvider for HostFsProvider {
     }
     fn file_size(&self, path: &Path) -> std::io::Result<u64> {
         host_fs::metadata(path).map(|meta| meta.len())
+    }
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        host_fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect()
     }
 }
 

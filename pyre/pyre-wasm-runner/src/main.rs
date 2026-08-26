@@ -1717,6 +1717,16 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
          buf_cap: u32|
          -> i64 { host_read(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
     )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_list_dir",
+        |mut caller: Caller<'_, Host>,
+         path_ptr: u32,
+         path_len: u32,
+         buf_ptr: u32,
+         buf_cap: u32|
+         -> i64 { host_list_dir(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
+    )?;
 
     Ok(linker)
 }
@@ -1774,6 +1784,51 @@ fn host_read(
         return -1;
     }
     n as i64
+}
+
+/// `pyre_host.host_list_dir`: write the host directory's entry names into the
+/// wasm buffer, NUL-separated, and answer the whole list's byte length.
+///
+/// The length is reported whether or not it fitted, so an undersized buffer is
+/// a retry rather than a truncation — the same protocol `host_stdlib_root`
+/// uses. A name with no UTF-8 spelling is skipped: the guest addresses the
+/// host through `String` paths and could not name it back.
+fn host_list_dir(
+    caller: &mut Caller<'_, Host>,
+    path_ptr: u32,
+    path_len: u32,
+    buf_ptr: u32,
+    buf_cap: u32,
+) -> i64 {
+    let Some(path) = host_path(caller, path_ptr, path_len) else {
+        return -1;
+    };
+    let Ok(entries) = std::fs::read_dir(&path) else {
+        return -1;
+    };
+    let mut packed: Vec<u8> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !packed.is_empty() {
+            packed.push(0);
+        }
+        packed.extend_from_slice(name.as_bytes());
+    }
+    if packed.len() > buf_cap as usize {
+        return packed.len() as i64;
+    }
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    if memory
+        .write(&mut *caller, buf_ptr as usize, &packed)
+        .is_err()
+    {
+        return -1;
+    }
+    packed.len() as i64
 }
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main

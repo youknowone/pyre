@@ -272,6 +272,12 @@ mod host_fs_provider {
         /// Read the file at `path` into `[buf, buf+cap)`; return bytes written
         /// (clamped to `cap`), or -1 on error.
         fn host_read(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32) -> i64;
+        /// Write the directory's entry names into `[buf, buf+cap)`,
+        /// NUL-separated, and return the whole list's byte length (without
+        /// writing if it exceeds `cap`), or -1 if `path` is not a readable
+        /// directory.
+        fn host_list_dir(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32)
+        -> i64;
     }
 
     struct HostFsProvider;
@@ -295,6 +301,44 @@ mod host_fs_provider {
         fn is_dir(&self, path: &Path) -> bool {
             let p = path.to_string_lossy();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
+        }
+        fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+            let p = path.to_string_lossy();
+            let size = unsafe { host_list_dir(p.as_ptr(), p.len() as u32, [].as_mut_ptr(), 0) };
+            if size < 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}", path.display()),
+                ));
+            }
+            let mut buf = vec![0u8; size as usize];
+            // The sizing call above and this one are two separate host reads of
+            // the same directory, so a name added between them would not fit.
+            // A short second answer is the whole list; a longer one is a
+            // directory that grew, and the names that did fit are still a
+            // valid answer for the moment it was asked.
+            let n = unsafe {
+                host_list_dir(
+                    p.as_ptr(),
+                    p.len() as u32,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::other(format!(
+                    "host_list_dir failed: {}",
+                    path.display()
+                )));
+            }
+            buf.truncate((n as usize).min(buf.len()));
+            if buf.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(buf
+                .split(|byte| *byte == 0)
+                .map(|name| std::ffi::OsString::from(String::from_utf8_lossy(name).into_owned()))
+                .collect())
         }
         fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             let p = path.to_string_lossy();
