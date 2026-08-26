@@ -232,7 +232,7 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (72): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (73): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -250,7 +250,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_FBW_STRICT_DIAG`,
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
-`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
+`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
+`PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
 `PYRE_LOOP_CENSUS`,
