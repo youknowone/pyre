@@ -229,7 +229,7 @@ fn objects_over_the_large_object_threshold_are_bounded_too() {
     // nothing to do with `--heapsize`.
     let control = run_shape(&[], &[], ROUNDS_LARGE, WORDS_LARGE);
     assert!(
-        String::from_utf8_lossy(&control.stdout).contains("completed"),
+        control.status.success() && String::from_utf8_lossy(&control.stdout).contains("completed"),
         "{}",
         report("large objects, unbounded control did not finish", &control)
     );
