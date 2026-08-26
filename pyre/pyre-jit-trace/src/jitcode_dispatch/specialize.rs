@@ -2550,7 +2550,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 /// A slot the shadow cannot answer declines the whole write-back, and with it
 /// the fold, leaving the residual force in place.  The validation pass runs
 /// before the first emission, so a decline emits nothing.
-fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
+pub(crate) fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_op: OpRef,
     concrete_frame: usize,

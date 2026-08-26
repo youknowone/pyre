@@ -1789,6 +1789,94 @@ fn report_post_residual_shadow<Sym: WalkSym>(
     }
 }
 
+/// The frame a residual argument gives a live view of, following the one
+/// wrapper a bound read puts in the way.
+///
+/// `p["x"]` hands the proxy to the residual directly, but `p.get("x")` binds
+/// the method first and the CALL then carries a `Method` whose `__self__` is
+/// the proxy.  Nothing deeper is followed: a wrapper that hides the receiver
+/// from the residual's own arguments hides it from the compiled call too.
+fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
+    use pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame;
+    if let Some(frame) = viewed_frame(obj) {
+        return Some(frame);
+    }
+    let receiver = unsafe { pyre_object::is_method(obj) }
+        .then(|| unsafe { pyre_object::w_method_get_self(obj) })
+        .filter(|recv| !recv.is_null())?;
+    viewed_frame(receiver)
+}
+
+/// Write the traced frame's locals region out before a residual that reads it
+/// through a live `FrameLocalsProxy`.
+///
+/// The proxy reads the frame's ARRAY, while a recording walk holds those locals
+/// in the virtualizable's boxes.  The `f_locals` getter fold already writes the
+/// region out when it hands a proxy over
+/// (`specialize.rs walker_write_back_standard_frame_locals`), but a proxy is a
+/// live view and outlives that write: bind one before a loop the JIT afterwards
+/// compiles and every later read answers with what the local held at the bind.
+/// Measured at `N=4000`, `p = f_locals` outside the loop and `p["x"]` in the
+/// body reads 1041 -- the compile threshold -- where the same read spelled
+/// `sys._getframe(0).f_locals["x"]`, which re-enters the fold each iteration,
+/// reads 3999.
+///
+/// A force at the read accessor is the shape this does NOT take, and
+/// `PyFrame::force_locals` records why: `hook_access_field` runs in residual
+/// code while a trace redirects the same accesses to the shadow, so forcing on
+/// every read forces the traced ones too and aborts the loop.  The write-back
+/// is not a force -- it is a mirror onto the concrete frame plus the same store
+/// into the trace, and none of its ops can reach `force_frame`.
+///
+/// Scoped to the standard virtualizable, gated on BOTH its red box and its
+/// concrete pointer, exactly as the getter fold gates itself.  A proxy onto any
+/// other frame is left alone: that frame's locals are in its own array already.
+///
+/// Every spelling of the read reaches the array through a residual that carries
+/// the proxy itself -- `p["x"]`, `len(p)`, `dict(p)`, and a helper the proxy is
+/// passed to, whose own subscript is the residual that carries it -- with one
+/// exception: `p.get("x")` binds `get` first, so the CALL sees a `Method` and
+/// the proxy only as its receiver.  [`proxy_viewed_frame`] takes that hop.
+///
+/// Called beside `vable_and_vrefs_before_residual_call`, which is the only
+/// point that satisfies the ordering: the dispatchers `record_op_with_descr`
+/// the CALL and only then hand it to
+/// [`try_execute_residual_call_via_executor`], so anything emitted from inside
+/// the executor lands AFTER the call in the trace.  Measured with the stores
+/// there, the walk still answered correctly -- the concrete mirror runs at
+/// record time either way -- while the compiled loop read what the PREVIOUS
+/// iteration's stores had left: `p["x"]` in a `x = i` body reported a lag of
+/// one on 1479 of the 2958 iterations past the compile point on dynasm, and
+/// none on cranelift.  Emitted here the stores sit between the token store and
+/// the call, where the residual reads them.
+fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) {
+    let (Some(frame_box), Some(frame_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) else {
+        return;
+    };
+    let mut reads_traced_frame = false;
+    for &arg in allboxes {
+        let Some(obj) = walker_concrete_ref_object(ctx, arg) else {
+            continue;
+        };
+        if proxy_viewed_frame(obj).is_some_and(|frame| frame as usize == frame_ptr) {
+            reads_traced_frame = true;
+            break;
+        }
+    }
+    if reads_traced_frame {
+        // A decline writes nothing and leaves the read as it is today.
+        let _ = crate::jitcode_dispatch::specialize::walker_write_back_standard_frame_locals(
+            ctx, frame_box, frame_ptr,
+        );
+    }
+}
+
 /// Adopt into the walk the fastlocals a residual wrote to the live frame.
 ///
 /// The walk holds each local as a box and reads it straight out of the
@@ -7067,6 +7155,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // split rationale.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         // pyjitpl.py `execute_and_record_varargs`; may-force
@@ -8390,6 +8479,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // walkthrough.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         if matches!(
@@ -8629,6 +8719,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // walkthrough.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         if matches!(

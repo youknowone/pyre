@@ -80,6 +80,17 @@ pub mod frame_locals_proxy {
         w_frame: PyObjectRef,
     }
 
+    /// The frame `obj` is a live proxy onto, or `None` for anything else.
+    ///
+    /// The proxy reads the frame's array lazily rather than copying out of it,
+    /// so a reader has to know whether the frame behind it is one whose locals
+    /// currently live somewhere else -- a virtualizable's boxes while a trace
+    /// is recording. Only the walker asks; the interpreter always reads the
+    /// array it writes.
+    pub fn viewed_frame(obj: PyObjectRef) -> Option<PyObjectRef> {
+        unsafe { FrameLocalsProxy::from_obj(obj) }.map(|proxy| proxy.w_frame)
+    }
+
     impl FrameLocalsProxy {
         #[inline]
         fn frame(&self) -> &mut PyFrame {
