@@ -1389,6 +1389,9 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             ));
         }
         let i = getindex_w(index)?;
+        // `memory_ass_sub`: `__index__` is arbitrary Python code and may have
+        // released this view before the offset reads its geometry (gh-92888).
+        memoryview_check_released(mv)?;
         let item_offset = memoryview_get_offset(mv, 0, i)?;
         let packed = memoryview_pack_value(&fmt, isz, value)?;
         // Re-check release after value coercion (see tuple path above).
