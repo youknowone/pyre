@@ -16170,12 +16170,17 @@ fn fileio_method_dealloc_warn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         .copied()
         .ok_or_else(|| crate::PyError::type_error("_dealloc_warn() requires self"))?;
     if !file_is_closed(self_obj) && file_closefd(self_obj) && file_get_fd(self_obj).is_some() {
-        let source = args.get(1).copied().unwrap_or(self_obj);
-        let repr = unsafe { crate::display::py_repr_wtf8(source)? };
-        crate::warn::warn_category(
+        let _roots = pyre_object::gc_roots::push_roots();
+        let source =
+            crate::module::_warnings::pin_root_slot(args.get(1).copied().unwrap_or(self_obj));
+        let repr = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(source))?
+        };
+        crate::warn::warn_category_source(
             &format!("unclosed file {}", repr.to_string_lossy()),
             "ResourceWarning",
             1,
+            pyre_object::gc_roots::shadow_stack_get(source),
         )?;
     }
     Ok(w_none())

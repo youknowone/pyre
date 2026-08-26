@@ -6270,7 +6270,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
             Err(_) => "unclosed scandir iterator".to_string(),
         };
-        if let Err(mut error) = crate::warn::warn_category(&message, "ResourceWarning", 1) {
+        if let Err(mut error) =
+            crate::warn::warn_category_source(&message, "ResourceWarning", 1, self_obj)
+        {
             // `W_ScandirIterator._finalize_` reports a warning promoted to an
             // error as unraisable because finalization cannot propagate it.
             error.write_unraisable(

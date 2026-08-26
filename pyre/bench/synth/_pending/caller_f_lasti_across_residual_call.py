@@ -84,6 +84,95 @@
 #     caller-frame-read-from-inside-a-callee receiver, so it is not in play.
 #   * OptHeap eliding the publish: it keeps and hoists the store.
 #
+# ===== 2026-08-25: THE WRONG VALUE IS NOT AN INSTRUCTION AT ALL =====
+#
+# Re-measured after the rebase onto `b9c76982bd6`; the defect is unchanged on
+# both backends, and CPython names the correct answer:
+#
+#   pyre     f_lasti values: [(52, 11074), (58, 8926)]   FAIL
+#   cpython  f_lasti values: [(52, 20000)]               PASS
+#
+# `dis` on `main()` places `CALL` at offset 52 and the next real instruction,
+# `STORE_FAST`, at 60.  So the CALL owns 52..59 -- three cache entries at 54,
+# 56, 58 -- and the wrong answer 58 is the CALL's LAST CACHE SLOT.  It is not a
+# rival instruction offset; it is not an instruction boundary at all.
+#
+# That reframes where the fix can go.  Every refuted line above targets the
+# WRITER or the record ORDER.  The reader was never examined, and CPython holds
+# an invariant the reader currently breaks: `f_lasti` always names an
+# instruction (`_PyInterpreterFrame_LASTI` is derived from `instr_ptr`), never a
+# cache slot.  Snapping a stored `last_instr` that lands inside an instruction's
+# cache region back to its owning instruction turns 58 into 52 -- the measured
+# correct answer -- and touches no resume consumer, because the blackhole and
+# the vable sync read the field directly, not through the getset.
+#
+# The getter is `pyframe.rs` `fget_f_lasti` (returns `self.last_instr` bare,
+# mirroring `pyframe.py fget_f_lasti`), scaled by 2 at `typedef.rs:8222`.
+#
+# !! The open design question is WHICH side owns the conversion, and it is a
+# real one, not a formality.  The stored value is deliberately a RESUME
+# coordinate (`resume_snapshot.rs:680` and `:2624`, both `pc - 1`, with a
+# comment saying a stale one makes a guard resume at the loop header).  Upstream
+# PyPy has no adaptive caches, so its one convention is unambiguous; 3.14's
+# adaptive bytecode is what splits it.  A reader-side snap keeps every resume
+# consumer untouched but leaves two conventions in one slot; a writer-side fix
+# has to satisfy the resume path first and is what the eight refutations above
+# kept failing to do.  Measure before choosing -- and note the snap has NOT been
+# implemented or tested, only shown to produce the right number by hand.
+#
+# ===== 2026-08-25: THE READER-SIDE SNAP IS REFUTED =====
+#
+# The section above left "which side owns the conversion" open and leaned
+# reader-side.  Do not implement it.  A snap inside `fget_f_lasti` breaks two
+# gated fixtures by construction, because the getset is NOT the only producer
+# of a Python-visible `f_lasti`:
+#
+#   * COMPILED code answers the read from `try_walker_specialize_frame_lasti`,
+#     which emits a trace constant `py_pc as i64 * 2` (`specialize.rs`) without
+#     going near `fget_f_lasti` (`pyframe.rs`, one caller, `typedef.rs:8222`).
+#     `bench/synth/frame_lasti_fold_callee_and_bridge` asserts `len(seen) == 1`
+#     across BOTH channels, so snapping one of them makes the two disagree
+#     wherever the raw value is already an instruction -- which is everywhere
+#     except this defect.
+#   * `tb_lasti` is minted from the RAW word: `pytraceback.rs` stores
+#     `last_instruction * 2` verbatim.  `traceback_inlined_callee_lasti_regression`
+#     (:41, :77-81) and `frame_lasti_fold_foreign_frames` (:48, :65-68) both
+#     assert `f_lasti == tb_lasti`, so a snap on one side alone breaks them.
+#   * upstream reads through the getset and needs it raw
+#     (`pypy/interpreter/pyframe.py:675`).
+#
+# A SECOND OBSERVABLE BREAK, not yet exercised by any fixture: a cache-region
+# `last_instr` also makes `frame.f_lineno = N` fail with "can't jump from
+# unreachable code".  `mark_stacks` steps `i + cache_entries + 1`
+# (`pyframe.rs:2238-2239`), so every cache index keeps `MARK_UNINITIALIZED`
+# (`:2029`) and `fset_f_lineno` indexes one of them.  CPython cannot hit this:
+# `TARGET(CALL)` sets `frame->instr_ptr = next_instr` BEFORE `next_instr += 4`,
+# so `_PyInterpreterFrame_LASTI` names the CALL for the callee's whole lifetime
+# and `frame_lineno_set` indexes `stacks[...]` with no snapping at all.  That is
+# the invariant this defect violates, and it says the fix belongs at the WRITER.
+#
+# But the narrow writer change -- "store the CALL's own index" -- is also wrong:
+# the stored value has an exact `+1` inverse applied by every resume consumer
+# (`pyframe.rs:5014` `next_instr() = last_instr + 1`, `eval.rs:12971`
+# `vable_ni = value + 1`), and that derived coordinate becomes `resume_pc`
+# (`eval.rs:12452`), the frame's re-entry point (`call_jit.rs:3522`), the bridge
+# walk's `start_pc`/`lasti_pc` (`trace.rs:1160-1183`) and the green/decline key
+# (`trace.rs:3620-3623`).  Storing `CALL` would make all of those resume at the
+# CALL's FIRST cache word.  It moves the defect onto the resume path.
+#
+# So the honest scope: of 33 field-read sites, only three want the resume
+# coordinate (`PyFrame::next_instr()`, `resume_execute_frame`, and the opaque
+# save/restore pairs); every other reader wants the executing instruction.  A
+# real fix makes `next_instr()` cache-aware and moves the whole `pc - 1` writer
+# family (`state.rs:5728/5744/5929/6249/6442` plus the two `resume_snapshot.rs`
+# sites) and the interpreter's own `set_last_instr_from_next_instr(opcode_pc + 1)`
+# round trip (`pyre-interpreter/src/eval.rs:2338`) together.  There is also no
+# backward helper to build on: `skip_python_trivia_forward` (`diag.rs:254`),
+# `semantic_fallthrough_pc` (`pyjitpl.rs:19`) and all three `skip_caches` copies
+# walk FORWARD, and `decode_instruction_at` backs up over `ExtendedArg` only.
+#
+# That is an epic, not a fix.  Leave the defect filed.
+#
 # NOT the same defect as `_pending/loop_callee_for_header_resume.py`, though it
 # is the same field: there the triple `(last_instr, valuestackdepth, cells)` is
 # torn at a resume; here nothing resumes, a live reader just reads the field.

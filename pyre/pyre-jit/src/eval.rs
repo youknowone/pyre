@@ -4510,6 +4510,7 @@ fn build_gc() -> Box<MiniMarkGC> {
              next collection. Register each in build_gc: {unregistered:?}",
         );
     }
+
     // rclass.py — assign subclassrange_{min,max} to each
     // vtable entry. freeze_types() runs assign_inheritance_ids
     // (normalizecalls.py:373-389), then we write the computed ranges
@@ -11506,8 +11507,14 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let vtable = descr.vtable();
     let bh_descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        // `descr.py` cache identity via `SizeDescr.cache_key()`.
-        type_id: descr.cache_key(),
+        // `resolve_gc_tid`'s producer contract: `allocate_with_vtable` widens
+        // the descr's own dense tid into the slot rather than serializing the
+        // `cache_key`, so the header the block gets is the layout the block
+        // was sized for.  The `BlackholeAllocator::allocate_with_vtable`
+        // sibling already does this; routing through the keyed cache instead
+        // resolves whatever group holds this descr's key — and a descr minted
+        // without one (`make_size_descr_with_vtable`) carries key 0.
+        type_id: descr.type_id() as u64,
         vtable: vtable as u64,
         owner: String::new(),
         all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),

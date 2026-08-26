@@ -776,6 +776,34 @@ fn build_object_descr_group_with_def_path(
         def_path,
         &[],
         &[],
+        "",
+    )
+}
+
+/// [`build_object_descr_group_with_def_path`] for a STRUCT that must stay out
+/// of BOTH name registries — one whose per-instance vtable differs while the
+/// layout does not, so a shared name slot would be first-write-wins and lose
+/// the other vtables — yet still needs a `gc_cache._cache_size` identity.
+/// `cache_key_name` supplies that identity directly; without it the group
+/// lands on the no-identity key and its `type_id` becomes the header tid for
+/// every keyless struct the blackhole and resume paths allocate.
+fn build_object_descr_group_keyed_only(
+    obj_size: usize,
+    type_id: u32,
+    vtable: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    cache_key_name: &str,
+) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_extra_gc_edges(
+        obj_size,
+        type_id,
+        vtable,
+        fields,
+        "",
+        "",
+        &[],
+        &[],
+        cache_key_name,
     )
 }
 
@@ -797,6 +825,7 @@ fn build_object_descr_group_with_field_indices(
         def_path,
         &[],
         field_indices,
+        "",
     )
 }
 
@@ -816,8 +845,17 @@ fn build_object_descr_group_with_extra_gc_edges(
     def_path: &str,
     extra_gc_edges: &[Arc<dyn FieldDescr>],
     field_indices: &[u32],
+    cache_key_name: &str,
 ) -> PyreObjectDescrGroup {
-    let cache_key = if !def_path.is_empty() {
+    // `cache_key_name` names the `gc_cache._cache_size` STRUCT identity for a
+    // group that publishes under neither name registry.  Zero is the
+    // no-STRUCT-identity sentinel, not a key: a group keyed there collapses
+    // onto whichever no-name group is inserted first, and `resolve_gc_tid`
+    // then hands that group's `type_id` to every header write whose descr
+    // carries no key — stamping one STRUCT's tid on another STRUCT's block.
+    let cache_key = if !cache_key_name.is_empty() {
+        majit_ir::descr::path_hash(cache_key_name)
+    } else if !def_path.is_empty() {
         majit_ir::descr::path_hash(def_path)
     } else if !simple_name.is_empty() {
         majit_ir::descr::path_hash(simple_name)
@@ -2721,6 +2759,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         "pyframe::PyFrame",
         std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
         &[],
+        "",
     )
 });
 
@@ -4455,7 +4494,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// is written separately by the raise lowering; the remaining pointer slots
 /// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
-    build_object_descr_group_with_def_path(
+    build_object_descr_group_keyed_only(
         W_BASE_EXCEPTION_SIZE,
         W_BASE_EXCEPTION_GC_TYPE_ID,
         exc_kind_to_pytype(kind) as *const _ as usize,
@@ -4816,12 +4855,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        // Empty name: the per-kind vtable means a shared "W_BaseException"
-        // name-registry slot would be first-write-wins and lose the other
-        // kinds' vtables.  NewWithVtable embeds the SizeDescr in the op, so
-        // the name-registry publish is not needed here.
-        "",
-        "",
+        // Out of both name registries: the per-kind vtable means a shared
+        // "W_BaseException" name-registry slot would be first-write-wins and
+        // lose the other kinds' vtables.  NewWithVtable embeds the SizeDescr
+        // in the op, so the name-registry publish is not needed here.  The
+        // `_cache_size` identity is still required: `resolve_gc_tid` reads the
+        // header tid for a serialized `BhDescr` out of that slot, and every
+        // kind shares one layout and one `W_BASE_EXCEPTION_GC_TYPE_ID`, so one
+        // key for all of them is exactly the STRUCT identity they have.
+        "W_BaseException",
     )
 }
 
@@ -4920,7 +4962,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
     };
 
-    build_object_descr_group_with_def_path(
+    build_object_descr_group_keyed_only(
         PYTRACEBACK_OBJECT_SIZE,
         PYTRACEBACK_GC_TYPE_ID,
         &PYTRACEBACK_TYPE as *const _ as usize,
@@ -4980,8 +5022,10 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
         ],
-        "",
-        "",
+        // Out of both name registries, but the `_cache_size` STRUCT identity
+        // still has to be its own: sharing the no-identity key hands
+        // `PYTRACEBACK_GC_TYPE_ID` to every keyless struct header write.
+        "PyTraceback",
     )
 });
 
@@ -5317,6 +5361,43 @@ pub fn pyframe_flags_descr() -> DescrRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every group that stays out of both name registries still needs a
+    /// `gc_cache._cache_size` STRUCT identity.  Sharing the no-identity key
+    /// makes whichever group lands there the header tid for every keyless
+    /// struct the blackhole and resume paths allocate, so a 24-byte block gets
+    /// stamped `W_BASE_EXCEPTION_GC_TYPE_ID` and the collector then reads 36
+    /// GC offsets across its neighbours.
+    #[test]
+    fn name_registry_less_groups_still_carry_a_cache_size_identity() {
+        let (exception, ..) = w_exception_descrs(ExcKind::ValueError);
+        let exception = exception.as_size_descr().expect("exception SizeDescr");
+        assert_ne!(exception.cache_key(), 0);
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_struct_tid(exception.cache_key()),
+            Some(W_BASE_EXCEPTION_GC_TYPE_ID)
+        );
+
+        let traceback = pytraceback_size_descr();
+        let traceback = traceback.as_size_descr().expect("PyTraceback SizeDescr");
+        assert_ne!(traceback.cache_key(), 0);
+        assert_ne!(traceback.cache_key(), exception.cache_key());
+
+        // And neither of them may be reachable through the sentinel: that is
+        // the slot a serialized `BhDescr` with no key lands on.
+        let sentinel = majit_ir::descr::gc_cache()
+            .lock()
+            .expect("gc_cache poisoned")
+            .resolve_struct_tid(0);
+        assert_ne!(sentinel, Some(W_BASE_EXCEPTION_GC_TYPE_ID));
+        assert_ne!(
+            sentinel,
+            Some(pyre_interpreter::pytraceback::PYTRACEBACK_GC_TYPE_ID)
+        );
+    }
 
     #[test]
     fn native_user_mapdict_fields_replace_prepass_placeholder_indices() {
