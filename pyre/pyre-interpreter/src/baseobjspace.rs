@@ -112,7 +112,8 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 /// explicit full collection.
 #[majit_macros::dont_look_inside]
 pub fn clear_method_cache() {
-    let mut cache = METHOD_CACHE.lock();
+    // SAFETY: the GIL is held, and nothing here runs Python code.
+    let cache = unsafe { method_cache_mut() };
     for entry in cache.entries.iter_mut() {
         *entry = MethodCacheEntry::EMPTY;
     }
@@ -9728,21 +9729,46 @@ struct MethodCache {
     entries: Vec<MethodCacheEntry>,
 }
 
-// PyPy stores this cache on the shared object space. The mutex below protects
-// every probe, fill, clear, and GC-forwarding walk, so its raw object-pointer
-// slots are never accessed concurrently while the collector rewrites them.
+// PyPy stores this cache on the shared object space and takes no lock at all:
+// `space.fromcache(MethodCache)` is serialised by the GIL, which every path
+// that can reach a type lookup already holds. pyre holds that same GIL
+// (`rgil.rs`, the `RPY_FASTGIL` of thread_gil.c), so the GIL is the lock here
+// too — the treatment `gc_sync::gc_op` already gives the collector singleton.
 unsafe impl Send for MethodCache {}
+
+/// GIL-guarded home for the cache, so a probe is two array reads rather than
+/// an acquire/release CAS pair.
+struct MethodCacheCell(std::cell::UnsafeCell<MethodCache>);
+
+// SAFETY: every access goes through `method_cache_mut`, whose callers hold the
+// GIL, so the cell is never touched concurrently.
+unsafe impl Sync for MethodCacheCell {}
+
+/// Borrow the cache.
+///
+/// # Safety
+/// The caller holds the GIL, and must not keep the borrow alive across
+/// anything that can run Python code, allocate, or collect — the walk that
+/// fills a missed slot runs between two separate borrows for that reason.
+#[inline]
+unsafe fn method_cache_mut() -> &'static mut MethodCache {
+    debug_assert!(
+        !majit_gc::rgil::gil_is_initialized() || majit_gc::rgil::am_i_holding_the_gil(),
+        "the method cache is guarded by the GIL",
+    );
+    // SAFETY: the GIL excludes every other thread from reaching this cell.
+    unsafe { &mut *METHOD_CACHE.0.get() }
+}
 
 /// `space.config.objspace.std.methodcachesizeexp` default.
 const METHOD_CACHE_SIZE_EXP: u32 = 11;
 const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
 
-static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
-    std::sync::LazyLock::new(|| {
-        parking_lot::Mutex::new(MethodCache {
-            entries: vec![MethodCacheEntry::EMPTY; METHOD_CACHE_SIZE],
-        })
-    });
+static METHOD_CACHE: std::sync::LazyLock<MethodCacheCell> = std::sync::LazyLock::new(|| {
+    MethodCacheCell(std::cell::UnsafeCell::new(MethodCache {
+        entries: vec![MethodCacheEntry::EMPTY; METHOD_CACHE_SIZE],
+    }))
+});
 
 /// `typeobject.py` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
@@ -9953,7 +9979,8 @@ unsafe fn _cached_lookup_where_name(
     let h = method_hash(version_tag, name);
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
-        let cache = METHOD_CACHE.lock();
+        // SAFETY: the GIL is held and the borrow ends before the walk below.
+        let cache = unsafe { method_cache_mut() };
         let entry = &cache.entries[h];
         if entry.version == version_tag
             && entry
@@ -9975,7 +10002,8 @@ unsafe fn _cached_lookup_where_name(
     // Prebuilt-family store: the cache slot is reached only by
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    let mut cache = METHOD_CACHE.lock();
+    // SAFETY: the GIL is held; the walk above has already finished.
+    let cache = unsafe { method_cache_mut() };
     cache.entries[h] = MethodCacheEntry {
         version: version_tag,
         lookup_where: tup,
@@ -9999,7 +10027,8 @@ unsafe fn _cached_lookup_where_name(
 /// never by a relocating move, so the cache's *own* copy of each pointer
 /// must be forwarded here or a later hit would read a stale address.
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    let mut cache = METHOD_CACHE.lock();
+    // SAFETY: the collector runs with the GIL held and no lookup in progress.
+    let cache = unsafe { method_cache_mut() };
     for MethodCacheEntry {
         lookup_where: (w_class, w_value),
         ..
@@ -10101,9 +10130,8 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     // call ABI cannot pass a `&Wtf8`. The ordinary interpreter returned through
     // `_cached_lookup_where_name` above without materialising this wrapper.
     // This does not fold away after tracing: each lookup calls
-    // `box_str_constant` (the process-global `STRING_INTERN_TABLE` mutex) and
-    // `_pure_lookup_where_with_method_cache` (the process-global
-    // `METHOD_CACHE` mutex) once per lookup per iteration.
+    // `box_str_constant` (the process-global `STRING_INTERN_TABLE` mutex) once
+    // per lookup per iteration.
     let w_name = pyre_object::unicodeobject::box_str_constant(name);
     // typeobject.py — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);

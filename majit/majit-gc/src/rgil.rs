@@ -194,6 +194,18 @@ pub fn allocate() {
     );
 }
 
+/// Whether [`allocate`] has run, i.e. whether this process has a GIL at all.
+///
+/// A bootstrap step or a unit test that never starts the threading machinery
+/// runs with `RPY_WAITING_THREADS` still at thread_gil.c's `-42` marker, and is
+/// single-threaded by construction. Callers that assert "the GIL is my lock"
+/// use this to exempt that window without weakening the assertion for a process
+/// that does have threads.
+#[inline]
+pub fn gil_is_initialized() -> bool {
+    RPY_WAITING_THREADS.load(Ordering::Relaxed) != GIL_NOT_INITIALIZED
+}
+
 /// `rpy_init_mutexes` re-runs through `pthread_atfork` (thread_gil.c:105-107).
 /// Only the forking thread survives, so nothing can be waiting and the surviving
 /// holder's claim, if any, is restored by the caller.
