@@ -2410,6 +2410,15 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         return false;
     }
+    // A bounded heap has one `MemoryError` to give and aborts on the breach
+    // after it.  Reaching the stdlib renderer imports `traceback`, whose module
+    // body is a nested dispatch loop whose first safepoint collects over a heap
+    // already at its limit -- so the report this route exists to write is
+    // exactly what that abort takes away.  Declining leaves the built-in
+    // renderer below, which reaches stderr without running a module body.
+    if majit_gc::gc_max_heap_already_raised() {
+        return false;
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc_value);

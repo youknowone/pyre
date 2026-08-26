@@ -7071,6 +7071,13 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py `max_heap_size_already_raised`, read from outside this
+    /// module.  See `crate::gc_max_heap_already_raised` for what the answer is
+    /// used to decide.
+    pub fn max_heap_already_raised(&self) -> bool {
+        self.max_heap_size_already_raised
+    }
+
     /// incminimark.py `collect_step`.
     pub fn collect_step(&mut self) -> crate::GcStepTransition {
         let _stw = if crate::gc_sync::stw_required() {
