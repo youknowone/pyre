@@ -9218,6 +9218,16 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_wtf8_as_str(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `RBigInt::{one,zero}()` — a 0-arg constructor returning the
                 // translated one-GC-reference bigint. Emit the same constant
                 // through the pointer-ABI `rbigint.fromint` residual instead
@@ -14273,6 +14283,122 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// Lower `Wtf8::as_str() -> Result<&str, Utf8Error>` to the same
+    /// runtime-tagged aggregate a translated RPython validity test followed
+    /// by the string value would produce.
+    ///
+    /// PyPy's unicode value can carry lone surrogates, while the Rust host
+    /// API exposes that distinction through `Result`.  The validity decision
+    /// therefore remains a red residual scalar (`wtf8_key_is_utf8`), and only
+    /// the `Ok` payload is the identity string value.  Folding the whole call
+    /// to the receiver would incorrectly delete the lone-surrogate arm.
+    ///
+    /// This lowering is restricted to the current interpreter shape, whose
+    /// `Wtf8::as_str` callers inspect only the tag and the `Ok` string.  A
+    /// caller that consumes `Utf8Error` would require a separate
+    /// foreign-boundary port of `valid_up_to` / `error_len`; this adapter must
+    /// not be generalized to such a call site by pretending that payload has
+    /// an RPython layout.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_wtf8_as_str(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if segments != ["Wtf8", "as_str"] {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let Some(ok_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !tyref_strips_to_str(&ok_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(err_ty) = self.tyref_adt_type_arg(dest_ty, 1) else {
+            return Ok(false);
+        };
+        let err_is_utf8 = self
+            .tyref_adt_def_id(&err_ty)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path().ends_with("::Utf8Error"));
+        if !err_is_utf8 {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        let valid = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "dictmultiobject".to_string(),
+                        "wtf8_key_is_utf8".to_string(),
+                    ],
+                },
+                args: vec![arg.clone()],
+                result_ty: ValueType::Bool,
+            },
+        );
+        // Result convention is Ok=0 / Err=1.  Comparing the validity bool
+        // with False therefore has exactly the required integer tag while
+        // preserving the runtime arm.  This is the same flowspace shape as
+        // the ordinary Rust `!bool` lowering above: RPython has no logical
+        // `not` operation, because `UNARY_NOT` becomes a truth test plus a
+        // branch in `flowcontext.py`; a scalar negation is `eq(b, False)`.
+        let false_var = push_op(&mut self.graph, OpKind::ConstBool(false));
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: valid,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+        );
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate_typed(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            ValueType::Str,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
     /// Lower the infallible `usize::try_from(<u8|u16|u32>)`
     /// (`core::convert::num::ptr_try_from_impls::<Impl>::try_from`,
     /// Opaque in the LLBC like every core fn) to its decomposed
@@ -15091,6 +15217,33 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<(), LowerError> {
+        self.emit_tagged_pair_aggregate_typed(
+            mir_bb,
+            owner,
+            payload_owner,
+            disc,
+            payload,
+            ValueType::Int,
+            dest_local,
+            target,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn emit_tagged_pair_aggregate_typed(
+        &mut self,
+        mir_bb: usize,
+        owner: &str,
+        payload_owner: &str,
+        disc: Variable,
+        payload: Variable,
+        payload_ty: ValueType,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
         let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
         let ctor_name = owner_path.pop().unwrap_or_default();
@@ -15110,17 +15263,16 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Ref(Some(owner.to_string())),
             },
         });
-        // Both decomposed fields carry integers: the `__discriminant`
-        // tag is an `i64` (matching the `Rvalue::Discriminant`
-        // `FieldRead` and the `i64` field registration) and the
-        // `__pos_0` payload is the negated / widened integer the
-        // `checked_neg` / `usize::try_from` callers materialize.  A
-        // `Ref` field type here would disagree with that registration.
-        // `__discriminant` keys the root (tag offset 0); `__pos_0` keys
-        // the success variant so its exact offset matches the read.
-        for (name, value, field_owner) in [
-            ("__discriminant", disc, owner),
-            ("__pos_0", payload, payload_owner),
+        // The `__discriminant` tag is always an `i64` (matching the
+        // `Rvalue::Discriminant` `FieldRead` and field registration).
+        // The success payload keeps the producer's actual low-level type:
+        // integer for checked arithmetic / widening, string for the
+        // `Wtf8::as_str` validity decomposition.  `__discriminant` keys the
+        // root (tag offset 0); `__pos_0` keys the success variant so its exact
+        // offset and type match the read.
+        for (name, value, field_owner, ty) in [
+            ("__discriminant", disc, owner, ValueType::Int),
+            ("__pos_0", payload, payload_owner, payload_ty),
         ] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
@@ -15134,7 +15286,7 @@ impl<'a> Lowering<'a> {
                         taken_by_address: false,
                     },
                     value: LinkArg::Value(value),
-                    ty: ValueType::Int,
+                    ty,
                 },
             });
         }
@@ -30208,6 +30360,50 @@ mod tests {
                 "missing builder marker {marker}"
             );
         }
+    }
+
+    /// `Wtf8::as_str` is fallible for a lone surrogate.  PyPy keeps the
+    /// unicode value plus the runtime validity branch; the lifted graph must
+    /// therefore contain the scalar validity residual and a tagged Result,
+    /// not a residual Rust `Result<&str, Utf8Error>` call or an unconditional
+    /// string identity.
+    #[test]
+    #[ignore]
+    fn wtf8_as_str_lowers_to_runtime_tagged_string_result() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "wtf8_display_string").expect("lower wtf8_display_string");
+
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["Wtf8", "as_str"])
+            }),
+            "the foreign Rust Result must not cross the translated graph: {graph:#?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, result_ty: ValueType::Bool, .. }
+                    if segments.last().map(String::as_str) == Some("wtf8_key_is_utf8"))
+            }),
+            "the lone-surrogate decision must remain a runtime scalar: {graph:#?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { field, ty: ValueType::Str, .. }
+                    if field.name == "__pos_0" && field.owner_root.as_deref().is_some_and(|owner| owner.ends_with("::Ok")))
+            }),
+            "the Result Ok payload must keep the lifted string repr: {graph:#?}"
+        );
     }
 
     /// Every local UTF-8 accumulator in PyPy's repr helpers is a
