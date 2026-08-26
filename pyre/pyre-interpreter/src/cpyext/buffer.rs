@@ -40,6 +40,7 @@ const PY_BUF_STRIDES: c_int = 0x0010 | PY_BUF_ND;
 const PY_BUF_C_CONTIGUOUS: c_int = 0x0020 | PY_BUF_STRIDES;
 const PY_BUF_F_CONTIGUOUS: c_int = 0x0040 | PY_BUF_STRIDES;
 const PY_BUF_ANY_CONTIGUOUS: c_int = 0x0080 | PY_BUF_STRIDES;
+const PY_BUF_INDIRECT: c_int = 0x0100 | PY_BUF_STRIDES;
 /// `PyBUF_MAX_NDIM` — the dimension count a `Py_buffer` may declare.
 const PY_BUF_MAX_NDIM: i64 = 64;
 const PY_BUF_READ: c_int = 0x100;
@@ -294,12 +295,7 @@ fn acquire(
         release_c_view(view);
         Err(crate::PyError::new(kind, message.to_string()))
     };
-    if unsafe { !(*view).suboffsets.is_null() } {
-        return refuse(
-            crate::PyErrorKind::BufferError,
-            "cpyext: a buffer export with suboffsets is not supported",
-        );
-    }
+    let suboffsets = dims(unsafe { (*view).suboffsets }, ndim);
     if ndim > PY_BUF_MAX_NDIM {
         return refuse(
             crate::PyErrorKind::ValueError,
@@ -318,56 +314,115 @@ fn acquire(
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
     let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    // The contiguous one-dimensional shape a `RawBufferView` describes, which
-    // is exactly the set this layer accepted before it carried geometry of
-    // its own; everything else rides on its own vectors.
-    let flat = ndim == 1
-        && strides.first() == Some(&itemsize)
-        && shape.first().copied().unwrap_or(0) * itemsize == length;
-    let built = if flat {
-        BufferView::Raw {
-            backing: Buffer::External {
-                w_obj: r_obj,
-                address,
-                size: length as usize,
-                readonly,
-            },
-            w_obj: r_obj,
-            w_fmt: reload(0),
-            itemsize,
+    let built = carrier_for(
+        Geometry {
+            address,
             length,
-        }
-    } else {
-        // A zero-dimensional export addresses one element, but `len` is the
-        // extent its exporter published and the storage behind it is
-        // contiguous, so the window is `len` bytes from `buf`.
-        let (low, high) = if ndim == 0 {
-            (0, length)
-        } else {
-            pyre_object::bufferview::addressable_window(&shape, &strides, itemsize)
-        };
-        BufferView::CBuffer {
-            backing: Buffer::External {
-                w_obj: r_obj,
-                address: (address as isize + low as isize) as usize,
-                size: (high - low).max(0) as usize,
-                readonly,
-            },
-            w_obj: r_obj,
-            w_fmt: reload(0),
             itemsize,
-            length,
+            readonly,
             ndim,
-            offset: -low,
             shape,
             strides,
-            suboffsets: Vec::new(),
-        }
-    };
+            suboffsets,
+        },
+        r_obj,
+        reload(0),
+    );
     let carrier = pyre_object::memoryview::bufferview_alloc(built);
     unsafe { pyre_object::memoryview::w_memoryview_set_view(mv, carrier) };
     record_export(carrier as usize, view);
     Ok(mv)
+}
+
+/// The geometry words a filled `Py_buffer` carries, read once.
+struct Geometry {
+    address: usize,
+    length: i64,
+    itemsize: i64,
+    readonly: bool,
+    ndim: i64,
+    shape: Vec<i64>,
+    strides: Vec<i64>,
+    suboffsets: Vec<i64>,
+}
+
+/// The view a filled `Py_buffer`'s geometry describes.
+///
+/// A one-dimensional export stepping by `itemsize` over exactly its own
+/// length is the shape a `RawBufferView` covers, and is exactly the set this
+/// layer accepted before it carried geometry of its own.  Everything else
+/// rides on its own vectors as a `CPyBuffer`.
+fn carrier_for(
+    geometry: Geometry,
+    w_obj: PyObjectRef,
+    w_fmt: PyObjectRef,
+) -> pyre_object::bufferview::BufferView {
+    use pyre_object::buffer::Buffer;
+    use pyre_object::bufferview::BufferView;
+    let Geometry {
+        address,
+        length,
+        itemsize,
+        readonly,
+        ndim,
+        shape,
+        strides,
+        suboffsets,
+    } = geometry;
+    if ndim == 1
+        && suboffsets.is_empty()
+        && strides.first() == Some(&itemsize)
+        && shape.first().copied().unwrap_or(0) * itemsize == length
+    {
+        return BufferView::Raw {
+            backing: Buffer::External {
+                w_obj,
+                address,
+                size: length.max(0) as usize,
+                readonly,
+            },
+            w_obj,
+            w_fmt,
+            itemsize,
+            length,
+        };
+    }
+    // A zero-dimensional export addresses one element, but `len` is the
+    // extent its exporter published and the storage behind it is contiguous,
+    // so the window is `len` bytes from `buf`.
+    //
+    // An indirect export's storage reaches only as far as the first dimension
+    // whose suboffset dereferences: past that the addresses come from the
+    // exporter's own pointers and no window describes them.  The elements up
+    // to and including that dimension are those pointers, so the window is
+    // measured in pointer widths.
+    let indirect = suboffsets.iter().position(|&suboffset| suboffset >= 0);
+    let (low, high) = match (ndim, indirect) {
+        (0, _) => (0, length),
+        (_, Some(dim)) => pyre_object::bufferview::addressable_window(
+            &shape[..=dim],
+            &strides[..=dim],
+            std::mem::size_of::<*const u8>() as i64,
+        ),
+        (_, None) => pyre_object::bufferview::addressable_window(&shape, &strides, itemsize),
+    };
+    BufferView::CBuffer {
+        backing: Buffer::External {
+            w_obj,
+            address: (address as isize + low as isize) as usize,
+            size: (high - low).max(0) as usize,
+            readonly,
+        },
+        w_obj,
+        w_fmt,
+        itemsize,
+        length,
+        ndim,
+        offset: -low,
+        shape,
+        strides,
+        suboffsets,
+    }
 }
 
 /// Run `bf_releasebuffer` for a structure this layer allocated, drop the
@@ -458,6 +513,7 @@ struct Export {
     format: Vec<u8>,
     shape: Vec<isize>,
     strides: Vec<isize>,
+    suboffsets: Vec<isize>,
 }
 
 /// The live [`Export`] blocks, so a release frees one this layer wrote and
@@ -469,8 +525,12 @@ static GEOMETRIES: super::ForkMutex<BufferSet> =
 /// anything -- `memory_getbuf`'s contiguity checks, in its order.
 ///
 /// `contiguous` is whether the export is contiguous in C and in Fortran
-/// order.
-fn contiguity_refusal(flags: c_int, contiguous: (bool, bool)) -> Option<&'static str> {
+/// order, and `indirect` whether any of its dimensions carries a suboffset.
+fn contiguity_refusal(
+    flags: c_int,
+    contiguous: (bool, bool),
+    indirect: bool,
+) -> Option<&'static str> {
     let requires = |mask| flags & mask == mask;
     let (c_order, fortran) = contiguous;
     if requires(PY_BUF_C_CONTIGUOUS) && !c_order {
@@ -482,12 +542,22 @@ fn contiguity_refusal(flags: c_int, contiguous: (bool, bool)) -> Option<&'static
     if requires(PY_BUF_ANY_CONTIGUOUS) && !(c_order || fortran) {
         return Some("memoryview: underlying buffer is not contiguous");
     }
+    // A request that does not ask to follow pointers cannot read a view whose
+    // elements are behind them.
+    if !requires(PY_BUF_INDIRECT) && indirect {
+        return Some("memoryview: underlying buffer requires suboffsets");
+    }
     // A request with no strides in it reads the address as one contiguous
     // run, which a strided export is not.
-    match requires(PY_BUF_STRIDES) || c_order {
-        true => None,
-        false => Some("memoryview: underlying buffer is not C-contiguous"),
+    if !requires(PY_BUF_STRIDES) && !c_order {
+        return Some("memoryview: underlying buffer is not C-contiguous");
     }
+    // A request with no shape in it reads the bytes as unsigned chars, which
+    // leaves nothing for a format to describe.
+    if !requires(PY_BUF_ND) && requires(PY_BUF_FORMAT) {
+        return Some("memoryview: cannot cast to unsigned bytes if the format flag is present");
+    }
+    None
 }
 
 /// `slotdefs.py slot_from_buffer_w` -- the `bf_getbuffer` of a type this
@@ -519,7 +589,10 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     let _ = roots.pin_root(w_view);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
     let contiguous = unsafe { crate::builtins::memoryview_contiguity(reload(view_slot)) };
-    if let Some(message) = contiguity_refusal(flags, contiguous) {
+    let indirect = unsafe {
+        !pyre_object::memoryview::w_memoryview_native_suboffsets(reload(view_slot)).is_empty()
+    };
+    if let Some(message) = contiguity_refusal(flags, contiguous, indirect) {
         release_acquired(reload(view_slot));
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::BufferError,
@@ -539,6 +612,7 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         format,
         shape: widen(unsafe { carrier.native_shape() }),
         strides: widen(unsafe { carrier.native_strides() }),
+        suboffsets: widen(unsafe { carrier.native_suboffsets() }),
     });
     // The exporter's own storage, which the collector does not move: the
     // address stays the one C was handed for as long as the export is open.
@@ -552,7 +626,12 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         (*view).len = carrier.length() as isize;
         (*view).itemsize = carrier.itemsize() as isize;
         (*view).readonly = carrier.readonly() as c_int;
-        (*view).ndim = carrier.ndim() as c_int;
+        // `memory_getbuf`: a request with no shape in it reads the whole
+        // export as one run of unsigned chars, whatever its own rank.
+        (*view).ndim = match flags & PY_BUF_ND == PY_BUF_ND {
+            true => carrier.ndim() as c_int,
+            false => 1,
+        };
         (*view).format = match flags & PY_BUF_FORMAT == PY_BUF_FORMAT {
             true => export.format.as_mut_ptr() as *mut c_char,
             false => std::ptr::null_mut(),
@@ -565,7 +644,12 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
             true => export.strides.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
-        (*view).suboffsets = std::ptr::null_mut();
+        (*view).suboffsets = match !export.suboffsets.is_empty()
+            && flags & PY_BUF_INDIRECT == PY_BUF_INDIRECT
+        {
+            true => export.suboffsets.as_mut_ptr(),
+            false => std::ptr::null_mut(),
+        };
         (*view).internal = Box::into_raw(export) as *mut c_void;
         GEOMETRIES.lock().insert((*view).internal as usize);
     }
@@ -840,15 +924,6 @@ pub unsafe extern "C" fn PyBuffer_SizeFromFormat(format: *const c_char) -> isize
 
 // ── the strided copies ──────────────────────────────────────────────────
 
-/// The byte offset of `indices` within `view`.
-fn offset_of(strides: &[i64], indices: &[i64]) -> isize {
-    strides
-        .iter()
-        .zip(indices)
-        .map(|(stride, index)| stride * index)
-        .sum::<i64>() as isize
-}
-
 /// Step `indices` one element in C order (`order == b'C'`) or Fortran order,
 /// answering `false` once the walk is over.
 fn advance(indices: &mut [i64], shape: &[i64], order: u8) -> bool {
@@ -867,33 +942,60 @@ fn advance(indices: &mut [i64], shape: &[i64], order: u8) -> bool {
     false
 }
 
-/// The `(shape, strides, itemsize, total)` a filled `Py_buffer` describes.
+/// The `(shape, strides, suboffsets, itemsize, total)` a filled `Py_buffer`
+/// describes.  An empty `suboffsets` is NULL.
 ///
 /// # Safety
-/// `view` must point at a filled `Py_buffer` with no suboffsets.
-unsafe fn geometry(view: *const CPyBuffer) -> (Vec<i64>, Vec<i64>, i64, i64) {
+/// `view` must point at a filled `Py_buffer`.
+unsafe fn geometry(view: *const CPyBuffer) -> (Vec<i64>, Vec<i64>, Vec<i64>, i64, i64) {
     let ndim = unsafe { (*view).ndim } as i64;
     let itemsize = unsafe { (*view).itemsize } as i64;
     let length = unsafe { (*view).len } as i64;
     let (shape, strides) = unsafe { shape_and_strides(view, ndim, itemsize, length) };
-    (shape, strides, itemsize, length)
+    let suboffsets = dims(unsafe { (*view).suboffsets }, ndim);
+    (shape, strides, suboffsets, itemsize, length)
+}
+
+/// `PyBuffer_GetPointer`'s per-axis chain: advance by each dimension's stride
+/// and follow the pointer a non-negative suboffset names.
+///
+/// # Safety
+/// `view` must point at a filled `Py_buffer`, and `indices` must name one
+/// in-bounds index per dimension.
+unsafe fn element_of(view: *const CPyBuffer, indices: &[i64]) -> *mut u8 {
+    let strides = unsafe { (*view).strides };
+    let suboffsets = unsafe { (*view).suboffsets };
+    let mut pointer = unsafe { (*view).buf } as *mut u8;
+    for (axis, &index) in indices.iter().enumerate() {
+        let stride = match strides.is_null() {
+            true => 0,
+            false => unsafe { *strides.add(axis) as i64 },
+        };
+        pointer = unsafe { pointer.offset((stride * index) as isize) };
+        if !suboffsets.is_null() {
+            let suboffset = unsafe { *suboffsets.add(axis) };
+            if suboffset >= 0 {
+                pointer = unsafe { (*(pointer as *mut *mut u8)).offset(suboffset) };
+            }
+        }
+    }
+    pointer
 }
 
 /// Walk every element of `view` in `order`, handing each element's address and
 /// its position in the contiguous block to `visit`.
 ///
 /// # Safety
-/// `view` must point at a filled `Py_buffer` with no suboffsets.
+/// `view` must point at a filled `Py_buffer`.
 unsafe fn walk(view: *const CPyBuffer, order: u8, mut visit: impl FnMut(*mut u8, usize, usize)) {
-    let (shape, strides, itemsize, _) = unsafe { geometry(view) };
+    let (shape, _, _, itemsize, _) = unsafe { geometry(view) };
     if shape.iter().any(|&extent| extent <= 0) {
         return;
     }
-    let base = unsafe { (*view).buf } as *mut u8;
     let mut indices = vec![0i64; shape.len()];
     let mut position = 0usize;
     loop {
-        let element = unsafe { base.offset(offset_of(&strides, &indices)) };
+        let element = unsafe { element_of(view, &indices) };
         visit(element, position, itemsize as usize);
         position += itemsize as usize;
         if !advance(&mut indices, &shape, order) {
@@ -907,20 +1009,11 @@ pub unsafe extern "C" fn PyBuffer_GetPointer(
     view: *const CPyBuffer,
     indices: *const isize,
 ) -> *mut c_void {
-    let (_, strides, _, _) = unsafe { geometry(view) };
-    let mut pointer = unsafe { (*view).buf } as *mut u8;
-    for (axis, stride) in strides.iter().enumerate() {
-        let index = unsafe { *indices.add(axis) } as i64;
-        pointer = unsafe { pointer.offset((stride * index) as isize) };
-        let suboffsets = unsafe { (*view).suboffsets };
-        if !suboffsets.is_null() {
-            let suboffset = unsafe { *suboffsets.add(axis) };
-            if suboffset >= 0 {
-                pointer = unsafe { (*(pointer as *mut *mut u8)).offset(suboffset) };
-            }
-        }
-    }
-    pointer as *mut c_void
+    let ndim = unsafe { (*view).ndim } as usize;
+    let named: Vec<i64> = (0..ndim)
+        .map(|axis| unsafe { *indices.add(axis) } as i64)
+        .collect();
+    unsafe { element_of(view, &named) as *mut c_void }
 }
 
 #[unsafe(no_mangle)]
@@ -1153,34 +1246,49 @@ pub unsafe extern "C" fn PyMemoryView_FromMemory(
 /// `PyMemoryView_FromBuffer` — the caller hands its filled `Py_buffer` over and
 /// must not release it itself.
 ///
-/// TODO: upstream copies `ndim`, `shape` and `strides` across, and this takes
-/// only a contiguous one-dimensional view.  Nothing measures the gap: the
-/// class that would, `test_buffer`'s `TestBufferProtocol`, is
-/// `skipUnless(ndarray)` and there is no `_testbuffer` to import it from, so
-/// building `lib_pypy/_testbuffer.c` comes before lifting the restriction.
+/// The handed-over structure's `obj` is a borrowed reference that must not be
+/// decremented, so the view carries no exporter and records no export: it
+/// keeps only the geometry and the address.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const CPyBuffer) -> *mut CPyObject {
-    if view.is_null() || unsafe { (*view).buf.is_null() } {
+    if view.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    let (_, strides, itemsize, length) = unsafe { geometry(view) };
-    let ndim = unsafe { (*view).ndim };
-    if ndim > 1 || (ndim == 1 && strides.first() != Some(&itemsize)) {
+    if unsafe { (*view).buf.is_null() } {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "PyMemoryView_FromBuffer(): info->buf must not be NULL",
+        ));
+        return std::ptr::null_mut();
+    }
+    let (shape, strides, suboffsets, itemsize, length) = unsafe { geometry(view) };
+    let ndim = unsafe { (*view).ndim } as i64;
+    if ndim > PY_BUF_MAX_NDIM {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "memoryview: number of dimensions must not exceed 64",
+        ));
+        return std::ptr::null_mut();
+    }
+    if shape.len() as i64 != ndim || strides.len() as i64 != ndim {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::BufferError,
-            "cpyext: only a contiguous one-dimensional Py_buffer becomes a memoryview",
+            "cpyext: a multi-dimensional buffer export must carry a shape",
         ));
         return std::ptr::null_mut();
     }
     let format = format_of(unsafe { (*view).format });
-    let readonly = unsafe { (*view).readonly } != 0;
-    result(Ok(unowned_view(
-        unsafe { (*view).buf } as usize,
-        length,
-        itemsize,
+    result(Ok(unowned_view_nd(
+        Geometry {
+            address: unsafe { (*view).buf } as usize,
+            length,
+            itemsize,
+            readonly: unsafe { (*view).readonly } != 0,
+            ndim,
+            shape,
+            strides,
+            suboffsets,
+        },
         &format,
-        readonly,
     )))
 }
 
@@ -1230,9 +1338,11 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     }
     let shape = unsafe { view.native_shape() };
     let strides = unsafe { view.native_strides() };
-    let laid_out = contiguous_in(order, &shape, &strides, view.itemsize(), unsafe {
-        view.length()
-    });
+    let indirect = !unsafe { view.native_suboffsets() }.is_empty();
+    let laid_out = !indirect
+        && contiguous_in(order, &shape, &strides, view.itemsize(), unsafe {
+            view.length()
+        });
     if laid_out {
         return pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(slot));
     }
@@ -1242,10 +1352,51 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
             "writable contiguous buffer requested for a non-contiguous object.",
         );
     }
-    refuse(
-        crate::PyErrorKind::NotImplementedError,
-        "creating contiguous readonly buffer from non-contiguous not implemented yet",
-    )
+    // `memory_from_contiguous_copy` — the bytes laid out in `order`, kept in a
+    // `bytes` object so the copy is collected with the view, carrying the
+    // source's format, itemsize and shape with the steps that layout implies.
+    let itemsize = view.itemsize();
+    let fortran = order as u8 == b'F';
+    let format = unsafe { view.format_str() }.to_owned();
+    let block = unsafe { view.gather_order(fortran) };
+    let copy_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&block));
+    let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(&format));
+    let copy = pyre_object::gc_roots::shadow_stack_get(copy_slot);
+    let w_fmt = pyre_object::gc_roots::shadow_stack_get(fmt_slot);
+    let out = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    let backing = pyre_object::buffer::Buffer::String { w_obj: copy };
+    let length = block.len() as i64;
+    let built = if shape.len() <= 1 {
+        pyre_object::bufferview::BufferView::Raw {
+            backing,
+            w_obj: copy,
+            w_fmt,
+            itemsize,
+            length,
+        }
+    } else {
+        pyre_object::bufferview::BufferView::CBuffer {
+            backing,
+            w_obj: copy,
+            w_fmt,
+            itemsize,
+            length,
+            ndim: shape.len() as i64,
+            offset: 0,
+            strides: pyre_object::bufferview::contiguous_strides(&shape, itemsize, fortran),
+            shape,
+            suboffsets: Vec::new(),
+        }
+    };
+    unsafe {
+        pyre_object::memoryview::w_memoryview_set_view(
+            out,
+            pyre_object::memoryview::bufferview_alloc(built),
+        )
+    };
+    pyobject::make_ref(out)
 }
 
 fn unowned_view(
@@ -1274,6 +1425,27 @@ fn unowned_view(
         itemsize,
         length,
     };
+    unsafe {
+        pyre_object::memoryview::w_memoryview_set_view(
+            mv,
+            pyre_object::memoryview::bufferview_alloc(built),
+        )
+    };
+    mv
+}
+
+/// The [`unowned_view`] sibling for a view that carries geometry of its own.
+fn unowned_view_nd(geometry: Geometry, format: &str) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(format));
+    let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    let w_obj = pyre_object::w_none();
+    let built = carrier_for(
+        geometry,
+        w_obj,
+        pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+    );
     unsafe {
         pyre_object::memoryview::w_memoryview_set_view(
             mv,

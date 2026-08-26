@@ -248,12 +248,16 @@ eq('and it writes through to the exporter', data, bytearray(b'zbcdef'))
 eq('a write view over bytes', m.mv_contiguous(b'abcdef', 'w', 'C'),
    ('BufferError', 'underlying buffer is not writable'))
 
-# A strided view is contiguous in no order, and only the read side has a
-# copy to fall back on -- which is not built yet.
-strided = memoryview(bytearray(b'abcdef'))[::2]
-eq('a read view over a strided one', m.mv_contiguous(strided, 'r', 'C'),
-   ('NotImplementedError',
-    'creating contiguous readonly buffer from non-contiguous not implemented yet'))
+# A strided view is contiguous in no order, and only the read side has a copy
+# to fall back on: it gets the selected elements laid out in the asked-for
+# order, over storage of its own rather than the exporter's.
+data = bytearray(b'abcdef')
+strided = memoryview(data)[::2]
+copied = m.mv_contiguous(strided, 'r', 'C')
+eq('a read view over a strided one', bytes(copied), b'ace')
+eq('and the copy is read-only', copied.readonly, True)
+data[0] = ord('z')
+eq('and it does not write through to the exporter', bytes(copied), b'ace')
 eq('a write view over a strided one', m.mv_contiguous(strided, 'w', 'C'),
    ('BufferError',
     'writable contiguous buffer requested for a non-contiguous object.'))
