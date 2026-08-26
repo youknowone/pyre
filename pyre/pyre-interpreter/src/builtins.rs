@@ -1081,22 +1081,26 @@ fn memoryview_is_byte_format(fmt: &str) -> bool {
     matches!(memoryview_format_code(fmt), b'b' | b'B' | b'c')
 }
 
-/// `get_native_fmtchar` — the native byte width of a single-character
-/// format (`x` or `@x`), or `None` for an unrecognised / non-native one.
-fn memoryview_native_fmtchar(fmt: &str) -> Option<i64> {
+/// `get_native_fmtchar` — the single-character format (`x` or `@x`) `fmt`
+/// names and its native byte width, or `None` for an unrecognised or
+/// non-native one.
+fn memoryview_native_fmtchar(fmt: &str) -> Option<(u8, i64)> {
     let b = fmt.as_bytes();
     let f = match b.first()? {
         b'@' if b.len() == 2 => b[1],
         _ if b.len() == 1 => b[0],
         _ => return None,
     };
-    Some(match f {
-        b'c' | b'b' | b'B' | b'?' => 1,
-        b'h' | b'H' | b'e' => 2,
-        b'i' | b'I' | b'f' => 4,
-        b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
-        _ => return None,
-    })
+    Some((
+        f,
+        match f {
+            b'c' | b'b' | b'B' | b'?' => 1,
+            b'h' | b'H' | b'e' => 2,
+            b'i' | b'I' | b'f' => 4,
+            b'l' | b'L' | b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
+            _ => return None,
+        },
+    ))
 }
 
 /// `_strides_from_shape` — C-contiguous strides for `shape`: the last
@@ -1769,7 +1773,7 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
         }
         // _cast_to_1D: a native single-character destination format.
-        let Some(new_itemsize) = memoryview_native_fmtchar(&fmt) else {
+        let Some((_, new_itemsize)) = memoryview_native_fmtchar(&fmt) else {
             return Err(crate::PyError::value_error(
                 "memoryview: destination format must be a native single \
                  character format prefixed with an optional '@'",
@@ -2197,6 +2201,51 @@ unsafe fn memoryview_released_either(mv: PyObjectRef, other: PyObjectRef) -> boo
     }
 }
 
+/// One item as the value `unpack_cmp` compares it by.
+///
+/// # Safety
+/// `data[base..base + itemsize]` must be in bounds.
+unsafe fn memoryview_unpack_compared(
+    native: bool,
+    fmt: &str,
+    data: &[u8],
+    base: usize,
+    itemsize: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        match native {
+            true => Ok(memoryview_unpack_element(fmt, data, base, itemsize)),
+            false => crate::module::r#struct::unpack_single(fmt, &data[base..base + itemsize]),
+        }
+    }
+}
+
+/// `equiv_shape` — equal dimensionality and equal extents, stopping at the
+/// first extent that is zero.  A dimension with no elements makes every
+/// dimension inside it unobservable, so `[0, 3]` and `[0, 5]` describe the
+/// same (empty) element set.
+///
+/// # Safety
+/// Both arguments must be live, unreleased memoryviews.
+unsafe fn memoryview_equiv_shape(lhs: PyObjectRef, rhs: PyObjectRef) -> bool {
+    unsafe {
+        use pyre_object::memoryview::*;
+        if w_memoryview_ndim(lhs) != w_memoryview_ndim(rhs) {
+            return false;
+        }
+        let rhs = w_memoryview_native_shape(rhs);
+        for (&extent, &other) in w_memoryview_native_shape(lhs).iter().zip(&rhs) {
+            if extent != other {
+                return false;
+            }
+            if extent == 0 {
+                break;
+            }
+        }
+        true
+    }
+}
+
 /// Python 3.14 `memory_richcompare`: equality first requires equivalent
 /// shapes, then compares unpacked element values.  Raw bytes are deliberately
 /// insufficient (`int(1)` and `float(1.0)` compare equal despite different
@@ -2227,11 +2276,7 @@ fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool
         };
         let lhs = pyre_object::gc_roots::shadow_stack_get(base);
         let comparison = (|| -> Result<bool, crate::PyError> {
-            if pyre_object::memoryview::w_memoryview_ndim(lhs)
-                != pyre_object::memoryview::w_memoryview_ndim(rhs)
-                || pyre_object::memoryview::w_memoryview_native_shape(lhs)
-                    != pyre_object::memoryview::w_memoryview_native_shape(rhs)
-            {
+            if !memoryview_equiv_shape(lhs, rhs) {
                 return Ok(false);
             }
             let lhs_data = memoryview_gather_bytes(lhs);
@@ -2247,21 +2292,36 @@ fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool
             }
             let lhs_fmt = pyre_object::memoryview::w_memoryview_format_str(lhs);
             let rhs_fmt = pyre_object::memoryview::w_memoryview_format_str(rhs);
+            // `get_native_fmtchar`: only one single-code native format shared
+            // by both sides decodes as a C value.  Anything else — a byte
+            // order prefix, several members, a repeat count — is unpacked by
+            // the struct module, and a format it cannot parse leaves the two
+            // views unequal rather than raising (`fix_struct_error_int`).
+            let code_of = |fmt| memoryview_native_fmtchar(fmt).map(|(code, _)| code);
+            let native = code_of(lhs_fmt).is_some_and(|code| Some(code) == code_of(rhs_fmt));
+            if !native
+                && !(crate::module::r#struct::format_is_supported(lhs_fmt)
+                    && crate::module::r#struct::format_is_supported(rhs_fmt))
+            {
+                return Ok(false);
+            }
             for index in 0..count {
                 let _values = pyre_object::gc_roots::push_roots();
                 let values = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_compared(
+                    native,
                     lhs_fmt,
                     &lhs_data,
                     index * lhs_size,
                     lhs_size,
-                ));
-                let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_element(
+                )?);
+                let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_compared(
+                    native,
                     rhs_fmt,
                     &rhs_data,
                     index * rhs_size,
                     rhs_size,
-                ));
+                )?);
                 if !crate::baseobjspace::eq_w(
                     pyre_object::gc_roots::shadow_stack_get(values),
                     pyre_object::gc_roots::shadow_stack_get(values + 1),
