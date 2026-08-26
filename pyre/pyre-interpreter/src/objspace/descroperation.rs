@@ -2133,6 +2133,13 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
 pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_a = w_list_len(a);
     let len_b = w_list_len(b);
+    // W_ListObject.descr_add: when the left operand is empty, clone the right
+    // operand. A SizeListStrategy clone retains that exact strategy instance.
+    if len_a == 0
+        && let Some(clone) = pyre_object::listobject::w_list_clone_if_size(b)
+    {
+        return Ok(clone);
+    }
     let mut items = Vec::with_capacity(len_a + len_b);
     for i in 0..len_a {
         if let Some(item) = w_list_getitem(a, i as i64) {
@@ -2167,6 +2174,9 @@ pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// listobject.py descr_mul
 pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n)?;
+    if let Some(clone) = pyre_object::listobject::w_list_clone_if_size(list) {
+        return Ok(clone);
+    }
     let len = w_list_len(list);
     let cap = len
         .checked_mul(count)
@@ -2196,6 +2206,9 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
 /// storage instead of building a fresh list.
 pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> Result<(), PyError> {
     let count = repeat_count(n)?;
+    if pyre_object::listobject::w_list_sizehint(list).is_some() {
+        return Ok(());
+    }
     if count == 0 {
         w_list_clear(list);
         return Ok(());

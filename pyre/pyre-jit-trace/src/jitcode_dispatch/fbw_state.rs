@@ -1395,6 +1395,7 @@ pub(crate) fn fbw_store_journal_rollback() {
                             }
                             pyre_object::listobject::ListStrategy::Float
                             | pyre_object::listobject::ListStrategy::Empty
+                            | pyre_object::listobject::ListStrategy::Size
                             | pyre_object::listobject::ListStrategy::Bytes
                             | pyre_object::listobject::ListStrategy::Ascii => {
                                 crate::trace::fbw_diag::bump(
@@ -1443,6 +1444,7 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // Empty never enters the append journal (no spare-capacity
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
+                    pyre_object::listobject::ListStrategy::Size => {}
                     // Bytes append does not enter this journal until the
                     // walker has a BytesBlock store emitter.
                     pyre_object::listobject::ListStrategy::Bytes => {}

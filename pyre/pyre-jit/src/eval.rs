@@ -1172,7 +1172,7 @@ unsafe fn unicode_user_object_custom_trace(
     };
 }
 
-/// Custom trace for `W_ListObject` under the Object strategy. `items`
+/// Custom trace for `W_ListObject`. Under the Object strategy, `items`
 /// points at an off-GC `std::alloc`'d `ItemsBlock`
 /// (`object_array::alloc_items_block`), so the element slots are
 /// unreachable through inline `gc_ptr_offsets` — the collector would see
@@ -1180,17 +1180,27 @@ unsafe fn unicode_user_object_custom_trace(
 /// untraced (a major collection then sweeps an element reachable only via
 /// the list).  Forward each live element slot in place, exactly as
 /// `tuple_object_custom_trace`, so a moving collector relocates young
-/// elements and a major collection marks them.  Only the Object strategy
-/// stores `PyObjectRef`s; Integer/Float/Bytes keep typed arrays (`items` null)
-/// and Empty has no block.  Trace `length` live slots, not capacity — the
-/// spare tail past the live length may hold stale pointers a shrink left
-/// behind.
+/// elements and a major collection marks them. SizeListStrategy uses the same
+/// inactive field as one direct edge to its shared strategy-state box;
+/// Integer/Float/Bytes keep typed arrays (`items` null) and Empty has no block.
+/// Trace `length` live slots for Object, not capacity — the spare tail past the
+/// live length may hold stale pointers a shrink left behind.
 unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let list_ptr = obj_addr as *mut pyre_object::listobject::W_ListObject;
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
+    if list.strategy == pyre_object::listobject::ListStrategy::Size && !list.items.is_null() {
+        // SizeListStrategy is an ordinary shared RPython strategy instance.
+        // Pyre keeps its mutable state box in the otherwise inactive `items`
+        // edge so clones preserve that identity without growing every list.
+        let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
+        if pyre_object::gc_hook::try_gc_owns_object(unsafe { *items_slot } as *mut u8) {
+            f(items_slot as *mut majit_ir::GcRef);
+        }
+    } else if list.strategy == pyre_object::listobject::ListStrategy::Object
+        && !list.items.is_null()
+    {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
             // A GC-managed (moving) block is forwarded by handing the
             // collector the `items` field slot itself; the type-9 varsize walker

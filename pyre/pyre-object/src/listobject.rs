@@ -9,8 +9,9 @@
 #![allow(dead_code)]
 
 use crate::object_array::{
-    ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, grow_list_items_block_gc,
-    items_block_capacity, items_block_items_base,
+    ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
+    dealloc_list_items_block, gc_int_array_gc_type_id, grow_list_items_block_gc,
+    items_block_capacity, items_block_items_base, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -19,8 +20,7 @@ use crate::{
     bytesobject::{BYTES_TYPE, w_bytes_block, w_bytes_from_block},
     floatobject::w_float_get_value,
     floatobject::w_float_new,
-    intobject::w_int_get_value,
-    intobject::w_int_new,
+    intobject::{w_int_get_value, w_int_new},
     longobject::jit_bigint_to_i64_value,
     longobject::w_long_fits_int,
     longobject::w_long_get_value,
@@ -109,6 +109,9 @@ pub enum ListStrategy {
     /// listobject.py AsciiListStrategy — erased UTF-8 `[rpython str]`
     /// payloads, restricted to exact ASCII strings.
     Ascii = 6,
+    /// listobject.py SizeListStrategy — empty storage carrying the allocation
+    /// hint used when the first item selects a concrete strategy.
+    Size = 7,
 }
 
 impl ListStrategy {
@@ -125,6 +128,7 @@ impl ListStrategy {
             Self::IntOrFloat => "IntOrFloatListStrategy",
             Self::Bytes => "BytesListStrategy",
             Self::Ascii => "AsciiListStrategy",
+            Self::Size => "SizeListStrategy",
         }
     }
 }
@@ -176,6 +180,9 @@ pub struct W_ListObject {
     /// capacity (= upstream `len(l.items)` per rlist.py:251). Null
     /// when the list is in a non-Object strategy (Empty/Integer/
     /// IntOrFloat/Float/Bytes); lazily allocated on strategy switch.
+    /// SizeListStrategy instead uses this otherwise inactive traced slot for
+    /// its shared strategy-state box, matching `EmptyListStrategy.clone`
+    /// retaining the same `SizeListStrategy` instance.
     pub items: *mut ItemsBlock,
     pub strategy: ListStrategy,
     pub int_items: IntArray,
@@ -199,6 +206,26 @@ pub struct W_ListObject {
 pub const W_LIST_GC_TYPE_ID: u32 = 7;
 pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
 
+/// Allocate the translated `SizeListStrategy` instance payload.  The object
+/// space reference is process-global in pyre, leaving its sole per-instance
+/// field (`sizehint`) as one Signed cell.  This is GC state, not a Python int:
+/// diagnostic APIs must not expose the strategy implementation as a W_Root.
+unsafe fn alloc_sizehint_state(sizehint: i64) -> *mut TypedItemsBlock {
+    let state = alloc_typed_items_block(1, gc_int_array_gc_type_id());
+    *(typed_items_block_items_base(state) as *mut i64) = sizehint;
+    state
+}
+
+#[inline]
+unsafe fn sizehint_state_value(state: *mut ItemsBlock) -> i64 {
+    *(typed_items_block_items_base(state as *mut TypedItemsBlock) as *const i64)
+}
+
+#[inline]
+unsafe fn set_sizehint_state_value(state: *mut ItemsBlock, sizehint: i64) {
+    *(typed_items_block_items_base(state as *mut TypedItemsBlock) as *mut i64) = sizehint;
+}
+
 impl W_ListObject {
     /// `_Py_atomic_load_ssize_relaxed(&ob_size)` on the Object-strategy length.
     ///
@@ -219,7 +246,7 @@ impl W_ListObject {
     #[inline]
     fn live_len(&self) -> usize {
         match self.strategy {
-            ListStrategy::Empty => 0,
+            ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::Object => self.length_relaxed(),
             // Direct rlist `length` field reads keep this helper in the
             // annotator's structural subset; the public `.len()` wrappers are
@@ -288,9 +315,8 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let list = &mut *(obj as *mut W_ListObject);
-        let current_cap = list.object_items_capacity();
-        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        let extra = if min_cap < 9 { 3 } else { 6 };
+        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
         // The GC rewrite emits COND_CALL_GC_WB before SETFIELD_GC. Keep that
         // ordering on the host path too: the grow below allocates in the moving
         // nursery and may collect, so this old list has to be on the remembered
@@ -320,6 +346,42 @@ impl W_ListObject {
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
+    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for the Object
+    /// strategy: publish an exact-capacity, zero-length RPython list backing.
+    unsafe fn object_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
+        let list = &*(obj as *const W_ListObject);
+        assert!(capacity >= list.length_relaxed());
+        if capacity == list.object_items_capacity() {
+            return obj;
+        }
+        if capacity == 0 {
+            list_write_barrier(obj);
+            let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            let list = &mut *(obj as *mut W_ListObject);
+            let old = list.items;
+            list.items = std::ptr::null_mut();
+            dealloc_list_items_block(old);
+            return crate::gc_roots::shadow_stack_get(obj_slot);
+        }
+        list_write_barrier(obj);
+        let block_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &*(obj as *const W_ListObject);
+        let block = grow_list_items_block_gc(list.items, capacity, list.length_relaxed());
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old = list.items;
+        list.items = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        dealloc_list_items_block(old);
+        crate::gc_roots::shadow_stack_get(obj_slot)
+    }
+
     /// Grow `bytes_items` to accommodate at least `min_cap` slots — the
     /// Bytes-strategy counterpart of [`W_ListObject::object_grow`], and the
     /// only place a fresh `bytes_items` block may be published.
@@ -337,9 +399,8 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let list = &*(obj as *const W_ListObject);
-        let current_cap = list.bytes_items.heap_capacity();
-        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        let extra = if min_cap < 9 { 3 } else { 6 };
+        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
         list_write_barrier(obj);
         let new_block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -355,6 +416,41 @@ impl W_ListObject {
         list.bytes_items.block =
             crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old_block);
+        crate::gc_roots::shadow_stack_get(obj_slot)
+    }
+
+    /// RPython `_ll_list_resize_hint_really` for BytesListStrategy.
+    unsafe fn bytes_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
+        let list = &*(obj as *const W_ListObject);
+        assert!(capacity >= list.bytes_items.len());
+        if capacity == list.bytes_items.heap_capacity() {
+            return obj;
+        }
+        if capacity == 0 {
+            let list = &mut *(obj as *mut W_ListObject);
+            let old = list.bytes_items.block;
+            list.bytes_items.block = std::ptr::null_mut();
+            list.bytes_items.set_len(0);
+            dealloc_list_items_block(old);
+            return crate::gc_roots::shadow_stack_get(obj_slot);
+        }
+        list_write_barrier(obj);
+        let block_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &*(obj as *const W_ListObject);
+        let block =
+            grow_list_items_block_gc(list.bytes_items.block, capacity, list.bytes_items.len());
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old = list.bytes_items.block;
+        list.bytes_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        dealloc_list_items_block(old);
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
@@ -384,9 +480,8 @@ impl W_ListObject {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let list = &*(obj as *const W_ListObject);
-        let current_cap = list.ascii_items.heap_capacity();
-        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        let extra = if min_cap < 9 { 3 } else { 6 };
+        let target_cap = min_cap.saturating_add(extra).saturating_add(min_cap >> 3);
         list_write_barrier(obj);
         let new_block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -402,6 +497,41 @@ impl W_ListObject {
         list.ascii_items.block =
             crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old_block);
+        crate::gc_roots::shadow_stack_get(obj_slot)
+    }
+
+    /// RPython `_ll_list_resize_hint_really` for AsciiListStrategy.
+    unsafe fn ascii_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
+        let list = &*(obj as *const W_ListObject);
+        assert!(capacity >= list.ascii_items.len());
+        if capacity == list.ascii_items.heap_capacity() {
+            return obj;
+        }
+        if capacity == 0 {
+            let list = &mut *(obj as *mut W_ListObject);
+            let old = list.ascii_items.block;
+            list.ascii_items.block = std::ptr::null_mut();
+            list.ascii_items.set_len(0);
+            dealloc_list_items_block(old);
+            return crate::gc_roots::shadow_stack_get(obj_slot);
+        }
+        list_write_barrier(obj);
+        let block_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &*(obj as *const W_ListObject);
+        let block =
+            grow_list_items_block_gc(list.ascii_items.block, capacity, list.ascii_items.len());
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old = list.ascii_items.block;
+        list.ascii_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        dealloc_list_items_block(old);
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
@@ -952,7 +1082,7 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
 }
 
 #[inline]
-fn is_bytes_strategy_item(item: PyObjectRef) -> bool {
+pub fn is_bytes_strategy_item(item: PyObjectRef) -> bool {
     unsafe { is_exact_type(item, &BYTES_TYPE) }
 }
 
@@ -961,7 +1091,7 @@ fn all_bytes(items: &[PyObjectRef]) -> bool {
 }
 
 #[inline]
-fn is_ascii_strategy_item(item: PyObjectRef) -> bool {
+pub fn is_ascii_strategy_item(item: PyObjectRef) -> bool {
     unsafe { is_exact_type(item, &STR_TYPE) && w_str_is_ascii(item) }
 }
 
@@ -1042,10 +1172,13 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
         ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
         ListStrategy::Bytes => boxed_from_bytes(obj_slot),
         ListStrategy::Ascii => boxed_from_ascii(obj_slot),
-        ListStrategy::Object | ListStrategy::Empty => Vec::new(),
+        ListStrategy::Object | ListStrategy::Empty | ListStrategy::Size => Vec::new(),
     };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
+    if list.strategy == ListStrategy::Size {
+        list.items = std::ptr::null_mut();
+    }
     list.set_object_items_from_vec(seed);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
@@ -1093,8 +1226,17 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let w_item = crate::gc_roots::shadow_stack_get(root_base + 1);
     let list = &mut *(obj as *mut W_ListObject);
+    // SizeListStrategy.get_sizehint; EmptyListStrategy inherits the zero
+    // default. The strategy object is replaced below, so consume the hint.
+    let sizehint = if list.strategy == ListStrategy::Size {
+        usize::try_from(sizehint_state_value(list.items)).unwrap_or(0)
+    } else {
+        0
+    };
+    list.set_length_relaxed(0);
+    list.items = std::ptr::null_mut();
     if is_plain_int1(w_item) {
-        let fresh = IntArray::from_vec(Vec::new());
+        let fresh = IntArray::with_capacity(sizehint);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.int_items.install(fresh);
@@ -1102,7 +1244,7 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Integer;
     } else if is_float_strategy_item(w_item) {
-        let fresh = FloatArray::from_vec(Vec::new());
+        let fresh = FloatArray::with_capacity(sizehint);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.float_items.install(fresh);
@@ -1113,26 +1255,26 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         // The immediately following append grows this null/zero rlist form
         // before storing. Avoiding a bulk Vec conversion here keeps the
         // generated append graph on PyPy's look-inside path.
-        let fresh = BytesArray::empty();
+        let fresh = BytesArray::with_capacity(sizehint);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let list = &mut *(obj as *mut W_ListObject);
-        list.bytes_items.install(fresh);
+        let _ = W_ListObject::install_bytes_items(obj, fresh);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Bytes;
     } else if is_ascii_strategy_item(w_item) {
-        let fresh = UnicodeArray::empty();
+        let fresh = UnicodeArray::with_capacity(sizehint);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let list = &mut *(obj as *mut W_ListObject);
-        list.ascii_items.install(fresh);
+        let _ = W_ListObject::install_ascii_items(obj, fresh);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Ascii;
     } else {
-        list.set_object_items_from_vec(Vec::new());
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
+        list.set_length_relaxed(0);
+        list.items = std::ptr::null_mut();
         list.strategy = ListStrategy::Object;
+        let _ = W_ListObject::object_resize_capacity(obj, sizehint);
     }
     crate::gc_roots::shadow_stack_get(root_base)
 }
@@ -1291,6 +1433,75 @@ pub fn w_list_new_empty() -> PyObjectRef {
     w_list_new_object(Vec::new())
 }
 
+/// `rpython.rlib.objectmodel.newlist_hint` for interpreter-level temporary
+/// lists of wrapped objects.
+///
+/// This is deliberately an Object-strategy list, not a Size-strategy list:
+/// `BaseObjSpace._unpackiterable_unknown_length` builds an RPython
+/// `list[W_Root]`, whereas [`w_list_new_with_sizehint`] implements PyPy's
+/// separate `space.newlist_hint` / `SizeListStrategy` object-space API.  An
+/// unrepresentable allocation mirrors the upstream `except MemoryError:
+/// items = []` fallback by returning an exact zero-capacity temporary.
+#[majit_macros::dont_look_inside]
+pub fn w_list_new_object_with_sizehint(sizehint: i64) -> PyObjectRef {
+    let obj = w_list_new_object(Vec::new());
+    let capacity = usize::try_from(sizehint)
+        .ok()
+        .filter(|&capacity| capacity <= (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>())
+        .unwrap_or(0);
+    unsafe { W_ListObject::object_resize_capacity(obj, capacity) }
+}
+
+/// listobject.py `make_empty_list_with_size` / `SizeListStrategy`.
+/// The hint belongs to the strategy while the list has no backing storage;
+/// the first append consumes it when selecting the concrete strategy.
+#[majit_macros::dont_look_inside]
+pub fn w_list_new_with_sizehint(sizehint: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let state_slot = crate::gc_roots::shadow_stack_len();
+    let state = unsafe { alloc_sizehint_state(sizehint) };
+    let _ = crate::gc_roots::pin_root(state as PyObjectRef);
+    let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Size);
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    unsafe {
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        (*(obj as *mut W_ListObject)).items =
+            crate::gc_roots::shadow_stack_get(state_slot) as *mut ItemsBlock;
+        obj
+    }
+}
+
+/// `EmptyListStrategy.clone` inherited by SizeListStrategy: when `obj` still
+/// uses Size, return a clone holding that same strategy object. The check and
+/// clone are one list-locked operation so a free-threaded append cannot switch
+/// the strategy between them.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_clone_if_size(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &*(obj as *const W_ListObject);
+    if list.strategy != ListStrategy::Size {
+        return None;
+    }
+    let state_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(list.items as PyObjectRef);
+    let clone = w_list_new_with_strategy(Vec::new(), ListStrategy::Size);
+    let clone_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(clone);
+    let clone = crate::gc_roots::shadow_stack_get(clone_slot);
+    list_write_barrier(clone);
+    let clone = crate::gc_roots::shadow_stack_get(clone_slot);
+    (*(clone as *mut W_ListObject)).items =
+        crate::gc_roots::shadow_stack_get(state_slot) as *mut ItemsBlock;
+    Some(clone)
+}
+
 /// Build the backing storage a `strategy`-strategy list holding `items` needs,
 /// without installing it anywhere: the typed blocks (empty unless the matching
 /// strategy) first, then the Object-strategy items block.
@@ -1407,7 +1618,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     // exists to express and only rejects the unboxing that has no payload.
     debug_assert!(
         match strategy {
-            ListStrategy::Empty => items.is_empty(),
+            ListStrategy::Empty | ListStrategy::Size => items.is_empty(),
             ListStrategy::Integer => all_ints(&items),
             ListStrategy::Float => all_floats(&items),
             ListStrategy::IntOrFloat => all_int_or_float(&items),
@@ -1470,7 +1681,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         ListStrategy::Float => storage.float_items.block as *mut u8,
         ListStrategy::Bytes => storage.bytes_items.block as *mut u8,
         ListStrategy::Ascii => storage.ascii_items.block as *mut u8,
-        ListStrategy::Empty => std::ptr::null_mut(),
+        ListStrategy::Empty | ListStrategy::Size => std::ptr::null_mut(),
     };
     let mut needs_write_barrier = true;
     let raw = unsafe {
@@ -1751,7 +1962,7 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // listobject.py EmptyListStrategy.getitem raises IndexError.
-        ListStrategy::Empty => None,
+        ListStrategy::Empty | ListStrategy::Size => None,
         ListStrategy::Object => {
             let items = list.object_items_slice();
             let len = items.len() as i64;
@@ -1829,7 +2040,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py EmptyListStrategy.setitem raises IndexError.
-        ListStrategy::Empty => false,
+        ListStrategy::Empty | ListStrategy::Size => false,
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
             let idx = if index < 0 { index + len } else { index };
@@ -2033,7 +2244,7 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
     match list.strategy {
         // listobject.py EmptyListStrategy.append: pick the matching
         // typed strategy first, then fall through to its append.
-        ListStrategy::Empty => {
+        ListStrategy::Empty | ListStrategy::Size => {
             let obj = switch_to_correct_strategy(list, value);
             let value = current_gc_ref(value);
             w_list_append_inner(obj, value);
@@ -2280,7 +2491,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // listobject.py EmptyListStrategy.length returns 0.
-        ListStrategy::Empty => 0,
+        ListStrategy::Empty | ListStrategy::Size => 0,
         ListStrategy::Object => list.length_relaxed(),
         ListStrategy::Integer => ll_list_int_length(list),
         ListStrategy::IntOrFloat => list.int_items.len(),
@@ -2301,6 +2512,148 @@ pub unsafe fn w_list_allocated(obj: PyObjectRef) -> isize {
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     (*(obj as *const W_ListObject)).allocated
+}
+
+/// listobject.py `ListStrategy.physical_size` and the strategy-specific
+/// overrides used by `__pypy__.list_get_physical_size`.
+pub unsafe fn w_list_physical_size(obj: PyObjectRef) -> usize {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &*(obj as *const W_ListObject);
+    match list.strategy {
+        ListStrategy::Empty | ListStrategy::Size => 0,
+        ListStrategy::Object => list.object_items_capacity(),
+        ListStrategy::Integer | ListStrategy::IntOrFloat => list.int_items.heap_capacity(),
+        ListStrategy::Float => list.float_items.heap_capacity(),
+        ListStrategy::Bytes => list.bytes_items.heap_capacity(),
+        ListStrategy::Ascii => list.ascii_items.heap_capacity(),
+    }
+}
+
+/// `W_ListObject._resize_hint` → strategy `_resize_hint`.
+///
+/// Returns false only when the RPython over-allocation arithmetic cannot be
+/// represented. A shrink hint is clamped to the live length: translated PyPy
+/// permits a lying private hint to truncate the backing below live elements,
+/// but Rust slices require the same `length <= capacity` invariant that the
+/// real caller is documented to uphold.
+pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
+    match list.strategy {
+        ListStrategy::Empty => {
+            if newsize != 0 {
+                let Ok(newsize) = isize::try_from(newsize) else {
+                    return false;
+                };
+                let state_slot = crate::gc_roots::shadow_stack_len();
+                let state = alloc_sizehint_state(newsize as i64);
+                let _ = crate::gc_roots::pin_root(state as PyObjectRef);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                list_write_barrier(obj);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                let list = &mut *(obj as *mut W_ListObject);
+                list.strategy = ListStrategy::Size;
+                list.items = crate::gc_roots::shadow_stack_get(state_slot) as *mut ItemsBlock;
+            }
+            return true;
+        }
+        ListStrategy::Size => {
+            let Ok(newsize) = isize::try_from(newsize) else {
+                return false;
+            };
+            set_sizehint_state_value(list.items, newsize as i64);
+            return true;
+        }
+        _ => {}
+    }
+
+    let newsize = usize::try_from(newsize).unwrap_or(0);
+
+    let current = match list.strategy {
+        ListStrategy::Object => list.object_items_capacity(),
+        ListStrategy::Integer | ListStrategy::IntOrFloat => list.int_items.heap_capacity(),
+        ListStrategy::Float => list.float_items.heap_capacity(),
+        ListStrategy::Bytes => list.bytes_items.heap_capacity(),
+        ListStrategy::Ascii => list.ascii_items.heap_capacity(),
+        ListStrategy::Empty | ListStrategy::Size => unreachable!(),
+    };
+    let requested = newsize.max(list.live_len());
+    let target = if requested > current {
+        let extra = if requested < 9 { 3 } else { 6 };
+        let Some(target) = requested
+            .checked_add(extra)
+            .and_then(|n| n.checked_add(requested >> 3))
+        else {
+            return false;
+        };
+        target
+    } else if requested < (current >> 1).saturating_sub(5) {
+        requested
+    } else {
+        return true;
+    };
+
+    match list.strategy {
+        ListStrategy::Object => {
+            let _ = W_ListObject::object_resize_capacity(obj, target);
+        }
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let old = list.int_items.block;
+            let len = list.int_items.len();
+            if target == 0 {
+                crate::object_array::dealloc_typed_items_block(old);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                let list = &mut *(obj as *mut W_ListObject);
+                list.int_items.block = std::ptr::null_mut();
+                list.int_items.set_len(0);
+            } else {
+                let fresh = crate::object_array::grow_typed_items_block(
+                    old,
+                    target,
+                    len,
+                    crate::object_array::gc_int_array_gc_type_id(),
+                );
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                (*(obj as *mut W_ListObject)).int_items.block = fresh;
+            }
+        }
+        ListStrategy::Float => {
+            let old = list.float_items.block;
+            let len = list.float_items.len();
+            if target == 0 {
+                crate::object_array::dealloc_typed_items_block(old);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                let list = &mut *(obj as *mut W_ListObject);
+                list.float_items.block = std::ptr::null_mut();
+                list.float_items.set_len(0);
+            } else {
+                let fresh = crate::object_array::grow_typed_items_block(
+                    old,
+                    target,
+                    len,
+                    crate::object_array::gc_float_array_gc_type_id(),
+                );
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                (*(obj as *mut W_ListObject)).float_items.block = fresh;
+            }
+        }
+        ListStrategy::Bytes => {
+            let _ = W_ListObject::bytes_resize_capacity(obj, target);
+        }
+        ListStrategy::Ascii => {
+            let _ = W_ListObject::ascii_resize_capacity(obj, target);
+        }
+        ListStrategy::Empty | ListStrategy::Size => unreachable!(),
+    }
+    true
 }
 
 /// Reserve CPython's logical slots before `list.extend` consumes its source.
@@ -2392,7 +2745,7 @@ pub unsafe fn w_list_can_append_without_realloc(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // EmptyListStrategy holds no array yet — first append always reallocates.
-        ListStrategy::Empty => false,
+        ListStrategy::Empty | ListStrategy::Size => false,
         ListStrategy::Object => list.object_spare_capacity() > 0,
         ListStrategy::Integer => list.int_items.spare_capacity() > 0,
         ListStrategy::IntOrFloat => list.int_items.spare_capacity() > 0,
@@ -2410,7 +2763,7 @@ pub unsafe fn w_list_is_inline_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // EmptyListStrategy.lstorage = self.erase(None) — no backing array.
-        ListStrategy::Empty => false,
+        ListStrategy::Empty | ListStrategy::Size => false,
         // Object strategy stores items in a GC-shaped `ItemsBlock`, never
         // an inline allocation — upstream rlist.py doesn't have an
         // "inline" bit either.
@@ -2533,7 +2886,7 @@ pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const Py
 unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
     match list.strategy {
         // listobject.py EmptyListStrategy.getitems returns [].
-        ListStrategy::Empty => Vec::new(),
+        ListStrategy::Empty | ListStrategy::Size => Vec::new(),
         ListStrategy::Object => list.object_to_vec(),
         ListStrategy::Integer => {
             let items = list.int_items.as_slice();
@@ -2606,7 +2959,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         // EmptyListStrategy doesn't override insert, so it falls through
         // ListStrategy.insert (listobject.py) → switches to typed strategy
         // via append. Mirror by switching first then re-dispatching.
-        ListStrategy::Empty => {
+        ListStrategy::Empty | ListStrategy::Size => {
             switch_to_correct_strategy(list, value);
             w_list_insert(
                 crate::gc_roots::shadow_stack_get(root_base),
@@ -2753,7 +3106,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let old_size = list.live_len();
     let result = match list.strategy {
         // listobject.py EmptyListStrategy.pop raises IndexError.
-        ListStrategy::Empty => None,
+        ListStrategy::Empty | ListStrategy::Size => None,
         ListStrategy::Integer => {
             let len = list.int_items.len() as i64;
             if len == 0 {
@@ -2854,7 +3207,7 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
     let length = match list.strategy {
-        ListStrategy::Empty => 0,
+        ListStrategy::Empty | ListStrategy::Size => 0,
         ListStrategy::Integer => ll_list_int_length(list),
         ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
@@ -2884,7 +3237,7 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
     match list.strategy {
         // EmptyListStrategy.pop is unreachable after descr_pop's length check
         // (pypy/objspace/std/listobject.py).
-        ListStrategy::Empty => PY_NULL,
+        ListStrategy::Empty | ListStrategy::Size => PY_NULL,
         ListStrategy::Integer => {
             let length = ll_list_int_length(list);
             let index = length - 1;
@@ -3005,6 +3358,17 @@ pub unsafe fn w_list_is_empty_strategy(obj: PyObjectRef) -> bool {
     (*(obj as *const W_ListObject)).strategy == ListStrategy::Empty
 }
 
+/// SizeListStrategy.get_sizehint; `None` for every other strategy.
+pub unsafe fn w_list_sizehint(obj: PyObjectRef) -> Option<i64> {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &*(obj as *const W_ListObject);
+    (list.strategy == ListStrategy::Size).then(|| sizehint_state_value(list.items))
+}
+
 /// listobject.py `W_ListObject.__init__` applied to an existing list:
 /// re-pick the strategy for `items` and install fresh storage, dropping
 /// whatever the list held.  This is how `descr_sort` (listobject.py) puts
@@ -3050,7 +3414,11 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     // `drop_object_items`' `try_gc_owns_object` query is a safepoint and the
     // fresh blocks have no heap edge until the stores below, so close their pin
     // bracket only once it is behind them (`IntArray::install`).
-    list.drop_object_items();
+    if list.strategy == ListStrategy::Object {
+        list.drop_object_items();
+    } else {
+        list.items = std::ptr::null_mut();
+    }
     storage.reload_typed_blocks();
     if let Some(s) = block_root {
         storage.block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
@@ -3094,7 +3462,12 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     if list.live_len() == 0 && list.allocated == -1 {
         return;
     }
-    list.drop_object_items();
+    if list.strategy == ListStrategy::Object {
+        list.drop_object_items();
+    } else {
+        list.items = std::ptr::null_mut();
+        list.set_length_relaxed(0);
+    }
     // Empty strategy reads neither typed array; the next append reinstalls the
     // matching one through `switch_to_correct_strategy`.
     list.int_items.install(IntArray::empty());
@@ -3102,20 +3475,61 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     list.bytes_items.install(BytesArray::empty());
     list.ascii_items.install(UnicodeArray::empty());
     list.strategy = ListStrategy::Empty;
+    list.set_length_relaxed(0);
     list.allocated = 0;
 }
 
 /// listobject.py EmptyListStrategy.switch_to_correct_strategy —
-/// public entry for the JIT's empty-append promotion. Installs empty typed
-/// storage (capacity-1 block, length 0) matching `value`'s type, WITHOUT
-/// appending. The caller performs the append afterward (the typed spare-
-/// capacity leg). Only valid on an Empty-strategy list.
+/// public entry for the JIT's empty-append staging. It selects the strategy and
+/// applies the first `_ll_list_resize_ge` growth (0 -> 4) WITHOUT changing the
+/// logical length or storing the item. The trace emitter stages the same array;
+/// the caller then performs the append through the spare-capacity leg. Only
+/// valid on an Empty-strategy list.
 /// # Safety
 /// `obj` must point to a valid Empty-strategy `W_ListObject`; `value` live.
-pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef) {
+pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let value = crate::gc_roots::shadow_stack_get(root_base + 1);
     let list = &mut *(obj as *mut W_ListObject);
     debug_assert_eq!(list.strategy, ListStrategy::Empty);
-    switch_to_correct_strategy(list, value);
+    let _ = switch_to_correct_strategy(list, value);
+    // `switch_to_correct_strategy` owns a nested root scope. Reload the outer
+    // slot before the first resize, then follow rlist's `_ll_list_resize_ge`
+    // allocation discipline: retain the old block only as an allocation
+    // input, and reload the possibly moved list before publishing the result.
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
+    match list.strategy {
+        ListStrategy::Integer => {
+            let fresh = crate::object_array::grow_typed_items_block(
+                list.int_items.block,
+                4,
+                0,
+                crate::object_array::gc_int_array_gc_type_id(),
+            );
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            (*(obj as *mut W_ListObject)).int_items.block = fresh;
+        }
+        ListStrategy::Float => {
+            let fresh = crate::object_array::grow_typed_items_block(
+                list.float_items.block,
+                4,
+                0,
+                crate::object_array::gc_float_array_gc_type_id(),
+            );
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            (*(obj as *mut W_ListObject)).float_items.block = fresh;
+        }
+        ListStrategy::Object => {
+            let _ = W_ListObject::object_resize_capacity(obj, 4);
+        }
+        _ => unreachable!("orthodox append fold admits int, float, or object storage"),
+    }
+    crate::gc_roots::shadow_stack_get(root_base)
 }
 
 /// listobject.py IntegerListStrategy.reverse
@@ -3128,7 +3542,7 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     match list.strategy {
         // Empty has nothing to reverse — falls through ListStrategy.reverse
         // (listobject.py defaults) which is a no-op for length 0.
-        ListStrategy::Empty => {}
+        ListStrategy::Empty | ListStrategy::Size => {}
         ListStrategy::Integer => list.int_items.as_mut_slice().reverse(),
         ListStrategy::IntOrFloat => list.int_items.as_mut_slice().reverse(),
         ListStrategy::Float => list.float_items.as_mut_slice().reverse(),
@@ -3149,7 +3563,7 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let mut changed = false;
     match list.strategy {
         // listobject.py EmptyListStrategy.deleteslice is a no-op (pass).
-        ListStrategy::Empty => {}
+        ListStrategy::Empty | ListStrategy::Size => {}
         ListStrategy::Integer => {
             let len = list.int_items.len();
             let s = start.min(len);
@@ -3271,7 +3685,7 @@ pub unsafe fn w_list_find_or_count_fast(
         // listobject.py EmptyListStrategy.find_or_count: returns
         // `0` in count mode and raises ValueError otherwise. Map the
         // ValueError to NotFound for the find case.
-        ListStrategy::Empty => {
+        ListStrategy::Empty | ListStrategy::Size => {
             if count {
                 ListFindFast::Count(0)
             } else {
@@ -3416,9 +3830,18 @@ unsafe fn w_list_setslice_inner(
         // listobject.py EmptyListStrategy.setslice: adopt donor's
         // strategy and storage wholesale. start/end are 0 because list
         // is empty, so this is just "become a copy of w_other".
-        if list.strategy == ListStrategy::Empty {
+        if matches!(list.strategy, ListStrategy::Empty | ListStrategy::Size) {
+            if matches!(other.strategy, ListStrategy::Empty | ListStrategy::Size) {
+                // EmptyListStrategy.copy_into is a no-op. SizeListStrategy
+                // inherits it, so the receiver keeps its current strategy
+                // object (and shared hint state).
+                return Ok(());
+            }
+            if list.strategy == ListStrategy::Size {
+                list.items = std::ptr::null_mut();
+            }
             match other.strategy {
-                ListStrategy::Empty => return Ok(()),
+                ListStrategy::Empty | ListStrategy::Size => unreachable!("handled above"),
                 ListStrategy::Integer => {
                     let fresh = IntArray::from_vec(other.int_items.to_vec());
                     list.int_items.install(fresh);
@@ -3526,7 +3949,7 @@ unsafe fn w_list_setslice_inner(
         let other_len = w_list_len(w_other);
         if list.strategy == other.strategy || other_len == 0 {
             match list.strategy {
-                ListStrategy::Empty => unreachable!("handled above"),
+                ListStrategy::Empty | ListStrategy::Size => unreachable!("handled above"),
                 ListStrategy::Integer => {
                     let new_items = if list.strategy == other.strategy {
                         other.int_items.as_slice()
@@ -3726,6 +4149,7 @@ mod tests {
     #[test]
     fn strategy_class_names_follow_interp_magic_spellings() {
         assert_eq!(ListStrategy::Empty.class_name(), "EmptyListStrategy");
+        assert_eq!(ListStrategy::Size.class_name(), "SizeListStrategy");
         assert_eq!(ListStrategy::Object.class_name(), "ObjectListStrategy");
         assert_eq!(ListStrategy::Integer.class_name(), "IntegerListStrategy");
         assert_eq!(ListStrategy::Float.class_name(), "FloatListStrategy");
@@ -3874,20 +4298,38 @@ mod tests {
         let donor = w_list_new(vec![crate::w_str_new("b")]);
         unsafe {
             w_list_insert(list, 1, crate::w_str_new("d"));
-            assert_eq!((*(list as *const W_ListObject)).strategy, ListStrategy::Ascii);
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Ascii
+            );
             w_list_delslice(list, 1, 2);
             w_list_setslice(list, 1, 1, donor).unwrap();
             assert!(w_list_sort_strings(list, false));
-            assert_eq!(crate::w_str_get_value(w_list_getitem(list, 0).unwrap()), "a");
-            assert_eq!(crate::w_str_get_value(w_list_getitem(list, 1).unwrap()), "b");
-            assert_eq!(crate::w_str_get_value(w_list_getitem(list, 2).unwrap()), "c");
+            assert_eq!(
+                crate::w_str_get_value(w_list_getitem(list, 0).unwrap()),
+                "a"
+            );
+            assert_eq!(
+                crate::w_str_get_value(w_list_getitem(list, 1).unwrap()),
+                "b"
+            );
+            assert_eq!(
+                crate::w_str_get_value(w_list_getitem(list, 2).unwrap()),
+                "c"
+            );
             w_list_reverse(list);
             assert_eq!(crate::w_str_get_value(w_list_pop(list, 0).unwrap()), "c");
-            assert_eq!((*(list as *const W_ListObject)).strategy, ListStrategy::Ascii);
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Ascii
+            );
 
             let empty = w_list_new(Vec::new());
             w_list_setslice(empty, 0, 0, list).unwrap();
-            assert_eq!((*(empty as *const W_ListObject)).strategy, ListStrategy::Ascii);
+            assert_eq!(
+                (*(empty as *const W_ListObject)).strategy,
+                ListStrategy::Ascii
+            );
             assert_eq!(w_list_len(empty), 2);
         }
     }
@@ -4338,6 +4780,119 @@ mod tests {
         unsafe {
             assert!(w_list_uses_empty_storage(list));
             assert_eq!(w_list_len(list), 0);
+        }
+    }
+
+    #[test]
+    fn test_size_list_strategy_consumes_hint_on_first_append() {
+        // listobject.py SizeListStrategy inherits EmptyListStrategy and only
+        // overrides get_sizehint/_resize_hint.
+        let list = w_list_new_with_sizehint(13);
+        unsafe {
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Size
+            );
+            assert_eq!(w_list_len(list), 0);
+            assert_eq!(w_list_physical_size(list), 0);
+            w_list_append(list, w_int_new(7));
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Integer
+            );
+            assert_eq!(w_list_physical_size(list), 13);
+            assert_eq!(w_list_len(list), 1);
+            assert_eq!(w_int_get_value(w_list_getitem(list, 0).unwrap()), 7);
+        }
+    }
+
+    #[test]
+    fn test_size_list_strategy_clone_shares_strategy_state() {
+        // SizeListStrategy inherits EmptyListStrategy.clone, which retains
+        // `self` rather than constructing a new strategy object.
+        unsafe {
+            let list = w_list_new_with_sizehint(5);
+            let clone = w_list_clone_if_size(list).unwrap();
+            assert!(w_list_resize_hint(list, 9));
+            w_list_append(clone, w_int_new(7));
+            assert_eq!(w_list_physical_size(clone), 9);
+        }
+    }
+
+    #[test]
+    fn test_object_list_sizehint_preallocates_without_changing_length() {
+        // BaseObjSpace._unpackiterable_unknown_length uses RPython
+        // newlist_hint for a raw list[W_Root], not SizeListStrategy.
+        unsafe {
+            let list = w_list_new_object_with_sizehint(11);
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Object
+            );
+            assert_eq!(w_list_len(list), 0);
+            assert_eq!(w_list_physical_size(list), 11);
+            w_list_append(list, w_int_new(7));
+            assert_eq!(w_list_physical_size(list), 11);
+
+            let empty = w_list_new_object_with_sizehint(0);
+            assert_eq!(w_list_physical_size(empty), 0);
+        }
+    }
+
+    #[test]
+    fn test_size_list_strategy_preallocates_each_unwrapped_storage() {
+        unsafe {
+            let float = w_list_new_with_sizehint(5);
+            w_list_append(float, w_float_new(1.5));
+            assert_eq!(
+                (*(float as *const W_ListObject)).strategy,
+                ListStrategy::Float
+            );
+            assert_eq!(w_list_physical_size(float), 5);
+
+            let bytes = w_list_new_with_sizehint(6);
+            w_list_append(bytes, crate::bytesobject::w_bytes_from_bytes(b"x"));
+            assert_eq!(
+                (*(bytes as *const W_ListObject)).strategy,
+                ListStrategy::Bytes
+            );
+            assert_eq!(w_list_physical_size(bytes), 6);
+
+            let ascii = w_list_new_with_sizehint(7);
+            w_list_append(ascii, crate::unicodeobject::w_str_new("x"));
+            assert_eq!(
+                (*(ascii as *const W_ListObject)).strategy,
+                ListStrategy::Ascii
+            );
+            assert_eq!(w_list_physical_size(ascii), 7);
+
+            let object = w_list_new_with_sizehint(8);
+            w_list_append(object, crate::w_none());
+            assert_eq!(
+                (*(object as *const W_ListObject)).strategy,
+                ListStrategy::Object
+            );
+            assert_eq!(w_list_physical_size(object), 8);
+        }
+    }
+
+    #[test]
+    fn test_resize_hint_uses_rpython_capacity_policy() {
+        unsafe {
+            let empty = w_list_new(Vec::new());
+            assert!(w_list_resize_hint(empty, 13));
+            assert_eq!(
+                (*(empty as *const W_ListObject)).strategy,
+                ListStrategy::Size
+            );
+            assert_eq!(w_list_sizehint(empty), Some(13));
+
+            let ints = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+            assert_eq!(w_list_physical_size(ints), 2);
+            assert!(w_list_resize_hint(ints, 10));
+            // rlist.py: newsize + 6 + (newsize >> 3)
+            assert_eq!(w_list_physical_size(ints), 17);
+            assert_eq!(w_int_get_value(w_list_getitem(ints, 1).unwrap()), 2);
         }
     }
 

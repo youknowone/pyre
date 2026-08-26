@@ -1218,10 +1218,11 @@ pub fn emit_typed_list_inline(
 
 /// Empty->typed in-place promotion of an existing `W_ListObject` wrapper (the
 /// comprehension accumulator). Mirrors `switch_to_correct_strategy`'s concrete
-/// effect as field mutations on `list_op`: allocate the capacity-1 typed
-/// backing block, then set strategy and the matching empty storage fields.
-/// Length stays 0; the subsequent append body sub-walk fills slot 0 through
-/// the spare-capacity leg.
+/// effect as field mutations on `list_op`: set the strategy and stage the
+/// capacity-4 storage produced by the first RPython `_ll_list_resize_ge`.
+/// `w_list_switch_to_strategy_for` applies the same concrete pre-grow before
+/// this emitter runs; the following append sub-walk therefore records only
+/// the length/item stores against identical concrete and symbolic shapes.
 pub fn emit_promote_empty_list_inline(
     ctx: &mut TraceCtx,
     list_op: OpRef,
@@ -1233,7 +1234,7 @@ pub fn emit_promote_empty_list_inline(
     };
     use crate::state::{float_gcarray_descr, int_gcarray_descr, pyobject_gcarray_descr};
 
-    let cap_ref = ctx.const_int(1);
+    let cap_ref = ctx.const_int(4);
     let zero_ref = ctx.const_int(0);
 
     match strategy {
@@ -1261,14 +1262,6 @@ pub fn emit_promote_empty_list_inline(
             let items_block_idx = items_block_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
             ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
-            // Seed the block's capacity getfield cache with the const (1). The
-            // block is a fresh const-size allocation whose capacity is known,
-            // matching the heapcache length tracking a `new_array` gets for a
-            // const-length array (heapcache.py `new_array` →
-            // `arraylen_now_known`). The append body sub-walk reads
-            // `ItemsBlock.capacity` via a getfield (not arraylen), so seed that
-            // field-index channel explicitly; otherwise the read stays symbolic
-            // and the spare-capacity `0 < capacity` branch cannot fold.
             let cap_idx = crate::descr::items_block_capacity_descr().index();
             ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
         }
@@ -1296,9 +1289,6 @@ pub fn emit_promote_empty_list_inline(
             let items_block_idx = items_block_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
             ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
-            // Seed the block's capacity getfield cache with the const (1); see
-            // the Integer arm above for the rationale (const-size block, getfield
-            // capacity channel distinct from the `new_array` arraylen seed).
             let cap_idx = crate::descr::items_block_capacity_descr().index();
             ctx.heapcache_setfield_cached(block, cap_idx, cap_ref);
         }
@@ -1326,11 +1316,9 @@ pub fn emit_promote_empty_list_inline(
             let items_idx = items_descr.index();
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_descr);
             ctx.heapcache_setfield_cached(list_op, items_idx, block);
-            // Object storage needs no capacity seed: the append body reads
-            // capacity through `list.items` (list_items_descr), a path that
-            // already resolves to the concrete block.
         }
         pyre_object::listobject::ListStrategy::Empty
+        | pyre_object::listobject::ListStrategy::Size
         | pyre_object::listobject::ListStrategy::IntOrFloat
         | pyre_object::listobject::ListStrategy::Bytes
         | pyre_object::listobject::ListStrategy::Ascii => {
@@ -1340,6 +1328,7 @@ pub fn emit_promote_empty_list_inline(
             debug_assert!(matches!(
                 strategy,
                 pyre_object::listobject::ListStrategy::Empty
+                    | pyre_object::listobject::ListStrategy::Size
                     | pyre_object::listobject::ListStrategy::IntOrFloat
                     | pyre_object::listobject::ListStrategy::Bytes
                     | pyre_object::listobject::ListStrategy::Ascii

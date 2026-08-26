@@ -786,6 +786,9 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     arity_no_args(args, "copy")?;
     let list = args[0];
     unsafe {
+        if let Some(clone) = pyre_object::listobject::w_list_clone_if_size(list) {
+            return Ok(clone);
+        }
         let n = w_list_len(list);
         let mut items = Vec::with_capacity(n);
         for i in 0..n {

@@ -13887,8 +13887,10 @@ fn _unpackiterable_unknown_length(
     let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
     // baseobjspace.py — `try: items = newlist_hint(length_hint(...))
     // except MemoryError: items = []`.
-    let _ = length_hint(w_iterable, 0)?;
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new_empty());
+    let sizehint = length_hint(w_iterable, 0)?;
+    let _ = pyre_object::gc_roots::pin_root(
+        pyre_object::listobject::w_list_new_object_with_sizehint(sizehint),
+    );
     // The slot index is computed once here, not at the append below.  Spelled
     // `root_base + 1` inside the drain's `Ok` arm, the addition lands in the
     // arm's own block ahead of the call, and the link out of that block then

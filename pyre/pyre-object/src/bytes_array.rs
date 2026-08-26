@@ -47,6 +47,19 @@ impl BytesArray {
         }
     }
 
+    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for bytes.
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity == 0 {
+            return Self::empty();
+        }
+        Self {
+            block: unsafe {
+                crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
+            },
+            len: 0,
+        }
+    }
+
     #[must_use]
     pub fn pin_block(&self) -> usize {
         let slot = crate::gc_roots::shadow_stack_len();

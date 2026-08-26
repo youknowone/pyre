@@ -705,7 +705,9 @@ fn pin_unboxed_container_referents(source_slot: usize) {
             let list = &*(w_obj as *const listobject::W_ListObject);
             if matches!(
                 list.strategy,
-                listobject::ListStrategy::Empty | listobject::ListStrategy::Object
+                listobject::ListStrategy::Empty
+                    | listobject::ListStrategy::Size
+                    | listobject::ListStrategy::Object
             ) {
                 return;
             }
