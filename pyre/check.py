@@ -342,7 +342,12 @@ PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
 SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S = 5
 CARGO_CONFIG = {
     "dynasm": {
-        "extra": ["--no-default-features", "--features", "dynasm"],
+        # `cpyext`, because the CPython suite step that rides this backend's
+        # Linux leg builds `_testbuffer`, `_testsinglephase` and
+        # `_testmultiphase` against the binary built here: without the feature
+        # `test_buffer` skips `TestBufferProtocol` wholesale, which is 95 of
+        # that module's cases, and `test_importlib.extension` skips too.
+        "extra": ["--no-default-features", "--features", "dynasm,cpyext"],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
@@ -1022,6 +1027,12 @@ def _first_stderr_line(stderr):
     return f"  {reason}"
 
 
+# Characters of a Rust panic's message body to keep. Wide enough for the
+# collector's longest `GC BUG` diagnostic, whose trailing fields are the ones
+# that attribute a crash nobody can reproduce on demand.
+PANIC_BODY_CHARS = 2000
+
+
 def _jit_panic_reason(stderr):
     """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
     nonzero internal_compile_panics stat, else None.
@@ -1053,11 +1064,14 @@ def _jit_panic_reason(stderr):
                 # crash with no way to attribute it. At 400 the two
                 # `invalid type_id` diagnostics, which reach about 800
                 # characters once their eight-word holder and child dumps are
-                # in, are cut inside the first dump.
+                # in, are cut inside the first dump, and at 1200 the major
+                # collector's own is cut at `site=` — dropping both
+                # generations, the remembered-set membership and the enclosing
+                # container.
                 for follow in lines[idx + 1 :]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:1200]}"
+                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
                         break
                 return reason
         return "rust panic"

@@ -603,6 +603,21 @@ assert driver.describe(bytearray(b'abc')) == (3, 1, 1, 'B', 3, 1)
 assert driver.describe(array.array('i', [1, 2])) == (8, 4, 1, 'i', 2, 4)
 assert driver.describe(memoryview(b'abcd')[1:]) == (3, 1, 1, 'B', 3, 1)
 
+# A view with no dimensions carries no dimension vectors at all: `shape` and
+# `strides` are absent rather than empty, and stay absent through a
+# `memoryview` and back into C.  `PyBuffer_GetPointer` is handed no index for
+# such a view, so a fabricated dimension makes it read one that is not there.
+scalar = m.Scalar(1.5)
+assert driver.describe(scalar) == (8, 8, 0, 'd', -1, -1)
+assert driver.describe(memoryview(scalar)) == (8, 8, 0, 'd', -1, -1)
+assert scalar.at(scalar) == 1.5
+assert scalar.at(memoryview(scalar)) == 1.5
+
+view = memoryview(scalar)
+assert (view.ndim, view.shape, view.strides, view.nbytes) == (0, (), (), 8)
+assert view.tolist() == 1.5
+assert len(bytes(view)) == 8
+
 # A strided export is refused by a request that cannot describe one.
 try:
     driver.read(memoryview(b'abcdef')[::2])

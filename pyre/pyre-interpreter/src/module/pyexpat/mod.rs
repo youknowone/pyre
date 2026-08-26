@@ -2203,13 +2203,28 @@ crate::py_module! {
         crate::module_ns_store(ns, "errors", errors);
 
         // features — list of (name, value) capability tuples.
-        let features = w_list_new(vec![
-            w_tuple_new(vec![w_str_new("sizeof(XML_Char)"), w_int_new(1)]),
-            w_tuple_new(vec![w_str_new("sizeof(XML_LChar)"), w_int_new(1)]),
-            w_tuple_new(vec![w_str_new("XML_DTD"), w_int_new(0)]),
-            w_tuple_new(vec![w_str_new("XML_CONTEXT_BYTES"), w_int_new(1024)]),
-            w_tuple_new(vec![w_str_new("XML_NS"), w_int_new(0)]),
-        ]);
+        // Each name, value and tuple allocates while the pieces already built
+        // are named only by a Rust local, so both levels are pinned as they are
+        // produced: the pair until its tuple exists, the tuples until the list
+        // does.  A pair's bracket closes before the tuple joins the outer set —
+        // the outer slots would otherwise sit above it and be popped with it.
+        let mut feature_items = pyre_object::gc_roots::RootedItems::new();
+        for (name, value) in [
+            ("sizeof(XML_Char)", 1),
+            ("sizeof(XML_LChar)", 1),
+            ("XML_DTD", 0),
+            ("XML_CONTEXT_BYTES", 1024),
+            ("XML_NS", 0),
+        ] {
+            let entry = {
+                let mut pair = pyre_object::gc_roots::RootedItems::new();
+                pair.push(w_str_new(name));
+                pair.push(w_int_new(value));
+                w_tuple_new(pair.take())
+            };
+            feature_items.push(entry);
+        }
+        let features = w_list_new(feature_items.take());
         crate::module_ns_store(ns, "features", features);
     },
 }

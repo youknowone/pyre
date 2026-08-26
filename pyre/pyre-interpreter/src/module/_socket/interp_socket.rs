@@ -1574,27 +1574,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if head.is_null() {
                         return Err(socket_last_error());
                     }
-                    let mut items = Vec::new();
+                    // Every field and entry is freshly allocated and the next
+                    // one allocates again, so each is pinned as it is produced
+                    // (`build_list_storage`).  The field bracket closes before
+                    // its tuple joins the outer one: the pins share one stack
+                    // and must unwind in order.
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
                     let mut p = head;
                     unsafe {
                         while (*p).if_index != 0 && !(*p).if_name.is_null() {
-                            // An interface name is an OS string: `dev_valid_name`
-                            // rejects only NUL, '/', ':', whitespace, '.' and
-                            // '..', so any other octet is legal.  The sibling
-                            // `if_nametoindex` below fsencodes, so decoding
-                            // here any other way breaks the round trip.
-                            let name = crate::gateway::fsdecode_filename_bytes(
-                                std::ffi::CStr::from_ptr((*p).if_name).to_bytes(),
-                            );
-                            items.push(pyre_object::w_tuple_new(vec![
-                                pyre_object::w_int_new((*p).if_index as i64),
-                                name,
-                            ]));
+                            let entry = {
+                                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                                fields.push(pyre_object::w_int_new((*p).if_index as i64));
+                                // An interface name is an OS string:
+                                // `dev_valid_name` rejects only NUL, '/', ':',
+                                // whitespace, '.' and '..', so any other octet
+                                // is legal.  The sibling `if_nametoindex` below
+                                // fsencodes, so decoding here any other way
+                                // breaks the round trip.
+                                fields.push(crate::gateway::fsdecode_filename_bytes(
+                                    std::ffi::CStr::from_ptr((*p).if_name).to_bytes(),
+                                ));
+                                pyre_object::w_tuple_new(fields.take())
+                            };
+                            items.push(entry);
                             p = p.add(1);
                         }
                         libc::if_freenameindex(head);
                     }
-                    Ok(pyre_object::w_list_new(items))
+                    Ok(pyre_object::w_list_new(items.take()))
                 },
                 0,
             ),
@@ -2209,7 +2217,12 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 return Err(socket_converted_error("gaierror", Some(rc), &msg));
             }
 
-            let mut items = Vec::new();
+            // Every field and entry is freshly allocated and the next lap
+            // allocates again, so each is pinned as it is produced
+            // (`build_list_storage`).  The field bracket closes before its
+            // tuple joins the outer one: the pins share one stack and must
+            // unwind in order.
+            let mut items = pyre_object::gc_roots::RootedItems::new();
             let mut cur = res;
             unsafe {
                 while !cur.is_null() {
@@ -2231,19 +2244,21 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut u8,
                         copy_len,
                     );
-                    let addr = unpack_inet_addr(&storage, copy_len as rffi::SockLen);
-                    items.push(pyre_object::w_tuple_new(vec![
-                        pyre_object::w_int_new(ai.ai_family as i64),
-                        pyre_object::w_int_new(ai.ai_socktype as i64),
-                        pyre_object::w_int_new(ai.ai_protocol as i64),
-                        pyre_object::w_str_new(&canon),
-                        addr,
-                    ]));
+                    let entry = {
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(ai.ai_family as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_socktype as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_protocol as i64));
+                        fields.push(pyre_object::w_str_new(&canon));
+                        fields.push(unpack_inet_addr(&storage, copy_len as rffi::SockLen));
+                        pyre_object::w_tuple_new(fields.take())
+                    };
+                    items.push(entry);
                     cur = ai.ai_next;
                 }
                 rffi::freeaddrinfo(res);
             }
-            Ok(pyre_object::w_list_new(items))
+            Ok(pyre_object::w_list_new(items.take()))
         }),
     );
 
@@ -4672,8 +4687,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             data.truncate(got as usize);
 
             // Walk ancillary data.  Re-run msghdr with the final
-            // controllen so CMSG_* macros see the trimmed buffer.
-            let mut anc_items = Vec::new();
+            // controllen so CMSG_* macros see the trimmed buffer.  Every field
+            // and cmsg tuple is freshly allocated and the next one allocates
+            // again, so each is pinned as it is produced (`build_list_storage`);
+            // the field bracket closes before its tuple joins the outer one,
+            // because the pins share one stack and must unwind in order.
+            let mut anc_items = pyre_object::gc_roots::RootedItems::new();
             if ancbufsize > 0 {
                 let mut iov = libc::iovec {
                     iov_base: data.as_mut_ptr() as *mut libc::c_void,
@@ -4696,11 +4715,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         let payload_len = total - hdr_size;
                         let payload_ptr = libc::CMSG_DATA(cmsg);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        anc_items.push(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_int_new(header.cmsg_level as i64),
-                            pyre_object::w_int_new(header.cmsg_type as i64),
-                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
-                        ]));
+                        let entry = {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                            fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                            fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&payload));
+                            pyre_object::w_tuple_new(fields.take())
+                        };
+                        anc_items.push(entry);
                         cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
                 }
@@ -4708,7 +4730,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let addr = unpack_inet_addr(&storage, msg_namelen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&data),
-                pyre_object::w_list_new(anc_items),
+                pyre_object::w_list_new(anc_items.take()),
                 pyre_object::w_int_new(msg_flags as i64),
                 addr,
             ]))
@@ -4828,7 +4850,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 crate::module::signal::interp_signal::checksignals_now()?;
             };
 
-            let mut anc_items = Vec::new();
+            // Every field and cmsg tuple is freshly allocated and the next one
+            // allocates again, so each is pinned as it is produced
+            // (`build_list_storage`); the field bracket closes before its tuple
+            // joins the outer one, because the pins share one stack and must
+            // unwind in order.
+            let mut anc_items = pyre_object::gc_roots::RootedItems::new();
             if ancbufsize > 0 && controllen > 0 {
                 let mut dummy_iov = libc::iovec {
                     iov_base: std::ptr::null_mut(),
@@ -4851,11 +4878,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         let payload_len = total - hdr_size;
                         let payload_ptr = libc::CMSG_DATA(cmsg);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        anc_items.push(pyre_object::w_tuple_new(vec![
-                            pyre_object::w_int_new(header.cmsg_level as i64),
-                            pyre_object::w_int_new(header.cmsg_type as i64),
-                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
-                        ]));
+                        let entry = {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                            fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                            fields.push(pyre_object::bytesobject::w_bytes_from_bytes(&payload));
+                            pyre_object::w_tuple_new(fields.take())
+                        };
+                        anc_items.push(entry);
                         cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
                 }
@@ -4863,7 +4893,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let addr = unpack_inet_addr(&storage, msg_namelen);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(got as i64),
-                pyre_object::w_list_new(anc_items),
+                pyre_object::w_list_new(anc_items.take()),
                 pyre_object::w_int_new(msg_flags as i64),
                 addr,
             ]))

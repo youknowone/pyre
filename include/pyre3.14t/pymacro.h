@@ -10,6 +10,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Minimum value between x and y */
+#define Py_MIN(x, y) (((x) > (y)) ? (y) : (x))
+
+/* Maximum value between x and y */
+#define Py_MAX(x, y) (((x) > (y)) ? (x) : (y))
+
 /* Names an argument a function does not read, so the compiler stops warning
    about it: `int func(int a, int Py_UNUSED(b))`. */
 #if defined(__GNUC__) || defined(__clang__)

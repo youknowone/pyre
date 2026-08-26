@@ -169,6 +169,25 @@ def platform_gate(module: str) -> str | None:
     return None if applies(sys.platform) else reason
 
 
+# `Modules/_testbuffer.c` is the exporter `test_buffer`'s `TestBufferProtocol`
+# is `skipUnless`d on, and the only C extension the suite needs.  CPython
+# builds it beside the interpreter; pyre builds it here against the same
+# headers `pyrex`'s cpyext fixtures compile against.  It reaches the modules
+# below and no others: `PYTHONPATH` is language-visible, and several modules
+# assert on the path their own child interpreters inherit.
+TEST_EXTENSION_SOURCES = {
+    "_testbuffer": ROOT / "lib_pypy" / "_testbuffer.c",
+    "_testsinglephase": ROOT / "lib_pypy" / "_testsinglephase.c",
+    "_testmultiphase": ROOT / "lib_pypy" / "_testmultiphase.c",
+}
+CPYEXT_INCLUDE = ROOT / "include" / "pyre3.14t"
+# The headers CPython keeps out of an installed tree and builds these modules
+# against inside its own: `_PyNamespace_New` and the argument parser Argument
+# Clinic writes calls to both live behind one.
+CPYEXT_INTERNAL_INCLUDE = CPYEXT_INCLUDE / "internal"
+EXTENSION_BUILD_DIR = ROOT / "build" / "cpython_tests"
+NEEDS_TEST_EXTENSION = {"test.test_buffer", "test.test_importlib"}
+
 # These modules intentionally assert on a child interpreter's exact stderr.
 # MAJIT_STATS is runner instrumentation rather than language-visible output,
 # so do not inject it into those modules or any subprocesses they spawn.
@@ -182,6 +201,13 @@ STATS_STDERR_INCOMPATIBLE = {
 }
 
 # ── classification ───────────────────────────────────────────────────
+
+# The collector's `GC BUG` panics carry the holder and child words, both
+# generations, the remembered-set membership and the enclosing container after
+# the `site=` field. At 200 characters every one of them is cut, which leaves a
+# rare crash unattributable from the run it appeared in.
+PANIC_BODY_CHARS = 2000
+
 
 def jit_panic_reason(stderr: str) -> str | None:
     """A JIT-level rust panic or nonzero internal_compile_panics, else None.
@@ -206,7 +232,7 @@ def jit_panic_reason(stderr: str) -> str | None:
                 for follow in lines[idx + 1:]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:1200]}"
+                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
                         break
                 return reason
         return "rust panic"
@@ -598,8 +624,71 @@ def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
     return [str(binary), str(module_path(module))]
 
 
+def build_test_extensions(binary: Path) -> tuple[Path | None, dict[str, str]]:
+    """Compile the test extensions for `binary`; answer their directory and,
+    per extension, why one is missing.
+
+    An interpreter built without `cpyext`, a platform the feature is not
+    compiled for, and a missing C compiler each leave every extension unbuilt,
+    and the directory is then `None`. A source that fails on its own leaves the
+    others usable, so its reason is reported alone. The tests that need one
+    skip exactly as they do upstream when the module is absent, rather than
+    failing the run.
+    """
+    if sys.platform not in ("darwin", "linux"):
+        reason = f"cpyext is built for macos and linux, not {sys.platform}"
+        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
+    named = subprocess.run(
+        [str(binary), "-c", "import _imp; print(_imp.extension_suffixes()[0])"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    suffix = named.stdout.strip().splitlines()[-1] if named.stdout.strip() else ""
+    if named.returncode != 0 or not suffix:
+        reason = "the interpreter reported no extension suffix"
+        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
+    EXTENSION_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    unbuilt = {}
+    for name, source in TEST_EXTENSION_SOURCES.items():
+        reason = build_one_test_extension(binary, name, source, suffix)
+        if reason:
+            unbuilt[name] = reason
+    return EXTENSION_BUILD_DIR, unbuilt
+
+
+def build_one_test_extension(binary: Path, name: str, source: Path,
+                             suffix: str) -> str:
+    """Compile one extension and prove the interpreter can import it, or say
+    why not."""
+    if not source.is_file():
+        return f"{source} is missing"
+    compile_cmd = [
+        os.environ.get("CC", "cc"), str(source),
+        "-I", str(CPYEXT_INCLUDE), "-I", str(CPYEXT_INTERNAL_INCLUDE),
+        "-o", str(EXTENSION_BUILD_DIR / f"{name}{suffix}"), "-O2",
+    ]
+    compile_cmd += (
+        ["-bundle", "-undefined", "dynamic_lookup"] if sys.platform == "darwin"
+        else ["-fPIC", "-shared"]
+    )
+    built = subprocess.run(
+        compile_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if built.returncode != 0:
+        return f"{compile_cmd[0]}: {last_stderr_line(built.stderr)}"
+    # Compiling proves the headers agree, not that the interpreter can load
+    # what they describe: a build without cpyext resolves none of the symbols.
+    loaded = subprocess.run(
+        [str(binary), "-c", f"import {name}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ, PYTHONPATH=str(EXTENSION_BUILD_DIR)),
+    )
+    if loaded.returncode != 0:
+        return f"built but not importable: {last_stderr_line(loaded.stderr)}"
+    return ""
+
+
 def run_module(binary: Path, module: str, mode: str, timeout: int,
-               env: dict) -> tuple[str, str]:
+               env: dict, extension_dir: Path | None = None) -> tuple[str, str]:
     # Run in a throwaway cwd so a test writing into '.' never touches the
     # repo (the stdlib is resolved relative to the executable, not cwd).
     # `ignore_cleanup_errors` because a test that leaves a file open takes the
@@ -656,8 +745,15 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
         else:
             cmd = build_cmd(binary, module, mode)
         module_env = env
-        if module in STATS_STDERR_INCOMPATIBLE:
+        if extension_dir is not None and module in NEEDS_TEST_EXTENSION:
             module_env = env.copy()
+            inherited = module_env.get("PYTHONPATH")
+            module_env["PYTHONPATH"] = os.pathsep.join(
+                [str(extension_dir)] + ([inherited] if inherited else [])
+            )
+        if module in STATS_STDERR_INCOMPATIBLE:
+            if module_env is env:
+                module_env = env.copy()
             module_env.pop("MAJIT_STATS", None)
         if mode == "script" and module == "test.test_regrtest":
             # libregrtest/setup.py:88-96 `setup_process` keeps a non-ASCII
@@ -780,8 +876,11 @@ def main() -> int:
     binary = binary.resolve()
     if not args.list and not binary.exists():
         print(f"error: interpreter not found: {binary}", file=sys.stderr)
+        features = args.backend
+        if sys.platform in ("darwin", "linux"):
+            features += ",cpyext"
         print("       build it with: cargo build --release -p pyrex --bin "
-              f"{BIN_NAME[args.backend]} --no-default-features --features {args.backend}",
+              f"{BIN_NAME[args.backend]} --no-default-features --features {features}",
               file=sys.stderr)
         return 2
 
@@ -810,6 +909,12 @@ def main() -> int:
     env.pop("PYRE_MAJIT_STATS_ANCESTOR", None)
     if args.no_jit:
         env["PYRE_NO_JIT"] = "1"
+
+    extension_dir, unbuilt = build_test_extensions(binary)
+    for name, reason in sorted(unbuilt.items()):
+        print(f"warning: {name} not built ({reason}) — "
+              f"{'/'.join(sorted(NEEDS_TEST_EXTENSION))} will skip the classes "
+              "that need it", file=sys.stderr)
 
     # Decide which modules to actually run.
     #
@@ -879,14 +984,16 @@ def main() -> int:
     serial_modules = [m for m in to_run if m in SERIAL_MODULES]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {
-            pool.submit(run_module, binary, m, args.mode, args.timeout, env): m
+            pool.submit(run_module, binary, m, args.mode, args.timeout,
+                        env, extension_dir): m
             for m in parallel_modules
         }
         for fut in concurrent.futures.as_completed(futs):
             m = futs[fut]
             record_result(m, fut.result())
     for m in serial_modules:
-        record_result(m, run_module(binary, m, args.mode, args.timeout, env))
+        record_result(m, run_module(binary, m, args.mode, args.timeout,
+                                    env, extension_dir))
     print()
 
     # Summary by status.

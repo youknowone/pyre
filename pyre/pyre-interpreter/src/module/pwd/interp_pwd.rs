@@ -226,17 +226,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    let items: Vec<pyre_object::PyObjectRef> = rustpython_host_env::pwd::getpwall()
-                        .iter()
-                        .map(make_struct_passwd)
-                        .collect();
-                    Ok(pyre_object::w_list_new(items))
+                    // Every entry is freshly allocated and the next one allocates
+                    // again, so they are pinned as they arrive (`build_list_storage`).
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for pw in rustpython_host_env::pwd::getpwall().iter() {
+                        items.push(make_struct_passwd(pw));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
                 }
                 // `interp_pwd.py:123-134` — setpwent / loop getpwent /
                 // endpwent.
                 #[cfg(not(feature = "host_env"))]
                 unsafe {
-                    let mut items: Vec<pyre_object::PyObjectRef> = Vec::new();
+                    // Every entry is freshly allocated and the next `getpwent`
+                    // entry allocates again, so they are pinned as they arrive
+                    // (`build_list_storage`).
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
                     libc::setpwent();
                     loop {
                         let pw = libc::getpwent();
@@ -246,7 +251,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         items.push(make_struct_passwd_libc(pw));
                     }
                     libc::endpwent();
-                    return Ok(pyre_object::w_list_new(items));
+                    return Ok(pyre_object::w_list_new(items.take()));
                 }
             },
             0,

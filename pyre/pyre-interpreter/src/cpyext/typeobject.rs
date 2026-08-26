@@ -4535,8 +4535,6 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         tp_hash,
         tp_call,
         tp_str,
-        tp_getattro,
-        tp_setattro,
         tp_traverse,
         tp_clear,
         tp_richcompare,
@@ -4550,7 +4548,20 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         tp_free,
         tp_finalize,
     );
+    // `inherit_slots` takes each legacy attribute hook together with its
+    // object-key twin: a type that filled either one has declared an attribute
+    // hook of its own, and copying the twin over it would cover that hook,
+    // because `PyObject_GetAttr` and `PyObject_SetAttr` reach the legacy slot
+    // only while the twin is null.
     unsafe {
+        if (*tp).tp_getattr.is_null() && (*tp).tp_getattro.is_null() {
+            (*tp).tp_getattr = (*base).tp_getattr;
+            (*tp).tp_getattro = (*base).tp_getattro;
+        }
+        if (*tp).tp_setattr.is_null() && (*tp).tp_setattro.is_null() {
+            (*tp).tp_setattr = (*base).tp_setattr;
+            (*tp).tp_setattro = (*base).tp_setattro;
+        }
         if (*tp).tp_basicsize == 0 {
             (*tp).tp_basicsize = (*base).tp_basicsize;
         }
@@ -4731,6 +4742,19 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             publish(ns, dunder, arity, slot, wrapper);
         }
     }
+    // `slotdefs` carries `TPSLOT(__setattr__, tp_setattr, NULL, NULL, "")` and
+    // publishes no wrapper for it, because `PyObject_SetAttr` reaches the
+    // legacy slot itself once the object-key twin is null.  Attribute access
+    // here resolves the dunder instead, so the fallback is a wrapper.
+    unsafe {
+        if (*tp).tp_getattro.is_null() && !(*tp).tp_getattr.is_null() {
+            publish(ns, "__getattribute__", 2, (*tp).tp_getattr, slot_getattr);
+        }
+        if (*tp).tp_setattro.is_null() && !(*tp).tp_setattr.is_null() {
+            publish(ns, "__setattr__", 3, (*tp).tp_setattr, slot_setattr);
+            publish(ns, "__delattr__", 2, (*tp).tp_setattr, slot_delattr);
+        }
+    }
     // The deletion shares its slot with the assignment above and goes in with
     // it, there being no spelling for a type that has only one of them.
     let descr_set = unsafe { (*tp).tp_descr_set };
@@ -4817,6 +4841,77 @@ fn slot_setattro(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRe
 
 fn slot_delattro(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     set_attribute(slot, args[0], args[1], None)
+}
+
+/// `tp_getattr` and `tp_setattr` take the name as a `char *`, so a name that is
+/// not text or carries a NUL cannot be handed over -- the refusals
+/// `PyObject_GetAttr` and `PyObject_SetAttr` raise before the call.
+fn legacy_attribute_name(name: PyObjectRef) -> Result<std::ffi::CString, crate::PyError> {
+    let text = crate::baseobjspace::text_w(name)?;
+    std::ffi::CString::new(text)
+        .map_err(|_| crate::PyError::value_error("attribute name must not contain null characters"))
+}
+
+fn slot_getattr(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = legacy_attribute_name(args[1])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(args[0]);
+    let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(receiver_slot));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut std::ffi::c_char) -> *mut CPyObject =
+            std::mem::transmute(slot);
+        call(receiver, name.as_ptr().cast_mut())
+    };
+    unsafe { pyobject::decref(receiver) };
+    super::from_c_result(result)
+}
+
+/// The legacy assignment, with a NULL value for the deletion as `tp_setattro`
+/// has.
+fn set_attribute_legacy(
+    slot: *const c_void,
+    w_self: PyObjectRef,
+    name: PyObjectRef,
+    value: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let name = legacy_attribute_name(name)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_self);
+    let _ = roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    let receiver = pyobject::make_ref(reload(0));
+    let item = match value {
+        Some(_) => pyobject::make_ref(reload(1)),
+        None => std::ptr::null_mut(),
+    };
+    let result = unsafe {
+        let call: unsafe extern "C" fn(
+            *mut CPyObject,
+            *mut std::ffi::c_char,
+            *mut CPyObject,
+        ) -> c_int = std::mem::transmute(slot);
+        call(receiver, name.as_ptr().cast_mut(), item)
+    };
+    unsafe {
+        pyobject::decref(receiver);
+        pyobject::decref(item);
+    }
+    if result != 0 {
+        return Err(pending_or(
+            "a cpyext attribute assignment failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn slot_setattr(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    set_attribute_legacy(slot, args[0], args[1], Some(args[2]))
+}
+
+fn slot_delattr(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    set_attribute_legacy(slot, args[0], args[1], None)
 }
 
 /// `tp_descr_get(self, obj, type)` — `obj` is NULL for a class access.

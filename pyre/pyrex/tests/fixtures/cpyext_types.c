@@ -1425,6 +1425,114 @@ static PyTypeObject BlobType = {
     blob_new,                                   /* tp_new */
 };
 
+/* ── Scalar: a view with no dimensions ──────────────────────────────── */
+
+/* An export whose `ndim` is zero holds exactly one element and carries no
+   dimension vectors at all: `init_shape_strides` leaves `shape` and `strides`
+   NULL rather than pointing them at an empty array, and `PyBuffer_GetPointer`
+   reads no index.  `Modules/_testbuffer.c` exports one of these from
+   `ndarray(scalar, shape=())`; this is the same export written out. */
+typedef struct {
+    PyObject_HEAD
+    double value;
+} ScalarObject;
+
+static PyObject *scalar_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    double value = 0.0;
+    if (!PyArg_ParseTuple(args, "|d", &value)) {
+        return NULL;
+    }
+    ScalarObject *self = (ScalarObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->value = value;
+    return (PyObject *)self;
+}
+
+static int scalar_getbuffer(PyObject *self, Py_buffer *view, int flags)
+{
+    ScalarObject *scalar = (ScalarObject *)self;
+    view->buf = &scalar->value;
+    view->obj = Py_NewRef(self);
+    view->len = (Py_ssize_t)sizeof(scalar->value);
+    view->itemsize = (Py_ssize_t)sizeof(scalar->value);
+    view->readonly = 1;
+    view->ndim = 0;
+    view->format = (flags & PyBUF_FORMAT) == PyBUF_FORMAT ? "d" : NULL;
+    view->shape = NULL;
+    view->strides = NULL;
+    view->suboffsets = NULL;
+    view->internal = NULL;
+    return 0;
+}
+
+/* The element `PyBuffer_GetPointer` names when the caller has no index to
+   hand it, which is the only way to address a view with no dimensions.  A
+   fabricated dimension makes this read one index past the end of `indices`. */
+static PyObject *scalar_at(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_FULL_RO) < 0) {
+        return NULL;
+    }
+    PyObject *element = PyFloat_FromDouble(*(double *)PyBuffer_GetPointer(&view, NULL));
+    PyBuffer_Release(&view);
+    return element;
+}
+
+static PyMethodDef scalar_methods[] = {
+    {"at", scalar_at, METH_O, "the element a view with no indices names"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyBufferProcs scalar_as_buffer = {
+    scalar_getbuffer,                           /* bf_getbuffer */
+    0,                                          /* bf_releasebuffer */
+};
+
+static PyTypeObject ScalarType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Scalar",                      /* tp_name */
+    sizeof(ScalarObject),                       /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    &scalar_as_buffer,                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a scalar exporter defined in C",           /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    scalar_methods,                             /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    scalar_new,                                 /* tp_new */
+};
+
 /* ── Ticker: the async table ────────────────────────────────────────── */
 
 typedef struct {
@@ -2125,6 +2233,9 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &BlobType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &ScalarType) < 0) {
         return -1;
     }
     if (PyModule_AddType(module, &TickerType) < 0) {
