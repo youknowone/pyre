@@ -6292,10 +6292,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // UNARY_NEGATIVE.  Descend `neg_inner` -- `neg` past the override probe --
     // rather than re-emit its integer arm by hand, the same shape the invert
     // descent below takes.  Sits ahead of the `unary_negative_int` fold so that
-    // fold's `consulted` count reads whether the descent took the site; the
-    // fold stays for every operand the descent declines (a bool, a subclass, a
-    // non-int) and for a build whose `neg_inner` body is absent or reaches a
-    // helper the build did not lower.
+    // fold's `consulted` count reads whether the descent took the site.  The
+    // fold is not dead and stays: besides the bool / subclass / non-int operand
+    // it never admitted, it is what serves the `INT_MIN` promotion, which the
+    // descent declines on an unlowered `PyObject` transparent ctor.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1

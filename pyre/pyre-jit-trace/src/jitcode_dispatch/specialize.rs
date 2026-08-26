@@ -7595,12 +7595,17 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
 ///
 /// The same orthodox shape as [`try_walker_orthodox_unary_invert`], and for the
 /// same reason: upstream traces *through* `descr_neg`, which is ordinary
-/// RPython. Coverage is again what makes it worth entering. The hand-written
-/// `unary_negative_int` answers the exact-`int` operand and, for `INT_MIN`,
-/// only when the residual it just executed happened to return a `long`; `-` on
-/// a `long` reaches no fold at all. The body's own arms cover both, and its
-/// `checked_neg` covers the promotion without the fold's `guard_value` pin to
-/// the single overflowing operand.
+/// RPython.
+///
+/// This does NOT retire `unary_negative_int`, and the census says why. Over
+/// the 484-fixture corpus the descent fires on six fixtures and the fold on
+/// one -- `unary_negative.py`'s `main_int_min`, the `INT_MIN` promotion. The
+/// body reaches that through `w_long_new_fresh_rbigint_handle`, and the
+/// sub-walk stops there on a `PyObject` synthetic transparent ctor this build
+/// does not lower, so the descent declines and the fold's `guard_value` +
+/// ovf2long tail still serves it. What the descent does take is every
+/// non-promoting exact `int` and the exact `long` operand, which reached no
+/// fold at all before.
 ///
 /// `neg` itself cannot be entered: its `__neg__` override probe is
 /// `dont_look_inside` and is the second operation the body executes.
