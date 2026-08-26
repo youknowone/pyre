@@ -10154,50 +10154,119 @@ fn publish_walk_abort_handoff(
 /// is re-enterable at — jitcode entry, or a merge point — and derive the
 /// register file by running forward from it.  A guard is neither: it sits
 /// mid-opcode, so the register file cannot be re-derived and has to be handed
-/// over.  `regs` is that file, one entry per live register.
+/// over.  `frames` is that file, one entry per rebuilt frame and one register
+/// per live register within it.
+///
+/// `frames` arrives in the resume stream's own order — outermost caller first
+/// — and is pushed in that order, so the walk resumes in the innermost frame
+/// with its callers underneath it, which is where `rebuild_from_resumedata`
+/// leaves `metainterp.framestack`.  A frame below the
+/// top is suspended inside a `BC_INLINE_CALL`, and the two things that call
+/// left on the live frames are restored here rather than re-derived: the
+/// caller's own `_result_argcode` / `result_arg_index`, which the next
+/// snapshot capture reads to blank the not-yet-written result register
+/// (`opencoder.py _ensure_parent_resumedata`), and the callee's `return_*`,
+/// which its typed return writes through (`make_result_of_lastop`).
 ///
 /// `outer_program_pc` is the interpreter-space anchor `run_to_end` reports
 /// portal positions against; the guard's own position is jitcode-space and
 /// says nothing about it.
-pub fn trace_jitcode_at_resume_position<S, R>(
+pub fn trace_jitcode_at_resume_framestack<S, R>(
     ctx: &mut TraceCtx,
     sym: &mut S,
-    jitcode: &JitCode,
-    resume_pc: usize,
+    frames: &[crate::jit_state::GuardResumeFrame],
     outer_program_pc: usize,
     runtime: &R,
-    regs: &[crate::jit_state::GuardResumeReg],
 ) -> TraceAction
 where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    let jitcode_arc = Arc::new(jitcode.clone());
-    let mut frame = MIFrame::setup(jitcode_arc, resume_pc, None, Some(ctx));
-    for reg in regs {
-        let index = reg.index as usize;
-        let (bank_regs, bank_values) = match reg.bank {
-            majit_ir::Type::Ref => (&mut frame.ref_regs, &mut frame.ref_values),
-            majit_ir::Type::Float => (&mut frame.float_regs, &mut frame.float_values),
-            _ => (&mut frame.int_regs, &mut frame.int_values),
-        };
-        // A register the jitcode does not declare is one the guard cannot have
-        // been holding, so there is no value to lose by skipping it — and
-        // indexing past the bank would panic on a mismatch that is already
-        // recoverable.
-        if index >= bank_regs.len() {
+    let mut standalone = StandaloneFrameStack::new();
+    for (depth, resume_frame) in frames.iter().enumerate() {
+        let mut frame = MIFrame::setup(
+            resume_frame.jitcode.clone(),
+            resume_frame.pc,
+            None,
+            Some(ctx),
+        );
+        for reg in &resume_frame.regs {
+            let index = reg.index as usize;
+            let (bank_regs, bank_values) = match reg.bank {
+                majit_ir::Type::Ref => (&mut frame.ref_regs, &mut frame.ref_values),
+                majit_ir::Type::Float => (&mut frame.float_regs, &mut frame.float_values),
+                _ => (&mut frame.int_regs, &mut frame.int_values),
+            };
+            // A register the jitcode does not declare is one the guard cannot
+            // have been holding, so there is no value to lose by skipping it —
+            // and indexing past the bank would panic on a mismatch that is
+            // already recoverable.
+            if index >= bank_regs.len() {
+                continue;
+            }
+            bank_regs[index] = Some(reg.opref);
+            bank_values[index] = Some(reg.value);
+        }
+        // The walker reads from `code_cursor`; `pc` is what a snapshot taken
+        // inside this frame reports. `setup_resume_at_op` is both.
+        frame.code_cursor = resume_frame.pc;
+        frame.pc = resume_frame.pc;
+        if depth > 0 {
+            // What `BC_INLINE_CALL` marks its pushed frame with, and what the
+            // return path reads back to decide whether to pop the ctx's inline
+            // ledger with it.
+            frame.inline_frame = true;
+            // `build_state_field_snapshot` blanks a non-root frame's reserved
+            // identity-slot prefix to `Const(0)` placeholders, because only the
+            // root frame's identity slots are meaningful and deopt re-derives
+            // the rest from the single reconstructed root virtualizable.  The
+            // rebuild is where that re-derivation happens for a bridge: copy
+            // the root's slots back over the placeholders, so a vable opcode in
+            // a callee body reads the identity the root frame holds rather than
+            // the zero the snapshot wrote.
+            let identity = sym.int_identity_slots_base()..sym.int_identity_reserved_end();
+            let root = &standalone.frames.frames[0];
+            for slot in identity {
+                if slot >= frame.int_regs.len() || slot >= root.int_regs.len() {
+                    break;
+                }
+                frame.int_regs[slot] = root.int_regs[slot];
+                frame.int_values[slot] = root.int_values[slot];
+            }
+        }
+        standalone.frames.push(frame);
+        if depth == 0 {
             continue;
         }
-        bank_regs[index] = Some(reg.opref);
-        bank_values[index] = Some(reg.value);
+        // The caller's half of the suspended call, in the shape
+        // `BC_INLINE_CALL` left it: the callee frame it pushed carries the
+        // caller register its typed return writes to, and the caller itself
+        // carries the same slot for the next snapshot to blank.
+        let caller_index = depth - 1;
+        let caller_pc = frames[caller_index].pc;
+        if let Some(sub_idx) = resume_frame.sub_idx {
+            ctx.push_inline_frame((sub_idx, caller_pc), u32::MAX);
+        }
+        let (argcode, dst) = match frames[caller_index].result_slot {
+            Some((JitArgKind::Int, dst)) => {
+                standalone.frames.frames[depth].return_i = Some(dst);
+                (b'i', Some(dst))
+            }
+            Some((JitArgKind::Ref, dst)) => {
+                standalone.frames.frames[depth].return_r = Some(dst);
+                (b'r', Some(dst))
+            }
+            Some((JitArgKind::Float, dst)) => {
+                standalone.frames.frames[depth].return_f = Some(dst);
+                (b'f', Some(dst))
+            }
+            None => (b'v', None),
+        };
+        let caller = &mut standalone.frames.frames[caller_index];
+        caller._result_argcode = argcode;
+        caller.result_arg_index = dst;
     }
-    // The walker reads from `code_cursor`; `pc` is what a snapshot taken
-    // inside this frame reports. `setup_resume_at_op` is both.
-    frame.code_cursor = resume_pc;
-    frame.pc = resume_pc;
 
-    let mut standalone = StandaloneFrameStack::new();
-    standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(outer_program_pc);
     let action = machine.run_to_end(ctx, sym, runtime);

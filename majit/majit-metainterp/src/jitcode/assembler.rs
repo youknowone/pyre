@@ -6606,6 +6606,59 @@ mod tests {
         );
     }
 
+    /// `inline_call_ending_at` has to answer with exactly the operands the
+    /// emitter wrote, for every argument count and every return bank.
+    ///
+    /// It is the only reader of a `BC_INLINE_CALL`'s operands that does not
+    /// start at the instruction — a frame rebuilt from resume data knows only
+    /// where the instruction ENDED — so nothing else would catch it drifting
+    /// from the encoder. Both directions are graded: the slots it recovers,
+    /// and that it declines a position that is not the far side of one.
+    #[test]
+    fn inline_call_ending_at_recovers_what_the_emitter_wrote() {
+        use crate::jitcode::JitArgKind;
+
+        let args: [&[(u16, u16)]; 3] = [&[], &[(1, 0)], &[(1, 0), (2, 1), (3, 2)]];
+        for args_r in args {
+            for (bank, emit) in [
+                (Some(JitArgKind::Int), 0usize),
+                (Some(JitArgKind::Ref), 1),
+                (None, 2),
+            ] {
+                let mut builder = JitCodeBuilder::new();
+                // A leading instruction, so the call never starts at 0 and a
+                // decoder that ignored the opcode byte could not accidentally
+                // be right.
+                builder.int_guard_value(4);
+                let start = builder.current_pos();
+                match emit {
+                    0 => builder.inline_call_r_i(7, args_r, Some(9)),
+                    1 => builder.inline_call_r_r(7, args_r, Some(9)),
+                    _ => builder.inline_call_r_v(7, args_r, None),
+                }
+                let end = builder.current_pos();
+                let jitcode = builder.finish();
+
+                let site = jitcode
+                    .inline_call_ending_at(end)
+                    .expect("the call ends here, so it must decode");
+                assert_eq!(site.sub_idx, 7, "sub-JitCode index");
+                assert_eq!(
+                    site.result_slot(),
+                    bank.map(|kind| (kind, 9usize)),
+                    "return slot for {args_r:?} args, bank {bank:?}",
+                );
+                // The width formula the search solves for.
+                assert_eq!(end - start, 8 + 3 * args_r.len(), "encoded width");
+                // A position one byte off is not the far side of this call,
+                // and answering there would be a wrong frame rebuild rather
+                // than a decline.
+                assert_eq!(jitcode.inline_call_ending_at(end - 1), None);
+                assert_eq!(jitcode.inline_call_ending_at(start), None);
+            }
+        }
+    }
+
     fn assert_no_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder)) {
         let mut builder = JitCodeBuilder::new();
         emit(&mut builder);

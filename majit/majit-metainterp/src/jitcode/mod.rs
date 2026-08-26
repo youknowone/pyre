@@ -689,6 +689,148 @@ impl JitCode {
         }
         global_build_descr_pool().and_then(|pool| pool.get(index))
     }
+
+    /// The `BC_INLINE_CALL` whose encoding ends exactly at `end_pc`.
+    ///
+    /// A caller frame suspended in an inline call carries two things its own
+    /// resume section does not: which callee it is waiting on, and which of
+    /// its registers the result lands in.  Neither is in the stream by design
+    /// — `opencoder.py _ensure_parent_resumedata` reads a parent frame's
+    /// liveness with `in_a_call=True`, which blanks the result register first,
+    /// because nothing has written it yet.  `pyjitpl.py
+    /// MIFrame.make_result_of_lastop` recovers it from the bytecode instead,
+    /// taking the register from `ord(self.bytecode[self.pc - 1])` and its kind
+    /// from `self.jitcode._resulttypes[self.pc]`.  This is that read, for the
+    /// grouped encoding `inline_call_typed` (`jitcode/assembler.rs`) emits.
+    ///
+    /// The instruction cannot be decoded backwards, so it is decoded forwards
+    /// from the only start position that can produce it.  Its width is
+    /// `1 + 2 + 2 + 3 * num_args + 3` — opcode, sub-JitCode index, argument
+    /// count, one `(kind, caller_src, callee_dst)` triple per argument, then
+    /// the three optional return slots — so each candidate `num_args` names
+    /// exactly one start, and that start is the real one only when the opcode
+    /// byte is there AND the count it encodes is the count that was assumed.
+    /// A position satisfying both while still ending at `end_pc` has decoded
+    /// itself; requiring the match to be unique is what turns a coincidence
+    /// into a decline rather than into a wrong answer.
+    ///
+    /// `None` means `end_pc` is not the far side of a `BC_INLINE_CALL` in this
+    /// jitcode — including when it is one of the typed `BC_INLINE_CALL_*`
+    /// variants, which no `JitCodeBuilder` emits.  Callers read it as "cannot
+    /// resume through this frame" rather than guessing.
+    pub fn inline_call_ending_at(&self, end_pc: usize) -> Option<InlineCallSite> {
+        let body = self.try_body()?;
+        let code = &body.code;
+        if end_pc > code.len() {
+            return None;
+        }
+        let mut found: Option<InlineCallSite> = None;
+        for num_args in 0.. {
+            let Some(start) = end_pc.checked_sub(INLINE_CALL_FIXED_WIDTH + 3 * num_args) else {
+                break;
+            };
+            if code.get(start).copied() != Some(insns::BC_INLINE_CALL) {
+                continue;
+            }
+            let mut cursor = start + 1;
+            let sub_idx = read_u16(code, &mut cursor) as usize;
+            if read_u16(code, &mut cursor) as usize != num_args {
+                continue;
+            }
+            cursor += 3 * num_args;
+            let return_slot = |cursor: &mut usize| match read_reg(code, cursor) {
+                NO_RETURN_REG => None,
+                reg => Some(reg as usize),
+            };
+            let site = InlineCallSite {
+                sub_idx,
+                return_i: return_slot(&mut cursor),
+                return_r: return_slot(&mut cursor),
+                return_f: return_slot(&mut cursor),
+            };
+            debug_assert_eq!(
+                cursor, end_pc,
+                "the inline-call width formula disagrees with the decode",
+            );
+            // `inline_call_typed` refuses to emit more than one filled slot,
+            // so a decode holding two has not landed on a real instruction.
+            if site.filled_return_slots() > 1 {
+                continue;
+            }
+            if found.replace(site).is_some() {
+                // Two start positions both decode into an instruction ending
+                // here, so the bytes do not name one call.
+                return None;
+            }
+        }
+        let site = found?;
+        // `pyjitpl.py make_result_of_lastop`'s own check, in its own place:
+        //
+        //     assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
+        //
+        // The writer records the kind at end-of-instruction position
+        // (`record_resulttype`, `assembler.py`), which makes it an independent
+        // witness of which return slot this call filled.
+        if body.resulttypes.as_ref()?.get(&end_pc).copied() != site.recorded_resulttype() {
+            return None;
+        }
+        Some(site)
+    }
+}
+
+/// The encoded width of a `BC_INLINE_CALL` that passes no arguments: the
+/// opcode byte, the `u16` sub-JitCode index, the `u16` argument count, and the
+/// three return-slot register bytes.  Each argument adds a
+/// `(kind, caller_src, callee_dst)` triple of one byte each.
+const INLINE_CALL_FIXED_WIDTH: usize = 1 + 2 + 2 + 3;
+
+/// The operands of one `BC_INLINE_CALL`, as [`JitCode::inline_call_ending_at`]
+/// recovers them from the instruction's far side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineCallSite {
+    /// The caller `descrs` slot holding the callee JitCode — the `j` argcode
+    /// `blackhole.py` resolves through `self.descrs[idx]`.
+    pub sub_idx: usize,
+    /// The caller register the callee's int result lands in, if it returns one.
+    pub return_i: Option<usize>,
+    /// The caller register the callee's ref result lands in, if it returns one.
+    pub return_r: Option<usize>,
+    /// The caller register the callee's float result lands in, if it returns one.
+    pub return_f: Option<usize>,
+}
+
+impl InlineCallSite {
+    /// The caller-side result register and the bank it lands in.
+    ///
+    /// `None` for a call whose result is discarded, which is the `_v` shape:
+    /// all three slots hold [`NO_RETURN_REG`].
+    pub fn result_slot(&self) -> Option<(JitArgKind, usize)> {
+        match (self.return_i, self.return_r, self.return_f) {
+            (Some(dst), None, None) => Some((JitArgKind::Int, dst)),
+            (None, Some(dst), None) => Some((JitArgKind::Ref, dst)),
+            (None, None, Some(dst)) => Some((JitArgKind::Float, dst)),
+            _ => None,
+        }
+    }
+
+    /// How many of the three return slots name a register.  A real
+    /// `BC_INLINE_CALL` has at most one.
+    fn filled_return_slots(&self) -> usize {
+        [self.return_i, self.return_r, self.return_f]
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    }
+
+    /// The `_resulttypes` entry these return slots imply, in the writer's own
+    /// spelling (`record_resulttype`, `jitcode/assembler.rs`).
+    fn recorded_resulttype(&self) -> Option<char> {
+        match self.result_slot()? {
+            (JitArgKind::Int, _) => Some('i'),
+            (JitArgKind::Ref, _) => Some('r'),
+            (JitArgKind::Float, _) => Some('f'),
+        }
+    }
 }
 
 impl JitCodeRuntimeExt for JitCode {

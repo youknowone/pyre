@@ -1684,11 +1684,11 @@ once, on both backends — so the separately reported dynasm
 `RegisterManager.loc: box IntOp(N) not found` from `consider_binop_j2` is gone
 with it and was never a second defect.
 
-## Why the branching portal never gets a bridge (0826)
+## Why the branching portal got no bridge, and the fix (0826)
 
-The short-circuit A/B's headline is that the branching body fails a guard on
+The short-circuit A/B's headline was that the branching body fails a guard on
 essentially every character and no bridge is ever built. `MAJIT_BRIDGE_DEBUG=1`
-names every one of the 19 bridge attempts, and they are all the same give-up:
+named every one of the 19 bridge attempts, and they were all the same give-up:
 
 ```text
 [bridgeB] multi-frame resume (7 frames) — only the root frame is seedable,
@@ -1696,16 +1696,74 @@ names every one of the 19 bridge attempts, and they are all the same give-up:
 ```
 
 13 at 7 frames, 3 at 4, 2 at 6, 1 at 5 — the frame count is the recursion depth
-of the inlined `shift` at the failing guard. `start_bridge_tracing` refuses
-whenever a state-field driver's resume data spans more than one frame, because
-`setup_bridge_sym` can seed the root frame only; a `JitState` with real
-multi-frame support (pyre) is unaffected.
+of the inlined `shift` at the failing guard. `start_bridge_tracing` refused
+whenever a state-field driver's resume data spanned more than one frame,
+because `setup_bridge_sym` seeds the root frame only. That applied to any
+`#[jit_interp]` machine whose hot loop calls an inlined recursive helper.
 
-That applies to any `#[jit_interp]` machine whose hot loop calls an inlined
-recursive helper, so the timing row it produces has to be read as "with no
-bridge available", not as the last word on short-circuit operators. Lifting it
-means multi-frame `setup_bridge_sym` for state-field drivers, which is a
-feature and not in this plan.
+**Fixed.** `resume.py rebuild_from_resumedata` is the shape:
+
+```python
+while not resumereader.done_reading():
+    jitcode_pos, pc = resumereader.read_jitcode_pos_pc()
+    jitcode = metainterp.staticdata.jitcodes[jitcode_pos]
+    f = metainterp.newframe(jitcode)
+    f.setup_resume_at_op(pc)
+    resumereader.consume_boxes(f.get_current_position_info(),
+                               f.registers_i, f.registers_r, f.registers_f)
+```
+
+One real `MIFrame` per section, each at its own pc with its own registers,
+appended in stream order — which is caller-first, because `opencoder.py
+SnapshotIterator.__init__` reversed on the writer side — so the walk ends up
+resuming in the innermost frame with its callers underneath it. majit now does
+exactly that. Each section resolves its jitcode through the flat registry
+(`resume.py`'s `jitcodes[jitcode_pos]`, `MetaInterp::jitcodes`) — the same
+registry the blackhole rebuild already used — and reads its own liveness at its
+own pc, so nothing is parent-relative.
+
+Two fields a caller frame needs are deliberately NOT in the resume stream, and
+recovering them is the whole difficulty. A frame below the top is suspended
+inside a `BC_INLINE_CALL`, and `opencoder.py _ensure_parent_resumedata` reads a
+parent's liveness with `in_a_call=True`, which blanks the result register
+first, because nothing has written it yet. RPython recovers it from the
+bytecode instead — `pyjitpl.py MIFrame.make_result_of_lastop` takes the
+register from `ord(self.bytecode[self.pc - 1])` and its kind from
+`self.jitcode._resulttypes[self.pc]`. majit's grouped `BC_INLINE_CALL` encoding
+puts three optional return slots at the end rather than one register byte, so
+"read the byte before pc" becomes `JitCode::inline_call_ending_at`: decode the
+instruction forwards from the only start that can produce an instruction ending
+at that pc, solving for `num_args` off the width formula and requiring the
+match to be unique, the encoded argument count to be the assumed one, and the
+recorded `_resulttypes` entry to agree with the slots decoded. Everything that
+does not check out is a decline, which lands back on the blackhole — the arm
+that was already serving these guards.
+
+The decline sites all log under `MAJIT_BRIDGE_DEBUG=1`, following
+`read_frame_liveness_reg_indices`'s own soft-decline policy, so "no bridge" is
+never silent again.
+
+One thing found by running it: the callee of a self-recursive `#[jit_inline]`
+helper resolves through a **`Weak`** descr (`Arc::new_cyclic`), so
+`RuntimeBhDescr::as_jitcode` misses exactly the recursion this walk exists to
+resume through. `BC_INLINE_CALL` itself uses `as_jitcode_owned`; the rebuild
+now does too. With `as_jitcode` it declined all 10 attempts at depth 1.
+
+Measured on the same 4096-character run, both backends identically:
+
+| | before | after |
+|---|---:|---:|
+| guard failures | 4090 | 4080 |
+| bridges compiled | 0 | 10 |
+| traces aborted | 19 (all bridge give-ups) | 0 |
+| trace ids seen failing | 1 | 1–11 |
+
+The deopt rate barely moves, and that is the honest result rather than a
+disappointment: a bridge covers one more path through the mark pattern, the
+bridge then exits at a guard of its own and grows the next bridge off that, and
+a 93-node tree has far more mark patterns than one 4096-character pass can
+bridge. What changed is that the post's "you get a lot of assembler code
+generated" now actually happens here.
 
 Two things were wrong in the tally on the way to that answer, and both are
 fixed. The bridge give-ups called `abort_trace` without staging a reason, so

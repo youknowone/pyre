@@ -10,12 +10,20 @@ so the example is not asking anyone to take the missing rows on trust.
 | the post's row | 2010 figure | here |
 |---|---:|---|
 | pure Python | 12,200 chars/s | `marked.py` |
-| Google re2 | 550,000 | `re2.py` — not installed on this machine, see below |
+| Google re2 | 550,000 | `re2.py` — out of scope, never run, see below |
 | RPython translated to C | 720,000 | the crate's `interp.rs` row, via `cargo run` |
 | C++ (Sebastian Fischer) | 750,000 | `marked.cpp` |
-| Java (Baltasar Trancon y Widemann) | 1,920,000 | `Marked.java` |
+| Java (Baltasar Trancon y Widemann) | 1,920,000 | `Marked.java` — out of scope, never run, see below |
 | CPython `re` module | 2,500,000 | `re_module.py` — **not comparable**, see below |
 | RPython + JIT | 16,500,000 | the crate's `jit_interp.rs` row, via `cargo run` |
+
+**Scope.** The comparison this example owes is between its majit portals and
+the RPython implementation the post describes — same algorithm, same shape,
+read side by side. The foreign-language rows are context for that, not a
+deliverable: the Java and re2 rows are explicitly out of scope and neither has
+ever run on this machine. Their files stay because they document what running
+them would take and which traps a future run would hit, and both sections below
+say plainly that no number may be quoted from them.
 
 The 2010 column is from an Intel Core 2 Duo P8400 at 2.26 GHz. It is quoted for
 shape, never as a comparison: sixteen years of hardware sit between it and any
@@ -277,7 +285,7 @@ That is the leading `(a|b)*` being retried from every start position, which is
 precisely the backtracking the marked algorithm exists to avoid, and it is why
 `search` at 2^20 characters would take hours.
 
-## Why re2 is missing
+## Why re2 is missing (and out of scope)
 
 Google re2 is not installed on the machine this harness was written on: there is
 no `libre2`, no re2 headers, and no importable `re2` Python module, and this
@@ -301,7 +309,7 @@ cleanly and fails much later as `module 're2' has no attribute 'compile'` — a
 bogus reason for a skipped row that reads like a broken binding. The file drops
 its own directory from `sys.path` before importing.)
 
-## Java: written, never compiled, never run
+## Java: written, never compiled, never run (and out of scope)
 
 **No number should be quoted from `Marked.java` until it has run once.** The
 machine this harness was written on has no JDK. `/usr/bin/java` and

@@ -40,12 +40,16 @@
 //! The surprise is the op count. The branching body is SMALLER, not bigger —
 //! 176 against 194 — because a guard replaces the `int_and` / `int_or` it
 //! stands in for, and because the dead side of a branch takes its ops out of
-//! the trace with it. "A lot of assembler code generated" is not what happens
-//! here, and the specialization is untouched: both bodies fold the whole
-//! 93-node tree walk to zero `getfield_gc_r`, both store one mark per node,
-//! and both reduce 46 `Char` nodes to 2 `int_eq`. Both compile exactly one
-//! loop, and `degraded_dispatch_arms()` is empty for both, so the branching
-//! body lowers completely — this is NOT the "refuses to lower" outcome.
+//! the trace with it. The specialization is untouched too: both bodies fold
+//! the whole 93-node tree walk to zero `getfield_gc_r`, both store one mark
+//! per node, and both reduce 46 `Char` nodes to 2 `int_eq`. Both compile
+//! exactly one loop, and `degraded_dispatch_arms()` is empty for both, so the
+//! branching body lowers completely — this is NOT the "refuses to lower"
+//! outcome.
+//!
+//! So the post's "a lot of assembler code generated" is not about the loop
+//! body: that gets smaller. It is about what the twenty-six guards go on to
+//! cost, which is section 2.
 //!
 //! Both backends agree op for op on every number in that table, and on the
 //! runtime counts below: dynasm and cranelift were measured separately and
@@ -56,57 +60,71 @@
 //! Over a 4096-character non-matching input, the branching portal records:
 //!
 //! ```text
-//! guard failures 4090   bridges compiled 0   traces aborted 19 (all ABORT_BRIDGE)
+//! guard failures 4080   bridges compiled 10   traces aborted 0
 //! ```
 //!
-//! One guard failure per input character. `MAJIT_LOG=1` over the same run
-//! counts 4090 `guard failure at key=`, 4090 `handle_fail`, 4090 blackhole
-//! entries matched by 4090 exits, and 4090 `execute_token` entries matched by
-//! 4090 returns. That is the steady state, and it is one full round trip per
-//! character: enter compiled code, fail a guard, deopt through the blackhole,
-//! resume the interpreter at `ContinueRunningNormally`, re-enter.
+//! One guard failure per input character, and it stays one per character even
+//! though ten bridges get built. That is the shape of the finding: bridging
+//! works here, and it does not catch up.
 //!
-//! Fourteen distinct guard indices take part, because the mark pattern moves
-//! with the input and no one trace covers it, but the distribution is steep —
-//! guard 2 alone accounts for 2716 of the 4090, then 603, 445, 228, 60, and a
-//! ten-guard tail summing to 38.
+//! The ten bridges are real machine code and they are entered. Before them
+//! every failure in the run reported `tid=1` — the one compiled loop. Now the
+//! failures spread across trace ids 1 through 11, the loop and its ten
+//! bridges, which is what a bridge failing its OWN guard looks like: the loop
+//! covers one path through
+//! the mark pattern, a bridge covers the next, that bridge exits at a guard of
+//! its own, and the next bridge grows off THAT. `must_compile` fires 10 times
+//! and all 10 reach `compile_trace`; none abort.
 //!
-//! The `ABORT_BRIDGE` label on that tally is not evidence on its own.
-//! `AbortReason::Bridge` and `AbortReason::Generic` share
-//! `Counters.ABORT_BRIDGE`'s integer, and `Generic` is the fallback for every
-//! unclassified walker decline, so the count alone cannot tell a bridge
-//! give-up from anything else. What says these 19 are give-ups is the log
-//! below, not the name.
+//! So the post's "you get a lot of assembler code generated" IS what happens
+//! here, once the bridges can be built at all — and it does not pay for
+//! itself over 4096 characters, because the number of distinct mark patterns a
+//! 93-node tree can be in is far larger than the number of bridges one pass
+//! can grow. The interpreter round trip per character stays.
 //!
-//! No bridge ever serves any of it, and the reason is not this algorithm.
-//! `must_compile` fires only 19 times in those 4090 failures and
-//! `compile_trace` is never reached at all: each attempt aborts on the very
-//! next log line after its tracing session opens, with zero bytecode-body ops
-//! walked. `MAJIT_BRIDGE_DEBUG=1` names all 19 of them, and they are one
-//! thing —
+//! ## What it took to get there, and what it says about majit
+//!
+//! Until this module was written, NO bridge was built here at all: the same
+//! run recorded `guard failures 4090   bridges compiled 0   traces aborted 19`,
+//! every one of the 19 aborting on the log line after its tracing session
+//! opened, with zero bytecode-body ops walked —
 //!
 //! ```text
 //! [bridgeB] multi-frame resume (7 frames) — only the root frame is seedable,
 //!           giving up on the bridge
 //! ```
 //!
-//! 13 at 7 frames, 3 at 4, 2 at 6, 1 at 5. `shift` is a recursive
-//! `#[jit_inline]` helper, so a guard that fails inside it resumes into a
-//! stack of frames, and `start_bridge_tracing` (`majit-metainterp`) gives up
-//! whenever a state-field driver's resume data spans more than one — its
-//! `setup_bridge_sym` can seed the root frame only. The frame count IS the
-//! recursion depth at the failing guard.
+//! `shift` is a recursive `#[jit_inline]` helper, so a guard that fails inside
+//! it resumes into a STACK of frames — 4 to 7 of them, the recursion depth at
+//! the failing guard — and `start_bridge_tracing` refused whenever a
+//! state-field driver's resume data spanned more than one, because
+//! `setup_bridge_sym` seeds the root frame only. That refusal would have
+//! applied to any `#[jit_interp]` machine whose hot loop calls an inlined
+//! recursive helper; the masking portal was not spared it either, it simply
+//! has one guard, which does not fail.
 //!
-//! So the branching portal never gets a bridge for a reason that would apply
-//! to any `#[jit_interp]` machine whose hot loop calls an inlined recursive
-//! helper. The masking portal is not spared it either; it simply has one
-//! guard, which does not fail. That is a majit limitation to lift, not a
-//! property of short-circuit operators, and the timing row below must be read
-//! as "with no bridge available" rather than as the last word.
+//! It is fixed, in `majit-metainterp`, by doing what `resume.py
+//! rebuild_from_resumedata` does: push one `MIFrame` per encoded resume
+//! section, outermost first, each `setup_resume_at_op(pc)` at its own position
+//! with its own liveness-decoded registers, and resume in the innermost one.
+//! Two things the resume stream does not carry had to be recovered from the
+//! bytecode the way `pyjitpl.py make_result_of_lastop` recovers them: which
+//! callee each suspended caller is waiting on, and which of its registers
+//! takes the result. `JitCode::inline_call_ending_at` is that read.
 //!
-//! So the post's "you get a lot of assembler code generated" does not describe
-//! what happens here. The opposite does: NO extra assembler is generated, and
-//! an interpreter round trip is paid per character instead.
+//! `MAJIT_BRIDGE_DEBUG=1` now names each rebuilt stack instead of the give-up.
+//! One 4096-character run rebuilds 10 of them — one 7-frame, three 6, three 5
+//! and three 4 —
+//!
+//! ```text
+//! [bridgeB] rebuild 7 frame(s): [(0, 101, 8), (1, 269, 7), (1, 269, 7),
+//!           (1, 269, 7), (1, 269, 7), (1, 214, 2), (1, 131, 4)]
+//! ```
+//!
+//! — jitcode 0 is the mainloop and jitcode 1 is `shift`, so the stack reads
+//! directly as "the mainloop called `shift`, which called itself five more
+//! times". The distinct `pc`s in the `shift` frames are the distinct call
+//! sites: 269 is the recursive descent, 214 and 131 the shallower ones.
 //!
 //! # Throughput
 //!
@@ -122,12 +140,28 @@
 //! no JIT  / branching             399x
 //! ```
 //!
-//! The third row is what turns "slower" into a verdict. The branching portal
-//! does not merely give back the JIT's win over the plain matcher: at 399x it
-//! is far slower than running the same algorithm with no JIT under it at all,
-//! because every character now pays an interpreter round trip the plain
-//! matcher never pays. "Not particularly fast" is, here, three orders of
-//! magnitude.
+//! **That branching row predates the multi-frame bridge fix above and is a
+//! floor, not the current number.** It was taken when every bridge attempt
+//! gave up, so it measures the portal with no bridge available at all. The
+//! machine has been under load 30-120 since the fix landed, which is where an
+//! absolute row stops meaning anything, so the row stands as recorded with its
+//! own load stamp rather than being replaced by a worse measurement. The two
+//! ratios below it move with it.
+//!
+//! What DID get measured after the fix is the in-process ratio the suite runs
+//! on every invocation, at 4096 characters, which is the quantity that
+//! survives a loaded machine because both rows are timed in the same process.
+//! It was 66x, 68x and 89x on dynasm before the fix; four runs after it, at
+//! 1-minute load 33 to 36, read 32x, 35x, 50x and 51x. The band moved and does
+//! not overlap, which is the direction the ten bridges predict; the spread
+//! inside it is the load, and neither band is a number to quote to two digits.
+//!
+//! The third row is what turns "slower" into a verdict, and the fix does not
+//! overturn it. The branching portal does not merely give back the JIT's win
+//! over the plain matcher: it is far slower than running the same algorithm
+//! with no JIT under it at all, because a character that misses every bridge
+//! still pays an interpreter round trip the plain matcher never pays. "Not
+//! particularly fast" is, here, orders of magnitude.
 //!
 //! Those are three rows of one process, which is what makes the two ratios
 //! worth quoting: the machine was not idle, and a ratio taken inside one run
@@ -135,13 +169,12 @@
 //! source at higher load read 1716x, 1579x and 2336x — the branching row is
 //! the load-sensitive one and moves by up to 1.7x, while the finding does not.
 //!
-//! The shorter row the suite runs on every invocation, 4096 characters, is a
-//! much smaller ratio: 66x on dynasm in the same session (1,822,199 against
-//! 27,782 in the length sweep), and 19x on cranelift. The ratio grows with
-//! input length because `matches` builds a fresh `JitDriver` per call, so at
-//! 4096 characters the masking row is still paying for a recording it only
-//! amortizes over a long input, while the branching row has nothing to
-//! amortize against, because it never gets to run the compiled loop.
+//! The 4096-character ratio is much smaller than the 1M one either way. It
+//! grows with input length because `matches` builds a fresh `JitDriver` per
+//! call, so at 4096 characters the masking row is still paying for a recording
+//! it only amortizes over a long input, while the branching row has far less
+//! to amortize it against — ten bridges that each serve one path, against a
+//! compiled loop that serves every character.
 //!
 //! # The spelling the post's advice suggests literally
 //!
@@ -729,13 +762,15 @@ mod tests {
     /// The mechanism behind the timing row, and the half that is free to
     /// assert: the branching body deopts once per input character.
     ///
-    /// 26 guards in the peeled body and 4090 failures over 4096 characters is
-    /// not "some guards sometimes fail" — it is the compiled loop leaving
-    /// through a guard on essentially every pass. What follows a failure is a
-    /// blackhole deopt and a bridge attempt, and the bridge attempts abort, so
-    /// the failure never stops recurring. That is a per-character cost measured
-    /// in microseconds against a compiled body measured in nanoseconds, and it
-    /// is why the timing row below is not a percentage.
+    /// 26 guards in the peeled body and 4080 failures over 4096 characters is
+    /// not "some guards sometimes fail" — it is compiled code leaving through a
+    /// guard on essentially every pass. Ten of those failures now grow a
+    /// bridge, and the rest still take a blackhole deopt, because a bridge
+    /// covers one more path through the mark pattern and the pattern has far
+    /// more paths than one 4096-character pass can bridge. That is a
+    /// per-character cost measured in microseconds against a compiled body
+    /// measured in nanoseconds, and it is why the timing row below is not a
+    /// percentage.
     #[test]
     fn the_branching_body_deopts_once_per_character() {
         let s = nonmatching(4096, 20, 42);
@@ -757,18 +792,24 @@ mod tests {
              does not hold",
             s.len(),
         );
-        // No bridge is ever built, so the failure repeats forever instead of
-        // being served by compiled code. Recorded, not assumed: if majit later
-        // learns to bridge these, this is the line that says the finding moved.
-        assert_eq!(
-            sc.bridges,
-            Some(0),
-            "a bridge was compiled, so the deopt is no longer unbounded and \
-             the timing row needs re-measuring",
-        );
+        // Bridges ARE built now — 10 of them in this run — and the deopt
+        // survives them anyway. Both halves are asserted, because each is a
+        // separate way for the finding to move: a run with no bridges at all
+        // is the multi-frame resume regressing back to a give-up, and a run
+        // whose failures collapse is the bridge tree finally covering the mark
+        // pattern, which would make the timing row wrong rather than stale.
         assert!(
-            sc.aborts.unwrap_or(0) > 0,
-            "no trace was abandoned; the bridge attempts are supposed to abort",
+            sc.bridges.unwrap_or(0) > 0,
+            "no bridge was compiled. Every guard here fails inside the
+             recursive `shift` helper, so its resume data spans 4 to 7 frames;
+             a state-field driver that cannot rebuild them all declines the
+             bridge, which is where this portal used to sit",
+        );
+        assert_eq!(
+            sc.aborts,
+            Some(0),
+            "a bridge attempt was abandoned; `MAJIT_BRIDGE_DEBUG=1` names the \
+             decline on the `[bridgeB] DECLINE` line",
         );
     }
 
@@ -784,10 +825,11 @@ mod tests {
     /// worth stating rather than smoothing over: `matches` builds a fresh
     /// `JitDriver` per call, so every call re-records and re-compiles, and at
     /// 4096 characters that one-off recording is most of the masking row's
-    /// wall clock. The branching row has nothing to amortize it against,
-    /// because it never gets to run the compiled loop. Longer input therefore
-    /// moves the two rows in opposite directions, and the ratio grows with
-    /// length — which is itself the shape of the finding.
+    /// wall clock. The branching row has far less to amortize it against — ten
+    /// bridges that each serve one path, against a compiled loop that serves
+    /// every character. Longer input therefore moves the two rows in opposite
+    /// directions, and the ratio grows with length — which is itself the shape
+    /// of the finding.
     #[test]
     fn the_branching_body_is_far_slower_per_character() {
         let s = nonmatching(1 << 12, 20, 42);
@@ -804,20 +846,20 @@ mod tests {
             median(&sc),
             median(&mk),
         );
-        // Measured at this length: 66x, 68x and 89x over this session's
-        // dynasm runs, 19x on cranelift. The backends differ here and not in
-        // the op census because at 4096 characters this row is dominated by
-        // the ONE recording each `matches` call pays for, and cranelift
-        // compiles slower than dynasm; the branching row is unaffected,
-        // having no compiled loop to amortize it against. The floor is 10x,
-        // low enough to clear cranelift under contention and still far above
-        // the ~1x a lost finding would read.
+        // Measured at this length: 66x, 68x and 89x on dynasm BEFORE the
+        // multi-frame bridge fix, 19x on cranelift; 32x, 35x, 50x and 51x on
+        // dynasm after it, at 1-minute load 33 to 36. The backends differ here
+        // and not in the op census because at 4096 characters this row is
+        // dominated by the ONE recording each `matches` call pays for, and
+        // cranelift compiles slower than dynasm. The floor stays 10x: low
+        // enough to clear cranelift under contention and to survive further
+        // bridging, and still far above the ~1x a lost finding would read.
         assert!(
             ratio > 10.0,
             "masking was only {ratio:.1}x the branching rate at {} characters. \
-             The module doc reports 66-89x here on dynasm, 19x on cranelift \
-             and 1716x at 1M, and under 10x that table is wrong rather than \
-             stale",
+             The module doc reports 32-51x here on dynasm since the \
+             multi-frame bridge fix, 19x on cranelift before it and 1716x at \
+             1M, and under 10x that table is wrong rather than stale",
             s.len(),
         );
     }

@@ -184,8 +184,8 @@ pub use io_buffer::{
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
 pub use jit_state::{
-    DeoptMaterializationCache, GuardResumeReg, JitState, PendingFieldWriteLayout, ResumeDataResult,
-    bridge_decode_red,
+    DeoptMaterializationCache, GuardResumeFrame, GuardResumeReg, JitState, PendingFieldWriteLayout,
+    ResumeDataResult, bridge_decode_red,
 };
 pub use jitcode::{
     BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
@@ -242,7 +242,7 @@ pub use pyjitpl::{
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
     set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
-    trace_jitcode, trace_jitcode_at_resume_position, trace_jitcode_from_merge_point,
+    trace_jitcode, trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point,
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
@@ -1843,6 +1843,21 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     "guard_resume_decline_replay_incomplete",
     "guard_resume_decline_regcount",
     "guard_resume_decline_unreadable_reg",
+    // The rungs the same ladder grew once it rebuilt EVERY encoded resume
+    // section rather than the root alone. All five are disagreements between
+    // the resume stream's frame chain and the bytecode that pushed it, and a
+    // nonzero one is worth reading as a defect rather than as a workload
+    // property: 88 = a section names a `jitcode_index` the flat registry does
+    // not hand out; 89 = a section below the top is not suspended on the far
+    // side of a `BC_INLINE_CALL`, so nothing names its callee or its result
+    // register; 90 = that call's `j` operand does not resolve to a JitCode; 91
+    // = it names a different callee than the section stacked on it; 92 = the
+    // callee ends in a typed return the call site has no slot for.
+    "guard_resume_decline_unregistered_jitcode",
+    "guard_resume_decline_no_inline_call_site",
+    "guard_resume_decline_call_not_jitcode",
+    "guard_resume_decline_callee_mismatch",
+    "guard_resume_decline_return_slot",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

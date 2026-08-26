@@ -181,6 +181,41 @@ pub struct GuardResumeReg {
     pub value: i64,
 }
 
+/// One rebuilt interpreter frame of a guard's resume stack.
+///
+/// `resume.py rebuild_from_resumedata` reads one `(jitcode_pos, pc)` section at
+/// a time and pushes a real `MIFrame` for each — `metainterp.newframe(jitcode)`,
+/// then `f.setup_resume_at_op(pc)`, then `consume_boxes` into that frame's own
+/// registers.  The sections arrive caller-first, because the writer put them
+/// that way (`opencoder.py SnapshotIterator.__init__`), so appending them in
+/// stream order leaves the framestack outermost-at-the-bottom.  This is one
+/// such section, and a slice of them is in that order: outermost caller first,
+/// the frame the guard failed in last.
+///
+/// `result_slot` is the piece the resume stream does not carry.  A frame that
+/// is not the innermost is suspended in an inline call, and the register its
+/// callee's result lands in was deliberately left out of its liveness
+/// (`opencoder.py _ensure_parent_resumedata` blanks it before reading).
+/// Upstream never restores it: `pyjitpl.py MIFrame.make_result_of_lastop`
+/// reads it off the bytecode at the moment the callee returns, so a rebuilt
+/// frame needs nothing.  majit's return path takes it from the frame instead
+/// (`MIFrame::return_i` / `_r` / `_f`, wired by `BC_INLINE_CALL`), so the same
+/// read has to happen here, at rebuild time — that is
+/// `JitCode::inline_call_ending_at`.  `None` on any frame whose callee returns
+/// nothing, and on the innermost frame, which is suspended in a guard rather
+/// than in a call.
+#[derive(Debug, Clone)]
+pub struct GuardResumeFrame {
+    pub jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+    pub pc: usize,
+    pub regs: Vec<GuardResumeReg>,
+    pub result_slot: Option<(crate::jitcode::JitArgKind, usize)>,
+    /// The caller `descrs` slot naming this frame's jitcode, as the
+    /// `BC_INLINE_CALL` that pushed it named it.  `None` for the root frame,
+    /// which no inline call pushed.
+    pub sub_idx: Option<usize>,
+}
+
 /// Interpreter-specific JIT state contract.
 pub trait JitState: Sized {
     type Meta: Clone;
@@ -431,8 +466,10 @@ pub trait JitState: Sized {
     /// the tail runs once either way, but only here does it also land in the
     /// trace.
     ///
-    /// `regs` is the rebuilt register file — the walk cannot re-derive it,
-    /// because a guard is not a position the interpreter is re-enterable at.
+    /// `frames` is the rebuilt framestack — outermost first, each carrying its
+    /// own register file, because the walk cannot re-derive either: a guard is
+    /// not a position the interpreter is re-enterable at, and the callers it
+    /// sits under are suspended mid-instruction.
     ///
     /// The default declines.  A state with no dispatch jitcode has no position
     /// to enter, and declining is not a loss: `compile.py handle_fail` treats
@@ -441,11 +478,9 @@ pub trait JitState: Sized {
     fn trace_from_guard_resume_position<R: crate::pyjitpl::JitCodeRuntime>(
         _ctx: &mut crate::trace_ctx::TraceCtx,
         _sym: &mut Self::Sym,
-        _dispatch_jitcode: &crate::jitcode::JitCode,
-        _resume_pc: usize,
+        _frames: &[GuardResumeFrame],
         _outer_program_pc: usize,
         _runtime: &R,
-        _regs: &[GuardResumeReg],
     ) -> Option<crate::TraceAction> {
         None
     }
