@@ -26,12 +26,52 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// Lower an `if` / `while` condition, peeling a leading `!` into the
+    /// branch instead of computing it.
+    ///
+    /// `jtransform.py` renames `bool_not` to `int_is_zero`, and
+    /// `optimize_goto_if_not` then folds that operation into the block's
+    /// exitswitch, so `if not x` reaches flatten as one
+    /// `goto_if_not_int_is_zero` and no separate negation op.
+    ///
+    /// The peel belongs to condition position and nowhere else. `BindingKind`
+    /// carries no `bool`, and `!` is logical on a Rust `bool` but bitwise on
+    /// an integer, so a general `UnOp::Not` arm could not tell the two apart
+    /// and does not exist. A condition is `bool` by the language's own typing
+    /// rule, which is the guarantee `optimize_goto_if_not` spells out as
+    /// `v.concretetype != lltype.Bool: return False`.
+    pub(super) fn lower_condition(&mut self, cond: &Expr) -> Option<(Binding, bool)> {
+        let mut negated = false;
+        let mut expr = cond;
+        loop {
+            match expr {
+                Expr::Paren(paren) => expr = &paren.expr,
+                Expr::Unary(ExprUnary {
+                    op: UnOp::Not(_),
+                    expr: inner,
+                    ..
+                }) => {
+                    negated = !negated;
+                    expr = inner;
+                }
+                _ => break,
+            }
+        }
+        let binding = self.lower_value_expr(expr)?;
+        // The int bank is what `goto_if_not_int_is_zero` reads. An unnegated
+        // condition keeps whatever the caller already accepted.
+        if negated && !matches!(binding.kind, BindingKind::Int) {
+            return None;
+        }
+        Some((binding, negated))
+    }
+
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {
         let snap_stmts = self.statements.len();
         let snap_meta = self.op_metadata.len();
         let snap_reg = self.next_reg;
         let snap_bindings = self.bindings.clone();
-        let cond = self.lower_value_expr(&expr_if.cond)?;
+        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
         if self.ops_since_contain_float_compare(snap_meta) {
             // Guard over a float comparison hangs the compiled trace; roll
             // back the condition ops and bail so the arm runs interpreted.
@@ -72,7 +112,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard(cond_reg, &else_label);
+        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
         self.append_lowered_sequence(then_seq);
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
@@ -93,6 +133,10 @@ impl<'c> Lowerer<'c> {
     /// default; end:
     /// ```
     pub(super) fn lower_match_stmt(&mut self, expr_match: &syn::ExprMatch) -> Option<()> {
+        self.transactional(|s| s.lower_match_stmt_inner(expr_match))
+    }
+
+    fn lower_match_stmt_inner(&mut self, expr_match: &syn::ExprMatch) -> Option<()> {
         let discriminant = self.lower_value_expr(&expr_match.expr)?;
         if !matches!(discriminant.kind, BindingKind::Int) {
             return None;
@@ -232,20 +276,20 @@ impl<'c> Lowerer<'c> {
     /// loop_end:
     /// ```
     pub(super) fn lower_while_loop(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
-        let snap_stmts = self.statements.len();
+        self.transactional(|s| s.lower_while_loop_inner(expr_while))
+    }
+
+    fn lower_while_loop_inner(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
         let snap_meta = self.op_metadata.len();
-        let snap_reg = self.next_reg;
-        let snap_label = self.next_label;
-        let snap_bindings = self.bindings.clone();
 
         // `loop_start` has to be marked *before* the condition lowers:
         // `mark_label` records the builder's current bytecode position, the
         // back edge re-enters there, and the condition must be re-tested on
         // every iteration.  So these allocations cannot be deferred past the
         // first fallible call the way `lower_if_with_loop_control` defers its
-        // own — both of that function's labels are forward targets, which is
-        // why it leaks nothing without a restore.  Here every exit below has
-        // to put `next_label` back itself.
+        // own — both of that function's labels are forward targets. Every exit
+        // below leaves two labels and three statements emitted, which is what
+        // the `transactional` wrapper puts back.
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
@@ -254,25 +298,10 @@ impl<'c> Lowerer<'c> {
         self.emit_label_def(&loop_start);
 
         // Evaluate the condition
-        let Some(cond) = self.lower_value_expr(&expr_while.cond) else {
-            // Two labels and three statements are already emitted; drop them
-            // so an unlowerable condition leaves no gap in the label counter.
-            self.statements.truncate(snap_stmts);
-            self.op_metadata.truncate(snap_meta);
-            self.next_reg = snap_reg;
-            self.next_label = snap_label;
-            self.bindings = snap_bindings;
-            return None;
-        };
+        let (cond, cond_negated) = self.lower_condition(&expr_while.cond)?;
         if self.ops_since_contain_float_compare(snap_meta) {
-            // Guard over a float comparison hangs the compiled trace; roll
-            // back everything emitted for this loop and bail so the arm
-            // runs interpreted instead.
-            self.statements.truncate(snap_stmts);
-            self.op_metadata.truncate(snap_meta);
-            self.next_reg = snap_reg;
-            self.next_label = snap_label;
-            self.bindings = snap_bindings;
+            // Guard over a float comparison hangs the compiled trace; bail so
+            // the arm runs interpreted instead.
             return None;
         }
         let cond_reg = cond.reg;
@@ -280,7 +309,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard(cond_reg, &loop_end);
+        self.emit_conditional_guard_negatable(cond_reg, &loop_end, cond_negated);
 
         // Lower the body, with break targets pointing to loop_end
         let body_seq = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
@@ -300,6 +329,10 @@ impl<'c> Lowerer<'c> {
     /// loop_end:
     /// ```
     pub(super) fn lower_loop_expr(&mut self, expr_loop: &syn::ExprLoop) -> Option<()> {
+        self.transactional(|s| s.lower_loop_expr_inner(expr_loop))
+    }
+
+    fn lower_loop_expr_inner(&mut self, expr_loop: &syn::ExprLoop) -> Option<()> {
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
@@ -321,6 +354,10 @@ impl<'c> Lowerer<'c> {
     /// and wildcard variants are accepted.  Other iterator protocol shapes
     /// still return `None` so the containing arm falls back unchanged.
     pub(super) fn lower_for_loop(&mut self, expr_for: &syn::ExprForLoop) -> Option<()> {
+        self.transactional(|s| s.lower_for_loop_inner(expr_for))
+    }
+
+    fn lower_for_loop_inner(&mut self, expr_for: &syn::ExprForLoop) -> Option<()> {
         let loop_var = match &*expr_for.pat {
             Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => Some(pat_ident.ident.clone()),
             Pat::Wild(_) => None,
@@ -513,6 +550,15 @@ impl<'c> Lowerer<'c> {
         break_label: &syn::Ident,
         continue_label: &syn::Ident,
     ) -> Option<()> {
+        self.transactional(|s| s.lower_loop_if_inner(expr_if, break_label, continue_label))
+    }
+
+    fn lower_loop_if_inner(
+        &mut self,
+        expr_if: &ExprIf,
+        break_label: &syn::Ident,
+        continue_label: &syn::Ident,
+    ) -> Option<()> {
         // Check if any branch contains break or continue
         let then_has_loop_ctrl = block_has_loop_control(&expr_if.then_branch);
         let else_has_loop_ctrl = expr_if
@@ -524,20 +570,11 @@ impl<'c> Lowerer<'c> {
             return None; // no break/continue, fall back to normal lowering
         }
 
-        let snap_stmts = self.statements.len();
         let snap_meta = self.op_metadata.len();
-        let snap_reg = self.next_reg;
-        let snap_label = self.next_label;
-        let snap_bindings = self.bindings.clone();
-        let cond = self.lower_value_expr(&expr_if.cond)?;
+        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
         if self.ops_since_contain_float_compare(snap_meta) {
-            // Guard over a float comparison hangs the compiled trace; roll
-            // back and bail so the arm runs interpreted instead.
-            self.statements.truncate(snap_stmts);
-            self.op_metadata.truncate(snap_meta);
-            self.next_reg = snap_reg;
-            self.next_label = snap_label;
-            self.bindings = snap_bindings;
+            // Guard over a float comparison hangs the compiled trace; bail so
+            // the arm runs interpreted instead.
             return None;
         }
         let else_label = self.alloc_label();
@@ -550,7 +587,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard(cond_reg, &else_label);
+        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
 
         // Lower then-branch with loop control
         let then_seq = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;
@@ -575,6 +612,10 @@ impl<'c> Lowerer<'c> {
     /// Lower a match expression in value position to chained if-else guards
     /// that produce a value.
     pub(super) fn lower_match_value(&mut self, expr_match: &syn::ExprMatch) -> Option<Binding> {
+        self.transactional(|s| s.lower_match_value_inner(expr_match))
+    }
+
+    fn lower_match_value_inner(&mut self, expr_match: &syn::ExprMatch) -> Option<Binding> {
         let discriminant = self.lower_value_expr(&expr_match.expr)?;
         if !matches!(discriminant.kind, BindingKind::Int) {
             return None;
@@ -995,6 +1036,60 @@ mod unroll_binding_tests {
         assert_eq!(lowerer.next_label, 31);
         assert!(lowerer.statements.is_empty());
         assert!(lowerer.op_metadata.is_empty());
+    }
+
+    /// The classification test above covers a match that refuses before it
+    /// emits. This is the other half: the discriminant lowers, the arm guard
+    /// and its two `new_label()`s are already in the stream, and then the arm
+    /// body refuses. What the stream must not keep is a label created without
+    /// a `mark_label` — the jitcode assembler cannot see that until it patches
+    /// a `goto` naming a position no block ever took.
+    #[test]
+    fn failed_match_arm_body_leaves_no_label_behind() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.next_label = 41;
+
+        let expr_match: syn::ExprMatch = syn::parse_quote! {
+            match 0 {
+                1 => unsupported_body(),
+                _ => {},
+            }
+        };
+        assert!(lowerer.lower_match_stmt(&expr_match).is_none());
+        assert_eq!(lowerer.next_label, 41);
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
+
+    /// `not cond` is a different branch opname, not an operation plus a
+    /// branch: `jtransform.py` renames `bool_not` to `int_is_zero` and
+    /// `optimize_goto_if_not` folds it into the exitswitch.
+    #[test]
+    fn a_negated_condition_selects_the_is_zero_branch() {
+        let mut lowerer = Lowerer::new(None);
+        let stmt: Stmt = syn::parse_quote! { let flag = 1; };
+        let Stmt::Local(local) = stmt else {
+            unreachable!("parse_quote produced the requested let statement")
+        };
+        assert!(lowerer.lower_local(&local).is_some());
+
+        let expr_if: syn::ExprIf = syn::parse_quote! { if !flag { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("goto_if_not_int_is_zero"),
+            "`if !flag` must branch on int_is_zero, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if_not_int_is_true"),
+            "the negation must replace the branch, not add one:\n{emitted}"
+        );
     }
 
     #[test]

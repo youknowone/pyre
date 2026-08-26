@@ -1886,7 +1886,7 @@ impl<'c> Lowerer<'c> {
             return Some(binding);
         }
 
-        let cond = self.lower_value_expr(&expr_if.cond)?;
+        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
         if !matches!(cond.kind, BindingKind::Int) {
             return None;
         }
@@ -1922,7 +1922,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard(cond_reg, &else_label);
+        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
         self.append_lowered_sequence(then_seq);
         self.emit_op(
             OpMeta::linear(
