@@ -14,8 +14,45 @@ use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
-/// Parse a unicode percent format, retaining the first unsupported conversion
-/// as a recoverable final spec.
+#[derive(Clone, Copy)]
+enum DeferredPercentError {
+    Unsupported(CFormatError),
+    Incomplete(CFormatError),
+    IncompleteMappingKey(CFormatError),
+}
+
+impl DeferredPercentError {
+    fn unsupported(self) -> Option<CFormatError> {
+        match self {
+            Self::Unsupported(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    fn after_parts(self, is_mapping: bool) -> Result<(), PyError> {
+        let error = match self {
+            Self::Unsupported(_) => {
+                unreachable!("the recovered unsupported spec raises after operand acquisition")
+            }
+            Self::Incomplete(error) => error,
+            Self::IncompleteMappingKey(_) if !is_mapping => {
+                return Err(PyError::type_error("format requires a mapping"));
+            }
+            Self::IncompleteMappingKey(error) => error,
+        };
+        Err(PyError::value_error(error.to_string()))
+    }
+}
+
+fn wtf8_prefix(fmt: &Wtf8, codepoints: usize) -> Wtf8Buf {
+    let mut prefix = Wtf8Buf::new();
+    for codepoint in fmt.code_points().take(codepoints) {
+        prefix.push(codepoint);
+    }
+    prefix
+}
+
+/// Parse a unicode percent format, retaining the first deferred parser error.
 ///
 /// PyPy's `StringFormatter.format` parses one spec at a time: `parse_fmt`
 /// performs mapping lookup and consumes `*` operands, then the loop validates
@@ -27,38 +64,84 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 /// Replace only that unsupported character with `s` and stop there. The caller
 /// can execute every preceding spec and the recovered spec's operand-acquisition
 /// path, then surface the saved 3.14 error without formatting the operand.
-fn parse_wtf8_incremental(fmt: &Wtf8) -> Result<(CFormatWtf8, Option<CFormatError>), PyError> {
+/// An incomplete trailing `%` or mapping key instead retains only the complete
+/// prefix, so its earlier conversions run before the saved parser error.
+fn parse_wtf8_incremental(
+    fmt: &Wtf8,
+) -> Result<(CFormatWtf8, Option<DeferredPercentError>), PyError> {
     match CFormatWtf8::parse_from_wtf8(fmt) {
         Ok(format) => Ok((format, None)),
-        Err(error) if matches!(error.typ, CFormatErrorType::UnsupportedFormatChar(_)) => {
-            let mut prefix = Wtf8Buf::new();
-            for (index, codepoint) in fmt.code_points().enumerate() {
-                if index == error.index {
-                    prefix.push_char('s');
-                    break;
+        Err(error) => {
+            let (prefix_len, replacement, deferred) = match error.typ {
+                CFormatErrorType::UnsupportedFormatChar(_) => {
+                    (error.index, true, DeferredPercentError::Unsupported(error))
                 }
-                prefix.push(codepoint);
+                CFormatErrorType::IncompleteFormat => (
+                    error
+                        .index
+                        .checked_sub(1)
+                        .expect("an incomplete format follows its percent sign"),
+                    false,
+                    DeferredPercentError::Incomplete(error),
+                ),
+                CFormatErrorType::UnmatchedKeyParentheses => (
+                    error
+                        .index
+                        .checked_sub(1)
+                        .expect("an incomplete mapping key follows its percent sign"),
+                    false,
+                    DeferredPercentError::IncompleteMappingKey(error),
+                ),
+                _ => return Err(PyError::value_error(error.to_string())),
+            };
+            let mut prefix = wtf8_prefix(fmt, prefix_len);
+            if replacement {
+                prefix.push_char('s');
             }
             let recovered = CFormatWtf8::parse_from_wtf8(&prefix)
-                .expect("replacing the first unsupported conversion with %s must parse");
-            Ok((recovered, Some(error)))
+                .expect("the complete prefix of a deferred percent-format error must parse");
+            Ok((recovered, Some(deferred)))
         }
-        Err(error) => Err(PyError::value_error(error.to_string())),
     }
 }
 
 /// Bytes counterpart of [`parse_wtf8_incremental`].
-fn parse_bytes_incremental(fmt: &[u8]) -> Result<(CFormatBytes, Option<CFormatError>), PyError> {
+fn parse_bytes_incremental(
+    fmt: &[u8],
+) -> Result<(CFormatBytes, Option<DeferredPercentError>), PyError> {
     match CFormatBytes::parse_from_bytes(fmt) {
         Ok(format) => Ok((format, None)),
-        Err(error) if matches!(error.typ, CFormatErrorType::UnsupportedFormatChar(_)) => {
-            let mut prefix = fmt[..error.index].to_vec();
-            prefix.push(b's');
+        Err(error) => {
+            let (prefix_len, replacement, deferred) = match error.typ {
+                CFormatErrorType::UnsupportedFormatChar(_) => {
+                    (error.index, true, DeferredPercentError::Unsupported(error))
+                }
+                CFormatErrorType::IncompleteFormat => (
+                    error
+                        .index
+                        .checked_sub(1)
+                        .expect("an incomplete format follows its percent sign"),
+                    false,
+                    DeferredPercentError::Incomplete(error),
+                ),
+                CFormatErrorType::UnmatchedKeyParentheses => (
+                    error
+                        .index
+                        .checked_sub(1)
+                        .expect("an incomplete mapping key follows its percent sign"),
+                    false,
+                    DeferredPercentError::IncompleteMappingKey(error),
+                ),
+                _ => return Err(PyError::value_error(error.to_string())),
+            };
+            let mut prefix = fmt[..prefix_len].to_vec();
+            if replacement {
+                prefix.push(b's');
+            }
             let recovered = CFormatBytes::parse_from_bytes(&prefix)
-                .expect("replacing the first unsupported conversion with %s must parse");
-            Ok((recovered, Some(error)))
+                .expect("the complete prefix of a deferred percent-format error must parse");
+            Ok((recovered, Some(deferred)))
         }
-        Err(error) => Err(PyError::value_error(error.to_string())),
     }
 }
 
@@ -84,7 +167,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let args = pyre_object::gc_roots::pin_root(args);
     let fmt_str = w_str_get_wtf8(fmt);
-    let (format, unsupported_error) = parse_wtf8_incremental(fmt_str)?;
+    let (format, deferred_error) = parse_wtf8_incremental(fmt_str)?;
 
     // `unicodeobject.c PyUnicode_Format` — the operand is usable as a
     // mapping (for `%(key)s` lookups) when it exposes `__getitem__` and is
@@ -150,16 +233,19 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     };
                     v
                 };
-                if unsupported_error.is_some() && parts.peek().is_none() {
-                    return Err(PyError::value_error(
-                        unsupported_error
-                            .expect("unsupported part retains its parser error")
-                            .to_string(),
-                    ));
+                if let Some(error) = deferred_error
+                    .and_then(DeferredPercentError::unsupported)
+                    .filter(|_| parts.peek().is_none())
+                {
+                    return Err(PyError::value_error(error.to_string()));
                 }
                 result.push_wtf8(&spec_format_string(&spec, value, idx)?);
             }
         }
+    }
+
+    if let Some(error) = deferred_error {
+        error.after_parts(dict.is_some())?;
     }
 
     // `checkconsumed` — surplus positional values are converted to an error
@@ -207,7 +293,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let args = pyre_object::gc_roots::pin_root(args);
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
-    let (format, unsupported_error) = parse_bytes_incremental(fmt_bytes)?;
+    let (format, deferred_error) = parse_bytes_incremental(fmt_bytes)?;
     let (num_specifiers, mapping_required) = format
         .check_specifiers()
         .ok_or_else(|| PyError::type_error("format requires a mapping"))?;
@@ -215,7 +301,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     let is_mapping = bytes_format_is_mapping(args);
     let mut result = Vec::new();
 
-    if num_specifiers == 0 {
+    if num_specifiers == 0 && deferred_error.is_none() {
         if !is_mapping && !bytes_format_empty_tuple(args) {
             return Err(PyError::type_error(
                 "not all arguments converted during bytes formatting",
@@ -248,16 +334,18 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                     )?;
                     let value = pyre_object::gc_roots::pin_root(value);
                     mapping_star_operands(&mut spec, value)?;
-                    if unsupported_error.is_some() && parts.peek().is_none() {
-                        return Err(PyError::value_error(
-                            unsupported_error
-                                .expect("unsupported part retains its parser error")
-                                .to_string(),
-                        ));
+                    if let Some(error) = deferred_error
+                        .and_then(DeferredPercentError::unsupported)
+                        .filter(|_| parts.peek().is_none())
+                    {
+                        return Err(PyError::value_error(error.to_string()));
                     }
                     result.extend(spec_format_bytes(&spec, value)?);
                 }
             }
+        }
+        if let Some(error) = deferred_error {
+            error.after_parts(is_mapping)?;
         }
         return Ok(bytes_format_result(fmt, &result));
     }
@@ -287,16 +375,19 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                         "not enough arguments for format string",
                     ));
                 };
-                if unsupported_error.is_some() && parts.peek().is_none() {
-                    return Err(PyError::value_error(
-                        unsupported_error
-                            .expect("unsupported part retains its parser error")
-                            .to_string(),
-                    ));
+                if let Some(error) = deferred_error
+                    .and_then(DeferredPercentError::unsupported)
+                    .filter(|_| parts.peek().is_none())
+                {
+                    return Err(PyError::value_error(error.to_string()));
                 }
                 result.extend(spec_format_bytes(&spec, value)?);
             }
         }
+    }
+
+    if let Some(error) = deferred_error {
+        error.after_parts(is_mapping)?;
     }
 
     if pos.has_next() {
@@ -933,5 +1024,52 @@ mod tests {
             PyErrorKind::TypeError,
             "not enough arguments for format string",
         );
+    }
+
+    #[test]
+    fn percent_incomplete_syntax_runs_the_complete_prefix_first() {
+        crate::typedef::init_typeobjects();
+
+        let error =
+            unsafe { str_format_percent(w_str_new("%s %"), w_tuple_new(Vec::new())).unwrap_err() };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string",
+        );
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%s %"), w_tuple_new(vec![w_str_new("done")])).unwrap_err()
+        };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%(x"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
+        };
+        assert_error(error, PyErrorKind::TypeError, "format requires a mapping");
+
+        let mapping = w_dict_new();
+        let error = unsafe { str_format_percent(w_str_new("%(x"), mapping).unwrap_err() };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format key");
+
+        let error = unsafe {
+            bytes_format_percent(
+                w_bytes_from_bytes(b"%s %"),
+                w_tuple_new(vec![w_bytes_from_bytes(b"done")]),
+            )
+            .unwrap_err()
+        };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%(x"), w_tuple_new(vec![w_int_new(1)]))
+                .unwrap_err()
+        };
+        assert_error(error, PyErrorKind::TypeError, "format requires a mapping");
+
+        let mapping = w_dict_new();
+        let error =
+            unsafe { bytes_format_percent(w_bytes_from_bytes(b"%(x"), mapping).unwrap_err() };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format key");
     }
 }
