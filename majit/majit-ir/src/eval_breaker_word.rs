@@ -165,7 +165,60 @@ thread_local! {
     /// an unrelated thread could reach a back edge first and take an exception
     /// nothing it did earned — leaving the thread that did exhaust the heap
     /// running on toward the fatal rung.
-    static MEMORY_ERROR_OWED: Cell<bool> = const { Cell::new(false) };
+    static MEMORY_ERROR_OWED: OwedMemoryError = const { OwedMemoryError(Cell::new(false)) };
+}
+
+/// This thread's half of the debt [`MEMORY_ERROR_OWERS`] counts.
+///
+/// A type with a destructor rather than a bare `Cell`, because a thread can
+/// exit still owing one: the exception is raised by a dispatch loop, and a
+/// thread whose loop has already returned never reaches another. Left on the
+/// census that debt is unpayable — the count never falls to zero, so no later
+/// owner clears the bit, and `EB_MEMORY_ERROR` is in `JIT_BREAKER_MASK`, so
+/// every back edge in the process fails from then on. It also freezes the
+/// collector's ladder, which reads [`memory_error_armed`] to tell a breach
+/// that repeats an exception the program already has from one that is new.
+struct OwedMemoryError(Cell<bool>);
+
+impl Drop for OwedMemoryError {
+    fn drop(&mut self) {
+        if self.0.replace(false) {
+            release_one_owed();
+        }
+    }
+}
+
+/// Take one undelivered exception off the census, clearing the bit if it was
+/// the last.
+fn release_one_owed() {
+    if MEMORY_ERROR_OWERS.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
+    // Another thread may have armed one between the decrement and the clear,
+    // and set a bit this then removed. Re-publish the summary it is owed;
+    // setting an already-set bit is what the racing arm did anyway, so this is
+    // idempotent rather than a second signal.
+    if MEMORY_ERROR_OWERS.load(Ordering::Acquire) != 0 {
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+    }
+}
+
+/// Rebuild the census around the one thread `fork()` leaves running.
+///
+/// `rthread.thread_after_fork()` parity: the child has only the thread that
+/// called `fork()`, and the others' debts have no dispatch loop left to pay
+/// them there. A vanished thread runs no destructor, so [`OwedMemoryError`]
+/// cannot clear them either, and keeping the count would arm the bit in the
+/// child for good.
+pub fn memory_error_after_fork_child() {
+    let owed_here = MEMORY_ERROR_OWED.with(|owed| owed.0.get());
+    MEMORY_ERROR_OWERS.store(usize::from(owed_here), Ordering::SeqCst);
+    if owed_here {
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+    } else {
+        EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
+    }
 }
 
 /// How many threads owe an undelivered `MemoryError`.
@@ -191,7 +244,7 @@ static MEMORY_ERROR_OWERS: AtomicUsize = AtomicUsize::new(0);
 /// that thread, and the bit only publishes that one is owed to someone.
 pub fn set_memory_error() {
     MEMORY_ERROR_OWED.with(|owed| {
-        if owed.replace(true) {
+        if owed.0.replace(true) {
             // Already owed here and not yet delivered, so the count and the
             // bit already stand for this thread.
             return;
@@ -222,7 +275,7 @@ pub fn memory_error_armed() -> bool {
 /// summary, so an exception owed to another thread would read as this thread's
 /// own and silence a breach that thread never caused.
 pub fn memory_error_owed_here() -> bool {
-    MEMORY_ERROR_OWED.with(|owed| owed.get())
+    MEMORY_ERROR_OWED.with(|owed| owed.0.get())
 }
 
 /// Consume the `MemoryError` owed to *this* thread, reporting whether one was.
@@ -238,19 +291,10 @@ pub fn take_memory_error() -> bool {
         return false;
     }
     MEMORY_ERROR_OWED.with(|owed| {
-        if !owed.replace(false) {
+        if !owed.0.replace(false) {
             return false;
         }
-        if MEMORY_ERROR_OWERS.fetch_sub(1, Ordering::AcqRel) == 1 {
-            EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
-            // Another thread may have armed one between the decrement and the
-            // clear, and set a bit this then removed. Re-publish the summary it
-            // is owed; setting an already-set bit is what the racing arm did
-            // anyway, so this is idempotent rather than a second signal.
-            if MEMORY_ERROR_OWERS.load(Ordering::Acquire) != 0 {
-                EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
-            }
-        }
+        release_one_owed();
         true
     })
 }
@@ -374,15 +418,23 @@ mod tests {
         let _guard = MEMORY_ERROR_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let owner = std::thread::spawn(|| {
+        // The owner stays alive until it has delivered. A thread that exits
+        // still owing hands the debt back — see the test below — so joining it
+        // here would clear the very bit this test is watching.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (deliver_tx, deliver_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
             set_memory_error();
             // The summary is published for everyone, so a compiled loop on any
             // thread leaves machine code — the bit is the deopt trigger, not
             // the delivery.
             assert_ne!(load() & EB_MEMORY_ERROR, 0);
             assert!(memory_error_armed());
+            armed_tx.send(()).unwrap();
+            deliver_rx.recv().unwrap();
+            assert!(take_memory_error(), "the owner is the thread that raises");
         });
-        owner.join().unwrap();
+        armed_rx.recv().unwrap();
 
         assert!(
             memory_error_armed(),
@@ -398,10 +450,79 @@ mod tests {
             "and a thread that is owed nothing must not clear the owner's bit"
         );
 
-        // The owner is gone without delivering, which is what leaves the bit
-        // set here; clear it so the resting state is what the next test finds.
-        MEMORY_ERROR_OWED.with(|owed| owed.set(true));
-        assert!(take_memory_error());
+        deliver_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the last owner to deliver clears the summary"
+        );
+    }
+
+    /// A thread can exit while still owed one, and the debt has to leave the
+    /// census with it. The exception is raised by a dispatch loop, so a thread
+    /// whose loop has already returned never reaches another; left counted,
+    /// nothing can ever clear the bit again.
+    #[test]
+    fn a_thread_that_exits_still_owing_hands_the_debt_back() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| {
+            set_memory_error();
+            assert!(
+                memory_error_armed(),
+                "the summary is published while it lives"
+            );
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the owner exited without delivering, so nothing is owed any more"
+        );
+        assert!(
+            !take_memory_error(),
+            "and no other thread inherits an exception it never earned"
+        );
+    }
+
+    /// `fork()` leaves one thread running, so in the child every other thread's
+    /// debt is unpayable. The census has to be rebuilt around the survivor.
+    #[test]
+    fn the_fork_child_keeps_only_the_surviving_threads_debt() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A sibling's debt, modelled by hand: a thread that vanishes at
+        // `fork()` runs no destructor, so an owner spawned here — which does —
+        // cannot stand in for one.
+        MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+
+        memory_error_after_fork_child();
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the thread that called fork owes nothing, so the child owes nothing"
+        );
+        assert_eq!(MEMORY_ERROR_OWERS.load(Ordering::Acquire), 0);
+
+        // The survivor's own debt is the half that is kept.
+        set_memory_error();
+        MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
+        memory_error_after_fork_child();
+        assert_ne!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "an exception owed to the surviving thread is still owed after the fork"
+        );
+        assert!(
+            take_memory_error(),
+            "and it is still that thread's to raise"
+        );
         assert_eq!(load() & EB_MEMORY_ERROR, 0);
     }
 
