@@ -6282,18 +6282,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #61: UNARY_INVERT `~int` fold.  `~x` always fits an int, so the fold
-    // emits a plain `IntInvert` behind a `GUARD_CLASS INT` (no overflow guard),
-    // eliding the `CALL_MAY_FORCE`.  A bool / subclass / non-int operand
-    // declines to the generic leg.
+    // UNARY_INVERT.  Descend `invert_inner` -- `invert` past the override probe
+    // and the bool slot -- rather than re-emit its integer arm by hand.  This
+    // replaced `unary_invert_int`, whose site it took whole: with the descent
+    // in, that fold measured `consulted=0` on every fixture that exercises `~`.
+    // Falls through to the generic residual when the body is absent from this
+    // build or reaches a helper the build did not lower.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && spec_gate(SpecFold::UnaryInvertInt, || {
-            try_walker_specialize_unary_invert_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
+        && spec_gate(SpecFold::UnaryInvertDescent, || {
+            try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
         .is_some()
     {
