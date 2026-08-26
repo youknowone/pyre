@@ -7279,6 +7279,13 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
         return Ok(None);
     }
     // SAFETY: as above.
+    //
+    // This cannot decline for an admitted operand.  `walker_exact_builtin_class`
+    // answers `None` for an exact builtin whose `w_class` is null, and the only
+    // objects born that way are the read-only singletons (`True`, `False`,
+    // `None`, `Ellipsis`, `NotImplemented`) -- every other builtin is born
+    // carrying `get_instantiate(ob_type)`.  None of those five survives the
+    // admission above: the first two are `bool`, the rest are not `int`.
     let Some(operand_class) = (unsafe { walker_exact_builtin_class(operand_obj) }) else {
         return Ok(None);
     };
