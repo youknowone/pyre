@@ -2,8 +2,8 @@ use std::ops::{Index, IndexMut};
 
 use crate::bytesobject::BytesBlock;
 use crate::object_array::{
-    ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, grow_list_items_block_gc,
-    items_block_capacity, items_block_items_base,
+    ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, items_block_capacity,
+    items_block_items_base,
 };
 use crate::pyobject::PyObjectRef;
 
@@ -91,9 +91,25 @@ impl BytesArray {
         false
     }
 
-    fn grow(&mut self, min_cap: usize) {
-        let target = min_cap.max(self.capacity().saturating_mul(2)).max(4);
-        self.block = unsafe { grow_list_items_block_gc(self.block, target, self.len) };
+    /// The room `capacity` must already hold for `additional` more entries.
+    ///
+    /// A fresh block is young, and this array is embedded in the owning
+    /// `W_ListObject` — the only object through which a collection reaches it.
+    /// An old-gen owner that gains that edge without being on the remembered
+    /// set is skipped by the minor collection that would forward the block, and
+    /// the block, along with every `BytesBlock` reachable only through it, is
+    /// reclaimed while the list still names it. `BytesArray` cannot reach its
+    /// owner to barrier it, so it never allocates a block: the list reserves
+    /// room through `W_ListObject::bytes_grow`, which barriers on both sides of
+    /// the allocation. Refuse loudly rather than grow behind the owner's back.
+    #[inline]
+    fn assert_room(&self, additional: usize) {
+        assert!(
+            self.len + additional <= self.capacity(),
+            "BytesArray needs {additional} more slot(s) than its capacity {}; \
+             reserve through W_ListObject::bytes_grow first",
+            self.capacity(),
+        );
     }
 
     #[inline]
@@ -107,9 +123,7 @@ impl BytesArray {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
-        if self.len == self.capacity() {
-            self.grow(self.len + 1);
-        }
+        self.assert_room(1);
         self.barrier();
         unsafe { *self.base().add(self.len) = crate::gc_roots::shadow_stack_get(value_slot) };
         self.len += 1;
@@ -142,9 +156,7 @@ impl BytesArray {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
-        if self.len == self.capacity() {
-            self.grow(self.len + 1);
-        }
+        self.assert_room(1);
         self.barrier();
         unsafe {
             let p = self.base().add(index);
@@ -197,9 +209,12 @@ impl BytesArray {
         for &value in values {
             let _ = crate::gc_roots::pin_root(value as PyObjectRef);
         }
-        if new_len > self.capacity() {
-            self.grow(new_len);
-        }
+        assert!(
+            new_len <= self.capacity(),
+            "BytesArray splice needs {new_len} slots but capacity is {}; \
+             reserve through W_ListObject::bytes_grow first",
+            self.capacity(),
+        );
         self.barrier();
         unsafe {
             let base = self.base();

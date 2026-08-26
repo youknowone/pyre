@@ -279,6 +279,65 @@ impl W_ListObject {
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
+    /// Grow `bytes_items` to accommodate at least `min_cap` slots — the
+    /// Bytes-strategy counterpart of [`W_ListObject::object_grow`], and the
+    /// only place a fresh `bytes_items` block may be published.
+    ///
+    /// The grow has to be driven from the list. `BytesArray` cannot reach its
+    /// owner, so growing from inside it allocates the block and stores it into
+    /// the list as one step, with no way to barrier the list in between. A
+    /// barrier the caller ran before the call is spent by the collection that
+    /// allocation itself starts: the list leaves the remembered set again, and
+    /// the young block then reaches an old list that the next minor collection
+    /// never visits, which drops the block and every `BytesBlock` reachable
+    /// only through it. Barrier on both sides of the allocation, with the fresh
+    /// block rooted across the second one, exactly as `object_grow` does.
+    unsafe fn bytes_grow(obj: PyObjectRef, min_cap: usize) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
+        let list = &*(obj as *const W_ListObject);
+        let current_cap = list.bytes_items.heap_capacity();
+        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        list_write_barrier(obj);
+        let new_block_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &*(obj as *const W_ListObject);
+        let new_block =
+            grow_list_items_block_gc(list.bytes_items.block, target_cap, list.bytes_items.len());
+        let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let old_block = list.bytes_items.block;
+        list.bytes_items.block =
+            crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
+        dealloc_list_items_block(old_block);
+        crate::gc_roots::shadow_stack_get(obj_slot)
+    }
+
+    /// Publish an already-built `BytesArray` as this list's `bytes_items`,
+    /// under [`W_ListObject::bytes_grow`]'s barrier discipline.
+    ///
+    /// `fresh` holds a block that nothing roots yet, so it travels on the
+    /// shadow stack across the owner barrier — the barrier waits on the GC
+    /// operation gate and can therefore let a collection move the block before
+    /// `install` pins it.
+    unsafe fn install_bytes_items(obj: PyObjectRef, fresh: BytesArray) -> PyObjectRef {
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let obj = crate::gc_roots::pin_root(obj);
+        let block_slot = fresh.pin_block();
+        list_write_barrier(obj);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let list = &mut *(obj as *mut W_ListObject);
+        let mut fresh = fresh;
+        fresh.reload_block(block_slot);
+        list.bytes_items.install(fresh);
+        crate::gc_roots::shadow_stack_get(obj_slot)
+    }
+
     /// Upstream list.append equivalent for the object strategy.
     /// (listobject.py `AbstractUnwrappedStrategy.append` for the
     /// Object case: no unwrap, just append.)
@@ -547,6 +606,29 @@ pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> P
     crate::gc_roots::shadow_stack_get(save + 1)
 }
 
+/// [`w_list_grow_items_block`] for the Bytes strategy: makes room for one more
+/// erased `rpython str` and returns `value` at its post-grow address.
+///
+/// `value` is pinned across the grow for the same reason the object arm pins
+/// it — [`W_ListObject::bytes_grow`] allocates in the moving nursery and may
+/// collect, so the caller must store the returned pointer, not the argument it
+/// passed.
+///
+/// # Safety
+/// `obj` must point to a valid Bytes-strategy `W_ListObject`; `value` must be
+/// a live `PyObjectRef`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_grow_bytes_block(obj: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let save = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let _ = crate::gc_roots::pin_root(value);
+    let obj = crate::gc_roots::shadow_stack_get(save);
+    let list = &*(obj as *const W_ListObject);
+    W_ListObject::bytes_grow(obj, list.bytes_items.len() + 1);
+    crate::gc_roots::shadow_stack_get(save + 1)
+}
+
 /// listobject.py is_plain_int1(w_obj)
 ///
 /// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
@@ -782,13 +864,27 @@ fn all_bytes(items: &[PyObjectRef]) -> bool {
     items.iter().all(|&item| is_bytes_strategy_item(item))
 }
 
-fn boxed_from_bytes(values: &[*const crate::bytesobject::BytesBlock]) -> Vec<PyObjectRef> {
+/// Box each erased `rpython str` of the list pinned at `obj_slot`.
+///
+/// Unlike the int/float pair this cannot walk a slice taken once: every
+/// `w_bytes_from_block` allocates, and a collection inside the loop forwards
+/// `bytes_items.block`, so a base pointer captured up front goes on naming the
+/// outgoing block.  Re-read the array from the pinned list at each step.
+///
+/// # Safety
+/// `obj_slot` must hold a live `W_ListObject` in the Bytes strategy.
+unsafe fn boxed_from_bytes(obj_slot: usize) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
-    for &value in values {
+    let bytes_items = |slot: usize| -> &BytesArray {
+        &(*(crate::gc_roots::shadow_stack_get(slot) as *const W_ListObject)).bytes_items
+    };
+    let len = bytes_items(obj_slot).len();
+    for i in 0..len {
+        let value = bytes_items(obj_slot).as_slice()[i];
         let _ = crate::gc_roots::pin_root(w_bytes_from_block(value));
     }
-    (0..values.len())
+    (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
         .collect()
 }
@@ -821,7 +917,7 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
         ListStrategy::Integer => boxed_from_ints(list.int_items.as_slice()),
         ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
-        ListStrategy::Bytes => boxed_from_bytes(list.bytes_items.as_slice()),
+        ListStrategy::Bytes => boxed_from_bytes(obj_slot),
         ListStrategy::Object | ListStrategy::Empty => Vec::new(),
     };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -840,12 +936,19 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     list.strategy = ListStrategy::Object;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    // Object strategy reads neither typed array again, so drop both to the
-    // empty form instead of installing two fresh single-slot blocks.
+    // Object strategy reads none of the typed arrays again, so drop all three
+    // to the empty form instead of installing fresh single-slot blocks.  Each
+    // `install` pins and reloads its incoming block, so it is a safepoint and
+    // the list is re-read from its slot before the next one: writing a later
+    // field through the reference the previous install left behind stores it
+    // into the moved-from copy, and the live list keeps the outgoing block —
+    // which the custom trace then forwards as a stale child.
     list.int_items.install(IntArray::empty());
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     list.float_items.install(FloatArray::empty());
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     list.bytes_items.install(BytesArray::empty());
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
@@ -1841,6 +1944,19 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Bytes => {
             if is_bytes_strategy_item(value) {
+                let value = prepare_list_ref_store(obj, value);
+                let obj = current_gc_ref(obj);
+                let list = &*(obj as *const W_ListObject);
+                // At capacity, route the grow through the list the way
+                // `object_push` does: the fresh block reaches `bytes_items`
+                // with the owner barrier directly in front of the store.
+                let value = if list.bytes_items.spare_capacity() == 0 {
+                    w_list_grow_bytes_block(obj, value)
+                } else {
+                    value
+                };
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.bytes_items.push(w_bytes_block(value));
             } else {
                 let obj = switch_to_object_strategy(list);
@@ -2230,7 +2346,16 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
                 .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
                 .collect()
         }
-        ListStrategy::Bytes => boxed_from_bytes(list.bytes_items.as_slice()),
+        ListStrategy::Bytes => {
+            // The wraps allocate, so the list has to be reachable by slot for
+            // the re-read `boxed_from_bytes` does per element.
+            let _roots = crate::gc_roots::push_roots();
+            let _ = crate::gc_roots::pin_root(
+                (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
+            );
+            let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
+            boxed_from_bytes(obj_slot)
+        }
     }
 }
 
@@ -2342,6 +2467,18 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         ListStrategy::Bytes => {
             if is_bytes_strategy_item(value) {
                 let idx = normalize_insert_index(index, list.bytes_items.len());
+                let value = prepare_list_ref_store(obj, value);
+                let obj = current_gc_ref(obj);
+                let list = &*(obj as *const W_ListObject);
+                // Same reservation the append arm makes: `insert` may not
+                // publish a fresh block itself.
+                let value = if list.bytes_items.spare_capacity() == 0 {
+                    w_list_grow_bytes_block(obj, value)
+                } else {
+                    value
+                };
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
                 list.bytes_items.insert(idx, w_bytes_block(value));
                 list.sync_allocated(old_size);
             } else {
@@ -3004,8 +3141,14 @@ unsafe fn w_list_setslice_inner(
                     return Ok(());
                 }
                 ListStrategy::Bytes => {
+                    let other =
+                        &*(crate::gc_roots::shadow_stack_get(root_base + 1) as *const W_ListObject);
                     let fresh = BytesArray::from_vec(other.bytes_items.to_vec());
-                    list.bytes_items.install(fresh);
+                    let obj = W_ListObject::install_bytes_items(
+                        crate::gc_roots::shadow_stack_get(root_base),
+                        fresh,
+                    );
+                    let list = &mut *(obj as *mut W_ListObject);
                     list.strategy = ListStrategy::Bytes;
                     return Ok(());
                 }
@@ -3133,20 +3276,38 @@ unsafe fn w_list_setslice_inner(
                     return Ok(());
                 }
                 ListStrategy::Bytes => {
-                    let new_items = if list.strategy == other.strategy {
-                        other.bytes_items.as_slice()
-                    } else {
-                        &[]
-                    };
+                    let obj = crate::gc_roots::shadow_stack_get(root_base);
+                    let w_other = crate::gc_roots::shadow_stack_get(root_base + 1);
+                    let list = &*(obj as *const W_ListObject);
+                    let other = &*(w_other as *const W_ListObject);
+                    let donates = list.strategy == other.strategy;
                     let s = start.min(list.bytes_items.len());
                     let e = end.min(list.bytes_items.len());
                     if obj == w_other {
                         let mut values = list.bytes_items.to_vec();
-                        values.splice(s..e, new_items.iter().copied());
-                        list.bytes_items.install(BytesArray::from_vec(values));
-                    } else {
-                        list.bytes_items.splice(s, e - s, new_items);
+                        let donated = values.clone();
+                        values.splice(s..e, donated.into_iter());
+                        W_ListObject::install_bytes_items(obj, BytesArray::from_vec(values));
+                        return Ok(());
                     }
+                    // `splice` may not publish a fresh block itself, so the
+                    // room it needs is reserved through the list first.  The
+                    // grow collects, so the donor slice is taken after it.
+                    let donated = if donates { other.bytes_items.len() } else { 0 };
+                    let grown = list.bytes_items.len() - (e - s) + donated;
+                    if grown > list.bytes_items.heap_capacity() {
+                        W_ListObject::bytes_grow(obj, grown);
+                    }
+                    let obj = crate::gc_roots::shadow_stack_get(root_base);
+                    let w_other = crate::gc_roots::shadow_stack_get(root_base + 1);
+                    let list = &mut *(obj as *mut W_ListObject);
+                    let other = &*(w_other as *const W_ListObject);
+                    let new_items = if donates {
+                        other.bytes_items.as_slice()
+                    } else {
+                        &[]
+                    };
+                    list.bytes_items.splice(s, e - s, new_items);
                     return Ok(());
                 }
                 ListStrategy::Object => {}
