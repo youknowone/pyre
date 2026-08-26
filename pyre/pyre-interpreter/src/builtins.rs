@@ -1293,6 +1293,100 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
+/// `equiv_format` reads a leading `@` as the native-order default, so `@i`
+/// and `i` name one layout.
+fn memoryview_native_format(fmt: &str) -> &str {
+    fmt.strip_prefix('@').unwrap_or(fmt)
+}
+
+/// `equiv_structure` — an lvalue slice accepts only an rvalue of the same
+/// format, itemsize, dimensionality and extent.
+///
+/// # Safety
+/// Both arguments must be live, unreleased memoryviews.
+unsafe fn memoryview_equiv_structure(
+    mv: PyObjectRef,
+    src: PyObjectRef,
+    extent: i64,
+    itemsize: usize,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let equivalent = w_memoryview_itemsize(src) as usize == itemsize
+            && memoryview_native_format(w_memoryview_format_str(mv))
+                == memoryview_native_format(w_memoryview_format_str(src))
+            && w_memoryview_ndim(src) == 1
+            && w_memoryview_native_shape(src).first().copied().unwrap_or(0) == extent;
+        match equivalent {
+            true => Ok(()),
+            false => Err(crate::PyError::value_error(
+                "memoryview assignment: lvalue and rvalue have different structures",
+            )),
+        }
+    }
+}
+
+/// `copy_single` — assign an exporter's elements to the positions `indices`
+/// names in a one-dimensional view.
+///
+/// # Safety
+/// `mv` must be a live, unreleased, writable one-dimensional memoryview, and
+/// `indices` must already be bounds-checked against its shape.
+unsafe fn memoryview_copy_single(
+    mv: PyObjectRef,
+    indices: &[i64],
+    itemsize: usize,
+    value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe {
+        use pyre_object::memoryview::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[mv, value]);
+        let value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        // `PyObject_GetBuffer(value, &src, PyBUF_FULL_RO)`: the rvalue has to
+        // export a buffer, and a memoryview already is one.
+        let (src, temporary) = if is_w_memoryview(value) {
+            memoryview_check_released(value)?;
+            (value, false)
+        } else {
+            let view = w_memoryview_new(value)?;
+            let _ = pyre_object::gc_roots::pin_root(view);
+            (pyre_object::gc_roots::shadow_stack_get(base + 2), true)
+        };
+        let mv = pyre_object::gc_roots::shadow_stack_get(base);
+        let copied = (|| -> Result<(), crate::PyError> {
+            // Acquiring the rvalue's buffer runs `__buffer__`, which may have
+            // released this view before the copy reads its geometry
+            // (`CHECK_RELEASED_INT_AGAIN`).
+            memoryview_check_released(mv)?;
+            memoryview_equiv_structure(mv, src, indices.len() as i64, itemsize)?;
+            // `copy_base` reads every rvalue element before it writes any of
+            // them, so an rvalue overlapping the lvalue is not clobbered
+            // part-way through the copy.
+            let mut bounce = Vec::with_capacity(indices.len() * itemsize);
+            for element in 0..indices.len() as i64 {
+                let from = w_memoryview_view(src).element_ptr(&[element]);
+                bounce.extend_from_slice(std::slice::from_raw_parts(from, itemsize));
+            }
+            for (element, &index) in indices.iter().enumerate() {
+                let into = w_memoryview_view(mv)
+                    .element_ptr_mut(&[index])
+                    .expect("writable backing checked above");
+                std::slice::from_raw_parts_mut(into, itemsize)
+                    .copy_from_slice(&bounce[element * itemsize..][..itemsize]);
+            }
+            Ok(())
+        })();
+        if temporary {
+            let release = memoryview_release(&[src]);
+            if copied.is_ok() {
+                release?;
+            }
+        }
+        copied.map(|()| w_none())
+    }
+}
+
 /// `memoryview.__setitem__` — write through to a mutable bytearray-backed
 /// view, packing the value per the view's format (`memoryobject.py
 /// descr_setitem`).  An integer index writes one element; a slice writes a
@@ -1342,28 +1436,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 indices.push(i);
                 i += step;
             }
-            let src: Vec<u8> = match crate::typedef::buffer_as_bytes_like(value)? {
-                Some(b) => pyre_object::bytesobject::bytes_like_data(b).to_vec(),
-                None => {
-                    return Err(crate::PyError::type_error(
-                        "memoryview: a bytes-like object is required",
-                    ));
-                }
-            };
-            if isz == 0 || src.len() != indices.len() * isz {
-                return Err(crate::PyError::value_error(
-                    "cannot modify size of memoryview object",
-                ));
-            }
-            let full = w_memoryview_view(mv)
-                .backing()
-                .as_bytes_mut()
-                .expect("writable backing checked above");
-            for (k, &idx) in indices.iter().enumerate() {
-                let dst = (offset + idx * stride0) as usize;
-                full[dst..dst + isz].copy_from_slice(&src[k * isz..k * isz + isz]);
-            }
-            return Ok(w_none());
+            return memoryview_copy_single(mv, &indices, isz, value);
         }
         // Multi-index tuple writes one element of an N-D view; an all-slice
         // tuple is multi-dimensional slice assignment (`_setitem_tuple_indexed`).
