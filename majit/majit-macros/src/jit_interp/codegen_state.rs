@@ -2983,6 +2983,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // its registers already decoded; nothing here is machine-specific
             // except the `Sym` type, which is why this forwards rather than
             // generating a walk of its own.
+            // Empty unless `split_dispatch` raised the sub-JitCodes' alloc
+            // floor past the range, which is the only case where a non-root
+            // frame's snapshot loses registers to the identity trim.
+            fn reserved_int_identity_range() -> Option<(usize, usize)> {
+                let (base, end) = (
+                    #int_identity_base,
+                    #int_identity_base + #num_reserved_identity_slots,
+                );
+                (end > base).then_some((base, end))
+            }
+
             fn trace_from_guard_resume_position<__R: majit_metainterp::JitCodeRuntime>(
                 ctx: &mut majit_metainterp::TraceCtx,
                 sym: &mut #sym_ty,

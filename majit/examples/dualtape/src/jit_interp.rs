@@ -208,6 +208,30 @@ mod tests {
     /// this is a plain mutex and re-entering it on one thread deadlocks.
     static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The armed side of the multi-frame bridge decline.
+    ///
+    /// `split_dispatch = true` is what raises the sub-JitCodes' allocation
+    /// floor past the identity range, and this is the only symbol in the tree
+    /// that asks for it. A non-root frame's snapshot has that range blanked to
+    /// `Const(0)` and nothing re-derives it, so
+    /// `bridge_from_guard_resume_position` refuses a bridge that spans inline
+    /// frames here and the blackhole serves the guard instead.
+    ///
+    /// The other 98 portals report `None` and are unaffected; without this
+    /// test the gate has no symbol that reaches it, so a declaration that
+    /// silently stopped reserving would read as "still fine".
+    #[test]
+    fn split_dispatch_reserves_the_identity_range_the_bridge_walk_refuses() {
+        let range = <DualState as majit_metainterp::JitState>::reserved_int_identity_range();
+        let (base, end) = range.expect(
+            "this portal declares `split_dispatch = true`, so its sub-JitCodes \
+             reserve identity slots and a multi-frame bridge through them \
+             cannot be rebuilt; reporting no range would let that bridge be \
+             built out of blanked registers",
+        );
+        assert!(end > base, "an empty range is spelled `None`, not `Some`");
+    }
+
     fn run_locked(code: &[u8]) -> i64 {
         let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         JitDualInterp::new().run(code)

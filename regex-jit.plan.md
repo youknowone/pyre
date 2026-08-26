@@ -1799,6 +1799,66 @@ rebuilt` site also had no log line at all, where its sibling had one. Neither
 change has a fixture: they are diagnostic accuracy, with no behavioural
 surface, and the shape that reaches them is the example itself.
 
+## The copy that would have miscompiled, and the decline that replaced it (0827)
+
+The multi-frame rebuild above shipped with one block that did not belong to it.
+For every non-root frame it copied the ROOT frame's reserved identity-slot
+registers over the callee's, justified by "only the root frame's identity slots
+are meaningful and deopt re-derives the rest from the single reconstructed root
+virtualizable". A parity review flagged it; four independent readers took it
+apart. Both halves of the justification are false:
+
+* **Nothing re-derives them.** `resume.py write_an_int` writes each section's
+  decoded values — the blanked `Const(0)` placeholders included — straight into
+  that frame's own register bank. The only root-to-callee propagation deopt
+  performs is on the `virtualizable_ptr` / `virtualizable_info` **fields**,
+  never the register file. So a compiled bridge would have seen the root's
+  values where the blackhole exiting the same guard sees zero.
+* **The root's registers are not a substitute.** The trim's own note records
+  the counterexample already: a dualtape sub-frame carries the virtualizable
+  identity in int reg 2, while the root's int reg 2 is the scalar `pb` under
+  the canonical layout. Copying would have fed `pb` in where the callee reads
+  an identity, and that identity is used as an array index.
+* **Upstream gives no cover.** `rebuild_from_resumedata` fills every frame from
+  its own section and consumes the vable once, before the loop.
+
+The range is empty for all 99 `#[jit_interp]` symbols but one, and that one
+(`dualtape`) compiles nothing, so the block was dead — but dead code that would
+be wrong if reached is a trap, not a nullity. It is replaced by a decline in
+`bridge_from_guard_resume_position`: `resume.frames.len() > 1 &&
+S::reserved_int_identity_range().is_some()` returns `None`, which falls through
+to `compile.py:711 resume_in_blackhole`.
+
+Two things about the shape, both of which a first attempt got wrong:
+
+* **The decline must be at the driver, not inside the walk.** Returning
+  `TraceAction::Abort` from `trace_jitcode_at_resume_framestack` is not a
+  decline: the walk publishes its handoff only after `run_to_end`, so an early
+  return leaves both handoffs empty, and the caller resumes at the loop header
+  with no blackhole at all. `None` at the driver is the decline, and it is the
+  upstream shape — `pyjitpl.py _handle_guard_failure` reaches `compile.py
+  giveup()` once the frames are known.
+* **The range must come from the sym, not the layout.** `JitState::Sym` carries
+  no `JitCodeSym` bound, and the split-unaware `StateFieldLayout` reports a
+  non-empty range for regex too — gating on it would refuse every multi-frame
+  bridge and erase the whole 0→10. Hence the `JitState::reserved_int_identity_range`
+  hook, `None` by default, overridden by the macro from the same
+  `split_dispatch` gate that raises the allocation floor.
+
+Both sides are gated, because a gate on only one is a gate on nothing:
+`this_portal_reserves_no_identity_slots_so_the_decline_is_inert` pins regex at
+`None` (if it ever reported a range, every bridge count in that module would
+silently go to zero), and
+`split_dispatch_reserves_the_identity_range_the_bridge_walk_refuses` pins
+dualtape at `Some`.
+
+Still open, and now recorded at `get_list_of_active_snapshot_boxes`: the
+blanking itself. A blackhole resuming inside a split arm reads `Const(0)`
+through `handler_load_state_field_di`. The deopt side needs a real
+re-derivation before any resume path is entitled to re-fill those slots — and
+if one is written it must read the reconstructed vable list the way
+`pyjitpl.py rebuild_state_after_failure` does, not frame 0's registers.
+
 ## The post's experiments, measured (0826)
 
 Everything below is one machine — Apple M4, 10 cores, macOS 26.5.2, dynasm,

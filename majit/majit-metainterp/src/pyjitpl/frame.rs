@@ -928,12 +928,31 @@ impl MIFrame {
                 {
                     // A non-root (inline) frame reserves the virtualizable
                     // identity-slot prefix int[base..end) so its register file
-                    // spans them, but only the ROOT frame's identity slots are
-                    // meaningful: deopt re-derives the real ptr/len from the
-                    // single reconstructed root virtualizable. Emit a
-                    // count-preserving Const(0) placeholder (the liveness
-                    // marker's length_i is baked, so dropping would desync the
-                    // decoder).
+                    // spans them. Emit a count-preserving Const(0) placeholder
+                    // (the liveness marker's length_i is baked, so dropping
+                    // would desync the decoder).
+                    //
+                    // OPEN, and narrower than an earlier version of this note
+                    // claimed: deopt reconstructs the virtualizable on the
+                    // `virtualizable_ptr` / `virtualizable_info` FIELD channel,
+                    // which is what a vable opcode reading through vinfo gets.
+                    // It does NOT re-derive these REGISTERS — `write_an_int`
+                    // (`resume.py`) writes each section's decoded values,
+                    // these zeros included, straight into the frame's own
+                    // bank. So a blackhole resuming inside a split arm reads
+                    // `Const(0)` through `handler_load_state_field_di`, and
+                    // the deopt side needs a real re-derivation before any
+                    // resume path is entitled to re-fill the slots.
+                    //
+                    // If such a re-fill is ever written, it must read the
+                    // reconstructed vable list (`TraceCtx::virtualizable_boxes`)
+                    // the way `pyjitpl.py rebuild_state_after_failure` does —
+                    // never frame 0's int registers, which hold a DIFFERENT
+                    // quantity at the same index (see the dualtape note
+                    // below) — and must use this trim's own `idx < num_regs_i`
+                    // bound. Until then `trace_jitcode_at_resume_framestack`
+                    // declines any multi-frame bridge for a symbol that
+                    // reserves these slots.
                     //
                     // Blank the range UNCONDITIONALLY. An earlier version also
                     // required `self.int_regs[idx].is_none()`, on the premise

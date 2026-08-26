@@ -10216,23 +10216,6 @@ where
             // return path reads back to decide whether to pop the ctx's inline
             // ledger with it.
             frame.inline_frame = true;
-            // `build_state_field_snapshot` blanks a non-root frame's reserved
-            // identity-slot prefix to `Const(0)` placeholders, because only the
-            // root frame's identity slots are meaningful and deopt re-derives
-            // the rest from the single reconstructed root virtualizable.  The
-            // rebuild is where that re-derivation happens for a bridge: copy
-            // the root's slots back over the placeholders, so a vable opcode in
-            // a callee body reads the identity the root frame holds rather than
-            // the zero the snapshot wrote.
-            let identity = sym.int_identity_slots_base()..sym.int_identity_reserved_end();
-            let root = &standalone.frames.frames[0];
-            for slot in identity {
-                if slot >= frame.int_regs.len() || slot >= root.int_regs.len() {
-                    break;
-                }
-                frame.int_regs[slot] = root.int_regs[slot];
-                frame.int_values[slot] = root.int_values[slot];
-            }
         }
         standalone.frames.push(frame);
         if depth == 0 {
