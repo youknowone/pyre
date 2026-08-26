@@ -439,10 +439,40 @@ folded builtin. That fixture says so in advance, and it is right: the gate can
 only narrow "with the reporting to back it up".
 
 So the ordering is fixed, and it is the opposite of the tempting one. The
-reporting has to be **recorded into the trace** — every builtin fold owes a
-`c_call` / `c_return` pair when `is_being_profiled` is green, which is the G2
-group of §3.8 plus the residual path — and only then can the decline narrow.
+reporting has to be **recorded into the trace** before the decline can narrow.
 Until that exists, declining is the correct answer and the cliff is the price.
+
+What that costs is now scoped rather than guessed. It is not one insertion per
+fold: `dispatch_residual_call_iRd_kind` sits ahead of every fold, every
+descent and the generic residual emit, so the reporting has one entry point.
+The pair is `ExecutionContext::c_call_trace` / `c_return_trace`, and since
+both funnel into a path that reads the arguments only through `firstarg`, a
+bridge needs `(frame, w_func, first_arg)` and no `Arguments` reconstruction.
+Two `extern "C"` bridges are required rather than raw Rust fns, per the
+residual-fnaddr ABI rule. The effect has to be `MOST_GENERAL` — the hook is
+arbitrary Python — which is mintable at trace time precisely because its raw
+sets are `None` rather than empty, and it has to be emitted through the
+residual path's `CallMayForceN` + `GuardNotForced` rather than a plain
+recorded call, or the declaration lies to the optimizer. The frame is
+reachable per level through `walker_executing_frame_box`, which resolves to
+the portal's virtualizable at the root and to the callee shadow inside an
+inline sub-walk — the split
+`profile_hook_c_call_is_bytecode_level_only` already pins.
+
+The hard part is the exit, not the entry: the choke point has one entrance and
+many early returns, one per fold, and `c_return` is owed on all of them
+including the raising one. And the payoff is not yet established — every
+folded builtin in a profiled loop would be bracketed by two forcing calls, so
+the first measurement to run is whether such a compiled loop actually beats
+the interpreted one it replaces. If it does not, the decline is not merely
+safe but right, and this entry's remaining half closes rather than lands.
+
+One claim examined along the way did not survive: that the method-form
+dispatcher carries no profiled decline and so already drops events for a bound
+builtin. Measured on `lst.append` / `lst.pop` in a hot profiled loop, pyre
+reports 5000 of each, and so does CPython, and both
+`profile_hook_armed_before_a_hot_loop` and
+`profile_hook_c_call_is_bytecode_level_only` pass.
 
 Two smaller defects fell out of the same investigation and are fixed.
 `function.py`'s `is_builtin_code` — unwrap a `_Method`, take the function's
