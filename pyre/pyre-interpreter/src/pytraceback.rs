@@ -431,6 +431,20 @@ pub unsafe fn record_application_traceback(
         if !pyre_object::is_exception(w_exc_object) {
             return;
         }
+        // `tb_lasti` names an instruction, and every fixture that pins it
+        // pins `f_lasti == tb_lasti`, so the two have to snap the same way:
+        // a caller suspended at a `CALL` carries that call's last cache word
+        // in `last_instr` (`PyFrame::executing_instr`).  The `-1` of a frame
+        // that has dispatched nothing is a sentinel, not an offset, and stays
+        // one -- `offset2lineno` answers it as "no line".
+        let last_instruction = if last_instruction < 0 {
+            last_instruction
+        } else {
+            crate::pyopcode::owning_instruction(
+                &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
+                last_instruction as usize,
+            ) as i64
+        };
         // Keep the exception now being propagated GC-reachable: until a frame
         // catches it, it lives only in the in-flight Rust `PyError`, so a
         // safepoint's non-moving major would otherwise sweep its old-gen

@@ -4468,7 +4468,30 @@ impl PyFrame {
     /// pyframe.py fget_f_lasti → space.newint(self.last_instr)
     #[inline]
     pub fn fget_f_lasti(&self) -> isize {
-        self.last_instr
+        self.executing_instr()
+    }
+
+    /// The instruction this frame is suspended at, as Python names it.
+    ///
+    /// [`Self::last_instr`] is a dispatch coordinate, not an instruction
+    /// index: the interpreter stores the unit it is about to run -- cache
+    /// words included, pyre dispatches them as no-ops -- and every resume
+    /// writer stores `resume_pc - 1` so that `next_instr()` recovers the
+    /// resume point.  After a `CALL` those agree on the call's LAST CACHE
+    /// WORD, which is not an instruction at all.
+    ///
+    /// `owning_instruction` maps a cache word back to the opcode that owns
+    /// it, and is the identity on every value that already names one.  Only
+    /// the Python-visible readers take it; `next_instr()` and the resume
+    /// consumers keep reading the field raw, so the coordinate they round-trip
+    /// through is untouched.
+    #[inline]
+    pub fn executing_instr(&self) -> isize {
+        if self.last_instr < 0 {
+            return self.last_instr;
+        }
+        crate::pyopcode::owning_instruction(&self.code().instructions, self.last_instr as usize)
+            as isize
     }
 
     /// PyPy-compatible `fget_f_trace`.
@@ -4756,7 +4779,10 @@ impl PyFrame {
         }
 
         let stacks = mark_stacks(code, len);
-        let last_instr = self.last_instr as usize;
+        // `mark_stacks` steps `i + cache_entries + 1`, so every cache index
+        // keeps `MARK_UNINITIALIZED` and a frame suspended inside a call's
+        // cache region would read "can't jump from unreachable code".
+        let last_instr = self.executing_instr() as usize;
         let start_stack = *stacks.get(last_instr).unwrap_or(&MARK_UNINITIALIZED);
 
         let mut best_stack = MARK_OVERFLOWED;
