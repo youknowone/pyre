@@ -3296,24 +3296,24 @@ pub fn fuse_boxing_alloc(
             _ => None,
         })
     }
-    /// The `&T` a runtime `pyobject::get_instantiate(&T)` call was handed.
+    /// The `&T` a runtime `get_instantiate(&T)` call was handed.
     ///
-    /// The owner path is matched in full rather than by the bare leaf, so a
-    /// function elsewhere that happens to share the name can never be read as
-    /// the `instantiate`-slot load.
+    /// The helper is accepted only under the external runtime owner or the
+    /// generic corpus owner. The caller separately proves that its sole
+    /// argument is the exact class address stored in the header.
     fn get_instantiate_arg_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
-        const GET_INSTANTIATE: [&str; 2] = ["pyobject", "get_instantiate"];
         resolve_addr(graph, var, depth, &|graph, kind, depth| match kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
                 args,
                 ..
             } if args.len() == 1
-                && segments.len() >= GET_INSTANTIATE.len()
-                && segments[segments.len() - GET_INSTANTIATE.len()..]
-                    .iter()
-                    .map(String::as_str)
-                    .eq(GET_INSTANTIATE.iter().copied()) =>
+                && matches!(
+                    segments.as_slice(),
+                    [.., owner, leaf]
+                        if matches!(owner.as_str(), "pyobject" | "object_model")
+                            && leaf == "get_instantiate"
+                ) =>
             {
                 const_ref_addr(graph, &args[0], depth - 1)
             }
@@ -3888,7 +3888,7 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// The header producers eligible for removal are all side-effect-free:
 /// a `SyntheticTransparentCtor` stack construct, a `__cast_instance_intrinsic`
 /// pointer reinterpret (`exception_cannot_occur` → `cast_pointer`), and the
-/// `runtime_object::pyobject::get_instantiate` read of a type's `instantiate`
+/// `runtime_object::object_model::get_instantiate` read of a type's `instantiate`
 /// slot feeding the dropped `w_class`.  `get_instantiate` is an `Acquire`
 /// atomic load of an init-once slot (the `set_instantiate` `Release` mutator
 /// writes it during `init_typeobjects`); it is removable not because the slot
@@ -3926,17 +3926,17 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             // share the synthetic marker leaf is never swept as a cast.
             let is_cast = segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                 && args.len() == 1;
-            // `pyobject::get_instantiate` — the pure
-            // `instantiate`-slot read feeding the dropped `w_class`.  Match
-            // the full owner path rather than the bare leaf so a future
-            // side-effecting function sharing the `get_instantiate` name in
-            // some other module can never be classified removable.
-            let get_instantiate = ["pyobject", "get_instantiate"];
-            let is_get_instantiate = segments.len() >= get_instantiate.len()
-                && segments[segments.len() - get_instantiate.len()..]
-                    .iter()
-                    .map(String::as_str)
-                    .eq(get_instantiate.iter().copied());
+            // The same single-argument runtime helper recognized by
+            // `get_instantiate_arg_addr`; its result feeds only the class word
+            // removed with the dead header. Restrict the owner so an unrelated
+            // function with the same leaf is never classified as removable.
+            let is_get_instantiate = args.len() == 1
+                && matches!(
+                    segments.as_slice(),
+                    [.., owner, leaf]
+                        if matches!(owner.as_str(), "pyobject" | "object_model")
+                            && leaf == "get_instantiate"
+                );
             // `boxed::Box::new_uninit()` — the no-arg heap-box allocation the
             // `vec![…]` lowering (`box_assume_init_into_vec_unsafe(box [..])`)
             // opens.  Once a consumer rewrite turns the `vec!` into a
@@ -7373,7 +7373,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![
                             "runtime_object".into(),
-                            "pyobject".into(),
+                            "object_model".into(),
                             "get_instantiate".into(),
                         ],
                     },
@@ -7754,7 +7754,7 @@ mod tests {
             call(
                 graph,
                 blk,
-                &["runtime_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "object_model", "get_instantiate"],
                 vec![arg],
             )
         }
@@ -8000,7 +8000,7 @@ mod tests {
         let w_class = call(
             &mut graph,
             entry,
-            &["runtime_object", "pyobject", "get_instantiate"],
+            &["runtime_object", "object_model", "get_instantiate"],
             vec![w_class_cast],
         );
         let header = ctor(&mut graph, entry, "PyObject");
@@ -8264,7 +8264,7 @@ mod tests {
             let w_class = call(
                 &mut graph,
                 entry,
-                &["runtime_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "object_model", "get_instantiate"],
                 vec![w_class_cast],
             );
             let header = ctor(&mut graph, entry, "PyObject");
@@ -8482,7 +8482,7 @@ mod tests {
             let w_class = call(
                 graph,
                 blk,
-                &["runtime_object", "pyobject", "get_instantiate"],
+                &["runtime_object", "object_model", "get_instantiate"],
                 vec![w_class_cast],
             );
             let header = ctor(graph, blk, "PyObject");
@@ -8669,7 +8669,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![
                             "runtime_object".into(),
-                            "pyobject".into(),
+                            "object_model".into(),
                             "get_instantiate".into(),
                         ],
                     },
@@ -9038,7 +9038,7 @@ mod tests {
                     Some(call(
                         &mut graph,
                         entry,
-                        &["runtime_object", "pyobject", "get_instantiate"],
+                        &["runtime_object", "object_model", "get_instantiate"],
                         vec![arg],
                     ))
                 }
@@ -9315,7 +9315,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec![
                     "runtime_object".into(),
-                    "pyobject".into(),
+                    "object_model".into(),
                     "get_instantiate".into(),
                 ],
             },

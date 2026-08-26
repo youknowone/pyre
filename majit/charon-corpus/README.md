@@ -97,8 +97,8 @@ only data field is `typeptr`. The two-word allocation can fuse when its
 allocation can fuse from its declared layout because no class word exists to
 disagree with the type pointer.
 
-The fixture spells `pyre_object::pyobject::get_instantiate` literally because
-`model.rs` currently recognises that path suffix. The one-word header does not
+The fixture's `object_model::get_instantiate` helper pins the single-argument
+class-lookup contract recognized by `model.rs`. The one-word header does not
 use this helper. `_immutable_fields_W_IntObject` preserves the marker shape
 harvested by `front::llbc_hints`.
 

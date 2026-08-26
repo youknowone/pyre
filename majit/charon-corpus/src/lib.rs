@@ -226,11 +226,10 @@ pub mod lltype {
 /// Minimal stand-in for the class-instantiation lookup whose result the
 /// class word is stored from.
 ///
-/// `model.rs`'s `get_instantiate_arg_addr` matches the two-segment path
-/// suffix `["pyobject", "get_instantiate"]` literally, so any
-/// other spelling would not exercise that recognizer.
+/// `model.rs`'s `get_instantiate_arg_addr` recognizes this helper by its
+/// single-argument runtime contract.
 pub mod runtime_object {
-    pub mod pyobject {
+    pub mod object_model {
         use crate::ClassObject;
 
         #[inline(never)]
@@ -253,7 +252,7 @@ pub fn w_new_int(x: i64) -> *mut W_IntObject {
     lltype::malloc_typed(W_IntObject {
         ob_header: ObjectHeader {
             ob_type: &INT_CLASS,
-            w_class: runtime_object::pyobject::get_instantiate(&INT_CLASS),
+            w_class: runtime_object::object_model::get_instantiate(&INT_CLASS),
         },
         intval: x,
     })

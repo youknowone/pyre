@@ -3131,27 +3131,27 @@ pub fn gc_rawrefcount_set_finalizer_claim(claim: rawrefcount::FinalizerClaimFn) 
     gc_sync::gc_op(|gc| gc.rawrefcount_set_finalizer_claim(claim));
 }
 
-/// `rawrefcount.py:create_link_pypy` — `pyobject` is a mirror of `obj`, and
+/// `rawrefcount.py:create_link_pypy` — `mirror` is a mirror of `obj`, and
 /// `obj` owns it: the mirror lives as long as the interpreter object does, plus
 /// as long afterwards as the C side still holds a reference.
 ///
 /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYPY`] to the
 /// mirror's count; that share is what this link is worth.
-pub fn gc_rawrefcount_create_link_pypy(obj: GcRef, pyobject: usize) {
-    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pypy(obj.0, pyobject));
+pub fn gc_rawrefcount_create_link_pypy(obj: GcRef, mirror: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pypy(obj.0, mirror));
 }
 
-/// `rawrefcount.py:create_link_pyobj` — the other direction: `pyobject` owns
+/// `rawrefcount.py:create_link_pyobj` — the other direction: `mirror` owns
 /// `obj`, so no trace pass roots `obj` on the mirror's behalf.
-pub fn gc_rawrefcount_create_link_pyobj(obj: GcRef, pyobject: usize) {
-    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pyobj(obj.0, pyobject));
+pub fn gc_rawrefcount_create_link_pyobj(obj: GcRef, mirror: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pyobj(obj.0, mirror));
 }
 
 /// `rawrefcount.py:mark_deallocating` — park `marker` in the link slot for the
 /// duration of a mirror's deallocator, so re-entrant C code asking for the
 /// interpreter object gets the sentinel rather than a freed address.
-pub fn gc_rawrefcount_mark_deallocating(marker: usize, pyobject: usize) {
-    gc_sync::gc_op(|gc| gc.rawrefcount_mark_deallocating(marker, pyobject));
+pub fn gc_rawrefcount_mark_deallocating(marker: usize, mirror: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_mark_deallocating(marker, mirror));
 }
 
 /// `rawrefcount.py:from_obj` — `obj`'s mirror, or 0.
@@ -3171,11 +3171,11 @@ pub fn gc_rawrefcount_from_obj(obj: GcRef) -> usize {
     gc_sync::gc_query_reentrant(|gc| gc.rawrefcount_from_obj(obj.0))
 }
 
-/// `rawrefcount.py:to_obj` — the interpreter object `pyobject` links to, null
+/// `rawrefcount.py:to_obj` — the interpreter object `mirror` links to, null
 /// once the link has been cleared.
-pub fn gc_rawrefcount_to_obj(pyobject: usize) -> GcRef {
+pub fn gc_rawrefcount_to_obj(mirror: usize) -> GcRef {
     GcRef(gc_sync::gc_query_reentrant(|gc| {
-        gc.rawrefcount_to_obj(pyobject)
+        gc.rawrefcount_to_obj(mirror)
     }))
 }
 
