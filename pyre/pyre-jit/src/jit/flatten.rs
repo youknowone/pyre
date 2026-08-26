@@ -4591,7 +4591,7 @@ where
         op,
         "load_import_globals",
         ctx.load_import_globals_fn_idx,
-        majit_ir::PyreHelperKind::LoadImportGlobals,
+        majit_ir::RuntimeHelperKind::LoadImportGlobals,
         get_register,
         lower_constant,
     )

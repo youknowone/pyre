@@ -912,7 +912,7 @@ pub enum RuntimeHelperKind {
     /// `bh_load_import_globals_fn(frame)` — IMPORT_NAME's globals argument,
     /// `pyopcode.py`'s `self.get_w_globals()`.  The frame reads its own
     /// namespace, so an inlined callee never inherits the caller's; infallible,
-    /// same standing as [`PyreHelperKind::LoadImportLocals`].
+    /// same standing as [`RuntimeHelperKind::LoadImportLocals`].
     LoadImportGlobals,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
