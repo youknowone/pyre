@@ -251,6 +251,15 @@ pub struct GcConfig {
     /// incminimark.py:275: card_page_indices (0 disables card marking).
     /// Must be a power of two.
     pub card_page_indices: u32,
+    /// gc/base.py `post_setup` — `PYPY_GC_DEBUG`, the level the collector's
+    /// own self-checks are gated on. 0 is off; 1 installs the rotating
+    /// nurseries; 2 additionally runs `debug_check_consistency` after every
+    /// minor collection.
+    pub debug: u8,
+    /// incminimark.py `gc_nursery_debug` — `PYPY_GC_NURSERY_DEBUG`. Fill the
+    /// recycled nursery with garbage rather than zeroes, and rotate the arena
+    /// when the debug ring is installed.
+    pub gc_nursery_debug: bool,
     /// translationoption.py `taggedpointers` (default off). When set,
     /// a small `int` may be stored as an unboxed immediate with an odd
     /// low bit; the collector must then skip such fields rather than read
@@ -258,12 +267,16 @@ pub struct GcConfig {
     pub taggedpointers: bool,
 }
 
+/// incminimark.py `post_setup` allocates this many spare nurseries, so a
+/// retired arena is not handed back until the whole ring has turned.
+pub const DEBUG_ROTATING_NURSERIES: usize = 6;
+
 /// The variables [`GcConfig`] and [`MiniMarkGC::with_config`] resolve against,
 /// for an embedder that has to hand its environment over rather than share it.
 ///
 /// Published here so such a host does not keep its own copy of the list in step
-/// with the collector; `PYPY_GC_DEBUG` and the tracing knobs are absent because
-/// nothing in this file reads them.
+/// with the collector; the tracing knobs are absent because nothing in this
+/// file reads them.
 pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_NURSERY",
     "PYPY_GC_MAX_PINNED",
@@ -273,6 +286,8 @@ pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_MIN",
     "PYPY_GC_MAX",
     "PYPY_GC_MAX_DELTA",
+    "PYPY_GC_NURSERY_DEBUG",
+    "PYPY_GC_DEBUG",
 ];
 
 /// Environment an embedder supplies because the platform gives the process
@@ -747,6 +762,10 @@ impl Default for GcConfig {
             debug_tiny_nursery,
             large_object_threshold: LARGE_OBJECT_THRESHOLD,
             card_page_indices: 128,
+            debug: read_uint_from_env("PYPY_GC_DEBUG")
+                .unwrap_or(0)
+                .min(u8::MAX as usize) as u8,
+            gc_nursery_debug: read_uint_from_env("PYPY_GC_NURSERY_DEBUG").is_some_and(|v| v != 0),
             taggedpointers: false,
         }
     }
@@ -1199,7 +1218,15 @@ impl MiniMarkGC {
         // nursery_size * major_collection_threshold.
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
-        let nursery = Nursery::new(config.nursery_size);
+        let mut nursery = Nursery::new(config.nursery_size);
+        // incminimark.py `post_setup`: under `PYPY_GC_DEBUG` a retired nursery
+        // is protected rather than reused, so a pointer left behind in one
+        // faults on the next read instead of being answered by whatever was
+        // allocated over it.
+        if config.debug != 0 {
+            nursery.install_debug_rotating_nurseries(DEBUG_ROTATING_NURSERIES);
+        }
+        nursery.set_nursery_debug(config.gc_nursery_debug);
         // incminimark.py:516-528. `nonlarge_max + 1` is the large-object
         // cutoff; pyre stores that cutoff directly in the configuration.
         let max_number_of_pinned_objects =
@@ -3253,6 +3280,13 @@ impl MiniMarkGC {
             unsafe { (*header_of(obj_addr)).clear_flag(flags::PINNED) };
         }
         self.refresh_published_nursery_top();
+
+        // incminimark.py `_minor_collection`: `if self.DEBUG >= 2` — the whole
+        // heap is walked, so it is gated a level above the rotating nurseries
+        // rather than on `PYPY_GC_DEBUG` being set at all.
+        if self.config.debug >= 2 {
+            self.debug_check_consistency();
+        }
 
         // incminimark.py `self.root_walker.finished_minor_collection()`,
         // the callback framework.py:135-138 reads out of `_jit2gc`: after the
@@ -7771,6 +7805,17 @@ impl MiniMarkGC {
             previous_end = header_addr + object_size;
         }
         self.nursery.reset_range(previous_end, nursery_end);
+        // `_minor_collection` rotates only on the no-pinned-objects arm: a
+        // pinned object stays where it is, and the arena holding it is about
+        // to be made inaccessible.
+        if self.config.gc_nursery_debug && barriers.is_empty() {
+            self.nursery.debug_rotate();
+        }
+        // Read the arena back rather than reusing the entry values: a rotation
+        // moved it, and both the barrier below and the `nursery_free` at the
+        // tail of this function have to name the arena now installed.
+        let nursery_start = self.nursery.start_ptr() as usize;
+        let nursery_end = nursery_start + self.nursery.size();
         barriers.push_back(nursery_end);
         self.nursery_barriers = barriers;
 
@@ -8715,6 +8760,62 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    /// incminimark.py `_minor_collection`: on the `gc_nursery_debug` arm with
+    /// no pinned survivor, the recycled arena is retired and the next one in
+    /// the ring takes its place.
+    #[test]
+    fn a_minor_collection_rotates_the_nursery_under_gc_nursery_debug() {
+        if !crate::nursery::HAS_PROTECT {
+            return;
+        }
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            debug: 1,
+            gc_nursery_debug: true,
+            ..GcConfig::default()
+        });
+        assert_eq!(
+            gc.nursery.debug_rotating_nurseries(),
+            DEBUG_ROTATING_NURSERIES
+        );
+
+        let before = gc.nursery.start_ptr() as usize;
+        gc.do_collect_nursery();
+        let after = gc.nursery.start_ptr() as usize;
+
+        assert_ne!(before, after, "the minor collection retired the arena");
+        assert_eq!(
+            gc.nursery.free_ptr() as usize,
+            after,
+            "allocation resumes at the start of the arena now installed"
+        );
+        assert_eq!(
+            gc.published_nursery_top.load(Ordering::Relaxed),
+            after + gc.nursery.size(),
+            "compiled code reads the published top, which must follow"
+        );
+    }
+
+    /// `post_setup` allocates the ring only `if self.DEBUG and
+    /// llarena.has_protect`, so an ordinary run keeps its one arena and
+    /// `debug_rotate_nursery` finds nothing to rotate to.
+    #[test]
+    fn no_ring_is_allocated_without_the_debug_level() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            gc_nursery_debug: true,
+            ..GcConfig::default()
+        });
+        assert_eq!(gc.config.debug, 0);
+        assert_eq!(gc.nursery.debug_rotating_nurseries(), 0);
+
+        let before = gc.nursery.start_ptr() as usize;
+        gc.do_collect_nursery();
+        assert_eq!(gc.nursery.start_ptr() as usize, before);
     }
 
     /// incminimark.py:1890-1893 `free_young_rawmalloced_objects`: an

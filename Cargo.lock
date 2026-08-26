@@ -1992,6 +1992,7 @@ dependencies = [
  "indexmap",
  "libc",
  "majit-ir",
+ "region",
 ]
 
 [[package]]

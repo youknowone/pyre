@@ -42,5 +42,11 @@ indexmap = { workspace = true }
 libc = { workspace = true }
 majit-ir = { workspace = true }
 
+# `llarena.arena_protect` is posix `mprotect` and nt `VirtualProtect`;
+# `llarena.has_protect` is false everywhere else, which is why this is not a
+# dependency of the wasm32 build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+region = { workspace = true }
+
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }
