@@ -344,7 +344,17 @@ unsafe impl Send for MutatorEntry {}
 static MUTATOR_REGISTRY: Mutex<Vec<MutatorEntry>> = Mutex::new(Vec::new());
 
 /// Register the current thread's TLS root structures for STW root walks.
-/// Unregistration is supplied by the caller's RAII destructor (pyre-jit's `GcMutatorRegistration` thread-local, armed in `init_gc_subsystem`, whose `Drop` calls [`unregister_mutator`]); callers must arm that pairing, while an API-level return guard is a tracked follow-up.
+/// Unregistration is the caller's, and the pairing is armed rather than
+/// returned: `pyre_interpreter::module::thread`'s `RuntimeThread` thread-local
+/// calls [`unregister_mutator`] from its `Drop`, and `enter_runtime_thread`
+/// arms it by touching `RUNTIME_THREAD` immediately after this call.  That
+/// order is what makes it correct — this function is where the thread first
+/// touches all five root structures, so their destructors are registered
+/// before `RuntimeThread`'s and therefore run after it, and the registry entry
+/// naming them is gone before any of them is destroyed.  A guard returned from
+/// here would carry the pairing in the type system instead, but it would have
+/// to be stored in a thread-local to survive the call, which is the same
+/// arming with an extra step.
 pub fn register_mutator() {
     let thread_id = std::thread::current().id();
     let shadow_stack = SHADOW_STACK.with(|stack| stack as *const _);
@@ -560,13 +570,16 @@ pub fn push(gcref: GcRef) -> usize {
 /// needs.  A plain `assert!` and not `debug_assert!` — this crate is
 /// extracted to LLBC, where debug assertions are compiled in.
 ///
-/// TODO: Rust drops thread-locals in reverse order on
-/// thread exit, and a TLS-owned `Drop` (e.g. `JitDriver`'s) may call
-/// this during its own teardown. If
-/// `SHADOW_STACK`'s destructor has already fired, `.with()` panics with
-/// `AccessError`. RPython has no analogous hazard — the GIL thread does
-/// not tear down TLS mid-run. Silently do nothing so the exiting thread
-/// proceeds.
+/// `try_with` and not `with`.  Rust registers a thread-local's destructor when
+/// the thread first touches it and runs the registered destructors in reverse,
+/// so anything reached from inside another thread-local's destructor can run
+/// after `SHADOW_STACK`'s own has fired, and `with` answers that with an
+/// `AccessError` panic.  Nothing pops from a thread-local destructor today —
+/// the guards that pop are stack locals, and the one destructor that does run
+/// at thread exit, `pyre_interpreter::module::thread`'s `RuntimeThread`,
+/// unregisters the mutator rather than popping — so this is a standing
+/// precaution and not a live path.  RPython has no analogous hazard at all:
+/// the GIL thread does not tear its thread-locals down mid-run.
 pub fn pop_to(depth: usize) {
     let _ = SHADOW_STACK.try_with(|ss| {
         let mut ss = ss.borrow_mut();
@@ -579,10 +592,20 @@ pub fn pop_to(depth: usize) {
     });
 }
 
-/// Like `pop_to` but silently no-ops if the shadow stack thread-local
-/// is already torn down (program shutdown). Drop callers should use this
-/// because the TLS drop order between `JitDriver` and `SHADOW_STACK` is
-/// not deterministic in Rust.
+/// [`pop_to`] without the balance assertion.
+///
+/// Not the teardown-tolerant half of a pair: both reach the thread-local
+/// through `try_with` and both no-op once it is destroyed.  The assert is the
+/// whole difference, and `Vec::truncate` saturates, so a depth above the
+/// current one leaves the stack alone rather than shortening it.
+///
+/// The callers that want it are all `Drop` impls — `FrameRoot` in both the
+/// jit and the call-jit evaluator, `FrameAnchor`, and the `RootGuard`s inside
+/// `gc_sync`'s `gc_op_with_root` and `gc_op_add_root` — where an assertion
+/// that fails while an unwind is already running aborts the process and takes
+/// the original panic's report with it.  That is a choice per site, not a rule
+/// about destructors: `ExportedState::release_roots` and
+/// `Trace::release_roots` are `Drop` paths that keep the assert.
 pub fn try_pop_to(depth: usize) {
     let _ = SHADOW_STACK.try_with(|ss| {
         let mut ss = ss.borrow_mut();
@@ -773,7 +796,7 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
 
 /// Current depth of the GcRef shadow stack.
 ///
-/// TODO: see `pop_to` for the TLS-teardown rationale.
+/// Answers through `try_with` for the reason [`pop_to`] gives.
 /// Returns 0 when the TLS has been destroyed; callers running under
 /// Drop (e.g. `ExportedState::release_roots`) observe an empty
 /// stack instead of panicking on the destroyed key.
