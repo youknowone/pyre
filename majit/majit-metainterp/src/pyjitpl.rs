@@ -22395,6 +22395,71 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.find_biggest_function(), None);
     }
 
+    /// pyjitpl.py:2817-2831 runs the too-long bookkeeping once per abort: the
+    /// reason travels on the `SwitchToBlackhole` instance and the `_interpret`
+    /// catch never re-enters the check that raised it.  This pins what a second
+    /// entry costs, because pyre reaches the same handler through a
+    /// `DispatchError` that carries no reason and so had a path back into it.
+    ///
+    /// The first run names the oversized callee and disables just that callee,
+    /// deliberately leaving the root un-marked so it can retrace without it.
+    /// It also retires the log it read, so a second run can name nothing and
+    /// takes `prepare_trace_segmenting` instead — which stamps the root with
+    /// `JC_FORCE_FINISH` + `JC_DONT_TRACE_HERE`, neither of which is ever
+    /// cleared.  The callee's size is what overflowed the trace; the root pays
+    /// for it permanently.
+    #[test]
+    fn a_second_too_long_run_segments_a_root_the_first_one_spared() {
+        // `start_tracing` opens the loop header this walk is rooted at, and
+        // its green key is the one the segmenting arm would mark.
+        const ROOT: u64 = 0;
+        const CALLEE: u64 = 0xa11;
+
+        let (mut meta, jc) = meta_with_recursive_portal();
+        start_tracing(&mut meta);
+        // One inlined callee, sized by the ops recorded between its entries.
+        meta.perform_call(jc, &[], Some(CALLEE)).unwrap_err();
+        record_ops(&mut meta, 5);
+        meta.popframe(true);
+        meta.tracing
+            .as_mut()
+            .expect("tracing is Some")
+            .set_trace_limit(0);
+
+        assert_eq!(
+            meta.blackhole_if_trace_too_long(),
+            Some(AbortReason::TooLong)
+        );
+        assert!(
+            !meta.warm_state_mut().can_inline_callable(CALLEE),
+            "the named callee is the one that gets disabled"
+        );
+        assert!(
+            !meta.warm_state_mut().should_force_finish_tracing(ROOT),
+            "the root is only asked to retrace, so it must not be force-finished"
+        );
+        assert!(
+            meta.warm_state_mut().can_inline_callable(ROOT),
+            "the root is only asked to retrace, so it must stay inlinable"
+        );
+
+        // Exactly what a second entry sees: the same over-budget trace, and a
+        // log this abort already retired.
+        assert_eq!(meta.find_biggest_function(), None);
+        assert_eq!(
+            meta.blackhole_if_trace_too_long(),
+            Some(AbortReason::TooLong)
+        );
+        assert!(
+            meta.warm_state_mut().should_force_finish_tracing(ROOT),
+            "a second run has no callee to name and segments the root instead"
+        );
+        assert!(
+            !meta.warm_state_mut().can_inline_callable(ROOT),
+            "and stamps it dont-trace-here, which nothing clears"
+        );
+    }
+
     #[test]
     fn portal_trace_positions_are_rearmed_for_each_trace() {
         // pyjitpl.py. Upstream builds a MetaInterp per tracing attempt;
