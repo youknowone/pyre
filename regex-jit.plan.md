@@ -510,9 +510,9 @@ would be a mis-report.
   inside it.
 * ~~`lower_call_value` reads `config.call_returns` in only the `ResidualRef` and
   `NurseryAllocRef` arms; every `*Wrapped` arm falls through to a tail returning
-  `struct_type: None`.~~ **Closed** (`f47e7c32fbb`, `4bfc01c34aa`): the shared
-  tail now attaches `declared_return_struct(func)` for a `BindingKind::Ref`
-  result, so every `*_ref_wrapped` policy carries the same `struct_type` the two
+  `struct_type: None`.~~ **Closed, and now on `main`**: `lower_value.rs`'s shared
+  tail attaches `declared_return_struct(func)` for a `BindingKind::Ref` result,
+  so every `*_ref_wrapped` policy carries the same `struct_type` the two
   early-returning arms did. It was off this plan's critical path — Stage 1 uses
   immutable fields — and it was fixed anyway, because a ref binding with no
   `struct_type` degrades its WHOLE dispatch arm to an abort stub while the
