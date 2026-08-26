@@ -303,6 +303,19 @@ pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
         crate::lltype::malloc_typed(body) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BytesObject, body) };
+        // The creation barrier the GC transform emits after a `SETFIELD_GC`
+        // into a non-nursery struct.  A stable allocation is always old-gen,
+        // and `oldgen_birth_flags` (incminimark.py) stamps one born during a
+        // major marking cycle black, so the marker never traces it.  Unlike
+        // every other bytes constructor, `data` here is a block that already
+        // existed and may still be white, and `BytesListStrategy` drops the
+        // array holding it in the same strategy switch that wraps it — leaving
+        // this wrapper its only owner.  Remembering the wrapper is what puts
+        // it back on `more_objects_to_trace` at the next minor
+        // (`_add_to_more_objects_to_trace`, incminimark.py), which is the
+        // invariant `_debug_check_object_marking` states: a black object must
+        // never point to a white one.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     }
 }
