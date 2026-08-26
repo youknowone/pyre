@@ -2164,6 +2164,46 @@ def report_unusable_headers(errors):
             print(f"    {line}")
 
 
+def synthetic_bench_paths(pattern):
+    """The fixtures *pattern* names under [`SYNTHETIC_BENCH_DIR`]."""
+    paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
+    if not paths and not Path(pattern).suffix:
+        paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(f"{pattern}.py"))
+    return [p for p in paths if p.is_file() and p.suffix == ".py"]
+
+
+def read_synthetic_headers(paths):
+    """`({path: headers}, [(path, message)])` -- the readable and the rest."""
+    headers, unusable = {}, []
+    for path in paths:
+        try:
+            headers[path] = synth_fixture_headers(path)
+        except ValueError as e:
+            unusable.append((path, str(e)))
+    return headers, unusable
+
+
+def check_synthetic_headers(pattern):
+    """`--check-headers`: read every fixture header and report, building nothing.
+
+    This pass touches files and nothing else -- no binary, no reference
+    interpreter, no cargo -- so it belongs beside `cargo fmt --check`, which
+    every expensive job in the workflow already waits on. Run from the suite it
+    cannot answer until the build it sits behind has finished, and an authoring
+    error costs a whole CI run to hear about. Returns a process exit status.
+    """
+    paths = synthetic_bench_paths(pattern)
+    if not paths:
+        print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
+        return 1
+    unusable = read_synthetic_headers(paths)[1]
+    if unusable:
+        report_unusable_headers(unusable)
+        return 1
+    print(f"{len(paths)} synthetic fixture header(s) read, pattern={pattern!r}")
+    return 0
+
+
 # `[spec-census] fold=<label> consulted=N fired=N suppressed=N site=... parent=...`
 SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
 
@@ -4661,10 +4701,7 @@ class Check:
 
     def run_synthetic_suite(self):
         pattern = self.args.synthetic_pattern
-        paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
-        if not paths and not Path(pattern).suffix:
-            paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(f"{pattern}.py"))
-        paths = [p for p in paths if p.is_file() and p.suffix == ".py"]
+        paths = synthetic_bench_paths(pattern)
         if not paths:
             print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
             sys.exit(1)
@@ -4673,13 +4710,10 @@ class Check:
         print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
         # Read every fixture's header before running any of them: a missing or
         # malformed directive is an authoring error, and it is reported with
-        # the others of its kind rather than one per run.
-        headers, unusable = {}, []
-        for path in paths:
-            try:
-                headers[path] = synth_fixture_headers(path)
-            except ValueError as e:
-                unusable.append((path, str(e)))
+        # the others of its kind rather than one per run. `--check-headers`
+        # runs this same pass with nothing built, so ordinarily it has already
+        # answered by the time the suite reaches here.
+        headers, unusable = read_synthetic_headers(paths)
         if unusable:
             report_unusable_headers(unusable)
             sys.exit(1)
@@ -5007,8 +5041,18 @@ def parse_args():
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )
+    parser.add_argument(
+        "--check-headers",
+        action="store_true",
+        help="read every synthetic fixture's `# pyre-check:` header, report the "
+             "unusable ones and exit; builds and runs nothing",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
+    # Answered here, ahead of the backend resolution below: the check is over
+    # the fixture files, and nothing about it needs a backend to exist.
+    if args.check_headers:
+        sys.exit(check_synthetic_headers(args.synthetic_pattern))
     try:
         args.backends = parse_backend_specs(args.backend)
     except argparse.ArgumentTypeError as e:

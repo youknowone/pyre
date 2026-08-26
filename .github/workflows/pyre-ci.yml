@@ -56,6 +56,13 @@ jobs:
       run: cargo fmt --all -- --check
     - name: Check majit ownership boundary
       run: python3 scripts/check-majit-boundary.py
+    - name: Check synthetic fixture headers
+      # `pyre/bench/synth/` is shared, so a directive `check.py` requires reds
+      # every fixture that arrives without one. Asked here because the pass
+      # reads files and builds nothing (0.2 s over 479 fixtures), while the
+      # synthetic suite cannot answer until the backend build it sits behind
+      # has finished.
+      run: python3 pyre/check.py --check-headers
 
   cpyext-abi:
     name: cpyext ABI
