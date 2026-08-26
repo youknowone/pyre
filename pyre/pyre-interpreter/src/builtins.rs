@@ -1871,19 +1871,22 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         if !has_shape {
             return Ok(w_memoryview_cast_1d(mv, &fmt, new_itemsize));
         }
-        // _cast_to_ND: `length = itemsize; for d in shape: length *= d`, then
-        // `length != view.getlength()` rejects.  A negative dimension makes the
-        // product mismatch `total`; checked multiplication keeps an overflow
-        // (which can never equal a real buffer size) a rejection rather than a
-        // debug-build panic.
+        // `copy_shape` then `cast_to_ND`: every extent must be positive — a
+        // dimension may be empty in general, but not for a cast — and only
+        // then does `length != view.getlength()` reject the product.
         let ndim = dims.len() as i64;
         let mut product = new_itemsize;
         for &d in &dims {
+            if d <= 0 {
+                return Err(crate::PyError::value_error(
+                    "memoryview.cast(): elements of shape must be integers > 0",
+                ));
+            }
             match product.checked_mul(d) {
                 Some(p) => product = p,
                 None => {
-                    return Err(crate::PyError::type_error(
-                        "memoryview: product(shape) * itemsize != buffer size",
+                    return Err(crate::PyError::value_error(
+                        "memoryview.cast(): product(shape) > SSIZE_MAX",
                     ));
                 }
             }
