@@ -10459,7 +10459,7 @@ fn walker_specialize_math_float<Sym: WalkSym>(
     arity: usize,
     row: impl FnOnce(pyre_object::PyObjectRef) -> Option<(MathFloatDomain, MathFloatEmit)>,
 ) -> Result<Option<()>, DispatchError> {
-    let Some((concrete_callable, operands)) =
+    let Some((concrete_callable, mut operands)) =
         plain_builtin_call_concretes(ctx, code, op, r_args, arity)
     else {
         return Ok(None);
@@ -10496,6 +10496,19 @@ fn walker_specialize_math_float<Sym: WalkSym>(
     let Ok(boxed_result) = boxed_result else {
         return Ok(None);
     };
+    // The call above allocates, so the operand pointers read before it may have
+    // been forwarded.  Re-fetch them from the walker's op cells, which the
+    // collector does update, before anything reads through them again
+    // (`try_walker_specialize_builtin_divmod_long_int` takes the same route).
+    // The callable needs no re-fetch: a module's builtin function outlives
+    // every nursery it could have been born in, while these operands are the
+    // loop's own boxes.
+    for (slot, &arg) in operands[..arity].iter_mut().zip(&r_args[2..2 + arity]) {
+        let Some(refetched) = walker_concrete_ref_object(ctx, arg) else {
+            return Ok(None);
+        };
+        *slot = refetched;
+    }
     let Some(result_value) = fold_finite_float_result(boxed_result) else {
         return Ok(None);
     };
