@@ -17418,6 +17418,18 @@ fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// ranges are plain int fields, so a field of one types as that inner
 /// value and its `load`/`store` fold to it (`is_atomic_load`).
 fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    match tyref_atomic_leaf(ty, llbc)? {
+        "AtomicPtr" => Some(ValueType::Ref(None)),
+        "AtomicBool" => Some(ValueType::Bool),
+        l if l.starts_with("AtomicI") => Some(ValueType::Int),
+        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+        _ => None,
+    }
+}
+
+/// The `Atomic*` leaf ident of a `core::sync::atomic` type, or `None` when
+/// `ty` is not a std atomic.
+fn tyref_atomic_leaf<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l str> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let name = &llbc.type_by_id(id)?.item_meta.name;
@@ -17441,11 +17453,28 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     if !in_atomic_mod {
         return None;
     }
-    match leaf {
-        "AtomicPtr" => Some(ValueType::Ref(None)),
-        "AtomicBool" => Some(ValueType::Bool),
-        l if l.starts_with("AtomicI") => Some(ValueType::Int),
-        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+    Some(leaf)
+}
+
+/// The inner scalar of a `core::sync::atomic` integer/bool wrapper, spelled
+/// as the Rust primitive the wrapper is layout-transparent over
+/// (`AtomicUsize` → `usize`), or `None` for anything else.
+///
+/// `AtomicPtr` is deliberately absent: its inner value is a pointer, which
+/// is already what an unrecognised name answers.
+fn tyref_atomic_inner_scalar_str(ty: &TyRef, llbc: &Llbc) -> Option<&'static str> {
+    match tyref_atomic_leaf(ty, llbc)? {
+        "AtomicBool" => Some("bool"),
+        "AtomicI8" => Some("i8"),
+        "AtomicI16" => Some("i16"),
+        "AtomicI32" => Some("i32"),
+        "AtomicI64" => Some("i64"),
+        "AtomicIsize" => Some("isize"),
+        "AtomicU8" => Some("u8"),
+        "AtomicU16" => Some("u16"),
+        "AtomicU32" => Some("u32"),
+        "AtomicU64" => Some("u64"),
+        "AtomicUsize" => Some("usize"),
         _ => None,
     }
 }
@@ -18496,6 +18525,16 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 }
 
 fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    // An atomic wrapper is layout-transparent over its inner scalar, and the
+    // typed side already models a field of one as that inner value
+    // (`tyref_atomic_inner_value_type`).  Spell the field with the scalar so
+    // the string-keyed layout tables — `get_type_flag`, `type_flag_from_str`,
+    // the annotator's field projection — reach the same answer instead of
+    // falling to their unknown-name GC-pointer wildcard, which would mint a
+    // `Ref` field descr against the runtime's `Int` publish.
+    if let Some(scalar) = tyref_atomic_inner_scalar_str(ty, llbc) {
+        return scalar.to_string();
+    }
     let Some(node) = tyref_node(ty, llbc) else {
         return tyref_to_ast_string(ty, llbc);
     };
@@ -25952,6 +25991,92 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&word_ty, &llbc),
             crate::model::ValueType::Int
+        );
+    }
+
+    #[test]
+    fn atomic_field_layout_string_is_the_inner_scalar() {
+        let atomic_decl = |def_id: u64, leaf: &str, size: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": [
+                        {"Ident": ["core", 0]},
+                        {"Ident": ["sync", 0]},
+                        {"Ident": ["atomic", 0]},
+                        {"Ident": [leaf, 0]}
+                    ],
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 8}
+                    }},
+                    "source_text": "pub struct Atomic;",
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": false
+                },
+                // Opaque: the scalar spelling comes from the wrapper's own
+                // name, not from reading its `UnsafeCell` payload, which a
+                // dependency artefact does not carry.
+                "kind": "Opaque",
+                "layout": [{
+                    "key": "x86_64-unknown-linux-gnu",
+                    "value": {
+                        "size": size,
+                        "align": size,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": false}
+                    }
+                }]
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    null,
+                    atomic_decl(1, "AtomicUsize", 8),
+                    atomic_decl(2, "AtomicPtr", 8)
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let adt_ty = |def_id: u64, args: serde_json::Value| {
+            serde_json::from_value::<super::TyRef>(serde_json::json!({
+                "HashConsedValue": [8, {
+                    "Adt": {"id": {"Adt": def_id}, "generics": {"types": args}}
+                }]
+            }))
+            .expect("fixture TyRef parses")
+        };
+
+        // An integer atomic spells as the scalar it is layout-transparent
+        // over, so the string-keyed field tables land on the same `Int` the
+        // runtime publishes rather than their unknown-name `Ref` wildcard.
+        let usize_ty = adt_ty(1, serde_json::json!([]));
+        assert_eq!(
+            super::tyref_to_field_layout_string(&usize_ty, &llbc),
+            "usize"
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("usize").1,
+            majit_ir::value::Type::Int
+        );
+
+        // `AtomicPtr` keeps the wrapper spelling: its inner value is a
+        // pointer, which is what the wildcard already answers.
+        let ptr_ty = adt_ty(2, serde_json::json!([{"Literal": {"UInt": "U8"}}]));
+        let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc);
+        assert_eq!(ptr_str, "AtomicPtr<u8>");
+        assert_eq!(
+            crate::codewriter::call::get_type_flag(&ptr_str).1,
+            majit_ir::value::Type::Ref
         );
     }
 
