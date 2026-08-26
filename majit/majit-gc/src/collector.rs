@@ -6789,6 +6789,33 @@ impl MiniMarkGC {
         }
     }
 
+    /// How many objects are registered with a finalizer queue —
+    /// `deal_with_objects_with_finalizers`' working set, young and old.
+    ///
+    /// The destructor lists are deliberately not counted. A destructor is
+    /// RPython's *light* finalizer (`rgc.must_be_light_finalizer`): it may not
+    /// run interpreter code, allocate or resurrect, so nothing the program can
+    /// observe distinguishes the collection it runs in from a later one. In
+    /// pyre they are drop glue — `function_destructor`, `type_object_destructor`,
+    /// `pycode_destructor`, `storage_box_destructor` — so every function, type
+    /// and code object is on those lists and a predicate that counted them
+    /// would never answer zero.
+    pub(crate) fn registered_finalizer_count(&self) -> usize {
+        self.probably_young_objects_with_finalizers.len() + self.old_objects_with_finalizers.len()
+    }
+
+    /// Whether a collection could still hand control back to the program.
+    ///
+    /// `deal_with_objects_with_finalizers` is the one pass that does, and it is
+    /// already guarded on its own queue being non-empty; `rawrefcount` answers
+    /// for the whole of itself, because a collection there can claim a mirror's
+    /// C finalizer and queue its deallocator, and which of its lists that
+    /// reaches is the embedder's business rather than this predicate's. It is
+    /// only ever enabled under `cpyext`.
+    pub(crate) fn has_pending_death_callbacks(&self) -> bool {
+        self.registered_finalizer_count() != 0 || self.rawrefcount_enabled()
+    }
+
     /// incminimark.py `deal_with_objects_with_finalizers`.
     fn deal_with_objects_with_finalizers(&mut self) {
         let mut new_with_finalizer = VecDeque::new();
