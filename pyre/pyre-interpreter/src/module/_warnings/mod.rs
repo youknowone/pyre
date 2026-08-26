@@ -216,7 +216,7 @@ fn setup_context(
     let _roots = pyre_object::gc_roots::push_roots();
     let frame = get_frame(stacklevel, skip_file_prefixes);
     let (filename, lineno, globals) = if frame.is_null() {
-        let globals = crate::importing::get_sys_module("sys")
+        let globals = crate::importing::get_interpreter_sys_module()
             .map(|module| unsafe { w_module_get_w_dict(module) })
             .unwrap_or_else(w_dict_new);
         (w_str_new("<sys>"), 0, globals)
@@ -485,7 +485,10 @@ pub(crate) fn show_warning(
         pyre_object::gc_roots::shadow_stack_get(text_slot),
     )?);
     line.push_str("\n");
-    if let Some(sys) = crate::importing::get_sys_module("sys")
+    // The interpreter-owned `sys`, not `sys.modules["sys"]`: upstream reads
+    // `space.sys` and a program that rebinds or deletes the mapping entry
+    // still gets its warnings written.
+    if let Some(sys) = crate::importing::get_interpreter_sys_module()
         && let Ok(stderr) = crate::baseobjspace::getattr_str(sys, "stderr")
         && !unsafe { is_none(stderr) }
         && let Ok(write) = crate::baseobjspace::getattr_str(stderr, "write")
