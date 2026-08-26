@@ -170,11 +170,10 @@ def platform_gate(module: str) -> str | None:
 
 
 # `Modules/_testbuffer.c` is the exporter `test_buffer`'s `TestBufferProtocol`
-# is `skipUnless`d on, and the only C extension the suite needs.  CPython
-# builds it beside the interpreter; pyre builds it here against the same
-# headers `pyrex`'s cpyext fixtures compile against.  It reaches the modules
-# below and no others: `PYTHONPATH` is language-visible, and several modules
-# assert on the path their own child interpreters inherit.
+# is `skipUnless`d on; `_testsinglephase` and `_testmultiphase` are the two
+# `test_importlib.extension` loads as C extensions.  CPython builds all three
+# beside the interpreter; pyre builds them here against the same headers
+# `pyrex`'s cpyext fixtures compile against.
 TEST_EXTENSION_SOURCES = {
     "_testbuffer": ROOT / "lib_pypy" / "_testbuffer.c",
     "_testsinglephase": ROOT / "lib_pypy" / "_testsinglephase.c",
@@ -185,18 +184,18 @@ CPYEXT_INCLUDE = ROOT / "include" / "pyre3.14t"
 # against inside its own: `_PyNamespace_New` and the argument parser Argument
 # Clinic writes calls to both live behind one.
 CPYEXT_INTERNAL_INCLUDE = CPYEXT_INCLUDE / "internal"
-EXTENSION_BUILD_DIR = ROOT / "build" / "cpython_tests"
+# `PYTHONPATH` is language-visible and does not reach a child started with
+# `-E` or `-I`, which `script_helper.run_python_until_end` does whenever the
+# caller passes no environment of its own — `test_importlib.extension`'s
+# `test_nonmodule_cases` runs `_test_nonmodule_cases.py` that way.  So the
+# extensions go on the interpreter's own default `sys.path` instead, whose
+# only entry here is `lib-python/3`.  `_testmultiphase_build.py` does the
+# same, compiling into `lib_pypy` — a source directory `compute_lib_pypy_path`
+# puts on the default path — because `test.importlib` imports the module as a
+# C extension and so cannot be served by a Python shim.  Only these three
+# names become importable; the artefacts are ignored by git.
+EXTENSION_DIR = ROOT / "lib-python" / "3"
 NEEDS_TEST_EXTENSION = {"test.test_buffer", "test.test_importlib"}
-# `PYTHONPATH` does not reach a child started with `-E` or `-I`, and
-# `script_helper.run_python_until_end` starts one whenever the caller passes
-# no environment of its own.  That costs one row today:
-# `test_importlib.extension`'s `test_nonmodule_cases` runs
-# `_test_nonmodule_cases.py` under `-E`, where `_testmultiphase` is not
-# importable and all four of its cases fail.  Reaching that child means
-# putting these modules on the interpreter's own default `sys.path`, whose
-# only entry here is `lib-python/3` — which would also make them importable
-# to every other module in the suite, and the suite branches on whether
-# `import X` succeeds.  That trade is not the runner's to make silently.
 
 # These modules intentionally assert on a child interpreter's exact stderr.
 # MAJIT_STATS is runner instrumentation rather than language-visible output,
@@ -634,20 +633,19 @@ def build_cmd(binary: Path, module: str, mode: str) -> list[str]:
     return [str(binary), str(module_path(module))]
 
 
-def build_test_extensions(binary: Path) -> tuple[Path | None, dict[str, str]]:
-    """Compile the test extensions for `binary`; answer their directory and,
-    per extension, why one is missing.
+def build_test_extensions(binary: Path) -> dict[str, str]:
+    """Compile the test extensions for `binary`; answer, per extension, why
+    one is missing.
 
     An interpreter built without `cpyext`, a platform the feature is not
-    compiled for, and a missing C compiler each leave every extension unbuilt,
-    and the directory is then `None`. A source that fails on its own leaves the
-    others usable, so its reason is reported alone. The tests that need one
-    skip exactly as they do upstream when the module is absent, rather than
-    failing the run.
+    compiled for, and a missing C compiler each leave every extension unbuilt.
+    A source that fails on its own leaves the others usable, so its reason is
+    reported alone. The tests that need one skip exactly as they do upstream
+    when the module is absent, rather than failing the run.
     """
     if sys.platform not in ("darwin", "linux"):
         reason = f"cpyext is built for macos and linux, not {sys.platform}"
-        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
+        return dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
     named = subprocess.run(
         [str(binary), "-c", "import _imp; print(_imp.extension_suffixes()[0])"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -655,14 +653,13 @@ def build_test_extensions(binary: Path) -> tuple[Path | None, dict[str, str]]:
     suffix = named.stdout.strip().splitlines()[-1] if named.stdout.strip() else ""
     if named.returncode != 0 or not suffix:
         reason = "the interpreter reported no extension suffix"
-        return None, dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
-    EXTENSION_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        return dict.fromkeys(TEST_EXTENSION_SOURCES, reason)
     unbuilt = {}
     for name, source in TEST_EXTENSION_SOURCES.items():
         reason = build_one_test_extension(binary, name, source, suffix)
         if reason:
             unbuilt[name] = reason
-    return EXTENSION_BUILD_DIR, unbuilt
+    return unbuilt
 
 
 def build_one_test_extension(binary: Path, name: str, source: Path,
@@ -674,7 +671,7 @@ def build_one_test_extension(binary: Path, name: str, source: Path,
     compile_cmd = [
         os.environ.get("CC", "cc"), str(source),
         "-I", str(CPYEXT_INCLUDE), "-I", str(CPYEXT_INTERNAL_INCLUDE),
-        "-o", str(EXTENSION_BUILD_DIR / f"{name}{suffix}"), "-O2",
+        "-o", str(EXTENSION_DIR / f"{name}{suffix}"), "-O2",
     ]
     compile_cmd += (
         ["-bundle", "-undefined", "dynamic_lookup"] if sys.platform == "darwin"
@@ -687,10 +684,12 @@ def build_one_test_extension(binary: Path, name: str, source: Path,
         return f"{compile_cmd[0]}: {last_stderr_line(built.stderr)}"
     # Compiling proves the headers agree, not that the interpreter can load
     # what they describe: a build without cpyext resolves none of the symbols.
+    # `-E` because that is the interpreter the tests reach it through, so the
+    # check answers for the default `sys.path` rather than for this process's
+    # environment.
     loaded = subprocess.run(
-        [str(binary), "-c", f"import {name}"],
+        [str(binary), "-E", "-c", f"import {name}"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=dict(os.environ, PYTHONPATH=str(EXTENSION_BUILD_DIR)),
     )
     if loaded.returncode != 0:
         return f"built but not importable: {last_stderr_line(loaded.stderr)}"
@@ -698,7 +697,7 @@ def build_one_test_extension(binary: Path, name: str, source: Path,
 
 
 def run_module(binary: Path, module: str, mode: str, timeout: int,
-               env: dict, extension_dir: Path | None = None) -> tuple[str, str]:
+               env: dict) -> tuple[str, str]:
     # Run in a throwaway cwd so a test writing into '.' never touches the
     # repo (the stdlib is resolved relative to the executable, not cwd).
     # `ignore_cleanup_errors` because a test that leaves a file open takes the
@@ -755,12 +754,6 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
         else:
             cmd = build_cmd(binary, module, mode)
         module_env = env
-        if extension_dir is not None and module in NEEDS_TEST_EXTENSION:
-            module_env = env.copy()
-            inherited = module_env.get("PYTHONPATH")
-            module_env["PYTHONPATH"] = os.pathsep.join(
-                [str(extension_dir)] + ([inherited] if inherited else [])
-            )
         if module in STATS_STDERR_INCOMPATIBLE:
             if module_env is env:
                 module_env = env.copy()
@@ -920,7 +913,7 @@ def main() -> int:
     if args.no_jit:
         env["PYRE_NO_JIT"] = "1"
 
-    extension_dir, unbuilt = build_test_extensions(binary)
+    unbuilt = build_test_extensions(binary)
     for name, reason in sorted(unbuilt.items()):
         print(f"warning: {name} not built ({reason}) — "
               f"{'/'.join(sorted(NEEDS_TEST_EXTENSION))} will skip the classes "
@@ -994,16 +987,14 @@ def main() -> int:
     serial_modules = [m for m in to_run if m in SERIAL_MODULES]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {
-            pool.submit(run_module, binary, m, args.mode, args.timeout,
-                        env, extension_dir): m
+            pool.submit(run_module, binary, m, args.mode, args.timeout, env): m
             for m in parallel_modules
         }
         for fut in concurrent.futures.as_completed(futs):
             m = futs[fut]
             record_result(m, fut.result())
     for m in serial_modules:
-        record_result(m, run_module(binary, m, args.mode, args.timeout,
-                                    env, extension_dir))
+        record_result(m, run_module(binary, m, args.mode, args.timeout, env))
     print()
 
     # Summary by status.

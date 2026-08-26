@@ -2419,6 +2419,7 @@ class SubinterpImportTests(unittest.TestCase):
             self.check_incompatible_fresh(module, isolated=True)
 
     @unittest.skipIf(_testmultiphase is None, "test requires _testmultiphase module")
+    @unittest.skipIf(_testinternalcapi is None, "requires _testinternalcapi")
     def test_multi_init_extension_compat(self):
         # Module with Py_MOD_PER_INTERPRETER_GIL_SUPPORTED
         module = '_testmultiphase'
