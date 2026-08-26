@@ -6828,6 +6828,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 }
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
+            // `descr_call`'s tail has no place in this fold.  The emit hands
+            // the caller `ca_result`, the compiled `__init__`'s own return,
+            // and for a constructor the CALL has to evaluate to the instance
+            // instead -- the discard, the None check and the `w_newobject`
+            // answer that `type_descr_call_impl` performs between the two
+            // frames.  The three legs that DO play it each own a resume
+            // coordinate to play it at ([`crate::ctor_continuation`] for the
+            // blackhole, `bridge_subwalk` for a bridge,
+            // `MidBodyPayload::constructor_instance` for the gh#467 rebuild);
+            // `CALL_ASSEMBLER` has none, and its `GUARD_NOT_FORCED` would
+            // resume the forced callee straight into the caller's call-result
+            // slot as well.  Residualize the whole instantiation, which is
+            // what `do_residual_call` (`pyjitpl.py`) does with a callee the
+            // tracer cannot follow: `type_descr_call_impl` then runs the tail
+            // for real, TypeError included.
+            //
+            // CONVERGENCE PATH: give the fold the tail as a paused level, the
+            // way the inline path pushes it on `InlineFrame::parents`, and the
+            // fold can be admitted for a constructor too.
+            if constructor_result.is_some() {
+                return resolved_inline_decline(op.pc, line!());
+            }
             emit_walker_loop_callee_call_assembler(
                 ctx,
                 op,
