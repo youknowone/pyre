@@ -35,6 +35,14 @@
 //!
 //! Association is free, as it should be: the depth-26 left-associated tree
 //! produces the same 194-op body as the depth-8 balanced one.
+//!
+//! The post also prints one trace in full — for `(a|b)*`, four nodes, small
+//! enough to read line by line — and the test below reproduces it op for op,
+//! same ops in the same order, on both backends. Ours is that listing minus
+//! two reads: the repetition's mark, which the preamble reads once and the
+//! back edge then carries in a register, and `len(s0)`, which is a red state
+//! field here and so arrives as a loop argument. 15 ops per character, and
+//! no `getfield_gc_i` at all.
 
 use crate::regex::{KIND_ALTERNATIVE, KIND_CHAR, KIND_REPETITION, KIND_SEQUENCE, NodeRec};
 use majit_metainterp::JitDriver;
@@ -424,6 +432,184 @@ mod tests {
             0,
             "the root promote is loop invariant and belongs in the preamble; a \
              per-pass `guard_value` means it was not hoisted; body={body:?}"
+        );
+    }
+
+    // ── the post's own worked example ──────────────────────────────────────
+
+    /// The post's listing for `(a|b)*`, line by line, beside the op of ours
+    /// that stands for it.
+    ///
+    /// This is the whole of that listing except the two lines in [`HOISTED`],
+    /// in the order the post prints them, and it is both what the test asserts
+    /// and what it prints — so the two can never disagree about what the post
+    /// says. `label` stands for the argument header because that is what a
+    /// `Label` carries: the loop's arguments.
+    const POST_BODY: [(OpCode, &str); 15] = [
+        (OpCode::Label, "[i0, result0, s0]  # arguments"),
+        (
+            OpCode::GetarrayitemGcI,
+            "char = s0[i0]      # read character",
+        ),
+        (OpCode::IntEq, "i7 = char == 'a'"),
+        (OpCode::IntAnd, "i8 = i5 & i7"),
+        (OpCode::IntEq, "i10 = char == 'b'"),
+        (OpCode::IntAnd, "i11 = i5 & i10"),
+        (OpCode::SetfieldGc, "ConstPtr(ptr_chara).marked = i8"),
+        (OpCode::IntOr, "i13 = i8 | i11"),
+        (OpCode::SetfieldGc, "ConstPtr(ptr_charb).marked = i11"),
+        (OpCode::SetfieldGc, "ConstPtr(ptr_alternative).marked = i13"),
+        (OpCode::IntAdd, "i17 = i0 + 1"),
+        (OpCode::SetfieldGc, "ConstPtr(ptr_repetition).marked = i13"),
+        (OpCode::IntLt, "i19 = i17 < i18"),
+        (
+            OpCode::GuardTrue,
+            "if not i19: go back to normally running match",
+        ),
+        (OpCode::Jump, "jump(i17, i13, s0)"),
+    ];
+
+    /// The two lines of the post's listing that our peeled body does not have,
+    /// and what carries them instead.
+    ///
+    /// Both are reads, and neither is a read we lost: the values are still
+    /// there, they just arrive as loop arguments. That is why this body has
+    /// zero `getfield_gc_i` where the post's has one.
+    const HOISTED: [&str; 2] = [
+        "i5 = ConstPtr(ptr_repetition).marked  -- the preamble reads it once \
+         and passes it into the label, and the store at the bottom of each \
+         pass forwards to the next one's read, so the mark rides the back \
+         edge in a register instead of being reloaded",
+        "i18 = len(s0)  -- the length is a red state field, so it is a loop \
+         argument here and never a read at all",
+    ];
+
+    /// The RPython spelling of an opcode: `SetfieldGc` prints as `setfield_gc`,
+    /// which is the vocabulary the post's listing is written in.
+    fn op_name(op: OpCode) -> String {
+        let mut out = String::new();
+        for (i, c) in op.name().chars().enumerate() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The body against [`POST_BODY`], one line per op, for a reader to lay
+    /// beside the listing in the post itself. Prints what is actually there,
+    /// so a body that stopped matching prints its own shape rather than the
+    /// expected one.
+    fn beside_the_post(body: &[OpCode]) -> String {
+        let mut out = String::new();
+        for i in 0..body.len().max(POST_BODY.len()) {
+            let ours = body.get(i).map_or("--".to_string(), |op| op_name(*op));
+            let post = POST_BODY.get(i).map_or("--", |(_, line)| line);
+            out += &format!("  {i:>3}  {ours:<18}  {post}\n");
+        }
+        for line in HOISTED {
+            out += &format!("       {:<18}  {line}\n", "(not in our body)");
+        }
+        out
+    }
+
+    /// The post's own worked example, which is the reason the post shows a
+    /// trace at all: `(a|b)*`, four nodes, small enough to read line by line.
+    ///
+    /// The 93-node benchmark tree above says the walk folds; this says what it
+    /// folds *to*. The claim is the strong one — not "the same counts" but the
+    /// same ops in the same order — so [`POST_BODY`] is asserted as a sequence
+    /// and the counts below are the individual shape questions the post's
+    /// listing answers, each with its own message.
+    ///
+    /// Two of the post's lines are missing here and both are explained in
+    /// [`HOISTED`]; nothing else differs.
+    #[test]
+    fn the_four_node_tree_reproduces_the_posts_listing() {
+        use crate::regex::{alt, ch, rep};
+
+        // Any `a`/`b` string long enough to cross the threshold will do —
+        // every one of them matches `(a|b)*`, and the fixup `nonmatching`
+        // performs is about the benchmark regex, not this one. It is borrowed
+        // because it is the file's source of long `a`/`b` inputs.
+        let s = nonmatching(4096, 20, 42);
+        let root = lower(&rep(alt(ch(b'a'), ch(b'b'))));
+        let nodes = count(root);
+        assert_eq!(nodes, 4, "the post's example is a 4-node tree");
+
+        let (matched, compiles, full) = measure(root, &s);
+        assert!(matched, "every `a`/`b` string matches `(a|b)*`");
+        assert!(
+            compiles > 0,
+            "nothing compiled, so there is no trace to compare with the \
+             post's; degraded={:?}",
+            degraded(),
+        );
+        let body = loop_body(&full);
+        println!(
+            "[regex-jit] (a|b)*: {nodes} nodes, {compiles} compiled, \
+             per character: {}\n{}",
+            census(body),
+            beside_the_post(body),
+        );
+
+        let n = |op: OpCode| body.iter().filter(|o| **o == op).count();
+        assert_eq!(
+            n(OpCode::GetarrayitemGcI),
+            1,
+            "the post reads the character once per pass and so should this; \
+             more than one means the buffer base or the index stopped being \
+             hoisted, none means the read left the loop and the body is not \
+             doing the matching; body={body:?}"
+        );
+        assert_eq!(
+            n(OpCode::IntEq),
+            2,
+            "one comparison per `Char` node is what the post's listing has, \
+             and `(a|b)*` has two: neither mark is provably zero here. Fewer \
+             would mean a comparison was folded that cannot be — unlike the \
+             93-node tree, where 44 of the 46 `Char` nodes really do have a \
+             constant-zero incoming mark and drop out; body={body:?}"
+        );
+        assert_eq!(
+            n(OpCode::SetfieldGc),
+            nodes,
+            "one mark stored per node, and the tree has {nodes}. Fewer means \
+             the recursion did not reach every node; more means a node was \
+             stored to twice, so the walk ran more than once; body={body:?}"
+        );
+        assert_eq!(
+            n(OpCode::GetfieldGcR),
+            0,
+            "a pointer read means an edge of the tree walk survived the fold, \
+             which is what `_immutable_fields_` plus a promoted root exist to \
+             prevent; the post's listing reaches all four nodes as `ConstPtr` \
+             and so must this; body={body:?}"
+        );
+        assert_eq!(
+            n(OpCode::GuardValue),
+            0,
+            "the root promote is loop invariant and belongs in the preamble; \
+             a per-pass `guard_value` means it was not hoisted, and the \
+             specialization would then cost a guard per character; \
+             body={body:?}"
+        );
+
+        let ours: Vec<OpCode> = body.to_vec();
+        let post: Vec<OpCode> = POST_BODY.iter().map(|(op, _)| *op).collect();
+        assert_eq!(
+            ours,
+            post,
+            "the body is no longer the post's listing op for op. The counts \
+             above can all still pass while the order changes, so this is the \
+             assertion that says we reproduced the trace rather than merely \
+             its census:\n{}",
+            beside_the_post(body),
         );
     }
 }

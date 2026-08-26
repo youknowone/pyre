@@ -1,0 +1,914 @@
+//! The control for the post's short-circuit remark: the same portal, with a
+//! `shift` that branches instead of masking.
+//!
+//! "A JIT for Regular Expression Matching" says, without showing the numbers:
+//!
+//! > the JIT-version of the code needs to be adapted to use the
+//! > non-short-circuiting operators `&` and `|` ... If you don't change the
+//! > "and" and "or" you get a lot of assembler code generated, and it's not
+//! > particularly fast
+//!
+//! `interp.rs` and `jit_interp.rs` both follow that advice, and this crate has
+//! documented it without ever measuring it. This module is the other side of
+//! that A/B: `jit_interp`'s portal copied whole — same state fields, same
+//! greens, same three-instruction program, same promote, same
+//! `_immutable_fields_` declarations, same inline policy — with `shift`'s four
+//! arms written the way part 1's Python writes them, `and`/`or` that stop
+//! early. The state struct's NAME is the one other difference, and only so a
+//! degraded arm stays attributable; the field list is identical.
+//!
+//! Measured on this machine, dynasm, on the post's own
+//! `(a|b)*a(a|b){20}a(a|b)*` — 93 nodes, balanced — over a non-matching random
+//! `a`/`b` string. Two separate claims, because they have separate evidence.
+//!
+//! # 1. The post's claim, about code shape. It holds.
+//!
+//! The peeled loop body, which is what runs per input character:
+//!
+//! ```text
+//!            ops guard_true guard_false gf_gc_r gf_gc_i setfield_gc int_eq guard_value
+//! masking    194     1           0         0      24        93        2        0
+//! branching  176     6          20         0      24        93        2        0
+//! ```
+//!
+//! One guard against twenty-six. The masking body's single guard is the loop
+//! exit — the `pos < len` test — and the branching body carries that one plus
+//! twenty-five more, one per `and`/`or` whose operand the optimizer could not
+//! prove constant. That is exactly the mechanism the post names: a branch the
+//! tracer records becomes a guard, and masking has no branch to record.
+//!
+//! The surprise is the op count. The branching body is SMALLER, not bigger —
+//! 176 against 194 — because a guard replaces the `int_and` / `int_or` it
+//! stands in for, and because the dead side of a branch takes its ops out of
+//! the trace with it. "A lot of assembler code generated" is not what happens
+//! here, and the specialization is untouched: both bodies fold the whole
+//! 93-node tree walk to zero `getfield_gc_r`, both store one mark per node,
+//! and both reduce 46 `Char` nodes to 2 `int_eq`. Both compile exactly one
+//! loop, and `degraded_dispatch_arms()` is empty for both, so the branching
+//! body lowers completely — this is NOT the "refuses to lower" outcome.
+//!
+//! Both backends agree op for op on every number in that table, and on the
+//! runtime counts below: dynasm and cranelift were measured separately and
+//! differ only in the throughput rows.
+//!
+//! # 2. What majit's runtime then does with those guards. This is the cost.
+//!
+//! Over a 4096-character non-matching input, the branching portal records:
+//!
+//! ```text
+//! guard failures 4090   bridges compiled 0   traces aborted 19 (all ABORT_BRIDGE)
+//! ```
+//!
+//! One guard failure per input character. `MAJIT_LOG=1` over the same run
+//! counts 4090 `guard failure at key=`, 4090 `handle_fail`, 4090 blackhole
+//! entries matched by 4090 exits, and 4090 `execute_token` entries matched by
+//! 4090 returns. That is the steady state, and it is one full round trip per
+//! character: enter compiled code, fail a guard, deopt through the blackhole,
+//! resume the interpreter at `ContinueRunningNormally`, re-enter.
+//!
+//! Fourteen distinct guard indices take part, because the mark pattern moves
+//! with the input and no one trace covers it, but the distribution is steep —
+//! guard 2 alone accounts for 2716 of the 4090, then 603, 445, 228, 60, and a
+//! ten-guard tail summing to 38.
+//!
+//! The `ABORT_BRIDGE` label on that tally is not evidence on its own.
+//! `AbortReason::Bridge` and `AbortReason::Generic` share
+//! `Counters.ABORT_BRIDGE`'s integer, and `Generic` is the fallback for every
+//! unclassified walker decline, so the count alone cannot tell a bridge
+//! give-up from anything else. What says these 19 are give-ups is the log
+//! below, not the name.
+//!
+//! No bridge ever serves any of it, and the reason is not this algorithm.
+//! `must_compile` fires only 19 times in those 4090 failures and
+//! `compile_trace` is never reached at all: each attempt aborts on the very
+//! next log line after its tracing session opens, with zero bytecode-body ops
+//! walked. `MAJIT_BRIDGE_DEBUG=1` names all 19 of them, and they are one
+//! thing —
+//!
+//! ```text
+//! [bridgeB] multi-frame resume (7 frames) — only the root frame is seedable,
+//!           giving up on the bridge
+//! ```
+//!
+//! 13 at 7 frames, 3 at 4, 2 at 6, 1 at 5. `shift` is a recursive
+//! `#[jit_inline]` helper, so a guard that fails inside it resumes into a
+//! stack of frames, and `start_bridge_tracing` (`majit-metainterp`) gives up
+//! whenever a state-field driver's resume data spans more than one — its
+//! `setup_bridge_sym` can seed the root frame only. The frame count IS the
+//! recursion depth at the failing guard.
+//!
+//! So the branching portal never gets a bridge for a reason that would apply
+//! to any `#[jit_interp]` machine whose hot loop calls an inlined recursive
+//! helper. The masking portal is not spared it either; it simply has one
+//! guard, which does not fail. That is a majit limitation to lift, not a
+//! property of short-circuit operators, and the timing row below must be read
+//! as "with no bridge available" rather than as the last word.
+//!
+//! So the post's "you get a lot of assembler code generated" does not describe
+//! what happens here. The opposite does: NO extra assembler is generated, and
+//! an interpreter round trip is paid per character instead.
+//!
+//! # Throughput
+//!
+//! Median of 5 over 1048576 characters, one untimed warm-up first, all three
+//! rows measured in one process by one test, 1-minute load average 7.7 before
+//! and 8.2 after:
+//!
+//! ```text
+//! masking, jit_interp      46,889,491 chars/s   (min 41,008,457  max 47,583,958)
+//! no JIT at all, interp     8,789,264 chars/s   (min  8,459,015  max  9,058,062)
+//! branching, this module       22,034 chars/s   (min     21,022  max     23,152)
+//! masking / branching            2128x
+//! no JIT  / branching             399x
+//! ```
+//!
+//! The third row is what turns "slower" into a verdict. The branching portal
+//! does not merely give back the JIT's win over the plain matcher: at 399x it
+//! is far slower than running the same algorithm with no JIT under it at all,
+//! because every character now pays an interpreter round trip the plain
+//! matcher never pays. "Not particularly fast" is, here, three orders of
+//! magnitude.
+//!
+//! Those are three rows of one process, which is what makes the two ratios
+//! worth quoting: the machine was not idle, and a ratio taken inside one run
+//! survives that where an absolute row does not. Earlier runs of the same
+//! source at higher load read 1716x, 1579x and 2336x — the branching row is
+//! the load-sensitive one and moves by up to 1.7x, while the finding does not.
+//!
+//! The shorter row the suite runs on every invocation, 4096 characters, is a
+//! much smaller ratio: 66x on dynasm in the same session (1,822,199 against
+//! 27,782 in the length sweep), and 19x on cranelift. The ratio grows with
+//! input length because `matches` builds a fresh `JitDriver` per call, so at
+//! 4096 characters the masking row is still paying for a recording it only
+//! amortizes over a long input, while the branching row has nothing to
+//! amortize against, because it never gets to run the compiled loop.
+//!
+//! # The spelling the post's advice suggests literally
+//!
+//! Swapping `&`/`|` for `&&`/`||` and leaving the shape alone is NOT the A/B
+//! this module runs, for two reasons, both measured on this machine in the
+//! same session as the tables above.
+//!
+//! First, in a lowered body `&&` and `||` are not short-circuit operators at
+//! all. `opcode_for_binop` maps `BinOp::And` / `BinOp::Or` to `IntAnd` /
+//! `IntOr`, so they lower to the same two ops `&` and `|` do, and
+//! `lower_bool_if` collapses `if cond { 1 } else { 0 }` back to `cond` with no
+//! branch emitted. Measured: with ONLY the `Char` arm rewritten that way, the
+//! peeled body carries one guard — the loop exit — exactly as the masking
+//! column does. A branch has to be written as a branch whose arms are not the
+//! literals `1` and `0`, which is why the arms below hand back the operand,
+//! the way Python's `and` / `or` actually evaluate.
+//!
+//! Second, writing that spelling here is what found a majit defect, now
+//! fixed. `(mark != 0) as i64 | (n.marked as i64 != 0) as i64` in the
+//! `Repetition` arm made the optimizer die after the trace recorded, on both
+//! backends, in `OptContext::getnullness` under `optimize_int_is_true`. The
+//! `int_or` of two `int_is_true` results asked about an operand that forwarded
+//! to an op whose `Rc` had been dropped: `_forwarded` held a `Weak`, so
+//! `get_box_replacement` stopped one hop early and handed back an operand that
+//! was still forwarding, which `getnullness` asserts cannot happen. The slot
+//! now owns its target the way RPython's `_forwarded` does
+//! (`majit-ir/src/forwarding.rs`). Measured after the fix: that spelling in
+//! the `Repetition` arm alone, in the `Sequence` arm alone, and in all four
+//! arms at once each compiles and agrees with the interpreter on both
+//! backends. `majit-ir`'s
+//! `operand::tests::a_forwarded_target_survives_every_other_reference_being_dropped`
+//! is the gate.
+
+use crate::regex::{KIND_ALTERNATIVE, KIND_CHAR, KIND_REPETITION, KIND_SEQUENCE, NodeRec};
+use majit_metainterp::JitDriver;
+
+/// `jit_interp::shift`, arm for arm, with every `&`/`|` replaced by the
+/// short-circuiting spelling part 1's Python uses.
+///
+/// The `and`/`or` are transcribed as Python evaluates them, not as booleans:
+/// `x and y` is `if x { y } else { x }` and `x or y` is `if x { x } else { y }`,
+/// which is why the else arms hand back the operand rather than a literal.
+/// That matters twice over — it is what makes the field read on the far side of
+/// the operator conditional (`mark and c == self.c` never touches `self.c` when
+/// the mark is clear), and it is what keeps the macro from folding the whole
+/// `if` away.
+///
+/// The recursive `shift` calls stay where the Python puts them: both children
+/// of an `Alternative` and both sides of a `Sequence` are shifted before the
+/// combinator runs, because each call stores a mark and skipping one would
+/// change the answer, not just the trace.
+#[majit_macros::jit_inline(
+    ref_params = { n: ref(NodeRec) },
+    ref_fields = {
+        NodeRec::left => NodeRec,
+        NodeRec::right => NodeRec,
+    },
+    int_fields = {
+        NodeRec::kind => u8,
+        NodeRec::ch => u8,
+        NodeRec::empty => u8,
+        NodeRec::marked => u8,
+    },
+)]
+fn shift(n: usize, c: i64, mark: i64) -> i64 {
+    let k = n.kind;
+    let m = match k {
+        // `mark and c == self.c`
+        KIND_CHAR => {
+            if mark != 0 {
+                let ch = n.ch as i64;
+                (ch == c) as i64
+            } else {
+                mark
+            }
+        }
+        // `marked_left or marked_right`
+        KIND_ALTERNATIVE => {
+            let marked_left = shift(n.left, c, mark);
+            let marked_right = shift(n.right, c, mark);
+            if marked_left != 0 {
+                marked_left
+            } else {
+                marked_right
+            }
+        }
+        // `self.re._shift(c, mark or self.marked)`
+        KIND_REPETITION => {
+            let inner_mark = if mark != 0 { mark } else { n.marked as i64 };
+            shift(n.left, c, inner_mark)
+        }
+        KIND_SEQUENCE => {
+            // The left mark from the PREVIOUS character is what enters the
+            // right side, so read it before `shift` overwrites it.
+            let l = n.left;
+            let r = n.right;
+            let old_left = l.marked as i64;
+            let marked_left = shift(l, c, mark);
+            // `old_marked_left or (mark and self.left.empty)`
+            let into_right = if old_left != 0 {
+                old_left
+            } else if mark != 0 {
+                l.empty as i64
+            } else {
+                mark
+            };
+            let marked_right = shift(r, c, into_right);
+            // `marked_left and self.right.empty or marked_right`
+            let left_closes = if marked_left != 0 {
+                r.empty as i64
+            } else {
+                marked_left
+            };
+            if left_closes != 0 {
+                left_closes
+            } else {
+                marked_right
+            }
+        }
+        // Epsilon, and anything else: no mark ever comes out.
+        _ => 0i64,
+    };
+    n.marked = m as u8;
+    m
+}
+
+// ── the portal ─────────────────────────────────────────────────────────────
+
+pub type Bytecode = [u8];
+
+/// Shift the next character in, and advance.
+const OP_SHIFT: u8 = 0;
+/// Close the back edge while the input has characters left.
+const OP_LOOP: u8 = 1;
+const OP_HALT: u8 = 2;
+
+/// The whole "program". `pc` and `program` are the greens, and the back edge
+/// returns to `pc = 0`, so every character shares one green key — the regex,
+/// which the loop promotes, is what the trace actually specializes on.
+pub const PROGRAM: [u8; 3] = [OP_SHIFT, OP_LOOP, OP_HALT];
+
+/// The input string, as a headerless buffer plus its length.
+#[repr(C)]
+struct Input {
+    data: *mut u8,
+    len: i64,
+}
+
+/// `jit_interp::MatchState`'s fields, under a different type name.
+///
+/// The name is the one deliberate deviation from "identical everything else":
+/// `degraded_dispatch_arms()` reports an arm under its state type, and two
+/// portals sharing the name would make a degraded arm unattributable — and
+/// `jit_interp`'s own test filters that list on `interp == "MatchState"`.
+struct ShortCircuitState {
+    /// The lowered regex. Red, then promoted: the promote is the one guard the
+    /// specialization costs.
+    root: usize,
+    /// The input buffer.
+    inp: usize,
+    pos: i64,
+    len: i64,
+    result: i64,
+}
+
+pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Bridges compiled. A guard that keeps failing grows a bridge, and bridges are
+/// the machine code the post's "a lot of assembler code generated" is about —
+/// the loop counter cannot see them, because a guard that declines to bridge
+/// still deopts through the blackhole and leaves the loop count at 1.
+pub static BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Traces abandoned. `COMPILES > 0` does not rule this out: a bridge can abort
+/// while the loop stands.
+pub static ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Guard failures, counted only while [`GUARD_FAILURE_PROBE`] is set.
+pub static GUARD_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether [`mainloop`] installs the guard-failure callback at all.
+///
+/// The other three callbacks fire on compile and abort events — a handful of
+/// times per run, and never on the path a character takes. This one fires on
+/// every deopt, so leaving it installed would put an instrument inside the very
+/// quantity the timing row measures. It is therefore installed per call, and
+/// the timed rows run with it off, which is also what makes them comparable to
+/// `jit_interp`'s portal (that one installs the loop callback and nothing else).
+pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// The last run's aborts split by `Counters.ABORT_*` reason, indexed as
+/// `majit_metainterp::jitprof::ABORT_COUNTER_KINDS`.
+///
+/// Read off the driver once, after the loop, because that is the only place
+/// the driver is in scope; `set_on_trace_abort` reports `permanent` and not the
+/// reason. Written per `matches` call, never per character.
+pub static ABORT_REASONS: [std::sync::atomic::AtomicUsize; 6] = {
+    const Z: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    [Z; 6]
+};
+static LAST_BODY: std::sync::Mutex<Vec<majit_ir::OpCode>> = std::sync::Mutex::new(Vec::new());
+
+/// The peeled loop body of the last loop this portal compiled — everything
+/// from the last `Label` on, which is what runs per input character.
+///
+/// A compiled loop is preamble plus peeled body. Grading the whole thing
+/// double-counts, and it also charges the body for the reads the preamble
+/// hoisted out of it.
+pub fn last_peeled_body() -> Vec<majit_ir::OpCode> {
+    let body = LAST_BODY.lock().unwrap_or_else(|e| e.into_inner());
+    match body.iter().rposition(|op| *op == majit_ir::OpCode::Label) {
+        Some(i) => body[i..].to_vec(),
+        None => body.clone(),
+    }
+}
+
+#[majit_macros::jit_interp(
+    state = ShortCircuitState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = {
+        root: ref(NodeRec),
+        inp: ref(Input),
+        pos: int,
+        len: int,
+        result: int,
+    },
+    array_fields = { Input::data => u8 },
+    ref_fields = {
+        NodeRec::left => NodeRec,
+        NodeRec::right => NodeRec,
+    },
+    int_fields = {
+        NodeRec::kind => u8,
+        NodeRec::ch => u8,
+        NodeRec::empty => u8,
+        NodeRec::marked => u8,
+    },
+    calls = { shift => inline_int },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn mainloop(
+    program: &Bytecode,
+    threshold: u32,
+    root: usize,
+    inp: usize,
+    len: i64,
+    first: i64,
+) -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut driver: JitDriver<ShortCircuitState> = JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_gk, _before, _ops_after, opcodes| {
+        COMPILES.fetch_add(1, Relaxed);
+        *LAST_BODY.lock().unwrap() = opcodes.to_vec();
+    });
+    driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
+        BRIDGES.fetch_add(1, Relaxed);
+    });
+    driver.set_on_trace_abort(|_gk, _permanent| {
+        ABORTS.fetch_add(1, Relaxed);
+    });
+    if GUARD_FAILURE_PROBE.load(Relaxed) {
+        driver.set_on_guard_failure(|_gk, _trace_id, _fail_index| {
+            GUARD_FAILURES.fetch_add(1, Relaxed);
+        });
+    }
+    let mut pc: usize = 0;
+    let mut state = ShortCircuitState {
+        root,
+        inp,
+        pos: 1i64,
+        len,
+        result: first,
+    };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
+    while pc < program.len() {
+        jit_merge_point!(driver, program, pc; state);
+        let opcode = program[pc];
+        pc += 1;
+        match opcode {
+            OP_SHIFT => {
+                let root = state.root;
+                majit_metainterp::jit::promote(root);
+                let idx = state.pos as usize;
+                let c = state.inp.data[idx] as i64;
+                state.result = shift(root, c, 0i64);
+                state.pos = state.pos + 1i64;
+            }
+            OP_LOOP => {
+                if state.pos < state.len {
+                    can_enter_jit!(driver, 0usize, &mut state, program, || {});
+                    pc = 0;
+                    continue;
+                }
+            }
+            OP_HALT => break,
+            _ => break,
+        }
+    }
+    for (i, slot) in ABORT_REASONS.iter().enumerate() {
+        slot.store(driver.abort_diag(i) as usize, Relaxed);
+    }
+    state.result
+}
+
+/// `interp::matches`, with the per-character loop handed to the JIT.
+///
+/// The first character is shifted in outside the loop — it is the one that
+/// carries a mark in from the left — so the loop body is uniform and the trace
+/// has no first-iteration special case.
+pub fn matches(root: *mut NodeRec, s: &[u8], threshold: u32) -> bool {
+    if s.is_empty() {
+        return unsafe { (*root).empty } != 0;
+    }
+    let first = crate::interp::shift(root, s[0] as i64, 1);
+    let result = if s.len() == 1 {
+        first
+    } else {
+        let mut input = Input {
+            data: s.as_ptr() as *mut u8,
+            len: s.len() as i64,
+        };
+        mainloop(
+            &PROGRAM,
+            threshold,
+            root as usize,
+            &mut input as *mut Input as usize,
+            input.len,
+            first,
+        )
+    };
+    crate::interp::reset(root);
+    result != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::regex::{bench_regex, count, lower, nonmatching, vectors};
+    use majit_ir::OpCode;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    /// The counters and `LAST_BODY` — this module's and `jit_interp`'s — are
+    /// process-wide, and libtest runs these in parallel. EVERY test that enters
+    /// either portal takes this, not only the ones that read the numbers: a
+    /// test that enters without it does not read the counters, but it moves
+    /// them.
+    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn matches_locked(root: *mut NodeRec, s: &[u8], threshold: u32) -> bool {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        matches(root, s, threshold)
+    }
+
+    /// What one measured run of either portal answers.
+    struct Run {
+        matched: bool,
+        compiles: usize,
+        /// `None` for the masking portal, which installs no bridge callback.
+        bridges: Option<usize>,
+        aborts: Option<usize>,
+        guard_failures: Option<usize>,
+        body: Vec<OpCode>,
+    }
+
+    fn peeled(full: Vec<OpCode>) -> Vec<OpCode> {
+        match full.iter().rposition(|op| *op == OpCode::Label) {
+            Some(i) => full[i..].to_vec(),
+            None => full,
+        }
+    }
+
+    /// One measured run of the short-circuit portal, guard-failure probe on.
+    fn measure(root: *mut NodeRec, s: &[u8]) -> Run {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        BRIDGES.store(0, Ordering::Relaxed);
+        ABORTS.store(0, Ordering::Relaxed);
+        GUARD_FAILURES.store(0, Ordering::Relaxed);
+        GUARD_FAILURE_PROBE.store(true, Ordering::Relaxed);
+        LAST_BODY.lock().unwrap().clear();
+        let matched = matches(root, s, 3);
+        GUARD_FAILURE_PROBE.store(false, Ordering::Relaxed);
+        Run {
+            matched,
+            compiles: COMPILES.load(Ordering::Relaxed),
+            bridges: Some(BRIDGES.load(Ordering::Relaxed)),
+            aborts: Some(ABORTS.load(Ordering::Relaxed)),
+            guard_failures: Some(GUARD_FAILURES.load(Ordering::Relaxed)),
+            body: last_peeled_body(),
+        }
+    }
+
+    /// The same, for the masking portal next door.
+    ///
+    /// `bridges` / `aborts` / `guard_failures` come back `None` because
+    /// `jit_interp::mainloop` installs `set_on_compile_loop` and nothing else.
+    /// Three `driver.set_on_*` lines there would answer them; that file belongs
+    /// to another change, so this side reports "not measured" rather than
+    /// implying zero.
+    fn measure_masking(root: *mut NodeRec, s: &[u8]) -> Run {
+        use crate::jit_interp;
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        jit_interp::COMPILES.store(0, Ordering::Relaxed);
+        jit_interp::LAST_BODY.lock().unwrap().clear();
+        let matched = jit_interp::matches(root, s, 3);
+        Run {
+            matched,
+            compiles: jit_interp::COMPILES.load(Ordering::Relaxed),
+            bridges: None,
+            aborts: None,
+            guard_failures: None,
+            body: peeled(jit_interp::LAST_BODY.lock().unwrap().clone()),
+        }
+    }
+
+    fn n_of(body: &[OpCode], op: OpCode) -> usize {
+        body.iter().filter(|o| **o == op).count()
+    }
+
+    fn guards(body: &[OpCode]) -> usize {
+        n_of(body, OpCode::GuardTrue) + n_of(body, OpCode::GuardFalse)
+    }
+
+    fn census(body: &[OpCode]) -> String {
+        format!(
+            "{} ops: {} guard_true, {} guard_false, {} getfield_gc_r, \
+             {} getfield_gc_i, {} setfield_gc, {} int_eq, {} guard_value",
+            body.len(),
+            n_of(body, OpCode::GuardTrue),
+            n_of(body, OpCode::GuardFalse),
+            n_of(body, OpCode::GetfieldGcR),
+            n_of(body, OpCode::GetfieldGcI),
+            n_of(body, OpCode::SetfieldGc),
+            n_of(body, OpCode::IntEq),
+            n_of(body, OpCode::GuardValue),
+        )
+    }
+
+    /// The last run's aborts, `Counters.ABORT_*` label to count, zeroes
+    /// dropped.
+    fn abort_reasons() -> Vec<(&'static str, usize)> {
+        majit_metainterp::jitprof::ABORT_COUNTER_KINDS
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| (*label, ABORT_REASONS[i].load(Ordering::Relaxed)))
+            .filter(|(_, n)| *n != 0)
+            .collect()
+    }
+
+    fn degraded() -> Vec<(&'static str, &'static str)> {
+        majit_metainterp::degraded_dispatch_arms()
+            .into_iter()
+            .filter(|a| a.interp == "ShortCircuitState")
+            .map(|a| (a.arm, a.reason))
+            .collect()
+    }
+
+    #[test]
+    fn the_short_circuit_matcher_agrees_with_the_interpreter() {
+        for (re, s, want) in vectors() {
+            let root = lower(&re);
+            assert_eq!(matches_locked(root, s.as_bytes(), 3), want, "input {s:?}");
+        }
+    }
+
+    /// Cold and warm must agree on an input long enough to cross the threshold
+    /// — on one that does not match, and on one that does. A branch the tracer
+    /// recorded one way and a guard that fails to re-check it shows up here and
+    /// nowhere else, and the branching body has twenty-six places to get that
+    /// wrong where the masking body has one.
+    #[test]
+    fn warm_agrees_with_cold_and_with_the_interpreter_on_a_long_input() {
+        let s = nonmatching(4096, 20, 42);
+        let root = lower(&bench_regex(20));
+        let cold = matches_locked(root, &s, u32::MAX);
+        let warm = matches_locked(root, &s, 3);
+        assert!(!cold, "the benchmark input is supposed NOT to match");
+        assert_eq!(warm, cold);
+        assert_eq!(warm, crate::interp::matches(root, &s));
+
+        let mut hit = s.clone();
+        // Two `a`s exactly 21 apart is the whole regex.
+        hit[100] = b'a';
+        hit[121] = b'a';
+        let cold = matches_locked(root, &hit, u32::MAX);
+        let warm = matches_locked(root, &hit, 3);
+        assert!(cold, "the reinstated pair is supposed to match");
+        assert_eq!(warm, cold);
+        assert_eq!(warm, crate::interp::matches(root, &hit));
+    }
+
+    /// The experiment's first half: what the two bodies look like.
+    ///
+    /// The numbers pinned here are the ones the module doc's table reports, and
+    /// they are pinned as ranges wide enough to survive an optimizer change
+    /// that keeps the finding and narrow enough to fail if the finding goes
+    /// away. The finding is NOT "the branching body is bigger" — it is smaller,
+    /// which is the surprise — it is that the branching body pays in guards.
+    #[test]
+    fn the_branching_body_trades_ops_for_guards() {
+        let s = nonmatching(4096, 20, 42);
+        let nodes = count(lower(&bench_regex(20)));
+
+        let sc = measure(lower(&bench_regex(20)), &s);
+        let mk = measure_masking(lower(&bench_regex(20)), &s);
+        assert_eq!(sc.matched, mk.matched, "the two portals disagreed");
+        assert!(!sc.matched, "the benchmark input is supposed NOT to match");
+
+        println!(
+            "[shortcircuit] {nodes} nodes, branching: {} loop(s), {:?} bridge(s), \
+             {:?} abort(s), {:?} guard failure(s), per character: {}",
+            sc.compiles,
+            sc.bridges,
+            sc.aborts,
+            sc.guard_failures,
+            census(&sc.body),
+        );
+        println!(
+            "[shortcircuit] {nodes} nodes, masking  : {} loop(s), per character: {}",
+            mk.compiles,
+            census(&mk.body),
+        );
+
+        // Both portals still reach the JIT, and the branching one lowers: a
+        // refusal would make every comparison below a comparison of nothing.
+        assert!(
+            sc.compiles > 0,
+            "the branching portal compiled nothing, so every character ran \
+             interpreted; degraded={:?}",
+            degraded(),
+        );
+        assert!(mk.compiles > 0, "the masking portal compiled nothing");
+        assert_eq!(
+            degraded(),
+            Vec::new(),
+            "the branching `shift` degraded a dispatch arm; with the arm \
+             interpreted the body below is not the branching body at all",
+        );
+        // Not asserted to be zero, because it is not: the branching portal
+        // aborts, and the abort is half the mechanism. See the test below.
+
+        // Every node is still in the trace, and the tree walk still folds: the
+        // operator moved the guards, not the specialization.
+        assert!(
+            n_of(&sc.body, OpCode::SetfieldGc) >= nodes,
+            "the branching walk stored {} marks for a {nodes}-node tree",
+            n_of(&sc.body, OpCode::SetfieldGc),
+        );
+        assert_eq!(
+            n_of(&sc.body, OpCode::GetfieldGcR),
+            0,
+            "the branching walk reloaded a `left`/`right` pointer",
+        );
+
+        // The finding. The masking body carries exactly one guard — the loop
+        // exit — and the branching body carries that one plus one per `and`/
+        // `or` the optimizer could not prove constant.
+        assert_eq!(
+            guards(&mk.body),
+            1,
+            "the masking body is supposed to carry only the loop-exit guard",
+        );
+        assert!(
+            guards(&sc.body) >= 20,
+            "the branching body carried {} guards; the whole claim is that \
+             short-circuit operators become guards, and under 20 it did not \
+             happen",
+            guards(&sc.body),
+        );
+        // And it is SMALLER, not bigger: the dead side of each branch takes
+        // its ops with it.
+        assert!(
+            sc.body.len() < mk.body.len(),
+            "the branching body ({} ops) was not smaller than the masking one \
+             ({} ops); the doc table says it is",
+            sc.body.len(),
+            mk.body.len(),
+        );
+    }
+
+    /// The mechanism behind the timing row, and the half that is free to
+    /// assert: the branching body deopts once per input character.
+    ///
+    /// 26 guards in the peeled body and 4090 failures over 4096 characters is
+    /// not "some guards sometimes fail" — it is the compiled loop leaving
+    /// through a guard on essentially every pass. What follows a failure is a
+    /// blackhole deopt and a bridge attempt, and the bridge attempts abort, so
+    /// the failure never stops recurring. That is a per-character cost measured
+    /// in microseconds against a compiled body measured in nanoseconds, and it
+    /// is why the timing row below is not a percentage.
+    #[test]
+    fn the_branching_body_deopts_once_per_character() {
+        let s = nonmatching(4096, 20, 42);
+        let sc = measure(lower(&bench_regex(20)), &s);
+        let failures = sc.guard_failures.expect("the probe was installed");
+        println!(
+            "[shortcircuit] {} chars: {failures} guard failures, {:?} bridges, \
+             {:?} aborts {:?}, {} loop(s)",
+            s.len(),
+            sc.bridges,
+            sc.aborts,
+            abort_reasons(),
+            sc.compiles,
+        );
+        assert!(
+            failures * 2 > s.len(),
+            "only {failures} guard failures over {} characters, so the \
+             compiled loop was actually running; the timing row's explanation \
+             does not hold",
+            s.len(),
+        );
+        // No bridge is ever built, so the failure repeats forever instead of
+        // being served by compiled code. Recorded, not assumed: if majit later
+        // learns to bridge these, this is the line that says the finding moved.
+        assert_eq!(
+            sc.bridges,
+            Some(0),
+            "a bridge was compiled, so the deopt is no longer unbounded and \
+             the timing row needs re-measuring",
+        );
+        assert!(
+            sc.aborts.unwrap_or(0) > 0,
+            "no trace was abandoned; the bridge attempts are supposed to abort",
+        );
+    }
+
+    /// The experiment's second half: what the two bodies cost.
+    ///
+    /// Short input and a loose floor, because this one runs in the normal
+    /// suite. The doc table's figure — median of 5 over 1048576 characters —
+    /// comes from [`the_branching_body_is_timed_at_the_full_length`], which is
+    /// `#[ignore]`d because at the branching portal's rate a single pass over
+    /// 1M characters takes over a minute.
+    ///
+    /// The ratio here is much smaller than the doc table's, and the reason is
+    /// worth stating rather than smoothing over: `matches` builds a fresh
+    /// `JitDriver` per call, so every call re-records and re-compiles, and at
+    /// 4096 characters that one-off recording is most of the masking row's
+    /// wall clock. The branching row has nothing to amortize it against,
+    /// because it never gets to run the compiled loop. Longer input therefore
+    /// moves the two rows in opposite directions, and the ratio grows with
+    /// length — which is itself the shape of the finding.
+    #[test]
+    fn the_branching_body_is_far_slower_per_character() {
+        let s = nonmatching(1 << 12, 20, 42);
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sc = time_rate(lower(&bench_regex(20)), &s, 3, |r, s| matches(r, s, 3));
+        let mk = time_rate(lower(&bench_regex(20)), &s, 3, |r, s| {
+            crate::jit_interp::matches(r, s, 3)
+        });
+        let ratio = median(&mk) / median(&sc);
+        println!(
+            "[shortcircuit] {} chars, branching: {:.0} chars/s, masking: \
+             {:.0} chars/s, masking / branching = {ratio:.0}x",
+            s.len(),
+            median(&sc),
+            median(&mk),
+        );
+        // Measured at this length: 66x, 68x and 89x over this session's
+        // dynasm runs, 19x on cranelift. The backends differ here and not in
+        // the op census because at 4096 characters this row is dominated by
+        // the ONE recording each `matches` call pays for, and cranelift
+        // compiles slower than dynasm; the branching row is unaffected,
+        // having no compiled loop to amortize it against. The floor is 10x,
+        // low enough to clear cranelift under contention and still far above
+        // the ~1x a lost finding would read.
+        assert!(
+            ratio > 10.0,
+            "masking was only {ratio:.1}x the branching rate at {} characters. \
+             The module doc reports 66-89x here on dynasm, 19x on cranelift \
+             and 1716x at 1M, and under 10x that table is wrong rather than \
+             stale",
+            s.len(),
+        );
+    }
+
+    /// The doc table's timing row: median of [`TIMED_RUNS`] over
+    /// [`TIMED_CHARS`] characters, one untimed warm-up first so the timed runs
+    /// measure compiled code and not the trace it had to record.
+    ///
+    /// Median rather than mean because benchmark noise is one-sided: a
+    /// preemption, an interrupt or a thermal step can only make a run slower,
+    /// so a mean reports a run that never happened and a rerun does not
+    /// reproduce it.
+    ///
+    /// `#[ignore]`d: at 27k chars/s the branching portal needs about 38
+    /// seconds per pass, six of them counting the warm-up, and the two fast
+    /// rows add about two seconds. Measured end to end at 236s.
+    /// `cargo test -p regex --release --no-default-features --features dynasm \
+    /// -- --ignored --nocapture the_branching_body_is_timed_at_the_full_length`
+    #[test]
+    #[ignore = "~4 minutes: the branching portal scans 1M characters in ~38s"]
+    fn the_branching_body_is_timed_at_the_full_length() {
+        let s = nonmatching(TIMED_CHARS, 20, 42);
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sc = time_rate(lower(&bench_regex(20)), &s, TIMED_RUNS, |r, s| {
+            matches(r, s, 3)
+        });
+        let mk = time_rate(lower(&bench_regex(20)), &s, TIMED_RUNS, |r, s| {
+            crate::jit_interp::matches(r, s, 3)
+        });
+        // The third row is the one that turns "slower" into a verdict: the same
+        // algorithm with no JIT under it at all.
+        let plain = time_rate(lower(&bench_regex(20)), &s, TIMED_RUNS, |r, s| {
+            crate::interp::matches(r, s)
+        });
+        println!(
+            "[shortcircuit] {TIMED_CHARS} chars, branching: {:.0} chars/s \
+             (min {:.0}, max {:.0})",
+            median(&sc),
+            sc[0],
+            sc[sc.len() - 1],
+        );
+        println!(
+            "[shortcircuit] {TIMED_CHARS} chars, masking  : {:.0} chars/s \
+             (min {:.0}, max {:.0})",
+            median(&mk),
+            mk[0],
+            mk[mk.len() - 1],
+        );
+        println!(
+            "[shortcircuit] {TIMED_CHARS} chars, no JIT    : {:.0} chars/s \
+             (min {:.0}, max {:.0})",
+            median(&plain),
+            plain[0],
+            plain[plain.len() - 1],
+        );
+        println!(
+            "[shortcircuit] masking / branching = {:.0}x, \
+             no-JIT / branching = {:.0}x",
+            median(&mk) / median(&sc),
+            median(&plain) / median(&sc),
+        );
+    }
+
+    const TIMED_CHARS: usize = 1 << 20;
+    const TIMED_RUNS: usize = 5;
+
+    /// chars/s per timed run, ascending. The untimed first pass takes the page
+    /// faults and the cold branch predictors, which are not what a row is about.
+    fn time_rate(
+        root: *mut NodeRec,
+        s: &[u8],
+        runs: usize,
+        run: impl Fn(*mut NodeRec, &[u8]) -> bool,
+    ) -> Vec<f64> {
+        assert!(
+            !run(root, s),
+            "the benchmark input is supposed NOT to match"
+        );
+        let mut rates = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t0 = Instant::now();
+            let hit = run(root, s);
+            let secs = t0.elapsed().as_secs_f64();
+            assert!(!hit, "the benchmark input is supposed NOT to match");
+            rates.push(s.len() as f64 / secs);
+        }
+        rates.sort_by(f64::total_cmp);
+        rates
+    }
+
+    fn median(rates: &[f64]) -> f64 {
+        rates[rates.len() / 2]
+    }
+}

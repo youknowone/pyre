@@ -1629,3 +1629,154 @@ that edge by construction, because a break falls to the same trailing
 expression.
 
 Still open from the plan: "let a matchless portal lower".
+
+## The fourth majit defect: `_forwarded` held a `Weak` (0826, `1e97e4ba14d`)
+
+`Forwarded::Op` / `Forwarded::InputArg` carried a `Weak`, so reaching a
+forwarding target depended on *some other* holder keeping it alive —
+`OptContext`'s `resop_refs`, `phase1_emit_ops` or `new_operations`. A target
+held by none of them was dropped mid-optimization; `get_box_replacement` then
+took its documented "dropped target: terminate at `cur`" early return and
+returned an operand whose own slot was still `Forwarded::Op`, which
+`getnullness` asserts cannot happen:
+
+```text
+chain walker terminal: fw=Op(upgrades=false) resolved_tp=Int
+orig_tp=Int resolved_is_same_as_orig=true
+```
+
+`upgrades=false` with `resolved_is_same_as_orig=true` is the whole diagnosis:
+the arm fires, the target is gone, and the walk made **zero hops**. Get it by
+replacing the `unreachable!` with a panic printing `w.upgrade().is_some()` and
+`resolved.same_box(op)`; neither is visible from the message alone.
+
+Making the dead-`Weak` arms fall through like `Forwarded::None` removes the
+crash and **answers wrong** — `((abc)*|(abcd))(d|e)` on `"abcabcabcd"` gives
+`cold=true warm=false` on dynasm. The drop is the defect; the `unreachable!`
+is its second face.
+
+`resoperation.py set_forwarded` is a plain attribute assignment, and the target
+is also reachable from the trace `operations` list, so upstream's slot is a
+strong reference. The port now is too. No new cycle class: the chain walker
+already loops with no visited set, so a cycle would hang today, and
+`Forwarded::Info(OpInfo)` already carries strong edges. About fifteen comments
+across `optimizeopt/{mod,optimizer,rewrite}.rs` documented those registries as
+forwarding keep-alives; they are producer-lookup and partial-trace stores, and
+are restated rather than deleted.
+
+Reproducing it needs the example, not a reduction. The trigger is an `int_or`
+of two `int_is_true` results reaching `optimize_int_is_true` — in
+`shortcircuit.rs`'s `Repetition` arm, `let inner_mark = (mark != 0) as i64 |
+(n.marked as i64 != 0) as i64;`. A hand-written fixture with the same shape
+(self-recursive `#[jit_inline]` over a tree, a mutable field, a promoted root,
+that `int_or` as the recursive call's argument) does **not** reproduce, because
+the trigger depends on which ops the optimizer eliminates.
+
+So the gate is the invariant, not the route:
+`majit-ir`'s `operand::tests::a_forwarded_target_survives_every_other_reference_being_dropped`
+walks a two-hop chain after dropping every other reference to both targets.
+Under the `Weak` slot it lands back on the head; measured red before, green
+after.
+
+After the fix that spelling compiles and agrees with the interpreter in the
+`Repetition` arm alone, in the `Sequence` arm alone, and in all four arms at
+once, on both backends — so the separately reported dynasm
+`RegisterManager.loc: box IntOp(N) not found` from `consider_binop_j2` is gone
+with it and was never a second defect.
+
+## Why the branching portal never gets a bridge (0826)
+
+The short-circuit A/B's headline is that the branching body fails a guard on
+essentially every character and no bridge is ever built. `MAJIT_BRIDGE_DEBUG=1`
+names every one of the 19 bridge attempts, and they are all the same give-up:
+
+```text
+[bridgeB] multi-frame resume (7 frames) — only the root frame is seedable,
+          giving up on the bridge
+```
+
+13 at 7 frames, 3 at 4, 2 at 6, 1 at 5 — the frame count is the recursion depth
+of the inlined `shift` at the failing guard. `start_bridge_tracing` refuses
+whenever a state-field driver's resume data spans more than one frame, because
+`setup_bridge_sym` can seed the root frame only; a `JitState` with real
+multi-frame support (pyre) is unaffected.
+
+That applies to any `#[jit_interp]` machine whose hot loop calls an inlined
+recursive helper, so the timing row it produces has to be read as "with no
+bridge available", not as the last word on short-circuit operators. Lifting it
+means multi-frame `setup_bridge_sym` for state-field drivers, which is a
+feature and not in this plan.
+
+Two things were wrong in the tally on the way to that answer, and both are
+fixed. The bridge give-ups called `abort_trace` without staging a reason, so
+the `abort_trace` fallback counted every one of them into the
+nothing-was-staged slot — the slot whose whole purpose is to separate the
+unclassified aborts from the bridge give-up that shares `ABORT_BRIDGE`'s
+integer. `compile.py giveup()` raises `SwitchToBlackhole(Counters.ABORT_BRIDGE)`,
+so both sites now stage it, under a named `AbortReason::Bridge` that maps to
+the same integer; the hook payload does not move. The `resume data could not be
+rebuilt` site also had no log line at all, where its sibling had one. Neither
+change has a fixture: they are diagnostic accuracy, with no behavioural
+surface, and the shape that reaches them is the example itself.
+
+## The post's experiments, measured (0826)
+
+Everything below is one machine — Apple M4, 10 cores, macOS 26.5.2, dynasm,
+`--release` — on `(a|b)*a(a|b){20}a(a|b)*` (93 nodes) over a 1,048,576-character
+non-matching input, median of 5. The 1-minute load average is quoted with every
+row because it has to be: the same C++ binary reads 8.3M chars/s at load ~10 and
+2.7M at load ~33, and no row here was taken on an idle machine.
+
+| the post's row | 2010 figure | here | load |
+|---|---:|---:|---:|
+| pure Python | 12,200 | **119,025** | 9.98→7.86 |
+| Google re2 | 550,000 | not installed — `pip install google-re2` | — |
+| RPython → C | 720,000 | Rust `interp.rs`, `rustc -O`: **7,380,362** | 7.7→8.2 |
+| C++ (Fischer) | 750,000 | `clang++ -O2`: **8,475,048** | 9.98 |
+| Java (Trancon y Widemann) | 1,920,000 | no JDK — `brew install --cask temurin` | — |
+| CPython `re` | 2,500,000 | **12,399,816**, and NOT comparable | 7.86→7.55 |
+| RPython + JIT | 16,500,000 | majit JIT: **37,494,169** | 7.7→8.2 |
+
+The two independently-compiled ports of the same algorithm land within 15% of
+each other (C++ 8.48M, Rust 7.38M), which is the check that neither optimizer
+deleted the walk. The harness also runs the node-count control on both: `n = 2`
+(21 nodes) over `n = 20` (93) gives 5.00x for C++ and 4.38x for Python against
+the ideal 93/21 = 4.4x, so the tree walk really is inside the timed loop.
+
+**JIT over the same matcher compiled ahead of time: 5.1x.** The post's own
+comparable quantity is 16,500,000 / 720,000 = 22.9x. Ours divides by a matcher
+`rustc -O` had already optimized well; the absolute rows are sixteen years and
+two instruction sets apart and only the ratios travel.
+
+The `re` row is a caveat, not a ratio: `re` is a backtracking engine doing an
+unmeasured multiple of the work per character. What `comparisons/` does
+establish about it is that it is linear in the input on this pattern
+(`rate_flatness` 1.16 over a 32x length sweep, where an engine bailing after a
+bounded prefix would show 32x) and that it reads the final byte
+(`reaches_last_char`), which is why the row is kept at all rather than thrown
+out.
+
+The two missing rows both need an install, which is the user's call:
+`pip install google-re2` and `brew install --cask temurin`. `Marked.java` is
+written and `run.sh` gates it on the same cross-port `--verify` line as every
+other row, so the first run proves it rather than trusting it — but it has
+never been through a compiler, and no Java number should be quoted until it has.
+
+The post's other experiments:
+
+* **The trace itself.** `(a|b)*`, four nodes, is the listing the post prints in
+  full, and `jit_interp::tests::the_four_node_tree_reproduces_the_posts_listing`
+  asserts our peeled body against it as an ordered sequence, not a census: 15
+  ops, same ops in the same order, on both backends. Ours is that listing minus
+  two reads — the repetition's mark, which the preamble reads once and the back
+  edge then carries in a register, and `len(s0)`, a red state field and so a
+  loop argument. 0 `getfield_gc_r`, 0 `getfield_gc_i`, 0 `guard_value`.
+* **Varying lengths.** 4,096 / 65,536 / 1,048,576, and the JIT row is *not* a
+  per-character rate across them: 1,822,199 → 19,916,228 → 37,494,169, a 20.6x
+  spread, with `1.0 loops compiled per run` at every length. `matches` builds
+  its `JitDriver` inside `mainloop`, so every call records and compiles again;
+  read the short row as matcher-plus-compiler and the long one as the compiled
+  loop's own.
+* **`&&`/`||` instead of `&`/`|`.** Measured, and the post's claim holds by a
+  different mechanism than it states — see the module doc of `shortcircuit.rs`
+  and the bridge section above.
