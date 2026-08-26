@@ -15331,19 +15331,19 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         }
         // `memoryview` — `memoryobject.py descr_iter` returns
         // `space.newseqiter(self)`; the cursor fetches each element through
-        // `__getitem__`.  Element count is `shape[0]` == length / itemsize.
+        // `__getitem__`.  Element count is `memory_length`'s `shape[0]`, which
+        // is `length / itemsize` only while the view is one-dimensional.
         if pyre_object::memoryview::is_w_memoryview(obj) {
             if pyre_object::memoryview::w_memoryview_released(obj) {
                 return Err(PyError::value_error(
                     "operation forbidden on released memoryview object",
                 ));
             }
-            let itemsize = pyre_object::memoryview::w_memoryview_itemsize(obj);
-            let len = if itemsize > 0 {
-                (pyre_object::memoryview::w_memoryview_length(obj) / itemsize) as usize
-            } else {
-                0
-            };
+            let len = pyre_object::memoryview::w_memoryview_native_shape(obj)
+                .first()
+                .copied()
+                .unwrap_or(0)
+                .max(0) as usize;
             return Ok(pyre_object::w_seq_iter_new(obj, len));
         }
         // pypy/objspace/descroperation.py `def iter(space, w_obj)`

@@ -1217,8 +1217,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 ));
             }
             let itemsize = w_memoryview_itemsize(mv);
-            let length = w_memoryview_length(mv);
-            let mut i = getindex_w(index)?;
+            let i = getindex_w(index)?;
             // memoryobject.py `descr_getitem`: `_decode_index` may invoke a
             // user `__index__` which releases the view.
             memoryview_check_released(mv)?;
@@ -1227,14 +1226,9 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "multi-dimensional sub-views are not implemented",
                 ));
             }
-            let count = if itemsize > 0 { length / itemsize } else { 0 };
-            if i < 0 {
-                i += count;
-            }
-            if i < 0 || i >= count {
-                return Err(crate::PyError::index_error("index out of bounds"));
-            }
-            let base = (w_memoryview_offset(mv) + i * w_memoryview_stride0(mv)) as usize;
+            // `ptr_from_index` -> `lookup_dimension`: the bound is `shape[0]`,
+            // not `length / itemsize`, and the step is `strides[0]`.
+            let base = (w_memoryview_offset(mv) + memoryview_get_offset(mv, 0, i)?) as usize;
             let full = w_memoryview_view(mv).backing().as_bytes();
             let fmt = w_memoryview_format_str(mv);
             return Ok(memoryview_unpack_element(
@@ -1306,11 +1300,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let itemsize = w_memoryview_itemsize(mv);
         let isz = itemsize.max(0) as usize;
         let fmt = w_memoryview_format_str(mv).to_owned();
-        let count = if itemsize > 0 {
-            w_memoryview_length(mv) / itemsize
-        } else {
-            0
-        };
+        let count = w_memoryview_native_shape(mv).first().copied().unwrap_or(0);
         let stride0 = w_memoryview_stride0(mv);
         let offset = w_memoryview_offset(mv);
         // Slice assignment writes the rvalue's element bytes through to the
@@ -1398,17 +1388,12 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 "memoryview: invalid slice key, must be int or slice",
             ));
         }
-        let mut i = getindex_w(index)?;
-        if i < 0 {
-            i += count;
-        }
-        if i < 0 || i >= count {
-            return Err(crate::PyError::index_error("index out of bounds"));
-        }
+        let i = getindex_w(index)?;
+        let item_offset = memoryview_get_offset(mv, 0, i)?;
         let packed = memoryview_pack_value(&fmt, isz, value)?;
         // Re-check release after value coercion (see tuple path above).
         memoryview_check_released(mv)?;
-        let addr = (offset + i * stride0) as usize;
+        let addr = (offset + item_offset) as usize;
         let full = w_memoryview_view(mv)
             .backing()
             .as_bytes_mut()
@@ -1753,9 +1738,9 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 .collect::<Result<_, _>>()?;
             let ndim = dims.len() as i64;
             if ndim > 64 {
-                return Err(crate::PyError::value_error(format!(
-                    "memoryview: number of dimensions must not exceed {ndim}"
-                )));
+                return Err(crate::PyError::value_error(
+                    "memoryview: number of dimensions must not exceed 64",
+                ));
             }
             if ndim > 1 && orig_ndim != 1 {
                 return Err(crate::PyError::type_error(
@@ -2398,7 +2383,12 @@ pub(crate) fn memoryview_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 
 /// `_IsCContiguous` — C order has the last (fastest) dimension's stride
 /// equal to `itemsize`, growing by the dimension sizes toward the front.
-fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+    // `len == 0` holds exactly when some extent is zero, and such a view is
+    // contiguous in both orders whatever its strides say.
+    if length == 0 {
+        return true;
+    }
     let ndim = shape.len();
     if ndim == 0 {
         return true;
@@ -2408,10 +2398,8 @@ fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> 
     }
     let mut sd = itemsize;
     for i in (0..ndim).rev() {
-        if shape[i] == 0 {
-            return true;
-        }
-        if strides[i] != sd {
+        // A dimension of one element imposes no step, so its stride is free.
+        if shape[i] > 1 && strides[i] != sd {
             return false;
         }
         sd *= shape[i];
@@ -2421,7 +2409,10 @@ fn memoryview_is_c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> 
 
 /// `_IsFortranContiguous` — Fortran order has the first (fastest)
 /// dimension's stride equal to `itemsize`, growing toward the back.
-fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+    if length == 0 {
+        return true;
+    }
     let ndim = shape.len();
     if ndim == 0 {
         return true;
@@ -2431,10 +2422,7 @@ fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> 
     }
     let mut sd = itemsize;
     for i in 0..ndim {
-        if shape[i] == 0 {
-            return true;
-        }
-        if strides[i] != sd {
+        if shape[i] > 1 && strides[i] != sd {
             return false;
         }
         sd *= shape[i];
@@ -2452,11 +2440,12 @@ pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
             return (true, true);
         }
         let itemsize = w_memoryview_itemsize(mv);
+        let length = w_memoryview_length(mv);
         let shape = w_memoryview_native_shape(mv);
         let strides = w_memoryview_native_strides(mv);
         (
-            memoryview_is_c_contiguous(&shape, &strides, itemsize),
-            memoryview_is_f_contiguous(&shape, &strides, itemsize),
+            memoryview_is_c_contiguous(&shape, &strides, itemsize, length),
+            memoryview_is_f_contiguous(&shape, &strides, itemsize, length),
         )
     }
 }

@@ -442,7 +442,13 @@ impl BufferView {
         unsafe {
             match self {
                 BufferView::Simple { length, .. } | BufferView::Raw { length, .. } => *length,
-                BufferView::Slice { parent, length, .. } => *length * parent.itemsize(),
+                // `init_len` — `product(shape) * itemsize`, so a slice of an
+                // N-dimensional parent keeps the trailing extents.  `length`
+                // is `shape[0]` alone (`BufferSlice.getlength`), which
+                // under-reports by their product.
+                BufferView::Slice { parent, .. } => {
+                    self.native_shape().iter().product::<i64>() * parent.itemsize()
+                }
                 BufferView::View1D { parent, .. } => parent.length(),
                 BufferView::ViewND {
                     parent, w_shape, ..
@@ -752,6 +758,40 @@ mod tests {
         unsafe {
             assert_eq!(s2.offset(), 2);
             assert_eq!(s2.native_strides(), vec![2]);
+        }
+    }
+
+    #[test]
+    fn slice_of_an_nd_view_reports_product_shape_nbytes() {
+        // `init_len` is `product(shape) * itemsize`, so a dimension-0 slice
+        // of an N-dimensional view keeps the trailing extents; reporting
+        // `shape[0]` alone under-reports by their product.
+        let exporter = crate::bytesobject::w_bytes_from_bytes(&[0u8; 10]);
+        let flat = BufferView::Simple {
+            backing: Buffer::String { w_obj: exporter },
+            w_obj: exporter,
+            length: 10,
+        };
+        let dims = |extents: [i64; 2]| {
+            crate::tupleobject::w_tuple_new(
+                extents
+                    .iter()
+                    .map(|&extent| crate::intobject::w_int_new(extent))
+                    .collect(),
+            )
+        };
+        let nd = BufferView::ViewND {
+            parent: Box::new(flat),
+            w_obj: exporter,
+            ndim: 2,
+            w_shape: dims([2, 5]),
+            w_strides: dims([5, 1]),
+        };
+        let s = unsafe { nd.new_slice(0, 2, 1) };
+        unsafe {
+            assert_eq!(s.native_shape(), vec![1, 5]);
+            assert_eq!(s.native_strides(), vec![10, 1]);
+            assert_eq!(s.length(), 5);
         }
     }
 

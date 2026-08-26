@@ -147,7 +147,12 @@ fn dims(pointer: *const isize, ndim: i64, derived: &[i64]) -> Vec<i64> {
 }
 
 /// `_IsCContiguous`.
-fn c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+fn c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+    // `len == 0` holds exactly when some extent is zero; such a view is
+    // contiguous in both orders whatever its strides say.
+    if length == 0 {
+        return true;
+    }
     let mut expected = itemsize;
     for (&extent, &stride) in shape.iter().zip(strides).rev() {
         if extent > 1 && stride != expected {
@@ -159,7 +164,10 @@ fn c_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
 }
 
 /// `_IsFortranContiguous`.
-fn fortran_contiguous(shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+fn fortran_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, length: i64) -> bool {
+    if length == 0 {
+        return true;
+    }
     let mut expected = itemsize;
     for (&extent, &stride) in shape.iter().zip(strides) {
         if extent > 1 && stride != expected {
@@ -256,7 +264,7 @@ fn acquire(
     if unsafe { !(*view).suboffsets.is_null() } {
         return refuse("cpyext: a buffer export with suboffsets is not supported");
     }
-    if ndim > 1 && !c_contiguous(&shape, &strides, itemsize) {
+    if ndim > 1 && !c_contiguous(&shape, &strides, itemsize, length) {
         return refuse("cpyext: a multi-dimensional buffer export must be C-contiguous");
     }
     if ndim == 1 && strides.first() != Some(&itemsize) {
@@ -736,18 +744,25 @@ pub unsafe extern "C" fn PyBuffer_IsContiguous(view: *const CPyBuffer, order: c_
     let elements = if itemsize > 0 { length / itemsize } else { 0 };
     let shape = dims(unsafe { (*view).shape }, ndim, &[elements]);
     let strides = dims(unsafe { (*view).strides }, ndim, &[itemsize]);
-    contiguous_in(order, &shape, &strides, itemsize) as c_int
+    contiguous_in(order, &shape, &strides, itemsize, length) as c_int
 }
 
 /// Whether the geometry is contiguous in `order`, which is `'C'`, `'F'`ortran
 /// or `'A'`ny of the two.  An order that is none of those is not contiguous:
 /// the entry points that reject one do so before asking.
-fn contiguous_in(order: c_char, shape: &[i64], strides: &[i64], itemsize: i64) -> bool {
+fn contiguous_in(
+    order: c_char,
+    shape: &[i64],
+    strides: &[i64],
+    itemsize: i64,
+    length: i64,
+) -> bool {
     match order as u8 {
-        b'C' => c_contiguous(shape, strides, itemsize),
-        b'F' => fortran_contiguous(shape, strides, itemsize),
+        b'C' => c_contiguous(shape, strides, itemsize, length),
+        b'F' => fortran_contiguous(shape, strides, itemsize, length),
         b'A' => {
-            c_contiguous(shape, strides, itemsize) || fortran_contiguous(shape, strides, itemsize)
+            c_contiguous(shape, strides, itemsize, length)
+                || fortran_contiguous(shape, strides, itemsize, length)
         }
         _ => false,
     }
@@ -1171,7 +1186,9 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     }
     let shape = unsafe { view.native_shape() };
     let strides = unsafe { view.native_strides() };
-    let laid_out = contiguous_in(order, &shape, &strides, view.itemsize());
+    let laid_out = contiguous_in(order, &shape, &strides, view.itemsize(), unsafe {
+        view.length()
+    });
     if laid_out {
         return pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(slot));
     }
