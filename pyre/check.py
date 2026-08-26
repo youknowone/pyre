@@ -88,7 +88,22 @@ def _resolve_python3():
     )
 
 
-PYTHON3 = _resolve_python3()
+_PYTHON3 = None
+
+
+def python3():
+    """The oracle interpreter, resolved once and remembered.
+
+    Resolved on first use rather than at import, because `_resolve_python3`
+    exits the process when no CPython 3.14 is on PATH -- and `--check-headers`
+    reads fixture files, never runs an oracle, and runs on a job that has no
+    reason to carry one.
+    """
+    global _PYTHON3
+    if _PYTHON3 is None:
+        _PYTHON3 = _resolve_python3()
+    return _PYTHON3
+
 PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
     "pypy3" if shutil.which("pypy3") else "pypy"
 )
@@ -111,7 +126,7 @@ def _detect_pyre_stdlib():
         return str(intree)
     try:
         proc = subprocess.run(
-            [PYTHON3, "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
+            [python3(), "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -122,7 +137,20 @@ def _detect_pyre_stdlib():
     return path if path and os.path.isdir(path) else None
 
 
-PYRE_STDLIB = _detect_pyre_stdlib()
+_UNSET = object()
+_PYRE_STDLIB = _UNSET
+
+
+def pyre_stdlib():
+    """[`_detect_pyre_stdlib`]'s answer, computed once and remembered.
+
+    Deferred with [`python3`]: the out-of-tree fallback spawns the oracle.
+    """
+    global _PYRE_STDLIB
+    if _PYRE_STDLIB is _UNSET:
+        _PYRE_STDLIB = _detect_pyre_stdlib()
+    return _PYRE_STDLIB
+
 
 # Which wasm runtime the `pyre-wasm-runner` uses (`--wasm-engine`). wasmtime
 # (cranelift) is fast in steady state but recompiles the ~14MB module on every
@@ -896,7 +924,7 @@ def pyre_env():
     # `pyre_set_launch_env`.
     #
     # Only pyre is pinned this way. The oracles are spawned with the inherited
-    # environment (`run_timed([PYTHON3, script])`), so they keep writing and
+    # environment (`run_timed([python3(), script])`), so they keep writing and
     # reading their own caches and import warm from their first run onward,
     # while pyre now imports cold on every run. Startup subtraction covers the
     # imports an empty program performs, not the ones a fixture adds on top, so
@@ -908,8 +936,9 @@ def pyre_env():
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
-    if PYRE_STDLIB and "PYRE_STDLIB" not in env:
-        env["PYRE_STDLIB"] = PYRE_STDLIB
+    stdlib = pyre_stdlib()
+    if stdlib and "PYRE_STDLIB" not in env:
+        env["PYRE_STDLIB"] = stdlib
     # Point the wasm runner at the built module by absolute path so it resolves
     # regardless of the child's working directory (ignored by other backends).
     if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
@@ -3064,7 +3093,7 @@ class Check:
             empty_path = handle.name  # zero-length program
         try:
             targets = [
-                ("cpython", [PYTHON3, empty_path], None),
+                ("cpython", [python3(), empty_path], None),
                 ("pypy", [PYPY3, empty_path], None),
             ]
             for backend in ALL_BACKENDS:
@@ -3686,7 +3715,7 @@ class Check:
     def warmup(self, script):
         sys.stdout.write(f"  {'warmup':<10s}")
         sys.stdout.flush()
-        for runner in [PYTHON3, PYPY3]:
+        for runner in [python3(), PYPY3]:
             try:
                 subprocess.run(
                     [runner, script],
@@ -4084,7 +4113,7 @@ class Check:
         if vs_cpython and t_cpython not in (None, "-"):
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
-                [PYTHON3, script], pypy_output, "cpython",
+                [python3(), script], pypy_output, "cpython",
             )
             if not passed:
                 detail = self._gate_fail_detail(
@@ -4294,7 +4323,7 @@ class Check:
         if need_cpython:
             sys.stdout.write(f"    {'cpython':<10s}")
             sys.stdout.flush()
-            cpython_output, t_cpu, cpython_code, _ = run_timed([PYTHON3, script])
+            cpython_output, t_cpu, cpython_code, _ = run_timed([python3(), script])
             t_cpython = t_cpu
             if cpython_code != 0:
                 print(f"{red('CRASH')} (exit {cpython_code})")
@@ -4490,7 +4519,7 @@ class Check:
         sys.stdout.flush()
         output, elapsed, code, stderr = run_timed(
             [
-                PYTHON3, str(Path(__file__).parent / "cpython_tests" / "run.py"),
+                python3(), str(Path(__file__).parent / "cpython_tests" / "run.py"),
                 "--binary", str(self._pyre(backend)),
                 "--baseline", str(CPYTHON_SUITE_BASELINE),
                 "--jobs", str(max(1, (os.cpu_count() or 4) - 1)),
@@ -4624,7 +4653,7 @@ class Check:
             self.cpython_declared_skips.append(name)
         else:
             cpython_output, cpython_time, cpython_code, _ = run_timed(
-                [PYTHON3, path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
+                [python3(), path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
             )
             if cpython_code == 124:
                 # Not a crash: the fixture is sized for the JITs and cpython is
