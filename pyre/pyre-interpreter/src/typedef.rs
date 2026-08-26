@@ -8152,17 +8152,8 @@ fn init_frame_type(ns: PyObjectRef) {
     }
 
     // f_code — read-only; the `PyCode` wrapper (pyframe.py fget_code).
-    let code_getter = make_builtin_function_with_arity(
-        "f_code",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(unsafe { &*f }.fget_f_code())
-        },
-        2,
-    );
+    let code_getter =
+        make_builtin_function_with_arity("f_code", crate::pyframe::descr_typecheck_fget_f_code, 2);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -8174,18 +8165,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_globals — read-only (pyframe.py fget_w_globals).
     let globals_getter = make_builtin_function_with_arity(
         "f_globals",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let w = unsafe { &*f }.get_w_globals();
-            Ok(if w.is_null() {
-                pyre_object::w_none()
-            } else {
-                w
-            })
-        },
+        crate::pyframe::descr_typecheck_get_w_globals,
         2,
     );
     unsafe {
@@ -8220,25 +8200,8 @@ fn init_frame_type(ns: PyObjectRef) {
     };
 
     // f_back — read-only; the next non-hidden frame (pyframe.py:767).
-    let back_getter = make_builtin_function_with_arity(
-        "f_back",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let back = unsafe { &*f }.fget_f_back();
-            Ok(if back.is_null() {
-                pyre_object::w_none()
-            } else {
-                // Exposing the frame to app level: mark escaped so the JIT
-                // materialises it (pyframe.py:176), mirroring `_getframe`.
-                unsafe { (*back).mark_as_escaped() };
-                back as pyre_object::PyObjectRef
-            })
-        },
-        2,
-    );
+    let back_getter =
+        make_builtin_function_with_arity("f_back", crate::pyframe::descr_typecheck_fget_f_back, 2);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -8253,18 +8216,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // internally through get_generator(); surface that exact backlink.
     let generator_getter = make_builtin_function_with_arity(
         "f_generator",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let owner = unsafe { &*f }.get_generator();
-            Ok(if owner.is_null() {
-                pyre_object::w_none()
-            } else {
-                owner
-            })
-        },
+        crate::pyframe::descr_typecheck_get_generator,
         2,
     );
     unsafe {
@@ -8275,86 +8227,12 @@ fn init_frame_type(ns: PyObjectRef) {
         )
     };
 
-    // f_lasti — read-only bytecode offset (pyframe.py:770).
-    //
-    // pyre stores `last_instr` as an instruction-unit index (increments
-    // by 1 per instruction); CPython's `f_lasti` is a byte offset
-    // (2 bytes per code unit).  Report the byte-offset form (× 2) so
-    // `dis` / `code.co_positions()` consumers that do `f_lasti // 2`
-    // recover the right instruction — the same adaptation `tb_lasti`
-    // uses (`typedef.rs` tb_lasti getter).
-    //
-    // A negative `last_instr` means the frame has not run an instruction, and
-    // that is not a coordinate this getter can hand out: `frame_lasti_get_impl`
-    // turns only a negative `_PyInterpreterFrame_LASTI` into `-1`, and the
-    // pointer is not negative there.  Frame setup consumes the
-    // compiler-inserted prologue, so the pointer rests on the first `RESUME`
-    // -- `code->_co_firsttraceable` -- which is what the `call` event reports:
-    // 0 for a plain function, 2 past a closure's `COPY_FREE_VARS`, 4 past a
-    // generator's `RETURN_GENERATOR` / `POP_TOP`.  Handing out `-1` instead
-    // named a coordinate no frame ever executes.  `pyframe.py fget_f_lasti`
-    // returns `last_instr` unscaled and stops there, so both adaptations live
-    // here rather than in [`PyFrame::fget_f_lasti`].
-    //
-    // A generator is the one shape whose not-yet-started frame rests somewhere
-    // else: `RETURN_GENERATOR` is what built the generator, so the frame it
-    // left behind sits on the instruction after it until the first resumption
-    // walks on to the `RESUME`.  Only the generator's own started flag
-    // separates the two, and the frame is reachable from Python in both states
-    // through `gi_frame`.
-    //
-    // That flag is read through the back-reference, which is cleared when the
-    // generator is collected (`generator_finalize`) and when a generator that
-    // never ran finishes.  A frame that outlives its generator therefore
-    // cannot say which of the two it rests on, and the sentinel stands: the
-    // `RESUME` would be the coordinate for a frame still at its `call` event,
-    // which this one is not.
-    //
-    // The flag alone does not separate a first `send` from a first `throw`,
-    // which marks the generator started and then injects before the `RESUME`
-    // is reached -- that frame is still on the instruction after
-    // `RETURN_GENERATOR`.  Nothing reads it there: the trace events that
-    // would are not emitted for an injection into a generator that never ran,
-    // and the frame is unlinked by the time the call returns.  Whatever
-    // starts emitting them owns that distinction.
-    //
-    // `-1` is left for a code object with no `RESUME` too, where that index
-    // runs past the end and the frame starts no line either.
+    // f_lasti — read-only bytecode offset (pyframe.py:770).  Both
+    // adaptations live on the wrapper; see
+    // [`crate::pyframe::descr_typecheck_fget_f_lasti`].
     let lasti_getter = make_builtin_function_with_arity(
         "f_lasti",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let frame = unsafe { &*f };
-            let lasti = frame.fget_f_lasti();
-            let lasti = if lasti < 0 {
-                let code = frame.code();
-                let owner = frame.get_generator();
-                let index = match crate::pycode::after_return_generator_index(code) {
-                    Some(after_return_generator) => (!owner.is_null()).then(|| {
-                        if unsafe { pyre_object::generator::w_generator_is_started(owner) } {
-                            crate::pycode::first_traceable_index(code)
-                        } else {
-                            after_return_generator
-                        }
-                    }),
-                    None => Some(crate::pycode::first_traceable_index(code)),
-                };
-                match index {
-                    Some(index) if index < code.instructions.len() => index as i64,
-                    _ => -1,
-                }
-            } else {
-                lasti as i64
-            };
-            Ok(pyre_object::w_int_new(if lasti < 0 {
-                -1
-            } else {
-                lasti * 2
-            }))
-        },
+        crate::pyframe::descr_typecheck_fget_f_lasti,
         2,
     );
     unsafe {
@@ -8368,18 +8246,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_builtins — read-only builtin dict (pyframe.py:761).
     let builtins_getter = make_builtin_function_with_arity(
         "f_builtins",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let w = unsafe { &*f }.fget_f_builtins();
-            Ok(if w.is_null() {
-                pyre_object::w_none()
-            } else {
-                w
-            })
-        },
+        crate::pyframe::descr_typecheck_fget_f_builtins,
         2,
     );
     unsafe {
@@ -8397,29 +8264,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // target (only permitted from within a trace function).
     let lineno_getter = make_builtin_function_with_arity(
         "f_lineno",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(unsafe { &*f }.fget_f_lineno())
-        },
+        crate::pyframe::descr_typecheck_fget_f_lineno,
         2,
     );
     let lineno_setter = make_builtin_function_with_arity(
         "f_lineno",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // `int_w` reaches `__index__`, which is application-level Python.
-            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-            let new_lineno = crate::baseobjspace::int_w(args[2])
-                .map_err(|_| crate::PyError::value_error("lineno must be an integer"))?;
-            unsafe { &mut *anchor.live() }.fset_f_lineno(new_lineno as isize)?;
-            Ok(pyre_object::w_none())
-        },
+        crate::pyframe::descr_typecheck_fset_f_lineno,
         3,
     );
     unsafe {
@@ -8438,40 +8288,17 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace — read/write/delete (pyframe.py:773-785).
     let trace_getter = make_builtin_function_with_arity(
         "f_trace",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let w = unsafe { &*f }.fget_f_trace();
-            Ok(if w.is_null() {
-                pyre_object::w_none()
-            } else {
-                w
-            })
-        },
+        crate::pyframe::descr_typecheck_fget_f_trace,
         2,
     );
     let trace_setter = make_builtin_function_with_arity(
         "f_trace",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if !f.is_null() {
-                unsafe { &mut *f }.fset_f_trace(args[2]);
-            }
-            Ok(pyre_object::w_none())
-        },
+        crate::pyframe::descr_typecheck_fset_f_trace,
         3,
     );
     let trace_deleter = make_builtin_function_with_arity(
         "f_trace",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if !f.is_null() {
-                unsafe { &mut *f }.fdel_f_trace();
-            }
-            Ok(pyre_object::w_none())
-        },
+        crate::pyframe::descr_typecheck_fdel_f_trace,
         2,
     );
     unsafe {
@@ -8485,29 +8312,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace_lines — read/write bool (pyframe.py:787-791).
     let trace_lines_getter = make_builtin_function_with_arity(
         "f_trace_lines",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(pyre_object::w_bool_from(
-                unsafe { &*f }.fget_f_trace_lines(),
-            ))
-        },
+        crate::pyframe::descr_typecheck_fget_f_trace_lines,
         2,
     );
     let trace_lines_setter = make_builtin_function_with_arity(
         "f_trace_lines",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if !f.is_null() {
-                // `is_true` reaches `__bool__` / `__len__`.
-                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-                let v = crate::baseobjspace::is_true(args[2])?;
-                unsafe { &mut *anchor.live() }.fset_f_trace_lines(v);
-            }
-            Ok(pyre_object::w_none())
-        },
+        crate::pyframe::descr_typecheck_fset_f_trace_lines,
         3,
     );
     unsafe {
@@ -8526,29 +8336,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace_opcodes — read/write bool (pyframe.py:793-797).
     let trace_opcodes_getter = make_builtin_function_with_arity(
         "f_trace_opcodes",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(pyre_object::w_bool_from(
-                unsafe { &*f }.fget_f_trace_opcodes(),
-            ))
-        },
+        crate::pyframe::descr_typecheck_fget_f_trace_opcodes,
         2,
     );
     let trace_opcodes_setter = make_builtin_function_with_arity(
         "f_trace_opcodes",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if !f.is_null() {
-                // `is_true` reaches `__bool__` / `__len__`.
-                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-                let v = crate::baseobjspace::is_true(args[2])?;
-                unsafe { &mut *anchor.live() }.fset_f_trace_opcodes(v);
-            }
-            Ok(pyre_object::w_none())
-        },
+        crate::pyframe::descr_typecheck_fset_f_trace_opcodes,
         3,
     );
     unsafe {
