@@ -1415,11 +1415,18 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             true => pyre_object::w_tuple_new(vec![]),
             false => index,
         };
+        // Once `...` has become the empty tuple, that tuple is the only key a
+        // zero-dimensional view accepts.
+        if w_memoryview_ndim(mv) == 0
+            && !(pyre_object::is_tuple(index) && pyre_object::w_tuple_len(index) == 0)
+        {
+            return Err(crate::PyError::type_error(
+                "invalid indexing of 0-dim memory",
+            ));
+        }
         let count = w_memoryview_native_shape(mv).first().copied().unwrap_or(0);
-        let stride0 = w_memoryview_stride0(mv);
-        let offset = w_memoryview_offset(mv);
-        // Slice assignment writes the rvalue's element bytes through to the
-        // strided positions of the view (`_setitem_slice`).
+        // Slice assignment copies an exporter's elements into the strided
+        // positions the slice names (`copy_single`).
         if pyre_object::is_slice(index) {
             if w_memoryview_ndim(mv) != 1 {
                 return Err(crate::PyError::not_implemented(
