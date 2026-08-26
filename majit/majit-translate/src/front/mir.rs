@@ -16120,7 +16120,12 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// names come from the Charon body locals, falling back to `arg{N}`.
 /// A return type `residual_return_shell` declines surfaces no entry,
 /// preserving the original "not registered" Skip for that fn.
-pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
+///
+/// `pub` so `test_cel_census`'s registration classifier can ask this
+/// collector which paths the stub channel holds instead of mirroring the
+/// accept filters below — a mirror that drifts labels a declined fn
+/// registered, which is the one direction that hides residue.
+pub fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
     Vec<String>,
