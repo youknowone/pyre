@@ -694,9 +694,17 @@ pub(crate) fn write_stack_slot(
         // graceful trace abort: the trace is discarded before any code is
         // installed, so the guard resolves through the interpreter instead of
         // crashing the process (mirrors the cross-frame snapshot-gap abort).
+        //
+        // The bound is `len - 1`, not `len`: the last shadow slot is the
+        // virtualizable identity (`virtualizable_boxes[-1]`), the box
+        // `_nonstandard_virtualizable` compares every later vable op against.
+        // One slot past `co_stacksize` lands exactly there, and a store that
+        // reaches it renames the standard virtualizable rather than corrupting
+        // one value — the compiled trace then writes frame fields into
+        // whatever object the push carried.
         if ctx
             .virtualizable_boxes_len()
-            .is_some_and(|len| flat_idx >= len)
+            .is_some_and(|len| flat_idx + 1 >= len)
         {
             crate::state::request_trace_abort();
             return;
@@ -820,6 +828,17 @@ pub(crate) fn swap_stack_slots(
     if sym.owns_virtualizable_shadow() {
         let flat_top = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_top;
         let flat_other = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_other;
+        // Same `len - 1` bound `write_stack_slot` takes, and for the same
+        // reason: the trailing shadow slot is the virtualizable identity, so a
+        // swap that reaches it would hand the standard-virtualizable box to a
+        // stack slot and a stack value to `virtualizable_boxes[-1]`.
+        if ctx
+            .virtualizable_boxes_len()
+            .is_some_and(|len| flat_top + 1 >= len || flat_other + 1 >= len)
+        {
+            crate::state::request_trace_abort();
+            return;
+        }
         if let (Some((op_top, val_top)), Some((op_other, val_other))) = (
             ctx.virtualizable_entry_at(flat_top),
             ctx.virtualizable_entry_at(flat_other),

@@ -239,7 +239,7 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -257,7 +257,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_FBW_STRICT_DIAG`,
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
-`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
+`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
+`PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
 `PYRE_LOOP_CENSUS`,
@@ -284,6 +285,15 @@ instead of declining before the descent starts. Same shape and same reason as
 `PYRE_WALKABORT_OFF`: the scan decides whether a descent happens at all and its
 cost is invisible in output, so weighing the conservatism against its price
 needs one binary and one variable. It retires when the scan does.
+
+`PYRE_GC_SIZE_AUDIT` makes `finish_alloc_in_oldgen` panic, with a captured
+backtrace, when the block it just carved is smaller than the declared size of
+the type its header names. It is the discriminator between a header stamped
+wrong at allocation and a genuine use-after-free: the collector's own
+`GC BUG` panics fire a whole major later and name the freed object, not the
+site that mis-sized it. Varsize and unregistered type ids are skipped, so it
+answers only where the declared size is authoritative. It retires if the
+check becomes unconditional.
 
 `PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`
 example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`

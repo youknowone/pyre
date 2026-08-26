@@ -8557,19 +8557,26 @@ fn eval_with_jit_inner(
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
-    frame_root.frame().fix_array_ptrs();
-    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
-    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-
     // During bridge tracing, concrete force-helper calls use the plain
     // interpreter so they cannot recursively enter warmstate or corrupt the
     // bridge trace's symbolic state.
+    //
+    // Declines before `install_current_frame`, like every decline above it.
+    // Both that helper and `ExecutionContext::enter` link the frame into the
+    // `topframeref`/`f_backref` chain, and `execute_frame_plain` reaches
+    // `enter` through `eval_frame_plain_with_resume`.  Linking twice makes the
+    // second `enter` read the `topframeref` the first one just set to this
+    // same frame, so `f_backref` ends up naming the frame itself and
+    // `walk_pyframe_roots` — which has no cycle guard — never terminates.
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
+    frame_root.frame().fix_array_ptrs();
+    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
 
     // A resumed frame reaches the portal already positioned mid-body, so its
     // payload has to be consumed before the merge point is consulted: the

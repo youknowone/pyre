@@ -1484,6 +1484,57 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
     false
 }
 
+/// Whether releasing this binding leaves the collection that would follow with
+/// no finalizer to deliver — and so whether that whole-heap mark-and-sweep can
+/// be skipped without moving where any `__del__` runs.
+///
+/// `release_frees_nothing` answers first: a value the release removes nothing
+/// from the reachable set can obviously deliver nothing. Past it two questions
+/// remain, and both are `O(1)` where the collection is `O(heap)`:
+///
+/// * Does the collector still owe *any* delivery? `deal_with_objects_with_
+///   finalizers` is the only pass that hands control back to the program, and
+///   with its queues empty a sweep can free memory but cannot run a line of
+///   Python. Re-asked per name because a `__del__` this loop runs can register
+///   one (`test_start_new_thread_at_finalization`'s starts a thread).
+/// * Is *this* object one it owes? `flags::FINALIZER_REGISTERED` is set by
+///   `allocate_instance` for every instance of a `hasuserdel` class and by
+///   `_io`, coroutine and weakref-lifeline construction for objects whose type
+///   carries no such flag, so it is the whole of PyPy's `hasuserdel` test and
+///   more.
+///
+/// The second is where this stops being exact, and deliberately: releasing a
+/// *container* of a finalizable — `holder = [AtFinalization()]` — frees one
+/// that no `O(1)` test on `holder` can see, and its `__del__` then runs at the
+/// walk's trailing collection instead of at its own name, reading `None` for
+/// the `__main__` globals released after it rather than their values. It still
+/// runs. Buying that case back costs a whole-heap mark-and-sweep per name, and
+/// a namespace binds one per function, class and import: releasing `inspect`'s
+/// 182 names as `__main__` was 1.5s of `pyre -m inspect`'s 1.9s against pypy3's
+/// 0.09s total, and `test.test_inspect` pays it four times over in
+/// subprocesses. PyPy itself neither clears `__main__` nor collects here
+/// (`baseobjspace.py finish`), so nothing upstream prices that case higher.
+fn release_delivers_no_finalizer(value: pyre_object::PyObjectRef) -> bool {
+    release_frees_nothing(value)
+        || !majit_gc::gc_has_pending_finalizers()
+        || !majit_gc::gc_object_finalizer_pending(value as usize)
+}
+
+/// `PYRE_GC_DIAG`: how many `__main__` bindings the release walk let go, and
+/// how many of them it collected after. `swept` is the count
+/// [`release_delivers_no_finalizer`] exists to keep near zero; a run where it
+/// tracks `released` is one where the walk is back to a mark-and-sweep per name.
+fn teardown_census(released: usize, swept: usize) {
+    if std::env::var_os("PYRE_GC_DIAG").is_none() {
+        return;
+    }
+    let registered = majit_gc::gc_registered_finalizer_count();
+    eprintln!(
+        "[jit-gc-diag] teardown_released={released} teardown_swept={swept} \
+         finalizers_registered={registered}"
+    );
+}
+
 fn shutdown_module_private_name(name: &rustpython_wtf8::Wtf8) -> bool {
     let bytes = name.as_bytes();
     bytes.first() == Some(&b'_') && bytes.get(1) != Some(&b'_')
@@ -1625,6 +1676,7 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // its buffered writes.
     pyre_interpreter::module::_io::flush_all_streams();
     let mut swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
+    let (mut released, mut swept) = (0usize, 0usize);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();
     for (name, _) in entries {
@@ -1635,14 +1687,17 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
         // this loop may have rebound the name, and the decision below is only
         // sound about the value actually being released.
         let value = unsafe { pyre_object::w_dict_getitem_str(canonical, &name) };
-        let frees_nothing = value.is_none_or(release_frees_nothing);
         unsafe {
             pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
         }
-        if !frees_nothing {
-            swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
+        released += 1;
+        if value.is_none_or(release_delivers_no_finalizer) {
+            continue;
         }
+        swept += 1;
+        swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
     }
+    teardown_census(released, swept);
     // Close the loop on a swept heap and a drained queue. A release the loop
     // skipped removes nothing from the reachable set, and one it did not is
     // followed immediately by the sweep above, so the only way this heap can

@@ -3067,6 +3067,49 @@ pub fn gc_collect_gen(generation: i64) {
     gc_sync::gc_op(|gc| gc.do_collect(generation));
 }
 
+/// Whether a collection could still deliver a finalizer — whether
+/// `deal_with_objects_with_finalizers` has anything registered to pass over, or
+/// `rawrefcount` is live.
+///
+/// `false` means a collection can free memory but cannot run program code, so a
+/// caller that collects only in order to *find* a finalizable object — teardown
+/// releasing one namespace binding at a time — can skip the whole mark-and-sweep
+/// and reach the same observable answer.
+pub fn gc_has_pending_finalizers() -> bool {
+    gc_sync::is_initialized() && gc_sync::gc_query_reentrant(|gc| gc.has_pending_death_callbacks())
+}
+
+/// How many objects are registered with a finalizer queue. A census number, for
+/// diagnostics; [`gc_has_pending_finalizers`] is the question code should ask.
+pub fn gc_registered_finalizer_count() -> usize {
+    if gc_sync::is_initialized() {
+        gc_sync::gc_query_reentrant(|gc| gc.registered_finalizer_count())
+    } else {
+        0
+    }
+}
+
+/// Whether the object at `addr` is itself one the finalizer queue still owes a
+/// delivery — `flags::FINALIZER_REGISTERED` set by
+/// [`GcAllocator::register_finalizer`], minus the two flags that retire it.
+///
+/// This is the whole of `hasuserdel` and more: `allocate_instance` registers
+/// every instance of a `hasuserdel` class, and `_io`, coroutine and weakref
+/// lifeline construction register objects whose *type* carries no such flag.
+/// It answers only for the object itself — another object it is the last
+/// referrer of stays a question only a collection can settle.
+pub fn gc_object_finalizer_pending(addr: usize) -> bool {
+    if !gc_owns_object(addr) {
+        return false;
+    }
+    let hdr = unsafe { header::header_of(addr) };
+    unsafe {
+        (*hdr).has_flag(flags::FINALIZER_REGISTERED)
+            && !(*hdr).has_flag(flags::FINALIZER_RUN)
+            && !(*hdr).has_flag(flags::IGNORE_FINALIZER)
+    }
+}
+
 /// incminimark.py `set_max_heap_size` — the `PYPY_GC_MAX` limit, set from
 /// inside a running process instead of read once at startup.  `0` is
 /// unbounded.

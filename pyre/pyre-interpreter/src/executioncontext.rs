@@ -655,6 +655,14 @@ impl ExecutionContext {
         // chain's relink.
         pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
         majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
+        // A caller that already linked the frame -- `install_current_frame`
+        // sets both ends of this pair -- would make the store below name the
+        // frame itself, and `walk_pyframe_roots` follows `f_backref` with no
+        // cycle guard.
+        debug_assert_ne!(
+            self.topframeref, frame,
+            "ExecutionContext::enter: frame is already the top, so f_backref would name itself",
+        );
         unsafe {
             (*frame).f_backref = self.topframeref;
         }
