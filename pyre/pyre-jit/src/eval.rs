@@ -1177,7 +1177,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         } else {
             // std::alloc stationary block: forward each live element in place.
             let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
-            for i in 0..list.length {
+            for i in 0..list.length_relaxed() {
                 f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
             }
         }

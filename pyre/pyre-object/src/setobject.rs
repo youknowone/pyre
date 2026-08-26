@@ -15,6 +15,7 @@ use pyre_macros::pyre_class;
 use std::cell::UnsafeCell;
 use std::hash::BuildHasher;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static SET_TYPE: PyType = crate::pyobject::new_pytype("set");
 pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
@@ -117,9 +118,36 @@ pub unsafe fn w_set_iter_set_index(obj: PyObjectRef, index: usize) {
 pub struct W_SetObject {
     pub ob_header: PyObject,
     pub items: *mut SetItemsStorage,
-    pub len: usize,
+    /// Element count, read WITHOUT the stripe lock.
+    ///
+    /// `Objects/setobject.c set_len` answers `len(s)` as
+    /// `FT_ATOMIC_LOAD_SSIZE_RELAXED(so->used)` — a relaxed atomic load and no
+    /// critical section — so a reader is entitled to a value from either side
+    /// of a concurrent mutation but never to a torn one.  The JIT's `len` fold
+    /// lowers to exactly that load (`set_len_descr`), which is why the slot
+    /// cannot be a plain `usize`: the mutators below write it while a compiled
+    /// loop is reading, and only an atomic makes that pair defined.
+    ///
+    /// Same size and bit validity as `usize`, so the descriptor group keeps
+    /// reading it as `Type::Int` at `offset_of!` — the shape
+    /// `W_TupleObject.hash` already uses.
+    pub len: AtomicUsize,
     /// setobject.py `W_FrozensetObject.hash = DEFAULT_HASH`.
     pub hash: i64,
+}
+
+impl W_SetObject {
+    /// `FT_ATOMIC_LOAD_SSIZE_RELAXED(so->used)`.
+    #[inline]
+    pub fn len_relaxed(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// `FT_ATOMIC_STORE_SSIZE_RELAXED(so->used, n)`.
+    #[inline]
+    pub fn set_len_relaxed(&self, n: usize) {
+        self.len.store(n, Ordering::Relaxed);
+    }
 }
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
@@ -317,7 +345,7 @@ pub fn w_set_new() -> PyObjectRef {
                 W_SetObject {
                     ob_header: header,
                     items,
-                    len: 0,
+                    len: AtomicUsize::new(0),
                     hash: -1,
                 },
             );
@@ -327,7 +355,7 @@ pub fn w_set_new() -> PyObjectRef {
         crate::lltype::malloc_typed(W_SetObject {
             ob_header: header,
             items,
-            len: 0,
+            len: AtomicUsize::new(0),
             hash: -1,
         }) as PyObjectRef
     }
@@ -355,7 +383,7 @@ pub fn w_frozenset_new() -> PyObjectRef {
                 W_SetObject {
                     ob_header: header,
                     items,
-                    len: 0,
+                    len: AtomicUsize::new(0),
                     hash: -1,
                 },
             );
@@ -365,7 +393,7 @@ pub fn w_frozenset_new() -> PyObjectRef {
         crate::lltype::malloc_typed(W_SetObject {
             ob_header: header,
             items,
-            len: 0,
+            len: AtomicUsize::new(0),
             hash: -1,
         }) as PyObjectRef
     }
@@ -585,7 +613,7 @@ pub unsafe fn w_set_discard_key_checked(
         match index {
             Some(index) => {
                 set_remove_index(s.items, index);
-                s.len = (*s.items).len();
+                s.set_len_relaxed((*s.items).len());
                 s.hash = -1;
                 true
             }
@@ -603,7 +631,7 @@ pub unsafe fn w_set_discard_key_checked(
         // leaving the live storage untouched (`discard` of an absent element).
         set_remove_index(items, index);
         let s = &mut *(obj as *mut W_SetObject);
-        s.len = (*s.items).len();
+        s.set_len_relaxed((*s.items).len());
         s.hash = -1;
         return Ok(true);
     }
@@ -673,7 +701,7 @@ pub unsafe fn w_set_clear(obj: PyObjectRef) {
     let s = &mut *(obj as *mut W_SetObject);
     s.items =
         crate::gc_storage::gc_alloc_storage_box(SetItemsStorage::default(), set_items_gc_type_id());
-    s.len = 0;
+    s.set_len_relaxed(0);
     s.hash = -1;
     set_write_barrier(obj);
 }
@@ -691,7 +719,7 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
     let s = &mut *(obj as *mut W_SetObject);
     let entries = &mut *s.items;
     let (key, ()) = entries.pop()?;
-    s.len -= 1;
+    s.set_len_relaxed(s.len_relaxed() - 1);
     s.hash = -1;
     Some(key.obj)
 }
@@ -728,7 +756,7 @@ pub unsafe fn w_set_copy_storage_from(dst: PyObjectRef, src: PyObjectRef) {
     let d = &mut *(dst as *mut W_SetObject);
     let copied = (*(*(src as *const W_SetObject)).items).clone();
     d.items = crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id());
-    d.len = (*d.items).len();
+    d.set_len_relaxed((*d.items).len());
     d.hash = -1;
     set_write_barrier(dst);
 }
@@ -921,7 +949,7 @@ unsafe fn w_set_insert_key_into(
         // comparisons and cannot break either.
         entries.insert(key, ());
         let set = &mut *(dst as *mut W_SetObject);
-        set.len = (*set.items).len();
+        set.set_len_relaxed((*set.items).len());
         set.hash = -1;
         set_write_barrier(dst);
     }) {
@@ -941,7 +969,7 @@ unsafe fn w_set_insert_key_into(
         RawEntryMut::Occupied(_) => unreachable!("a never-matching raw probe is vacant"),
     }
     let set = &mut *(dst as *mut W_SetObject);
-    set.len = (*set.items).len();
+    set.set_len_relaxed((*set.items).len());
     set.hash = -1;
     set_write_barrier(dst);
     Ok(())
@@ -1023,7 +1051,7 @@ unsafe fn w_set_remove_key_for_update(
         if let Some(index) = index {
             set_remove_index(items, index);
             let set = &mut *(dst as *mut W_SetObject);
-            set.len -= 1;
+            set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
         }
     }) {
@@ -1068,7 +1096,7 @@ unsafe fn w_set_remove_key_for_update(
         if let Some(index) = found {
             set_remove_index(items, index);
             let set = &mut *(dst as *mut W_SetObject);
-            set.len -= 1;
+            set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
         }
         return Ok(());
@@ -1077,11 +1105,17 @@ unsafe fn w_set_remove_key_for_update(
 
 /// Number of elements in the set.
 ///
+/// Takes no stripe lock, matching `Objects/setobject.c set_len`:
+/// `FT_ATOMIC_LOAD_SSIZE_RELAXED(so->used)`.  A lock here would be stricter
+/// than the spec and would not buy anything — every mutator publishes the
+/// count with a relaxed store while holding the stripe, so the value read is
+/// from one side of a concurrent mutation either way, and the JIT's `len` fold
+/// lowers to this same unlocked load.
+///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_len(obj: PyObjectRef) -> usize {
-    let _set_guard = w_set_lock(obj);
-    (*(obj as *const W_SetObject)).len
+    (*(obj as *const W_SetObject)).len_relaxed()
 }
 
 /// Cached frozenset hash; `-1` is the uncomputed sentinel.

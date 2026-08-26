@@ -28,6 +28,7 @@ use crate::{
 };
 use std::cell::UnsafeCell;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // PyPy's list strategy/storage transitions are indivisible under its GIL.
 // Pyre keeps the list itself as the sole semantic owner and uses only narrow
@@ -148,7 +149,21 @@ pub struct W_ListObject {
     /// switch rewrites both together — typed-strategy operations do
     /// NOT update this field. Callers must read length via
     /// `w_list_len()` which dispatches on strategy.
-    pub length: usize,
+    ///
+    /// Read WITHOUT the list lock, so the slot is an atomic rather than a plain
+    /// `usize`.  `Include/cpython/listobject.h PyList_GET_SIZE` answers a length
+    /// under `Py_GIL_DISABLED` as `_Py_atomic_load_ssize_relaxed(&ob_size)` — a
+    /// relaxed atomic load and no critical section — so a reader is entitled to
+    /// a value from either side of a concurrent mutation but never to a torn
+    /// one.  The JIT's `len` fold lowers to exactly that load through
+    /// `list_length_descr`, and the mutators below write it while a compiled
+    /// loop is reading; only an atomic makes that pair defined.  The writes are
+    /// relaxed stores for the same reason — `&mut self` bounds no raw-pointer
+    /// reader, so `get_mut()` would put the plain store straight back.
+    ///
+    /// Same size and bit validity as `usize`, so `offset_of!` and the JIT's
+    /// `Type::Int` read are unchanged.
+    pub length: AtomicUsize,
     /// `Ptr(GcArray(OBJECTPTR))` — rlist.py:116 `l.items`. Points at
     /// the `ItemsBlock` whose offset-0 header is the allocated
     /// capacity (= upstream `len(l.items)` per rlist.py:251). Null
@@ -177,11 +192,27 @@ pub const W_LIST_GC_TYPE_ID: u32 = 7;
 pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
 
 impl W_ListObject {
+    /// `_Py_atomic_load_ssize_relaxed(&ob_size)` on the Object-strategy length.
+    ///
+    /// Not the list's length — that is `w_list_len`, which dispatches on the
+    /// strategy.  This is the raw slot, valid only where the caller has already
+    /// established the Object strategy.
+    #[inline]
+    pub fn length_relaxed(&self) -> usize {
+        self.length.load(Ordering::Relaxed)
+    }
+
+    /// `_Py_atomic_store_ssize_relaxed(&ob_size, n)` on the same slot.
+    #[inline]
+    pub fn set_length_relaxed(&self, n: usize) {
+        self.length.store(n, Ordering::Relaxed);
+    }
+
     #[inline]
     fn live_len(&self) -> usize {
         match self.strategy {
             ListStrategy::Empty => 0,
-            ListStrategy::Object => self.length,
+            ListStrategy::Object => self.length_relaxed(),
             // Direct rlist `length` field reads keep this helper in the
             // annotator's structural subset; the public `.len()` wrappers are
             // host collection conveniences that translate as `__len__`.
@@ -221,13 +252,13 @@ impl W_ListObject {
     #[inline]
     unsafe fn object_items_slice(&self) -> &[PyObjectRef] {
         let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts(base, self.length)
+        std::slice::from_raw_parts(base, self.length_relaxed())
     }
 
     #[inline]
     unsafe fn object_items_slice_mut(&mut self) -> &mut [PyObjectRef] {
         let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts_mut(base, self.length)
+        std::slice::from_raw_parts_mut(base, self.length_relaxed())
     }
 
     #[inline]
@@ -237,7 +268,8 @@ impl W_ListObject {
 
     #[inline]
     unsafe fn object_spare_capacity(&self) -> usize {
-        self.object_items_capacity().saturating_sub(self.length)
+        self.object_items_capacity()
+            .saturating_sub(self.length_relaxed())
     }
 
     /// Grow `items` to accommodate at least `min_cap` slots. Upstream
@@ -262,7 +294,7 @@ impl W_ListObject {
         let new_items_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
-        let new_items = grow_list_items_block_gc(list.items, target_cap, list.length);
+        let new_items = grow_list_items_block_gc(list.items, target_cap, list.length_relaxed());
         let _ = crate::gc_roots::pin_root(new_items as PyObjectRef);
         // framework.py's GC transform places the owner write barrier directly
         // before SETFIELD_GC. Keep the old block installed while the barrier
@@ -361,7 +393,7 @@ impl W_ListObject {
         // returns it relocated. The in-place store below stays outside the
         // boundary so the spare-capacity fold still lowers it. No-op grow
         // under the std::alloc fallback.
-        let value = if list.length == list.object_items_capacity() {
+        let value = if list.length_relaxed() == list.object_items_capacity() {
             w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
         } else {
             crate::gc_roots::shadow_stack_get(root_base + 1)
@@ -371,8 +403,8 @@ impl W_ListObject {
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(list.items);
-        *base.add(list.length) = value;
-        list.length += 1;
+        *base.add(list.length_relaxed()) = value;
+        list.set_length_relaxed(list.length_relaxed() + 1);
     }
 
     unsafe fn object_insert(&mut self, index: usize, value: PyObjectRef) {
@@ -382,11 +414,11 @@ impl W_ListObject {
         crate::gc_roots::normalize_roots(root_base, 2);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
-        assert!(index <= list.length);
+        assert!(index <= list.length_relaxed());
         // Same grow-then-store shape as `object_push`: at capacity, route the
         // grow through the `dont_look_inside` boundary, which roots `value`
         // across the (collecting) resize and returns it relocated.
-        let value = if list.length == list.object_items_capacity() {
+        let value = if list.length_relaxed() == list.object_items_capacity() {
             w_list_grow_items_block(obj, crate::gc_roots::shadow_stack_get(root_base + 1))
         } else {
             crate::gc_roots::shadow_stack_get(root_base + 1)
@@ -397,30 +429,30 @@ impl W_ListObject {
         let list = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(list.items);
         let p = base.add(index);
-        std::ptr::copy(p, p.add(1), list.length - index);
+        std::ptr::copy(p, p.add(1), list.length_relaxed() - index);
         *p = value;
-        list.length += 1;
+        list.set_length_relaxed(list.length_relaxed() + 1);
     }
 
     unsafe fn object_remove(&mut self, index: usize) -> PyObjectRef {
-        assert!(index < self.length);
+        assert!(index < self.length_relaxed());
         let base = items_block_items_base(self.items);
         let value = *base.add(index);
         let p = base.add(index);
-        std::ptr::copy(p.add(1), p, self.length - index - 1);
+        std::ptr::copy(p.add(1), p, self.length_relaxed() - index - 1);
         // Phase L2: the varsize walker forwards items[0..capacity], so clear the
         // vacated tail slot the shift left holding a stale duplicate.
-        *base.add(self.length - 1) = PY_NULL;
-        self.length -= 1;
+        *base.add(self.length_relaxed() - 1) = PY_NULL;
+        self.set_length_relaxed(self.length_relaxed() - 1);
         value
     }
 
     unsafe fn object_pop(&mut self) -> PyObjectRef {
-        assert!(self.length > 0);
+        assert!(self.length_relaxed() > 0);
         let base = items_block_items_base(self.items);
-        let value = *base.add(self.length - 1);
-        *base.add(self.length - 1) = PY_NULL;
-        self.length -= 1;
+        let value = *base.add(self.length_relaxed() - 1);
+        *base.add(self.length_relaxed() - 1) = PY_NULL;
+        self.set_length_relaxed(self.length_relaxed() - 1);
         value
     }
 
@@ -431,19 +463,19 @@ impl W_ListObject {
     unsafe fn object_drain(&mut self, range: std::ops::Range<usize>) {
         let start = range.start;
         let end = range.end;
-        assert!(start <= end && end <= self.length);
+        assert!(start <= end && end <= self.length_relaxed());
         let count = end - start;
         if count == 0 {
             return;
         }
         let base = items_block_items_base(self.items);
         let p = base.add(start);
-        std::ptr::copy(p.add(count), p, self.length - end);
-        let old_len = self.length;
-        self.length -= count;
+        std::ptr::copy(p.add(count), p, self.length_relaxed() - end);
+        let old_len = self.length_relaxed();
+        self.set_length_relaxed(self.length_relaxed() - count);
         // Phase L2: clear the vacated tail [new_len..old_len] the shift left
         // holding stale duplicates, so the varsize walker (0..capacity) skips them.
-        for i in self.length..old_len {
+        for i in self.length_relaxed()..old_len {
             *base.add(i) = PY_NULL;
         }
     }
@@ -454,7 +486,7 @@ impl W_ListObject {
         remove_count: usize,
         new_values: &[PyObjectRef],
     ) {
-        let old_len = self.length;
+        let old_len = self.length_relaxed();
         let s = start.min(old_len);
         let slicelength = remove_count.min(old_len - s);
         let len2 = new_values.len();
@@ -482,7 +514,7 @@ impl W_ListObject {
                     base.add(s + len2),
                     old_len - s - slicelength,
                 );
-                list.length = new_len;
+                list.set_length_relaxed(new_len);
             } else {
                 let base = items_block_items_base(list.items);
                 std::ptr::copy(
@@ -490,7 +522,7 @@ impl W_ListObject {
                     base.add(s + len2),
                     old_len - s - slicelength,
                 );
-                list.length = new_len;
+                list.set_length_relaxed(new_len);
             }
         } else if slicelength > len2 {
             let base = items_block_items_base(list.items);
@@ -503,7 +535,7 @@ impl W_ListObject {
             for i in new_len..old_len {
                 *base.add(i) = PY_NULL;
             }
-            list.length = new_len;
+            list.set_length_relaxed(new_len);
         }
         if len2 > 0 {
             let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -550,7 +582,7 @@ impl W_ListObject {
         let list = &mut *(obj as *mut W_ListObject);
         let old_items = list.items;
         list.items = crate::gc_roots::shadow_stack_get(new_items_slot) as *mut ItemsBlock;
-        list.length = rooted_values.len();
+        list.set_length_relaxed(rooted_values.len());
         dealloc_list_items_block(old_items);
     }
 
@@ -559,7 +591,7 @@ impl W_ListObject {
     unsafe fn drop_object_items(&mut self) {
         dealloc_list_items_block(self.items);
         self.items = std::ptr::null_mut();
-        self.length = 0;
+        self.set_length_relaxed(0);
     }
 }
 
@@ -602,7 +634,7 @@ pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> P
     let _ = crate::gc_roots::pin_root(value);
     let obj = crate::gc_roots::shadow_stack_get(save);
     let list = &mut *(obj as *mut W_ListObject);
-    W_ListObject::object_grow(obj, list.length + 1);
+    W_ListObject::object_grow(obj, list.length_relaxed() + 1);
     crate::gc_roots::shadow_stack_get(save + 1)
 }
 
@@ -1350,7 +1382,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         let boxed = Box::new(W_ListObject {
             ob_header: header,
             allocated: items.len() as isize,
-            length,
+            length: AtomicUsize::new(length),
             items: items_block,
             strategy,
             int_items,
@@ -1366,7 +1398,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
             W_ListObject {
                 ob_header: header,
                 allocated: items.len() as isize,
-                length,
+                length: AtomicUsize::new(length),
                 items: items_block,
                 strategy,
                 int_items,
@@ -1541,7 +1573,7 @@ pub fn ll_list_float_set_len(l: &mut W_ListObject, n: usize) {
 /// (rlist.py:116 `l.length`).
 #[majit_macros::oopspec("list.obj_len(l)")]
 pub fn ll_list_obj_length(l: &W_ListObject) -> usize {
-    l.length
+    l.length_relaxed()
 }
 
 /// Allocated capacity for the Object strategy — the `items` block's
@@ -1555,7 +1587,7 @@ pub fn ll_list_obj_capacity(l: &W_ListObject) -> usize {
 /// `l.length = newsize`, rlist.py:293).
 #[majit_macros::oopspec("list.obj_set_len(l, n)")]
 pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
-    l.length = n;
+    l.set_length_relaxed(n);
 }
 
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
@@ -1661,7 +1693,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
         // listobject.py EmptyListStrategy.setitem raises IndexError.
         ListStrategy::Empty => false,
         ListStrategy::Object => {
-            let len = list.length as i64;
+            let len = list.length_relaxed() as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return false;
@@ -2072,7 +2104,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     match list.strategy {
         // listobject.py EmptyListStrategy.length returns 0.
         ListStrategy::Empty => 0,
-        ListStrategy::Object => list.length,
+        ListStrategy::Object => list.length_relaxed(),
         ListStrategy::Integer => ll_list_int_length(list),
         ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
@@ -2456,7 +2488,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             }
         }
         ListStrategy::Object => {
-            let idx = normalize_insert_index(index, list.length);
+            let idx = normalize_insert_index(index, list.length_relaxed());
             list.object_insert(idx, value);
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             list_write_barrier(obj);
@@ -2550,7 +2582,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             Some(w_float_new(item))
         }
         ListStrategy::Object => {
-            let len = list.length as i64;
+            let len = list.length_relaxed() as i64;
             if len == 0 {
                 return None;
             }
@@ -2603,7 +2635,7 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::Integer => ll_list_int_length(list),
         ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
-        ListStrategy::Object => list.length,
+        ListStrategy::Object => list.length_relaxed(),
         ListStrategy::Bytes => list.bytes_items.len(),
     };
     if length == 0 {
@@ -2773,7 +2805,7 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     if let Some(s) = block_root {
         storage.block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
     }
-    list.length = storage.length;
+    list.set_length_relaxed(storage.length);
     list.items = storage.block;
     list.strategy = strategy;
     list.int_items = storage.int_items;
@@ -2899,7 +2931,7 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
             }
         }
         ListStrategy::Object => {
-            let len = list.length;
+            let len = list.length_relaxed();
             let s = start.min(len);
             let e = end.min(len);
             if s < e {

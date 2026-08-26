@@ -3058,6 +3058,38 @@ struct Lowering<'a> {
     /// `local_var` by local and only falls back to the recorded
     /// Variable for a base/index without a backing local (a constant).
     index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
+    /// MIR locals bound by `_i = &place` where `place` is a
+    /// `core::sync::atomic` slot, mapped to the place they borrowed.
+    ///
+    /// `<Atomic*>::store(&self, v, ord)` is a call, so the write target
+    /// survives only as the receiver operand; the load fold gets away with
+    /// aliasing the receiver Variable because a read needs no place, but a
+    /// write does.  Keyed on the referent being an atomic, so a body's
+    /// ordinary borrows never enter the map.
+    ///
+    /// Only locals outside [`Lowering::multi_assigned_locals`] enter, the
+    /// same restriction [`Lowering::const_discriminant_locals`] carries and
+    /// for the same reason: MIR locals are not SSA and this map is not a
+    /// flow-state, so a local borrowed from `&a` in one block and `&b` in
+    /// another would hand the store whichever block happened to be lowered
+    /// last rather than the definition that reaches it — a write to the
+    /// wrong field.  A local assigned once in the whole body carries the
+    /// reaching place at every use of it; a rebound one stays a call.
+    atomic_ref_place: std::collections::HashMap<usize, Place>,
+    /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
+    /// the variant's name.
+    ///
+    /// Charon does not hand the ordering to `load` / `store` as a constant
+    /// operand: it assigns `_i = Ordering::<V>` as a fieldless-enum
+    /// `Aggregate` and passes `move _i`, so the variant is only knowable from
+    /// that statement.  [`Lowering::is_atomic_store`]'s arm folds a `Relaxed`
+    /// store and nothing else — a `Release` store lowered as an unordered
+    /// `FieldWrite` would DROP a barrier the residual call it replaces still
+    /// performs (`w_type_set_version_tag` publishes `version_tag` with
+    /// `Release` against an `Acquire` reader).  Which makes reading the WRONG
+    /// variant a dropped barrier, so this map carries the single-assignment
+    /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
+    atomic_ordering_locals: std::collections::HashMap<usize, String>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -3369,6 +3401,8 @@ impl<'a> Lowering<'a> {
             binop_result_locals: compute_binop_result_locals(body),
             builder_mode: false,
             index_elem_alias: std::collections::HashMap::new(),
+            atomic_ref_place: std::collections::HashMap::new(),
+            atomic_ordering_locals: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
@@ -4217,6 +4251,20 @@ impl<'a> Lowering<'a> {
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
+                // `_i = &atomic_slot` — remember the referent so a later
+                // `<Atomic*>::store` through this local can write to the
+                // place rather than to the value it resolved to.  Read
+                // before `build_rvalue` consumes the rvalue.
+                if !self.multi_assigned_locals.contains(&(i as usize)) {
+                    if let Some(place) = atomic_ref_referent(&rvalue, self.llbc) {
+                        self.atomic_ref_place.insert(i as usize, place);
+                    }
+                    // `_i = Ordering::<V>` — the ordering the store arm has
+                    // to read before it may fold.
+                    if let Some(name) = self.atomic_ordering_variant(&rvalue) {
+                        self.atomic_ordering_locals.insert(i as usize, name);
+                    }
+                }
                 // Capture the construction `owner_root` if this binding
                 // is a positional aggregate, before `build_rvalue`
                 // consumes the rvalue, so `.N` reads of the local can
@@ -8029,6 +8077,84 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<Atomic*>::store(&self, value, ordering)` — the write twin
+                // of the load fold above.  A read needs no place, so the load
+                // gets away with aliasing the receiver Variable; a write does,
+                // so recover the borrowed slot from the `&self` operand
+                // ([`Lowering::atomic_ref_place`]) and emit the same
+                // `FieldWrite` a plain `slot = value` assignment would.
+                //
+                // PRECONDITION, and it is a real one: a `FieldWrite` lowers to
+                // one plain machine store, which implements a RELAXED atomic
+                // store only where that store is single-copy atomic — i.e. the
+                // backend emits ONE store for the slot's width.  It does on
+                // every target pyre emits for: `mov` / `str` for a naturally
+                // aligned word or narrower on x86_64 and aarch64, and `iN.store`
+                // for every atomic width on wasm32.  Relaxed buys freedom from
+                // tearing and nothing else — no fence, no `lock` prefix — so
+                // under that condition the emitted access IS the access the
+                // residual call would have performed.  What would break it is a
+                // slot the backend has to split: an `AtomicU64` field on a
+                // 32-bit NATIVE target, which pyre has none of.  The threshold
+                // is deliberately NOT checked here: it is a per-backend store
+                // granularity, not a front-end fact, and spelling it as
+                // `target_word_size()` would decline `AtomicI64` on wasm32,
+                // where `i64.store` is a single instruction.  Adding such a
+                // target means teaching the BACKEND, or declining there.
+                // The load fold rests on the same precondition.
+                //
+                // ONLY a `Relaxed` store folds.  A stronger ordering is not
+                // decoration: `w_type_set_version_tag` publishes `version_tag`
+                // with `Release` against `w_type_get_version_tag`'s `Acquire`
+                // reader, and today that store reaches the CALL, which performs
+                // the release.  Replacing it with an unordered `FieldWrite`
+                // would let a traced class mutation publish the new cache key
+                // before the dictionary changes behind it are visible.  So the
+                // ordering is read (`atomic_ordering_locals`) and anything but
+                // `Relaxed` keeps the residual call it has today.
+                if args.len() == 3
+                    && self.is_atomic_store(&reg)
+                    && arg_locals
+                        .get(2)
+                        .copied()
+                        .flatten()
+                        .and_then(|l| self.atomic_ordering_locals.get(&l))
+                        .is_some_and(|ordering| ordering == "Relaxed")
+                {
+                    // A receiver this body did not bind as a borrow of a
+                    // field — or one borrowing a whole local rather than a
+                    // field of one, or one rebound elsewhere in the body —
+                    // leaves no place to write to.  Fall through to the
+                    // ordinary call path, which is what an unrecognised
+                    // `store` already lowers to, rather than inventing a
+                    // target or failing a graph that compiles today.  The
+                    // place is copied, not taken: one borrow stored through
+                    // twice folds both times.
+                    let referent = arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .and_then(|l| self.atomic_ref_place.get(&l))
+                        .map(clone_place);
+                    if let Some(referent) = referent {
+                        let field_ty = clone_tyref(&referent.ty);
+                        if let PlaceKind::Projection(inner, elem) = referent.kind {
+                            let value = LinkArg::Value(args[1].clone());
+                            self.emit_projection_write(mir_bb, *inner, elem, value, &field_ty)?;
+                            // `store` returns `()`; the destination binds a
+                            // Void the same way the stringbuilder-append
+                            // marker above does.
+                            self.local_var[dest_local] = Some(
+                                self.graph
+                                    .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                            );
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                    }
+                }
                 // `(block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET)` inside
                 // an `ItemsBlock` items-base accessor — the interior items
                 // pointer the runtime reads through a `base_size`-bearing
@@ -10534,6 +10660,50 @@ impl<'a> Lowering<'a> {
     /// excludes unrelated inherent `load` methods, and the method name
     /// never reaches the rtyper as a `ptr.getattr`.
     fn is_atomic_load(&self, reg: &RegularCall) -> bool {
+        self.is_atomic_method(reg, "load")
+    }
+
+    /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
+    /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
+    /// layout-transparent atomic is the same machine store a plain field
+    /// write emits, so `lower_call` lowers it to the same `FieldWrite`.
+    fn is_atomic_store(&self, reg: &RegularCall) -> bool {
+        self.is_atomic_method(reg, "store")
+    }
+
+    /// The `core::sync::atomic::Ordering` variant name an `Rvalue::Aggregate`
+    /// builds, or `None` when the rvalue is not one.
+    ///
+    /// Keyed on the enum's own path and read back by variant NAME rather than
+    /// index, so a reordering of `Ordering`'s variants cannot silently turn a
+    /// `Release` into a `Relaxed`.
+    fn atomic_ordering_variant(&self, rvalue: &Rvalue) -> Option<String> {
+        let Rvalue::Aggregate(kind, _) = rvalue else {
+            return None;
+        };
+        // Same head shapes `resolve_aggregate_adt` decodes: a bare `type_id`
+        // or a full `TypeDeclRef` object.
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let td = self.llbc.type_by_id(type_id)?;
+        if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
+            return None;
+        }
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
+        Some(variants.get(variant_idx)?.name.clone())
+    }
+
+    /// `<core::sync::atomic::Atomic*>::<method>(&self, ..)` — an inherent
+    /// method of a std atomic, keyed on the receiver's type so a user type
+    /// with a `load` / `store` method of its own does not match.
+    fn is_atomic_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -10541,7 +10711,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let name = fd.item_meta.name_path();
-        if name.rsplit("::").next() != Some("load") {
+        if name.rsplit("::").next() != Some(method) {
             return false;
         }
         fd.signature.inputs.first().is_some_and(|t| {
@@ -16489,6 +16659,45 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
 /// [`Lowering::resolve_adt_field`] when handing the resolved field's
 /// type to [`tyref_to_value_type`].
+/// The borrowed place behind `_i = &place` / `&raw place`, cloned out of the
+/// rvalue, when `place` names a `core::sync::atomic` slot.  Nothing else is
+/// recorded: the only consumer is [`Lowering::is_atomic_store`]'s write
+/// target.
+fn atomic_ref_referent(rvalue: &Rvalue, llbc: &Llbc) -> Option<Place> {
+    let place = match rvalue {
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
+        _ => return None,
+    };
+    tyref_atomic_inner_value_type(&place.ty, llbc)?;
+    Some(clone_place(place))
+}
+
+/// Charon's `Place` carries a `TyRef`, which is not `Clone` (see
+/// [`clone_tyref`]); this is the same by-hand deep copy for a whole place.
+fn clone_place(p: &Place) -> Place {
+    Place {
+        kind: match &p.kind {
+            PlaceKind::Local(i) => PlaceKind::Local(*i),
+            PlaceKind::Projection(inner, elem) => {
+                PlaceKind::Projection(Box::new(clone_place(inner)), clone_projection_elem(elem))
+            }
+            PlaceKind::Global { generics, id } => PlaceKind::Global {
+                generics: generics.clone(),
+                id: *id,
+            },
+            PlaceKind::Unknown => PlaceKind::Unknown,
+        },
+        ty: clone_tyref(&p.ty),
+    }
+}
+
+fn clone_projection_elem(e: &ProjectionElem) -> ProjectionElem {
+    match e {
+        ProjectionElem::Atom(s) => ProjectionElem::Atom(s.clone()),
+        ProjectionElem::Tagged(v) => ProjectionElem::Tagged(v.clone()),
+    }
+}
+
 fn clone_tyref(ty: &TyRef) -> TyRef {
     match ty {
         TyRef::Dedup { id } => TyRef::Dedup { id: *id },
@@ -17226,6 +17435,18 @@ fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// ranges are plain int fields, so a field of one types as that inner
 /// value and its `load`/`store` fold to it (`is_atomic_load`).
 fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    match tyref_atomic_leaf(ty, llbc)? {
+        "AtomicPtr" => Some(ValueType::Ref(None)),
+        "AtomicBool" => Some(ValueType::Bool),
+        l if l.starts_with("AtomicI") => Some(ValueType::Int),
+        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+        _ => None,
+    }
+}
+
+/// The `Atomic*` leaf ident of a `core::sync::atomic` type, or `None` when
+/// `ty` is not a std atomic.
+fn tyref_atomic_leaf<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l str> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let name = &llbc.type_by_id(id)?.item_meta.name;
@@ -17249,11 +17470,28 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     if !in_atomic_mod {
         return None;
     }
-    match leaf {
-        "AtomicPtr" => Some(ValueType::Ref(None)),
-        "AtomicBool" => Some(ValueType::Bool),
-        l if l.starts_with("AtomicI") => Some(ValueType::Int),
-        l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
+    Some(leaf)
+}
+
+/// The inner scalar of a `core::sync::atomic` integer/bool wrapper, spelled
+/// as the Rust primitive the wrapper is layout-transparent over
+/// (`AtomicUsize` → `usize`), or `None` for anything else.
+///
+/// `AtomicPtr` is deliberately absent: its inner value is a pointer, which
+/// is already what an unrecognised name answers.
+fn tyref_atomic_inner_scalar_str(ty: &TyRef, llbc: &Llbc) -> Option<&'static str> {
+    match tyref_atomic_leaf(ty, llbc)? {
+        "AtomicBool" => Some("bool"),
+        "AtomicI8" => Some("i8"),
+        "AtomicI16" => Some("i16"),
+        "AtomicI32" => Some("i32"),
+        "AtomicI64" => Some("i64"),
+        "AtomicIsize" => Some("isize"),
+        "AtomicU8" => Some("u8"),
+        "AtomicU16" => Some("u16"),
+        "AtomicU32" => Some("u32"),
+        "AtomicU64" => Some("u64"),
+        "AtomicUsize" => Some("usize"),
         _ => None,
     }
 }
@@ -18304,6 +18542,16 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 }
 
 fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    // An atomic wrapper is layout-transparent over its inner scalar, and the
+    // typed side already models a field of one as that inner value
+    // (`tyref_atomic_inner_value_type`).  Spell the field with the scalar so
+    // the string-keyed layout tables — `get_type_flag`, `type_flag_from_str`,
+    // the annotator's field projection — reach the same answer instead of
+    // falling to their unknown-name GC-pointer wildcard, which would mint a
+    // `Ref` field descr against the runtime's `Int` publish.
+    if let Some(scalar) = tyref_atomic_inner_scalar_str(ty, llbc) {
+        return scalar.to_string();
+    }
     let Some(node) = tyref_node(ty, llbc) else {
         return tyref_to_ast_string(ty, llbc);
     };
@@ -25760,6 +26008,92 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&word_ty, &llbc),
             crate::model::ValueType::Int
+        );
+    }
+
+    #[test]
+    fn atomic_field_layout_string_is_the_inner_scalar() {
+        let atomic_decl = |def_id: u64, leaf: &str, size: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": [
+                        {"Ident": ["core", 0]},
+                        {"Ident": ["sync", 0]},
+                        {"Ident": ["atomic", 0]},
+                        {"Ident": [leaf, 0]}
+                    ],
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 8}
+                    }},
+                    "source_text": "pub struct Atomic;",
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": false
+                },
+                // Opaque: the scalar spelling comes from the wrapper's own
+                // name, not from reading its `UnsafeCell` payload, which a
+                // dependency artefact does not carry.
+                "kind": "Opaque",
+                "layout": [{
+                    "key": "x86_64-unknown-linux-gnu",
+                    "value": {
+                        "size": size,
+                        "align": size,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": false}
+                    }
+                }]
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    null,
+                    atomic_decl(1, "AtomicUsize", 8),
+                    atomic_decl(2, "AtomicPtr", 8)
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let adt_ty = |def_id: u64, args: serde_json::Value| {
+            serde_json::from_value::<super::TyRef>(serde_json::json!({
+                "HashConsedValue": [8, {
+                    "Adt": {"id": {"Adt": def_id}, "generics": {"types": args}}
+                }]
+            }))
+            .expect("fixture TyRef parses")
+        };
+
+        // An integer atomic spells as the scalar it is layout-transparent
+        // over, so the string-keyed field tables land on the same `Int` the
+        // runtime publishes rather than their unknown-name `Ref` wildcard.
+        let usize_ty = adt_ty(1, serde_json::json!([]));
+        assert_eq!(
+            super::tyref_to_field_layout_string(&usize_ty, &llbc),
+            "usize"
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("usize").1,
+            majit_ir::value::Type::Int
+        );
+
+        // `AtomicPtr` keeps the wrapper spelling: its inner value is a
+        // pointer, which is what the wildcard already answers.
+        let ptr_ty = adt_ty(2, serde_json::json!([{"Literal": {"UInt": "U8"}}]));
+        let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc);
+        assert_eq!(ptr_str, "AtomicPtr<u8>");
+        assert_eq!(
+            crate::codewriter::call::get_type_flag(&ptr_str).1,
+            majit_ir::value::Type::Ref
         );
     }
 

@@ -3,6 +3,7 @@
 //! PyPy equivalent: pypy/objspace/std/bytearrayobject.py
 
 use crate::pyobject::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 
@@ -25,7 +26,19 @@ pub struct W_BytearrayObject {
     ///
     /// [`w_bytearray_sync_alloc`] is what keeps this current.  Every mutator
     /// that changes the buffer's length already has to call it, for `alloc`.
-    pub length: usize,
+    ///
+    /// Read WITHOUT a lock, so the slot is an atomic rather than a plain
+    /// `usize`.  `Include/cpython/listobject.h PyList_GET_SIZE` answers a length
+    /// under `Py_GIL_DISABLED` as `_Py_atomic_load_ssize_relaxed(&ob_size)` — a
+    /// relaxed atomic load and no critical section — so a reader is entitled to
+    /// a value from either side of a concurrent mutation but never to a torn
+    /// one.  The JIT's `len` fold lowers to exactly that load through
+    /// `bytearray_length_descr`, while [`w_bytearray_sync_alloc`] writes it;
+    /// only an atomic makes that pair defined.
+    ///
+    /// Same size and bit validity as `usize`, so `offset_of!` and the JIT's
+    /// `Type::Int` read are unchanged.
+    pub length: AtomicUsize,
     /// CPython `PyByteArrayObject.ob_alloc`, including the trailing NUL byte.
     ///
     /// This cannot be derived from `Vec::capacity()`: Rust's allocator uses a
@@ -45,6 +58,20 @@ pub struct W_BytearrayObject {
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
+
+impl W_BytearrayObject {
+    /// `_Py_atomic_load_ssize_relaxed(&ob_size)` on the byte count.
+    #[inline]
+    pub fn length_relaxed(&self) -> usize {
+        self.length.load(Ordering::Relaxed)
+    }
+
+    /// `_Py_atomic_store_ssize_relaxed(&ob_size, n)` on the same slot.
+    #[inline]
+    pub fn set_length_relaxed(&self, n: usize) {
+        self.length.store(n, Ordering::Relaxed);
+    }
+}
 
 /// Fixed payload size (`framework.py:811`).
 pub const W_BYTEARRAY_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObject>();
@@ -97,7 +124,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let body = W_BytearrayObject {
         ob_header: header,
         data,
-        length,
+        length: AtomicUsize::new(length),
         alloc,
         logical_offset: 0,
         exports: 0,
@@ -165,7 +192,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             w_class: crate::gc_roots::shadow_stack_get(root_base),
         },
         data: crate::lltype::malloc_raw(bytes.to_vec()),
-        length: bytes.len(),
+        length: AtomicUsize::new(bytes.len()),
         alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
         logical_offset: 0,
         exports: 0,
@@ -236,12 +263,12 @@ pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
         // `length` would be a wrong length in compiled code rather than a
         // wrong answer here.  Debug builds turn that into a test failure.
         debug_assert_eq!(
-            ba.length,
+            ba.length_relaxed(),
             (*ba.data).len(),
             "bytearray length is stale: a mutator changed the buffer without \
              calling w_bytearray_sync_alloc"
         );
-        ba.length
+        ba.length_relaxed()
     }
 }
 
@@ -263,7 +290,7 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
         let size = (*ba.data).len();
         // Above the early return: `length` tracks every change, while `alloc`
         // only moves when the resize policy says it should.
-        ba.length = size;
+        ba.set_length_relaxed(size);
         if size == old_size {
             return;
         }
