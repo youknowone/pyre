@@ -4264,8 +4264,8 @@ mod tests {
         use crate::history::test_support::bound_inputarg_operand;
         let (_i0, i0_rc) = bound_inputarg_operand(majit_ir::Type::Int, 0);
         let (_i1, i1_rc) = bound_inputarg_operand(majit_ir::Type::Int, 1);
-        // A live producer for v (IntGt result) at int_op(2); the OpRc is held
-        // in `int_gt` so the from_bound_op box's Weak upgrade stays live.
+        // A live producer for v (IntGt result) at int_op(2), held in
+        // `int_gt` for the body of the test.
         let int_gt = std::rc::Rc::new(Op::new(
             OpCode::IntGt,
             &[

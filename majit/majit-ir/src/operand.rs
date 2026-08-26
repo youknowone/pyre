@@ -10,7 +10,7 @@
 //! position→producer registry, no `Op::box_cache` memoization, and no
 //! position-only ref fabrication.
 //!
-//! Strong `Rc` (not the `Weak` of [`Forwarded`](crate::forwarding::Forwarded)):
+//! Strong `Rc`, as in [`Forwarded`](crate::forwarding::Forwarded):
 //! operands must keep their producers alive. The trace already holds the 1st
 //! strong ref in `Trace.ops: Vec<OpRc>` (#103); an operand `Rc<Op>` is a 2nd
 //! strong ref on the acyclic SSA use-before-def DAG (operands reference
@@ -295,20 +295,8 @@ impl Operand {
             };
             match forwarded {
                 Forwarded::None | Forwarded::Info(_) => return cur,
-                Forwarded::Op(weak) => {
-                    let Some(op_rc) = weak.upgrade() else {
-                        // Dropped target: terminate at `cur` (PyPy keeps
-                        // targets alive through the `operations` list).
-                        return cur;
-                    };
-                    cur = Operand::Op(op_rc);
-                }
-                Forwarded::InputArg(weak) => {
-                    let Some(ia_rc) = weak.upgrade() else {
-                        return cur;
-                    };
-                    cur = Operand::InputArg(ia_rc);
-                }
+                Forwarded::Op(op_rc) => cur = Operand::Op(op_rc),
+                Forwarded::InputArg(ia_rc) => cur = Operand::InputArg(ia_rc),
                 Forwarded::Const(c) => {
                     if not_const {
                         return cur;
@@ -323,7 +311,7 @@ impl Operand {
 
     /// The bound producer `Op` (`Operand::Op` arm), or `None` for
     /// `InputArg` / `Const` / `None`. The operand IS the producer `Rc` — no
-    /// `Weak` upgrade and no `box_cache`.
+    /// indirection and no `box_cache`.
     pub fn bound_op(&self) -> Option<OpRc> {
         match self {
             Operand::Op(op) => Some(Rc::clone(op)),
@@ -733,7 +721,7 @@ mod tests {
         assert!(matches!(a.get_forwarded(), Forwarded::None));
         a.set_forwarded_op(&b);
         match a.get_forwarded() {
-            Forwarded::Op(w) => assert!(Rc::ptr_eq(&w.upgrade().unwrap(), &b)),
+            Forwarded::Op(target) => assert!(Rc::ptr_eq(&target, &b)),
             other => panic!("expected Forwarded::Op, got {other:?}"),
         }
         // The walker follows a -> b to the terminal.
@@ -743,6 +731,59 @@ mod tests {
         }
         a.clear_forwarded();
         assert!(matches!(a.get_forwarded(), Forwarded::None));
+    }
+
+    /// The `_forwarded` slot keeps its target alive on its own.
+    ///
+    /// RPython reaches a forwarding target two ways at once — the assignment
+    /// in `resoperation.py set_forwarded` and the trace `operations` list — so
+    /// `get_box_replacement` never meets a collected target. While this slot
+    /// held a `Weak`, only the second of those existed on the pyre side, spread
+    /// over `OptContext`'s `resop_refs` / `phase1_emit_ops` / `new_operations`;
+    /// a target held by none of them was dropped, the walk stopped one hop
+    /// early, and it handed back an operand that was still forwarding. Its
+    /// callers assert that cannot happen — `getnullness` reached an
+    /// `unreachable!` on an `int_or` of two `int_is_true` results.
+    ///
+    /// Dropping every other reference is the point of this test: it is what
+    /// no registry-side keep-alive can be asked to prevent.
+    #[test]
+    fn a_forwarded_target_survives_every_other_reference_being_dropped() {
+        let a = Operand::from_bound_op(&op_at(0, Type::Int));
+
+        // Two hops, so the walk has to hold the middle alive to reach the end.
+        let (b_ptr, c_ptr) = {
+            let b = op_at(1, Type::Int);
+            let c = op_at(2, Type::Int);
+            b.set_forwarded_op(&c);
+            a.set_forwarded_op(&b);
+            (Rc::as_ptr(&b), Rc::as_ptr(&c))
+        };
+
+        match a.get_box_replacement(false) {
+            Operand::Op(op) => assert!(
+                std::ptr::eq(Rc::as_ptr(&op), c_ptr),
+                "the walk stopped short of the chain terminal",
+            ),
+            other => panic!(
+                "the walk returned {other:?}; landing back on `a` is the \
+                 dropped-target termination this test exists to refuse \
+                 (middle was {b_ptr:?})",
+            ),
+        }
+
+        // The InputArg twin: `compile.py` / `unroll.py` redirect inputargs the
+        // same way in bridge import and retrace remap.
+        let d = Operand::from_bound_op(&op_at(3, Type::Int));
+        let e_ptr = {
+            let e = Rc::new(InputArg::from_type(Type::Int, 9));
+            d.set_forwarded_inputarg(&e);
+            Rc::as_ptr(&e)
+        };
+        match d.get_box_replacement(false) {
+            Operand::InputArg(ia) => assert!(std::ptr::eq(Rc::as_ptr(&ia), e_ptr)),
+            other => panic!("the InputArg walk returned {other:?}"),
+        }
     }
 
     /// `bound_op` / `bound_inputarg` expose the carried producer `Rc` for the

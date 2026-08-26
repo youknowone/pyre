@@ -863,8 +863,8 @@ pub struct OptContext {
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
     /// via `TreeLoop.inputargs`; the test-and-fallback helper
     /// `with_inputarg_types` has no upstream `TreeLoop`, so it stashes
-    /// fresh `InputArgRc`s here to keep the `Weak<InputArg>` stored
-    /// inside each operand's `inputarg_handle` upgradable. `make_equal_to`
+    /// fresh `InputArgRc`s here so the canonical host each InputArg OpRef
+    /// resolves to is the same object across the run. `make_equal_to`
     /// then routes the chain step through `Forwarded::InputArg(_)`
     /// (`optimizer.py:394 op.set_forwarded(newop)`) instead of the
     /// retired orphan-box forwarding fallback.
@@ -879,9 +879,8 @@ pub struct OptContext {
     /// the same OpRef position, `emit()` re-binds the operand to that
     /// Op (carrying forwarded state across) and the synthetic stand-in
     /// becomes unreferenced from the operand but is still retained here
-    /// for the OptContext's lifetime so any lingering `Weak<Op>`
-    /// upgrades (e.g. in already-installed `Forwarded::Op` chains)
-    /// stay valid.
+    /// for the OptContext's lifetime, so a position that is looked up again
+    /// resolves to the same `_forwarded` host rather than a second stand-in.
     ///
     /// Keyed by the full type-tagged `OpRef`, so a typed and an untyped
     /// (or differently-typed) position sharing a raw `u32` are distinct
@@ -899,7 +898,7 @@ pub struct OptContext {
     /// Live synthetic stand-ins (mint_synthetic_resop / bind_input_resops
     /// products) that have NOT been superseded by an `emit` at their
     /// position. The end-of-Phase-1 orphan-binding pass drains this into
-    /// `phase1_emit_ops` so retrace's `Weak<Op>` upgrades stay valid; an
+    /// `phase1_emit_ops` so retrace sees them in `partial_trace_operations`; an
     /// `emit` that rebinds a position's box off its synthetic removes the
     /// synthetic here (it stays strongly held by `resop_refs` for lookup,
     /// but is no longer an orphan needing carry). Tracking liveness
@@ -1870,9 +1869,9 @@ impl OptContext {
         // Seed a fresh canonical `InputArgRc` per slot so the optimizer's
         // `make_equal_to` routes an InputArg-targeted chain step through
         // `Forwarded::InputArg(_)` (`optimizer.py:394 op.set_forwarded(newop)`).
-        // The strong `InputArgRc`s are stashed in `ctx.inputarg_refs` so the
-        // `Weak<InputArg>` each bound box later carries stays upgradable for
-        // the OptContext's lifetime. Production traces own these via
+        // The `InputArgRc`s are stashed in `ctx.inputarg_refs` so every
+        // reader of a slot resolves to the same host for the OptContext's
+        // lifetime. Production traces own these via
         // `TreeLoop.inputargs`; this test-and-fallback helper has no upstream
         // `TreeLoop`.
         ctx.inputarg_refs = inputarg_types
@@ -1891,14 +1890,12 @@ impl OptContext {
     /// Mirror every InputArg position into `inputarg_refs[pos]`: an
     /// already-bound slot keeps the `InputArgRc` it binds; an unbound slot
     /// gets a fresh one (bound here) carrying the position's type. Stashing
-    /// the strong ref in `inputarg_refs` keeps each bound `Weak<InputArg>`
-    /// upgradable for the OptContext's lifetime AND gives the canonical-host
-    /// readers (`resolve_to_operand` / `read_forwarded` / `clear_forwarded`)
-    /// a live `InputArg.forwarded` host to resolve to.
+    /// the strong ref in `inputarg_refs` gives the canonical-host readers
+    /// (`resolve_to_operand` / `read_forwarded` / `clear_forwarded`) a live
+    /// `InputArg.forwarded` host to resolve to.
     ///
-    /// Phase 2 enters with a fresh per-iteration inputarg set whose earlier
-    /// `Weak<InputArg>` owners (the previous OptContext's `inputarg_refs`)
-    /// were dropped, leaving them dangling. Re-binding here restores
+    /// Phase 2 enters with a fresh per-iteration inputarg set that the
+    /// previous OptContext's `inputarg_refs` no longer names. Re-binding here restores
     /// `Forwarded::InputArg(_)` reachability for every InputArg operand the
     /// optimizer will hand to `make_equal_to` (`optimizer.py
     /// op.set_forwarded(newop)`, unroll.py:497). Idempotent — re-running
@@ -1944,7 +1941,7 @@ impl OptContext {
     /// `tp` (the `_forwarded` host that `resolve_to_operand` / `read_forwarded`
     /// / `clear_forwarded` / `materialize_operand_at` route the matching InputArg OpRef
     /// through). Idempotent: keeps an existing same-shape host (preserving any
-    /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
+    /// `_forwarded` chain and the chain targets naming it) and only
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
     /// the `materialize_operand_at` InputArg arm).
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
@@ -2092,8 +2089,8 @@ impl OptContext {
     /// `bound_is_synthetic` rebind path later upgrades the binding to
     /// the real producer via `bind_op`'s carry-over. The synthetic
     /// stays referenced from `resop_refs` for the OptContext's
-    /// lifetime so lingering `Forwarded::Op(_)` `Weak<Op>` upgrades
-    /// stay valid until rebind.
+    /// lifetime so a repeat lookup of the position resolves to the same
+    /// `_forwarded` host until rebind.
     pub(crate) fn mint_synthetic_resop(
         &mut self,
         opref: OpRef,
@@ -2179,9 +2176,7 @@ impl OptContext {
             // this link its box-native walk freezes on the orphaned
             // stand-in while `find_producer_op` resolves `op`, so a later
             // operand fold lands on a different host than the OpRef path
-            // observes. `superseded` stays alive in operand `Operand::Op`
-            // strong refs, so the `Weak` upgrades and the chain reaches
-            // `op`. Mirrors `emit`'s live-synthetic catch-up so a
+            // observes. Mirrors `emit`'s live-synthetic catch-up so a
             // supersession chain (stand-in → extra-producer → emitted op)
             // stays transitively resolvable to the final producer.
             use majit_ir::forwarding::ForwardingHost;
@@ -2319,8 +2314,8 @@ impl OptContext {
 
     /// Record every input op's resop producer `OpRc` into
     /// `resop_refs` so any `Forwarded::Op(_)` chain step targeting the
-    /// slot has an upgradable `Weak<Op>` from the start of the
-    /// optimization run. Absent this pre-pass, `getintbound_box` →
+    /// slot resolves to a bound host from the start of the optimization
+    /// run. Absent this pre-pass, `getintbound_box` →
     /// `get_box_replacement_operand_opt` (a `&self` reader) can land on an
     /// unbound terminal and a subsequent `set_forwarded_info` write
     /// trips `write_forwarded`'s bound-precondition assert.
@@ -3091,9 +3086,6 @@ impl OptContext {
             // orphaned stand-in while the OpRef path resolves `op_rc`, so a
             // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
             // on a different host and `resolve_operand_operand`'s witness diverges.
-            // `synth` stays alive in `resop_refs` (seeded there alongside
-            // `live_synthetics`), so its `Weak` upgrades and the chain reaches
-            // `op_rc`.
             if !std::rc::Rc::ptr_eq(&synth, &op_rc) {
                 use majit_ir::forwarding::ForwardingHost;
                 synth.set_forwarded_op(&op_rc);
@@ -4599,7 +4591,7 @@ impl OptContext {
                 .expect("is_constant() implies const_value() Some");
             op.set_forwarded_const(majit_ir::Const::from_value(value));
         } else if let Some(target_op) = newop.bound_op() {
-            // Op-target chain step: route through Forwarded::Op(Weak<Op>)
+            // Op-target chain step: route through Forwarded::Op(Rc<Op>)
             // so the chain refers to the canonical Rc<Op> (PyPy
             // resoperation.py set_forwarded(forwarded_to) where
             // forwarded_to is an AbstractResOp), i.e. the
@@ -8110,6 +8102,13 @@ impl OptContext {
                     Forwarded::Info(_) => {
                         return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
                     }
+                    // `resolved` came out of `get_box_replacement(false)`,
+                    // which walks `Op` / `InputArg` steps to exhaustion and
+                    // materializes a `Const` target, so none of the three can
+                    // still be the slot here. That holds because the slot owns
+                    // its target (`forwarding.rs Forwarded::Op`); while it held
+                    // a `Weak`, a dropped target ended the walk one hop early
+                    // and this arm fired.
                     Forwarded::Const(_) | Forwarded::Op(_) | Forwarded::InputArg(_) => {
                         unreachable!("chain walker terminal")
                     }
@@ -9085,7 +9084,7 @@ mod boxref_forwarding_tests {
         }
         // old's slot now points to new. Bound-InputArg target routes through
         // `set_forwarded_inputarg`, so the slot carries
-        // `Forwarded::InputArg(Weak<InputArg>)`; chain walk lands on a
+        // `Forwarded::InputArg(Rc<InputArg>)`; chain walk lands on a
         // transient operand sharing `ia_holder[1]`'s identity.
         assert!(matches!(b0.get_forwarded(), BoxForwarded::InputArg(_)));
         let walked = b0.get_box_replacement(false);
@@ -9500,8 +9499,8 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (b, ia) = bound_inputarg_operand(Type::Ref, 0);
         ctx.seed_boxes_canonical(std::slice::from_ref(&b));
-        // Keep the InputArgRc alive in ctx so the Weak<InputArg> in
-        // `b.inputarg_handle` upgrades across the test body.
+        // Register the InputArgRc as the slot's canonical host so the
+        // context's readers resolve to it across the test body.
         ctx.inputarg_refs = vec![ia];
         (ctx, b)
     }
