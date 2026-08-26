@@ -1146,7 +1146,14 @@ mod tests {
         // The pointer walk is entered only for a view that has suboffsets;
         // an empty vector keeps the byte-index walk, strides and all.
         let block: [u8; 6] = [1, 2, 3, 4, 5, 6];
-        let view = cbuffer_over(block.as_ptr(), block.len(), vec![2, 3], vec![3, 1], vec![], 1);
+        let view = cbuffer_over(
+            block.as_ptr(),
+            block.len(),
+            vec![2, 3],
+            vec![3, 1],
+            vec![],
+            1,
+        );
         assert_eq!(unsafe { view.gather() }, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(unsafe { view.gather_order(true) }, vec![1, 4, 2, 5, 3, 6]);
         assert_eq!(unsafe { *view.element_ptr(&[1, 2]) }, 6);

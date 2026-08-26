@@ -157,7 +157,12 @@ fn dims(pointer: *const isize, ndim: i64) -> Vec<i64> {
 ///
 /// # Safety
 /// `view` must point at a filled `Py_buffer`.
-unsafe fn shape_and_strides(view: *const CPyBuffer, ndim: i64, itemsize: i64, length: i64) -> (Vec<i64>, Vec<i64>) {
+unsafe fn shape_and_strides(
+    view: *const CPyBuffer,
+    ndim: i64,
+    itemsize: i64,
+    length: i64,
+) -> (Vec<i64>, Vec<i64>) {
     let (shape_ptr, strides_ptr) = unsafe { ((*view).shape, (*view).strides) };
     if ndim <= 0 {
         return (Vec::new(), Vec::new());
@@ -644,12 +649,11 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
             true => export.strides.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
-        (*view).suboffsets = match !export.suboffsets.is_empty()
-            && flags & PY_BUF_INDIRECT == PY_BUF_INDIRECT
-        {
-            true => export.suboffsets.as_mut_ptr(),
-            false => std::ptr::null_mut(),
-        };
+        (*view).suboffsets =
+            match !export.suboffsets.is_empty() && flags & PY_BUF_INDIRECT == PY_BUF_INDIRECT {
+                true => export.suboffsets.as_mut_ptr(),
+                false => std::ptr::null_mut(),
+            };
         (*view).internal = Box::into_raw(export) as *mut c_void;
         GEOMETRIES.lock().insert((*view).internal as usize);
     }
@@ -1046,9 +1050,7 @@ pub unsafe extern "C" fn PyBuffer_ToContiguous(
     // This is what 'A' asks for over a Fortran-contiguous source: its own
     // physical bytes, not the C-order walk below.
     if unsafe { PyBuffer_IsContiguous(view, order) } != 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping((*view).buf as *const u8, target, length as usize)
-        };
+        unsafe { std::ptr::copy_nonoverlapping((*view).buf as *const u8, target, length as usize) };
         return 0;
     }
     unsafe {
@@ -1081,9 +1083,7 @@ pub unsafe extern "C" fn PyBuffer_FromContiguous(
     // As in `PyBuffer_ToContiguous`, an already-contiguous destination takes
     // the whole run at once.
     if unsafe { PyBuffer_IsContiguous(view, order) } != 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(source, (*view).buf as *mut u8, length as usize)
-        };
+        unsafe { std::ptr::copy_nonoverlapping(source, (*view).buf as *mut u8, length as usize) };
         return 0;
     }
     unsafe {
