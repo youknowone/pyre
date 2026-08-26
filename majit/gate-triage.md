@@ -121,7 +121,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-translate/src/decline.rs`
 - Accessor: `level()`
-- What it does: Census of the lowering gates' silent declines. Unset, `0`, or empty disables it; any other value counts declines per (gate, reason) and prints runtime reasons; `2` additionally prints one line per decline event. `PYRE_MIR_FRONTEND_DEBUG` is accepted as an alias at the counter level.
+- What it does: Census of the lowering gates' silent declines. Unset, `0`, or empty disables it; any other value counts declines per (gate, reason) and prints runtime reasons; `2` additionally prints one line per decline event. `MAJIT_MIR_FRONTEND_DEBUG` is accepted as an alias at the counter level.
 - Retirement condition: retire when the decline counts are no longer needed to steer cel lowering coverage.
 
 ### `MAJIT_DIAG`

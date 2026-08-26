@@ -40,7 +40,7 @@
 //!
 //! # Switches
 //!
-//! `MAJIT_DECLINE_LOG` is the switch; `PYRE_MIR_FRONTEND_DEBUG` (the
+//! `MAJIT_DECLINE_LOG` is the switch; `MAJIT_MIR_FRONTEND_DEBUG` (the
 //! existing front-end debug switch, `front/checked_arith.rs` et al.) is
 //! accepted as an alias at level 1 so a reader who already knows this
 //! codebase's debug channel does not have to learn a second one.
@@ -48,7 +48,7 @@
 //! | value | effect |
 //! |---|---|
 //! | unset | disabled — no counting, no output, no formatting |
-//! | `1` (or `PYRE_MIR_FRONTEND_DEBUG` set) | count per (gate, reason); [`record_reason`] also prints its runtime reason |
+//! | `1` (or `MAJIT_MIR_FRONTEND_DEBUG` set) | count per (gate, reason); [`record_reason`] also prints its runtime reason |
 //! | `2` | the above, plus one stderr line per individual decline |
 //!
 //! Level 1 does not print per-event lines because the instrumented gates
@@ -136,10 +136,10 @@ fn level() -> Level {
         Some(_) => Level::Counters,
         // Alias: the front end's established debug switch turns the
         // census on at counter level, so a reader who already reaches
-        // for `PYRE_MIR_FRONTEND_DEBUG` gets the decline rows too
+        // for `MAJIT_MIR_FRONTEND_DEBUG` gets the decline rows too
         // rather than finding a second, parallel channel for the same
         // job.
-        None if std::env::var_os("PYRE_MIR_FRONTEND_DEBUG").is_some() => Level::Counters,
+        None if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() => Level::Counters,
         None => Level::Off,
     })
 }
