@@ -2291,6 +2291,12 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // own breach and another thread's STW request. Delivering first would
         // run a handler through a world the collector has asked to stop.
         if majit_ir::eval_breaker_word::take_memory_error() {
+            // Park again, on a fresh read: the test above ran against the
+            // dispatch-time copy of the word, and the collection between them
+            // is a whole major cycle, so a request that arrived during it is
+            // not in that copy. Delivery runs a Python handler, which must not
+            // run through a world the collector has asked to stop.
+            majit_gc::gc_sync::safepoint_poll();
             let mut err = crate::PyError::memory_error("");
             if handle_exception(frame, &mut err, &mut next_instr) {
                 continue;

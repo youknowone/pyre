@@ -9080,6 +9080,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // stale test does not delay the exception, it drops it, and the
         // program's next sign of a full heap is the abort on the second breach.
         if majit_ir::eval_breaker_word::take_memory_error() {
+            // Park again, on a fresh read: the test above ran against the
+            // dispatch-time copy of the word, and the collection between them
+            // is a whole major cycle, so a request that arrived during it is
+            // not in that copy. Delivery runs a Python handler, which must not
+            // run through a world the collector has asked to stop.
+            majit_gc::gc_sync::safepoint_poll();
             let mut err = pyre_interpreter::PyError::memory_error("");
             let mut next_instr = unsafe { &*f }.next_instr();
             if pyre_interpreter::eval::handle_exception(
