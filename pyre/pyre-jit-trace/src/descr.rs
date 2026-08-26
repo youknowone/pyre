@@ -1457,6 +1457,69 @@ static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
     )
 });
 
+/// `W_SetObject`, the body `set` and `frozenset` share.
+///
+/// `setobject.py W_BaseSetObject.length` is `self.strategy.length(self)`; pyre
+/// keeps the count in a field of the body instead, so the answer is one read
+/// once the receiver's class is pinned.  `len` is declared MUTABLE even though
+/// a published `frozenset` never moves it: the field is the same slot on both
+/// types and every mutator that moves the count -- `w_set_add`,
+/// `w_set_discard`, `w_set_clear`, `w_set_popitem` and the bulk updates --
+/// stores through `set_len_relaxed`, so a read must not hoist out of a loop
+/// that can mutate the receiver.  The slot is an `AtomicUsize` written
+/// `Relaxed`; the descr declares it `Type::Int` at `offset_of!`, the same
+/// declaration `W_ListObject.length` and `W_BytearrayObject.length` carry
+/// over their own atomic slots.
+///
+/// One STRUCT gets one def-path-keyed group (see [`DECLARED_GROUPS`]), so the
+/// vtable here is `SET_TYPE` and a `frozenset` receiver reads its length
+/// through the same field descr.  The parent vtable is consulted in exactly
+/// one place — `protect_speculative_field`, off `optimizeopt`'s
+/// `GETFIELD_GC_PURE_*` branch — and a mutable field never reaches it, which
+/// is the same declaration `set` requires on its own.  Registering a second
+/// group under this def path would not give `frozenset` its own vtable
+/// anyway: `register_keyed_size` arbitrates by field count with both vtables
+/// non-zero, so an equal-length twin loses the slot, and `_cache_field`
+/// re-parenting would cross-wire the two.
+static W_SET_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::setobject::W_SET_OBJECT_SIZE,
+        W_SET_GC_TYPE_ID,
+        &pyre_object::setobject::SET_TYPE as *const _ as usize,
+        &[
+            (
+                "items",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, items),
+                std::mem::size_of::<*mut pyre_object::setobject::SetItemsStorage>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "len",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, len),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "hash",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, hash),
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+        ],
+        "W_SetObject",
+        "setobject::W_SetObject",
+    )
+});
+
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
@@ -4351,6 +4414,12 @@ pub fn bytearray_length_descr() -> DescrRef {
     field_descr_from_group(&W_BYTEARRAY_DESCR_GROUP, 1)
 }
 
+/// `W_SetObject.len` — the count `setobject.py`'s `length` answers with,
+/// reached there through the strategy. Mutable; see [`W_SET_DESCR_GROUP`].
+pub fn set_len_descr() -> DescrRef {
+    field_descr_from_group(&W_SET_DESCR_GROUP, 1)
+}
+
 pub fn str_len_descr() -> DescrRef {
     // Python len(str) returns codepoint count.
     // unicodeobject.py W_UnicodeObject._len() → _length field.
@@ -6785,6 +6854,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("bytearrayobject::W_BytearrayObject", || {
         LazyLock::force(&W_BYTEARRAY_DESCR_GROUP);
+    }),
+    ("setobject::W_SetObject", || {
+        LazyLock::force(&W_SET_DESCR_GROUP);
     }),
     ("functional::W_IntRangeIterator", || {
         LazyLock::force(&RANGE_ITER_DESCR_GROUP);
