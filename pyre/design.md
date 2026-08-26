@@ -533,12 +533,14 @@ recorder, or the green accounts for.
 
 pyre records traces through 70 `try_walker_specialize_*` functions — 68 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
-`inline_call.rs` — 10,288 lines of body inside `specialize.rs`'s 16,968,
+`inline_call.rs` — roughly 10.3k lines of body inside `specialize.rs`'s 17k,
 described by the 73 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
 and some rows are gate labels inside a larger arm rather than functions of
-their own). Every figure here is re-derivable: `rg -c 'fn
-try_walker_specialize_'` over the three files, `wc -l` on `specialize.rs`, and
-the length of `SPEC_FOLD_ROWS`. Nothing in this charter named that layer
+their own). The counts are exact and the line figures deliberately are not:
+a fold count moves only when a fold is added or retired, while a line count
+moves whenever anyone touches the file and carries no part of the argument.
+Both are re-derivable: `rg -c 'fn try_walker_specialize_'` over the three
+files and the length of `SPEC_FOLD_ROWS`. Nothing in this charter named that layer
 before 2026-08-26, which is itself the finding: it is the largest single
 adaptation in the tree.
 
@@ -580,24 +582,29 @@ blockers and retired zero folds. A separate census over the synthetic corpus
 found no fold with `consulted=0`, so the layer is not merely carrying dead
 arms — `load_deref` alone never fired.
 
-**What does not hold it in place.** Only 15 fixtures carry a `spec-folds=`
-header and they name 25 distinct folds between them, so 51 of the 76 rows have
-no fixture coupling at all. Retirement is blocked by reach, not by headers.
+**What does not hold it in place.** 23 fixtures carry a `spec-folds=` header
+and they name 44 distinct labels between them, so 29 of the 73 rows have no
+fixture coupling at all. Retirement is blocked by reach, not by headers.
+(`rg -o 'spec-folds=[A-Za-z0-9_,]+' pyre/bench/synth/*.py`, split on commas,
+against the row list.)
 
-**The bounded first step** is the type-identity group — `builtin_type`,
-`builtin_isinstance`, `builtin_issubclass`, 291 lines — because it is the
-smallest group that is entirely fixture-free *and* whose upstream counterpart
-is a pass that pyre has already ported (`PtrEq | InstancePtrEq` is registered
-in `executor.rs` and reached through `OptPure`). Its go/no-go is a
-measurement, not a design question: whether the descent declines on those
-three callables and on which blocker. Until that is run, the step is proposed
-and not accepted.
+**The bounded first step is not specified.** This entry named one — the
+type-identity group, "`builtin_type`, `builtin_isinstance`,
+`builtin_issubclass`, 291 lines" — and **none of those three exists**: no
+`try_walker_specialize_` function and no `SPEC_FOLD_ROWS` row carries any of
+those names, so neither the group membership nor the 291 lines was ever
+measurable. The folds whose names point that way are `builtin_type_getattr`,
+`load_type_attr` and `load_type_name_attr`, and whether they are one group is
+exactly the question the removed `n` column could not answer. Specifying a
+first step therefore needs the grouping settled from the fold bodies first;
+until then there is no measurement to run, and any plan quoting those three
+names is quoting something that is not in the tree.
 
-**Falsification.** If making those three callables descendable does not let
-their folds be retired with the corpus unchanged, then reach is not the
-binding constraint and this entry is wrong — the layer would then be
-compensating for something the descent cannot reach in principle, and the
-right response is to say what that is rather than to widen the descent again.
+**Falsification.** If making a group's callables descendable does not let its
+folds be retired with the corpus unchanged, then reach is not the binding
+constraint and this entry is wrong — the layer would then be compensating for
+something the descent cannot reach in principle, and the right response is to
+say what that is rather than to widen the descent again.
 
 ---
 
