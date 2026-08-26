@@ -162,10 +162,17 @@ WASM_TIMEOUT_SCALE = 4.0
 # What does is the rest of the census, and it is worth stating because the
 # ceiling has now been widened twice by a fixture that was never going to be
 # caught by widening it. Two ubuntu runs of one base gate 299 fixtures between
-# them. Outside the two that still carry an allowance (builtin_folds_hot
-# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst is foriter_make_function_body at
-# 3.74x, then short_circuit_boxed_int_cross_fn 3.0x/3.5x and
-# pickle_terminal_raise_resume steady at 3.4x.
+# them, and the worst is foriter_make_function_body at 3.74x, then
+# short_circuit_boxed_int_cross_fn 3.0x/3.5x and pickle_terminal_raise_resume
+# steady at 3.4x.
+#
+# ⛔Every one of those is a gated reading, not an exempted one: no fixture in
+# the tree carries a `max-wasm-ratio` header any more. This paragraph used to
+# except builtin_folds_hot and math_folds_hot as allowance-holders and no longer
+# can. The ratios are from a base that has since moved -- one later ubuntu run
+# of 249 gated fixtures read pickle_terminal_raise_resume worst at 3.26x with
+# foriter_make_function_body absent from the table, which under the union rule
+# below is a reason to census again, not a refutation of 3.74x.
 #
 # Under the highest-observed-plus-15% rule the allowances are fitted with, that
 # 3.74x asks for 4.30x -- ABOVE this constant. 4.0 is therefore not slack: it

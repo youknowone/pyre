@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=hot
 # A profiler and a trace function are both installed on a loop the JIT already
 # compiled, and the trace callback raises.
 #
