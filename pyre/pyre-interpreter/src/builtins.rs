@@ -251,6 +251,18 @@ unsafe fn w_memoryview_cast_1d(mv_src: PyObjectRef, fmt: &str, itemsize: i64) ->
     }
 }
 
+/// `picklebuf_raw` — the 1-D unsigned-byte view over the bytes of a buffer
+/// that is contiguous in either order, in physical order.
+///
+/// `memoryview.cast` refuses a Fortran-contiguous source and is right to: a
+/// cast is defined on C order.  `raw()` is not a cast — it rewrites the view's
+/// format, ndim, itemsize, shape and strides and marks the result contiguous
+/// both ways — so it takes an `'A'`-order source.  The caller owns the
+/// contiguity check; this only reinterprets.
+pub(crate) fn memoryview_raw_bytes(mv: PyObjectRef) -> PyObjectRef {
+    unsafe { w_memoryview_cast_1d(mv, "B", 1) }
+}
+
 /// `descr_cast` with a shape — `_cast_to_1D` then `_cast_to_ND`
 /// (`memoryobject.py:599-603`): a `ViewND` reshaping a fresh `View1D` over
 /// the source view.  The shape / strides tuples are built and pinned inside

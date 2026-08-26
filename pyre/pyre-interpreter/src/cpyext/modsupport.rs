@@ -249,11 +249,31 @@ fn store(module: PyObjectRef, name: &str, value: PyObjectRef) {
     crate::module_ns_store(module_dict(module), name, value);
 }
 
+/// `_add_methods_to_object` / `modsupport.py:157` — the same store against
+/// whatever a create slot answered.
+///
+/// Only a module has the proxy-free dict [`store`] writes straight through;
+/// anything else takes the ordinary attribute path, which is what upstream
+/// uses for both.
+fn store_on_object(
+    target: PyObjectRef,
+    name: &str,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    if unsafe { pyre_object::module::is_module(target) } {
+        store(target, name, value);
+        return Ok(());
+    }
+    crate::baseobjspace::setattr_str(target, name, value).map(drop)
+}
+
 /// `modsupport.py:convert_method_defs`, module branch.
 ///
 /// The table is NUL-name terminated.  `METH_CLASS` / `METH_STATIC` are
 /// rejected here exactly as upstream rejects them for a module-level table;
 /// their type-level meaning arrives with C-defined types.
+///
+/// `module` is whatever the create slot answered, so it need not be one.
 fn convert_method_defs(
     module: PyObjectRef,
     methods: *mut CPyMethodDef,
@@ -287,11 +307,11 @@ fn convert_method_defs(
         )?;
         let function_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(function);
-        store(
+        store_on_object(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             &name,
             pyre_object::gc_roots::shadow_stack_get(function_slot),
-        );
+        )?;
     }
 }
 
@@ -339,6 +359,25 @@ fn populate_module(
         store(reload(module_slot), "__file__", reload(value_slot));
     }
 
+    add_methods_and_doc(reload(module_slot), def, name)
+}
+
+/// The tail of `moduleobject.c PyModule_FromDefAndSpec2`: `m_methods` and
+/// `m_doc` go on whatever the create slot answered, module or not.
+///
+/// `_testmultiphase`'s `nonmodule_with_methods` answers a `SimpleNamespace`
+/// and still declares a method table, which is the case that separates this
+/// from the module-only fields [`populate_module`] sets.
+fn add_methods_and_doc(
+    module: PyObjectRef,
+    def: *mut CPyModuleDef,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(module);
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+
     let w_name = pyre_object::w_str_new(name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_name);
@@ -353,7 +392,7 @@ fn populate_module(
         let value = pyre_object::w_str_new(&doc);
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(value);
-        store(reload(module_slot), "__doc__", reload(value_slot));
+        store_on_object(reload(module_slot), "__doc__", reload(value_slot))?;
     }
 
     Ok(reload(module_slot))
@@ -706,7 +745,11 @@ pub(super) fn create_module_from_def_and_spec(
                 ),
             ));
         }
-        return Ok(pyre_object::gc_roots::shadow_stack_get(module_slot));
+        return add_methods_and_doc(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            def,
+            name,
+        );
     }
     populate_module(
         pyre_object::gc_roots::shadow_stack_get(module_slot),

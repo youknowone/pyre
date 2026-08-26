@@ -5,7 +5,12 @@
 //! ordinary heap objects carrying ASDL fields and source locations.
 
 use pyre_object::{PY_NULL, PyObjectRef};
+use rustpython_compiler::codegen::{
+    interpolated_string_literal_value, string_literal_part_value, string_literal_value,
+};
+use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 type AstResult<T> = Result<T, crate::PyError>;
 
@@ -267,7 +272,7 @@ impl ObjectConverter {
                 "AST identifier must be of type str",
             ));
         }
-        Ok(unsafe { pyre_object::w_str_get_value(value).to_string() })
+        Ok(utf8_only(value)?.to_string())
     }
 
     /// How `%R` names the value an error rejected.
@@ -1691,9 +1696,7 @@ impl ObjectConverter {
                 )))
             } else if pyre_object::is_str(object) {
                 Ok(ast::ConstantValue::Str(
-                    pyre_object::w_str_get_value(object)
-                        .to_string()
-                        .into_boxed_str(),
+                    utf8_only(object)?.to_string().into_boxed_str(),
                 ))
             } else if pyre_object::is_bytes(object) {
                 Ok(ast::ConstantValue::Bytes(
@@ -1921,7 +1924,11 @@ fn module_to_object(
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
     let _ = pyre_object::gc_roots::pin_root(module_object);
-    let converter = Converter { source, ast_module };
+    let converter = Converter {
+        source,
+        source_file: SourceFileBuilder::new("<unknown>", source).finish(),
+        ast_module,
+    };
     let root = match module {
         ast::Mod::Expression(module) => converter.node(
             "Expression",
@@ -1988,6 +1995,11 @@ type RootedResult = Result<Rooted, crate::PyError>;
 
 struct Converter<'a> {
     source: &'a str,
+    /// A literal's parsed value cannot hold a lone surrogate -- the escape
+    /// decoder answers U+FFFD for one -- so `string_literal_value` and its
+    /// siblings re-read the text the node came from.  They need the source as
+    /// a `SourceFile` to slice it by range.
+    source_file: SourceFile,
     ast_module: Rooted,
 }
 
@@ -2012,6 +2024,10 @@ impl Converter<'_> {
 
     fn string(&self, value: &str) -> Rooted {
         self.pin(pyre_object::w_str_new(value))
+    }
+
+    fn wtf8(&self, value: Wtf8Buf) -> Rooted {
+        self.pin(pyre_object::w_str_from_wtf8(value))
     }
 
     fn none(&self) -> Rooted {
@@ -2551,7 +2567,7 @@ impl Converter<'_> {
             ),
             Expr::StringLiteral(n) => self.constant(
                 range(n.range),
-                self.string(n.value.to_str()),
+                self.wtf8(string_literal_value(&self.source_file, &n.value)),
                 if n.value.is_unicode() {
                     self.string("u")
                 } else {
@@ -2688,11 +2704,13 @@ impl Converter<'_> {
         let mut parts = Vec::new();
         for part in node.value.iter() {
             match part {
-                ast::FStringPart::Literal(literal) => {
-                    push_literal(&mut parts, range(literal.range), &literal.value)
-                }
+                ast::FStringPart::Literal(literal) => push_literal(
+                    &mut parts,
+                    range(literal.range),
+                    &string_literal_part_value(&self.source_file, literal),
+                ),
                 ast::FStringPart::FString(fstring) => {
-                    self.interpolated_elements(&fstring.elements, &mut parts)?
+                    self.interpolated_elements(&fstring.elements, fstring.flags.into(), &mut parts)?
                 }
             }
         }
@@ -2709,7 +2727,7 @@ impl Converter<'_> {
             .into_iter()
             .map(|part| match part {
                 JoinedPart::Literal { start, end, value } => {
-                    self.constant((start, end), self.string(&value), self.none())
+                    self.constant((start, end), self.wtf8(value), self.none())
                 }
                 JoinedPart::Value(value) => Ok(value),
             })
@@ -2719,13 +2737,16 @@ impl Converter<'_> {
     fn interpolated_elements(
         &self,
         elements: &[ast::InterpolatedStringElement],
+        flags: ast::AnyStringFlags,
         parts: &mut Vec<JoinedPart>,
     ) -> Result<(), crate::PyError> {
         for element in elements {
             match element {
-                ast::InterpolatedStringElement::Literal(literal) => {
-                    push_literal(parts, range(literal.range), &literal.value)
-                }
+                ast::InterpolatedStringElement::Literal(literal) => push_literal(
+                    parts,
+                    range(literal.range),
+                    &interpolated_string_literal_value(&self.source_file, literal, flags),
+                ),
                 ast::InterpolatedStringElement::Interpolation(interpolation) => {
                     let mut conversion = interpolation.conversion;
                     if let Some(debug_text) = interpolation.debug_text.as_ref() {
@@ -2745,7 +2766,7 @@ impl Converter<'_> {
                         .as_deref()
                         .map(|spec| {
                             let mut spec_parts = Vec::new();
-                            self.interpolated_elements(&spec.elements, &mut spec_parts)?;
+                            self.interpolated_elements(&spec.elements, flags, &mut spec_parts)?;
                             let values = self.joined_values(spec_parts)?;
                             self.node(
                                 "JoinedStr",
@@ -2794,7 +2815,11 @@ impl Converter<'_> {
                 start.saturating_sub(leading.len() as u32),
                 end + trailing.len() as u32,
             ),
-            &[leading.as_str(), expression, trailing.as_str()].concat(),
+            Wtf8::new(
+                [leading.as_str(), expression, trailing.as_str()]
+                    .concat()
+                    .as_str(),
+            ),
         );
     }
 
@@ -3302,11 +3327,15 @@ fn class_name(object: PyObjectRef) -> &'static str {
 /// implicit concatenation, the text an `=` conversion echoes -- therefore
 /// reaches the tree as one node, not one per piece.
 enum JoinedPart {
-    Literal { start: u32, end: u32, value: String },
+    Literal {
+        start: u32,
+        end: u32,
+        value: Wtf8Buf,
+    },
     Value(Rooted),
 }
 
-fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &str) {
+fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &Wtf8) {
     if value.is_empty() {
         return;
     }
@@ -3317,14 +3346,41 @@ fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &s
     }) = parts.last_mut()
     {
         *last_end = end;
-        last.push_str(value);
+        last.push_wtf8(value);
         return;
     }
     parts.push(JoinedPart::Literal {
         start,
         end,
-        value: value.to_string(),
+        value: value.to_owned(),
     });
+}
+
+/// The `&str` a compiler AST field is, or the refusal `PyUnicode_AsUTF8`
+/// answers with for the same value.
+///
+/// `ast::ConstantValue::Str` and every identifier field are `str`, so a lone
+/// surrogate has nowhere to go on the way back into the compiler.  It gets
+/// there through an ordinary `ast.parse` round trip, since the tree the parse
+/// answers does carry one, and [`w_str_get_value`] would take the process
+/// down over it.
+///
+/// [`w_str_get_value`]: pyre_object::w_str_get_value
+fn utf8_only(value: PyObjectRef) -> AstResult<&'static str> {
+    if let Some(text) = unsafe { pyre_object::w_str_get_value_opt(value) } {
+        return Ok(text);
+    }
+    let position = unsafe { pyre_object::w_str_get_wtf8(value) }
+        .code_points()
+        .position(|point| point.to_char().is_none())
+        .expect("not valid UTF-8, so one of the code points is a surrogate");
+    Err(crate::typedef::unicode_encode_error(
+        "utf-8",
+        value,
+        position,
+        position + 1,
+        "surrogates not allowed",
+    ))
 }
 
 /// A comment inside the braces runs to the end of the line and is no part of

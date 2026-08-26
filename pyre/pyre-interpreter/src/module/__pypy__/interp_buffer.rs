@@ -332,6 +332,10 @@ impl W_PickleBuffer {
     /// itemsize 1) that aliases the source and preserves its read-only flag,
     /// regardless of the source's element format; extracting it from a
     /// non-contiguous buffer raises `BufferError`.
+    ///
+    /// `picklebufobject.c:161` asks `PyBuffer_IsContiguous(&view, 'A')`, so a
+    /// Fortran-contiguous buffer qualifies: the bytes are still one run, and
+    /// what `raw()` promises is the physical order, not the logical one.
     fn raw(&self) -> Result<PyObjectRef, PyError> {
         let w_obj = self.w_obj;
         if unsafe { pyre_object::is_none(w_obj) } {
@@ -340,17 +344,16 @@ impl W_PickleBuffer {
         let mv_type = memoryview_type()
             .ok_or_else(|| PyError::runtime_error("memoryview type unavailable"))?;
         let mv = crate::module::_pickle::call_fn(mv_type, &[w_obj])?;
-        // Raw extraction is only defined for a C-contiguous buffer.
-        let w_contig = crate::baseobjspace::getattr_str(mv, "c_contiguous")?;
+        let w_contig = crate::baseobjspace::getattr_str(mv, "contiguous")?;
         if !crate::baseobjspace::is_true(w_contig)? {
             return Err(PyError::new(
                 crate::PyErrorKind::BufferError,
                 "cannot extract raw buffer from non-contiguous buffer",
             ));
         }
-        // Normalize to the raw byte layout via `cast('B')` so an `array('i')`
-        // or other non-`'B'` source still yields a byte view.
-        crate::module::_pickle::call_meth(mv, "cast", &[pyre_object::unicodeobject::w_str_new("B")])
+        // Normalize to the raw byte layout so an `array('i')` or other
+        // non-`'B'` source still yields a byte view.
+        Ok(crate::builtins::memoryview_raw_bytes(mv))
     }
 
     /// PEP 688 exporter slot exposed by CPython 3.14's `pickle.PickleBuffer`.
@@ -533,6 +536,9 @@ fn is_memoryview(obj: PyObjectRef) -> bool {
 /// Extract `(contents, readonly)` from a buffer exporter: `bytes` is
 /// read-only, `bytearray` and `array` are mutable, and a `memoryview` reports
 /// both through its own contents and `readonly` flag.
+///
+/// The contents are the bytes in physical order, which is what the buffer a
+/// `PickleBuffer` saves is defined to be.
 pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> {
     unsafe {
         if pyre_object::is_bytes(obj) {
@@ -552,7 +558,13 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
         }
     }
     if is_memoryview(obj) {
-        let w_data = crate::module::_pickle::call_meth(obj, "tobytes", &[])?;
+        // `_pickle.c:2691` writes `view.buf` for `view.len` bytes — the
+        // physical run.  `memoryview.tobytes()` walks the strides instead, and
+        // the two orders differ for a Fortran-contiguous export, so the raw
+        // 1-D reinterpretation is what goes into the stream.  The only caller
+        // has already refused a buffer contiguous in neither order.
+        let raw = crate::builtins::memoryview_raw_bytes(obj);
+        let w_data = crate::module::_pickle::call_meth(raw, "tobytes", &[])?;
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_data) }.to_vec();
         let w_ro = crate::baseobjspace::getattr_str(obj, "readonly")?;
         return Ok((data, crate::baseobjspace::is_true(w_ro)?));
@@ -563,13 +575,14 @@ pub(crate) fn buffer_view(obj: PyObjectRef) -> Result<(Vec<u8>, bool), PyError> 
     )))
 }
 
-/// Whether the wrapped exporter's buffer is C-contiguous, matching the
-/// `_pickle` save path's `iscontiguous(buf)` guard. `bytes`/`bytearray`/`array`
-/// are one-dimensional and always contiguous; a `memoryview` reports through
-/// its `c_contiguous` flag.
+/// Whether the wrapped exporter's buffer is contiguous in either order, which
+/// is what `_pickle.c:2683` asks of the one it is about to save.
+///
+/// `bytes`/`bytearray`/`array` are one-dimensional and always contiguous; a
+/// `memoryview` reports through its `contiguous` flag, the `'A'` order one.
 pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
     if is_memoryview(obj) {
-        let w = crate::baseobjspace::getattr_str(obj, "c_contiguous")?;
+        let w = crate::baseobjspace::getattr_str(obj, "contiguous")?;
         return crate::baseobjspace::is_true(w);
     }
     Ok(true)
