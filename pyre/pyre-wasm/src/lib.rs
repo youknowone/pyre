@@ -852,6 +852,19 @@ fn run_python_impl(source: &str) -> String {
     let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
     pyre_interpreter::importing::set_sys_module("__main__", main_module);
 
+    // Create `sys` before user code runs, as `run_script_path` does. Nothing on
+    // this entry point imports it otherwise, and the interpreter reads it
+    // directly for its own work: `_warnings.show_warning` writes through
+    // `sys.stderr` and gives up silently when the module is absent, so every
+    // warning raised before the first `import sys` disappeared.
+    let _ = pyre_interpreter::importing::importhook(
+        "sys",
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        pyre_interpreter::call::getexecutioncontext(),
+    );
+
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pyre_jit::eval::eval_with_jit(&mut frame, None)
