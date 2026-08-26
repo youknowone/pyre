@@ -3902,10 +3902,28 @@ pub fn encode_raw_unicode_escape(s: &Wtf8) -> Vec<u8> {
 /// `\UXXXXXXXX` escape; any other byte (including a lone backslash or a
 /// malformed escape) is taken as a Latin-1 code point.
 pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, crate::PyError> {
+    Ok(decode_raw_unicode_escape_stateful(data, errors, true)?.0)
+}
+
+/// `unicodeobject.c:_PyUnicode_DecodeRawUnicodeEscapeStateful` — the form that
+/// answers how many input bytes were consumed alongside the text.
+///
+/// While `final_` is false more input may still follow, so an escape that runs
+/// off the end of this chunk is left unconsumed rather than reported: the
+/// digits it is missing can arrive in the next call.  Only a sequence this
+/// chunk already decides -- `\u12zz`, which has its four bytes and they are
+/// not all hex -- reaches the error handler.
+pub fn decode_raw_unicode_escape_stateful(
+    data: &[u8],
+    errors: &str,
+    final_: bool,
+) -> Result<(Wtf8Buf, usize), crate::PyError> {
     let mut out = Wtf8Buf::new();
     // A custom error handler may replace exc.object; decoding then resumes
-    // from the new bytes (`buf`).
+    // from the new bytes (`buf`), and `pos_delta` keeps the reported consumed
+    // count relative to the original input length.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
+    let mut pos_delta = 0i64;
     let mut i = 0usize;
     while i < buf.len() {
         let b = buf[i];
@@ -3928,6 +3946,9 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
         if want != 0 {
             let escape_start = i;
             let digits_start = i + 2;
+            if !final_ && digits_start + want > buf.len() {
+                return Ok((out, (escape_start as i64 + pos_delta).max(0) as usize));
+            }
             let available_end = (digits_start + want).min(buf.len());
             let mut hex_end = digits_start;
             while hex_end < available_end && buf[hex_end].is_ascii_hexdigit() {
@@ -3977,6 +3998,7 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
                         &mut out,
                     )?;
                     if let Some(nb) = nb {
+                        pos_delta += buf.len() as i64 - nb.len() as i64;
                         buf = std::borrow::Cow::Owned(nb);
                     }
                     i = np;
@@ -3987,6 +4009,10 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
             continue;
         }
         // Not a valid escape — emit both bytes literally as Latin-1.
+        if kind.is_none() && !final_ {
+            // A trailing backslash may yet turn out to introduce `\uXXXX`.
+            return Ok((out, (i as i64 + pos_delta).max(0) as usize));
+        }
         out.push_char(b as char);
         if let Some(next) = kind {
             out.push_char(next as char);
@@ -3995,7 +4021,7 @@ pub fn decode_raw_unicode_escape(data: &[u8], errors: &str) -> Result<Wtf8Buf, c
             i += 1;
         }
     }
-    Ok(out)
+    Ok((out, (buf.len() as i64 + pos_delta).max(0) as usize))
 }
 
 fn encode_narrow(
@@ -4006,6 +4032,9 @@ fn encode_narrow(
     range_msg: &str,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(source);
     let cps: Vec<u32> = s.code_points().map(|c| c.to_u32()).collect();
     let mut out: Vec<u8> = Vec::with_capacity(cps.len());
     let mut i = 0usize;
@@ -4042,7 +4071,11 @@ fn encode_narrow(
             // narrow codec re-raises the original UnicodeEncodeError.
             "strict" | "surrogateescape" | "surrogatepass" => {
                 return Err(crate::typedef::unicode_encode_error(
-                    enc_name, source, start, end, range_msg,
+                    enc_name,
+                    pyre_object::gc_roots::shadow_stack_get(source_slot),
+                    start,
+                    end,
+                    range_msg,
                 ));
             }
             "ignore" => {}
@@ -4068,7 +4101,7 @@ fn encode_narrow(
                 let (rep, newpos) = call_registered_encode_error_handler(
                     errors,
                     enc_name,
-                    source,
+                    pyre_object::gc_roots::shadow_stack_get(source_slot),
                     cps.len(),
                     start,
                     end,
@@ -4079,7 +4112,11 @@ fn encode_narrow(
                         for rc in rcps {
                             if rc > max_cp {
                                 return Err(crate::typedef::unicode_encode_error(
-                                    enc_name, source, start, end, range_msg,
+                                    enc_name,
+                                    pyre_object::gc_roots::shadow_stack_get(source_slot),
+                                    start,
+                                    end,
+                                    range_msg,
                                 ));
                             }
                             out.push(rc as u8);
@@ -4174,6 +4211,9 @@ fn encode_utf16_32_impl(
     w_object: PyObjectRef,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_object);
     let mut out = Vec::new();
     if bom {
         emit_scalar(&mut out, 0xFEFF, is32, big_endian);
@@ -4218,7 +4258,7 @@ fn encode_utf16_32_impl(
             "strict" | "surrogateescape" => {
                 return Err(crate::typedef::unicode_encode_error(
                     codec,
-                    w_object,
+                    pyre_object::gc_roots::shadow_stack_get(object_slot),
                     index,
                     index + 1,
                     "surrogates not allowed",
@@ -4228,7 +4268,7 @@ fn encode_utf16_32_impl(
                 let (rep, newpos) = call_registered_encode_error_handler(
                     errors,
                     codec,
-                    w_object,
+                    pyre_object::gc_roots::shadow_stack_get(object_slot),
                     cps.len(),
                     index,
                     index + 1,
@@ -4240,7 +4280,7 @@ fn encode_utf16_32_impl(
                             if rc >= 0x80 {
                                 return Err(crate::typedef::unicode_encode_error(
                                     codec,
-                                    w_object,
+                                    pyre_object::gc_roots::shadow_stack_get(object_slot),
                                     index,
                                     index + 1,
                                     "surrogates not allowed",
@@ -4254,7 +4294,7 @@ fn encode_utf16_32_impl(
                         if b.len() % unit != 0 {
                             return Err(crate::typedef::unicode_encode_error(
                                 codec,
-                                w_object,
+                                pyre_object::gc_roots::shadow_stack_get(object_slot),
                                 index,
                                 index + 1,
                                 "surrogates not allowed",
@@ -4441,23 +4481,39 @@ fn call_decode_error_handler(
             format!("unknown error handler name '{err_mode}'"),
         )
     })?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_handler);
 
     let w_exc =
         crate::typedef::unicode_decode_error(codec, data, start, end, reason).to_exc_object();
-    let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
+    let _ = pyre_object::gc_roots::pin_root(w_exc);
+    let w_res = crate::baseobjspace::call_function(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+    );
     if w_res.is_null() {
         return Err(crate::call::take_call_error()
             .unwrap_or_else(|| crate::PyError::type_error("error handler failed")));
     }
+    let _ = pyre_object::gc_roots::pin_root(w_res);
 
-    if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
+    if !unsafe { pyre_object::is_tuple(pyre_object::gc_roots::shadow_stack_get(sp + 2)) }
+        || unsafe { pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(sp + 2)) } != 2
+    {
         return Err(crate::PyError::type_error(
             "decoding error handler must return (str, int) tuple",
         ));
     }
-    let w_replace = unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap() };
-    let w_newpos = unsafe { pyre_object::w_tuple_getitem(w_res, 1).unwrap() };
-    if !unsafe { pyre_object::is_str(w_replace) } {
+    let w_replace = unsafe {
+        pyre_object::w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(sp + 2), 0).unwrap()
+    };
+    let _ = pyre_object::gc_roots::pin_root(w_replace);
+    let w_newpos = unsafe {
+        pyre_object::w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(sp + 2), 1).unwrap()
+    };
+    let _ = pyre_object::gc_roots::pin_root(w_newpos);
+    if !unsafe { pyre_object::is_str(pyre_object::gc_roots::shadow_stack_get(sp + 3)) } {
         return Err(crate::PyError::type_error(
             "decoding error handler must return (str, int) tuple",
         ));
@@ -4469,13 +4525,17 @@ fn call_decode_error_handler(
     // decode C code checks PyBytes_Check on the reread object).
     let new_bytes = match resume_in {
         DecodeResume::RereadObject => {
-            let w_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_object(w_exc) };
+            let w_obj = unsafe {
+                pyre_object::interp_exceptions::w_exception_get_object(
+                    pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                )
+            };
             if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
                 return Err(crate::PyError::type_error(
                     "UnicodeError 'object' attribute must be a bytes",
                 ));
             }
-            Some(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) })
+            Some(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec())
         }
         #[cfg(not(target_arch = "wasm32"))]
         DecodeResume::OriginalInput => None,
@@ -4484,17 +4544,18 @@ fn call_decode_error_handler(
     // newpos folds against the length of whichever buffer decoding resumes
     // in: the reread object (unicodeobject.c insize), or the one it started
     // on (`multibytecodec_decerror`'s `size`).
-    let length = new_bytes.map_or(data.len(), <[u8]>::len) as i64;
-    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
-        Ok(n) => n,
-        Err(e) => {
-            if e.kind == crate::PyErrorKind::OverflowError {
-                -1
-            } else {
-                return Err(e);
+    let length = new_bytes.as_ref().map_or(data.len(), Vec::len) as i64;
+    let mut newpos =
+        match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.kind == crate::PyErrorKind::OverflowError {
+                    -1
+                } else {
+                    return Err(e);
+                }
             }
-        }
-    };
+        };
     if newpos < 0 {
         newpos += length;
     }
@@ -4505,9 +4566,11 @@ fn call_decode_error_handler(
         ));
     }
 
-    out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
+    out.push_wtf8(unsafe {
+        pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(sp + 3))
+    });
     let resume = match new_bytes {
-        Some(bytes) if bytes != data => Some(bytes.to_vec()),
+        Some(bytes) if bytes.as_slice() != data => Some(bytes),
         _ => None,
     };
     Ok((newpos as usize, resume))

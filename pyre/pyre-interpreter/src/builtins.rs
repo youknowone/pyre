@@ -8104,6 +8104,23 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(exc)
 }
 
+/// Convert a Unicode error bound through `__index__` and enforce the
+/// platform's `Py_ssize_t` range before storing it as a plain integer.
+pub(crate) fn unicode_error_index_w(w_value: PyObjectRef) -> Result<i64, crate::PyError> {
+    let value = space_index_w(w_value).map_err(|err| {
+        if err.kind == crate::PyErrorKind::OverflowError
+            && err.message_text() == "int too large to convert to int"
+        {
+            crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+        } else {
+            err
+        }
+    })?;
+    isize::try_from(value)
+        .map(|value| value as i64)
+        .map_err(|_| crate::PyError::overflow_error("Python int too large to convert to C ssize_t"))
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py:433-445
 /// W_UnicodeTranslateError.descr_init` —
 ///
@@ -8138,24 +8155,24 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     let w_reason = args[4];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_object) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_object)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 4 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 4 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `W_BaseException.descr_init(self, space, [w_object, w_start,
         // w_end, w_reason])` → `self.args_w = args_w`.  The
@@ -8191,25 +8208,24 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_reason = args[5];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_encoding) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_encoding)
+            )));
         }
         if !crate::baseobjspace::isinstance_bytes_like_w(w_object_in) {
-            return Err(crate::PyError::type_error(
-                "argument 2 must be bytes-like, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                crate::error::type_name_of(w_object_in)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 5 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 5 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
         // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
         // `space.newbytes` coerce buffer-protocol producers
@@ -8243,10 +8259,12 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             };
             pyre_object::w_bytes_from_bytes(data)
         };
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `interp_exceptions.py:1058-1059` — the args list passed to
         // `W_BaseException.descr_init` is the un-coerced
@@ -8284,30 +8302,31 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_reason = args[5];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_encoding) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_encoding)
+            )));
         }
         if !crate::baseobjspace::isinstance_str_w(w_object) {
-            return Err(crate::PyError::type_error(
-                "argument 2 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 2 must be str, not {}",
+                crate::error::type_name_of(w_object)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 5 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 5 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             w_encoding, w_object, w_start, w_end, w_reason,

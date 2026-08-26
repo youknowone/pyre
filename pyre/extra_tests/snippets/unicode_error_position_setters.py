@@ -32,6 +32,10 @@ for kind in ("decode", "encode", "translate"):
             exc = errors(kind)
             setattr(exc, attribute, value)
             assert getattr(exc, attribute) == value, (kind, attribute, value)
+            # The slot holds the number, not the object it was written with.
+            assert type(getattr(exc, attribute)) is int, (
+                kind, attribute, value, type(getattr(exc, attribute)),
+            )
         for value in REFUSED:
             exc = errors(kind)
             try:
@@ -48,6 +52,16 @@ for kind in ("decode", "encode", "translate"):
             # The refused write left the slot alone.
             assert getattr(exc, attribute) == (0 if attribute == "start" else 1)
             str(exc)
+
+        # A value the word cannot hold is refused too, and says so differently.
+        exc = errors(kind)
+        try:
+            setattr(exc, attribute, 10 ** 30)
+        except OverflowError as error:
+            assert str(error) == "Python int too large to convert to C ssize_t", str(error)
+        else:
+            raise AssertionError(f"{kind}.{attribute} accepted an oversize value")
+        assert getattr(exc, attribute) == (0 if attribute == "start" else 1)
 
     # The object members take a non-str without complaint.
     for attribute in ("object", "reason") + (() if kind == "translate" else ("encoding",)):
