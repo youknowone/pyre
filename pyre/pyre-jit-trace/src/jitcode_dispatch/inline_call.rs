@@ -5417,28 +5417,43 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Taken off `callable_guard_op`, which the resolve proved names
         // `callable`.
         //
-        // `function.py` DOES declare `w_kw_defs?`, and `function_set_kwdefaults`
-        // already notifies `QuasiImmutSlot::WKwDefs`, so the orthodox pin is the
-        // quasi-immutable marker `defs_w` installs a few lines up rather than a
-        // guard.  It is not a drop-in here: that install dereferences
-        // `callable_guard_op`, which is why `defs_w` gates it on
-        // `guards_the_callee_function`, and the callee this fold is for is the
-        // baked module-level one.  Settling that case is what the swap waits on.
+        // `function.py` declares `w_kw_defs?`, and every writer of the slot
+        // funnels through `function_set_kwdefaults` -- `fset_func_kwdefaults`,
+        // `fdel_func_kwdefaults` and the definition path all reach it -- which
+        // notifies `QuasiImmutSlot::WKwDefs`.  The orthodox pin is therefore
+        // the marker, and it costs nothing to flush: the guard below drains
+        // every marker recorded this epoch, and one is going out for the
+        // mapping version regardless.
         //
-        // A `GuardValue` on the slot stands in meanwhile.  It is stricter than
-        // the hint -- a per-call read where upstream pays none -- and sound for
-        // the reason the marker would be: the cells baked below belong to one
-        // mapping, and only pinning the slot that holds it makes that true on
-        // every later execution.  A `f.__kwdefaults__ = {...}` rebind fails the
-        // guard, and so does a callee defined inside the loop, whose next
-        // iteration builds a mapping of its own.
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_w_kw_defs_descr(),
-            resolved.mapping as i64,
-        )?;
+        // Available on a constant callable for the reason
+        // `walker_pin_function_code` gives: a marker resolves its owner by raw
+        // address at record and compile time, so it never loads through the
+        // baked `ConstPtr` the guard arm must stay off.  What being constant
+        // adds is the part a marker needs and cannot check for itself -- one
+        // object on every execution, which is what makes watching that object's
+        // slot answer for all of them.  The caller has already refused a callee
+        // the collector can relocate on this arm, so both reads find it where
+        // the constant says it is.
+        //
+        // Off a live operand the callee's identity is not fixed -- two closures
+        // minted from one `def` both satisfy the class-and-code test -- so the
+        // slot is re-read per execution and the `GuardValue` stays.  It is
+        // stricter than the hint and sound for the reason the marker is: the
+        // cells baked below belong to one mapping, and only pinning the slot
+        // that holds it makes that true on every later execution.
+        let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
+        if callable_guard_op.is_constant() {
+            let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+            crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, kw_defs_descr);
+        } else {
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                kw_defs_descr,
+                resolved.mapping as i64,
+            )?;
+        }
         // `walker_pin_namespace_version`'s body, opened up: the resolve already
         // read the strategy box and proved it immovable, and there is no way
         // back from here to act on the `Ok(false)` the wrapper would return.
