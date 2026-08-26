@@ -17,6 +17,20 @@ pyre's plain-Python runner convention (no pytest / RPython dependency).
   decision never becomes a test-file edit: it lives in the external
   `baseline.json`, so stdlib upgrades stay a clean drop-in (see
   `lib-python/stdlib-upgrade.txt`).
+- **`_testbuffer` is built by the runner.** `test_buffer`'s
+  `TestBufferProtocol` — 95 of that module's cases — is `skipUnless(ndarray)`,
+  and `ndarray` comes from `Modules/_testbuffer.c`, which CPython builds beside
+  its interpreter. The runner compiles `lib_pypy/_testbuffer.c` — that file
+  verbatim, and unchanged across 3.14.6 and 3.14.7 — against
+  `include/pyre3.14t` and puts it on `PYTHONPATH` for that module alone,
+  because several other modules assert on the path their child interpreters
+  inherit. An interpreter without `cpyext`, a platform the feature is not
+  compiled for, or a missing C compiler leaves it unbuilt and the class
+  skipped, as upstream does when the module is absent. The feature also fills
+  `EXTENSION_SUFFIXES`, which unskips `test_importlib.extension.*`; those cases
+  want `_testsinglephase` and `_testmultiphase`, whose sources include
+  `pycore_*` headers pyre does not ship, so `test_importlib` is recorded
+  `FAIL`.
 - **External baseline.** `baseline.json` records the expected status of every
   module per backend. A module recorded `PASS` that stops passing is a
   regression and fails CI. The default gate runs only the `PASS` subset (for CI
@@ -27,7 +41,7 @@ pyre's plain-Python runner convention (no pytest / RPython dependency).
 
 ```sh
 # build the interpreter first
-cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
+cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,cpyext
 
 # gate against the baseline (default: dynasm, JIT on, script mode)
 python3 pyre/cpython_tests/run.py

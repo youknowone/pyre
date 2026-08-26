@@ -11,6 +11,17 @@
 #ifndef Py_PYTHON_H
 #define Py_PYTHON_H
 
+/* A module built inside the interpreter's own tree says so with one of the
+   two spellings below, and the headers under `internal/` are the ones that
+   ask.  Both fold to `Py_BUILD_CORE`, as the reference header does, so a
+   source that sets either reaches them. */
+#if defined(Py_BUILD_CORE_BUILTIN) && !defined(Py_BUILD_CORE)
+#  define Py_BUILD_CORE
+#endif
+#if defined(Py_BUILD_CORE_MODULE) && !defined(Py_BUILD_CORE)
+#  define Py_BUILD_CORE
+#endif
+
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -49,6 +60,9 @@
 
 /* The `datetime` C API's structs, which the entry points below name. */
 #include "datetime.h"
+
+/* `PyTime_t`, which the clock entry points below take and answer with. */
+#include "pytime.h"
 
 /* Every exported entry point. It sits here because the headers above
    name the types it uses, and the ones below define `static inline`

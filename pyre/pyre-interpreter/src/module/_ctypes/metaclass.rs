@@ -2039,11 +2039,13 @@ fn array_get_slice(obj: PyObjectRef, meta: &ArrayMeta, slice: PyObjectRef) -> Py
         }
         return Ok(pyre_object::w_str_new(&value));
     }
-    let mut items = Vec::with_capacity(idxs.len());
+    // Each element is freshly boxed and the next index allocates again, so they
+    // are pinned as they arrive.
+    let mut items = pyre_object::gc_roots::RootedItems::new();
     for i in idxs {
         items.push(array_get_index(obj, meta, i)?);
     }
-    Ok(pyre_object::w_list_new(items))
+    Ok(pyre_object::w_list_new(items.take()))
 }
 
 fn array_set_slice(
@@ -2406,13 +2408,15 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
             crate::sliceobject::eval_slice_index(start_obj)?
         };
         let stop = crate::sliceobject::eval_slice_index(stop_obj)?;
-        let mut values = Vec::new();
+        // Each element is freshly allocated and the next index allocates again,
+        // so they are pinned as they arrive.
+        let mut values = pyre_object::gc_roots::RootedItems::new();
         let mut index = start;
         while if step > 0 { index < stop } else { index > stop } {
             values.push(pointer_get_index(obj, index as isize)?);
             index = index.saturating_add(step);
         }
-        return Ok(pyre_object::w_list_new(values));
+        return Ok(pyre_object::w_list_new(values.take()));
     }
     if !unsafe { pyre_object::is_int(key) } {
         return Err(crate::PyError::type_error(

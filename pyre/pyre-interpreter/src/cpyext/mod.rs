@@ -39,6 +39,7 @@ pub mod longobject;
 pub mod mapping;
 pub mod methodobject;
 pub mod modsupport;
+pub mod namespaceobject;
 pub mod number;
 pub mod object;
 pub mod osmodule;
@@ -48,6 +49,7 @@ pub mod pyobject;
 pub mod pystate;
 pub mod pystrtod;
 pub mod pythonrun;
+pub mod pytime;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
@@ -332,23 +334,59 @@ enum InitProtocol {
 }
 
 impl InitProtocol {
-    fn symbol(self, basename: &str) -> String {
-        match self {
-            InitProtocol::Export => format!("PyModExport_{basename}"),
-            InitProtocol::Init => format!("PyInit_{basename}"),
-        }
+    fn symbol(self, basename: &InitName) -> String {
+        let prefix = match (self, basename.non_ascii) {
+            (InitProtocol::Export, false) => "PyModExport_",
+            (InitProtocol::Export, true) => "PyModExportU_",
+            (InitProtocol::Init, false) => "PyInit_",
+            (InitProtocol::Init, true) => "PyInitU_",
+        };
+        format!("{prefix}{}", basename.text)
     }
 }
 
-fn init_basename(name: &str) -> Result<&str, crate::PyError> {
+/// The variable part of a module's export symbol.
+///
+/// PEP 489: a name outside ASCII is spelled in punycode and looked up under
+/// the `U` prefix instead, so the two namespaces cannot collide.
+struct InitName {
+    text: String,
+    non_ascii: bool,
+}
+
+/// `importdl.c get_encoded_name`: the short name, encoded to ASCII where it
+/// can be and to punycode where it cannot.  `-` is punycode's delimiter and is
+/// not a C identifier character, so it becomes `_`.
+fn init_basename(name: &str) -> Result<InitName, crate::PyError> {
     let basename = name.rsplit('.').next().unwrap_or(name);
-    if !basename.is_ascii() {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("non-ASCII cpyext init names are not implemented yet: {basename}"),
-        ));
+    if basename.is_ascii() {
+        return Ok(InitName {
+            text: basename.to_string(),
+            non_ascii: false,
+        });
     }
-    Ok(basename)
+    // `encode_object` reaches the `punycode` codec, which is written in
+    // Python and allocates, so the name it reads is rooted across the call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let basename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(basename));
+    let encoded = crate::type_methods::encode_object(
+        pyre_object::gc_roots::shadow_stack_get(basename_slot),
+        "punycode",
+        "strict",
+    )?;
+    let text = String::from_utf8(encoded)
+        .map_err(|_| {
+            crate::PyError::new(
+                crate::PyErrorKind::ImportError,
+                format!("punycode encoding of {basename} is not text"),
+            )
+        })?
+        .replace('-', "_");
+    Ok(InitName {
+        text,
+        non_ascii: true,
+    })
 }
 
 /// The entry point an open library publishes.
@@ -359,7 +397,7 @@ fn init_basename(name: &str) -> Result<&str, crate::PyError> {
 fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)>, crate::PyError> {
     let basename = init_basename(name)?;
     for protocol in [InitProtocol::Export, InitProtocol::Init] {
-        if let Some(address) = lookup_init_address(handle, &protocol.symbol(basename)) {
+        if let Some(address) = lookup_init_address(handle, &protocol.symbol(&basename)) {
             return Ok(Some((protocol, address)));
         }
     }
@@ -368,11 +406,14 @@ fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)
 
 /// What the lookup reports when neither entry point is there.
 fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
-    let basename = name.rsplit('.').next().unwrap_or(name);
+    let symbol = match init_basename(name) {
+        Ok(basename) => InitProtocol::Init.symbol(&basename),
+        // The name could not be encoded at all, so name it as it was written.
+        Err(_) => format!("PyInit_{}", name.rsplit('.').next().unwrap_or(name)),
+    };
     extension_import_error(
         format!(
-            "function {} not found in library '{}'",
-            InitProtocol::Init.symbol(basename),
+            "function {symbol} not found in library '{}'",
             path.display()
         ),
         name,
@@ -451,15 +492,17 @@ pub fn load_extension_module(
             )
         })?;
 
-    let found = match lookup_init(handle, name) {
-        Ok(found) => found,
-        Err(error) => {
-            rustpython_host_env::ctypes::drop_library(handle);
-            return Err(error);
-        }
-    };
+    // Every path from here leaves the library loaded, however it fails.  The
+    // handle cache keeps one `dlopen` count per library and hands the same
+    // handle back to a second open, so closing it here unloads the image
+    // outright -- and a multi-phase module never records its path in
+    // `EXTENSIONS`, so a later load of a *different* name out of the same file
+    // reaches this code while the modules the earlier loads built are still
+    // live.  Their types' `tp_traverse` is then a pointer into text nobody has
+    // mapped, which the next minor collection walks.  Upstream keeps the
+    // library on both of these failures.
+    let found = lookup_init(handle, name)?;
     let Some((protocol, address)) = found else {
-        rustpython_host_env::ctypes::drop_library(handle);
         return Err(missing_init_error(name, path));
     };
 
@@ -486,24 +529,17 @@ pub fn load_extension_module(
         }
     };
 
-    let init_result = match answer {
-        Ok(module) => module,
-        Err(error) => {
-            rustpython_host_env::ctypes::drop_library(handle);
-            return Err(error);
-        }
-    };
+    let init_result = answer?;
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(init_result.module());
     match init_result {
         // `create_cpyext_module` returns straight from the multi-phase branch:
         // the definition, not a copied dictionary, is what a later import
-        // rebuilds the module from.
-        InitResult::MultiPhase(_) => crate::importing::set_sys_module(
-            name,
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-        ),
+        // rebuilds the module from, and `sys.modules` is the importer's to
+        // write -- a caller that only creates the module and executes it
+        // itself must not find the name there.
+        InitResult::MultiPhase(_) => {}
         InitResult::SinglePhase(_) => fixup_extension(
             pyre_object::gc_roots::shadow_stack_get(module_slot),
             name,
@@ -547,6 +583,15 @@ fn finish_init(
                 format!("initialization of {name} failed without raising an exception"),
             )
         }));
+    }
+    // `importdl.c _Py_ext_module_loader_result_from_module`: this is checked
+    // before the uninitialized-object one, so a module that both left an
+    // exception set and came back untyped is reported as the raise.
+    if let Some(pending) = pyerrors::take_pending_error() {
+        return Err(system_error_from_cause(
+            format!("initialization of {name} raised unreported exception"),
+            pending,
+        ));
     }
     if unsafe { (*result).ob_type.is_null() } {
         return Err(crate::PyError::new(
@@ -801,6 +846,33 @@ pub(super) fn from_c_result(result: *mut CPyObject) -> Result<PyObjectRef, crate
     Ok(value)
 }
 
+/// `_PyErr_FormatFromCause`: a `SystemError` carrying `cause` as both its
+/// `__context__` and its `__cause__`.
+///
+/// An extension that reported success while leaving an exception set has
+/// already lost the raise site, so the exception it left behind is the only
+/// description of what went wrong and is chained onto the report rather than
+/// discarded.
+pub(super) fn system_error_from_cause(
+    message: String,
+    mut cause: crate::PyError,
+) -> crate::PyError {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(cause.to_exc_object());
+    let mut error = crate::PyError::new(crate::PyErrorKind::SystemError, message);
+    let error_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(error.to_exc_object());
+    let w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+    let w_error = pyre_object::gc_roots::shadow_stack_get(error_slot);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_context(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_cause(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_suppress_context(w_error, true);
+    }
+    unsafe { crate::PyError::from_exc_object(w_error) }
+}
+
 /// `_imp.exec_dynamic` — PyPy `cpyext/api.py:exec_extension_module`.
 ///
 /// A module that already owns a state block has run its slots, so the second
@@ -850,6 +922,8 @@ pub fn ensure_linked() {
     pystate::ensure_linked();
     pystrtod::ensure_linked();
     pythonrun::ensure_linked();
+    pytime::ensure_linked();
+    namespaceobject::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
     cdatetime::ensure_linked();
