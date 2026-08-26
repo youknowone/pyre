@@ -1824,12 +1824,6 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// nested-residual decline was masking, as opposed to an ordinary nested
 /// callee (the #73 depth-≥2 payoff, which inlines).
 ///
-/// * **Loop-bearing** — a framestack callee whose `CodeObject` has a
-///   `FOR_ITER`.  Its side-effecting `for` consume runs concretely in the
-///   sub-walk, and a later kept-stack guard abort can REFUSE the Option-C item
-///   delivery (a `for..break` frame parked past the loop header, in
-///   `eval.rs`), so the re-run re-executes the consume and double-advances
-///   the iterator (the two `foriter_exempt_*` witnesses).
 /// * **Self-recursive** — the callee calls itself.  A hot self-recursion
 ///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
 ///   survive the residual trampoline retaining a pre-call frame pointer (the
@@ -1851,27 +1845,25 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// the next attempt residualize that call, so the surviving nest is
 /// hazard-free and the enclosing loop can compile.
 ///
-/// The second element names which of the three clauses fired.  The clauses
-/// are not equally tight: `repeat` and `self-recursive` name the frame that
-/// is actually recursing, while `for-iter` fires on any code object whose
-/// bytecode contains a `FOR_ITER` anywhere, whether or not an iterator is in
-/// flight at the decline point.  Reporting them apart is what lets a census
-/// say how much of the decline the loose clause is carrying: over 441 synth +
-/// 83 parity fixtures it fires 8 times on 6 fixtures for its 2 witnesses.
+/// The second element names which of the two clauses fired.
 ///
-/// The looseness is load-bearing and the clause must stay FORWARD-looking.
-/// Requiring that a consume have ALREADY run in that frame — asking
-/// `FBW_FORITER_INFLIGHT`, whose `Jit` entries carry the `jitcode_index` each
-/// consume ran in, which needs no per-frame Python pc — cuts the census to 3
-/// fires and produces WRONG OUTPUT on `foriter_exempt_shared_generator` on all
-/// three backends, plus a jitstats regression on `inline_subwalk_user_iterator`
-/// (loops_aborted 1 -> 5, `fbw_rolled_back_with_effects` 0 -> 5, loops_compiled
-/// 3 -> 2) and on `list_append_write_barrier_gc` (loops_compiled 13 -> 12).
-/// Inlining the residual is what CARRIES the walk to the consume, so a decline
-/// conditioned on the consume having happened always arrives one step late: the
-/// witness still declined, at pc 533 instead of 261.  A real narrowing has to
-/// ask whether a `FOR_ITER` is REACHABLE from the frame's current position,
-/// which does need the per-frame pc `InlineFrame` does not carry.
+/// A third clause used to sit here: any framestack callee whose `CodeObject`
+/// contained a `FOR_ITER` anywhere, on the grounds that a re-run would
+/// re-execute the `for` consume and double-advance the iterator (the two
+/// `foriter_exempt_*` witnesses).  The re-run it was describing was
+/// `emit_walker_loop_callee_call_assembler` re-executing the caller's whole
+/// CALL to stamp `ca_result`, which replayed the callee prologue the sub-walk
+/// had already run concretely.  That emit now performs `do_recursive_call`'s
+/// portal resume on the frame the sub-walk advanced, so nothing is replayed
+/// and both witnesses agree with the `PYRE_NO_JIT=1` and CPython oracles with
+/// the clause gone.
+///
+/// The clause was expensive: it is a STATIC test, so a `while` loop calling a
+/// loop-bearing helper declined every inline and the JIT bought nothing.
+/// Measured on a same-binary pair over `foriter_exempt_nested_foriter` and
+/// `foriter_exempt_shared_generator` at N=600000, plus a plain-list variant of
+/// the first at N=300000, JIT-on against `PYRE_JIT=0` went 1.133x -> 0.745x,
+/// 1.084x -> 0.672x and 1.000x -> 0.514x.
 fn fbw_inline_callee_hazardous<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(usize, &'static str)> {
@@ -1886,9 +1878,6 @@ fn fbw_inline_callee_hazardous<Sym: WalkSym>(
             if let Some(raw_code) = crate::state::raw_code_for_jitcode_index(idx) {
                 let code = unsafe { raw_code.as_ref() };
                 if let Some(code) = code {
-                    if pyre_interpreter::code_has_for_iter(code) {
-                        return Some((frame.w_code, "for-iter"));
-                    }
                     if pyre_interpreter::code_is_self_recursive(code) {
                         return Some((frame.w_code, "self-recursive"));
                     }

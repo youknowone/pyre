@@ -18,9 +18,7 @@
 #
 # Measured before the fix on dynasm at the DEFAULT thresholds: the `while`
 # shapes reported 97 of 300 constructor calls evaluating to `None`, the `for`
-# shapes 5 of 20000, and `PYRE_NO_JIT=1` reported none.  The `for` shapes were
-# reachable only with `fbw_inline_callee_hazardous`'s loop-bearing arm off,
-# which declined that inline one step earlier.
+# shapes 5 of 20000, and `PYRE_NO_JIT=1` reported none.
 import sys
 
 N = 20000
