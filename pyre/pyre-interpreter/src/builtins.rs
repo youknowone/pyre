@@ -6364,6 +6364,14 @@ fn type_descr_new_with_metaclass(
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
         let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
         let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        // Nothing refers to a class this young — the classcell is optional and
+        // `weak_subclasses` is weak — while the passes below allocate, so a
+        // major cycle sweeps it out from under `create_all_slots` and the
+        // barrier in `tag_subclass_instance` then writes through a freed
+        // header.  This is the `_entry_roots` scope's reasoning extended back
+        // to the construction; a type does not move, so the local stays a good
+        // address and the root is for liveness only.
+        let _ = pyre_object::gc_roots::pin_root(w_type);
         // The type allocation may have moved the namespace, so the qualname
         // pass receives the forwarded address rather than the word above.
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
