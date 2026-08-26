@@ -1102,7 +1102,7 @@ fn memoryview_native_fmtchar(fmt: &str) -> Option<i64> {
 /// `_strides_from_shape` — C-contiguous strides for `shape`: the last
 /// dimension steps by `itemsize`, each earlier one by the product of the
 /// faster dimensions.
-fn memoryview_strides_from_shape(shape: &[i64], itemsize: i64) -> Vec<i64> {
+pub(crate) fn strides_from_shape(shape: &[i64], itemsize: i64) -> Vec<i64> {
     let ndim = shape.len();
     if ndim == 0 {
         return vec![];
@@ -1794,7 +1794,7 @@ fn memoryview_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "memoryview: product(shape) * itemsize != buffer size",
             ));
         }
-        let strides_v = memoryview_strides_from_shape(&dims, new_itemsize);
+        let strides_v = strides_from_shape(&dims, new_itemsize);
         Ok(w_memoryview_cast_nd(
             mv,
             &fmt,
