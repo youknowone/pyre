@@ -445,3 +445,13 @@ pub unsafe fn w_memoryview_native_shape(obj: PyObjectRef) -> Vec<i64> {
 pub unsafe fn w_memoryview_native_strides(obj: PyObjectRef) -> Vec<i64> {
     unsafe { w_memoryview_view(obj).native_strides() }
 }
+
+/// The view's suboffsets as native `i64` byte offsets, empty for a view that
+/// has none (`memoryview.suboffsets`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_MemoryView`.
+#[inline]
+pub unsafe fn w_memoryview_native_suboffsets(obj: PyObjectRef) -> Vec<i64> {
+    unsafe { w_memoryview_view(obj).native_suboffsets() }
+}

@@ -1,4 +1,5 @@
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::object_array::{
     TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
@@ -27,14 +28,40 @@ pub struct IntArray {
     /// empty form ([`IntArray::empty`]), where the live length and the
     /// allocated capacity are both zero.
     pub block: *mut TypedItemsBlock,
-    /// Live length (rlist.py `("length", Signed)`).
-    len: usize,
+    /// Live length (rlist.py `("length", Signed)`), read WITHOUT a lock.
+    ///
+    /// `Include/cpython/listobject.h PyList_GET_SIZE` answers a length under
+    /// `Py_GIL_DISABLED` as `_Py_atomic_load_ssize_relaxed(&ob_size)` — a
+    /// relaxed atomic load, no critical section — so a reader is entitled to a
+    /// value from either side of a concurrent mutation but never to a torn one.
+    /// The JIT's `len` fold lowers to exactly that load, addressing this slot
+    /// by [`INT_ARRAY_LEN_OFFSET`], which is why it cannot be a plain
+    /// `usize`: the methods below write it while a compiled loop is reading it,
+    /// and only an atomic makes that pair defined.  Every write here is a
+    /// relaxed store for the same reason — `&mut self` bounds no raw-pointer
+    /// reader, so `get_mut()` would put the plain store straight back.
+    ///
+    /// Same size and bit validity as `usize`, so `offset_of!` and the JIT's
+    /// `Type::Int` read are unchanged.
+    len: AtomicUsize,
 }
 
 pub const INT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(IntArray, block);
 pub const INT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(IntArray, len);
 
 impl IntArray {
+    /// `_Py_atomic_load_ssize_relaxed(&ob_size)`.
+    #[inline]
+    fn len_relaxed(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// `_Py_atomic_store_ssize_relaxed(&ob_size, n)`.
+    #[inline]
+    fn set_len_relaxed(&self, n: usize) {
+        self.len.store(n, Ordering::Relaxed);
+    }
+
     /// Items base pointer (`&l.items[0]`), derived from `block`.
     ///
     /// `wrapping_add`, so the empty form's null `block` yields the items offset
@@ -63,7 +90,7 @@ impl IntArray {
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),
-            len: 0,
+            len: AtomicUsize::new(0),
         }
     }
 
@@ -71,7 +98,7 @@ impl IntArray {
         let len = values.len();
         let arr = Self {
             block: unsafe { alloc_typed_items_block(len, gc_int_array_gc_type_id()) },
-            len,
+            len: AtomicUsize::new(len),
         };
         unsafe {
             std::ptr::copy_nonoverlapping(values.as_ptr(), arr.base(), len);
@@ -141,7 +168,7 @@ impl IntArray {
 
     #[inline]
     pub fn spare_capacity(&self) -> usize {
-        self.capacity().saturating_sub(self.len)
+        self.capacity().saturating_sub(self.len_relaxed())
     }
 
     /// Allocated capacity (block header). The no-resize append fast path
@@ -166,7 +193,7 @@ impl IntArray {
             new_len <= cap,
             "IntArray::set_len precondition violated: new_len ({new_len}) > capacity ({cap})"
         );
-        self.len = new_len;
+        self.set_len_relaxed(new_len);
     }
 
     /// Integer list storage is always a separate block (no inline buffer).
@@ -180,36 +207,41 @@ impl IntArray {
             .max(self.capacity().saturating_mul(2))
             .max(INT_ARRAY_INLINE_CAP);
         self.block = unsafe {
-            grow_typed_items_block(self.block, target_cap, self.len, gc_int_array_gc_type_id())
+            grow_typed_items_block(
+                self.block,
+                target_cap,
+                self.len_relaxed(),
+                gc_int_array_gc_type_id(),
+            )
         };
     }
 
     pub fn push(&mut self, value: i64) {
-        if self.len == self.capacity() {
-            self.grow(self.len + 1);
+        if self.len_relaxed() == self.capacity() {
+            self.grow(self.len_relaxed() + 1);
         }
         unsafe {
-            *self.base().add(self.len) = value;
+            *self.base().add(self.len_relaxed()) = value;
         }
-        self.len += 1;
+        self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len_relaxed()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len_relaxed() == 0
     }
 
     pub fn as_slice(&self) -> &[i64] {
-        unsafe { std::slice::from_raw_parts(self.base(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.base(), self.len_relaxed()) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [i64] {
-        unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.base(), self.len_relaxed()) }
     }
 
     pub fn to_vec(&self) -> Vec<i64> {
@@ -217,33 +249,33 @@ impl IntArray {
     }
 
     pub fn insert(&mut self, index: usize, value: i64) {
-        assert!(index <= self.len);
-        if self.len == self.capacity() {
-            self.grow(self.len + 1);
+        assert!(index <= self.len_relaxed());
+        if self.len_relaxed() == self.capacity() {
+            self.grow(self.len_relaxed() + 1);
         }
         unsafe {
             let p = self.base().add(index);
-            std::ptr::copy(p, p.add(1), self.len - index);
+            std::ptr::copy(p, p.add(1), self.len_relaxed() - index);
             *p = value;
         }
-        self.len += 1;
+        self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
     pub fn remove(&mut self, index: usize) -> i64 {
-        assert!(index < self.len);
+        assert!(index < self.len_relaxed());
         let value = self.as_slice()[index];
         unsafe {
             let p = self.base().add(index);
-            std::ptr::copy(p.add(1), p, self.len - index - 1);
+            std::ptr::copy(p.add(1), p, self.len_relaxed() - index - 1);
         }
-        self.len -= 1;
+        self.set_len_relaxed(self.len_relaxed() - 1);
         value
     }
 
     pub fn pop(&mut self) -> i64 {
-        assert!(self.len > 0);
-        let value = self.as_slice()[self.len - 1];
-        self.len -= 1;
+        assert!(self.len_relaxed() > 0);
+        let value = self.as_slice()[self.len_relaxed() - 1];
+        self.set_len_relaxed(self.len_relaxed() - 1);
         value
     }
 
@@ -252,7 +284,7 @@ impl IntArray {
     }
 
     pub fn splice(&mut self, start: usize, remove_count: usize, new_values: &[i64]) {
-        let old_len = self.len;
+        let old_len = self.len_relaxed();
         let s = start.min(old_len);
         let slicelength = remove_count.min(old_len - s);
         let len2 = new_values.len();
@@ -269,7 +301,7 @@ impl IntArray {
                     old_len - s - slicelength,
                 );
             }
-            self.len = new_len;
+            self.set_len_relaxed(new_len);
         } else if slicelength > len2 {
             unsafe {
                 let base = self.base();
@@ -279,7 +311,7 @@ impl IntArray {
                     old_len - s - slicelength,
                 );
             }
-            self.len = new_len;
+            self.set_len_relaxed(new_len);
         }
         if len2 > 0 {
             self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
@@ -289,20 +321,20 @@ impl IntArray {
     pub fn drain(&mut self, range: std::ops::Range<usize>) {
         let start = range.start;
         let end = range.end;
-        assert!(start <= end && end <= self.len);
+        assert!(start <= end && end <= self.len_relaxed());
         let count = end - start;
         if count == 0 {
             return;
         }
         unsafe {
             let p = self.base().add(start);
-            std::ptr::copy(p.add(count), p, self.len - end);
+            std::ptr::copy(p.add(count), p, self.len_relaxed() - end);
         }
-        self.len -= count;
+        self.set_len_relaxed(self.len_relaxed() - count);
     }
 
     pub fn clear(&mut self) {
-        self.len = 0;
+        self.set_len_relaxed(0);
     }
 }
 

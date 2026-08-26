@@ -8292,6 +8292,41 @@ impl CodeWriter {
             }};
         }
 
+        // Read a localsplus slot into a value WITHOUT touching the operand
+        // stack — `pyopcode.py`'s bare `self.cells[varindex]` /
+        // `self.locals_cells_stack_w[i]`, which `jtransform.py:1877
+        // do_fixed_list_getitem` lowers to a single `getarrayitem_vable_r`.
+        //
+        // `emit_load_fast_ref!` is the LOAD_FAST *opcode*: that read plus a
+        // `pushvalue`.  A handler that only wants the value in hand must not
+        // borrow a stack slot for it.  The operand stack is the tail of
+        // `locals_cells_stack_w` and is exactly `co_stacksize` slots long, so
+        // a scratch push taken while the stack is already at its compiled
+        // maximum addresses one slot past the array: flat index
+        // `NUM_VABLE_SCALARS + nlocals + co_stacksize` in
+        // `virtualizable_boxes`, which is the trailing virtualizable identity
+        // entry (`virtualizable_boxes[-1]`).  Overwriting it makes every
+        // later vable op read the stored value as the standard virtualizable.
+        macro_rules! emit_read_local_ref {
+            ($reg:expr, $py_pc:expr) => {{
+                let reg = $reg;
+                let read_local_py_pc: i64 = ($py_pc) as i64;
+                let local_slot = local_to_vable_slot(reg as usize) as i64;
+                let v_local_idx: super::flow::FlowValue =
+                    super::flow::Constant::signed(local_slot).into();
+                let v_loaded = emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "getarrayitem_vable_r",
+                    vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
+                    Kind::Ref,
+                    read_local_py_pc,
+                );
+                let loaded: super::flow::FlowValue = v_loaded.into();
+                loaded
+            }};
+        }
+
         // Post-emit bookkeeping for a stack-pushing handler: append the
         // produced FlowValue to the symbolic stack and run the full
         // `pyframe.py pushvalue` lowering on it.
@@ -13280,9 +13315,14 @@ impl CodeWriter {
                         // `locals_cells_stack_w` holds a cell object
                         // (`initialize_frame_scopes` / MAKE_CELL / the closure
                         // tuple install one), so `i` is the unified localsplus
-                        // index read like LOAD_FAST. The cell is read FIRST so
-                        // it lands above the value on the symbolic stack and
-                        // the two pinned slots stay distinct. The
+                        // index read like LOAD_FAST, but through
+                        // `emit_read_local_ref!`: `pyopcode.py STORE_DEREF`
+                        // reads the cell straight out of `cells[varindex]`,
+                        // and routing it over the operand stack instead
+                        // borrows a slot above the value this opcode pops —
+                        // one past `co_stacksize` whenever the compiler sized
+                        // the stack for that value, which lands on the
+                        // virtualizable identity entry. The
                         // `store_deref_value(cell, value)` HLOp →
                         // `residual_call_r_r(store_deref_value_fn,
                         // ListR[cell, value])` mutates the cell's contents in
@@ -13316,9 +13356,7 @@ impl CodeWriter {
                                     py_pc as i64,
                                 );
                             } else {
-                                emit_load_fast_ref!(current_depth, idx, py_pc);
-                                let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
-                                let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let cell_value = emit_read_local_ref!(idx, py_pc);
                                 let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let result_value = emit_graph_op_with_result(

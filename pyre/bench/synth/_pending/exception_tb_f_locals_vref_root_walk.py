@@ -6,10 +6,10 @@
 # closure_per_call overlay over — two counters there disagreed with themselves
 # across jobs, one toward its shared value and one away from it — so a
 # `.cranelift.win32.jitstats` overlay cannot hold this either, and a missing
-# baseline is a hard fail rather than an opt-out. The walker guard therefore has
-# no suite gate; this file is the reproduction, and it is correct on all three
-# native backends and PYRE_NO_JIT=1 at every size of a 512K-32M PYPY_GC_NURSERY
-# sweep.
+# baseline is a hard fail rather than an opt-out. The walker guard had no suite
+# gate when that was written -- #1060 gave it one the next day, see ANSWERED
+# below -- and this file is the reproduction, correct on all three native
+# backends and PYRE_NO_JIT=1 at every size of a 512K-32M PYPY_GC_NURSERY sweep.
 #
 # ⛔ MEASURED 2026-08-24 at be1d37c1f94: IT NO LONGER DISCRIMINATES ITS GUARD.
 # Removing `forward_virtual_ref_forced`'s value-stack arm from
@@ -33,9 +33,45 @@
 # `is_exception` still dereferences `ob_type`, so the arm is not redundant --
 # its input has disappeared.
 #
-# That is worth a look on its own: a vref that stops reaching a frame slot is
-# either a deliberate earlier force or the virtualizable optimisation quietly
-# not applying where it used to.
+# ⛔ ANSWERED 2026-08-26 at 4953fb0edf8: NEITHER READING HOLDS. The vrefs are
+# still built, and the guard already has a gate that is not this file.
+#
+# Measured with birth/force counters in `virtualref.rs` (`alloc_virtual_ref`,
+# `force_virtual`) and hit counters on both `forward_virtual_ref_forced` call
+# sites in `walk_pyframe_roots_area`:
+#
+#   this file, cranelift AND dynasm, at `15000 head` and at the default
+#     alloc=8, force=4, value-stack arm hits=0 over 16-63 slot walks
+#   the f_backref arm -- the SAME helper one block earlier in the same walk
+#     0 here, but 1 on exception_residual_raise_caught_in_frame.py
+#   the 70 synth fixtures naming f_locals/tb_frame/__traceback__/f_back/
+#   _getframe, cranelift: value-stack arm hits 0 on all 70
+#
+# Eight vrefs are built on this shape at every size tried, so the virtualizable
+# optimisation is applying and the "quietly not applying" reading is out. The
+# f_backref line is the positive control the note above lacked: the helper is
+# live and has a producer -- `inline_call.rs walker_ec_enter` stores the
+# concrete vref into `ec.topframeref` and threads the caller's into
+# `frame.f_backref`. Both are frame-shaped fields. Neither is a
+# `locals_cells_stack_w` slot, and it is the value-stack arm specifically that
+# has nothing feeding it.
+#
+# ⛔ The birth counter sees TRACING-time births only. A vref materialized by
+# compiled code is allocated through NEW_WITH_VTABLE (`optimizeopt/
+# virtualize.rs` stamps JIT_VIRTUAL_REF_VTABLE there), which this counter never
+# observes -- `alloc=8` bounds the tracing population, not the runtime one. The
+# runtime population is why the arm exists, so its emptiness is measured here
+# only through the arm's own 0 hits.
+#
+# The gate: #1060 (`fa2eda0bd8e`) extracted the slot body as
+# `walk_frame_value_slot` and covered the arm with
+# `test_frame_value_slot_holding_a_virtual_ref_skips_the_pyobject_walks`
+# (`pyre-interpreter/src/eval.rs`), which hand-builds a vref and asserts the
+# visitor is handed exactly the slot and then the vref's own `forced` field.
+# That PR recorded that removing the early return aborts the test with SIGABRT,
+# and CI runs it on every push (`pyre-ci.yml`, `cargo test --all
+# --no-default-features --features dynasm,cpyext`). Promoting this file would
+# spend three backend runs re-gating what one unit test already holds.
 #
 # When it is promoted, `# pyre-check: selfcheck` is the shape, and the baseline
 # blocker above dissolves rather than needing an overlay: `run_selfcheck` takes

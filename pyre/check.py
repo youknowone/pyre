@@ -88,7 +88,22 @@ def _resolve_python3():
     )
 
 
-PYTHON3 = _resolve_python3()
+_PYTHON3 = None
+
+
+def python3():
+    """The oracle interpreter, resolved once and remembered.
+
+    Resolved on first use rather than at import, because `_resolve_python3`
+    exits the process when no CPython 3.14 is on PATH -- and `--check-headers`
+    reads fixture files, never runs an oracle, and runs on a job that has no
+    reason to carry one.
+    """
+    global _PYTHON3
+    if _PYTHON3 is None:
+        _PYTHON3 = _resolve_python3()
+    return _PYTHON3
+
 PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
     "pypy3" if shutil.which("pypy3") else "pypy"
 )
@@ -111,7 +126,7 @@ def _detect_pyre_stdlib():
         return str(intree)
     try:
         proc = subprocess.run(
-            [PYTHON3, "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
+            [python3(), "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"],
             capture_output=True, text=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -122,7 +137,20 @@ def _detect_pyre_stdlib():
     return path if path and os.path.isdir(path) else None
 
 
-PYRE_STDLIB = _detect_pyre_stdlib()
+_UNSET = object()
+_PYRE_STDLIB = _UNSET
+
+
+def pyre_stdlib():
+    """[`_detect_pyre_stdlib`]'s answer, computed once and remembered.
+
+    Deferred with [`python3`]: the out-of-tree fallback spawns the oracle.
+    """
+    global _PYRE_STDLIB
+    if _PYRE_STDLIB is _UNSET:
+        _PYRE_STDLIB = _detect_pyre_stdlib()
+    return _PYRE_STDLIB
+
 
 # Which wasm runtime the `pyre-wasm-runner` uses (`--wasm-engine`). wasmtime
 # (cranelift) is fast in steady state but recompiles the ~14MB module on every
@@ -896,7 +924,7 @@ def pyre_env():
     # `pyre_set_launch_env`.
     #
     # Only pyre is pinned this way. The oracles are spawned with the inherited
-    # environment (`run_timed([PYTHON3, script])`), so they keep writing and
+    # environment (`run_timed([python3(), script])`), so they keep writing and
     # reading their own caches and import warm from their first run onward,
     # while pyre now imports cold on every run. Startup subtraction covers the
     # imports an empty program performs, not the ones a fixture adds on top, so
@@ -908,8 +936,9 @@ def pyre_env():
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
-    if PYRE_STDLIB and "PYRE_STDLIB" not in env:
-        env["PYRE_STDLIB"] = PYRE_STDLIB
+    stdlib = pyre_stdlib()
+    if stdlib and "PYRE_STDLIB" not in env:
+        env["PYRE_STDLIB"] = stdlib
     # Point the wasm runner at the built module by absolute path so it resolves
     # regardless of the child's working directory (ignored by other backends).
     if "PYRE_WASM_MODULE" not in env and Path(WASM_MODULE_PATH).exists():
@@ -2111,6 +2140,99 @@ def synth_spec_folds(path):
     return names
 
 
+def synth_fixture_headers(path):
+    """Every directive `path` owes, read in one pass.
+
+    Which of the readers above apply depends on the fixture's kind, so that
+    rule lives here rather than being restated at each consumer. Raises
+    `ValueError` on this fixture's first unusable directive.
+    """
+    selfcheck = synth_selfcheck(path)
+    headers = {
+        "selfcheck": selfcheck,
+        "skip_backends": synth_skip_backends(path),
+        "spec_folds": synth_spec_folds(path),
+    }
+    if selfcheck:
+        interpreted = synth_selfcheck_interpreted(path)
+        headers["interpreted"] = interpreted
+        headers["want_compiles"] = (
+            () if interpreted else synth_selfcheck_compiles(path)
+        )
+    else:
+        headers["max_pypy_ratio"] = synth_perf_gate(path)
+        headers["max_rss_mb"] = synth_rss_gate(path)
+        headers["skip_cpython"] = synth_skip_cpython(path)
+        headers["no_cpython"] = synth_no_cpython(path)
+        # `_apply_snapshot_gate` reads these two per backend and nothing there
+        # catches a `ValueError`, so an unusable value in either arrived as a
+        # traceback out of a backend run. Read here for the raise alone; the
+        # gate still reads them itself, once it knows which backend it is.
+        synth_ungated_jitstats(path)
+        synth_jitstats_bands(path)
+    return headers
+
+
+def report_unusable_headers(errors):
+    """Name every fixture whose header could not be read, not just the first.
+
+    `pyre/bench/synth/` is shared, so a directive this script requires reds
+    every fixture that arrives without it, and stopping at the first one costs
+    a CI run per name. Fixtures that fail the same way share a block, so the
+    guidance the reader wrote is printed once instead of once per fixture.
+    """
+    groups = {}
+    for path, message in errors:
+        groups.setdefault(message.replace(str(path), "<fixture>"), []).append(path)
+    print(f"{red('ERROR')}: {len(errors)} fixture(s) with a header this suite cannot read")
+    for message, paths in groups.items():
+        print()
+        for path in paths:
+            print(f"  {path}")
+        for line in message.splitlines():
+            print(f"    {line}")
+
+
+def synthetic_bench_paths(pattern):
+    """The fixtures *pattern* names under [`SYNTHETIC_BENCH_DIR`]."""
+    paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
+    if not paths and not Path(pattern).suffix:
+        paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(f"{pattern}.py"))
+    return [p for p in paths if p.is_file() and p.suffix == ".py"]
+
+
+def read_synthetic_headers(paths):
+    """`({path: headers}, [(path, message)])` -- the readable and the rest."""
+    headers, unusable = {}, []
+    for path in paths:
+        try:
+            headers[path] = synth_fixture_headers(path)
+        except ValueError as e:
+            unusable.append((path, str(e)))
+    return headers, unusable
+
+
+def check_synthetic_headers(pattern):
+    """`--check-headers`: read every fixture header and report, building nothing.
+
+    This pass touches files and nothing else -- no binary, no reference
+    interpreter, no cargo -- so it belongs beside `cargo fmt --check`, which
+    every expensive job in the workflow already waits on. Run from the suite it
+    cannot answer until the build it sits behind has finished, and an authoring
+    error costs a whole CI run to hear about. Returns a process exit status.
+    """
+    paths = synthetic_bench_paths(pattern)
+    if not paths:
+        print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
+        return 1
+    unusable = read_synthetic_headers(paths)[1]
+    if unusable:
+        report_unusable_headers(unusable)
+        return 1
+    print(f"{len(paths)} synthetic fixture header(s) read, pattern={pattern!r}")
+    return 0
+
+
 # `[spec-census] fold=<label> consulted=N fired=N suppressed=N site=... parent=...`
 SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
 
@@ -2886,6 +3008,7 @@ class Check:
         # applied. Reported in the summary: an unevaluated gate otherwise
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
+        self.pypy_ratio_ungated = []
         # (bench name, ceiling, measured ratio or None) for fixtures whose
         # header raised the ratio above WASM_MAX_DYNASM_RATIO, for the same
         # reason as the line above: a gate widened for a fixture and a gate the
@@ -2971,7 +3094,7 @@ class Check:
             empty_path = handle.name  # zero-length program
         try:
             targets = [
-                ("cpython", [PYTHON3, empty_path], None),
+                ("cpython", [python3(), empty_path], None),
                 ("pypy", [PYPY3, empty_path], None),
             ]
             for backend in ALL_BACKENDS:
@@ -3593,7 +3716,7 @@ class Check:
     def warmup(self, script):
         sys.stdout.write(f"  {'warmup':<10s}")
         sys.stdout.flush()
-        for runner in [PYTHON3, PYPY3]:
+        for runner in [python3(), PYPY3]:
             try:
                 subprocess.run(
                     [runner, script],
@@ -3991,7 +4114,7 @@ class Check:
         if vs_cpython and t_cpython not in (None, "-"):
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
-                [PYTHON3, script], pypy_output, "cpython",
+                [python3(), script], pypy_output, "cpython",
             )
             if not passed:
                 detail = self._gate_fail_detail(
@@ -4012,6 +4135,18 @@ class Check:
                 ratio = _ratio(elapsed, t_pypy)
 
         if vs_pypy and t_pypy not in (None, "-"):
+            # A clamped baseline declines BOTH bounds in `_performance_gate_passed`,
+            # so a fixture can carry a `max-pypy-ratio` that no run has ever
+            # applied. The comparison table already prints `~` on the row, but a
+            # marker per row is not a set anyone can review, and absence of the
+            # directive exempts a fixture entirely -- so a ceiling that never
+            # arms reads exactly like one that holds. Named for the same reason
+            # the wasm ratio is.
+            if (
+                self._baseline_exec_time_clamped("pypy", float(t_pypy))
+                and name not in self.pypy_ratio_ungated
+            ):
+                self.pypy_ratio_ungated.append(name)
             minimum = perf_gate_floor(vs_pypy)
             passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
@@ -4201,7 +4336,7 @@ class Check:
         if need_cpython:
             sys.stdout.write(f"    {'cpython':<10s}")
             sys.stdout.flush()
-            cpython_output, t_cpu, cpython_code, _ = run_timed([PYTHON3, script])
+            cpython_output, t_cpu, cpython_code, _ = run_timed([python3(), script])
             t_cpython = t_cpu
             if cpython_code != 0:
                 print(f"{red('CRASH')} (exit {cpython_code})")
@@ -4397,7 +4532,7 @@ class Check:
         sys.stdout.flush()
         output, elapsed, code, stderr = run_timed(
             [
-                PYTHON3, str(Path(__file__).parent / "cpython_tests" / "run.py"),
+                python3(), str(Path(__file__).parent / "cpython_tests" / "run.py"),
                 "--binary", str(self._pyre(backend)),
                 "--baseline", str(CPYTHON_SUITE_BASELINE),
                 "--jobs", str(max(1, (os.cpu_count() or 4) - 1)),
@@ -4499,20 +4634,16 @@ class Check:
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
 
-    def run_synthetic_bench(self, path, timeout):
+    def run_synthetic_bench(self, path, timeout, headers):
         self.maybe_refresh_startups()
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
-        try:
-            max_pypy_ratio = synth_perf_gate(path)
-            max_rss_mb = synth_rss_gate(path)
-            skip_backends = synth_skip_backends(path)
-            skip_cpython = synth_skip_cpython(path)
-            no_cpython = synth_no_cpython(path)
-            spec_folds = synth_spec_folds(path)
-        except ValueError as e:
-            print(f"{red('ERROR')}: {e}")
-            sys.exit(1)
+        max_pypy_ratio = headers["max_pypy_ratio"]
+        max_rss_mb = headers["max_rss_mb"]
+        skip_backends = headers["skip_backends"]
+        skip_cpython = headers["skip_cpython"]
+        no_cpython = headers["no_cpython"]
+        spec_folds = headers["spec_folds"]
 
         print(f"  {name}")
 
@@ -4535,7 +4666,7 @@ class Check:
             self.cpython_declared_skips.append(name)
         else:
             cpython_output, cpython_time, cpython_code, _ = run_timed(
-                [PYTHON3, path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
+                [python3(), path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
             )
             if cpython_code == 124:
                 # Not a crash: the fixture is sized for the JITs and cpython is
@@ -4612,46 +4743,38 @@ class Check:
 
     def run_synthetic_suite(self):
         pattern = self.args.synthetic_pattern
-        paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
-        if not paths and not Path(pattern).suffix:
-            paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(f"{pattern}.py"))
-        paths = [p for p in paths if p.is_file() and p.suffix == ".py"]
+        paths = synthetic_bench_paths(pattern)
         if not paths:
             print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
             sys.exit(1)
 
         print(bold("synthetic parity suite"))
         print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
+        # Read every fixture's header before running any of them: a missing or
+        # malformed directive is an authoring error, and it is reported with
+        # the others of its kind rather than one per run. `--check-headers`
+        # runs this same pass with nothing built, so ordinarily it has already
+        # answered by the time the suite reaches here.
+        headers, unusable = read_synthetic_headers(paths)
+        if unusable:
+            report_unusable_headers(unusable)
+            sys.exit(1)
+
         for path in paths:
-            try:
-                selfcheck = synth_selfcheck(path)
-                skip_backends = synth_skip_backends(path) if selfcheck else ()
-                # Every header a selfcheck fixture owes, read inside the same
-                # try: a missing or malformed directive is an authoring error
-                # to report by name, not a traceback out of the suite loop.
-                selfcheck_folds = synth_spec_folds(path) if selfcheck else ()
-                interpreted = selfcheck and synth_selfcheck_interpreted(path)
-                want_compiles = (
-                    synth_selfcheck_compiles(path)
-                    if selfcheck and not interpreted
-                    else ()
-                )
-            except ValueError as e:
-                print(f"{red('ERROR')}: {e}")
-                sys.exit(1)
-            if selfcheck:
+            header = headers[path]
+            if header["selfcheck"]:
                 self.run_selfcheck(
                     f"synth/{path.stem}",
                     str(path),
                     self.args.synthetic_timeout,
-                    skip_backends=skip_backends,
-                    require_jit=not interpreted,
-                    spec_folds=selfcheck_folds,
-                    want_compiles=want_compiles,
+                    skip_backends=header["skip_backends"],
+                    require_jit=not header["interpreted"],
+                    spec_folds=header["spec_folds"],
+                    want_compiles=header["want_compiles"],
                 )
             else:
                 self.run_synthetic_bench(
-                    str(path), self.args.synthetic_timeout,
+                    str(path), self.args.synthetic_timeout, header,
                 )
         # A fixture that loses its cpython reference also loses the
         # cpython/pypy output cross-check, so the count belongs in the summary
@@ -4664,6 +4787,18 @@ class Check:
                 dim(
                     f"cpython reference skipped (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s) "
                     f"for {len(self.cpython_reference_skips)}: {names}"
+                )
+            )
+        # A `max-pypy-ratio` whose baseline was pinned to the floor every time
+        # it ran is a recorded number nobody checked.
+        if self.pypy_ratio_ungated:
+            names = ", ".join(self.pypy_ratio_ungated)
+            print(
+                dim(
+                    "max-pypy-ratio not evaluated for "
+                    f"{len(self.pypy_ratio_ungated)} fixture(s): pypy's "
+                    "execution-only time was clamped to the floor, so no ratio "
+                    f"gate was applied to them: {names}"
                 )
             )
         # A wasm run with no usable dynasm denominator beside it leaves
@@ -4960,8 +5095,18 @@ def parse_args():
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )
+    parser.add_argument(
+        "--check-headers",
+        action="store_true",
+        help="read every synthetic fixture's `# pyre-check:` header, report the "
+             "unusable ones and exit; builds and runs nothing",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
+    # Answered here, ahead of the backend resolution below: the check is over
+    # the fixture files, and nothing about it needs a backend to exist.
+    if args.check_headers:
+        sys.exit(check_synthetic_headers(args.synthetic_pattern))
     try:
         args.backends = parse_backend_specs(args.backend)
     except argparse.ArgumentTypeError as e:

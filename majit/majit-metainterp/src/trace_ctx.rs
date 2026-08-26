@@ -3140,10 +3140,19 @@ impl TraceCtx {
             values.len(),
             "set_virtualizable_entry_at: boxes/values length mismatch",
         );
+        // `boxes.len() - 1` is the virtualizable identity
+        // (`virtualizable_boxes[-1]`, appended once by
+        // `init_virtualizable_boxes`), not a state slot: it is the box every
+        // `_nonstandard_virtualizable` check compares against, so a store
+        // landing on it does not corrupt one value, it renames the standard
+        // virtualizable. Nothing may write it through this entry point.
         assert!(
-            index < boxes.len(),
-            "set_virtualizable_entry_at: index {index} out of range for {} slots",
+            index + 1 < boxes.len(),
+            "set_virtualizable_entry_at: index {index} is not a state slot; {} slots carry {} \
+             vable entries plus the virtualizable identity at {}",
             boxes.len(),
+            boxes.len() - 1,
+            boxes.len() - 1,
         );
         boxes[index] = opref;
         values[index] = value;
@@ -5612,10 +5621,26 @@ impl TraceCtx {
 
     /// Compute the flat index into virtualizable_boxes for an array element.
     /// Returns `None` if standard virtualizable is not active or the array field is unknown.
+    ///
+    /// `pyjitpl.py _get_arrayitem_vable_index` gates the same arithmetic on
+    /// `assert 0 <= index < vinfo.get_array_length(virtualizable, arrayindex)`,
+    /// and that assert is load-bearing rather than documentary: the flat space
+    /// runs `[static fields][array 0]..[array n-1][virtualizable identity]`, so
+    /// an index one past the last array is not merely out of the array — it is
+    /// the identity entry `virtualizable_boxes[-1]` that
+    /// `_nonstandard_virtualizable` compares every later vable op against.
+    /// Writing there silently retargets the whole shadow at whatever value the
+    /// store carried. Answer `None` instead: the read paths fall back to a heap
+    /// `GETARRAYITEM_GC_*` and the write path reports `VableArrayStore::
+    /// OutOfVable`, which is the honest outcome for a slot the frame's
+    /// `locals_cells_stack_w` does not have.
     fn vable_array_flat_index(&self, fdescr: &DescrRef, item_index: usize) -> Option<usize> {
         let info = self.virtualizable_info.as_ref()?;
         let lengths = self.virtualizable_array_lengths.as_ref()?;
         let array_idx = info.array_field_by_descr(fdescr)?;
+        if item_index >= *lengths.get(array_idx)? {
+            return None;
+        }
         Some(info.get_index_in_array(array_idx, item_index, lengths))
     }
 

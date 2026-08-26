@@ -1177,7 +1177,7 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         } else {
             // std::alloc stationary block: forward each live element in place.
             let base = unsafe { pyre_object::object_array::items_block_items_base(list.items) };
-            for i in 0..list.length {
+            for i in 0..list.length_relaxed() {
                 f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
             }
         }
@@ -1297,6 +1297,26 @@ fn trace_bufferview(
             f(w_shape as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_bufferview(parent, f);
+        }
+        // Named fields, not `..`: `shape` / `strides` / `suboffsets` are
+        // native vectors and the scalars are plain integers, so the ref slots
+        // are exactly `w_obj`, `w_fmt` and the backing.  A field added later
+        // is a compile error here rather than a missed root.
+        pyre_object::bufferview::BufferView::CBuffer {
+            backing,
+            w_obj,
+            w_fmt,
+            itemsize: _,
+            length: _,
+            ndim: _,
+            offset: _,
+            shape: _,
+            strides: _,
+            suboffsets: _,
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_fmt as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_buffer_exporter(backing, f);
         }
         pyre_object::bufferview::BufferView::Readonly { view, w_obj } => {
             f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -8537,19 +8557,26 @@ fn eval_with_jit_inner(
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
-    frame_root.frame().fix_array_ptrs();
-    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
-    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-
     // During bridge tracing, concrete force-helper calls use the plain
     // interpreter so they cannot recursively enter warmstate or corrupt the
     // bridge trace's symbolic state.
+    //
+    // Declines before `install_current_frame`, like every decline above it.
+    // Both that helper and `ExecutionContext::enter` link the frame into the
+    // `topframeref`/`f_backref` chain, and `execute_frame_plain` reaches
+    // `enter` through `eval_frame_plain_with_resume`.  Linking twice makes the
+    // second `enter` read the `topframeref` the first one just set to this
+    // same frame, so `f_backref` ends up naming the frame itself and
+    // `walk_pyframe_roots` — which has no cycle guard — never terminates.
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
             return frame_root.frame().execute_frame_plain(resume);
         }
     }
+    frame_root.frame().fix_array_ptrs();
+    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
 
     // A resumed frame reaches the portal already positioned mid-body, so its
     // payload has to be consumed before the merge point is consulted: the

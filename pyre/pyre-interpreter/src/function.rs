@@ -828,6 +828,15 @@ pub(crate) fn function_new_impl(
             unsafe {
                 std::ptr::write(raw as *mut Function, function);
             }
+            // The fields were published by the `ptr::write` above, which no
+            // barrier sees. An old-gen Function that never joins the
+            // remembered set is not scanned by a minor collection, so a
+            // freshly nursery-born `w_func_globals_obj` reached only through
+            // it is neither forwarded nor kept alive. The setters barrier
+            // just ahead of their single store; a bulk write has no such
+            // point, so barrier once behind it for the whole initial set.
+            // Nothing collectable runs in between.
+            function_write_barrier(raw as PyObjectRef);
             return raw as PyObjectRef;
         }
     }
@@ -3111,6 +3120,10 @@ pub fn find(_identifier: &str) -> PyObjectRef {
 /// Not the same predicate as `gateway::is_builtin_code`, which asks whether
 /// the object handed to it *is* a builtin code.  This one is asked about a
 /// callable, which is why it has to reach the code through `getcode` first.
+///
+/// `getcode`, not the `code` field: it is the accessor that promotes a
+/// changeable code and takes the elidable one otherwise, and a profiled call
+/// reaches this while a trace records.
 #[inline]
 pub fn is_builtin_code(w_func: PyObjectRef) -> bool {
     unsafe {
@@ -3121,7 +3134,7 @@ pub fn is_builtin_code(w_func: PyObjectRef) -> bool {
         if w_func.is_null() || !crate::is_function(w_func) {
             return false;
         }
-        let code = crate::function_get_code(w_func) as PyObjectRef;
+        let code = crate::getcode(w_func) as PyObjectRef;
         !code.is_null() && crate::gateway::is_builtin_code(code)
     }
 }

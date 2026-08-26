@@ -187,6 +187,16 @@ CPYEXT_INCLUDE = ROOT / "include" / "pyre3.14t"
 CPYEXT_INTERNAL_INCLUDE = CPYEXT_INCLUDE / "internal"
 EXTENSION_BUILD_DIR = ROOT / "build" / "cpython_tests"
 NEEDS_TEST_EXTENSION = {"test.test_buffer", "test.test_importlib"}
+# `PYTHONPATH` does not reach a child started with `-E` or `-I`, and
+# `script_helper.run_python_until_end` starts one whenever the caller passes
+# no environment of its own.  That costs one row today:
+# `test_importlib.extension`'s `test_nonmodule_cases` runs
+# `_test_nonmodule_cases.py` under `-E`, where `_testmultiphase` is not
+# importable and all four of its cases fail.  Reaching that child means
+# putting these modules on the interpreter's own default `sys.path`, whose
+# only entry here is `lib-python/3` — which would also make them importable
+# to every other module in the suite, and the suite branches on whether
+# `import X` succeeds.  That trade is not the runner's to make silently.
 
 # These modules intentionally assert on a child interpreter's exact stderr.
 # MAJIT_STATS is runner instrumentation rather than language-visible output,

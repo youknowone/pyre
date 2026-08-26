@@ -1149,20 +1149,23 @@ pub extern "C" fn bh_lookup_exc_class_for_kind(kind_disc: i64) -> i64 {
 }
 
 /// C-ABI residual bridge for `exc_kind_discriminant`: the caught exception
-/// value rides in as a `PyObjectRef`; its `kind` discriminant rides back as `i64`.
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_w_exception_get_kind(evalue: pyre_object::PyObjectRef) -> i64 {
-    pyre_object::interp_exceptions::exc_kind_discriminant(evalue)
+/// value rides in through the integer arg slot a residual call supplies, so
+/// take it as `i64` here; its `kind` discriminant rides back as `i64`.
+///
+/// `PyObjectRef` is `*mut PyObject`, which is four bytes on wasm32 and eight
+/// on the native targets. Spelling the parameter as the pointer would declare
+/// an `i32` argument there while the emitted `call_indirect` supplies a word,
+/// and the mismatch traps.
+pub extern "C" fn bh_w_exception_get_kind(evalue: i64) -> i64 {
+    pyre_object::interp_exceptions::exc_kind_discriminant(evalue as pyre_object::PyObjectRef)
 }
 
 /// C-ABI residual bridge for `exception_object_matches_stop_iteration`: the
-/// caught exception value rides in as a `PyObjectRef`; its boolean result rides
-/// back in the integer result slot.
-#[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_exception_object_matches_stop_iteration(
-    evalue: pyre_object::PyObjectRef,
-) -> i64 {
-    crate::error::exception_object_matches_stop_iteration(evalue) as i64
+/// caught exception value rides in through the integer arg slot, the
+/// [`bh_w_exception_get_kind`] twin; its boolean result rides back in the
+/// integer result slot.
+pub extern "C" fn bh_exception_object_matches_stop_iteration(evalue: i64) -> i64 {
+    crate::error::exception_object_matches_stop_iteration(evalue as pyre_object::PyObjectRef) as i64
 }
 
 #[cfg(test)]
