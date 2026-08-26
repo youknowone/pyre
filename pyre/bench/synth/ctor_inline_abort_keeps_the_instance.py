@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=through_plain,through_paired,through_spare,through_nested
 # A CALL that inlined a constructor and then aborted inside `__init__` handed
 # the caller `None` instead of the instance.
 #
