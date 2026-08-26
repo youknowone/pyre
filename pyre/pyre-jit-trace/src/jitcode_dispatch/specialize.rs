@@ -6538,6 +6538,39 @@ pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     Ok(Some(DispatchOutcome::Continue))
 }
 
+/// Two-sided bounds guard `0 <= raw_index < len` for a direct element access.
+///
+/// The trace is recorded from a non-negative observed index, but a later
+/// NEGATIVE index would still satisfy `raw_index < len` and reach the element
+/// having proved nothing about its sign.  `space.getitem` / `space.setitem`
+/// remap a negative index to `index + len` (listobject.py, tupleobject.py), so
+/// the direct access would address before the start of the array; the
+/// lower-bound guard deopts such an index to re-execute that remap generically.
+///
+/// Both halves are emitted here so that an indexing arm cannot take one without
+/// the other.
+fn walker_emit_index_bounds_guards<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw_index: OpRef,
+    index: i64,
+    lenbox: OpRef,
+    concrete_len: usize,
+) -> Result<(), DispatchError> {
+    let zero = ctx.trace_ctx.const_int(0);
+    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(
+        in_bounds,
+        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+    Ok(())
+}
+
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`
 /// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
 /// the former subscription/list-strategy path for the object-, int-, and
@@ -6884,30 +6917,15 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
-    // Two-sided bounds guard `0 <= raw_index < len`.  Object storage keeps the
-    // inline `length` field (rlist.py); int/float storage read the typed
-    // items-array length field.  The trace is recorded from a non-negative
-    // observed index, but a later NEGATIVE index would still satisfy
-    // `raw_index < len` and reach the element load out of range; `space.getitem`
-    // treats a negative index as `index + len` (listobject.py), so the
-    // lower-bound guard deopts to re-execute that remap generically.
+    // Object storage keeps the inline `length` field (rlist.py); int/float
+    // storage read the typed items-array length field.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
         _ => crate::descr::list_float_items_len_descr(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
-    let zero = ctx.trace_ctx.const_int(0);
-    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-    ctx.trace_ctx
-        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
-    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
-    ctx.trace_ctx.set_opref_concrete(
-        in_bounds,
-        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
 
     // Element load.  Object storage reads the boxed Ref directly from the
     // `Ptr(GcArray(OBJECTPTR))` items block (no unbox/rebox).  Int/float
@@ -7069,23 +7087,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         items_block,
         crate::state::pyobject_gcarray_descr(),
     );
-    // Two-sided bounds guard `0 <= raw_index < len`.  The trace is recorded
-    // from a non-negative observed index, but a later NEGATIVE index would
-    // still satisfy `raw_index < len` and reach the PURE element load out of
-    // range.  `space.getitem` treats a negative index as `index + len`
-    // (tupleobject.py); the lower-bound guard deopts so that remap
-    // re-executes generically instead of reading before the array.
-    let zero = ctx.trace_ctx.const_int(0);
-    let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
-    ctx.trace_ctx
-        .set_opref_concrete(nonneg, majit_ir::Value::Int((index >= 0) as i64));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
-    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
-    ctx.trace_ctx.set_opref_concrete(
-        in_bounds,
-        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
 
     // PURE element load.  Object storage reads the boxed Ref directly from
     // the immutable `Ptr(GcArray(OBJECTPTR))` body (no unbox/rebox).
@@ -15222,7 +15224,8 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
-    // Bounds guard (non-negative index path): IntLt(raw_index, len).
+    // Object storage keeps the inline `length` field (rlist.py); int/float
+    // storage read the typed items-array length field.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
@@ -15230,12 +15233,7 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         _ => unreachable!(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
-    let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
-    ctx.trace_ctx.set_opref_concrete(
-        in_bounds,
-        majit_ir::Value::Int(((index as usize) < concrete_len) as i64),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+    walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
 
     // Store the reference directly for ObjectListStrategy; only the typed
     // strategies unwrap their payload.  The object arm is what keeps Python
