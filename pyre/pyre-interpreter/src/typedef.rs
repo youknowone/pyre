@@ -13699,6 +13699,21 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
     }
 }
 
+/// Typecheck a write to a `Unicode*Error` `start` / `end` slot.
+///
+/// Those two are `Py_T_PYSSIZET` members, and `PyMember_SetOne` admits only a
+/// real `int` for one: an object carrying nothing but `__index__` is refused,
+/// which is why the test is `isinstance(value, int)` and not the wider
+/// conversion `descr_init` would reach for.  The slot itself holds the object,
+/// as `readwrite_attrproperty_w` does, so the check is all that stands between
+/// a write and a `descr_str` that would go on to format a non-number.
+fn unicode_error_position_w(value: PyObjectRef) -> Result<(), crate::PyError> {
+    if unsafe { crate::baseobjspace::isinstance_int_w(value) } {
+        return Ok(());
+    }
+    Err(crate::PyError::type_error("an integer is required"))
+}
+
 pub(crate) unsafe fn direct_member_set(
     member: PyObjectRef,
     obj: PyObjectRef,
@@ -13836,10 +13851,12 @@ pub(crate) unsafe fn direct_member_set(
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_UNICODE_ERROR_START => {
+            unicode_error_position_w(value)?;
             unsafe { pyre_object::interp_exceptions::w_exception_set_start(obj, value) };
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_UNICODE_ERROR_END => {
+            unicode_error_position_w(value)?;
             unsafe { pyre_object::interp_exceptions::w_exception_set_end(obj, value) };
             Ok(pyre_object::w_none())
         }
