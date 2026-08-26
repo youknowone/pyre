@@ -1323,7 +1323,14 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
     }
     fn write_barrier(&mut self, obj: GcRef) {
-        gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj))
+        // No root bracket: the barrier neither allocates nor collects, so
+        // nothing inside it can move `obj`.  `do_write_barrier` /
+        // `remember_young_pointer` (collector.rs) read headers, append to the
+        // host-allocated `remembered_set`, and clear a tid flag — which is why
+        // upstream inlines the barrier at the store (framework.py:533-537) and
+        // publishes no shadow-stack root anywhere in it.  Restore the bracket
+        // if the remembered set ever becomes GC-managed.
+        gc_sync::gc_op(|gc| gc.write_barrier(obj))
     }
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.jit_remember_young_pointer_from_array(obj))

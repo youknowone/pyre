@@ -883,14 +883,15 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
     if gc_box::with_mut(|g| g.write_barrier(obj)).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier(obj));
+    // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+    majit_gc::gc_sync::gc_op(|g| g.write_barrier(obj));
 }
 
 fn dynasm_gc_write_barrier_managed(obj: GcRef) {
     if gc_box::with_mut(|g| g.write_barrier_managed(obj)).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.write_barrier_managed(obj));
+    majit_gc::gc_sync::gc_op(|g| g.write_barrier_managed(obj));
 }
 
 fn dynasm_id_or_identityhash(addr: usize) -> usize {
