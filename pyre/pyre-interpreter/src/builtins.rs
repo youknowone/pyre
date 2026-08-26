@@ -19051,7 +19051,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))]
     {
         let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
-            #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+            #[cfg(not(feature = "host_env"))]
             {
                 // Sandbox-intentional: with the host_env feature off the
                 // interpreter must not reach `std::fs` directly.  Callers in
@@ -19062,6 +19062,24 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(crate::PyError::not_implemented(
                     "open() for reading requires host_env feature",
                 ));
+            }
+            #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+            {
+                // wasm32 has no filesystem of its own, so a read goes through
+                // the embedder's, over the same `SourceProvider` seam `import`
+                // resolves modules with: `open()` reaches exactly the files an
+                // import could, and no others.
+                let _ = binary;
+                match crate::importing::read_source_bytes(std::path::Path::new(&path)) {
+                    Ok(bytes) => bytes,
+                    Err(_e) if writing => Vec::new(),
+                    Err(e) => {
+                        return Err(crate::PyError::os_error_syscall(
+                            io_error_posix_errno(&e, 2),
+                            resolved_path.w_path(),
+                        ));
+                    }
+                }
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             let read_result = rustpython_host_env::fs::read(&path);
