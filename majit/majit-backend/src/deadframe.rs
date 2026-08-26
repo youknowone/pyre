@@ -123,15 +123,38 @@ struct FramePool {
 }
 
 thread_local! {
+    /// Per-thread, and per-thread is the only scope that pays for itself here.
+    ///
+    /// The effect being bought is 2.62 ns per entry. A pool shared between
+    /// threads costs an uncontended atomic read-modify-write pair to take and to
+    /// return a buffer, which is the same order as the saving, so a process-wide
+    /// free list would hand back what it was built to remove. Sharding by thread
+    /// is what leaves the take and the return as plain `Vec` pops and pushes.
+    ///
+    /// A field would be the alternative to a `thread_local!`, and there is no
+    /// object to make it a field of: `run_compiled_code` and
+    /// `run_compiled_code_inner` (`majit-backend-cranelift/src/compiler.rs`) are
+    /// free functions whose only context is a `&CpuDescrAttachments`, a shared
+    /// reference. Compiled entries also nest — `execute_bridge` recurses and
+    /// CALL_ASSEMBLER hops re-enter — so a `&mut` owner threaded down to the
+    /// allocation could not be re-borrowed by the inner entry.
+    ///
+    /// Per-thread is also the right scope for the lifetime, not merely a cheap
+    /// one. A buffer is taken and returned inside one compiled entry, which runs
+    /// to completion on its caller's thread and never hands the frame to another;
+    /// a buffer parked on some other thread's list is one this entry could not
+    /// have used.
+    ///
+    /// Handing a buffer out REMOVES it from `free`, so two live frames can never
+    /// address one. Every access is `try_with`: a frame outliving its thread's
+    /// TLS teardown would otherwise panic inside a `Drop`, and falling back to
+    /// the allocator is the answer there.
     static FRAME_POOL: RefCell<FramePool> = const {
         RefCell::new(FramePool { free: Vec::new(), owned: 0, taken: 0, misses: 0 })
     };
 }
 
 fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
-    // `try_with` and not `with`: a frame outliving its thread's TLS teardown
-    // would otherwise panic inside a `Drop`, and falling back to the allocator
-    // is the right answer there anyway.
     let pooled = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
         pool.taken += 1;
@@ -192,14 +215,36 @@ pub fn jitframe_pool_counts() -> (u64, u64, u64) {
         .unwrap_or((0, 0, 0))
 }
 
-const POOL_ARM_UNSEEDED: u8 = 0;
-const POOL_ARM_OFF: u8 = 1;
-const POOL_ARM_ON: u8 = 2;
+/// Which arm [`FrameHeapOwner::new`] allocates through.
+///
+/// `Unseeded` is the state before the first entry reads the selector, not a
+/// third strategy: the first read resolves it to one of the other two and
+/// stores that back, so no later read can see it again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PoolArm {
+    Unseeded = 0,
+    Owned = 1,
+    Pooled = 2,
+}
+
+impl PoolArm {
+    /// The arm a [`POOL_ARM`] byte names. A byte outside the three
+    /// discriminants reads as `Unseeded`, which re-runs the selection rather
+    /// than choosing an arm from a value nothing wrote.
+    fn from_stored(stored: u8) -> Self {
+        match stored {
+            x if x == PoolArm::Owned as u8 => PoolArm::Owned,
+            x if x == PoolArm::Pooled as u8 => PoolArm::Pooled,
+            _ => PoolArm::Unseeded,
+        }
+    }
+}
 
 /// Process-wide, because the thing it selects is a strategy and not a state:
 /// a caller flipping arms between two timed batches wants the flip to hold for
 /// whichever thread the next entry runs on.
-static POOL_ARM: AtomicU8 = AtomicU8::new(POOL_ARM_UNSEEDED);
+static POOL_ARM: AtomicU8 = AtomicU8::new(PoolArm::Unseeded as u8);
 
 /// Select the frame-allocation arm for subsequent compiled entries.
 ///
@@ -208,20 +253,18 @@ static POOL_ARM: AtomicU8 = AtomicU8::new(POOL_ARM_UNSEEDED);
 /// harness that cannot call this — a test binary with no hook of its own —
 /// picks an arm.
 pub fn set_jitframe_pool(on: bool) {
-    POOL_ARM.store(
-        if on { POOL_ARM_ON } else { POOL_ARM_OFF },
-        Ordering::Relaxed,
-    );
+    let arm = if on { PoolArm::Pooled } else { PoolArm::Owned };
+    POOL_ARM.store(arm as u8, Ordering::Relaxed);
 }
 
 /// Whether the next frame comes off the pool. One relaxed load on the entry
 /// path, which BOTH arms pay, so it cancels out of their difference.
 #[inline]
 pub fn jitframe_pool_enabled() -> bool {
-    match POOL_ARM.load(Ordering::Relaxed) {
-        POOL_ARM_OFF => false,
-        POOL_ARM_ON => true,
-        _ => seed_jitframe_pool_arm(),
+    match PoolArm::from_stored(POOL_ARM.load(Ordering::Relaxed)) {
+        PoolArm::Owned => false,
+        PoolArm::Pooled => true,
+        PoolArm::Unseeded => seed_jitframe_pool_arm(),
     }
 }
 
