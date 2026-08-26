@@ -154,6 +154,18 @@ pub(crate) fn format_float_repr(val: f64) -> String {
     rustpython_literal::float::to_string(val)
 }
 
+/// RPython `rfloat.formatd` residual ABI for the generated JIT.
+///
+/// Upstream returns one low-level `STR` GC pointer. The host formatter returns
+/// a three-word Rust `String`, so the source translator retargets only that
+/// formatter call to this wrapper and keeps the bytes in the managed
+/// length-prefixed block used for translated RPython strings.
+#[majit_macros::dont_look_inside]
+pub fn jit_format_float_repr_rstr(val: f64) -> *mut pyre_object::bytesobject::BytesBlock {
+    let text = rustpython_literal::float::to_string(val);
+    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+}
+
 /// `unicodedb.isprintable` in PyPy's `rutf8.make_utf8_escape_function` is a
 /// pure generated-table lookup.  Keep the same scalar call boundary around
 /// pyre's Unicode database provider, including the upstream guarantee that a
@@ -2303,7 +2315,10 @@ impl fmt::Display for PyDisplay {
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_repr_string, format_wtf8_repr, nt_drive_len};
+    use super::{
+        bytes_repr_string, format_float_repr, format_wtf8_repr, jit_format_float_repr_rstr,
+        nt_drive_len,
+    };
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
     #[test]
@@ -2329,6 +2344,15 @@ mod tests {
         let mut surrogate = Wtf8Buf::from("x");
         surrogate.push(CodePoint::from_u32(0xd800).unwrap());
         assert_eq!(format_wtf8_repr(&surrogate), "'x\\ud800'");
+    }
+
+    #[test]
+    fn float_repr_residual_returns_the_same_lowlevel_string_bytes() {
+        for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let block = jit_format_float_repr_rstr(value);
+            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            assert_eq!(bytes, format_float_repr(value).as_bytes());
+        }
     }
 
     /// Every expectation is `len(ntpath.splitdrive(p)[0].encode())` for the

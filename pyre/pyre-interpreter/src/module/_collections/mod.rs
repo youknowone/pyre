@@ -147,22 +147,19 @@ pub(crate) fn is_deque(obj: PyObjectRef) -> bool {
 
 /// Read one app-level `__slots__` entry from a deque subclass.
 pub(crate) unsafe fn deque_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { pyre_object::slots::slot_get(obj, index, deque_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
+    unsafe { pyre_object::slots::slot_get(slots, index) }
 }
 
 /// Write one app-level `__slots__` entry on a deque subclass.
 pub(crate) unsafe fn deque_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { pyre_object::slots::slot_set(obj, index, value, deque_slots_field) }
+    pyre_object::slot_set_direct!(obj, index, value, W_Deque, w_slots)
 }
 
 /// Clear one app-level `__slots__` entry on a deque subclass.
 pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { pyre_object::slots::slot_del(obj, index, deque_slots_field) }
-}
-
-/// Address of `W_Deque::w_slots` for the shared native-subclass slot helpers.
-unsafe fn deque_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_Deque)).w_slots }
+    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
+    unsafe { pyre_object::slots::slot_del(slots, index) }
 }
 
 /// Snapshot the backing list into a `Vec`.

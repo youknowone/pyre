@@ -19017,10 +19017,51 @@ fn init_int_type(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
-/// Complex `repr` (`Xj` for a pure-`+0` real part, else `(re±imj)`),
-/// delegated to `rustpython_literal::complex::to_string`.
+/// `complexobject.py repr_format` — `rfloat.formatd(x, 'r', 0)` without the
+/// `DTSF_ADD_DOT_0` flag used by float repr.  RustPython keeps that spelling
+/// inside its complex formatter; selecting a pure-imaginary value exposes the
+/// same component text to the interpreter path.
+pub(crate) fn format_complex_component_repr(val: f64) -> String {
+    let mut out = rustpython_literal::complex::to_string(0.0, val);
+    debug_assert!(out.ends_with('j'));
+    out.pop();
+    out
+}
+
+/// RPython `rfloat.formatd` residual ABI for a complex repr component.
+///
+/// The translator replaces only the component-format call with this one-word
+/// low-level string result.  The surrounding positive-zero/sign/parenthesis
+/// builder remains visible in `complex_repr_string`, matching PyPy.
+#[majit_macros::dont_look_inside]
+pub fn jit_format_complex_component_repr_rstr(
+    val: f64,
+) -> *mut pyre_object::bytesobject::BytesBlock {
+    let text = format_complex_component_repr(val);
+    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+}
+
+/// `complexobject.py W_ComplexObject.descr_repr` — a pure positive-zero real
+/// part uses `Xj`; every other value uses `(re±imj)`.  Keep the branch and the
+/// two `repr_format` calls visible to source translation, just as PyPy does,
+/// instead of delegating the whole operation to a foreign Rust formatter.
 pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
-    rustpython_literal::complex::to_string(re, im)
+    if re == 0.0 && re.is_sign_positive() {
+        let mut out = String::new();
+        out.push_str(&format_complex_component_repr(im));
+        out.push_str("j");
+        return out;
+    }
+
+    let mut out = String::new();
+    out.push_str("(");
+    out.push_str(&format_complex_component_repr(re));
+    if im.is_sign_positive() || im.is_nan() {
+        out.push_str("+");
+    }
+    out.push_str(&format_complex_component_repr(im));
+    out.push_str("j)");
+    out
 }
 
 fn init_complex_type(ns: PyObjectRef) {
@@ -31491,6 +31532,33 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn complex_repr_keeps_pypy_positive_zero_and_sign_rules() {
+        for (re, im, expected) in [
+            (0.0, 2.0, "2j"),
+            (-0.0, 2.0, "(-0+2j)"),
+            (1.0, 2.0, "(1+2j)"),
+            (1.0, -2.0, "(1-2j)"),
+            (1.0, f64::NAN, "(1+nanj)"),
+            (f64::INFINITY, f64::NEG_INFINITY, "(inf-infj)"),
+            (0.0, -0.0, "-0j"),
+        ] {
+            assert_eq!(super::complex_repr_string(re, im), expected);
+        }
+    }
+
+    #[test]
+    fn complex_component_residual_returns_the_same_lowlevel_string_bytes() {
+        for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let block = super::jit_format_complex_component_repr_rstr(value);
+            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            assert_eq!(
+                bytes,
+                super::format_complex_component_repr(value).as_bytes()
+            );
+        }
+    }
+
     #[test]
     fn module_init_retains_a_surrogate_name_object() {
         let module = pyre_object::w_module_new_managed("");

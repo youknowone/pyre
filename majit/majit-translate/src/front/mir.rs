@@ -8726,8 +8726,8 @@ impl<'a> Lowering<'a> {
                 // therefore the same array value in the translated model, and its
                 // length is the block capacity the descr reports.  Fold only these
                 // capacity-length enclosing accessors, not arbitrary raw slices
-                // (`object_items_slice` uses the logical list length, not the
-                // capacity — see [`is_container_items_view_from_raw_parts`]).
+                // (an object list's logical length can differ from its items
+                // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -8857,6 +8857,52 @@ impl<'a> Lowering<'a> {
                             op: "lt".to_string(),
                             lhs: bits.clone(),
                             rhs: zero.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `f64::is_sign_positive(x)` is the complementary sign-bit
+                // test, `float2longlong(x) >= 0`. PyPy spells the complex repr
+                // decision as `math.copysign(1.0, x) == 1.0`; both must inspect
+                // the sign bit so +0.0/-0.0 remain distinct.
+                if args.len() == 1 && self.is_f64_is_sign_positive(&reg) {
+                    let bits = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(bits.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "longlong2float".to_string(),
+                                    "float2longlong".to_string(),
+                                ],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    let zero = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "ge".to_string(),
+                            lhs: bits,
+                            rhs: zero,
                             result_ty: ValueType::Int,
                         },
                     });
@@ -9654,6 +9700,29 @@ impl<'a> Lowering<'a> {
             OpKind::Hint {
                 value: args[0].clone(),
                 kind,
+            }
+        } else {
+            op_kind
+        };
+
+        // PyPy float repr and each complex repr component call
+        // `rfloat.formatd`, an external returning one low-level `STR` GC
+        // pointer. RustPython's equivalent host formatters return a three-word
+        // Rust `String`, which the residual ABI cannot express. Retarget only
+        // those exact formatting boundaries to one-word `BytesBlock*`
+        // wrappers; the complex sign/parenthesis builder remains in its graph.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && let Some(residual) = crate::front::rfloat_call::repr_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
             }
         } else {
             op_kind
@@ -11458,13 +11527,12 @@ impl<'a> Lowering<'a> {
     /// Only capacity-length views qualify: `digits` builds its slice with
     /// `from_raw_parts(base, capacity)` (the block header's own length), so the
     /// header-alias descr (which reports capacity) preserves the length exactly.
-    /// `W_ListObject::object_items_slice{,_mut}` is deliberately EXCLUDED — it
-    /// uses `from_raw_parts(base, self.length)`, the *logical* list length,
-    /// which is `< capacity` when the block is over-allocated (e.g. after
-    /// `pop`).  Aliasing it to the header would make `items.len()` report
-    /// capacity, so `w_list_getitem` would accept an index in
-    /// `[length, capacity)` and return a stale slot instead of raising.  Fold
-    /// only the capacity-length enclosing accessors, not arbitrary raw slices.
+    /// Object-list storage is deliberately excluded: its *logical* list
+    /// length is `< capacity` when the block is over-allocated (e.g. after
+    /// `pop`). Aliasing a logical-length view to the header would make a
+    /// consumer observe capacity and accept an index in `[length, capacity)`.
+    /// The object-list port therefore follows `rlist.ll_getitem_fast` and
+    /// reads `length` plus the indexed item directly, without a raw slice.
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
             || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
@@ -12302,6 +12370,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_negative")
+    }
+
+    /// `f64::is_sign_positive(self)` — the positive half of the same sign-bit
+    /// primitive as [`Self::is_f64_is_sign_negative`]. Reinterpret the f64 as
+    /// a signed i64 and test `>= 0`; a numerical comparison with zero would
+    /// incorrectly classify `-0.0` and sign-bit-set NaN.
+    fn is_f64_is_sign_positive(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_positive")
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
@@ -29020,7 +29101,7 @@ mod tests {
                         value: crate::model::LinkArg::Value(value),
                         array_type_id: Some(array_type_id),
                         ..
-                    } if value == cast_result && array_type_id == super::PYOBJECT_GCARRAY_TYPE_ID
+                    } if value == cast_result && array_type_id == super::OBJECT_REF_GCARRAY_TYPE_ID
                 )
             })
         });
@@ -29644,20 +29725,19 @@ mod tests {
         );
     }
 
-    /// `W_ListObject::object_items_slice` builds its slice with
-    /// `from_raw_parts(base, self.length)` (the LOGICAL list length, `<`
-    /// capacity for an over-allocated block), so it must NOT fold to the
-    /// items-block header (whose gcarray descr reports capacity). The residual
-    /// `from_raw_parts` call must survive. Loads the pyre-object LLBC (the
-    /// accessor lives in `pyre_object::listobject`), so ignored by default.
+    /// RPython `ll_getitem_fast` indexes a list's items array after checking
+    /// the list's logical length. The pyre object-list path must keep that
+    /// direct shape instead of manufacturing a Rust fat slice with
+    /// `from_raw_parts(base, self.length)`: such a slice is neither an RPython
+    /// source operation nor representable by the one-word GC-array model.
+    /// Loads the pyre-object LLBC, so ignored by default.
     #[test]
     #[ignore]
-    fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
+    fn object_list_getitem_keeps_logical_length_without_a_raw_slice() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
-        let graph =
-            super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
+        let graph = super::lower_function(&llbc, "w_list_getitem").expect("lower w_list_getitem");
         let from_raw_parts_calls = graph
             .blocks
             .iter()
@@ -29670,10 +29750,120 @@ mod tests {
                 )
             })
             .count();
+        assert_eq!(
+            from_raw_parts_calls, 0,
+            "object-list getitem must read logical length and items directly, \
+             like rlist.ll_getitem_fast"
+        );
+    }
+
+    /// PyPy `float_repr` reaches `rfloat.formatd`, whose translated return is
+    /// one low-level string pointer. The real interpreter LLBC must therefore
+    /// retarget RustPython's three-word `String` formatter to the one-word
+    /// `BytesBlock*` residual wrapper.
+    #[test]
+    #[ignore]
+    fn float_repr_uses_the_rpython_string_residual_abi() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph =
+            super::lower_function(&llbc, "format_float_repr").expect("lower format_float_repr");
+        let paths: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.iter().any(|segments| {
+            segments
+                == &[
+                    "pyre_interpreter".to_string(),
+                    "display".to_string(),
+                    "jit_format_float_repr_rstr".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "rustpython_literal".to_string(),
+                    "float".to_string(),
+                    "to_string".to_string(),
+                ]
+        }));
+    }
+
+    /// PyPy's complex repr keeps its positive-zero/sign branch in
+    /// `W_ComplexObject.descr_repr` and calls `repr_format` for each component.
+    /// The interpreter graph must retain that shape rather than collapsing the
+    /// whole operation into RustPython's foreign complex formatter.
+    #[test]
+    #[ignore]
+    fn complex_repr_keeps_the_pypy_builder_and_float_formatter_calls() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph =
+            super::lower_function(&llbc, "complex_repr_string").expect("lower complex repr");
+        let paths: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.iter().any(|segments| {
+            segments
+                == &[
+                    "pyre_interpreter".to_string(),
+                    "typedef".to_string(),
+                    "jit_format_complex_component_repr_rstr".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "rustpython_literal".to_string(),
+                    "complex".to_string(),
+                    "to_string".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "core".to_string(),
+                    "f64".to_string(),
+                    "<Impl>".to_string(),
+                    "is_sign_positive".to_string(),
+                ]
+        }));
+        assert!(paths.iter().any(|segments| {
+            segments == &["longlong2float".to_string(), "float2longlong".to_string()]
+        }));
         assert!(
-            from_raw_parts_calls >= 1,
-            "object_items_slice must keep its residual from_raw_parts (logical \
-             length != capacity), not alias to the items-block header"
+            !paths.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "push" || leaf == "push_str")
+            }),
+            "complex repr String appends must use the RPython builder lift: {paths:#?}"
         );
     }
 

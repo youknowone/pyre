@@ -345,20 +345,6 @@ impl W_ListObject {
         self.allocated = self.resized_allocation(old_size, self.live_len()) as isize;
     }
 
-    /// Borrow a slice over object-strategy items. Must only be called
-    /// when `self.strategy == ListStrategy::Object`.
-    #[inline]
-    unsafe fn object_items_slice(&self) -> &[PyObjectRef] {
-        let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts(base, self.length_relaxed())
-    }
-
-    #[inline]
-    unsafe fn object_items_slice_mut(&mut self) -> &mut [PyObjectRef] {
-        let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts_mut(base, self.length_relaxed())
-    }
-
     #[inline]
     unsafe fn object_items_capacity(&self) -> usize {
         items_block_capacity(self.items)
@@ -711,7 +697,19 @@ impl W_ListObject {
         // new reference, so it owes the same barrier as the shifts above.
         let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
         let this = &mut *(obj as *mut W_ListObject);
-        this.object_items_slice_mut().reverse();
+        // rlist.py:ll_reverse operates on the logical list directly through
+        // ll_getitem_fast / ll_setitem_fast. Keep that shape here instead of
+        // manufacturing a Rust fat slice over the over-allocated items block.
+        let base = items_block_items_base(this.items);
+        let mut i = 0;
+        let mut length_1_i = this.length_relaxed() as isize - 1;
+        while i < length_1_i {
+            let tmp = *base.add(i as usize);
+            *base.add(i as usize) = *base.add(length_1_i as usize);
+            *base.add(length_1_i as usize) = tmp;
+            i += 1;
+            length_1_i -= 1;
+        }
     }
 
     unsafe fn object_drain(&mut self, range: std::ops::Range<usize>) {
@@ -806,7 +804,13 @@ impl W_ListObject {
     }
 
     unsafe fn object_to_vec(&self) -> Vec<PyObjectRef> {
-        self.object_items_slice().to_vec()
+        let base = items_block_items_base(self.items);
+        let length = self.length_relaxed();
+        let mut result = Vec::with_capacity(length);
+        for i in 0..length {
+            result.push(*base.add(i));
+        }
+        result
     }
 
     /// Free the current `items` block and install a freshly allocated
@@ -2229,13 +2233,13 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
             Some(w_int_new(range_list_item_unchecked(list, idx as usize)))
         }
         ListStrategy::Object => {
-            let items = list.object_items_slice();
-            let len = items.len() as i64;
+            let len = list.length_relaxed() as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(items[idx as usize])
+            let base = items_block_items_base(list.items);
+            Some(*base.add(idx as usize))
         }
         ListStrategy::Integer => {
             let len = ll_list_int_length(list) as i64;
@@ -2319,8 +2323,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             let value = prepare_list_ref_store(obj, value);
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             let list = &mut *(obj as *mut W_ListObject);
-            let items = list.object_items_slice_mut();
-            items[idx as usize] = value;
+            let base = items_block_items_base(list.items);
+            *base.add(idx as usize) = value;
             true
         }
         ListStrategy::Integer => {
@@ -3162,10 +3166,7 @@ pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
 pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const PyObjectRef, usize)> {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            let items = list.object_items_slice();
-            Some((items.as_ptr(), items.len()))
-        }
+        ListStrategy::Object => Some((items_block_items_base(list.items), list.length_relaxed())),
         _ => None,
     }
 }
