@@ -38,6 +38,13 @@ pub struct LaunchFlags {
     pub safe_path: bool,
     /// `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
     pub optimize: i64,
+    /// `-v` count; PYTHONVERBOSE folds in during finalize.  Read back as
+    /// `sys.flags.verbose`, which is what `importlib._bootstrap`'s
+    /// `_verbose_message` gates the import trace on.
+    pub verbose: i64,
+    /// `-d` count; PYTHONDEBUG folds in during finalize.  The parser has no
+    /// debug output to emit, so the count exists to be reported.
+    pub debug: i64,
     pub bytes_warning: i64,
     pub dont_write_bytecode: bool,
     pub unbuffered: bool,
@@ -87,6 +94,8 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONDEVMODE",
     "PYTHONINSPECT",
     "PYTHONOPTIMIZE",
+    "PYTHONVERBOSE",
+    "PYTHONDEBUG",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONUTF8",
     "PYTHONWARNDEFAULTENCODING",
@@ -210,28 +219,39 @@ fn env_int_flag(name: &str) -> Option<u32> {
     // Read the bytes, not a decoded string: `_Py_str_to_int` rejects undecodable
     // input exactly the way it rejects trailing junk, so both land on 1 rather
     // than on "unset".
+    //
+    // `strtol` steps over leading whitespace before the digits and then reports
+    // where it stopped, so `_Py_str_to_int` takes a value padded on the left and
+    // refuses one padded on the right.  Rust's parse refuses both, so the left
+    // pad is trimmed here; the set is `isspace`'s, not `char::is_whitespace`'s,
+    // which would also step over spacing the C function stops at.
     let parsed = std::str::from_utf8(&raw)
         .ok()
+        .map(|value| value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']))
         .and_then(|value| value.parse::<i64>().ok());
+    // `preconfig.c:554` rejects anything outside the C `int` range as
+    // overflow, and an unreadable value is what becomes 1, so the ceiling is
+    // INT_MAX rather than the width of the field this returns into.
     let value = match parsed {
-        Some(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
+        Some(v) if (0..=i64::from(i32::MAX)).contains(&v) => v as u32,
         _ => 1,
     };
     Some(value)
 }
 
-/// `-O` count folded with PYTHONOPTIMIZE (`config_init_optimization_level`):
-/// the effective level is the larger of the two.  The level is kept as a wide
-/// integer so `sys.flags.optimize` mirrors a large `PYTHONOPTIMIZE` verbatim;
-/// the compiler clamps it into a byte at read time.
-fn resolve_optimize(flags: &LaunchFlags) -> i64 {
-    let mut level = flags.optimize;
-    if !flags.ignore_environment
-        && let Some(v) = env_int_flag("PYTHONOPTIMIZE")
-    {
-        level = level.max(i64::from(v));
+/// A repeatable option folded with its integer environment variable
+/// (`app_main.py`'s `parse_env`, and `config_init_optimization_level` for the
+/// `-O` case): the effective count is the larger of the two.  The count is kept
+/// as a wide integer so `sys.flags` mirrors a large variable verbatim; the
+/// compiler clamps the optimization level into a byte at read time.
+fn resolve_counter(flags: &LaunchFlags, count: i64, name: &str) -> i64 {
+    if flags.ignore_environment {
+        return count;
     }
-    level
+    match env_int_flag(name) {
+        Some(value) => count.max(i64::from(value)),
+        None => count,
+    }
 }
 
 /// A boolean option folded with an *integer* environment flag: the variable
@@ -264,7 +284,9 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         );
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
-    flags.optimize = resolve_optimize(&flags);
+    flags.optimize = resolve_counter(&flags, flags.optimize, "PYTHONOPTIMIZE");
+    flags.verbose = resolve_counter(&flags, flags.verbose, "PYTHONVERBOSE");
+    flags.debug = resolve_counter(&flags, flags.debug, "PYTHONDEBUG");
     // Which of the two shapes a name takes is per-variable, not a category:
     // PYTHONSAFEPATH and PYTHONINSPECT enable on a bare `=0`, PYTHONNOUSERSITE
     // and PYTHONUNBUFFERED do not.

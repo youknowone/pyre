@@ -3120,6 +3120,8 @@ static SYS_DEV_MODE: AtomicBool = AtomicBool::new(false);
 static SYS_UTF8_MODE: AtomicI64 = AtomicI64::new(0);
 static SYS_SAFE_PATH: AtomicBool = AtomicBool::new(false);
 static SYS_OPTIMIZE: AtomicI64 = AtomicI64::new(0);
+static SYS_VERBOSE: AtomicI64 = AtomicI64::new(0);
+static SYS_DEBUG: AtomicI64 = AtomicI64::new(0);
 static SYS_BYTES_WARNING: AtomicI64 = AtomicI64::new(0);
 static SYS_DONT_WRITE_BYTECODE: AtomicBool = AtomicBool::new(false);
 static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
@@ -3170,6 +3172,8 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
     SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);
+    SYS_VERBOSE.store(flags.verbose, Ordering::Relaxed);
+    SYS_DEBUG.store(flags.debug, Ordering::Relaxed);
     SYS_BYTES_WARNING.store(flags.bytes_warning, Ordering::Relaxed);
     SYS_DONT_WRITE_BYTECODE.store(flags.dont_write_bytecode, Ordering::Relaxed);
     SYS_UNBUFFERED.store(flags.unbuffered, Ordering::Relaxed);
@@ -3185,6 +3189,19 @@ pub fn xoptions() -> Vec<std::ffi::OsString> {
 
 pub fn bytes_warning_flag() -> i64 {
     SYS_BYTES_WARNING.load(Ordering::Relaxed)
+}
+
+/// `-v` / PYTHONVERBOSE, read back as `sys.flags.verbose`.  The import trace
+/// itself is emitted by `importlib._bootstrap`'s `_verbose_message`, which
+/// compares this against the verbosity a message asks for.
+pub fn verbose_flag() -> i64 {
+    SYS_VERBOSE.load(Ordering::Relaxed)
+}
+
+/// `-d` / PYTHONDEBUG as the config counts it.  `sys.flags.debug` saturates
+/// this to 0/1, because `parser_debug` is declared BOOL there.
+pub fn debug_flag() -> i64 {
+    SYS_DEBUG.load(Ordering::Relaxed)
 }
 
 /// CPython 3.14 `PyConfig.code_debug_ranges`, consumed by every compiler

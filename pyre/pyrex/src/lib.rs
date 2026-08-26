@@ -56,6 +56,7 @@ usage: {binary_name} [option] ... [-c cmd | file | -] [arg] ...
 Options:
 -c cmd : program passed in as string (terminates option list)
 -m mod : run library module as a script (terminates option list)
+-d     : debug output from parser; also PYTHONDEBUG=x
 -h     : print this help message and exit (also --help)
 -i     : inspect interactively after running script
 -E     : ignore PYTHON* environment variables
@@ -67,6 +68,7 @@ Options:
 -s     : don't add user site directory to sys.path
 -S     : don't imply 'import site' on initialization
 -P     : don't prepend a potentially unsafe path to sys.path (also PYTHONSAFEPATH)
+-v     : verbose (trace import statements); also PYTHONVERBOSE=x
 -V     : print the Python version number and exit (also --version)
 -X opt : set implementation-specific option
 file   : program read from script file
@@ -243,6 +245,12 @@ fn parse_args(
             // PyPy app_main.py `simple_option`: repeated `-b` increments the
             // bytes-warning level (`-bb` therefore records 2).
             Short('b') => flags.bytes_warning = flags.bytes_warning.saturating_add(1),
+            // The other two `simple_option` counters. `-v` reaches the import
+            // machinery through `sys.flags.verbose`, which `_verbose_message`
+            // reads; `-d` names parser debug output there is none of, and is
+            // carried so `sys.flags.debug` reports it.
+            Short('v') => flags.verbose = flags.verbose.saturating_add(1),
+            Short('d') => flags.debug = flags.debug.saturating_add(1),
             // `-B` disables writing bytecode caches (PYTHONDONTWRITEBYTECODE).
             Short('B') => flags.dont_write_bytecode = true,
             // PyPy app_main.py `unbuffered`: writing streams use raw FileIO
@@ -2124,6 +2132,23 @@ fn eval_source_in_main(
     };
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
+
+    // `run_command_line` reaches its stdin branch with `site`, the warnings
+    // bootstrap and the signal handlers already installed, and prints the
+    // banner there rather than on the way in: what it labels is the import
+    // trace `-v` produced for all of that, so it follows the trace instead of
+    // heading it.  `<stdin>` names that branch -- a tty takes the prompt, and
+    // the prompt prints its own.  On stderr, where the trace goes; a piped
+    // program's stdout is its own.
+    if filename == "<stdin>" && importing::verbose_flag() != 0 {
+        eprintln!("{}", repl::BANNER);
+        // `print_banner(not no_site)` -- the second line names the four
+        // builtins `site` installs, so `-S` leaves it nothing to offer and the
+        // notice is dropped with them.
+        if !no_site {
+            eprintln!("{}", repl::BANNER_COPYRIGHT);
+        }
+    }
 
     // `<string>` names no file, so `linecache._interactive_cache` is the only
     // place a traceback frame or `inspect.getsource` can reach the command's

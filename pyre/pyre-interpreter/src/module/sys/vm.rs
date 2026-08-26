@@ -1687,7 +1687,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let flags = crate::_structseq::new_instance_with_extra(
             flags_type,
             vec![
-                w_int_new(0), // debug
+                // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
+                // while `verbose` is UINT, so `-dd` reports 1 here and 2
+                // there.  Both count in the config; only this one saturates.
+                w_int_new(i64::from(crate::importing::debug_flag() != 0)),
                 // `-i` sets both.
                 w_int_new(i64::from(crate::importing::inspect_flag())),
                 w_int_new(i64::from(crate::importing::inspect_flag())),
@@ -1697,7 +1700,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `-S` (skip `import site`) is recorded by the launcher.
                 w_int_new(i64::from(crate::importing::no_site_flag())),
                 w_int_new(i64::from(crate::importing::ignore_environment_flag())),
-                w_int_new(0), // verbose
+                w_int_new(crate::importing::verbose_flag()),
                 w_int_new(crate::importing::bytes_warning_flag()),
                 w_int_new(i64::from(crate::importing::quiet_flag())),
                 w_int_new(0), // hash_randomization
