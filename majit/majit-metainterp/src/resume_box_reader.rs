@@ -61,6 +61,30 @@ pub struct BridgeVirtualCache<'a> {
     /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
     /// the recording-only reader, which never needs a concrete.
     fail_values: &'a [i64],
+    /// Addresses of the virtuals the applying reader has allocated, indexed by
+    /// virtual number and registered as resume-construction GC roots.
+    ///
+    /// resume.py keeps each freshly allocated virtual in `virtuals_cache`,
+    /// an ordinary RPython object and therefore a root, and its own comment
+    /// says why: `allocate()` must fill the cache "as soon as they have the
+    /// object, before they fill its fields", because a later allocation in the
+    /// same walk can collect. Between one `bh_new` and the store that
+    /// publishes its result nothing else refers to that object, so without
+    /// these roots the second virtual of a two-virtual guard collects the
+    /// first. The length is fixed at construction, so the registered slice
+    /// never moves, and the collector writes forwarded addresses back through
+    /// it — always read the address back from here, never from a copy.
+    concrete_roots: Vec<i64>,
+    /// Root-stack depth to unwind to, captured before this cache registered
+    /// anything. Equal to the entry depth for the recording-only reader, whose
+    /// unwind is then a no-op.
+    roots_depth: usize,
+}
+
+impl Drop for BridgeVirtualCache<'_> {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.roots_depth);
+    }
 }
 
 impl<'a> BridgeVirtualCache<'a> {
@@ -84,6 +108,8 @@ impl<'a> BridgeVirtualCache<'a> {
             mint_raw_array_descr,
             executing: None,
             fail_values: &[],
+            concrete_roots: Vec::new(),
+            roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         }
     }
 
@@ -101,10 +127,50 @@ impl<'a> BridgeVirtualCache<'a> {
         allocator: &'a dyn crate::resume::BlackholeAllocator,
         fail_values: &'a [i64],
     ) -> Self {
-        Self {
+        // Built field by field rather than from `Self::new`: the cache
+        // unregisters its roots in `Drop`, and a type that implements `Drop`
+        // cannot be moved out of by struct-update syntax.
+        let mut cache = Self {
+            virtuals_ptr_cache: vec![None; size],
+            virtuals_int_cache: vec![None; size],
+            concrete_ptr_cache: vec![None; size],
+            concrete_int_cache: vec![None; size],
+            mint_raw_array_descr,
             executing: Some(allocator),
             fail_values,
-            ..Self::new(size, mint_raw_array_descr)
+            concrete_roots: vec![0i64; size],
+            roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        };
+        if size > 0 {
+            // SAFETY: the buffer is heap-allocated at a fixed address, never
+            // resized after this point, and unregistered by `Drop` before the
+            // cache dies.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        cache
+    }
+
+    /// Publish a freshly allocated virtual as a root and remember which
+    /// `OpRef` names it, so later operands resolve to the address the
+    /// collector is maintaining rather than to a copy taken before it moved.
+    fn set_concrete_root(&mut self, vidx: usize, address: i64) {
+        if let Some(slot) = self.concrete_roots.get_mut(vidx) {
+            *slot = address;
+        }
+    }
+
+    /// The address a materialized virtual currently lives at, by the `OpRef`
+    /// the recording half minted for it.
+    fn concrete_root_of(&self, opref: OpRef) -> Option<i64> {
+        let vidx = self
+            .virtuals_ptr_cache
+            .iter()
+            .position(|slot| *slot == Some(opref))?;
+        match self.concrete_roots.get(vidx) {
+            Some(0) | None => None,
+            Some(address) => Some(*address),
         }
     }
 
@@ -316,6 +382,9 @@ fn operand_concrete(
     // `decode_ref` reads a TAGBOX operand out of the deadframe and nothing
     // else, so the guard's fail values win for an input arg — a shadow carried
     // on the OpRef describes some earlier run of the same slot.
+    if let Some(address) = cache.concrete_root_of(opref) {
+        return Some(majit_ir::Value::Ref(majit_ir::GcRef(address as usize)));
+    }
     if opref.is_input_arg() {
         let bits = *cache.fail_values().get(opref.raw() as usize)?;
         return Some(match opref {
@@ -449,6 +518,15 @@ pub fn materialize_bridge_virtual(
                 .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+            // `execute_and_record` reaches `_record_helper`, whose
+            // `invalidate_caches` is `mark_escaped` alone for a store
+            // (`clear_caches_not_necessary` answers true for SETFIELD_GC).
+            // Recording the store without it leaves a struct that
+            // `allocate_struct` had just flagged unescaped still flagged so
+            // after it was written into one that is not, and the walk that
+            // follows keeps folding its fields across calls that can reach it.
+            ctx.heap_cache_mut()
+                .mark_escaped(OpCode::SetfieldGc, None, &[struct_op, value]);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
             if let Some(allocator) = cache.allocator()
                 && !apply_setfield(ctx, cache, allocator, struct_op, value, fd_info)
@@ -545,15 +623,18 @@ pub fn materialize_bridge_virtual(
             // concrete onto the recorded OpRef is what makes the object the
             // trace names and the object the interpreter resumes against the
             // same one.
+            // resume.py decoder.virtuals_cache.set_ptr(index, struct), which
+            // its own comment requires BEFORE the fields are filled: the cache
+            // is what keeps the object reachable across the allocations
+            // `setfields` may itself perform.
+            cache.set_ptr(vidx, new_op);
             if let Some(allocator) = cache.allocator() {
                 let ptr = allocator.bh_new(&struct_descr);
                 if ptr == 0 {
                     return OpRef::NONE;
                 }
-                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+                cache.set_concrete_root(vidx, ptr);
             }
-            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
-            cache.set_ptr(vidx, new_op);
             // resume.py self.setfields(decoder, struct)
             if !setfields(
                 ctx,
@@ -1073,6 +1154,10 @@ pub fn emit_pending_field_op(
             .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+        // `_record_helper`'s `invalidate_caches`, which for a store is
+        // `mark_escaped` alone — see the same call in `setfields`.
+        ctx.heap_cache_mut()
+            .mark_escaped(OpCode::SetfieldGc, None, &[target_op, value_op]);
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[target_op, value_op], descr.clone());
         if let Some(allocator) = cache.allocator() {
             let Some(fd) = descr.as_field_descr() else {

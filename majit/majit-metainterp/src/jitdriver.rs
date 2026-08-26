@@ -5046,24 +5046,27 @@ impl<S: JitState> JitDriver<S> {
             {
                 return Err(Decline::ReplayIncomplete);
             }
-            // OPEN: applying the writes is necessary but not sufficient. A
-            // guard carrying deferred writes is one this entry has never run
-            // for, and serving it here makes a self-interpreting workload
-            // produce a short answer with every write applied and no rung
-            // raised, so something else on this path does not hold for these
-            // guards. Keep declining them until that is named; the applying
-            // reader above is what makes the entry survivable at all, and the
-            // blackhole arm keeps serving them meanwhile.
-            if resume
+            let has_pending = resume
                 .storage
                 .as_ref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-            {
-                return Err(Decline::ReplayIncomplete);
-            }
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
             let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
+            // OPEN, and not the reader's: what the reader applies is
+            // op-for-op what the blackhole applies for the same guard. What
+            // the walk it enables is missing is the trailing
+            // `synchronize_virtualizable()` of `pyjitpl.py
+            // rebuild_state_after_failure` — `start_bridge_tracing` seeds the
+            // virtualizable BOXES from the resume stream but nothing writes
+            // them back to the object, so a frontend that does not run that
+            // writer itself walks against a stale virtualizable. Guards
+            // carrying deferred writes are the ones that surface it; the
+            // blackhole arm does not, because it writes the virtualizable
+            // back on its way through. Decline them until that call is wired.
+            if has_pending {
+                return Err(Decline::ReplayIncomplete);
+            }
             let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
             let reg_indices = ctx
                 .bridge_reg_indices()
