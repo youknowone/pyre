@@ -1287,7 +1287,11 @@ pub extern "C" fn bh_portal_runner_c(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr as usize);
-    match crate::eval::portal_runner_result(frame) {
+    // `bhimpl_recursive_call_r` performs a call the traced code made, so the
+    // frame it hands over is entering its body for the first time and owes
+    // `execute_frame`'s hook bracket.  The CRN arms below resume a frame whose
+    // activation already began and take the unbracketed entry instead.
+    match crate::eval::portal_activation_result(frame) {
         Ok(result) => result as i64,
         Err(mut err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
@@ -4952,7 +4956,9 @@ fn bh_call_self_recursive_portal(
     let frame_ptr = create_callee_frame_in_ctx(ec, callable, args);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        crate::eval::portal_runner_result(frame)
+        // The frame was built on the line above, so this entry is the callee's
+        // activation and owes `execute_frame`'s hook bracket.
+        crate::eval::portal_activation_result(frame)
     };
     jit_drop_callee_frame(frame_ptr);
     Some(match result {

@@ -8616,43 +8616,41 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    // `pyframe.py execute_frame` brackets the eval loop with
-    // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
-    // upstream's merge point sits inside that bracket: the jitdriver is
-    // applied to `PyFrame.dispatch` (`interp_jit.py`), which `execute_frame`
-    // calls between the two hooks.  pyre's portal is this function instead,
-    // one level up, so the arms below enter the frame at its first bytecode,
-    // past the bracket, and a frame the JIT took over reported neither its
-    // `call` nor its `return` event.  Every declining path above returns
-    // through `execute_frame_plain`, which reaches the bracket in
-    // `eval::eval_frame_plain_with_resume`, so these two arms are the only
-    // ones that owe one.
-    //
-    // Both hooks carry their own test — `call_trace` fires on
-    // `gettrace() is not None or profilefunc is not None`, `return_trace` on
-    // `gettrace() is not None` — so an untraced activation pays one null read
-    // per hook.  Both run application-level Python and may move the frame, so
-    // each takes its argument from the root rather than from a saved word.
-    //
-    // The bracket is two nested `try`s under one `finally`, and the nesting is
-    // what decides which hook still runs after another one raised:
-    // `call_trace` sits in the outer `try`, `return_trace` in the inner
-    // `finally`, and `leave` in the outer one.  So a `call_trace` that raises
-    // skips the eval body AND `return_trace` yet still owes the leave hook,
-    // `return_trace` runs on the raising path too — with `w_exitvalue` still
-    // the `None` the bracket opened with — and each hook that raises replaces
-    // whatever was pending, in that order.  `?` on any of the three would
-    // flatten the nesting and drop the hooks after it.
-    fn portal_body(frame_root: &mut FrameRoot) -> PyResult {
-        match try_function_entry_jit(frame_root.frame()) {
-            Some(result) => result,
-            None => handle_jitexception(frame_root.frame()),
-        }
-    }
+    portal_activation_bracketed(&mut frame_root)
+}
+
+/// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
+/// for the entries that BEGIN an activation.
+///
+/// Upstream's merge point sits inside that bracket: the jitdriver is applied to
+/// `PyFrame.dispatch` (`interp_jit.py`), which `execute_frame` calls between the
+/// two hooks.  pyre's portal is one level up, at `execute_frame`'s own level, so
+/// the dispatch below enters the frame at its first bytecode, past the bracket,
+/// and a frame the JIT took over reported neither its `call` nor its `return`
+/// event.  Every declining path returns through `execute_frame_plain`, which
+/// reaches the bracket in `eval::eval_frame_plain_with_resume`, so only the
+/// portal arms owe one.
+///
+/// Both hooks carry their own test — `call_trace` fires on
+/// `gettrace() is not None or profilefunc is not None`, `return_trace` on
+/// `gettrace() is not None` — so an untraced activation pays one null read per
+/// hook.  Both run application-level Python and may move the frame, so each
+/// takes its argument from the root rather than from a saved word.
+///
+/// The bracket is two nested `try`s under one `finally`, and the nesting is what
+/// decides which hook still runs after another one raised: `call_trace` sits in
+/// the outer `try`, `return_trace` in the inner `finally`, and `leave` in the
+/// outer one.  So a `call_trace` that raises skips the eval body AND
+/// `return_trace` yet still owes the leave hook, `return_trace` runs on the
+/// raising path too — with `w_exitvalue` still the `None` the bracket opened
+/// with — and each hook that raises replaces whatever was pending, in that
+/// order.  `?` on any of the three would flatten the nesting and drop the hooks
+/// after it.
+fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
     let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
     if ec.is_null() {
         // No execution context is no hook to owe, and no `leave` either.
-        return portal_body(&mut frame_root);
+        return portal_runner_dispatch(frame_root);
     }
     // `w_exitvalue` is `execute_frame`'s own local, not a re-read of the result
     // word: it opens as the `None` the bracket opened with, takes the body's
@@ -8665,7 +8663,7 @@ fn eval_with_jit_inner(
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
-            let result = portal_body(&mut frame_root);
+            let result = portal_runner_dispatch(frame_root);
             if let Ok(value) = &result {
                 w_exitvalue = *value;
             }
@@ -8681,8 +8679,8 @@ fn eval_with_jit_inner(
     // `setprofile`'s `return` is not `return_trace`'s — that one tests
     // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
     // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
-    // this arm never reaches `leave`: the declining paths above return through
-    // `execute_frame_plain`, which does, and these two do not.
+    // this arm never reaches `leave`: the declining paths return through
+    // `execute_frame_plain`, which does, and the portal arms do not.
     let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
     outer_result.map(|_| live)
 }
@@ -8937,25 +8935,50 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///
 /// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
 pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
-    // warmspot.py ll_portal_runner:
-    //   maybe_compile_and_run(state.increment_function_threshold, *args)
-    //   return portal_ptr(*args)
-    //
-    // portal_ptr is the JIT-aware interpreter (jit_merge_point +
-    // can_enter_jit). pyre's equivalent is handle_jitexception →
-    // eval_loop_jit, NOT eval_frame_plain. Routing through
-    // eval_frame_plain here would skip maybe_enter_jit at every
-    // opcode of the recursive portal frame, which breaks parity for
-    // bhimpl_recursive_call_* paths.
-    // `ll_portal_runner` is an activation entry in its own right: recursive
-    // portal calls can reach it without the ordinary `eval_with_jit_inner`
-    // wrapper.  Account before constructing `FrameRoot`, because a moving GC
-    // may change the frame's address while the activation remains the same.
+    enter_portal(frame, portal_runner_dispatch)
+}
+
+/// [`portal_runner_result`] for an entry that BEGINS the activation rather than
+/// continuing one, so it owes `pyframe.py execute_frame`'s hook bracket.
+///
+/// The two are separated because pyre's portal is re-entered for reasons
+/// upstream's is not.  A `ContinueRunningNormally` handoff and a
+/// CALL_ASSEMBLER completion resume a frame whose activation already began, and
+/// upstream reaches those through `portal_ptr` — `PyFrame.dispatch`, INSIDE
+/// `execute_frame`'s bracket — so they must not report a second `call` event.
+/// Every other portal entry is handed a callee frame that was just constructed
+/// (`create_callee_frame_in_ctx`, `create_self_recursive_callee_frame_impl_1_boxed`,
+/// `emit_new_pyframe_inline_with_params`) and is the only bracket that frame
+/// will ever get.
+///
+/// Measured with `sys.setprofile` over a self-recursive callee driven from a
+/// compiled loop: 4 activations per iteration are owed and 1 was reported —
+/// exactly the outermost one, which reaches the interpreter's own
+/// `execute_frame` — for every tail from 10 000 iterations up.
+pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
+    enter_portal(frame, portal_activation_bracketed)
+}
+
+/// warmspot.py ll_portal_runner:
+///   maybe_compile_and_run(state.increment_function_threshold, *args)
+///   return portal_ptr(*args)
+///
+/// portal_ptr is the JIT-aware interpreter (jit_merge_point + can_enter_jit).
+/// pyre's equivalent is handle_jitexception → eval_loop_jit, NOT
+/// eval_frame_plain. Routing through eval_frame_plain here would skip
+/// maybe_enter_jit at every opcode of the recursive portal frame, which breaks
+/// parity for bhimpl_recursive_call_* paths.
+///
+/// `ll_portal_runner` is an activation entry in its own right: recursive portal
+/// calls can reach it without the ordinary `eval_with_jit_inner` wrapper.
+/// Account before constructing `FrameRoot`, because a moving GC may change the
+/// frame's address while the activation remains the same.
+fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> PyResult {
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-    portal_runner_dispatch(&mut frame_root)
+    body(&mut frame_root)
 }
 
 /// The dispatch half of `portal_runner_result`, taking the caller's
@@ -8978,8 +9001,15 @@ fn portal_runner_dispatch(frame_root: &mut FrameRoot) -> PyResult {
     }
 }
 
+/// The raw-ref spelling of [`portal_activation_result`], for the compiled-code
+/// force helpers whose ABI returns a `PyObjectRef` and stashes the exception.
+///
+/// Every caller builds the callee frame immediately before calling
+/// (`run_frame_through_portal` receives the one the trace emitted; the
+/// `jit_force_*_recursive_call_*` helpers construct theirs a line above), so
+/// this entry always begins an activation.
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    match portal_runner_result(frame) {
+    match portal_activation_result(frame) {
         Ok(r) => r,
         Err(mut err) => {
             crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
