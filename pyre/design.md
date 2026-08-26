@@ -534,8 +534,13 @@ recorder, or the green accounts for.
 pyre records traces through 69 `try_walker_specialize_*` functions — 67 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
 (`load_deref`) and `inline_call.rs` (`instance_next`) — 9,865 lines of body
-inside `specialize.rs`'s 16,933, described by the 74 rows of
+inside `specialize.rs`'s 17,062, described by the 75 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
+Three of those rows are not folds at all: `subscr_tuple_descent`,
+`unary_invert_descent` and `unary_negative_descent` are orthodox sub-walks
+of `w_tuple_getitem`, `invert_inner` and `neg_inner`, carrying a row only so
+they can be suppressed and A/B'd like the folds they replaced.  Counting them
+as debt overstates it by three.
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
@@ -543,8 +548,8 @@ Re-derive every number here before citing it; this section has published
 two miscounts, and both survived because the recipe beside them did not run.
 Every command below is quoted as it must be typed.
 
-* Rows — `spec_folds!` opens at `diag.rs:342` and closes at `:418`:
-  `sed -n '342,418p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`.
+* Rows — `spec_folds!` opens at `diag.rs:342` and closes at `:419`:
+  `sed -n '342,419p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`.
   `-F` is load-bearing: without it the `(` is an unclosed regex group and
   `rg` exits 2 rather than counting.
 * Definitions — `rg -c` reports one count *per file*, so it answers 67/1/1
