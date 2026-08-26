@@ -44,7 +44,7 @@
 //! The anchor corpus will surface which
 //! followup is the next priority. `Ref`-typed operands now route
 //! through `valuetype_to_someshell(Ref) → SomeInstance(classdef=None)`
-//! (`codewriter/annotation_state.rs`), so the rtyper picks
+//! (`codewriter/annotation_state.rs:69`), so the rtyper picks
 //! `getinstancerepr(rtyper, None, Gc) → InstanceRepr::new_rootinstance
 //! → Ptr(GcStruct(OBJECT))` and the projection collapses to
 //! `ConcreteType::GcRef` matching the legacy resolver — the previous
@@ -987,12 +987,12 @@ fn dead_op_result_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variabl
 }
 
 /// Results of a synthetic `FieldRead("__discriminant")` that feed a block
-/// exitswitch — the tag read a Rust `match` lowers to (`front/mir.rs`
+/// exitswitch — the tag read a Rust `match` lowers to (`front/mir.rs:1184`
 /// `Rvalue::Discriminant` → `FieldRead("__discriminant")`, then the switch
 /// terminator reads that result as `ExitSwitch::Value`).
 ///
 /// The legacy walker types this tag `Signed` (`ty: Int` at the producer,
-/// `legacy_annotator.rs`).  The real (annotate→rtype) path lowers the
+/// `legacy_annotator.rs:273`).  The real (annotate→rtype) path lowers the
 /// enclosing `Result`/`StepResult` through the uniform exception-transform
 /// (`front/result_exc.rs`), which **rebuilds** the discriminant-switch block
 /// with its own freshly-minted tag Variable; the projection back onto the
@@ -1040,7 +1040,7 @@ fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashS
 /// `FieldWrite` of the same field name — the extract-then-repack of an
 /// identity `match` re-wrap (`match step { Return(v) => Ok(Return(v)),
 /// CloseLoop { jump_args, loop_header_pc } => Ok(CloseLoop { .. }), … }`,
-/// `pyopcode.rs`).  Each arm reads the incoming variant's payload
+/// `pyopcode.rs:1945`).  Each arm reads the incoming variant's payload
 /// (`FieldRead("__pos_0" | "loop_header_pc", owner = StepResult::Variant)`)
 /// and immediately writes it into a freshly-built outgoing variant
 /// (`FieldWrite(same field, owner = StepResult<…>::Variant)`).
@@ -1239,12 +1239,12 @@ fn collect_divergences(
         // `JUMP_*` delta — all bare bytecode operands the rtyper types
         // `Signed` (matching upstream, where a bytecode oparg is a plain
         // int).  The legacy walker's `GcRef` is the pyre-only conservative
-        // `Unknown → GcRef` backfill (`legacy_resolve.rs`), which has
+        // `Unknown → GcRef` backfill (`legacy_resolve.rs:374-378`), which has
         // no RPython analogue (upstream's rtyper never leaves a value
         // untyped, so it never defaults to ref); it is the divergent side.
         //
         // This pair once appeared unacceptable because accepting it crashed
-        // `emit_list_of_kind` (`assembler.rs`).  That crash was a phase
+        // `emit_list_of_kind` (`assembler.rs:2169`).  That crash was a phase
         // ordering artifact, not a real mistype: a residual `dont_look_inside`
         // decode helper's argument list is partitioned by kind at jtransform
         // time (`make_three_lists_from_vars`), and the real path's kind was
@@ -1415,7 +1415,8 @@ fn compare_real_against_legacy(
 /// The returned tag identifies the matching fallback condition. Keeping the
 /// category and the boolean decision in one function prevents diagnostic code
 /// from maintaining a second, drifting copy of the substring table. Lowering
-/// only tests whether the result is `Some`.
+/// only tests whether the result is `Some`; the tags are stable identifiers
+/// for the decline census (`crate::decline`).
 pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     if msg.contains("not registered in CallRegistry") {
         return Some("call-registry-miss");
@@ -1762,6 +1763,30 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     None
 }
 
+/// Category for a Skip that never passes through [`unported_category`].
+///
+/// [`unported_category`] classifies a PANIC payload: the dual gate
+/// catches an unwind and asks whether the failure is a known-unported
+/// shape.  A Skip returned directly as `Ok(DualGateOutcome::Skip(..))`
+/// never reaches that predicate, so a census that only broke down
+/// `unported_category`'s arms would file every one of them under
+/// "unclassified" — and on cel's closure the direct Skips are the ones
+/// that fire.  The two populations are disjoint, which is why this is a
+/// separate function rather than more arms: adding these to
+/// `unported_category` would make `is_known_unported` answer `true` for
+/// them and change what the panic handler does.
+///
+/// Census classification only.  No lowering decision reads it.
+pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
+    if msg.contains("two-phase: graph was never a prepass subject") {
+        return Some("two-phase-never-a-subject");
+    }
+    if msg.contains("two-phase: subject rtype-skipped in prepass") {
+        return Some("two-phase-rtype-skipped");
+    }
+    None
+}
+
 /// Whether the dual gate should Skip this failure to the legacy walker.
 ///
 /// The predicate is [`unported_category`] with its answer erased, so there is
@@ -1787,7 +1812,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 /// 1. `get_or_register` every entry's signature so HostObjects exist
 ///    before any callee body lifts.
 /// 2. `lift_callee_to_pygraph` + `prefill_default_cache` per entry
-///    so `cachedgraph` (`description.rs`) hits at the
+///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
 ///    rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
@@ -1795,6 +1820,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     registry: &CallRegistry,
 ) -> Result<(), TyperError> {
+    // Decline-census gate name for this function's registration skips.
+    // A callable skipped here has no registry entry, so every callsite
+    // resolves it as a host builtin or a residual stub rather than as a
+    // user graph — silently, with the four reasons below indistinguishable
+    // from one another at the callsite.
+    use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
     // (`bookkeeper.py:353-409`) returns the *same* FunctionDesc for
     // any reference to the same callable, keyed by `Constant(pyobj)`
@@ -1860,7 +1891,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `W_ComplexObject`/`W_LongObject`, per `model.rs payload_fields`) that
         // `fuse_boxing_alloc` rewrites to a native
         // `NewWithVtable` during MIR `simplify_lowered_graph`
-        // (`front/mir.rs`, `model.rs` `payload_fields`) — *before* the
+        // (`front/mir.rs:1409`, `model.rs` `payload_fields`) — *before* the
         // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
         // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py`) lowers
         // EVERY mallocable GC struct to `new`/`new_with_vtable`; pyre has not
@@ -1881,6 +1912,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if canonical_strip == ["lltype", "malloc_typed"]
             || canonical_strip == ["lltype", "malloc_typed_managed"]
         {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-malloc-typed-intrinsic",
+                format_args!("{path}"),
+            );
             continue;
         }
         // `#[pyre_class]`'s generated allocation constructors
@@ -1901,6 +1937,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             canonical_strip.last().map(String::as_str),
             Some("allocate") | Some("allocate_stable")
         ) {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-pyre-class-allocate-ctor",
+                format_args!("{path}"),
+            );
             continue;
         }
         // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
@@ -1913,6 +1954,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `malloc_typed`: callsites resolve to the HOST_ENV builtin
         // (translate_op Layer-3b) instead of this failed user-graph entry.
         if canonical_strip == ["lltype", "malloc_raw"] {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-malloc-raw-intrinsic",
+                format_args!("{path}"),
+            );
             continue;
         }
         // The `pyobject::ll_issubclass` / `ll_issubclass_const` / `ll_isinstance`
@@ -1932,6 +1978,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             || canonical_strip == ["pyobject", "ll_isinstance"]
             || canonical_strip == ["pyobject", "subclass_range_read"]
         {
+            crate::decline::record(
+                REGISTRY_GATE,
+                "skip-issubclass-helper-body",
+                format_args!("{path}"),
+            );
             continue;
         }
         let signature = function_graphs
@@ -1966,7 +2017,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // fail nor what each computes — only the attribution determinism.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
-    // Pass 2 (callee lift).  `build_flow.rs` rejects unsafe bodies so
+    // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
     // they never enter `function_graphs`; without a stub a safe-fn body
     // lifted in Pass 2 that calls an unsafe callee (`is_cell`,
     // `is_exception`, …) records a "not registered" lift error and the
@@ -2014,7 +2065,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // `cachedgraph` consumer surfaces the actual producer-side
     // failure instead of falling through to `buildflowgraph`'s
     // generic "missing code object" message
-    // (`translator/translator.rs`).  This keeps the lazy-failure
+    // (`translator/translator.rs:439`).  This keeps the lazy-failure
     // *point of observation* aligned with upstream
     // `description.py:228` while preserving pyre's eager prefill
     // shape for the success path.  Without per-entry error capture a
@@ -2116,7 +2167,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // minted with no members (`Bookkeeper::intern_class_by_qualname`),
     // so a receiver method call — `CallTarget::Method` lowers to
     // `getattr(recv, name)` + `simple_call`
-    // (`flowspace_adapter.rs`) — found no attribute source and
+    // (`flowspace_adapter.rs:1357`) — found no attribute source and
     // blocked.  Registering each `[owner, method]` registry entry's
     // user-function HostObject as a class member completes the
     // analogue: `find_source_for` imports it into the classdict as a
@@ -2163,9 +2214,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
 /// Lift a pyre `model::FunctionGraph` (a callee that may appear on a
 /// `OpKind::Call::FunctionPath` callsite of some other graph) into a
 /// `Rc<PyGraph>` suitable for pre-filling the callee's
-/// `FunctionDesc.cache` (`description.rs`).
+/// `FunctionDesc.cache` (`description.rs:794`).
 ///
-/// `cachedgraph` (`description.rs`) returns the cached
+/// `cachedgraph` (`description.rs:1037-1039`) returns the cached
 /// `Rc<PyGraph>` as soon as the lookup key matches, skipping the
 /// `buildgraph` path that delegates to
 /// `translator.buildflowgraph(pyobj, false)` — that delegation
@@ -2520,7 +2571,7 @@ fn declared_funcptr_type_from_legacy(
 /// while the rest of the batch lands.
 ///
 /// Mirrors `populate_call_registry_from_call_graphs`'s
-/// "register and prefill" contract but feeds
+/// "register and prefill" contract (`cutover.rs:856-875`) but feeds
 /// from the LLBC-sourced stub-spec list (`collect_unsafe_fn_stubs_from_llbc`)
 /// instead of pyre's
 /// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
@@ -2536,7 +2587,7 @@ fn declared_funcptr_type_from_legacy(
 /// is never present in `function_graphs`.  `CallControl::
 /// find_all_graphs` walks `function_graphs.keys()` only and resolves
 /// each call target via `target_to_path_and_graph`
-/// (`codewriter/call.rs`) which returns `None` for any
+/// (`codewriter/call.rs:2601`) which returns `None` for any
 /// path absent from `function_graphs` — so an unsafe-stub target
 /// triggers `continue` and is never added to `candidate_graphs`,
 /// never reaches `transform_graph_to_jitcode`, and never compiles
@@ -2934,7 +2985,7 @@ fn drive_subject(
     // queue, mirroring how callees enter through
     // `pycall -> recursivecall -> addpendingblock`
     // (`description.py:283-305`, `annrpython.py:315-336`).
-    // `addpendingblock` (`annrpython.rs`) writes
+    // `addpendingblock` (`annrpython.rs:1245-1302`) writes
     // `Variable.annotation` for each inputarg via
     // `bindinputargs.setbinding`, inserts `all_blocks[startblock]`
     // and `annotated[startblock] = None`, then
@@ -2943,7 +2994,7 @@ fn drive_subject(
     // `processblock` flips `annotated[block] = Some(graph)`,
     // `flowin` walks every op and recurses into successors via
     // `process_link -> addpendingblock(target, inputs_s)`
-    // (`annrpython.rs/1690`).  Transitive blocks register
+    // (`annrpython.rs:1502/1690`).  Transitive blocks register
     // themselves into `all_blocks`/`annotated` through the same
     // bindinputargs path on first arrival.
     let subject_inputcells =
@@ -2963,7 +3014,7 @@ fn drive_subject(
     // never reach it through a `Link`, but `specialize_more_blocks`
     // must walk it so its inputargs receive an exception-typed
     // `concretetype`.  The rtyper's `setup_block_entry`
-    // exception-block branch (`rtyper.rs`) writes
+    // exception-block branch (`rtyper.rs:1915-1942`) writes
     // `Variable.concretetype = ExceptionData.lltype_of_exception_*`
     // without reading `Variable.annotation`, so the block needs no
     // `flowin`; it only needs to appear in `annotator.annotated`.
@@ -2974,7 +3025,7 @@ fn drive_subject(
     // same exceptblock via `addpendingblock` with `seen_before=true`
     // and routes to `mergeinputargs` — does not panic on the unbound
     // `seed_variable(legacy_v)` inputargs from
-    // `flowspace_adapter.rs`.  `setbinding` widens via the
+    // `flowspace_adapter.rs:1839`.  `setbinding` widens via the
     // lattice's `contains` check, so an `Integer`-already-annotated
     // slot stays `Integer`; a `None`-annotated slot becomes
     // `Impossible`, which any later `mergeinputargs` widens to the
@@ -3025,7 +3076,7 @@ fn drive_subject(
     // → policy hook → exit-on-empty.  Without this drain, the
     // `addpendingblock(startblock, inputcells)` queued just above
     // stays in `genpendingblocks`, `annotated[block]` remains the
-    // `None` sentinel, and `specialize_block` (`rtyper.rs`)
+    // `None` sentinel, and `specialize_block` (`rtyper.rs:1656`)
     // panics on "annotator.annotated[block] is False sentinel".
     annotator
         .complete_pending_blocks()
@@ -3045,9 +3096,9 @@ fn drive_subject(
 
     // Populate per-callsite call-family / calltable state
     // by walking the seeded blocks' call_ops.  `compute_at_fixpoint`
-    // (`bookkeeper.py:108-118`, pyre `bookkeeper.rs`) drains
+    // (`bookkeeper.py:108-118`, pyre `bookkeeper.rs:627-648`) drains
     // `annotator.call_sites()` through `consider_call_site`
-    // (`bookkeeper.py:152-166`, pyre `bookkeeper.rs`); each
+    // (`bookkeeper.py:152-166`, pyre `bookkeeper.rs:675`); each
     // `simple_call(callable_const, *args)` op resolves the callable
     // to a `SomePBC` (via `immutablevalue_hostobject` for the
     // pre-registered `HostObject::UserFunction`), then records the
@@ -3066,7 +3117,7 @@ fn drive_subject(
     // `try`/`except`, so a failed `consider_call_site` terminates
     // `simplify` and unwinds out of the annotator driver.  Pyre's
     // port surfaces the same condition through `?`-propagation
-    // here rather than swallowing it at `bookkeeper.rs`.
+    // here rather than swallowing it at `bookkeeper.rs:627-648`.
     call_registry
         .bookkeeper()
         .compute_at_fixpoint()
@@ -3561,7 +3612,7 @@ fn run_phase_b_rtype_isolated(
     // linked into Phase B. The annotator never followed those links — a
     // constant exitswitch makes the mismatched-exitcase arm carry
     // `s_ImpossibleValue` through `follow_link`, which returns before
-    // `links_followed[link] = True` (annrpython.rs), leaving the
+    // `links_followed[link] = True` (annrpython.rs:1762-1768), leaving the
     // arm's target unannotated — but the surviving structural link reaches
     // `specialize_block` → `insert_link_conversions` → `bindingrepr`, which
     // then KeyErrors on the dead target's unbound inputargs.
@@ -3852,7 +3903,7 @@ fn run_phase_b_rtype_isolated(
 /// as a `None` twin, reached when the rtyper defaulted the un-narrowed
 /// projection to unit.  It would otherwise be colored by
 /// `emit_call_result_arg` (the op's declared non-void `result_kind`
-/// forces the `>X` result argcode, `assembler.rs`) and panic in
+/// forces the `>X` result argcode, `assembler.rs:2226`) and panic in
 /// `lookup_coloring`.  A twin the rtyper *positively* typed `Signed` /
 /// `Float` is left untouched — that is a real kind conflict → Skip.
 #[expect(
@@ -3896,21 +3947,30 @@ pub(crate) fn dual_gate_outcome_from_cache(
 ) -> Result<DualGateOutcome, String> {
     // Clone the cached real types out so the cache borrow drops before the
     // legacy baseline runs (the baseline never touches the cache).
+    // Two causes reach the Skip below and they are not the same finding:
+    // the prepass may never have had this graph as a subject at all, or it
+    // may have had it and rtype-skipped it.  The first says the closure
+    // walk did not reach the graph; the second says it did and the real
+    // rtyper refused it.  They shared one message until now, so a census
+    // of Skip reasons could not separate "never attempted" from
+    // "attempted and declined" — the same conflation the decline census
+    // exists to remove.  Neither spelling matches any
+    // `unported_category` arm, so classification is unchanged.
     let cached = {
         let tp = call_registry.two_phase();
         match tp.subjects.get(diag_key) {
-            Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Some((
+            Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => Ok((
                 subj.value_to_var.clone(),
                 subj.value_to_var_candidates.clone(),
                 subj.constant_concretetypes.clone(),
             )),
-            _ => None,
+            Some(_) => Err("two-phase: subject rtype-skipped in prepass"),
+            None => Err("two-phase: graph was never a prepass subject"),
         }
     };
-    let Some((mut value_to_var, value_to_var_candidates, constants)) = cached else {
-        return Ok(DualGateOutcome::Skip(
-            "two-phase: subject not annotated/rtyped in prepass".to_string(),
-        ));
+    let (mut value_to_var, value_to_var_candidates, constants) = match cached {
+        Ok(cached) => cached,
+        Err(reason) => return Ok(DualGateOutcome::Skip(reason.to_string())),
     };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
@@ -5374,7 +5434,7 @@ mod tests {
         // `prefill_default_cache`, bypassing `buildflowgraph`, so the
         // graph would otherwise never enter `translator.graphs`.
         // `FunctionDesc.cachedgraph`'s hit path restores the invariant
-        // (description.rs).  This pins that the registration
+        // (description.rs:1058-1082).  This pins that the registration
         // actually fires through the shared-bookkeeper session and that
         // `funcobj.graph` (= the cached PyGraph's `graph`) is the exact
         // `Rc` now resolvable by the flowspace effect analyzers
@@ -5875,7 +5935,7 @@ mod tests {
     /// `function_graphs.keys()` and resolves each call op's target via
     /// `target_to_path_and_graph` which requires the target to be
     /// present in `function_graphs`.  This test mirrors the
-    /// `codewriter.rs` production call shape (registry +
+    /// `codewriter.rs:192-195` production call shape (registry +
     /// `callcontrol.unsafe_fn_stubs`) and asserts the path is reachable
     /// via the registry but not via `CallControl::function_graphs`.
     #[test]

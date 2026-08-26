@@ -32,6 +32,10 @@ pub mod annotator;
 )]
 pub mod codewriter;
 pub mod config;
+// Decline census — no upstream counterpart.  Upstream gates that cannot
+// lower a shape raise a named error (`jtransform.py _handle_list_call`);
+// every gate here declines silently, so the refusals are counted instead.
+pub mod decline;
 #[cfg_attr(
     test,
     expect(
@@ -748,6 +752,12 @@ fn analyze_pipeline_from_module_paths(
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    // Dump the decline census when this run ends — on the normal return
+    // AND on the unwind, since a pipeline that panics on an undigestible
+    // shape is exactly the run whose silent refusals a reader needs.
+    // Silent unless `MAJIT_DECLINE_LOG` / `PYRE_MIR_FRONTEND_DEBUG` is
+    // set, so default output is unchanged.
+    let _decline_census = decline::CensusScope::new("analyze_pipeline");
     let mut prof = PhaseProfiler::new();
     macro_rules! mark_phase {
         ($name:literal) => {

@@ -30,7 +30,8 @@ fn loads_fixture_corpus() {
     // `w_new_type_only_int`, `w_number_add`, `w_int_add`,
     // `lltype::malloc_typed`, the fixture's `object_model::get_instantiate`, and
     // the initializer bodies for `INT_CLASS`, `DOUBLE_CLASS`, and
-    // `_immutable_fields_W_IntObject`.
+    // `_immutable_fields_W_IntObject` — a `static`/`const` carries its
+    // initializer as a function body, so it lands in `iter_local_fns` too.
     //
     // + 2 for the host-registered callback table: `host_registry_dispatch`
     // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,

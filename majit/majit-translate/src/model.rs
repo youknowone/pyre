@@ -3038,11 +3038,24 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// The orphaned aggregate ctor + header `FieldWrite`s become dead and are swept
 /// by the `remove_dead_aggregates` + `prune_dead_phis` passes that follow in
 /// `simplify_lowered_graph`.
+///
+/// Every refusal below is a bare `continue` that leaves `malloc_typed`
+/// residual, and none of them says so anywhere.  They are counted through
+/// [`crate::decline`] under the two gate names declared next; see that
+/// module for why the shape filters at the top of the site loop are
+/// deliberately not among them.
 pub fn fuse_boxing_alloc(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> usize {
     use crate::flowspace::model::Variable;
+    // Gate names come from `crate::decline::gate` rather than being
+    // spelled here: a name defined at its call site can be referenced
+    // while the recorder module is absent, which is how a half-applied
+    // edit left this function naming two gates the tree could not build.
+    use crate::decline::gate::{
+        FUSE_BOXING_ALLOC as FUSE_GATE, RESOLVE_HEADER_PLAN as VTABLE_GATE,
+    };
     // Derive a boxing struct's scalar payload fields from its registered field
     // layout, in struct-declaration order, skipping the `ob_header` (PyObject
     // base): the header's type pointer is captured separately into
@@ -3058,11 +3071,8 @@ pub fn fuse_boxing_alloc(
     // already-computed layout map the front end owns, so this pass performs no
     // front-end (Llbc) reads.
     //
-    // The ctor carries the bare struct leaf (`W_FloatObject`) while the map is
-    // keyed by the crate-stripped qualified path (`floatobject::W_FloatObject`),
-    // so fall back to a leaf match when the exact key misses.  An unknown struct
-    // yields `None` and is left unfused — the same fail-safe the old hardcoded
-    // set applied to any struct outside the numeric four.
+    // An unknown struct yields `None` and is left unfused — the same fail-safe
+    // the old hardcoded set applied to any struct outside the numeric four.
     //
     // The `PyObject` base field carries the type pointer, which
     // `resolve_vtable_addr` lifts into `NewWithVtable.vtable`, so it is skipped
@@ -3377,10 +3387,23 @@ pub fn fuse_boxing_alloc(
         w_class: Option<Payload>,
     }
     let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
-        let header =
-            store_value(graph, agg, "ob_header").or_else(|| store_value(graph, agg, "ob"))?;
+        let Some(header) =
+            store_value(graph, agg, "ob_header").or_else(|| store_value(graph, agg, "ob"))
+        else {
+            crate::decline::record(
+                VTABLE_GATE,
+                "no-unique-ob_header-store",
+                format_args!("{}", graph.name),
+            );
+            return None;
+        };
         let mut roots = Vec::new();
         if !store_roots(graph, &header, 8, &mut roots) {
+            crate::decline::record(
+                VTABLE_GATE,
+                "header-roots-unresolvable",
+                format_args!("{}", graph.name),
+            );
             return None;
         }
         let mut resolved: Option<i64> = None;
@@ -3388,15 +3411,36 @@ pub fn fuse_boxing_alloc(
         // folds into the vtable, `Some(Some(_))` once one does not.
         let mut w_class: Option<Option<(FieldDescriptor, LinkArg, ValueType)>> = None;
         for root in &roots {
-            let vtable = store_value(graph, root, "ob_type")
-                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))?;
+            let Some(vtable) = store_value(graph, root, "ob_type")
+                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
+            else {
+                // The commonest reason in a test fixture: the `PyType`
+                // singleton addresses were not supplied, so the `&T` read
+                // stayed a residual call rather than a `ConstRefAddr`. It is
+                // indistinguishable here from a graph that genuinely stores no
+                // type pointer, which is why the count names the resolution
+                // step rather than guessing the cause.
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "ob_type-not-a-constant-address",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            };
             let declares_no_class_word =
                 header_declares_no_class_word(graph, root, struct_field_attrs);
             let store = match unique_store(graph, root, "w_class") {
                 // A store to a field absent from the registered layout makes
                 // the layout evidence self-contradictory, so keep the original
                 // allocation rather than guessing which source is correct.
-                Some(_) if declares_no_class_word => return None,
+                Some(_) if declares_no_class_word => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "w_class-store-contradicts-layout",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
                 Some((field, value, ty)) => {
                     let folds = value
                         .as_variable()
@@ -3406,11 +3450,22 @@ pub fn fuse_boxing_alloc(
                 }
                 // RPython's root OBJECT declares only `typeptr`. With no
                 // per-instance class word, there is nothing that can disagree
-                // with the vtable carried by `NewWithVtable`.
+                // with the vtable carried by `NewWithVtable`, and nothing
+                // downstream can read one either: every `w_class` consumer
+                // keys on a field descriptor named `w_class`
+                // (`descr.rs FieldDescr::is_w_class`), which a struct that
+                // never declares the field cannot produce.
                 None if declares_no_class_word => None,
                 // A layout that declares `w_class` still needs a unique store
                 // proving that the vtable stands for that per-instance class.
-                None => return None,
+                None => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "no-unique-w_class-store",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
             };
             match &w_class {
                 None => w_class = Some(store),
@@ -3427,6 +3482,11 @@ pub fn fuse_boxing_alloc(
                         _ => false,
                     };
                     if !agrees {
+                        crate::decline::record(
+                            VTABLE_GATE,
+                            "header-roots-disagree-about-w_class",
+                            format_args!("{}", graph.name),
+                        );
                         return None;
                     }
                 }
@@ -3436,9 +3496,20 @@ pub fn fuse_boxing_alloc(
                 Some(seen) if seen == vtable => {}
                 // Predecessors building headers for different types merge into
                 // one malloc: no single vtable stands for the whole cluster.
-                Some(_) => return None,
+                Some(_) => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "header-roots-name-different-vtables",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
             }
         }
+        // `store_roots` only answers `true` for a non-empty `roots`, and every
+        // iteration either sets `resolved` or returns, so the `?` below is
+        // unreachable rather than a decline path — it is not recorded, and a
+        // `None` from there would be a bug in that invariant, not a refusal.
         Some(HeaderPlan {
             vtable: resolved?,
             w_class: w_class
@@ -3464,13 +3535,27 @@ pub fn fuse_boxing_alloc(
     let mut sites: Vec<Site> = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
+            // The two shape tests below are the population filter, not a
+            // decline: every operation in the graph is offered to them and
+            // almost all fail.  Recording here would make the instrument
+            // part of the population it measures — the fuse's count would
+            // be dominated by ops that were never boxing clusters.
+            // Recording starts once the op IS a `malloc_typed` call, i.e.
+            // once the pass has committed to lowering it.
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
             if !is_malloc_typed(target) || args.len() != 1 {
                 continue;
             }
-            let Some(result) = &op.result else { continue };
+            let Some(result) = &op.result else {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "malloc-call-has-no-result-var",
+                    format_args!("{}", graph.name),
+                );
+                continue;
+            };
             // The aggregate itself can reach the malloc as a `Block.inputargs`
             // phi, not only its header: a constructor that builds the struct up
             // front and then branches — `w_float_new` builds the `W_FloatObject`
@@ -3484,12 +3569,27 @@ pub fn fuse_boxing_alloc(
             // `sink_fused_boxing_aggregates_at_raw_writes` matches on.
             let mut agg_roots = Vec::new();
             if !store_roots(graph, &args[0], 8, &mut agg_roots) {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "aggregate-roots-unresolvable",
+                    format_args!("{}", graph.name),
+                );
                 continue;
             }
             let Some((agg, other_roots)) = agg_roots.split_first() else {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "aggregate-has-no-roots",
+                    format_args!("{}", graph.name),
+                );
                 continue;
             };
             if other_roots.iter().any(|root| root != agg) {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "aggregate-roots-disagree",
+                    format_args!("{}", graph.name),
+                );
                 continue;
             }
             // `%agg` must be a `SyntheticTransparentCtor` for a known boxing
@@ -3510,8 +3610,24 @@ pub fn fuse_boxing_alloc(
                     ) if r == agg => Some(name.clone()),
                     _ => None,
                 });
-            let Some(owner) = owner else { continue };
+            let Some(owner) = owner else {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "aggregate-is-not-a-synthetic-ctor",
+                    format_args!("{}", graph.name),
+                );
+                continue;
+            };
             let Some(fields) = payload_fields(&owner, struct_field_attrs) else {
+                // Either the struct has no registered field layout at all,
+                // or its leaf name is ambiguous across the layout map.  Both
+                // leave `malloc_typed` residual; `registered_layout` is where
+                // they part, and neither is visible in the fused count.
+                crate::decline::record(
+                    FUSE_GATE,
+                    "struct-layout-unregistered-or-ambiguous",
+                    format_args!("{owner} in {}", graph.name),
+                );
                 continue;
             };
             // Resolve every payload field's store: `FieldWrite { base: %agg,
@@ -3536,6 +3652,11 @@ pub fn fuse_boxing_alloc(
                 }
             }
             if !complete {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "payload-store-missing-or-conflicting",
+                    format_args!("{owner} in {}", graph.name),
+                );
                 continue;
             }
             // Leave the cluster unfused when the `ob_header.ob_type` store
@@ -3552,7 +3673,17 @@ pub fn fuse_boxing_alloc(
             // `ConstRefAddr`; the production driver supplies those addresses,
             // so there the pointer resolves.  Predecessors that disagree about
             // the type or the class also decline — see `HeaderPlan`.
+            //
+            // Which of those it was is not knowable from the `None`; the
+            // `model::resolve_header_plan` rows are where that is recorded,
+            // and this row is the count of clusters the fuse gave up on for
+            // any header reason at all.
             let Some(header) = resolve_header_plan(graph, agg) else {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "vtable-unresolved",
+                    format_args!("{owner} in {}", graph.name),
+                );
                 continue;
             };
             sites.push(Site {

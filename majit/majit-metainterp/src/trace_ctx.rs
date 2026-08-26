@@ -305,6 +305,9 @@ pub struct TraceCtx {
     /// (virtualizable.py write_boxes parity). `None` disables the
     /// write — unit-test or init-before-run path.
     virtualizable_heap_ptr: Option<*const u8>,
+    /// Set when the current residual call receives a virtualizable array's raw
+    /// base address. Drained by the post-call escape check.
+    raw_vable_base_escape_pending: bool,
     /// Header PC at which this trace started (0 = function entry).
     pub header_pc: usize,
     /// When a cross-loop cut occurs (trace closes at inner loop header),
@@ -1707,6 +1710,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
+            raw_vable_base_escape_pending: false,
             header_pc: 0,
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
@@ -1801,6 +1805,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
+            raw_vable_base_escape_pending: false,
             header_pc: 0,
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
@@ -5617,6 +5622,50 @@ impl TraceCtx {
             None,
             0,
         )
+    }
+
+    /// Address of item 0 of a virtualizable array field, as a constant int,
+    /// and raise the raw-base escape signal.
+    ///
+    /// `None` when the array's layout cannot be resolved. That is not a
+    /// recoverable miss to paper over with a zero or a recorded op: the walker
+    /// really performs the residual call this address is an argument to, so an
+    /// unresolved base would hand a live callee a wrong pointer and corrupt
+    /// memory. The caller aborts the trace instead.
+    ///
+    /// The address is read from the live heap object rather than recorded as
+    /// an operation because the trace does not survive: raising the escape
+    /// signal here means the enclosing CALL_MAY_FORCE aborts with
+    /// ABORT_ESCAPE before this constant can reach an optimizer or a backend.
+    /// Returns the trace-side constant and the same address as a concrete, so
+    /// the caller can stamp the destination register with both.
+    pub fn vable_arraybase_vable(
+        &mut self,
+        vable_struct_ptr: i64,
+        fdescr: DescrRef,
+    ) -> Option<(OpRef, i64)> {
+        if vable_struct_ptr == 0 {
+            return None;
+        }
+        let info = self.virtualizable_info.as_ref()?;
+        let array_idx = info.array_field_by_descr(&fdescr)?;
+        let array = info.array_fields.get(array_idx)?;
+        let base = unsafe {
+            crate::virtualizable::bhimpl_arraybase_vable(vable_struct_ptr as *const u8, array)
+        };
+        if base.is_null() {
+            return None;
+        }
+        // Raised only once the address is known to be real, so an aborted
+        // resolution above cannot leave a signal behind for the next call.
+        self.raw_vable_base_escape_pending = true;
+        let addr = base as usize as i64;
+        Some((self.const_int(addr), addr))
+    }
+
+    /// Consume the raw-base escape signal for the current residual call.
+    pub(crate) fn take_raw_vable_base_escape(&mut self) -> bool {
+        std::mem::take(&mut self.raw_vable_base_escape_pending)
     }
 
     /// Compute the flat index into virtualizable_boxes for an array element.

@@ -362,6 +362,43 @@ pub(crate) fn lower_result_exc_returns(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
 ) -> Result<usize, String> {
+    // Every `Err` below declines the WHOLE callee to a residual call.  The
+    // message says why, but it travels out as `LowerError::Unsupported` and
+    // the front end's coverage gate reports only a category tally, so the
+    // per-graph reason is not recoverable from any output.  Record it here,
+    // where the reason still exists.
+    //
+    // Upstream is loud in the equivalent position:
+    // `rpython/jit/codewriter/jtransform.py`'s `_handle_list_call` raises
+    // `NotImplementedError("prebuilt lists cannot be virtual")` rather than
+    // falling through to a residual.  This does not change the decline into
+    // an error — the fail-safe residual is deliberate here — it only makes
+    // the refusal countable.
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns);
+    if let Err(msg) = &outcome {
+        crate::decline::record_reason(
+            RESULT_EXC_CALLEE_GATE,
+            "callee-declined-to-residual",
+            msg,
+            &graph.name,
+        );
+    }
+    outcome
+}
+
+// Decline-census gate names: the callee rule (a scoped
+// `Result<T, PyError>` graph the exception-link lowering refused whole)
+// and the caller rule (one `?`-site the diamond rewrite refused).
+// Declared in `crate::decline::gate` so a name cannot outlive the
+// recorder that consumes it.
+use crate::decline::gate::{
+    RESULT_EXC_CALLEE as RESULT_EXC_CALLEE_GATE, RESULT_EXC_CALLER as RESULT_EXC_CALLER_GATE,
+};
+
+fn lower_result_exc_returns_inner(
+    graph: &mut FunctionGraph,
+    tail_forwarded_returns: usize,
+) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
     for bi in 0..nblocks {
@@ -1100,13 +1137,30 @@ pub(crate) fn rewire_result_exc_call_sites(
         fused: 0,
     };
     for (r, suffix, payload_ty) in results {
-        match rewire_one_call_site(
+        let site = rewire_one_call_site(
             graph,
             r,
             suffix.as_deref().unwrap_or(""),
             payload_ty,
             enclosing_scoped,
-        )? {
+        );
+        let site = match site {
+            Ok(site) => site,
+            Err(msg) => {
+                // Same disposition as the callee rule above: the message
+                // is the only statement of why this `?`-site could not be
+                // lowered, and it is about to be flattened into the front
+                // end's category tally.  Count it with its reason intact.
+                crate::decline::record_reason(
+                    RESULT_EXC_CALLER_GATE,
+                    "call-site-declined-to-residual",
+                    &msg,
+                    &graph.name,
+                );
+                return Err(msg);
+            }
+        };
+        match site {
             SiteOutcome::Diamond => outcome.diamonds += 1,
             SiteOutcome::TailForward => outcome.tail_forwards += 1,
             SiteOutcome::Rewrapped => outcome.rewrapped += 1,
@@ -1164,8 +1218,22 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        if try_fuse_drain_match(graph, a, r).is_ok() {
-            return Ok(SiteOutcome::Fused);
+        match try_fuse_drain_match(graph, a, r) {
+            Ok(()) => return Ok(SiteOutcome::Fused),
+            Err(msg) => {
+                // The one refusal in this file that discards a fully
+                // formed reason string: `is_ok()` threw the message away,
+                // so a site that ALMOST matched the drain shape and a site
+                // that never resembled it produced identical evidence —
+                // none.  The fail-safe fallthrough to `catch_and_rewrap` is
+                // deliberate and unchanged; only the reason is now kept.
+                crate::decline::record_reason(
+                    RESULT_EXC_CALLER_GATE,
+                    "drain-match-fusion-declined",
+                    &msg,
+                    &name,
+                );
+            }
         }
         catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);

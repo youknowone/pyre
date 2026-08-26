@@ -339,6 +339,15 @@ impl CodeWriter {
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
                 real_value_to_var,
             }) => {
+                // The accept arm, recorded so this gate's rows sum to a
+                // denominator.  "N graphs Skipped" is not a finding on its
+                // own — "N of M" is, and M has to come from the same run
+                // rather than from a figure written down elsewhere.
+                crate::decline::observe_accept(
+                    crate::decline::gate::DUAL_GATE,
+                    "match-real-rtyper (ACCEPT, not a decline)",
+                    &graph.name,
+                );
                 // Commit each real-rtyper Variable's `concretetype`
                 // (LowLevelType) onto its placeholder on the graph's
                 // value table.  Mirrors RPython `rtyper.py:258 v.concretetype = ...`
@@ -368,6 +377,57 @@ impl CodeWriter {
                 Some(real_value_to_var)
             }
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
+                // A Skip is a decline: the real rtyper refused this graph
+                // and the legacy walker types it instead.  This is the fork
+                // that decides whether a host gets the real rtyper or the
+                // flattening fallback, and it is keyed on substring-matching
+                // a diagnostic string (`cutover::unported_category`) — so
+                // WHICH arm matched is the finding, not that one did.  A
+                // single "Skip" count cannot say whether a host is dominated
+                // by registry misses or by unimplemented operations, and
+                // those imply completely different work.
+                //
+                // The classification already exists at this point and was
+                // being discarded; the outcome was visible only behind
+                // `MAJIT_RTYPER_VERBOSE=1`.  Record the arm as the count key
+                // and the graph as the subject, so the row carries both an
+                // event count and a distinct-graph count.
+                //
+                // WHICH ROUTE the Skip took is decidable here, and the two
+                // must not share a bucket.  `unported_category` classifies
+                // a CAUGHT PANIC PAYLOAD; the arm above is the only
+                // producer of that shape and it stamps a
+                // `registry build panicked: ` prefix.  Every other Skip
+                // arrives as a direct `Ok(DualGateOutcome::Skip(..))` and
+                // never reaches that predicate at all — the two
+                // populations are disjoint by construction, not
+                // overlapping.
+                //
+                // So an unmatched direct Skip is NOT "unknown shape, the
+                // arm list is incomplete".  It is "this route never
+                // consults the arm list".  Those prescribe opposite next
+                // actions — extend the arms, versus instrument a route
+                // nobody had drawn — so the row is labelled for its
+                // mechanism.  Same defect as a zero that two causes can
+                // produce.
+                const PANIC_PREFIX: &str = "registry build panicked: ";
+                let class = if reason.starts_with(PANIC_PREFIX) {
+                    crate::translator::rtyper::cutover::unported_category(&reason)
+                        // Unreachable while the arm above is the sole
+                        // producer (it only builds this shape when
+                        // `is_known_unported` said yes), so a row here
+                        // means that invariant broke.
+                        .unwrap_or("panic-route-unmatched-by-any-arm")
+                } else {
+                    crate::translator::rtyper::cutover::non_arm_skip_category(&reason)
+                        .unwrap_or("direct-skip (never reaches unported_category)")
+                };
+                crate::decline::record_reason(
+                    crate::decline::gate::DUAL_GATE,
+                    class,
+                    &reason,
+                    &graph.name,
+                );
                 if std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|v| v == "1") {
                     eprintln!(
                         "[MAJIT_RTYPER skip] graph {diag_label:?} ({:?}): {reason}",

@@ -72,6 +72,25 @@ impl CallPath {
     }
 }
 
+/// The `canonical_key` spelling, written straight into a formatter.
+///
+/// Lets a diagnostic name a path through `format_args!` without the
+/// `canonical_key()` `String` allocation, which matters where the
+/// diagnostic is disabled: `format_args!` evaluates its arguments
+/// eagerly, so an allocating accessor there would cost on the path that
+/// prints nothing.
+impl std::fmt::Display for CallPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, segment) in self.segments.iter().enumerate() {
+            if i > 0 {
+                f.write_str("::")?;
+            }
+            f.write_str(segment)?;
+        }
+        Ok(())
+    }
+}
+
 /// Strip the module prefix and return the trailing identifier.
 ///
 /// Accepts both spellings: a `::`-joined Rust path and the `.`-joined

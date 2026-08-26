@@ -117,6 +117,13 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_DECLINE_LOG`
+
+- Read sites: 1 — `majit/majit-translate/src/decline.rs`
+- Accessor: `level()`
+- What it does: Census of the lowering gates' silent declines. Unset, `0`, or empty disables it; any other value counts declines per (gate, reason) and prints runtime reasons; `2` additionally prints one line per decline event. `PYRE_MIR_FRONTEND_DEBUG` is accepted as an alias at the counter level.
+- Retirement condition: retire when the decline counts are no longer needed to steer cel lowering coverage.
+
 ### `MAJIT_DIAG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
@@ -170,7 +177,7 @@ cover the condition they diagnose.
 
 - Read sites: 2 — `majit/majit-ir/src/descr.rs`, `pyre/pyre-jit-trace/build.rs`
 - Accessor: `field_mint_trace_enabled()`; the build script also declares it as a rerun input and bypasses its code-generation cache while enabled
-- What it does: Setting it to `1` prints descriptor-mint disagreements and keeps the analyzer live so those diagnostics cannot be hidden by a restored artifact cache. Unset is inert.
+- What it does: Setting it to `1` prints field-descriptor mint disagreements (`cache_hit_disagree`, `ei_descr_mint_disagree`) and keeps the analyzer live so those diagnostics cannot be hidden by a restored artifact cache. Unset is inert.
 - Retirement condition: Remove when field and size descriptor identity no longer has fallback or disagreement paths to diagnose.
 
 ### `MAJIT_FIELD_POS_UNRESOLVED`
@@ -411,7 +418,7 @@ cover the condition they diagnose.
 
 - Read sites: 2 — `majit/majit-translate/src/lib.rs`, `pyre/pyre-jit-trace/build.rs`
 - Accessor: `struct_layout_census_enabled()`; the build script also declares it as a rerun input and bypasses its code-generation cache while enabled
-- What it does: Setting it to `1` reports structure IDs that resolve to multiple spellings or conflicting concrete layouts during translation. Unset is inert.
+- What it does: Setting it to `1` reports structure IDs that resolve to multiple spellings or conflicting concrete layouts during translation, as `conflict`, `variant` and `summary` lines. Unset is inert.
 - Retirement condition: Remove when one structure ID cannot collect conflicting layouts by construction.
 
 ### `MAJIT_TLDBG`
