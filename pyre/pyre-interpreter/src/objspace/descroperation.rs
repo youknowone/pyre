@@ -4986,7 +4986,20 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // non-overriding subclasses fall through to the by-layout comparison slot,
     // which gives the inherited builtin comparison.
     unsafe {
-        if let Some(result) = try_compare_override(a, b, op)? {
+        // A pair of exact builtins cannot reach an override, so the probe can
+        // only answer `None` for it: `is_instance` is false for both, and
+        // `subclass_special_override` returns `None` on
+        // `is_exact_builtin_instance` before it looks anything up.  Deciding
+        // that here spares the pair a reverse-dunder resolution and two MRO
+        // lookups, which is the whole of the probe for the commonest
+        // comparison there is.
+        //
+        // Only the probe is skipped.  The subtype ordering below still runs
+        // for such a pair, because `bool` is a proper subclass of `int` and
+        // both are exact builtin instances.
+        let pair_can_override = !pyre_object::is_exact_builtin_instance(a)
+            || !pyre_object::is_exact_builtin_instance(b);
+        if pair_can_override && let Some(result) = try_compare_override(a, b, op)? {
             return Ok(result);
         }
         // PyPy `descroperation.py:_make_comparison_impl` swaps the operands
