@@ -531,13 +531,16 @@ recorder, or the green accounts for.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 74 `try_walker_specialize_*` functions — 72 in
+pyre records traces through 70 `try_walker_specialize_*` functions — 68 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
-`inline_call.rs` — 10,858 lines of body inside `specialize.rs`'s 17,349,
-described by the 76 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
-and one row-less fold exists). Nothing in this charter named that layer before
-2026-08-26, which is itself the finding: it is the largest single adaptation
-in the tree.
+`inline_call.rs` — 10,288 lines of body inside `specialize.rs`'s 16,968,
+described by the 73 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
+and some rows are gate labels inside a larger arm rather than functions of
+their own). Every figure here is re-derivable: `rg -c 'fn
+try_walker_specialize_'` over the three files, `wc -l` on `specialize.rs`, and
+the length of `SPEC_FOLD_ROWS`. Nothing in this charter named that layer
+before 2026-08-26, which is itself the finding: it is the largest single
+adaptation in the tree.
 
 **Why it exists.** PyPy's objspace is RPython, so the tracer walks into it and
 `optimizeopt/` only ever sees ordinary recorded operations. pyre's objspace is
@@ -546,15 +549,23 @@ job is to *recognise* that residual and answer in its place. Upstream has no
 equivalent job, which means the obvious convergence — "retire the folds in
 favour of the ported optimizer" — is not available as stated. Group by group:
 
-| group | n | nearest upstream |
-|---|---|---|
-| unbox → raw int/float/bigint arithmetic, compare, truth | 17 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
-| opaque builtin call → pure elidable call | 19 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
-| residual → `new_with_vtable` / `new_array` so it stays virtual | 10 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
-| guarded heap field / array / mapdict read and write | 19 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
-| type-identity shortcut | 3 | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
-| frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
-| function-object construction | 2 | none |
+| group | nearest upstream |
+|---|---|
+| unbox → raw int/float/bigint arithmetic, compare, truth | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| opaque builtin call → pure elidable call | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
+| residual → `new_with_vtable` / `new_array` so it stays virtual | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
+| guarded heap field / array / mapdict read and write | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
+| type-identity shortcut | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| frame / execution-context introspection | none at any layer; PyPy forces the virtualizable instead |
+| function-object construction | none |
+
+The table carries no per-group count on purpose. It used to carry one, reached
+by the same method that first published 74/72/17,349/76 for the totals above —
+none of which matched any tree this branch ever had — so its rows were
+unreliable individually as well as in sum. A fold's group is decided by what it
+emits in place of the residual and not by its label, which is a question each
+of the 70 bodies has to be read to answer, and the claim below needs only which
+upstream construct each group maps to.
 
 Four groups have only downstream cleanup upstream, two have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
