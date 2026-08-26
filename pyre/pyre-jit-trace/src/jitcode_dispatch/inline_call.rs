@@ -579,7 +579,7 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 /// does: a loop header is where a deferred `load_method_self`'s two
 /// operand-stack entries can be crossed by a failing guard.  See the admission
 /// itself, which pairs this predicate with
-/// [`fbw_callee_body_has_load_method_self_residual`] rather than declining
+/// [`fbw_callee_body_has_two_entry_method_push`] rather than declining
 /// every loop-bearing body.
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
@@ -4758,7 +4758,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // publish an unresolved null (`collect_call_stack_overrides`),
                 // not any admission test here.
                 let loop_header_admitted = !body_facts.owns_loop_header
-                    || !fbw_callee_body_has_load_method_self_residual(body.code, callee_descr_refs);
+                    || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
                 foriter_deferred_admit = entry_is_call_boundary
                     && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
@@ -4835,10 +4835,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 CalleeReplaySafety::Clean => true,
                 CalleeReplaySafety::DeferredCall => {
                     let loop_header_admitted = !body_facts.owns_loop_header
-                        || !fbw_callee_body_has_load_method_self_residual(
-                            body.code,
-                            callee_descr_refs,
-                        );
+                        || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
                     entry_is_call_boundary && loop_header_admitted
                 }
                 // The scan reports this only when it could not model the body,
