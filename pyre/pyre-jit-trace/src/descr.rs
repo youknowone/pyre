@@ -5683,6 +5683,81 @@ pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
 mod tests {
     use super::*;
 
+    /// A JIT-built inline callee frame is a `NewWithVtable` over recycled
+    /// nursery bytes: `Nursery::reset` leaves them as they were
+    /// (`malloc_zero_filled = False`) and the GC rewriter's `clear_gc_fields`
+    /// initialises only the GC-reference slots.  Every non-`Type::Ref` field of
+    /// `PyFrame` therefore owes the emitter an explicit store, and one added to
+    /// the group without it is born holding whatever the previous tenant of
+    /// those bytes left.  `failed_attr_cleanup` was that field: the value it
+    /// reads as "run the deferred cleanup before the next opcode" is `u8::MAX`,
+    /// so a recycled `0xff` made every dispatch on the frame run a full
+    /// non-moving old-gen collection.
+    #[test]
+    fn inline_frame_emitters_store_every_scalar_pyframe_field() {
+        fn setfield_offsets(
+            emit: impl FnOnce(&mut majit_metainterp::TraceCtx) -> Option<majit_ir::OpRef>,
+        ) -> std::collections::BTreeSet<usize> {
+            let mut ctx = majit_metainterp::TraceCtx::for_test(0);
+            emit(&mut ctx).expect("the emitter declines only on a namespace mismatch");
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+                .filter_map(|op| {
+                    let descr = op.descr.borrow();
+                    descr.as_ref()?.as_field_descr().map(FieldDescr::offset)
+                })
+                .collect()
+        }
+
+        let scalars: Vec<(&str, usize)> = PYFRAME_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .filter(|d| d.field_type() != Type::Ref)
+            .map(|d| (d.field_name(), d.offset()))
+            .collect();
+        // `valuestackdepth`, `last_instr`, `flags`, `failed_attr_cleanup`: a
+        // census that found fewer is reading the wrong group.
+        assert!(scalars.len() >= 4, "scalar field census is vacuous");
+
+        let with_params = setfield_offsets(|ctx| {
+            let pycode = ctx.const_ref(0);
+            let w_globals = ctx.const_ref(0);
+            crate::helpers::emit_new_pyframe_inline_with_params(
+                ctx,
+                &[],
+                &[],
+                0,
+                1,
+                0,
+                pycode,
+                w_globals,
+            )
+        });
+        let self_recursive = setfield_offsets(|ctx| {
+            let arg_box = ctx.const_ref(0);
+            let pycode = ctx.const_ref(0);
+            let w_globals = ctx.const_ref(0);
+            crate::helpers::emit_new_pyframe_inline_self_recursive(
+                ctx, arg_box, 1, 0, pycode, w_globals,
+            )
+        });
+
+        for (emitter, stored) in [
+            ("emit_new_pyframe_inline_with_params", &with_params),
+            ("emit_new_pyframe_inline_self_recursive", &self_recursive),
+        ] {
+            for (name, offset) in &scalars {
+                assert!(
+                    stored.contains(offset),
+                    "{emitter} stores no {name} (offset {offset}), so the field is \
+                     born holding recycled nursery bytes",
+                );
+            }
+        }
+    }
+
     /// Every group that stays out of both name registries still needs a
     /// `gc_cache._cache_size` STRUCT identity.  Sharing the no-identity key
     /// makes whichever group lands there the header tid for every keyless
