@@ -3029,10 +3029,25 @@ pub fn find(_identifier: &str) -> PyObjectRef {
     pyre_object::PY_NULL
 }
 
+/// function.py `is_builtin_code`: unwrap a `_Method`, take the function's
+/// code, and report whether that code is a `BuiltinCode`.
+///
+/// Not the same predicate as `gateway::is_builtin_code`, which asks whether
+/// the object handed to it *is* a builtin code.  This one is asked about a
+/// callable, which is why it has to reach the code through `getcode` first.
 #[inline]
-#[allow(dead_code)]
-fn is_builtin_code(obj: PyObjectRef) -> bool {
-    unsafe { crate::gateway::is_builtin_code(obj) }
+pub fn is_builtin_code(w_func: PyObjectRef) -> bool {
+    unsafe {
+        let mut w_func = w_func;
+        if !w_func.is_null() && pyre_object::is_method(w_func) {
+            w_func = pyre_object::w_method_get_func(w_func);
+        }
+        if w_func.is_null() || !crate::is_function(w_func) {
+            return false;
+        }
+        let code = crate::function_get_code(w_func) as PyObjectRef;
+        !code.is_null() && crate::gateway::is_builtin_code(code)
+    }
 }
 
 #[inline]
