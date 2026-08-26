@@ -1793,6 +1793,55 @@ fn bank_span(bank_len: usize, base: usize, count: usize) -> std::ops::Range<usiz
     start..(start + count).min(bank_len)
 }
 
+/// Why [`JitDriver::bridge_from_guard_resume_position`] gave the guard's own
+/// position up and handed the failure to the blackhole arm instead.
+///
+/// Its ladder runs before the walk and every rung ends in the same
+/// `abort_trace`, which is counted under one `Counters.ABORT_*` id that the
+/// unclassified default also uses. The rung is therefore only knowable at the
+/// point it is chosen; carrying it out of the closure is what lets
+/// [`Self::diag_slot`] tally each one separately.
+#[derive(Clone, Copy)]
+enum GuardResumeDecline {
+    /// No rebuilt resume data, no frame in it, no position to convert, or no
+    /// live trace session to seed — there is nothing to enter at.
+    NoResumeState,
+    /// The frame names a jitcode other than the dispatch one. A position is an
+    /// offset into the jitcode the frame NAMES, so entering a different one
+    /// there lands mid-instruction in unrelated code.
+    ForeignJitcode,
+    /// The guard's deferred heap writes have not been applied. Only the
+    /// blackhole applies them, so entering here resumes against a heap that is
+    /// missing half of whatever the guard deferred.
+    PendingFields,
+    /// The register-index count and the rebuilt-value count disagree, so the
+    /// two sides read different liveness and no per-register pairing off them
+    /// is trustworthy.
+    RegCountMismatch,
+    /// A live register holds a virtual, which has no concrete value, or nothing
+    /// at all. The walk executes, so a register it cannot read a value out of
+    /// is not one it can run past.
+    UnreadableRegister,
+}
+
+impl GuardResumeDecline {
+    /// The `MC_DIAG` slot this rung is tallied in.
+    const fn diag_slot(self) -> usize {
+        match self {
+            GuardResumeDecline::NoResumeState => 83,
+            GuardResumeDecline::ForeignJitcode => 84,
+            GuardResumeDecline::PendingFields => 85,
+            GuardResumeDecline::RegCountMismatch => 86,
+            GuardResumeDecline::UnreadableRegister => 87,
+        }
+    }
+
+    /// The same rung, for the log line that names it without a slot legend.
+    const fn label(self) -> &'static str {
+        crate::MC_DIAG_LABELS[self.diag_slot()]
+    }
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
@@ -4959,17 +5008,23 @@ impl<S: JitState> JitDriver<S> {
         }
         // From here the trace session is LIVE, so a decline has to tear it
         // down rather than return through it.
-        let seeded = (|| {
-            let resume = self.resume_data_result.as_ref()?;
-            let frame = resume.frames.first()?;
+        type Seeded = (usize, Vec<crate::jit_state::GuardResumeReg>);
+        let seeded = (|| -> Result<Seeded, GuardResumeDecline> {
+            use GuardResumeDecline as Decline;
+            let resume = self
+                .resume_data_result
+                .as_ref()
+                .ok_or(Decline::NoResumeState)?;
+            let frame = resume.frames.first().ok_or(Decline::NoResumeState)?;
             // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a
             // different one at that offset lands mid-instruction in unrelated
             // code, and the walk decodes whatever byte is there. Only the
             // dispatch jitcode is enterable here, so a frame that names any
             // other one is a decline.
-            if frame.jitcode_index as usize != dispatch.try_index()? {
-                return None;
+            let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
+            if frame.jitcode_index as usize != dispatch_index {
+                return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
             // heap writes through `execute_and_record` — it applies them to the
@@ -4988,18 +5043,21 @@ impl<S: JitState> JitDriver<S> {
                 .as_ref()
                 .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
             {
-                return None;
+                return Err(Decline::PendingFields);
             }
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
-            let resume_pc = usize::try_from(frame.pc).ok()?;
-            let ctx = self.meta.tracing.as_mut()?;
-            let reg_indices = ctx.bridge_reg_indices()?.clone();
+            let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
+            let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
+            let reg_indices = ctx
+                .bridge_reg_indices()
+                .ok_or(Decline::NoResumeState)?
+                .clone();
             // `consume_boxes` fills every live register of the frame, so a
             // count that disagrees means the two sides read different
             // liveness and no per-register pairing off them is trustworthy.
             if reg_indices.total_len() != values.len() {
-                return None;
+                return Err(Decline::RegCountMismatch);
             }
             let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
                 (majit_ir::Type::Int, &reg_indices.int, 0),
@@ -5035,7 +5093,9 @@ impl<S: JitState> JitDriver<S> {
                         // register it cannot read a value out of is not a
                         // register it can run past — decline the whole frame
                         // rather than enter it half-seeded.
-                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => return None,
+                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => {
+                            return Err(Decline::UnreadableRegister);
+                        }
                     };
                     regs.push(crate::jit_state::GuardResumeReg {
                         bank,
@@ -5045,14 +5105,26 @@ impl<S: JitState> JitDriver<S> {
                     });
                 }
             }
-            Some((resume_pc, regs))
+            Ok((resume_pc, regs))
         })();
-        let Some((resume_pc, regs)) = seeded else {
-            self.meta.abort_trace(false);
-            self.clear_tracing_session_state();
-            self.resume_data_result = None;
-            self.last_bridge_is_exception_guard = false;
-            return None;
+        let (resume_pc, regs) = match seeded {
+            Ok(seeded) => seeded,
+            Err(why) => {
+                crate::mc_diag_bump(why.diag_slot());
+                if crate::majit_log_enabled() {
+                    eprintln!("[bridge] guard-resume entry declined: {}", why.label());
+                }
+                // The ladder above already decided; it is the abort that cannot
+                // see which rung chose. Name the reason here so the
+                // `abort_trace` below tallies a bridge given up rather than
+                // falling into the unclassified default, which shares its id.
+                self.meta.stage_abort_reason(crate::counters::ABORT_BRIDGE);
+                self.meta.abort_trace(false);
+                self.clear_tracing_session_state();
+                self.resume_data_result = None;
+                self.last_bridge_is_exception_guard = false;
+                return None;
+            }
         };
 
         self.bridge_entered_at_guard_resume = true;

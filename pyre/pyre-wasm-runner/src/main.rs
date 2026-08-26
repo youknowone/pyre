@@ -994,6 +994,11 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "abort_ceiling_banned",
                 "abort_ceiling_refused",
                 "bridge_abort_permanent",
+                "guard_resume_decline_no_state",
+                "guard_resume_decline_foreign_jitcode",
+                "guard_resume_decline_pendingfields",
+                "guard_resume_decline_regcount",
+                "guard_resume_decline_unreadable_reg",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
