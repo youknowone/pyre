@@ -2963,6 +2963,11 @@ fn rewrite_body(
 
     struct MarkerRewriter {
         merge_fn_name: Ident,
+        /// Whether this body's `jit_merge_point!` carries the `; state`
+        /// single-executor close. `take_single_pass_finish` is set only by that
+        /// machinery, so it is also what decides whether the back edge below
+        /// has a terminal-return exit to emit.
+        single_pass_close: bool,
         default_greens: Vec<Expr>,
         /// Whether the attribute spelled a `greens` key. `default_greens` being
         /// empty does not answer this: an omitted key and `greens = []` both
@@ -3351,24 +3356,38 @@ fn rewrite_body(
                                     #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr)
                                 }
                             };
+                            // The back edge's spelling of the
+                            // `jit_merge_point!` hook's terminal-return exit. A
+                            // guard that bridges enters the walk at the guard's
+                            // own position, so the walk reaches the interpreted
+                            // function's return here just as it can at a merge
+                            // point; the position reported alongside names
+                            // nothing to resume at, and assigning it to
+                            // `#pc_expr` decodes an out-of-range index in any
+                            // dispatch loop not bottom-tested on its program
+                            // length.
+                            //
+                            // Emitted only for a body whose merge point carries
+                            // `; state`, because only that machinery ever sets
+                            // the flag. A bare `jit_merge_point!()` body would
+                            // get a `break` that can never be taken, and a bare
+                            // `break` gives an expression-position dispatch
+                            // `loop` the type `()` — so an unconditional
+                            // emission stops such a body from compiling at all.
+                            let single_pass_finish_exit: TokenStream = if self.single_pass_close {
+                                quote! {
+                                    if #driver_expr.take_single_pass_finish() {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                TokenStream::new()
+                            };
                             let back_edge: TokenStream = quote! {
                                 {
                                     let __back_edge_resume = #call;
                                     #finish_drain
-                                    // The back edge's spelling of the
-                                    // `jit_merge_point!` hook's terminal-return
-                                    // exit. A guard that bridges enters the walk
-                                    // at the guard's own position, so the walk
-                                    // reaches the interpreted function's return
-                                    // here just as it can at a merge point; the
-                                    // position reported alongside names nothing
-                                    // to resume at, and assigning it to
-                                    // `#pc_expr` decodes an out-of-range index in
-                                    // any dispatch loop not bottom-tested on its
-                                    // program length.
-                                    if #driver_expr.take_single_pass_finish() {
-                                        break;
-                                    }
+                                    #single_pass_finish_exit
                                     if let Some(__resume_pc) = __back_edge_resume {
                                         #pc_expr = __resume_pc;
                                         continue;
@@ -3394,8 +3413,35 @@ fn rewrite_body(
     }
 
     let mut cloned_block = block.clone();
+    // Whether any `jit_merge_point!` in this body carries `; state`. Read
+    // before the rewrite because the back edge and the merge point are separate
+    // statements visited in source order, and a dispatch loop reaches its back
+    // edge inside an opcode arm that can precede the merge point in the tree.
+    struct SinglePassCloseScan {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let path_str = mac
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
+                let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
+                self.found |= args.state.is_some();
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+    let mut scan = SinglePassCloseScan { found: false };
+    syn::visit::Visit::visit_block(&mut scan, &cloned_block);
+
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
+        single_pass_close: scan.found,
         default_greens: default_greens.to_vec(),
         greens_declared,
         default_green_type_tags: default_green_type_tags.to_vec(),
