@@ -531,13 +531,18 @@ recorder, or the green accounts for.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 74 `try_walker_specialize_*` functions — 72 in
+pyre records traces through 70 `try_walker_specialize_*` functions — 68 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
-`inline_call.rs` — 10,858 lines of body inside `specialize.rs`'s 17,349,
-described by the 76 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
-and one row-less fold exists). Nothing in this charter named that layer before
-2026-08-26, which is itself the finding: it is the largest single adaptation
-in the tree.
+`inline_call.rs` — roughly 10.3k lines of body inside `specialize.rs`'s 17k,
+described by the 73 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
+and some rows are gate labels inside a larger arm rather than functions of
+their own). The counts are exact and the line figures deliberately are not:
+a fold count moves only when a fold is added or retired, while a line count
+moves whenever anyone touches the file and carries no part of the argument.
+Both are re-derivable: `rg -c 'fn try_walker_specialize_'` over the three
+files and the length of `SPEC_FOLD_ROWS`. Nothing in this charter named that layer
+before 2026-08-26, which is itself the finding: it is the largest single
+adaptation in the tree.
 
 **Why it exists.** PyPy's objspace is RPython, so the tracer walks into it and
 `optimizeopt/` only ever sees ordinary recorded operations. pyre's objspace is
@@ -546,15 +551,23 @@ job is to *recognise* that residual and answer in its place. Upstream has no
 equivalent job, which means the obvious convergence — "retire the folds in
 favour of the ported optimizer" — is not available as stated. Group by group:
 
-| group | n | nearest upstream |
-|---|---|---|
-| unbox → raw int/float/bigint arithmetic, compare, truth | 17 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
-| opaque builtin call → pure elidable call | 19 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
-| residual → `new_with_vtable` / `new_array` so it stays virtual | 10 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
-| guarded heap field / array / mapdict read and write | 19 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
-| type-identity shortcut | 3 | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
-| frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
-| function-object construction | 2 | none |
+| group | nearest upstream |
+|---|---|
+| unbox → raw int/float/bigint arithmetic, compare, truth | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| opaque builtin call → pure elidable call | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
+| residual → `new_with_vtable` / `new_array` so it stays virtual | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
+| guarded heap field / array / mapdict read and write | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
+| type-identity shortcut | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| frame / execution-context introspection | none at any layer; PyPy forces the virtualizable instead |
+| function-object construction | none |
+
+The table carries no per-group count on purpose. It used to carry one, reached
+by the same method that first published 74/72/17,349/76 for the totals above —
+none of which matched any tree this branch ever had — so its rows were
+unreliable individually as well as in sum. A fold's group is decided by what it
+emits in place of the residual and not by its label, which is a question each
+of the 70 bodies has to be read to answer, and the claim below needs only which
+upstream construct each group maps to.
 
 Four groups have only downstream cleanup upstream, two have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
@@ -569,24 +582,29 @@ blockers and retired zero folds. A separate census over the synthetic corpus
 found no fold with `consulted=0`, so the layer is not merely carrying dead
 arms — `load_deref` alone never fired.
 
-**What does not hold it in place.** Only 15 fixtures carry a `spec-folds=`
-header and they name 25 distinct folds between them, so 51 of the 76 rows have
-no fixture coupling at all. Retirement is blocked by reach, not by headers.
+**What does not hold it in place.** 23 fixtures carry a `spec-folds=` header
+and they name 44 distinct labels between them, so 29 of the 73 rows have no
+fixture coupling at all. Retirement is blocked by reach, not by headers.
+(`rg -o 'spec-folds=[A-Za-z0-9_,]+' pyre/bench/synth/*.py`, split on commas,
+against the row list.)
 
-**The bounded first step** is the type-identity group — `builtin_type`,
-`builtin_isinstance`, `builtin_issubclass`, 291 lines — because it is the
-smallest group that is entirely fixture-free *and* whose upstream counterpart
-is a pass that pyre has already ported (`PtrEq | InstancePtrEq` is registered
-in `executor.rs` and reached through `OptPure`). Its go/no-go is a
-measurement, not a design question: whether the descent declines on those
-three callables and on which blocker. Until that is run, the step is proposed
-and not accepted.
+**The bounded first step is not specified.** This entry named one — the
+type-identity group, "`builtin_type`, `builtin_isinstance`,
+`builtin_issubclass`, 291 lines" — and **none of those three exists**: no
+`try_walker_specialize_` function and no `SPEC_FOLD_ROWS` row carries any of
+those names, so neither the group membership nor the 291 lines was ever
+measurable. The folds whose names point that way are `builtin_type_getattr`,
+`load_type_attr` and `load_type_name_attr`, and whether they are one group is
+exactly the question the removed `n` column could not answer. Specifying a
+first step therefore needs the grouping settled from the fold bodies first;
+until then there is no measurement to run, and any plan quoting those three
+names is quoting something that is not in the tree.
 
-**Falsification.** If making those three callables descendable does not let
-their folds be retired with the corpus unchanged, then reach is not the
-binding constraint and this entry is wrong — the layer would then be
-compensating for something the descent cannot reach in principle, and the
-right response is to say what that is rather than to widen the descent again.
+**Falsification.** If making a group's callables descendable does not let its
+folds be retired with the corpus unchanged, then reach is not the binding
+constraint and this entry is wrong — the layer would then be compensating for
+something the descent cannot reach in principle, and the right response is to
+say what that is rather than to widen the descent again.
 
 ---
 
