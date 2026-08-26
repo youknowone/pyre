@@ -232,7 +232,7 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (72): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -250,8 +250,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_FBW_STRICT_DIAG`,
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
-`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GEN_ENTRY_DIAG`,
-`PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
+`PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
+`PYRE_GEN_ENTRY_DIAG`, `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
 `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
@@ -323,6 +323,14 @@ inherited one is startup allocation and moves `guard_failures`; setting the
 gate restores the whole-environment copy, so the size of that effect stays
 measurable on one binary. It goes when the allowlist stops being the thing
 under measurement.
+
+`PYRE_GC_SIZE_AUDIT` is the one entry here that aborts rather than reports: at
+every fixed-size stamp it compares the block's payload against the size the
+type id declares and panics when the block is the smaller of the two. The
+mismatch it looks for is otherwise silent at the stamp and surfaces an
+arbitrary number of collections later in whichever object followed, so the
+audit trades a report for a stack that still holds the caller. It goes when a
+stamp cannot outlive its block's extent.
 
 ## §7 — Additional runtime diagnostic
 
