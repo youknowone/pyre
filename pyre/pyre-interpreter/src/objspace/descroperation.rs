@@ -5017,7 +5017,11 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             && !is_instance(b)
             && let (Some(a_type), Some(b_type)) =
                 (crate::typedef::r#type(a), crate::typedef::r#type(b))
-            && a_type != b_type
+            // Spelled as a raw-pointer identity, the way this file spells every
+            // other one.  `NonNull`'s own `!=` goes through `NonNull::ne`,
+            // which is not a call a trace can lower, and this test now sits on
+            // the walked path for an exact-builtin pair.
+            && !std::ptr::eq(a_type.as_ptr(), b_type.as_ptr())
             && issubtype_cached(b_type.as_ptr(), a_type.as_ptr())
         {
             return compare_slot(b, a, reverse_compare_op(op));
