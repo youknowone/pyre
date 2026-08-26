@@ -5955,7 +5955,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_len", || {
+        && spec_gate(SpecFold::BuiltinLen, || {
             try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6227,7 +6227,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `int_is_true`, eliding the may-force call whose force/exc guards
         // mis-resume the kept short-circuit stack.
         if ei.runtime_helper == majit_ir::RuntimeHelperKind::Truth {
-            if let Some(truth) = spec_gate("truth_int", || {
+            if let Some(truth) = spec_gate(SpecFold::TruthInt, || {
                 try_walker_specialize_truth_int(ctx, op.pc, r_args[0])
             })? {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
@@ -6236,7 +6236,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             // The boxed bool a residual `COMPARE_OP` leaves behind — the int
             // arm above guards `INT_TYPE` and declines it, so without this the
             // test on every `if a == b:` stays a second may-force call.
-            if let Some(truth) = spec_gate("truth_bool", || {
+            if let Some(truth) = spec_gate(SpecFold::TruthBool, || {
                 try_walker_specialize_truth_bool(ctx, op.pc, r_args[0])
             })? {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, truth)?;
@@ -6255,7 +6255,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && spec_gate("unary_positive_int", || {
+        && spec_gate(SpecFold::UnaryPositiveInt, || {
             try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
         .is_some()
@@ -6272,7 +6272,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate("unary_negative_int", || {
+        && spec_gate(SpecFold::UnaryNegativeInt, || {
             try_walker_specialize_unary_negative_int(
                 ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
             )
@@ -6290,7 +6290,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && spec_gate("unary_invert_int", || {
+        && spec_gate(SpecFold::UnaryInvertInt, || {
             try_walker_specialize_unary_invert_int(
                 ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
             )
@@ -6310,7 +6310,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::StoreSubscr
     {
-        if spec_gate("store_subscr", || {
+        if spec_gate(SpecFold::StoreSubscr, || {
             try_walker_specialize_store_subscr(ctx, op.pc, &r_args)
         })?
         .is_some()
@@ -6323,7 +6323,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // a virtualizable BUILD_LIST source temp is consumed without forcing.
         // Declines to the opaque residual for any shape it cannot reproduce
         // faithfully (SAFE — always byte-correct).
-        if spec_gate("setslice", || {
+        if spec_gate(SpecFold::Setslice, || {
             try_walker_specialize_setslice(ctx, op.pc, &r_args)
         })?
         .is_some()
@@ -6342,7 +6342,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Range GET_ITER: virtualize exact machine-word `range` into the same
     // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
     if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::GetIter {
-        if let Some(iter_op) = spec_gate("get_iter", || {
+        if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
             try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
@@ -6364,13 +6364,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
     {
-        if let Some(item_op) = spec_gate("for_iter_next", || {
+        if let Some(item_op) = spec_gate(SpecFold::ForIterNext, || {
             try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        if let Some(inlined) = spec_gate("instance_next", || {
+        if let Some(inlined) = spec_gate(SpecFold::InstanceNext, || {
             try_walker_specialize_instance_next(
                 ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
             )
@@ -6386,7 +6386,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::MakeFunction
-        && spec_gate("make_function", || {
+        && spec_gate(SpecFold::MakeFunction, || {
             try_walker_specialize_make_function(ctx, op.pc, &r_args, dst, dst_bank)
         })?
         .is_some()
@@ -6402,7 +6402,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
-        && spec_gate("newtuple", || {
+        && spec_gate(SpecFold::Newtuple, || {
             try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)
         })?
         .is_some()
@@ -6419,7 +6419,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
-        && spec_gate("newtuple_object", || {
+        && spec_gate(SpecFold::NewtupleObject, || {
             try_walker_specialize_newtuple_object(ctx, op.pc, &r_args, dst, dst_bank)
         })?
         .is_some()
@@ -6439,7 +6439,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewlistFromArray
-        && spec_gate("newlist", || {
+        && spec_gate(SpecFold::Newlist, || {
             try_walker_specialize_newlist(ctx, op.pc, &r_args, dst, dst_bank)
         })?
         .is_some()
@@ -6527,7 +6527,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_dict_get", || {
+        && spec_gate(SpecFold::BuiltinDictGet, || {
             try_walker_specialize_builtin_dict_get(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6541,7 +6541,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_type_getattr", || {
+        && spec_gate(SpecFold::BuiltinTypeGetattr, || {
             try_walker_specialize_builtin_type_getattr(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6556,7 +6556,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_getattr", || {
+        && spec_gate(SpecFold::BuiltinGetattr, || {
             try_walker_specialize_builtin_getattr(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6571,7 +6571,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        if let Some(outcome) = spec_gate("builtin_range", || {
+        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
             try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
         })? {
             return Ok((outcome, op.next_pc));
@@ -6582,7 +6582,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallKw
-        && spec_gate("builtin_zip", || {
+        && spec_gate(SpecFold::BuiltinZip, || {
             try_walker_specialize_builtin_zip(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6602,7 +6602,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_locals", || {
+        && spec_gate(SpecFold::BuiltinLocals, || {
             try_walker_specialize_builtin_locals(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6621,7 +6621,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("sys_getframe", || {
+        && spec_gate(SpecFold::SysGetframe, || {
             try_walker_specialize_sys_getframe(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6638,7 +6638,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_sqrt", || {
+        && spec_gate(SpecFold::MathSqrt, || {
             try_walker_specialize_math_sqrt(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6648,7 +6648,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_log_trig", || {
+        && spec_gate(SpecFold::MathLogTrig, || {
             try_walker_specialize_math_log_trig(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6658,7 +6658,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_frexp", || {
+        && spec_gate(SpecFold::MathFrexp, || {
             try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6668,7 +6668,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_ldexp", || {
+        && spec_gate(SpecFold::MathLdexp, || {
             try_walker_specialize_math_ldexp(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6678,7 +6678,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_isqrt", || {
+        && spec_gate(SpecFold::MathIsqrt, || {
             try_walker_specialize_math_isqrt(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6688,7 +6688,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_fabs", || {
+        && spec_gate(SpecFold::MathFabs, || {
             try_walker_specialize_math_fabs(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6698,7 +6698,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_float1", || {
+        && spec_gate(SpecFold::MathFloat1, || {
             try_walker_specialize_math_float1(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6708,7 +6708,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_float2", || {
+        && spec_gate(SpecFold::MathFloat2, || {
             try_walker_specialize_math_float2(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6718,7 +6718,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_isclose", || {
+        && spec_gate(SpecFold::MathIsclose, || {
             try_walker_specialize_math_isclose(ctx, code, op, &r_args, dst, dst_bank)
         })?
         .is_some()
@@ -6728,7 +6728,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_fold1", || {
+        && spec_gate(SpecFold::BuiltinFold1, || {
             try_walker_specialize_builtin_fold1(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6738,7 +6738,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_fold2", || {
+        && spec_gate(SpecFold::BuiltinFold2, || {
             try_walker_specialize_builtin_fold2(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6748,7 +6748,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_floor", || {
+        && spec_gate(SpecFold::MathFloor, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
                 code,
@@ -6765,7 +6765,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_ceil", || {
+        && spec_gate(SpecFold::MathCeil, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
                 code,
@@ -6782,7 +6782,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("math_trunc", || {
+        && spec_gate(SpecFold::MathTrunc, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
                 code,
@@ -6799,7 +6799,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("int_call", || {
+        && spec_gate(SpecFold::IntCall, || {
             try_walker_specialize_int_call(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6809,7 +6809,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("bare_super_call", || {
+        && spec_gate(SpecFold::BareSuperCall, || {
             try_walker_specialize_bare_super_call(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6819,7 +6819,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("float_call", || {
+        && spec_gate(SpecFold::FloatCall, || {
             try_walker_specialize_float_call(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6829,7 +6829,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("str_call", || {
+        && spec_gate(SpecFold::StrCall, || {
             try_walker_specialize_str_call(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6846,7 +6846,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate("builtin_divmod", || {
+        && spec_gate(SpecFold::BuiltinDivmod, || {
             try_walker_specialize_builtin_divmod(ctx, code, op, &r_args, dst)
         })?
         .is_some()
@@ -6974,7 +6974,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        spec_gate("set_add_method", || {
+        spec_gate(SpecFold::SetAddMethod, || {
             try_walker_specialize_set_add_method(ctx, code, op, &r_args)
         })?
     } else {
@@ -7344,7 +7344,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && runtime_helper_kind == majit_ir::RuntimeHelperKind::SetFunctionAttribute
-        && spec_gate("set_function_attribute", || {
+        && spec_gate(SpecFold::SetFunctionAttribute, || {
             try_walker_specialize_set_function_attribute(
                 ctx, op.pc, &i_args, &r_args, dst, dst_bank,
             )
@@ -7368,7 +7368,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && runtime_helper_kind == majit_ir::RuntimeHelperKind::LoadDeref
     {
-        if let Some(value) = spec_gate("load_deref", || {
+        if let Some(value) = spec_gate(SpecFold::LoadDeref, || {
             try_walker_specialize_load_deref(ctx, op.pc, &r_args)
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, value)?;
@@ -7768,7 +7768,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // operand, so the lookup has to reach it already resolved.
                 let attr_name = walker_load_name_from_code(w_code_ptr, namei as usize);
                 if let Some(attr_name) = attr_name.as_deref()
-                    && spec_gate("load_attr", || {
+                    && spec_gate(SpecFold::LoadAttr, || {
                         try_walker_specialize_load_attr(
                             ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                         )
@@ -7780,7 +7780,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // The plain-slot fold wants a mapdict instance and declines a
                 // class; `Cls.__name__` reads the slot the metatype getset
                 // returns instead.
-                if spec_gate("load_type_name_attr", || {
+                if spec_gate(SpecFold::LoadTypeNameAttr, || {
                     try_walker_specialize_load_type_name_attr(
                         ctx,
                         op.pc,
@@ -7829,7 +7829,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 }
                 // A type receiver whose class-MRO value needs no descriptor
                 // binding folds to that value under receiver + version pins.
-                if spec_gate("load_type_attr", || {
+                if spec_gate(SpecFold::LoadTypeAttr, || {
                     try_walker_specialize_load_type_attr(
                         ctx,
                         op.pc,
@@ -7894,7 +7894,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
-                if spec_gate("load_method_attr", || {
+                if spec_gate(SpecFold::LoadMethodAttr, || {
                     try_walker_specialize_load_method_attr(
                         ctx,
                         op.pc,
@@ -7914,7 +7914,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // declines (non-instance receiver, non-method descriptor).
                 // Write the classmethod's `__func__` so the paired
                 // `load_method_self` binds the class and the CALL inlines it.
-                if spec_gate("load_classmethod_attr", || {
+                if spec_gate(SpecFold::LoadClassmethodAttr, || {
                     try_walker_specialize_load_classmethod_attr(
                         ctx,
                         op.pc,
@@ -7934,7 +7934,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // builtin receiver (`lst.append`) leaves `getattr` to build a
                 // `Method`.  Emit that construction instead of the opaque
                 // residual so it virtualizes into the following CALL.
-                if spec_gate("load_bound_method_attr", || {
+                if spec_gate(SpecFold::LoadBoundMethodAttr, || {
                     try_walker_specialize_load_bound_method_attr(
                         ctx,
                         op.pc,
@@ -8056,7 +8056,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         }
                         // BINARY_SUBSCR list[int] getitem (int/float storage);
                         // falls through to the generic may-force leg otherwise.
-                        spec_gate("subscr", || {
+                        spec_gate(SpecFold::Subscr, || {
                             try_walker_specialize_subscr(
                                 ctx, op.pc, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
@@ -8064,7 +8064,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     } else {
                         // int specialization first; float (incl. mixed int/float)
                         // as a fallback so two-int operands keep int arithmetic.
-                        if let Some(outcome) = spec_gate("binary_op_int", || {
+                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpInt, || {
                             try_walker_specialize_binary_op_int(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
@@ -8074,7 +8074,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // longobject.py `_make_generic_descr_binop` and
                         // `descr_sub` use the rbigint.int_* family for
                         // mixed Long/Int operands.
-                        let mut specialized = spec_gate("binary_op_long_int", || {
+                        let mut specialized = spec_gate(SpecFold::BinaryOpLongInt, || {
                             try_walker_specialize_binary_op_long_int(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
@@ -8083,12 +8083,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // `_make_descr_binop` gives shifts with an Int
                             // count their own `_int_lshift` / `_int_rshift`
                             // path before Long/Long.
-                            if let Some(outcome) = spec_gate("binary_op_long_int_shift", || {
-                                try_walker_specialize_binary_op_long_int_shift(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })? {
+                            if let Some(outcome) =
+                                spec_gate(SpecFold::BinaryOpLongIntShift, || {
+                                    try_walker_specialize_binary_op_long_int_shift(
+                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
+                                        dst_bank,
+                                    )
+                                })?
+                            {
                                 return Ok((outcome, op.next_pc));
                             }
                         }
@@ -8097,7 +8099,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // an Int divisor keeps its machine word instead of
                             // being widened to a bigint, and `_int_mod`'s
                             // result is a machine int rather than a long.
-                            if let Some(outcome) = spec_gate("binary_op_long_int_div", || {
+                            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
                                 try_walker_specialize_binary_op_long_int_div(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
@@ -8110,7 +8112,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // `descr_pow` keeps a `W_IntObject` exponent
                             // unwrapped and calls `rbigint.int_pow`; only a
                             // long exponent reaches `rbigint.pow`.
-                            specialized = spec_gate("binary_op_long_int_pow", || {
+                            specialized = spec_gate(SpecFold::BinaryOpLongIntPow, || {
                                 try_walker_specialize_binary_op_long_int_pow(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
@@ -8121,7 +8123,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             // W_LongObject operands take the long fast path
                             // before float so bigint arithmetic retains its
                             // payload representation.
-                            specialized = spec_gate("binary_op_long", || {
+                            specialized = spec_gate(SpecFold::BinaryOpLong, || {
                                 try_walker_specialize_binary_op_long(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
@@ -8131,7 +8133,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         if specialized.is_none() {
                             // Two-long true-divide → float fast path
                             // (CallPureF + wrapfloat).
-                            specialized = spec_gate("truediv_op_long", || {
+                            specialized = spec_gate(SpecFold::TruedivOpLong, || {
                                 try_walker_specialize_truediv_op_long(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
@@ -8139,7 +8141,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             })?;
                         }
                         if specialized.is_none() {
-                            if let Some(outcome) = spec_gate("binary_op_float", || {
+                            if let Some(outcome) = spec_gate(SpecFold::BinaryOpFloat, || {
                                 try_walker_specialize_binary_op_float(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
@@ -8183,26 +8185,26 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 } else {
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
-                    match spec_gate("compare_op_int", || {
+                    match spec_gate(SpecFold::CompareOpInt, || {
                         try_walker_specialize_compare_op_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )
                     })? {
                         Some(()) => Some(()),
-                        None => match spec_gate("compare_op_long_int", || {
+                        None => match spec_gate(SpecFold::CompareOpLongInt, || {
                             try_walker_specialize_compare_op_long_int(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
                         })? {
                             Some(()) => Some(()),
-                            None => match spec_gate("compare_op_long", || {
+                            None => match spec_gate(SpecFold::CompareOpLong, || {
                                 try_walker_specialize_compare_op_long(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
                                 )
                             })? {
                                 Some(()) => Some(()),
-                                None => spec_gate("compare_op_float", || {
+                                None => spec_gate(SpecFold::CompareOpFloat, || {
                                     try_walker_specialize_compare_op_float(
                                         ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                         dst_bank,
@@ -8240,7 +8242,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     if matches!(
         ei.runtime_helper,
         majit_ir::RuntimeHelperKind::UnpackSequence | majit_ir::RuntimeHelperKind::UnpackItem
-    ) && spec_gate("unpack", || {
+    ) && spec_gate(SpecFold::Unpack, || {
         try_walker_specialize_unpack(
             ctx,
             op.pc,

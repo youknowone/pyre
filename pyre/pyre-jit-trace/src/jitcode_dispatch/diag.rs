@@ -304,86 +304,117 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 ///
-/// Spelled as a slice rather than an array so that adding a row cannot leave a
-/// hand-written length behind it: `SPEC_FOLD_COUNT` reads `len()`, which is a
-/// `const fn`, and every other reader iterates.
+/// Nothing about a row is written twice: `SPEC_FOLD_COUNT` reads `len()`, and
+/// the `SpecFold` a call site names is generated from the same list, so adding
+/// a row cannot leave a hand-written length or a stale label behind it.
+/// Declare the fold table.  The rows are the source: the `SpecFold` variants a
+/// call site names, the `SPEC_FOLD_ROWS` the census prints, and the width of
+/// the counter arrays all come out of the same list, in the same order, so a
+/// row and its call site cannot disagree.  A label that is not a row does not
+/// compile, and a row no site names is an unconstructed variant, which
+/// `dead_code` reports.
+macro_rules! spec_folds {
+    ($($variant:ident => ($label:literal, $site:literal, $parent:literal),)*) => {
+        /// The row a gated call site names.  Its discriminant is that row's
+        /// index into the counter arrays, which is why the two orders are one
+        /// order.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum SpecFold {
+            $($variant,)*
+        }
+
+        impl SpecFold {
+            /// This row's index into [`SPEC_FOLD_ROWS`] and the counter arrays.
+            const fn index(self) -> usize {
+                self as usize
+            }
+        }
+
+        #[rustfmt::skip]
+        pub const SPEC_FOLD_ROWS: &[(&str, &str, &str)] = &[
+            // (label, site, parent)
+            $(($label, $site, $parent),)*
+        ];
+    };
+}
+
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: &[(&str, &str, &str)] = &[
-    // (label, site, parent)
-    ("truth_int",                 "residual_call", "-"),
-    ("truth_bool",                "residual_call", "-"),
-    ("unary_positive_int",        "residual_call", "-"),
-    ("unary_negative_int",        "residual_call", "-"),
-    ("unary_invert_int",          "residual_call", "-"),
-    ("store_subscr",              "residual_call", "-"),
-    ("setslice",                  "residual_call", "-"),
-    ("get_iter",                  "residual_call", "-"),
-    ("for_iter_next",             "residual_call", "-"),
-    ("make_function",             "residual_call", "-"),
-    ("set_function_attribute",    "residual_call", "-"),
-    ("newtuple",                  "residual_call", "-"),
-    ("newtuple_object",           "residual_call", "-"),
-    ("newlist",                   "residual_call", "-"),
-    ("builtin_len",               "residual_call", "-"),
-    ("builtin_dict_get",          "residual_call", "-"),
-    ("builtin_type_getattr",      "residual_call", "-"),
-    ("builtin_getattr",           "residual_call", "-"),
-    ("builtin_range",             "residual_call", "-"),
-    ("builtin_zip",               "residual_call", "-"),
-    ("builtin_locals",            "residual_call", "-"),
-    ("sys_getframe",              "residual_call", "-"),
-    ("math_sqrt",                 "residual_call", "-"),
-    ("math_log_trig",             "residual_call", "-"),
-    ("math_frexp",                "residual_call", "-"),
-    ("math_ldexp",                "residual_call", "-"),
-    ("math_isqrt",                "residual_call", "-"),
-    ("math_fabs",                 "residual_call", "-"),
-    ("math_float1",               "residual_call", "-"),
-    ("math_float2",               "residual_call", "-"),
-    ("math_isclose",              "residual_call", "-"),
-    ("builtin_fold1",             "residual_call", "-"),
-    ("builtin_fold2",             "residual_call", "-"),
-    ("math_floor",                "residual_call", "-"),
-    ("math_ceil",                 "residual_call", "-"),
-    ("math_trunc",                "residual_call", "-"),
-    ("int_call",                  "residual_call", "-"),
-    ("float_call",                "residual_call", "-"),
-    ("str_call",                  "residual_call", "-"),
-    ("builtin_divmod",            "residual_call", "-"),
-    ("set_add_method",            "residual_call", "-"),
-    ("store_attr_direct",         "residual_call", "-"),
-    ("store_attr_residual",       "residual_call", "store_attr_direct"),
-    ("load_attr",                 "residual_call", "-"),
-    ("load_type_name_attr",       "residual_call", "-"),
-    ("load_type_attr",            "residual_call", "-"),
-    ("load_method_attr",          "residual_call", "-"),
-    ("load_classmethod_attr",     "residual_call", "-"),
-    ("load_bound_method_attr",    "residual_call", "-"),
-    ("subscr",                    "residual_call", "-"),
-    ("binary_op_int",             "residual_call", "-"),
-    ("binary_op_long_int",        "residual_call", "-"),
-    ("binary_op_long_int_shift",  "residual_call", "-"),
-    ("binary_op_long_int_div",    "residual_call", "-"),
-    ("binary_op_long_int_pow",    "residual_call", "-"),
-    ("binary_op_long",            "residual_call", "-"),
-    ("truediv_op_long",           "residual_call", "-"),
-    ("binary_op_float",           "residual_call", "-"),
-    ("compare_op_int",            "residual_call", "-"),
-    ("compare_op_long_int",       "residual_call", "-"),
-    ("compare_op_long",           "residual_call", "-"),
-    ("compare_op_float",          "residual_call", "-"),
-    ("unpack",                    "residual_call", "-"),
-    ("subscr_tuple_descent",      "specialize",    "subscr"),
-    ("subscr_tuple",              "specialize",    "subscr"),
-    ("subscr_str",                "specialize",    "subscr"),
-    ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
-    ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
-    ("instance_next",             "residual_call", "-"),
-    ("frame_lasti",               "specialize",    "load_attr"),
-    ("load_deref",                "residual_call", "-"),
-    ("frame_lineno",              "specialize",    "load_attr"),
-    ("bare_super_call",           "residual_call", "-"),
-];
+spec_folds! {
+    // variant                    label                       site             parent
+    TruthInt             => ("truth_int",                "residual_call", "-"),
+    TruthBool            => ("truth_bool",               "residual_call", "-"),
+    UnaryPositiveInt     => ("unary_positive_int",       "residual_call", "-"),
+    UnaryNegativeInt     => ("unary_negative_int",       "residual_call", "-"),
+    UnaryInvertInt       => ("unary_invert_int",         "residual_call", "-"),
+    StoreSubscr          => ("store_subscr",             "residual_call", "-"),
+    Setslice             => ("setslice",                 "residual_call", "-"),
+    GetIter              => ("get_iter",                 "residual_call", "-"),
+    ForIterNext          => ("for_iter_next",            "residual_call", "-"),
+    MakeFunction         => ("make_function",            "residual_call", "-"),
+    SetFunctionAttribute => ("set_function_attribute",   "residual_call", "-"),
+    Newtuple             => ("newtuple",                 "residual_call", "-"),
+    NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
+    Newlist              => ("newlist",                  "residual_call", "-"),
+    BuiltinLen           => ("builtin_len",              "residual_call", "-"),
+    BuiltinDictGet       => ("builtin_dict_get",         "residual_call", "-"),
+    BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
+    BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
+    BuiltinRange         => ("builtin_range",            "residual_call", "-"),
+    BuiltinZip           => ("builtin_zip",              "residual_call", "-"),
+    BuiltinLocals        => ("builtin_locals",           "residual_call", "-"),
+    SysGetframe          => ("sys_getframe",             "residual_call", "-"),
+    MathSqrt             => ("math_sqrt",                "residual_call", "-"),
+    MathLogTrig          => ("math_log_trig",            "residual_call", "-"),
+    MathFrexp            => ("math_frexp",               "residual_call", "-"),
+    MathLdexp            => ("math_ldexp",               "residual_call", "-"),
+    MathIsqrt            => ("math_isqrt",               "residual_call", "-"),
+    MathFabs             => ("math_fabs",                "residual_call", "-"),
+    MathFloat1           => ("math_float1",              "residual_call", "-"),
+    MathFloat2           => ("math_float2",              "residual_call", "-"),
+    MathIsclose          => ("math_isclose",             "residual_call", "-"),
+    BuiltinFold1         => ("builtin_fold1",            "residual_call", "-"),
+    BuiltinFold2         => ("builtin_fold2",            "residual_call", "-"),
+    MathFloor            => ("math_floor",               "residual_call", "-"),
+    MathCeil             => ("math_ceil",                "residual_call", "-"),
+    MathTrunc            => ("math_trunc",               "residual_call", "-"),
+    IntCall              => ("int_call",                 "residual_call", "-"),
+    FloatCall            => ("float_call",               "residual_call", "-"),
+    StrCall              => ("str_call",                 "residual_call", "-"),
+    BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
+    SetAddMethod         => ("set_add_method",           "residual_call", "-"),
+    StoreAttrDirect      => ("store_attr_direct",        "residual_call", "-"),
+    StoreAttrResidual    => ("store_attr_residual",      "residual_call", "store_attr_direct"),
+    LoadAttr             => ("load_attr",                "residual_call", "-"),
+    LoadTypeNameAttr     => ("load_type_name_attr",      "residual_call", "-"),
+    LoadTypeAttr         => ("load_type_attr",           "residual_call", "-"),
+    LoadMethodAttr       => ("load_method_attr",         "residual_call", "-"),
+    LoadClassmethodAttr  => ("load_classmethod_attr",    "residual_call", "-"),
+    LoadBoundMethodAttr  => ("load_bound_method_attr",   "residual_call", "-"),
+    Subscr               => ("subscr",                   "residual_call", "-"),
+    BinaryOpInt          => ("binary_op_int",            "residual_call", "-"),
+    BinaryOpLongInt      => ("binary_op_long_int",       "residual_call", "-"),
+    BinaryOpLongIntShift => ("binary_op_long_int_shift", "residual_call", "-"),
+    BinaryOpLongIntDiv   => ("binary_op_long_int_div",   "residual_call", "-"),
+    BinaryOpLongIntPow   => ("binary_op_long_int_pow",   "residual_call", "-"),
+    BinaryOpLong         => ("binary_op_long",           "residual_call", "-"),
+    TruedivOpLong        => ("truediv_op_long",          "residual_call", "-"),
+    BinaryOpFloat        => ("binary_op_float",          "residual_call", "-"),
+    CompareOpInt         => ("compare_op_int",           "residual_call", "-"),
+    CompareOpLongInt     => ("compare_op_long_int",      "residual_call", "-"),
+    CompareOpLong        => ("compare_op_long",          "residual_call", "-"),
+    CompareOpFloat       => ("compare_op_float",         "residual_call", "-"),
+    Unpack               => ("unpack",                   "residual_call", "-"),
+    SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
+    SubscrTuple          => ("subscr_tuple",             "specialize",    "subscr"),
+    SubscrStr            => ("subscr_str",               "specialize",    "subscr"),
+    BuiltinDivmodLongInt => ("builtin_divmod_long_int",  "specialize",    "builtin_divmod"),
+    ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
+    InstanceNext         => ("instance_next",            "residual_call", "-"),
+    FrameLasti           => ("frame_lasti",              "specialize",    "load_attr"),
+    LoadDeref            => ("load_deref",               "residual_call", "-"),
+    FrameLineno          => ("frame_lineno",             "specialize",    "load_attr"),
+    BareSuperCall        => ("bare_super_call",          "residual_call", "-"),
+}
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
 
@@ -402,10 +433,6 @@ static SPEC_SUPPRESSED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [Z; SPEC_FOLD_COUNT]
 };
-/// A label passed to a gate that `SPEC_FOLD_ROWS` does not carry.  A nonzero
-/// value means a typo at a call site; the summary reports it rather than
-/// silently dropping the row.
-static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED: std::sync::atomic::AtomicU64 =
@@ -624,7 +651,7 @@ fn spec_row_index(name: &str) -> Option<usize> {
 /// it is counted as consulted and never as fired.
 #[inline]
 pub(crate) fn spec_gate<T, E>(
-    name: &'static str,
+    fold: SpecFold,
     call: impl FnOnce() -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
     // Neither axis armed: one cached load, one predictable branch, then the
@@ -632,10 +659,7 @@ pub(crate) fn spec_gate<T, E>(
     if !spec_instrumented() {
         return call();
     }
-    let Some(idx) = spec_row_index(name) else {
-        SPEC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return call();
-    };
+    let idx = fold.index();
     if spec_suppressed_mask().get(idx) {
         SPEC_SUPPRESSED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(None);
@@ -667,13 +691,10 @@ pub(super) fn spec_gate_store_attr<E>(
     if !spec_instrumented() {
         return call();
     }
-    let (Some(direct_idx), Some(residual_idx)) = (
-        spec_row_index("store_attr_direct"),
-        spec_row_index("store_attr_residual"),
-    ) else {
-        SPEC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return call();
-    };
+    let (direct_idx, residual_idx) = (
+        SpecFold::StoreAttrDirect.index(),
+        SpecFold::StoreAttrResidual.index(),
+    );
     let mask = spec_suppressed_mask();
     if mask.get(direct_idx) || mask.get(residual_idx) {
         SPEC_SUPPRESSED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -742,9 +763,8 @@ pub fn spec_census_summary() -> String {
         spec_suppress_unknown().join(",")
     };
     let mut summary = format!(
-        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} unknown_labels={} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown}\n",
+        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown}\n",
         rows.len(),
-        SPEC_UNKNOWN.load(ordering),
     );
     summary.push_str(&format!(
         "[spec-census] instance_next_foriter route_guards_keyed={} callee_guards_captured={} callee_guards_keyed={}\n",
