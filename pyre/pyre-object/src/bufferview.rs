@@ -28,6 +28,10 @@ fn copy_base(full: &[u8], base: i64, isz: usize, out: &mut Vec<u8>) {
 /// `_copy_rec` — recursive C-order copy of dimension `idim`.  The innermost
 /// dimension walks `shape[ndim-1]` elements by `strides[ndim-1]`; an outer
 /// dimension recurses `shape[idim]` times, advancing `off` by `strides[idim]`.
+///
+/// A stride of zero addresses the same element at every index of that
+/// dimension, so it is copied `shape[idim]` times rather than skipped:
+/// `_copy_base` stops early only because `range(off, off, 0)` is not a walk.
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -45,9 +49,6 @@ fn copy_rec(
     let dimshape = shape.get(idim as usize).copied().unwrap_or(0);
     let dimstride = strides.get(idim as usize).copied().unwrap_or(0);
     if idim == ndim - 1 {
-        if dimstride == 0 {
-            return;
-        }
         for _ in 0..dimshape {
             copy_base(full, off, isz, out);
             off += dimstride;
@@ -75,9 +76,6 @@ fn copy_rec_fortran(
     let dimshape = shape.get(idim as usize).copied().unwrap_or(0);
     let dimstride = strides.get(idim as usize).copied().unwrap_or(0);
     if idim == 0 {
-        if dimstride == 0 {
-            return;
-        }
         for _ in 0..dimshape {
             copy_base(full, off, isz, out);
             off += dimstride;
@@ -908,6 +906,15 @@ mod tests {
         assert_eq!(addressable_window(&[0, 3], &[12, 4], 4), (0, 0));
         // A zero-dimensional export still addresses its one element.
         assert_eq!(addressable_window(&[], &[], 8), (0, 8));
+    }
+
+    #[test]
+    fn cbuffer_backing_stays_the_external_export() {
+        // `release_view` ends a foreign export only for a view whose backing
+        // is the `External` block the export handed over; a variant that
+        // stopped answering with one would silently never be released.
+        let view = cbuffer(vec![2, 3], vec![12, 4], 4, 0);
+        assert!(matches!(view.backing(), Buffer::External { .. }));
     }
 
     #[test]
