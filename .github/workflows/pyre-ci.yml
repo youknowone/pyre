@@ -595,8 +595,9 @@ jobs:
     # the work.
     timeout-minutes: 90
     strategy: &pyre-check-backends
-      # Linux runs one job per backend; macOS and Windows run both backends in
-      # one job. `check.py` builds each backend's release binary itself, and
+      # Linux runs one job per backend and macOS runs both backends in one job;
+      # Windows runs dynasm alone. `check.py` builds each backend's release
+      # binary itself, and
       # splitting the two builds across jobs only pays off where the second
       # build is cheap. Runner-seconds spent on check.py, one backend per job
       # (run 32657938846) against both in one (run 32647581403):
@@ -907,15 +908,17 @@ jobs:
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     strategy:
-      # Both backends in one job rather than one job each: see the runner-second
-      # measurements on `&pyre-check-backends`. The single entry keeps
-      # `matrix.backend` / `matrix.label` / `matrix.only` defined for the shared
-      # steps, and the steps that name one backend are gated on Linux anyway.
+      # dynasm alone here. cranelift keeps its own ubuntu leg and rides the
+      # collapsed macOS job, so what this drops is cranelift on a Windows host,
+      # and what it saves is this job's second release build. The single entry
+      # keeps `matrix.backend` / `matrix.label` / `matrix.only` defined for the
+      # shared steps, and the steps that name one backend are gated on Linux
+      # anyway.
       matrix:
         include:
-        - backend: dynasm,cranelift
-          label: dynasm+cranelift
-          only: ""
+        - backend: dynasm
+          label: dynasm
+          only: --dynasm-only
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
