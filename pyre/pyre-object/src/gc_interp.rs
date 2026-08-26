@@ -200,13 +200,24 @@ pub fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let value = std::env::var_os("PYRE_GC_INTERP");
-            let on = enabled_from_env(value.as_deref());
-            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        _ => init_state(&STATE, "PYRE_GC_INTERP"),
     }
+}
+
+/// First-touch half of [`enabled`] and [`collect_enabled`], out of line.
+///
+/// `env::var_os` allocates and unwinds, so leaving it inlined puts its frame
+/// on whoever inlines the switch — and that is [`safepoint`], which the
+/// dispatch loop calls on every bytecode.  Cold and never inlined, the switch
+/// itself is an atomic load and a branch, which is all upstream's equivalent
+/// gate is (`bytecode_trace` reads a field of the prebuilt `ActionFlag`).
+#[cold]
+#[inline(never)]
+fn init_state(state: &AtomicU8, var: &str) -> bool {
+    let value = std::env::var_os(var);
+    let on = enabled_from_env(value.as_deref());
+    state.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
 }
 
 /// Pure half of [`enabled`] and [`collect_enabled`], kept separate so the
@@ -375,12 +386,7 @@ pub fn collect_enabled() -> bool {
     match COLLECT_STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let value = std::env::var_os("PYRE_GC_INTERP_COLLECT");
-            let on = enabled_from_env(value.as_deref());
-            COLLECT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        _ => init_state(&COLLECT_STATE, "PYRE_GC_INTERP_COLLECT"),
     }
 }
 
