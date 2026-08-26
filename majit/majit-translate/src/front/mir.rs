@@ -3058,6 +3058,17 @@ struct Lowering<'a> {
     /// `local_var` by local and only falls back to the recorded
     /// Variable for a base/index without a backing local (a constant).
     index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
+    /// MIR locals bound by `_i = &place` where `place` is a
+    /// `core::sync::atomic` slot, mapped to that borrowed place.
+    ///
+    /// `<Atomic*>::store(&self, v, ord)` is a call, so the write target
+    /// survives only as the receiver operand; the load fold gets away with
+    /// aliasing the receiver Variable because a read needs no place, but a
+    /// write does.  Recorded last-write-wins like
+    /// [`Lowering::positional_aggregate_locals`], so a rebound local never
+    /// carries a stale place, and keyed on the referent being an atomic so a
+    /// body's ordinary borrows never enter the map.
+    atomic_ref_place: std::collections::HashMap<usize, Place>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -3369,6 +3380,7 @@ impl<'a> Lowering<'a> {
             binop_result_locals: compute_binop_result_locals(body),
             builder_mode: false,
             index_elem_alias: std::collections::HashMap::new(),
+            atomic_ref_place: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
@@ -4217,6 +4229,18 @@ impl<'a> Lowering<'a> {
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
+                // `_i = &atomic_slot` — remember the referent so a later
+                // `<Atomic*>::store` through this local can write to the
+                // place rather than to the value it resolved to.  Read
+                // before `build_rvalue` consumes the rvalue.
+                match atomic_ref_referent(&rvalue, self.llbc) {
+                    Some(place) => {
+                        self.atomic_ref_place.insert(i as usize, place);
+                    }
+                    None => {
+                        self.atomic_ref_place.remove(&(i as usize));
+                    }
+                }
                 // Capture the construction `owner_root` if this binding
                 // is a positional aggregate, before `build_rvalue`
                 // consumes the rvalue, so `.N` reads of the local can
@@ -8029,6 +8053,50 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `<Atomic*>::store(&self, value, ordering)` — the write twin
+                // of the load fold above.  A read needs no place, so the load
+                // gets away with aliasing the receiver Variable; a write does,
+                // so recover the borrowed slot from the `&self` operand
+                // ([`Lowering::atomic_ref_place`]) and emit the same
+                // `FieldWrite` a plain `slot = value` assignment would.  The
+                // ordering arg is discarded, as it is on the load: the traced
+                // model has no fences at all — every field write in a walked
+                // body is already an unordered store — so a body that needed
+                // an acquire or a release could not be expressed here whether
+                // this arm fired or not.  Relaxed, the only ordering pyre
+                // writes, IS this store exactly.
+                if args.len() == 3 && self.is_atomic_store(&reg) {
+                    // A receiver this body did not bind as a borrow of a
+                    // field — or one borrowing a whole local rather than a
+                    // field of one — leaves no place to write to.  Fall
+                    // through to the ordinary call path, which is what an
+                    // unrecognised `store` already lowers to, rather than
+                    // inventing a target or failing a graph that compiles
+                    // today.
+                    let referent = arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .and_then(|l| self.atomic_ref_place.remove(&l));
+                    if let Some(referent) = referent {
+                        let field_ty = clone_tyref(&referent.ty);
+                        if let PlaceKind::Projection(inner, elem) = referent.kind {
+                            let value = LinkArg::Value(args[1].clone());
+                            self.emit_projection_write(mir_bb, *inner, elem, value, &field_ty)?;
+                            // `store` returns `()`; the destination binds a
+                            // Void the same way the stringbuilder-append
+                            // marker above does.
+                            self.local_var[dest_local] = Some(
+                                self.graph
+                                    .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                            );
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                    }
+                }
                 // `(block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET)` inside
                 // an `ItemsBlock` items-base accessor — the interior items
                 // pointer the runtime reads through a `base_size`-bearing
@@ -10534,6 +10602,21 @@ impl<'a> Lowering<'a> {
     /// excludes unrelated inherent `load` methods, and the method name
     /// never reaches the rtyper as a `ptr.getattr`.
     fn is_atomic_load(&self, reg: &RegularCall) -> bool {
+        self.is_atomic_method(reg, "load")
+    }
+
+    /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
+    /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
+    /// layout-transparent atomic is the same machine store a plain field
+    /// write emits, so `lower_call` lowers it to the same `FieldWrite`.
+    fn is_atomic_store(&self, reg: &RegularCall) -> bool {
+        self.is_atomic_method(reg, "store")
+    }
+
+    /// `<core::sync::atomic::Atomic*>::<method>(&self, ..)` — an inherent
+    /// method of a std atomic, keyed on the receiver's type so a user type
+    /// with a `load` / `store` method of its own does not match.
+    fn is_atomic_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -10541,7 +10624,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let name = fd.item_meta.name_path();
-        if name.rsplit("::").next() != Some("load") {
+        if name.rsplit("::").next() != Some(method) {
             return false;
         }
         fd.signature.inputs.first().is_some_and(|t| {
@@ -16489,6 +16572,45 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
 /// [`Lowering::resolve_adt_field`] when handing the resolved field's
 /// type to [`tyref_to_value_type`].
+/// The borrowed place behind `_i = &place` / `&raw place`, cloned out of the
+/// rvalue, when `place` names a `core::sync::atomic` slot.  Nothing else is
+/// recorded: the only consumer is [`Lowering::is_atomic_store`]'s write
+/// target.
+fn atomic_ref_referent(rvalue: &Rvalue, llbc: &Llbc) -> Option<Place> {
+    let place = match rvalue {
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
+        _ => return None,
+    };
+    tyref_atomic_inner_value_type(&place.ty, llbc)?;
+    Some(clone_place(place))
+}
+
+/// Charon's `Place` carries a `TyRef`, which is not `Clone` (see
+/// [`clone_tyref`]); this is the same by-hand deep copy for a whole place.
+fn clone_place(p: &Place) -> Place {
+    Place {
+        kind: match &p.kind {
+            PlaceKind::Local(i) => PlaceKind::Local(*i),
+            PlaceKind::Projection(inner, elem) => {
+                PlaceKind::Projection(Box::new(clone_place(inner)), clone_projection_elem(elem))
+            }
+            PlaceKind::Global { generics, id } => PlaceKind::Global {
+                generics: generics.clone(),
+                id: *id,
+            },
+            PlaceKind::Unknown => PlaceKind::Unknown,
+        },
+        ty: clone_tyref(&p.ty),
+    }
+}
+
+fn clone_projection_elem(e: &ProjectionElem) -> ProjectionElem {
+    match e {
+        ProjectionElem::Atom(s) => ProjectionElem::Atom(s.clone()),
+        ProjectionElem::Tagged(v) => ProjectionElem::Tagged(v.clone()),
+    }
+}
+
 fn clone_tyref(ty: &TyRef) -> TyRef {
     match ty {
         TyRef::Dedup { id } => TyRef::Dedup { id: *id },
