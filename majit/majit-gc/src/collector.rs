@@ -5828,15 +5828,101 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:1316-1319 debug invariant.
+    /// incminimark.py `debug_check_consistency`.
+    ///
+    /// Self-gated on the debug level rather than gated at its call sites, as
+    /// upstream is: the body opens with `if self.DEBUG:`, so a run that did
+    /// not ask for the checks pays one load and the checks are real
+    /// assertions rather than `debug_assert!`s that a release build drops.
+    /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
+    /// asking to be aborted on a broken invariant.
     fn debug_check_consistency(&self) {
+        if self.config.debug == 0 {
+            return;
+        }
+        assert!(
+            self.oldgen.young_rawmalloced_is_empty(),
+            "young raw-malloced objects in a major collection"
+        );
+        assert!(
+            self.young_objects_with_weakrefs.is_empty(),
+            "young objects with weakrefs in a major collection"
+        );
         if self.oldgen.rawmalloc_sweep_pending() {
-            debug_assert_eq!(
+            assert_eq!(
                 self.gc_state,
                 GcState::Sweeping,
                 "raw_malloc_might_sweep must be empty outside SWEEPING"
             );
         }
+        self.debug_check_reachable();
+    }
+
+    /// gc/base.py `debug_check_consistency`'s heap half — enumerate every root
+    /// and trace the whole reachable graph, checking each object once.
+    ///
+    /// Upstream keeps its seen set and pending stack as GC-side `AddressDict` /
+    /// `AddressStack` because it has no other allocator; here they are ordinary
+    /// Rust containers, which is the same structure without the bookkeeping.
+    fn debug_check_reachable(&self) {
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let record =
+            |addr: usize, seen: &mut std::collections::HashSet<usize>, pending: &mut Vec<usize>| {
+                if seen.insert(addr) {
+                    self.debug_check_object(addr);
+                    pending.push(addr);
+                }
+            };
+        for root in self.enumerate_root_walker_values() {
+            if !root.is_null() {
+                record(root.0, &mut seen, &mut pending);
+            }
+        }
+        while let Some(obj_addr) = pending.pop() {
+            let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+            if (type_id as usize) >= self.types.len() {
+                continue;
+            }
+            let mut children: Vec<usize> = Vec::new();
+            unsafe {
+                self.types.get(type_id).for_each_gc_ptr(obj_addr, |slot| {
+                    let child = *slot;
+                    if !child.is_null() {
+                        children.push(child.0);
+                    }
+                });
+            }
+            for child in children {
+                record(child, &mut seen, &mut pending);
+            }
+        }
+    }
+
+    /// incminimark.py `debug_check_object`: after a collection nothing is left
+    /// in the nursery but the pinned objects, and neither of the two flags the
+    /// collection itself uses may survive it.
+    fn debug_check_object(&self, obj_addr: usize) {
+        let hdr = unsafe { &*header_of(obj_addr) };
+        if self.is_pinned(GcRef(obj_addr)) {
+            assert!(
+                self.is_in_nursery(obj_addr),
+                "pinned object not in nursery at {obj_addr:#x}"
+            );
+            return;
+        }
+        assert!(
+            !self.is_in_nursery(obj_addr),
+            "object in nursery after collection at {obj_addr:#x}"
+        );
+        assert!(
+            !hdr.has_flag(flags::VISITED_RMY),
+            "GCFLAG_VISITED_RMY after collection at {obj_addr:#x}"
+        );
+        assert!(
+            !hdr.has_flag(flags::PINNED),
+            "GCFLAG_PINNED outside the nursery after collection at {obj_addr:#x}"
+        );
     }
 
     /// Perform one incremental marking step.
@@ -11754,11 +11840,82 @@ mod tests {
         gc.roots.clear();
     }
 
+    /// A GC armed for the debug checks, with the rotation ring the level also
+    /// installs.
+    fn debug_gc(nursery_size: usize) -> MiniMarkGC {
+        MiniMarkGC::with_config(GcConfig {
+            nursery_size,
+            large_object_threshold: nursery_size / 2,
+            debug: 1,
+            ..GcConfig::default()
+        })
+    }
+
+    /// The heap half of the check reaches an object through the root walk, so
+    /// a flag the collection should have cleared is caught on the object
+    /// rather than only on the collector's own lists.
+    ///
+    /// This is what makes the walk non-vacuous: without it a root enumeration
+    /// that returned nothing would pass every run.
     #[test]
-    #[cfg(debug_assertions)]
+    #[should_panic(expected = "GCFLAG_VISITED_RMY after collection")]
+    fn the_debug_walk_reaches_a_promoted_object() {
+        let mut gc = debug_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root.0), "the object promoted");
+
+        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        gc.debug_check_consistency();
+    }
+
+    /// The same walk over a heap nothing has broken reports nothing, so the
+    /// test above is failing on the flag rather than on the walk itself.
+    #[test]
+    fn the_debug_walk_passes_a_clean_heap() {
+        let mut gc = debug_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// Without the level the body returns before the first assertion, so the
+    /// same broken flag goes unreported.
+    #[test]
+    fn the_debug_checks_are_off_without_the_level() {
+        let mut gc = test_gc(4096);
+        assert_eq!(gc.config.debug, 0);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+
+        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        gc.debug_check_consistency();
+        unsafe { (*header_of(root.0)).clear_flag(flags::VISITED_RMY) };
+        gc.roots.clear();
+    }
+
+    /// No `#[cfg(debug_assertions)]`: `debug_check_consistency` self-gates on
+    /// the debug level and asserts for real, so the check survives a release
+    /// build — which is what makes `PYPY_GC_DEBUG` worth setting there.
+    #[test]
     #[should_panic(expected = "raw_malloc_might_sweep must be empty outside SWEEPING")]
     fn rawmalloc_sweep_candidates_require_sweeping_state() {
-        let mut gc = test_gc(4096);
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            debug: 1,
+            ..GcConfig::default()
+        });
         let tid = gc.register_type(TypeInfo::simple(16));
         let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
         gc.alloc_in_oldgen_clear(tid, raw_size);
