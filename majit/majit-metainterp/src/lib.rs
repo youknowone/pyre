@@ -201,15 +201,15 @@ pub use jitdriver::{
 // The warm-entry stage probe, which an embedder drives from its own harness —
 // the split has to be read through the frontend's own door, so the counts are
 // set from outside and the door is left the shipping one.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_stage_repeats};
 // The compiled-run split, which reaches one crate further down than the rest of
 // this probe: the frame build it prices is the backend's, so the count for that
 // one arm is set through `majit_backend` and only its loop is in the backend.
 pub use majit_backend::CompiledTraceInfo;
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub use majit_backend::deadframe::{frame_build_passes, set_frame_build_repeats};
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub use pyjitpl::{
     ExecuteStageRepeats, call_shot_totals, execute_stage_clock_floor_ns, execute_stage_passes,
     reset_call_shot_totals, set_execute_stage_repeats,

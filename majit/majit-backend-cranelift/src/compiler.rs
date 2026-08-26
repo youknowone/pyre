@@ -8160,7 +8160,7 @@ fn run_compiled_code_inner(
     // that no root names, which is a different question and an unsafe way to
     // ask it. Each pass drops its frame before the next, so the pool cycles one
     // buffer and the loop prices a build rather than a pool miss.
-    #[cfg(feature = "execute-stage-probe")]
+    #[cfg(feature = "__execute-stage-probe")]
     if !use_gc_alloc {
         let repeats = majit_backend::deadframe::frame_build_repeats();
         majit_backend::deadframe::count_frame_build_passes(repeats);

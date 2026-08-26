@@ -12,7 +12,7 @@ description = "Cranelift code generation backend for majit JIT compiler"
 # argument writes into a frame nothing enters, so the repeatable PREFIX of a
 # compiled entry's call can be priced against the call it prefixes. Off by
 # default; the count it reads lives in `majit_backend::deadframe`.
-execute-stage-probe = []
+__execute-stage-probe = []
 
 [dependencies]
 indexmap = { workspace = true }

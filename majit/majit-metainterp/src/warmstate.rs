@@ -1505,7 +1505,7 @@ impl WarmEnterState {
     /// invalidated token still upgrades, so this returns `true` where the door
     /// would decide `false`. That is why it is a cost probe and never a
     /// decision -- nothing may route on it.
-    #[cfg(feature = "yield-stage-probe")]
+    #[cfg(feature = "__yield-stage-probe")]
     pub fn probe_cell_token_upgrades(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
             .and_then(|cell| cell.loop_token.as_ref())

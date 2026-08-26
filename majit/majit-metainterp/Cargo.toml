@@ -18,13 +18,13 @@ jit-audits = ["majit-ir/jit-audits"]
 # and a build without it has neither the loops nor the atomic load that
 # selects them. See `jitdriver::BackEdgeStageRepeats`, which also says which
 # stages CANNOT be amplified and are therefore left in the residual.
-back-edge-stage-probe = []
+__back-edge-stage-probe = []
 # The second half of the same split, and never a shipping feature either. It
 # amplifies the two repeatable stages of `execute_assembler_at_dispatch_key`
 # and clocks the one that cannot repeat, and forwards to the cranelift arm
 # that repeats the frame build. See `pyjitpl::ExecuteStageRepeats`, which
 # says which numbers are amplified and which is single-shot.
-execute-stage-probe = ["majit-backend-cranelift?/execute-stage-probe"]
+__execute-stage-probe = ["majit-backend-cranelift?/__execute-stage-probe"]
 # The third of the same family, for the sibling-door yield scan an embedder
 # runs ahead of a warm entry. That scan's predicate is a conjunction over three
 # state sources, and the public API fuses two of them: `has_compiled_loop` is
@@ -33,7 +33,7 @@ execute-stage-probe = ["majit-backend-cranelift?/execute-stage-probe"]
 # adds the one reader that separates them -- the cell lookup and the upgrade
 # with NO flag read after it -- so an amplified arm can price the refcount pair
 # on its own. See `WarmState::probe_cell_token_upgrades`.
-yield-stage-probe = []
+__yield-stage-probe = []
 
 [dependencies]
 majit-ir = { workspace = true }

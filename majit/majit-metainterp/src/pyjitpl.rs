@@ -200,7 +200,7 @@ fn guardlog_enabled() -> bool {
 /// that call and are amplified on the backend's side of the boundary instead —
 /// `majit_backend::deadframe::set_frame_build_repeats`, whose loop lives in
 /// `run_compiled_code_inner`, because that is where the frame is.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ExecuteStageRepeats {
     /// Extra `compiled_loops` probes and meta clones, plus
@@ -218,7 +218,7 @@ pub struct ExecuteStageRepeats {
     pub call_shot: u16,
 }
 
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 impl ExecuteStageRepeats {
     fn pack(self) -> u64 {
         (self.prologue as u64)
@@ -240,34 +240,62 @@ impl ExecuteStageRepeats {
 /// Four counts packed into one word, so the compiled-run path takes exactly ONE
 /// relaxed load that every arm pays and which therefore cancels out of the
 /// difference between two of them.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 static EXECUTE_STAGE_REPEATS: AtomicU64 = AtomicU64::new(0);
 
-/// Amplified passes actually performed, `[prologue, decode, barrier]`.
-#[cfg(feature = "execute-stage-probe")]
-static EXECUTE_STAGE_PASSES: [AtomicU64; 3] =
+/// A stage of the compiled run that the probe can amplify.
+///
+/// The variants are the field order of [`ExecuteStageRepeats`], and each one's
+/// discriminant is its slot in [`EXECUTE_STAGE_PASSES`]. `Barrier` is the arm
+/// the other two are differenced against.
+#[cfg(feature = "__execute-stage-probe")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum ExecuteStage {
+    Prologue = 0,
+    Decode = 1,
+    Barrier = 2,
+}
+
+#[cfg(feature = "__execute-stage-probe")]
+impl ExecuteStage {
+    const COUNT: usize = 3;
+}
+
+/// Amplified passes actually performed, one slot per [`ExecuteStage`].
+#[cfg(feature = "__execute-stage-probe")]
+static EXECUTE_STAGE_PASSES: [AtomicU64; ExecuteStage::COUNT] =
     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Charge `repeats` amplified passes to `stage`, or nothing when it is off.
+#[cfg(feature = "__execute-stage-probe")]
+fn count_execute_stage_passes(stage: ExecuteStage, repeats: u16) {
+    if repeats != 0 {
+        EXECUTE_STAGE_PASSES[stage as usize].fetch_add(u64::from(repeats), Ordering::Relaxed);
+    }
+}
 
 /// Nanoseconds accumulated across single-shot readings of the compiled call,
 /// and how many readings that is.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 static CALL_SHOT_NS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 static CALL_SHOT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Set the repeat counts for subsequent compiled runs, answering what they were.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub fn set_execute_stage_repeats(repeats: ExecuteStageRepeats) -> ExecuteStageRepeats {
     ExecuteStageRepeats::unpack(EXECUTE_STAGE_REPEATS.swap(repeats.pack(), Ordering::Relaxed))
 }
 
-/// `[prologue, decode, barrier]` amplified passes since the process started.
-#[cfg(feature = "execute-stage-probe")]
-pub fn execute_stage_passes() -> [u64; 3] {
+/// `[prologue, decode, barrier]` amplified passes since the process started —
+/// [`ExecuteStage`] order, which is what the array is indexed by.
+#[cfg(feature = "__execute-stage-probe")]
+pub fn execute_stage_passes() -> [u64; ExecuteStage::COUNT] {
     [
-        EXECUTE_STAGE_PASSES[0].load(Ordering::Relaxed),
-        EXECUTE_STAGE_PASSES[1].load(Ordering::Relaxed),
-        EXECUTE_STAGE_PASSES[2].load(Ordering::Relaxed),
+        EXECUTE_STAGE_PASSES[ExecuteStage::Prologue as usize].load(Ordering::Relaxed),
+        EXECUTE_STAGE_PASSES[ExecuteStage::Decode as usize].load(Ordering::Relaxed),
+        EXECUTE_STAGE_PASSES[ExecuteStage::Barrier as usize].load(Ordering::Relaxed),
     ]
 }
 
@@ -275,7 +303,7 @@ pub fn execute_stage_passes() -> [u64; 3] {
 ///
 /// The mean is the call PLUS one clock pair's own cost; subtract
 /// [`execute_stage_clock_floor_ns`] to get the call.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub fn call_shot_totals() -> (u64, u64) {
     (
         CALL_SHOT_NS.load(Ordering::Relaxed),
@@ -285,7 +313,7 @@ pub fn call_shot_totals() -> (u64, u64) {
 
 /// Reset the single-shot accumulators, so a harness can bracket one measured
 /// window rather than reading the whole process's history.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub fn reset_call_shot_totals() {
     CALL_SHOT_NS.store(0, Ordering::Relaxed);
     CALL_SHOT_COUNT.store(0, Ordering::Relaxed);
@@ -299,7 +327,7 @@ pub fn reset_call_shot_totals() {
 /// the minimum rather than the mean: the pair cannot run faster than it is, so
 /// the smallest of many readings is the least contaminated one, and subtracting
 /// a mean inflated by scheduler noise would under-report the call.
-#[cfg(feature = "execute-stage-probe")]
+#[cfg(feature = "__execute-stage-probe")]
 pub fn execute_stage_clock_floor_ns() -> f64 {
     let mut best = u128::MAX;
     for _ in 0..4096 {
@@ -11235,15 +11263,12 @@ impl<M: Clone> MetaInterp<M> {
         // Read once per run, ahead of every stage, so no stage's difference
         // carries it. See [`ExecuteStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
-        #[cfg(feature = "execute-stage-probe")]
+        #[cfg(feature = "__execute-stage-probe")]
         let stage_repeats =
             ExecuteStageRepeats::unpack(EXECUTE_STAGE_REPEATS.load(Ordering::Relaxed));
-        #[cfg(feature = "execute-stage-probe")]
+        #[cfg(feature = "__execute-stage-probe")]
         {
-            if stage_repeats.prologue != 0 {
-                EXECUTE_STAGE_PASSES[0]
-                    .fetch_add(u64::from(stage_repeats.prologue), Ordering::Relaxed);
-            }
+            count_execute_stage_passes(ExecuteStage::Prologue, stage_repeats.prologue);
             for _ in 0..stage_repeats.prologue {
                 let repeat_meta = self.compiled_loops.get(&green_key).map(|c| c.meta.clone());
                 Self::prepare_compiled_run_io();
@@ -11252,10 +11277,7 @@ impl<M: Clone> MetaInterp<M> {
             // The same loop and the same barrier with no stage in them, so what
             // the amplification itself costs is subtracted rather than reported
             // as a stage.
-            if stage_repeats.barrier != 0 {
-                EXECUTE_STAGE_PASSES[2]
-                    .fetch_add(u64::from(stage_repeats.barrier), Ordering::Relaxed);
-            }
+            count_execute_stage_passes(ExecuteStage::Barrier, stage_repeats.barrier);
             for _ in 0..stage_repeats.barrier {
                 std::hint::black_box(&green_key);
             }
@@ -11267,14 +11289,14 @@ impl<M: Clone> MetaInterp<M> {
         // same branch shape; only the armed one pays the two clock reads, and
         // that cost stays inside the figure this accumulates rather than
         // leaking into the amplified stages above.
-        #[cfg(feature = "execute-stage-probe")]
+        #[cfg(feature = "__execute-stage-probe")]
         let call_started = (stage_repeats.call_shot != 0).then(std::time::Instant::now);
         let frame = self.backend.execute_token_with_dispatch_key(
             procedure_token,
             live_values,
             dispatch_key,
         );
-        #[cfg(feature = "execute-stage-probe")]
+        #[cfg(feature = "__execute-stage-probe")]
         if let Some(started) = call_started {
             CALL_SHOT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             CALL_SHOT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -11306,12 +11328,9 @@ impl<M: Clone> MetaInterp<M> {
         // and builds two fresh lists; it does not touch the frame, so it
         // repeats. Each pass drops what it built, which is the same drop the
         // shipping pass eventually pays for its own.
-        #[cfg(feature = "execute-stage-probe")]
+        #[cfg(feature = "__execute-stage-probe")]
         {
-            if stage_repeats.decode != 0 {
-                EXECUTE_STAGE_PASSES[1]
-                    .fetch_add(u64::from(stage_repeats.decode), Ordering::Relaxed);
-            }
+            count_execute_stage_passes(ExecuteStage::Decode, stage_repeats.decode);
             for _ in 0..stage_repeats.decode {
                 let repeat_descr = self.backend.get_latest_descr_arc(&frame);
                 let repeat_fail = repeat_descr
@@ -12250,7 +12269,7 @@ impl<M: Clone> MetaInterp<M> {
     /// [`Self::has_compiled_loop`] with both flag reads removed, for pricing
     /// the refcount pair alone. See `WarmState::probe_cell_token_upgrades` --
     /// a cost probe, never a decision.
-    #[cfg(feature = "yield-stage-probe")]
+    #[cfg(feature = "__yield-stage-probe")]
     pub fn probe_cell_token_upgrades(&self, green_key: u64) -> bool {
         self.warm_state.probe_cell_token_upgrades(green_key)
     }

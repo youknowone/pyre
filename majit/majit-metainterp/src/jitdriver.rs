@@ -574,7 +574,7 @@ fn portal_rca_enabled() -> bool {
 /// advanced, and would leave through a different exit. There is no honest
 /// repeatable form of it, so none is offered — the call is what the residual
 /// is, together with the handful of one-shot moves named on the fields below.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct BackEdgeStageRepeats {
     /// Extra gate consultations: `entry_procedure_token` (only for a caller
@@ -622,7 +622,7 @@ pub struct BackEdgeStageRepeats {
     pub barrier: u16,
 }
 
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 impl BackEdgeStageRepeats {
     fn pack(self) -> u64 {
         (self.gate as u64)
@@ -653,33 +653,44 @@ impl BackEdgeStageRepeats {
 /// between two of them. There is no unseeded state and no environment gate to
 /// seed one from: all-zero is the shipping shape, and
 /// [`set_back_edge_stage_repeats`] is the only way out of it.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 static BACK_EDGE_STAGE_REPEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Amplified passes actually executed, indexed by the constants below.
-#[cfg(feature = "back-edge-stage-probe")]
-static BACK_EDGE_STAGE_PASSES: [std::sync::atomic::AtomicU64; 4] = [
+/// A stage of the warm compiled entry that the probe can amplify.
+///
+/// The variants are the field order of [`BackEdgeStageRepeats`], and each one's
+/// discriminant is its slot in [`BACK_EDGE_STAGE_PASSES`]. `Barrier` is the arm
+/// the other three are differenced against.
+#[cfg(feature = "__back-edge-stage-probe")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum BackEdgeStage {
+    Gate = 0,
+    MarshalIn = 1,
+    MarshalOut = 2,
+    Barrier = 3,
+}
+
+#[cfg(feature = "__back-edge-stage-probe")]
+impl BackEdgeStage {
+    const COUNT: usize = 4;
+}
+
+/// Amplified passes actually executed, one slot per [`BackEdgeStage`].
+#[cfg(feature = "__back-edge-stage-probe")]
+static BACK_EDGE_STAGE_PASSES: [std::sync::atomic::AtomicU64; BackEdgeStage::COUNT] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-#[cfg(feature = "back-edge-stage-probe")]
-const BACK_EDGE_STAGE_GATE: usize = 0;
-#[cfg(feature = "back-edge-stage-probe")]
-const BACK_EDGE_STAGE_MARSHAL_IN: usize = 1;
-#[cfg(feature = "back-edge-stage-probe")]
-const BACK_EDGE_STAGE_MARSHAL_OUT: usize = 2;
-#[cfg(feature = "back-edge-stage-probe")]
-const BACK_EDGE_STAGE_BARRIER: usize = 3;
-
 /// Set the repeat counts for subsequent warm entries, answering what they were.
 ///
 /// A setter and not a wrapper around one entry: the entry's whole cost is read
 /// through the frontend's own door, so the stages have to be read through it
 /// too, or the parts and the whole are about different doors.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 pub fn set_back_edge_stage_repeats(repeats: BackEdgeStageRepeats) -> BackEdgeStageRepeats {
     BackEdgeStageRepeats::unpack(
         BACK_EDGE_STAGE_REPEATS.swap(repeats.pack(), std::sync::atomic::Ordering::Relaxed),
@@ -693,19 +704,21 @@ pub fn set_back_edge_stage_repeats(repeats: BackEdgeStageRepeats) -> BackEdgeSta
 /// The witness that an arm was REACHED. Two arms that ran the same code differ
 /// by nothing but the box, and a stage figure taken off such a pair describes
 /// the box; these counts are what tells the two cases apart without a clock.
-#[cfg(feature = "back-edge-stage-probe")]
-pub fn back_edge_stage_passes() -> [u64; 4] {
-    let read = |i: usize| BACK_EDGE_STAGE_PASSES[i].load(std::sync::atomic::Ordering::Relaxed);
+#[cfg(feature = "__back-edge-stage-probe")]
+pub fn back_edge_stage_passes() -> [u64; BackEdgeStage::COUNT] {
+    let read = |stage: BackEdgeStage| {
+        BACK_EDGE_STAGE_PASSES[stage as usize].load(std::sync::atomic::Ordering::Relaxed)
+    };
     [
-        read(BACK_EDGE_STAGE_GATE),
-        read(BACK_EDGE_STAGE_MARSHAL_IN),
-        read(BACK_EDGE_STAGE_MARSHAL_OUT),
-        read(BACK_EDGE_STAGE_BARRIER),
+        read(BackEdgeStage::Gate),
+        read(BackEdgeStage::MarshalIn),
+        read(BackEdgeStage::MarshalOut),
+        read(BackEdgeStage::Barrier),
     ]
 }
 
 /// One relaxed load per warm entry. Both arms pay it.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 #[inline]
 fn back_edge_stage_repeats() -> BackEdgeStageRepeats {
     BackEdgeStageRepeats::unpack(BACK_EDGE_STAGE_REPEATS.load(std::sync::atomic::Ordering::Relaxed))
@@ -716,11 +729,11 @@ fn back_edge_stage_repeats() -> BackEdgeStageRepeats {
 /// Once per call rather than once per pass, and the barrier arm pays it too, so
 /// the read-modify-write cancels out of every stage's difference instead of
 /// being amplified `k`-fold into it.
-#[cfg(feature = "back-edge-stage-probe")]
+#[cfg(feature = "__back-edge-stage-probe")]
 #[inline]
-fn count_back_edge_stage_passes(stage: usize, repeats: u16) {
+fn count_back_edge_stage_passes(stage: BackEdgeStage, repeats: u16) {
     if repeats != 0 {
-        BACK_EDGE_STAGE_PASSES[stage]
+        BACK_EDGE_STAGE_PASSES[stage as usize]
             .fetch_add(repeats as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -5261,11 +5274,11 @@ impl<S: JitState> JitDriver<S> {
         // Read once per entry, ahead of every stage, so no stage's difference
         // carries it. See [`BackEdgeStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
-        #[cfg(feature = "back-edge-stage-probe")]
+        #[cfg(feature = "__back-edge-stage-probe")]
         let stage_repeats = back_edge_stage_repeats();
         // Which shape the gate below takes, recorded before the token is moved
         // into it, so the amplified gate can take the same one.
-        #[cfg(feature = "back-edge-stage-probe")]
+        #[cfg(feature = "__back-edge-stage-probe")]
         let carried_token = carried_procedure_token.is_some();
         if let Some(procedure_token) =
             carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
@@ -5286,9 +5299,9 @@ impl<S: JitState> JitDriver<S> {
             // makes is repeated here in the same order and under the same
             // condition rather than being reordered into a shape the entry
             // never takes.
-            #[cfg(feature = "back-edge-stage-probe")]
+            #[cfg(feature = "__back-edge-stage-probe")]
             {
-                count_back_edge_stage_passes(BACK_EDGE_STAGE_GATE, stage_repeats.gate);
+                count_back_edge_stage_passes(BackEdgeStage::Gate, stage_repeats.gate);
                 for _ in 0..stage_repeats.gate {
                     let token = if carried_token {
                         None
@@ -5306,7 +5319,7 @@ impl<S: JitState> JitDriver<S> {
                 // The same loop and the same barrier with no stage in them, so
                 // what the amplification itself costs is subtracted rather than
                 // reported as a stage.
-                count_back_edge_stage_passes(BACK_EDGE_STAGE_BARRIER, stage_repeats.barrier);
+                count_back_edge_stage_passes(BackEdgeStage::Barrier, stage_repeats.barrier);
                 for _ in 0..stage_repeats.barrier {
                     std::hint::black_box(&mut *state);
                 }
@@ -5331,9 +5344,9 @@ impl<S: JitState> JitDriver<S> {
             // pass ENDS with the clears `take_entry_scratch` performs, so the
             // buffers the real extraction below fills are in exactly the state
             // it would have found them in, whatever any pass answered.
-            #[cfg(feature = "back-edge-stage-probe")]
+            #[cfg(feature = "__back-edge-stage-probe")]
             if !values_are_label_ordered {
-                count_back_edge_stage_passes(BACK_EDGE_STAGE_MARSHAL_IN, stage_repeats.marshal_in);
+                count_back_edge_stage_passes(BackEdgeStage::MarshalIn, stage_repeats.marshal_in);
                 for _ in 0..stage_repeats.marshal_in {
                     let synced = self.sync_before(state, &compiled_meta, vable);
                     state.extract_live_values_into(
@@ -5534,12 +5547,9 @@ impl<S: JitState> JitDriver<S> {
             // Stage E4, before the arm split, so it prices one pair of calls
             // rather than a different pair per outcome — and before the FINISH
             // arm takes the exit values out from under it.
-            #[cfg(feature = "back-edge-stage-probe")]
+            #[cfg(feature = "__back-edge-stage-probe")]
             if result.is_finish || result.fail_index == u32::MAX {
-                count_back_edge_stage_passes(
-                    BACK_EDGE_STAGE_MARSHAL_OUT,
-                    stage_repeats.marshal_out,
-                );
+                count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
                 for _ in 0..stage_repeats.marshal_out {
                     if !result.is_finish && !result.typed_values.is_empty() {
                         state.restore_values(&result.meta, &result.typed_values);
@@ -7361,7 +7371,7 @@ impl<S: JitState> JitDriver<S> {
     /// pair without them. A cost probe with a deliberately weaker answer than
     /// the door's -- see `WarmState::probe_cell_token_upgrades`. Nothing may
     /// route on it.
-    #[cfg(feature = "yield-stage-probe")]
+    #[cfg(feature = "__yield-stage-probe")]
     #[inline]
     pub fn probe_cell_token_upgrades(&self, green_key: u64) -> bool {
         self.meta.probe_cell_token_upgrades(green_key)
