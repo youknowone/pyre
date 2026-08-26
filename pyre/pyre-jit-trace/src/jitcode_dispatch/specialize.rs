@@ -10486,9 +10486,9 @@ enum MathFloatDomain {
     /// The helper reports every raising direction as a non-finite result, so
     /// the operand is unconstrained and the *result* is guarded instead: the
     /// guard deoptimizes into the builtin, which re-executes and raises or
-    /// returns the non-finite value itself.  A row spelled this way needs no
-    /// per-function domain knowledge, which is why adding a function to
-    /// `MATH_FLOAT1_FOLDS` is all it takes to cover it.
+    /// returns the non-finite value itself.  A row spelled this way carries no
+    /// per-function domain knowledge, so every `MATH_FLOAT1_FOLDS` entry
+    /// shares this one arm.
     ResultFinite,
 }
 
@@ -11221,7 +11221,13 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
 
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
 /// `ll_math_fabs` to a sign mask, so the whole builtin is one `FloatAbs` once
-/// the operand is unboxed, and `fabs` raises for no input.
+/// the operand is unboxed, and `fabs` raises for no input, which is why the
+/// row is [`MathFloatDomain::Total`].
+///
+/// `Total` only spares the row its operand guards.  The shared driver still
+/// screens the authentic result through `fold_finite_float_result`, so
+/// `fabs(inf)` and `fabs(nan)` decline at trace time and keep the residual
+/// even though the sign mask would answer them correctly.
 pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -11487,8 +11493,9 @@ fn walker_guard_float_result_finite<Sym: WalkSym>(
 }
 
 /// The one-argument rows of the `math` float fold: `interp_math`'s `pm1!`
-/// family, each standing for one raw helper in `MATH_FLOAT1_FOLDS`.  Adding a
-/// function to that table is all it takes to cover it.
+/// family, each standing for one raw helper in `MATH_FLOAT1_FOLDS`.  Every row
+/// is [`MathFloatDomain::ResultFinite`], so the table is the whole of what
+/// this entry point knows.
 pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
