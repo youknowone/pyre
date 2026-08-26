@@ -7911,17 +7911,42 @@ impl<'a> Lowering<'a> {
                 // escape guard (a failing shape stays residual — safe).  The
                 // read leaf (`index`, a value copy) needs no such guard.
                 let workspace_index = self.is_workspace_index_call(&reg);
+                // `&vec[..]` / `&mut vec[..]` is Rust's whole-list borrowed
+                // view (`Index<RangeFull>`). RPython has no borrow wrapper:
+                // both sides are the same `SomeList` value.  Preserve that
+                // identity before the scalar element arm; Range/RangeFrom/
+                // RangeTo remain real getslice operations.
+                if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `ArrayRead` addresses its element as `base + index *
-                // itemsize`.  RPython can leave that width implicit — every
-                // non-primitive there IS a one-word GC pointer — but a Rust
-                // `Vec<T>` stores `T` inline, so a `Vec<u8>` strides 1 and a
-                // `Vec<String>` strides 24.  An element that is neither a
-                // sizable scalar nor a thin pointer falls through to the
-                // residual call, where Rust computes the address itself.
+                // itemsize`.  A scalar host element carries its spelling as
+                // the array identity so the descr computes the exact width;
+                // a thin pointer, or a source value translated to RPython's
+                // one-word GC pointer repr, needs only that pointer identity.
+                // Any other inline Rust ADT falls through to the residual
+                // call: assigning it a target-word stride would be false.
+                // The workspace arm asks nothing: its `pyre_` fence admits
+                // exactly the three element banks named below, all one word.
                 let element_node = tyref_index_element_node(&call.dest.ty, self.llbc);
                 let element_scalar =
                     element_node.and_then(|elem| json_ty_scalar_element_spelling(elem, self.llbc));
-                let element_is_addressable = element_scalar.is_some()
+                // RPython's string list item is one GC pointer
+                // (`lltypesystem/rstr.py:229-230`, `StringRepr.lowleveltype =
+                // Ptr(STR)`).  Rust's `&str` is a fat pointer before source
+                // translation, but the translated value is the same
+                // `SomeString` / `Ptr(STR)` used for `String`, `Wtf8`, and
+                // `Wtf8Buf` everywhere else in this front end.  Name that
+                // translated element `str` so `get_array_descr` computes the
+                // RPython pointer item, never the host Rust width.
+                let element_rpython_ref = element_node
+                    .and_then(|elem| json_ty_rpython_gc_pointer_element_spelling(elem, self.llbc));
+                let element_spelling = element_scalar.or(element_rpython_ref);
+                let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
                 let index_leg = args.len() == 2
@@ -8008,7 +8033,7 @@ impl<'a> Lowering<'a> {
                         // non-`Ref` element at 8 bytes, so a narrow int read
                         // through such a receiver would stride past its
                         // neighbours.
-                        element_scalar
+                        element_spelling
                             .as_deref()
                             .map(|elem| format!("[{elem}]"))
                             .or_else(|| {
@@ -16401,10 +16426,25 @@ fn constants_call_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
 /// same gate is shared by the call-lowering intercept and the deferred-write
 /// liveness pre-pass.
 fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
+    let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
+    let int_indexed = reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tys| tys.get(1))
+        .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
+        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
+    int_indexed.then_some(leaf)
+}
+
+/// The Vec Index/IndexMut leaf before classifying its index argument.  Scalar
+/// element access and the `RangeFull` whole-list identity share this exact
+/// owner proof but intentionally take different lowerings.
+fn vec_index_regular_unchecked_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let leaf = llbc.fn_by_id(*id).and_then(|fd| {
+    llbc.fn_by_id(*id).and_then(|fd| {
         impl_method_owner_for_fundecl(llbc, fd).and_then(|(owner, leaf)| {
             if owner != "vec::Vec" {
                 return None;
@@ -16415,15 +16455,23 @@ fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str
                 _ => None,
             }
         })
-    })?;
-    let int_indexed = reg
-        .generics
+    })
+}
+
+/// `Vec<T>::index(_mut)(RangeFull)` creates only a borrowed whole-list view.
+/// The translated RPython list model has no distinct borrow/slice wrapper, so
+/// the callsite aliases the receiver instead of residualizing a Rust trait
+/// shim.
+fn is_vec_rangefull_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    if vec_index_regular_unchecked_leaf(reg, llbc).is_none() {
+        return false;
+    }
+    reg.generics
         .get("types")
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
-    int_indexed.then_some(leaf)
+        .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
 }
 
 /// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
@@ -19484,6 +19532,34 @@ fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> boo
         return false;
     };
     json_ty_is_statically_sized(pointee, llbc)
+}
+
+/// The element spelling of source values whose RPython repr is a one-word GC
+/// pointer even though their Rust source representation is wider.
+///
+/// RPython strings are `Ptr(STR)` (`lltypesystem/rstr.py:229-230`) and
+/// non-empty tuples are `Ptr(GcStruct(...))` (`rtuple.py:116-126`).  These are
+/// exactly the two non-scalar value families a PyPy list stores by reference;
+/// admitting arbitrary named Rust ADTs here would falsely shrink inline host
+/// structs to one word.
+fn json_ty_rpython_gc_pointer_element_spelling(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let ty = TyRef::Other(node.clone());
+    if tyref_is_string_value(&ty, llbc) {
+        return Some("str".to_string());
+    }
+    let node = strip_ty_indirections(node, llbc)?;
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
+        return None;
+    }
+    let types = adt.get("generics")?.as_object()?.get("types")?.as_array()?;
+    if types.is_empty() {
+        return None;
+    }
+    Some(charon_type_value_to_ast_string(node, llbc, 0))
 }
 
 /// `true` when `node` names a type of compile-time-known size, which is what
@@ -24578,7 +24654,8 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
+        fn_ptr_family_for, json_ty_is_thin_pointer_element,
+        json_ty_rpython_gc_pointer_element_spelling, json_ty_scalar_element_spelling,
         shaped_array_parts, simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
@@ -27524,6 +27601,43 @@ mod tests {
         assert!(!thin(uint("U8")));
     }
 
+    /// RPython stores strings and non-empty tuples as GC pointers inside a
+    /// list (`rstr.py:229-230`, `rtuple.py:116-126`).  The MIR source types
+    /// can be wider (`&str`, an inline Rust tuple), but their translated list
+    /// element repr must retain the upstream one-word shape.  An arbitrary
+    /// named ADT remains excluded.
+    #[test]
+    fn rpython_string_and_tuple_list_items_are_gc_pointer_elements() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let spelling =
+            |ty: serde_json::Value| json_ty_rpython_gc_pointer_element_spelling(&ty, &llbc);
+        let str_ty = serde_json::json!({
+            "Adt": {
+                "id": {"Builtin": "Str"},
+                "generics": {"types": []}
+            }
+        });
+        assert_eq!(spelling(str_ty).as_deref(), Some("str"));
+
+        let tuple_ty = serde_json::json!({
+            "Adt": {
+                "id": "Tuple",
+                "generics": {
+                    "types": [
+                        {"Literal": {"UInt": "U8"}},
+                        {"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]}
+                    ]
+                }
+            }
+        });
+        assert_eq!(spelling(tuple_ty).as_deref(), Some("(u8,*mut i64)"));
+
+        let named_adt = serde_json::json!({
+            "Adt": {"id": {"Adt": 7}, "generics": {"types": []}}
+        });
+        assert_eq!(spelling(named_adt), None);
+    }
+
     /// `[T]`, `str` and `dyn Trait` each have two Charon spellings — a
     /// top-level `{"Slice": elem}` and the `{"Adt": {"id": {"Builtin":
     /// "Slice"}}}` form.  A pointer to any of them is fat, and the width proof
@@ -30464,7 +30578,7 @@ mod tests {
     /// call that prevents the whole builtin-call chain from being annotated.
     #[test]
     #[ignore]
-    fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
+    fn bind_kwargs_indexes_lower_to_array_reads() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
@@ -30495,6 +30609,26 @@ mod tests {
             residual_scalar_indexes.len(),
             0,
             "scalar SliceIndex<usize> calls must become getitem operations"
+        );
+        let residual_vec_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                )
+            })
+            .collect();
+        assert_eq!(
+            residual_vec_indexes.len(),
+            0,
+            "PyPy argument.py list getitems must not remain opaque Vec::index calls: \
+             {residual_vec_indexes:#?}"
         );
         assert!(
             graph
@@ -30551,6 +30685,47 @@ mod tests {
             }),
             "From<bool> for usize should use RPython's cast_bool_to_uint path"
         );
+    }
+
+    /// Real-LLBC anchors for the three roots that previously left
+    /// `vec::Vec::index` opaque. Their corresponding PyPy operations are
+    /// ordinary list reads: argument-list concatenation, dict-item tuple
+    /// reads, and gateway keyword-name/value matching.
+    #[test]
+    #[ignore]
+    fn pypy_list_item_roots_have_no_residual_vec_index() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for fname in [
+            "combine_starargs_wrapped",
+            "dict_repr",
+            "bind_builtin_kwargs",
+        ] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
+            let residual: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                    )
+                })
+                .collect();
+            assert!(
+                residual.is_empty(),
+                "{fname}: PyPy list getitems must not remain Vec::index: {residual:#?}"
+            );
+        }
     }
 
     /// `basename_start` indexes `path[drive..]` with a runtime `usize`

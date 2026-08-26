@@ -2614,7 +2614,13 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // _match_keywords — match each keyword to a param name by index.
-    let mut extra_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = Vec::new();
+    // `argument.py:_collect_keyword_args` keeps keyword names and values in
+    // parallel lists (`keyword_names_w`, `keywords_w`) and uses the mapping
+    // only to select unmatched positions.  Preserve that storage shape: an
+    // inline Rust `(Wtf8Buf, PyObjectRef)` tuple would otherwise become a
+    // list-of-inline-structs that RPython never has.
+    let mut extra_kw_names: Vec<Wtf8Buf> = Vec::new();
+    let mut extra_kw_values: Vec<PyObjectRef> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     // argument.py:469,481-484 — collected across the whole loop, reported
     // together instead of raising on the first violation found.
@@ -2661,7 +2667,8 @@ pub(crate) fn bind_kwargs_to_signature(
                 // and every one of those is a safepoint that relocates the
                 // values already accumulated — and the bound parameters in
                 // `result` — while nothing names them.
-                extra_kwargs.push((key.clone(), *value));
+                extra_kw_names.push(key.clone());
+                extra_kw_values.push(*value);
             } else {
                 unmatched_kw_names.push(key.clone());
             }
@@ -2699,10 +2706,11 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
-    // The bound parameters, the unmatched keyword pairs and both tail objects
+    // The bound parameters, the unmatched keyword values and both tail objects
     // are all raw copies held across the packing allocations; see the same
     // bracket in `resolve_kwargs`, including why a star-less signature returns
-    // before it.
+    // before it.  Keyword names are non-GC Wtf8 buffers and remain in their
+    // parallel list.
     if !has_varargs && !has_varkw {
         return Ok(result);
     }
@@ -2712,10 +2720,10 @@ pub(crate) fn bind_kwargs_to_signature(
         let _ = roots.pin_root(value);
     }
     let extra_slot = result_slot + result.len();
-    for &(_, value) in &extra_kwargs {
+    for &value in &extra_kw_values {
         let _ = roots.pin_root(value);
     }
-    let varargs_slot = extra_slot + extra_kwargs.len();
+    let varargs_slot = extra_slot + extra_kw_values.len();
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
             pos_args[n_pos_params..n_pos].to_vec()
@@ -2729,8 +2737,8 @@ pub(crate) fn bind_kwargs_to_signature(
         let _ = roots.pin_root(pyre_object::w_dict_new_kwargs());
         // The index loop lowers to direct element loads; iterator adapters are residual calls.
         #[allow(clippy::needless_range_loop)]
-        for i in 0..extra_kwargs.len() {
-            let key = &extra_kwargs[i].0;
+        for i in 0..extra_kw_names.len() {
+            let key = &extra_kw_names[i];
             unsafe {
                 // The key allocation runs first: as the second argument it
                 // would be evaluated after the receiver, handing
