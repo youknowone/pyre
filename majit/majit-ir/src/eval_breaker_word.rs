@@ -214,6 +214,17 @@ pub fn memory_error_armed() -> bool {
     EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_MEMORY_ERROR != 0
 }
 
+/// Whether *this* thread is the one still owed a `MemoryError`.
+///
+/// The collector's max-heap ladder asks it to tell a breach that repeats an
+/// exception this thread has already been given from one that is new to it.
+/// [`memory_error_armed`] cannot answer that: it reports the process-wide
+/// summary, so an exception owed to another thread would read as this thread's
+/// own and silence a breach that thread never caused.
+pub fn memory_error_owed_here() -> bool {
+    MEMORY_ERROR_OWED.with(|owed| owed.get())
+}
+
 /// Consume the `MemoryError` owed to *this* thread, reporting whether one was.
 ///
 /// A thread that is not owed one leaves the bit alone and deopts again at its

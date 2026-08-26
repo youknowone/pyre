@@ -6625,19 +6625,36 @@ impl MiniMarkGC {
         // The fatal rung asks whether the program has already had its
         // `MemoryError`. Upstream raises here, so setting the flag and handing
         // the program its exception are one event and the question answers
-        // itself. Deferring delivery pulls them apart, and a breach that lands
-        // in between is the same arrival, not a second one: taking the fatal
-        // rung there ends the process without the program ever seeing the
-        // exception the rung above promised it. `do_collect_full` completes two
-        // cycles per call with no dispatch between them, so an explicit
-        // `gc.collect()` on a heap at its limit reaches exactly that. Both
-        // channels clear as they deliver, so an armed one is the whole test.
+        // itself. Deferring delivery pulls them apart, and the two halves of
+        // that are asked separately:
+        //
+        //   * *This* breach repeats one this thread has not been given yet —
+        //     `do_collect_full` completes two cycles per call with no dispatch
+        //     between them, so an explicit `gc.collect()` on a heap at its
+        //     limit reaches exactly that. Nothing new has happened, so return.
+        //     The question is per-thread: an exception owed to another thread
+        //     says nothing about this breach, and treating it as this one's
+        //     would let this thread allocate past the limit unremarked.
+        //   * The *fatal* rung needs the exception to have landed, not merely
+        //     to have been armed, or it ends the process before the program
+        //     sees what the rung above promised it. So a breach while any
+        //     thread is still owed one falls through and arms this thread too,
+        //     which is what upstream's raise does for whichever thread ran the
+        //     collection.
+        //
+        // Both channels clear as they deliver, so an armed one is the whole
+        // test in either case.
         if bounded && self.threshold_reached(reserving_size) {
-            if self.oom_pending || majit_ir::eval_breaker_word::memory_error_armed() {
+            if self.oom_pending || majit_ir::eval_breaker_word::memory_error_owed_here() {
+                // Upstream raises again here, and never reaches the collect-step
+                // hook; this return stands for that raise, so suppress it too.
+                self.oom_signalled_this_step = true;
                 self.gc_state = GcState::Scanning;
                 return;
             }
-            if self.max_heap_size_already_raised {
+            if self.max_heap_size_already_raised
+                && !majit_ir::eval_breaker_word::memory_error_armed()
+            {
                 panic!("using too much memory, aborting");
             }
             self.max_heap_size_already_raised = true;
@@ -9878,6 +9895,73 @@ mod tests {
         );
         // Whatever that breach armed on its way out belongs to no one now.
         majit_ir::eval_breaker_word::take_memory_error();
+    }
+
+    /// A breach on a thread that is owed nothing is new, however loudly another
+    /// thread's exception is still pending.
+    ///
+    /// The two questions the ladder asks are deliberately different widths. "Is
+    /// this the same arrival?" is about the breaching thread, because an
+    /// exception owed to some other thread says nothing about this collection —
+    /// reading the process-wide summary there would let this thread allocate on
+    /// past the limit with nothing owed to it. "May the process die now?" is
+    /// process-wide, because the fatal rung must not fire while any thread is
+    /// still to be told.
+    #[test]
+    fn a_breach_owed_to_another_thread_arms_this_one_rather_than_silencing_it() {
+        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(4096));
+        let obj = gc.alloc_with_type(tid, 4096);
+        assert!(!obj.is_null());
+        majit_ir::eval_breaker_word::take_memory_error();
+
+        // Another thread breaches first and has not reached its own dispatch
+        // loop yet — the window a stop-the-world collection opens, since its
+        // guard resumes the other mutators before the collecting one returns.
+        // It stays parked until this thread has breached, and then delivers,
+        // so nothing is left owed to a thread that no longer exists.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            majit_ir::eval_breaker_word::set_memory_error();
+            armed_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert!(
+                majit_ir::eval_breaker_word::take_memory_error(),
+                "the other thread's own exception is still owed to it"
+            );
+        });
+        armed_rx.recv().unwrap();
+        // Burn the one grace event on that thread's behalf, so this breach can
+        // only reach the fatal rung or the arming below.
+        gc.max_heap_size_already_raised = true;
+
+        gc.max_heap_size = 1.0;
+        gc.pending_reserving_size = 0;
+        gc.gc_state = GcState::Sweeping;
+        gc.finish_incremental_cycle();
+
+        assert_eq!(
+            gc.gc_state,
+            GcState::Scanning,
+            "the fatal rung must not fire while a thread is still owed one"
+        );
+        assert!(
+            majit_ir::eval_breaker_word::take_memory_error(),
+            "this thread breached and had none owed to it, so it is owed one now"
+        );
+        assert!(
+            majit_ir::eval_breaker_word::memory_error_armed(),
+            "delivering this thread's does not clear the one the other is owed"
+        );
+
+        release_tx.send(()).unwrap();
+        other.join().unwrap();
+        assert!(
+            !majit_ir::eval_breaker_word::memory_error_armed(),
+            "the last owner to deliver clears the summary"
+        );
     }
 
     /// The other half of the same policy: a collection with no allocation
