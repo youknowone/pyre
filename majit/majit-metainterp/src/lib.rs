@@ -184,7 +184,7 @@ pub use jitdriver::{
     DeclarativeJitDriver, FlatEntryContract, JitDriver, JitDriverStaticData,
     MultiFrameBlackholeResult, PendingAbortBlackhole, SingleFrameBlackholeResult,
     TraceContinuationSuspendGuard, bridge_fuel_take, current_state_field_fvc_epoch,
-    drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled,
+    drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled, spdiag_enabled,
     trace_continuation_suspended,
 };
 pub use majit_backend::CompiledTraceInfo;

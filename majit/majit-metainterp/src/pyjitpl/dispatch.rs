@@ -3955,6 +3955,16 @@ where
                     .count_ops(kind, crate::counters::RECORDED_OPS);
                 let op = ctx.record_op_with_descr(kind, &[], descr);
                 ctx.set_opref_concrete(op, Value::Ref(majit_ir::GcRef(ptr as usize)));
+                // `execute_new` stamps `heapcache.new(resbox)`;
+                // `execute_new_with_vtable` stamps `class_now_known` on top of
+                // it. The vtable written at offset 0 just above is the word
+                // `cls_of_box` reads back, so the class is known here by
+                // construction — a zero one is the "unavailable" spelling and
+                // stays unrecorded.
+                ctx.heap_cache_mut().new_object(op);
+                if with_vtable && vtable != 0 {
+                    ctx.heap_cache_mut().class_now_known(op, vtable as i64);
+                }
                 self.set_ref_reg(dest, Some(op), Some(ptr));
             }
             jitcode::insns::BC_SETFIELD_GC_I
@@ -3993,6 +4003,17 @@ where
                     }
                     _ => self.read_int_reg(value_reg),
                 };
+                let field_index = fielddescr.index();
+                // `_record_helper` runs `heapcache.invalidate_caches` before it
+                // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
+                // only the mark-escaped half runs: a ref written into an
+                // already-escaped struct escapes with it. Same shape as
+                // BC_SETARRAYITEM_GC below.
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetfieldGc,
+                    None,
+                    &[struct_opref, value_opref],
+                );
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
@@ -4002,6 +4023,10 @@ where
                     &[struct_opref, value_opref],
                     fielddescr,
                 );
+                // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
+                // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
+                // The cache stores the Box identity, not the value word.
+                ctx.heapcache_setfield_cached(struct_opref, field_index, value_opref);
                 if struct_ptr != 0 {
                     // blackhole.py:1471-1483 stores through the fielddescr,
                     // which carries the field's byte width, and the getfield
@@ -4733,12 +4758,47 @@ where
                     .wrapping_add(base_size)
                     .wrapping_add((index_value as usize).wrapping_mul(itemsize));
                 let concrete = unsafe { *(item_addr as *const i64) };
-                let opref = if let Some(cached) = cached {
+                let (opref, reg_concrete) = if let Some(cached) = cached {
                     ctx.profiler().count_ops(
                         OpCode::GetarrayitemGcR,
                         crate::pyjitpl::counters::HEAPCACHED_OPS,
                     );
-                    cached
+                    // `_do_getarrayitem_gc_any`'s `typ == 'r'` arm compares the
+                    // freshly executed load against the cached box's
+                    // `tobox.getref_base()`. Same structure as the int/float
+                    // arm above: a mismatch records a fallback op whose result
+                    // is discarded, asserts in debug, and still answers with
+                    // the stale cached box.
+                    let expected = match ctx.box_value(cached) {
+                        Some(Value::Ref(majit_ir::GcRef(p))) => Some(p as i64),
+                        _ => None,
+                    };
+                    let stale = matches!(expected, Some(exp) if exp != concrete);
+                    if stale {
+                        ctx.heapcache_invalidate_caches_varargs(
+                            OpCode::GetarrayitemGcR,
+                            None,
+                            &[array_opref, index_opref],
+                        );
+                        ctx.profiler()
+                            .count_ops(OpCode::GetarrayitemGcR, crate::counters::RECORDED_OPS);
+                        let _ = ctx.record_op_with_descr(
+                            OpCode::GetarrayitemGcR,
+                            &[array_opref, index_opref],
+                            descr,
+                        );
+                        debug_assert!(
+                            false,
+                            "GetarrayitemGcR sanity check failed: \
+                             cached={expected:?} concrete={concrete}",
+                        );
+                    }
+                    let reg_concrete = if stale {
+                        expected.expect("stale only set when expected is Some")
+                    } else {
+                        concrete
+                    };
+                    (cached, reg_concrete)
                 } else {
                     ctx.profiler()
                         .count_ops(OpCode::GetarrayitemGcR, crate::counters::OPS);
@@ -4756,9 +4816,9 @@ where
                         descr_index,
                         opref,
                     );
-                    opref
+                    (opref, concrete)
                 };
-                self.set_ref_reg(dst, Some(opref), Some(concrete));
+                self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
             }
             // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
             // SetarrayitemGc (a single op-kind whose descr carries the item
@@ -9022,17 +9082,29 @@ where
                     .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
                 let sbox_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr);
                 ctx.set_opref_concrete(sbox_op, Value::Ref(majit_ir::GcRef(struct_ptr as usize)));
+                // `opimpl_newlist_clear` composes `opimpl_new`,
+                // `_opimpl_setfield_gc_any`, `opimpl_new_array_clear` and a
+                // second `_opimpl_setfield_gc_any`; each carries the heapcache
+                // effect stamped alongside it here.
+                ctx.heap_cache_mut().new_object(sbox_op);
 
                 // ── 2. store the length into the header's `length` field. ──
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+                let length_field_index = length_fielddescr.index();
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetfieldGc,
+                    None,
+                    &[sbox_op, length_opref],
+                );
                 ctx.record_op_with_descr(
                     OpCode::SetfieldGc,
                     &[sbox_op, length_opref],
                     length_fielddescr,
                 );
+                ctx.heapcache_setfield_cached(sbox_op, length_field_index, length_opref);
                 if struct_ptr != 0 {
                     unsafe {
                         *((struct_ptr as *mut u8).add(length_offset) as *mut i64) = length_val
@@ -9074,6 +9146,11 @@ where
                     .count_ops(OpCode::NewArrayClear, crate::counters::RECORDED_OPS);
                 let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
                 ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
+                // `execute_new_array_clear`'s `heapcache.new_array`. Only a
+                // constant length makes the array a virtual candidate, which is
+                // the `isinstance(lengthbox, Const)` the flag stands for.
+                ctx.heap_cache_mut()
+                    .new_array(abox_op, length_opref, length_opref.is_constant());
 
                 // ── 4. store the items block into the header's `items` field.
                 // A ref store adds a heap edge header→items, so notify the GC
@@ -9082,7 +9159,14 @@ where
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+                let items_field_index = items_fielddescr.index();
+                ctx.heapcache_invalidate_caches_varargs(
+                    OpCode::SetfieldGc,
+                    None,
+                    &[sbox_op, abox_op],
+                );
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
+                ctx.heapcache_setfield_cached(sbox_op, items_field_index, abox_op);
                 if struct_ptr != 0 {
                     unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
                     majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));

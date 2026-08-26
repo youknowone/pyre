@@ -4030,15 +4030,27 @@ impl TraceCtx {
             );
             self.promote_int(eqbox, isstandard, 0);
             if isstandard != 0 {
-                // pyjitpl.py:1140-1142 `if box.type == 'r':
+                // `_nonstandard_virtualizable`'s `if box.type == 'r':
                 //     self.metainterp.replace_box(box, standard_box)`.
-                // Virtualizables are always Refs in pyre, so the
-                // `box.type == 'r'` check is unconditional here.
-                // Upstream's `MetaInterp.replace_box` includes a
-                // framestack walk (see `MetaInterp::replace_box` in
-                // pyjitpl.rs); reaching that walk from TraceCtx
-                // requires a MetaInterp backref which does not exist
-                // today — C tracks the architectural move.
+                // Virtualizables are always Refs here, so the
+                // `box.type == 'r'` check is unconditional.
+                //
+                // Upstream's `MetaInterp.replace_box` also walks the
+                // framestack, rewriting the box in every frame's active
+                // registers; this one rewrites only the records `TraceCtx`
+                // owns, so an alias of `vable_opref` sitting in a register
+                // would keep naming the nonstandard box.
+                //
+                // That gap is unreachable rather than tolerated: this arm
+                // needs a vable op whose base is an OpRef other than the
+                // declared virtualizable variable but pointing at the same
+                // frame, and no lowering mints one — a field access becomes
+                // a vable op only for the declared variable, and every
+                // seeding site takes it from the standard box itself, so
+                // the identity check above returns first. A NEW SEEDING
+                // SITE ARMS THIS ARM, and closing the register half then
+                // has to come with it: `TraceCtx` owns no frame registers,
+                // so the pair has to reach whichever walker does.
                 self.replace_box(vable_opref, standard_box);
                 return false;
             }
