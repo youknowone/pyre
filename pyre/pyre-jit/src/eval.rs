@@ -1283,6 +1283,26 @@ fn trace_bufferview(
             f(w_strides as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_bufferview(parent, f);
         }
+        // Named fields, not `..`: `shape` / `strides` / `suboffsets` are
+        // native vectors and the scalars are plain integers, so the ref slots
+        // are exactly `w_obj`, `w_fmt` and the backing.  A field added later
+        // is a compile error here rather than a missed root.
+        pyre_object::bufferview::BufferView::CBuffer {
+            backing,
+            w_obj,
+            w_fmt,
+            itemsize: _,
+            length: _,
+            ndim: _,
+            offset: _,
+            shape: _,
+            strides: _,
+            suboffsets: _,
+        } => {
+            f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(w_fmt as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            trace_buffer_exporter(backing, f);
+        }
         pyre_object::bufferview::BufferView::Readonly { view, w_obj } => {
             f(w_obj as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             trace_bufferview(view, f);
