@@ -187,6 +187,25 @@ pub trait JitState: Sized {
     type Sym;
     type Env: ?Sized;
 
+    /// Whether this frontend's own guard-failure recovery already filled the
+    /// virtualizable from the resume stream.
+    ///
+    /// `pyjitpl.py rebuild_state_after_failure` closes by assigning
+    /// `self.virtualizable_boxes` and then calling
+    /// `self.synchronize_virtualizable()` — the boxes are the trace's copy and
+    /// the object still holds whatever compiled code last spilled, so the
+    /// second half is what makes a walk resumed at the guard read the right
+    /// fields. Bridge setup here performs it for a frontend that answers
+    /// `false`.
+    ///
+    /// A frontend answers `true` when its own recovery already wrote those
+    /// fields, which it may have to: the write this crate can make converts a
+    /// shadow value with `value_to_raw_bits`, and a frontend whose array slots
+    /// hold boxed objects needs a field-aware conversion that only it can
+    /// spell. Writing twice is not the hazard — writing raw bits into a slot
+    /// that wanted a box is.
+    const SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE: bool = false;
+
     fn can_trace(&self) -> bool {
         true
     }

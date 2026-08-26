@@ -10162,6 +10162,14 @@ impl JitState for PyreJitState {
     type Sym = PyreSym;
     type Env = PyreEnv;
 
+    /// `sync_virtualizable_after_guard_failure` has already run by the time
+    /// bridge setup is reached: guard-failure recovery selects it through
+    /// `ResumeVableMode::GuardFailureSync`, and it writes each slot through
+    /// `value_to_static_vable_bits` / `value_to_vable_array_item_bits`, which
+    /// box an unwrapped `Value::Int` / `Value::Float` back into an object
+    /// before it lands in a slot the frame reads as one.
+    const SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE: bool = true;
+
     fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();

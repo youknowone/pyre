@@ -5053,17 +5053,17 @@ impl<S: JitState> JitDriver<S> {
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
             let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
-            // OPEN, and not the reader's: what the reader applies is
-            // op-for-op what the blackhole applies for the same guard. What
-            // the walk it enables is missing is the trailing
-            // `synchronize_virtualizable()` of `pyjitpl.py
-            // rebuild_state_after_failure` — `start_bridge_tracing` seeds the
-            // virtualizable BOXES from the resume stream but nothing writes
-            // them back to the object, so a frontend that does not run that
-            // writer itself walks against a stale virtualizable. Guards
-            // carrying deferred writes are the ones that surface it; the
-            // blackhole arm does not, because it writes the virtualizable
-            // back on its way through. Decline them until that call is wired.
+            // OPEN, and narrower than it was. The reader applies these guards'
+            // writes op-for-op as the blackhole does, and the virtualizable
+            // arrays are now written back from the resume stream, but a
+            // self-interpreting workload still reads one operand twice when
+            // these guards are served — and stops doing so when the
+            // virtualizable's banded arms are put out of reach, so what the
+            // walk resumes on is still described somewhere this entry does
+            // not restore. The scalars are the remaining candidate: they are
+            // carried by the state-field resume mechanism, disjoint from the
+            // array restore above, and nothing writes them into the live
+            // state before the walk reads through them.
             if has_pending {
                 return Err(Decline::ReplayIncomplete);
             }
@@ -8424,7 +8424,18 @@ impl<S: JitState> JitDriver<S> {
             // An entry that asked to apply and has no allocator to apply
             // through cannot fall back to recording only: nothing else will
             // write this guard's deferred stores.
-            if execute_replay && replay_allocator.is_none() {
+            //
+            // Only where there are any. `ResumeDataBoxReader` allocates and
+            // stores for the virtuals and the pending fields the stream
+            // carries and for nothing else, so a guard carrying neither asks
+            // the allocator for nothing and is served whether one exists or
+            // not.
+            if execute_replay
+                && replay_allocator.is_none()
+                && retrace.storage.as_deref().is_some_and(|storage| {
+                    !storage.rd_pendingfields.is_empty() || !storage.rd_virtuals.is_empty()
+                })
+            {
                 ctx.mark_bridge_replay_incomplete();
             }
             S::setup_bridge_sym(
@@ -8436,6 +8447,17 @@ impl<S: JitState> JitDriver<S> {
                 &retrace.fail_types,
                 replay_allocator,
             );
+            // `pyjitpl.py rebuild_state_after_failure` tail: the call above is
+            // `rebuild_from_resumedata`, which leaves the virtualizable
+            // described by the trace's boxes and by nothing else — the object
+            // itself still holds whatever the compiled loop last spilled into
+            // it. Upstream closes the same routine by writing those boxes
+            // back, and an entry that asked to apply is the entry upstream
+            // reaches it from: no blackhole ran ahead of it, so no one else
+            // has written them.
+            if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
+                ctx.synchronize_virtualizable_after_guard_failure();
+            }
         }
         self.bridge_body_start_op_count = self.meta.tracing.as_ref().map(|ctx| ctx.num_ops());
         self.meta.begin_trace_session(trace_meta);

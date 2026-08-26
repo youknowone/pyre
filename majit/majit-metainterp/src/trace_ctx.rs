@@ -2807,6 +2807,29 @@ impl TraceCtx {
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
     pub fn synchronize_virtualizable(&self) {
+        self.write_virtualizable_back(true);
+    }
+
+    /// The same write at the one moment the carve-out below does not apply:
+    /// `pyjitpl.py rebuild_state_after_failure`'s closing
+    /// `self.synchronize_virtualizable()`.
+    ///
+    /// A guard has just failed out of compiled code and nothing has run the
+    /// outer executor since, so the resume stream is the only description of
+    /// the virtualizable that exists and every field is this write's to make —
+    /// including the arrays an executor would otherwise own. A frontend whose
+    /// own guard-failure recovery already performed it does not reach here;
+    /// `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` is how it
+    /// says so.
+    pub fn synchronize_virtualizable_after_guard_failure(&self) {
+        self.write_virtualizable_back(false);
+    }
+
+    /// `virtualizable.py write_boxes` over the whole shadow.
+    ///
+    /// `skip_outer_owned_arrays` is the tracing-time carve-out described at
+    /// its own test below; the guard-failure caller clears it.
+    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -2848,12 +2871,14 @@ impl TraceCtx {
         // clobber the outer executor's writes. The heap is authoritative, so
         // skip the write-back during tracing — the resume path performs its
         // own field-aware flush on guard failure.
-        if info.array_fields.iter().any(|a| {
-            matches!(
-                a.storage,
-                crate::virtualizable::VableArrayStorage::RustVec { .. }
-            )
-        }) {
+        if skip_outer_owned_arrays
+            && info.array_fields.iter().any(|a| {
+                matches!(
+                    a.storage,
+                    crate::virtualizable::VableArrayStorage::RustVec { .. }
+                )
+            })
+        {
             return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
