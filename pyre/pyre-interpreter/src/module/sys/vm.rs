@@ -3215,8 +3215,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // sys.pycache_prefix — None unless -X pycache_prefix / PYTHONPYCACHEPREFIX.
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
-    // bytecode path before `dont_write_bytecode` is consulted.
-    module_ns_store(ns, "pycache_prefix", w_none());
+    // bytecode path before `dont_write_bytecode` is consulted.  The path is
+    // decoded the way `sys._xoptions` decodes the same bytes, so one the host
+    // cannot spell in UTF-8 arrives with the surrogates that re-encode to it.
+    module_ns_store(
+        ns,
+        "pycache_prefix",
+        crate::importing::pycache_prefix()
+            .map_or_else(w_none, |path| crate::gateway::fsdecode_os_str(&path)),
+    );
     // `vm.py addaudithook`
     module_ns_store(
         ns,
