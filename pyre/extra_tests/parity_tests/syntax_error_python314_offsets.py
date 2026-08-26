@@ -118,4 +118,42 @@ for operator, message in (
         error.end_offset,
     )
 
+# "Perhaps you forgot a comma?" spans both atoms, so it ends past the whole
+# second one.  A width measured in bytes rather than in atoms agrees only when
+# that atom is a single ASCII character, which `(a b)` is and none of these
+# are: the ASCII rows below catch a length assumption and the non-ASCII ones
+# catch a byte-vs-character one.
+for source, offset, end_offset in (
+    ("(a bb)", 2, 6),
+    ("(a bbb)", 2, 7),
+    ("(1 22)", 2, 6),
+    ("(a \u03b2)", 2, 5),
+    ("(a \u03b2\u03b2)", 2, 6),
+    ("(\u03b1\u03b1 \u03b2)", 2, 6),
+    ("[\u03b1 \u03b2]", 2, 5),
+    # The f-string forms reach the same rule through a recursive parse of the
+    # replacement field, and the span has to survive being mapped back onto
+    # the original source.
+    ("f'{a bb}'", 4, 8),
+    ("f'{\u03b1\u03b1 \u03b2}'", 4, 8),
+    ("f'{a \u03b2}'", 4, 7),
+):
+    error = syntax_error(source)
+    assert error.msg == "invalid syntax. Perhaps you forgot a comma?", (
+        source,
+        error.msg,
+    )
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (
+        1,
+        offset,
+        1,
+        end_offset,
+    ), (
+        source,
+        error.lineno,
+        error.offset,
+        error.end_lineno,
+        error.end_offset,
+    )
+
 print("OK")

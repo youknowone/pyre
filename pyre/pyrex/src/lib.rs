@@ -56,6 +56,7 @@ usage: {binary_name} [option] ... [-c cmd | file | -] [arg] ...
 Options:
 -c cmd : program passed in as string (terminates option list)
 -m mod : run library module as a script (terminates option list)
+-d     : debug output from parser; also PYTHONDEBUG=x
 -h     : print this help message and exit (also --help)
 -i     : inspect interactively after running script
 -E     : ignore PYTHON* environment variables
@@ -67,6 +68,7 @@ Options:
 -s     : don't add user site directory to sys.path
 -S     : don't imply 'import site' on initialization
 -P     : don't prepend a potentially unsafe path to sys.path (also PYTHONSAFEPATH)
+-v     : verbose (trace import statements); also PYTHONVERBOSE=x
 -V     : print the Python version number and exit (also --version)
 -X opt : set implementation-specific option
 file   : program read from script file
@@ -217,6 +219,24 @@ fn parse_args(
                 // pyre acts on are matched, and every one of those is ASCII,
                 // so a value with no UTF-8 form simply cannot be one of them.
                 let option: std::ffi::OsString = parser.value()?;
+                // `sys._xoptions` splits each option at the first `=`, so an
+                // option `run_command_line` tests with `in` answers to its key
+                // alone while one that reads the value does not.  The split is
+                // on the encoded bytes because `pycache_prefix` carries a
+                // *directory*, which is not required to have a UTF-8 form; `=`
+                // is ASCII, and `OsStr` documents its encoded form as
+                // splittable at an ASCII byte, so each half is a whole `OsStr`.
+                let bytes = option.as_encoded_bytes();
+                let (key, value) = match bytes.iter().position(|b| *b == b'=') {
+                    Some(at) => (&bytes[..at], Some(&bytes[at + 1..])),
+                    None => (bytes, None),
+                };
+                // `'faulthandler' in sys._xoptions`, so every spelling that
+                // names the key installs the handlers -- `=0` included, which
+                // is not a way to ask for it to stay off.
+                if key == b"faulthandler" {
+                    flags.faulthandler = true;
+                }
                 match option.to_str() {
                     Some("dev") => flags.dev_mode = true,
                     Some("warn_default_encoding") => flags.warn_default_encoding = true,
@@ -226,7 +246,19 @@ fn parse_args(
                     Some(value) if value.starts_with("utf8=") => {
                         fatal_utf8_config_error("invalid -X utf8 option value")
                     }
-                    _ => {}
+                    // An empty value is recorded rather than dropped: a
+                    // named option and an unnamed one are what the three-state
+                    // fold tells apart, and only the second lets
+                    // PYTHONPYCACHEPREFIX supply a prefix.
+                    _ => {
+                        if key == b"pycache_prefix" {
+                            let path = value.unwrap_or(&bytes[..0]);
+                            flags.pycache_prefix = Some(
+                                unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(path) }
+                                    .to_os_string(),
+                            );
+                        }
+                    }
                 }
                 flags.xoptions.push(option);
             }
@@ -243,6 +275,12 @@ fn parse_args(
             // PyPy app_main.py `simple_option`: repeated `-b` increments the
             // bytes-warning level (`-bb` therefore records 2).
             Short('b') => flags.bytes_warning = flags.bytes_warning.saturating_add(1),
+            // The other two `simple_option` counters. `-v` reaches the import
+            // machinery through `sys.flags.verbose`, which `_verbose_message`
+            // reads; `-d` names parser debug output there is none of, and is
+            // carried so `sys.flags.debug` reports it.
+            Short('v') => flags.verbose = flags.verbose.saturating_add(1),
+            Short('d') => flags.debug = flags.debug.saturating_add(1),
             // `-B` disables writing bytecode caches (PYTHONDONTWRITEBYTECODE).
             Short('B') => flags.dont_write_bytecode = true,
             // PyPy app_main.py `unbuffered`: writing streams use raw FileIO
@@ -1309,11 +1347,87 @@ fn init_warnoptions(
     }
 }
 
+/// The failures that leave the install silent rather than ending startup.
+/// `app_main.py run_command_line` swallows the ValueError a descriptor that is
+/// no longer open raises -- and only that one -- while the whole block sits
+/// behind an `'faulthandler' in sys.builtin_module_names` guard, which is what
+/// the other two stand in for: a build with no host seam carries the module but
+/// can only answer NotImplementedError, and one with no reachable stdlib cannot
+/// import it.  Neither is a failed install; both mean the guard would have kept
+/// the block from running at all.
+fn faulthandler_init_is_silent(error: &pyre_interpreter::PyError) -> bool {
+    matches!(
+        error.kind,
+        PyErrorKind::ValueError | PyErrorKind::NotImplementedError
+    ) || is_import_error(error)
+}
+
+/// `app_main.py run_command_line` — `-X faulthandler`, `-X dev` or
+/// PYTHONFAULTHANDLER installs the fatal-signal handlers ahead of
+/// `import site`, so a crash in anything that runs from here on dumps the
+/// Python traceback it was in.
+///
+/// The descriptor is named rather than left for `enable` to resolve, which is
+/// what `faulthandler.enable(2)` does upstream: 2 is the file a fatal dump has
+/// to reach whatever the program later does to `sys.stderr`, and passing it
+/// also keeps the install from running a Python-level `fileno()` and `flush()`
+/// during startup.
+fn init_faulthandler(
+    w_main_globals: pyre_object::PyObjectRef,
+    ec_ptr: *const pyre_interpreter::PyExecutionContext,
+) {
+    if !importing::faulthandler_flag() {
+        return;
+    }
+    let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
+        use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+        let module = importing::importhook(
+            "faulthandler",
+            w_main_globals,
+            pyre_object::PY_NULL,
+            0,
+            ec_ptr,
+        )?;
+        // Both the module and the descriptor have to survive an allocation the
+        // other one drives, so neither is held in a Rust local across it.
+        let _roots = push_roots();
+        let module_slot = shadow_stack_len();
+        let _ = pin_root(module);
+        let fd_slot = shadow_stack_len();
+        let _ = pin_root(pyre_object::w_int_new(2));
+        let enable_slot = shadow_stack_len();
+        let _ = pin_root(pyre_interpreter::baseobjspace::getattr_str(
+            shadow_stack_get(module_slot),
+            "enable",
+        )?);
+        pyre_interpreter::call::call_function_impl_result(
+            shadow_stack_get(enable_slot),
+            &[shadow_stack_get(fd_slot)],
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = attempt
+        && !faulthandler_init_is_silent(&e)
+    {
+        // `run_command_line` catches the one error it means to ignore and
+        // nothing else, so a failed install leaves startup the way an
+        // unhandled exception does -- the traceback, and no program run.  The
+        // handlers were asked for by name; continuing without them would run
+        // the program in exactly the configuration the option refused.
+        pyre_interpreter::eprint_exception(&e, true);
+        std::process::exit(1);
+    }
+}
+
 pub(crate) fn import_site(
     no_site: bool,
     w_main_globals: pyre_object::PyObjectRef,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) {
+    // `run_command_line` installs it ahead of its own `import site`, so a
+    // crash inside `site` itself is already covered.
+    init_faulthandler(w_main_globals, ec_ptr);
     if !no_site
         && importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err()
     {
@@ -2202,6 +2316,23 @@ fn eval_source_in_main(
     };
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
+
+    // `run_command_line` reaches its stdin branch with `site`, the warnings
+    // bootstrap and the signal handlers already installed, and prints the
+    // banner there rather than on the way in: what it labels is the import
+    // trace `-v` produced for all of that, so it follows the trace instead of
+    // heading it.  `<stdin>` names that branch -- a tty takes the prompt, and
+    // the prompt prints its own.  On stderr, where the trace goes; a piped
+    // program's stdout is its own.
+    if filename == "<stdin>" && importing::verbose_flag() != 0 {
+        eprintln!("{}", repl::BANNER);
+        // `print_banner(not no_site)` -- the second line names the four
+        // builtins `site` installs, so `-S` leaves it nothing to offer and the
+        // notice is dropped with them.
+        if !no_site {
+            eprintln!("{}", repl::BANNER_COPYRIGHT);
+        }
+    }
 
     // `<string>` names no file, so `linecache._interactive_cache` is the only
     // place a traceback frame or `inspect.getsource` can reach the command's

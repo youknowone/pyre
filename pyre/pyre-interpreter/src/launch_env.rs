@@ -24,6 +24,10 @@ pub struct LaunchFlags {
     pub ignore_environment: bool,
     pub isolated: bool,
     pub dev_mode: bool,
+    /// `-X faulthandler`; `-X dev` and PYTHONFAULTHANDLER fold in during
+    /// finalize.  Installs the fatal-signal handlers before user code runs, so
+    /// a crash dumps the Python traceback it was in.
+    pub faulthandler: bool,
     pub warn_default_encoding: bool,
     /// PYTHONLEGACYWINDOWSFSENCODING, which no command-line option spells.
     /// Read only on Windows, the only platform whose `PyPreConfig` carries it,
@@ -38,8 +42,24 @@ pub struct LaunchFlags {
     pub safe_path: bool,
     /// `-O` count on the command line; PYTHONOPTIMIZE folds in during finalize.
     pub optimize: i64,
+    /// `-v` count; PYTHONVERBOSE folds in during finalize.  Read back as
+    /// `sys.flags.verbose`, which is what `importlib._bootstrap`'s
+    /// `_verbose_message` gates the import trace on.
+    pub verbose: i64,
+    /// `-d` count; PYTHONDEBUG folds in during finalize.  The parser has no
+    /// debug output to emit, so the count exists to be reported.
+    pub debug: i64,
     pub bytes_warning: i64,
     pub dont_write_bytecode: bool,
+    /// `-X pycache_prefix[=PATH]`, three-state until [`finalize`] resolves it.
+    /// `None` is an option the command line did not name, and is the only
+    /// state PYTHONPYCACHEPREFIX still applies to; after finalize a `Some`
+    /// always carries a non-empty path, which is what `sys.pycache_prefix`
+    /// reports and what `_bootstrap_external.cache_from_source` writes under.
+    ///
+    /// The path keeps the host's own spelling for the same reason the option
+    /// lists do: a directory name is not required to have a UTF-8 form.
+    pub pycache_prefix: Option<std::ffi::OsString>,
     pub unbuffered: bool,
     /// Both option lists stay in the host's own spelling until sys module
     /// initialization decodes them, because neither is required to be text the
@@ -85,9 +105,13 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONNOUSERSITE",
     "PYTHONUNBUFFERED",
     "PYTHONDEVMODE",
+    "PYTHONFAULTHANDLER",
     "PYTHONINSPECT",
     "PYTHONOPTIMIZE",
+    "PYTHONVERBOSE",
+    "PYTHONDEBUG",
     "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPYCACHEPREFIX",
     "PYTHONUTF8",
     "PYTHONWARNDEFAULTENCODING",
     "PYTHONLEGACYWINDOWSFSENCODING",
@@ -210,28 +234,39 @@ fn env_int_flag(name: &str) -> Option<u32> {
     // Read the bytes, not a decoded string: `_Py_str_to_int` rejects undecodable
     // input exactly the way it rejects trailing junk, so both land on 1 rather
     // than on "unset".
+    //
+    // `strtol` steps over leading whitespace before the digits and then reports
+    // where it stopped, so `_Py_str_to_int` takes a value padded on the left and
+    // refuses one padded on the right.  Rust's parse refuses both, so the left
+    // pad is trimmed here; the set is `isspace`'s, not `char::is_whitespace`'s,
+    // which would also step over spacing the C function stops at.
     let parsed = std::str::from_utf8(&raw)
         .ok()
+        .map(|value| value.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']))
         .and_then(|value| value.parse::<i64>().ok());
+    // `preconfig.c:554` rejects anything outside the C `int` range as
+    // overflow, and an unreadable value is what becomes 1, so the ceiling is
+    // INT_MAX rather than the width of the field this returns into.
     let value = match parsed {
-        Some(v) if (0..=i64::from(u32::MAX)).contains(&v) => v as u32,
+        Some(v) if (0..=i64::from(i32::MAX)).contains(&v) => v as u32,
         _ => 1,
     };
     Some(value)
 }
 
-/// `-O` count folded with PYTHONOPTIMIZE (`config_init_optimization_level`):
-/// the effective level is the larger of the two.  The level is kept as a wide
-/// integer so `sys.flags.optimize` mirrors a large `PYTHONOPTIMIZE` verbatim;
-/// the compiler clamps it into a byte at read time.
-fn resolve_optimize(flags: &LaunchFlags) -> i64 {
-    let mut level = flags.optimize;
-    if !flags.ignore_environment
-        && let Some(v) = env_int_flag("PYTHONOPTIMIZE")
-    {
-        level = level.max(i64::from(v));
+/// A repeatable option folded with its integer environment variable
+/// (`app_main.py`'s `parse_env`, and `config_init_optimization_level` for the
+/// `-O` case): the effective count is the larger of the two.  The count is kept
+/// as a wide integer so `sys.flags` mirrors a large variable verbatim; the
+/// compiler clamps the optimization level into a byte at read time.
+fn resolve_counter(flags: &LaunchFlags, count: i64, name: &str) -> i64 {
+    if flags.ignore_environment {
+        return count;
     }
-    level
+    match env_int_flag(name) {
+        Some(value) => count.max(i64::from(value)),
+        None => count,
+    }
 }
 
 /// A boolean option folded with an *integer* environment flag: the variable
@@ -249,6 +284,24 @@ fn fold_presence_flag(flags: &LaunchFlags, set: bool, name: &str) -> bool {
     set || (!flags.ignore_environment && is_set_nonempty(name))
 }
 
+/// `app_main.py run_command_line` — `-X pycache_prefix` folded with
+/// PYTHONPYCACHEPREFIX.  Naming the option at all settles the question, so
+/// `-X pycache_prefix` and `-X pycache_prefix=` both leave the prefix unset
+/// *and* keep the variable from supplying one; only an unnamed option reaches
+/// the environment. An empty value never becomes a prefix, from either source,
+/// and a value that is a relative path is stored the way it was written.
+fn resolve_pycache_prefix(flags: &LaunchFlags) -> Option<std::ffi::OsString> {
+    let named = match &flags.pycache_prefix {
+        Some(value) => value.clone(),
+        None if flags.ignore_environment => return None,
+        // Read as bytes: a directory name is free text, so `read`'s `env::var`
+        // contract would drop the whole variable for one undecodable byte
+        // rather than carry the path `-X` would have carried.
+        None => os_string_from_bytes(&read_raw("PYTHONPYCACHEPREFIX")?),
+    };
+    (!named.is_empty()).then_some(named)
+}
+
 /// Fold the environment over the options a command line named. An embedding
 /// without a command line passes `LaunchFlags::default()`.
 pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
@@ -264,7 +317,9 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         );
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
-    flags.optimize = resolve_optimize(&flags);
+    flags.optimize = resolve_counter(&flags, flags.optimize, "PYTHONOPTIMIZE");
+    flags.verbose = resolve_counter(&flags, flags.verbose, "PYTHONVERBOSE");
+    flags.debug = resolve_counter(&flags, flags.debug, "PYTHONDEBUG");
     // Which of the two shapes a name takes is per-variable, not a category:
     // PYTHONSAFEPATH and PYTHONINSPECT enable on a bare `=0`, PYTHONNOUSERSITE
     // and PYTHONUNBUFFERED do not.
@@ -274,6 +329,16 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     flags.unbuffered = fold_int_flag(&flags, flags.unbuffered, "PYTHONUNBUFFERED");
     flags.safe_path = fold_presence_flag(&flags, flags.safe_path, "PYTHONSAFEPATH");
     flags.dev_mode = fold_presence_flag(&flags, flags.dev_mode, "PYTHONDEVMODE");
+    // app_main.py run_command_line — the option, developer mode and the
+    // variable all reach the same install, and the variable takes the presence
+    // fold, so a `PYTHONFAULTHANDLER=0` enables it the way any other non-empty
+    // value does.  Folded after dev_mode so the variable spelling of that one
+    // carries here too.
+    flags.faulthandler = fold_presence_flag(
+        &flags,
+        flags.faulthandler || flags.dev_mode,
+        "PYTHONFAULTHANDLER",
+    );
     flags.inspect = fold_presence_flag(&flags, flags.inspect, "PYTHONINSPECT");
     // app_main.py:773-774 — the variable enables it on any non-empty value,
     // `0` included, the same way `-X warn_default_encoding` does.
@@ -284,6 +349,7 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     );
     flags.no_debug_ranges =
         fold_presence_flag(&flags, flags.no_debug_ranges, "PYTHONNODEBUGRANGES");
+    flags.pycache_prefix = resolve_pycache_prefix(&flags);
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {

@@ -20501,14 +20501,13 @@ mod tests {
     #[test]
     fn fstring_missing_comma_uses_recursive_expression_range() {
         assert_eq!(fstring_missing_comma_span("f'{6 0}'", 5), Some((3, 6)));
-        // A range whose end falls inside a multi-byte character is reported
-        // one character short, because `character_offset` counts the
-        // characters up to the byte the range ends at and a byte inside a
-        // scalar counts as the character before it.  The span is still worth
-        // projecting: `4, 6` under the message the recursive parse found
-        // beats `6, 7` under `f-string: expecting '}'`, which is what
-        // refusing it leaves behind.  3.14 answers `4, 7`.
-        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), Some((3, 6)));
+        // Byte indices, so this is `α` through `}`, which the caller reports
+        // as the character columns 4 and 7 that 3.14 answers.  The end used
+        // to land one byte inside `β` and round back off it, and the reason
+        // was the recursive parse's own span rather than the projection:
+        // `missing_comma_expression_error` measured the second atom as one
+        // byte wide.
+        assert_eq!(fstring_missing_comma_span("f'{α β}'", 7), Some((3, 8)));
         assert_eq!(
             fstring_missing_comma_span(
                 "f\"\"\"\n\n\n            {\n            6\n            0=\"\"\"",

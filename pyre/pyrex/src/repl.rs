@@ -42,6 +42,17 @@ struct ReplRuntime {
     sys_module: pyre_object::PyObjectRef,
 }
 
+/// The interpreter identification `app_main.py print_banner` heads both the
+/// prompt and a verbose non-interactive run with.
+pub(crate) const BANNER: &str = "pyre 0.0.1 (Rust meta-tracing JIT)";
+
+/// `print_banner`'s second line, carried by the run that has no prompt to
+/// suggest anything else. The prompt writes an exit hint there instead, so this
+/// one is not shared, but the names it offers are: they are `site`'s, which is
+/// why upstream gates the line on `not no_site`.
+pub(crate) const BANNER_COPYRIGHT: &str =
+    "Type \"help\", \"copyright\", \"credits\" or \"license\" for more information.";
+
 pub fn run_repl(quiet: bool, no_site: bool) {
     let mut repl = Readline::new();
     let history_path = repl_history_path();
@@ -107,7 +118,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     };
 
     if !quiet {
-        println!("pyre 0.0.1 (Rust meta-tracing JIT)");
+        println!("{BANNER}");
         println!("Type \"exit()\" or Ctrl-D to exit.");
     }
 

@@ -3121,8 +3121,11 @@ static SYS_DEV_MODE: AtomicBool = AtomicBool::new(false);
 static SYS_UTF8_MODE: AtomicI64 = AtomicI64::new(0);
 static SYS_SAFE_PATH: AtomicBool = AtomicBool::new(false);
 static SYS_OPTIMIZE: AtomicI64 = AtomicI64::new(0);
+static SYS_VERBOSE: AtomicI64 = AtomicI64::new(0);
+static SYS_DEBUG: AtomicI64 = AtomicI64::new(0);
 static SYS_BYTES_WARNING: AtomicI64 = AtomicI64::new(0);
 static SYS_DONT_WRITE_BYTECODE: AtomicBool = AtomicBool::new(false);
+static SYS_FAULTHANDLER: AtomicBool = AtomicBool::new(false);
 static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
 // pypy/interpreter/app_main.py keeps the raw `-X` strings in
 // `options['_xoptions']` (a list) until sys initialization builds the public
@@ -3134,6 +3137,8 @@ static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
 static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SYS_PYCACHE_PREFIX: LazyLock<Mutex<Option<std::ffi::OsString>>> =
+    LazyLock::new(|| Mutex::new(None));
 static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
 static SYS_CODE_DEBUG_RANGES: AtomicBool = AtomicBool::new(true);
 
@@ -3171,12 +3176,31 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
     SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);
+    SYS_VERBOSE.store(flags.verbose, Ordering::Relaxed);
+    SYS_DEBUG.store(flags.debug, Ordering::Relaxed);
     SYS_BYTES_WARNING.store(flags.bytes_warning, Ordering::Relaxed);
     SYS_DONT_WRITE_BYTECODE.store(flags.dont_write_bytecode, Ordering::Relaxed);
+    SYS_FAULTHANDLER.store(flags.faulthandler, Ordering::Relaxed);
+    *SYS_PYCACHE_PREFIX.lock().unwrap() = flags.pycache_prefix.clone();
     SYS_UNBUFFERED.store(flags.unbuffered, Ordering::Relaxed);
     *SYS_XOPTIONS.lock().unwrap() = flags.xoptions.clone();
     *SYS_WARNOPTIONS.lock().unwrap() = flags.warnoptions.clone();
     *SYS_STDIO_ENCODING.lock().unwrap() = flags.stdio_encoding.clone();
+}
+
+/// Whether the launcher resolved `-X faulthandler` / `-X dev` /
+/// PYTHONFAULTHANDLER, which asks for the fatal-signal handlers to be in place
+/// before user code runs.
+pub fn faulthandler_flag() -> bool {
+    SYS_FAULTHANDLER.load(Ordering::Relaxed)
+}
+
+/// The directory `-X pycache_prefix` / PYTHONPYCACHEPREFIX named, already
+/// resolved to `None` for every spelling that names no directory.  Read back as
+/// `sys.pycache_prefix`, which is what `_bootstrap_external.cache_from_source`
+/// computes the bytecode path from.
+pub fn pycache_prefix() -> Option<std::ffi::OsString> {
+    SYS_PYCACHE_PREFIX.lock().unwrap().clone()
 }
 
 /// Raw `-X` values recorded by the launcher, in command-line order.
@@ -3186,6 +3210,19 @@ pub fn xoptions() -> Vec<std::ffi::OsString> {
 
 pub fn bytes_warning_flag() -> i64 {
     SYS_BYTES_WARNING.load(Ordering::Relaxed)
+}
+
+/// `-v` / PYTHONVERBOSE, read back as `sys.flags.verbose`.  The import trace
+/// itself is emitted by `importlib._bootstrap`'s `_verbose_message`, which
+/// compares this against the verbosity a message asks for.
+pub fn verbose_flag() -> i64 {
+    SYS_VERBOSE.load(Ordering::Relaxed)
+}
+
+/// `-d` / PYTHONDEBUG as the config counts it.  `sys.flags.debug` saturates
+/// this to 0/1, because `parser_debug` is declared BOOL there.
+pub fn debug_flag() -> i64 {
+    SYS_DEBUG.load(Ordering::Relaxed)
 }
 
 /// CPython 3.14 `PyConfig.code_debug_ranges`, consumed by every compiler
