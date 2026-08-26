@@ -57,15 +57,19 @@
 //!
 //! # 2. What majit's runtime then does with those guards. This is the cost.
 //!
-//! Over a 4096-character non-matching input, the branching portal records:
+//! Over a 4096-character non-matching input, the two portals record:
 //!
 //! ```text
-//! guard failures 4080   bridges compiled 10   traces aborted 0
+//! branching  guard failures 4080   bridges compiled 10   traces aborted 0
+//! masking    guard failures    1   bridges compiled  0   traces aborted 0
 //! ```
 //!
-//! One guard failure per input character, and it stays one per character even
-//! though ten bridges get built. That is the shape of the finding: bridging
-//! works here, and it does not catch up.
+//! The masking portal is the control and it is the number to read first: over
+//! the same 4096 characters it leaves its compiled loop **once**. The
+//! branching portal leaves it 4080 times — one guard failure per input
+//! character — and it stays one per character even though ten bridges get
+//! built. That is the shape of the finding: bridging works here, and it does
+//! not catch up.
 //!
 //! The ten bridges are real machine code and they are entered. Before them
 //! every failure in the run reported `tid=1` — the one compiled loop. Now the
@@ -143,32 +147,38 @@
 //! # Throughput
 //!
 //! Median of 5 over 1048576 characters, one untimed warm-up first, all three
-//! rows measured in one process by one test, 1-minute load average 7.7 before
-//! and 8.2 after:
+//! rows measured in one process by one test. Three runs, one before the
+//! multi-frame bridge fix and two after it, each with the 1-minute load
+//! average it ran at — which is the only way these rows can be read:
 //!
 //! ```text
-//! masking, jit_interp      46,889,491 chars/s   (min 41,008,457  max 47,583,958)
-//! no JIT at all, interp     8,789,264 chars/s   (min  8,459,015  max  9,058,062)
-//! branching, this module       22,034 chars/s   (min     21,022  max     23,152)
-//! masking / branching            2128x
-//! no JIT  / branching             399x
+//!                        pre-fix        post-fix A      post-fix B
+//!   1-min load         7.7 -> 8.2      3.4 -> 50       34 -> 83
+//!   masking          46,889,491       17,327,682      17,382,474
+//!   no JIT at all     8,789,264        3,840,742       3,807,803
+//!   branching            22,034           10,154           9,407
+//!   masking / branching    2128x            1706x           1848x
+//!   no JIT  / branching     399x             378x            405x
 //! ```
 //!
-//! **That branching row predates the multi-frame bridge fix above and is a
-//! floor, not the current number.** It was taken when every bridge attempt
-//! gave up, so it measures the portal with no bridge available at all. The
-//! machine has been under load 30-120 since the fix landed, which is where an
-//! absolute row stops meaning anything, so the row stands as recorded with its
-//! own load stamp rather than being replaced by a worse measurement. The two
-//! ratios below it move with it.
+//! **All three absolute rows fell by about the same factor** — masking 2.7x,
+//! no-JIT 2.3x, branching 2.2x — which is what a loaded machine does to every
+//! row at once and is not what a code change does to one of them. The ratios,
+//! which are taken inside a single process and so survive that, did not move:
+//! the verdict row reads 378x and 405x after the fix against 399x before it.
 //!
-//! What DID get measured after the fix is the in-process ratio the suite runs
-//! on every invocation, at 4096 characters, which is the quantity that
-//! survives a loaded machine because both rows are timed in the same process.
-//! It was 66x, 68x and 89x on dynasm before the fix; four runs after it, at
-//! 1-minute load 33 to 36, read 32x, 35x, 50x and 51x. The band moved and does
-//! not overlap, which is the direction the ten bridges predict; the spread
-//! inside it is the load, and neither band is a number to quote to two digits.
+//! So the fix does not show up here, and the reason is the bridge arithmetic
+//! above: `trace_eagerness` is 200, a 1M-character pass can grow at most a few
+//! thousand bridges, and the mark pattern has far more states than that. The
+//! branching portal stays about 400x slower than running the same algorithm
+//! with no JIT under it at all.
+//!
+//! The in-process ratio the suite runs on every invocation, at 4096
+//! characters, is the one quantity that did move: 66x, 68x and 89x on dynasm
+//! before the fix; four runs after it, at 1-minute load 33 to 36, read 32x,
+//! 35x, 50x and 51x. The band moved and does not overlap, which is the
+//! direction the ten bridges predict; the spread inside it is the load, and
+//! neither band is a number to quote to two digits.
 //!
 //! The third row is what turns "slower" into a verdict, and the fix does not
 //! overturn it. The branching portal does not merely give back the JIT's win
@@ -177,8 +187,8 @@
 //! still pays an interpreter round trip the plain matcher never pays. "Not
 //! particularly fast" is, here, orders of magnitude.
 //!
-//! Those are three rows of one process, which is what makes the two ratios
-//! worth quoting: the machine was not idle, and a ratio taken inside one run
+//! Each column is three rows of one process, which is what makes the ratios
+//! worth quoting: the machine was never idle, and a ratio taken inside one run
 //! survives that where an absolute row does not. Earlier runs of the same
 //! source at higher load read 1716x, 1579x and 2336x — the branching row is
 //! the load-sensitive one and moves by up to 1.7x, while the finding does not.
@@ -371,8 +381,8 @@ pub static GUARD_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// times per run, and never on the path a character takes. This one fires on
 /// every deopt, so leaving it installed would put an instrument inside the very
 /// quantity the timing row measures. It is therefore installed per call, and
-/// the timed rows run with it off, which is also what makes them comparable to
-/// `jit_interp`'s portal (that one installs the loop callback and nothing else).
+/// the timed rows run with it off — `jit_interp`'s portal gates its own the
+/// same way, which is what keeps the two portals' timed rows comparable.
 pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// The last run's aborts split by `Counters.ABORT_*` reason, indexed as
@@ -587,23 +597,26 @@ mod tests {
 
     /// The same, for the masking portal next door.
     ///
-    /// `bridges` / `aborts` / `guard_failures` come back `None` because
-    /// `jit_interp::mainloop` installs `set_on_compile_loop` and nothing else.
-    /// Three `driver.set_on_*` lines there would answer them; that file belongs
-    /// to another change, so this side reports "not measured" rather than
-    /// implying zero.
+    /// It carries the same four counters, so this side is a control that
+    /// answers rather than one that reports "not measured": whatever the
+    /// branching portal's numbers mean, they mean it against these.
     fn measure_masking(root: *mut NodeRec, s: &[u8]) -> Run {
         use crate::jit_interp;
         let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         jit_interp::COMPILES.store(0, Ordering::Relaxed);
+        jit_interp::BRIDGES.store(0, Ordering::Relaxed);
+        jit_interp::ABORTS.store(0, Ordering::Relaxed);
+        jit_interp::GUARD_FAILURES.store(0, Ordering::Relaxed);
+        jit_interp::GUARD_FAILURE_PROBE.store(true, Ordering::Relaxed);
         jit_interp::LAST_BODY.lock().unwrap().clear();
         let matched = jit_interp::matches(root, s, 3);
+        jit_interp::GUARD_FAILURE_PROBE.store(false, Ordering::Relaxed);
         Run {
             matched,
             compiles: jit_interp::COMPILES.load(Ordering::Relaxed),
-            bridges: None,
-            aborts: None,
-            guard_failures: None,
+            bridges: Some(jit_interp::BRIDGES.load(Ordering::Relaxed)),
+            aborts: Some(jit_interp::ABORTS.load(Ordering::Relaxed)),
+            guard_failures: Some(jit_interp::GUARD_FAILURES.load(Ordering::Relaxed)),
             body: peeled(jit_interp::LAST_BODY.lock().unwrap().clone()),
         }
     }
@@ -711,8 +724,12 @@ mod tests {
             census(&sc.body),
         );
         println!(
-            "[shortcircuit] {nodes} nodes, masking  : {} loop(s), per character: {}",
+            "[shortcircuit] {nodes} nodes, masking  : {} loop(s), {:?} bridge(s), \
+             {:?} abort(s), {:?} guard failure(s), per character: {}",
             mk.compiles,
+            mk.bridges,
+            mk.aborts,
+            mk.guard_failures,
             census(&mk.body),
         );
 
@@ -725,6 +742,25 @@ mod tests {
             degraded(),
         );
         assert!(mk.compiles > 0, "the masking portal compiled nothing");
+        // The control, and the single number this whole comparison rests on:
+        // the masking portal leaves its compiled loop ONE time over the same
+        // 4096 characters, where the branching portal leaves it 4080. Without
+        // this the branching row is just a slow number; with it, the two rows
+        // differ by whether the compiled code is what runs.
+        let mk_failures = mk.guard_failures.expect("the probe was installed");
+        assert!(
+            mk_failures * 100 < s.len(),
+            "the masking portal deopted {mk_failures} times over {} characters, \
+             so it is not the stays-in-compiled-code control the branching \
+             portal is being measured against",
+            s.len(),
+        );
+        assert_eq!(
+            mk.bridges,
+            Some(0),
+            "the masking portal grew a bridge, so its guards fail too and it \
+             is no longer the control",
+        );
         assert_eq!(
             degraded(),
             Vec::new(),
@@ -923,13 +959,15 @@ mod tests {
     /// so a mean reports a run that never happened and a rerun does not
     /// reproduce it.
     ///
-    /// `#[ignore]`d: at 27k chars/s the branching portal needs about 38
+    /// `#[ignore]`d: at 10k chars/s the branching portal needs about 100
     /// seconds per pass, six of them counting the warm-up, and the two fast
-    /// rows add about two seconds. Measured end to end at 236s.
+    /// rows add a second. Measured end to end at 547s and 694s, on a machine
+    /// at 1-minute load 3 and 34 — which is most of the difference between
+    /// those two, and is why the doc table stamps the load on every column.
     /// `cargo test -p regex --release --no-default-features --features dynasm \
     /// -- --ignored --nocapture the_branching_body_is_timed_at_the_full_length`
     #[test]
-    #[ignore = "~4 minutes: the branching portal scans 1M characters in ~38s"]
+    #[ignore = "~10 minutes: the branching portal scans 1M characters in ~100s"]
     fn the_branching_body_is_timed_at_the_full_length() {
         let s = nonmatching(TIMED_CHARS, 20, 42);
         let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

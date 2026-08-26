@@ -11,7 +11,12 @@
 //! * `#[jit_interp]` drives a bytecode portal, so the loop over the input is
 //!   spelled as a three-instruction program whose back edge closes at `pc = 0`.
 //!   `pc` and `program` are the greens and both are constant there, so the
-//!   whole input is one green key and one trace.
+//!   whole input is one green key and one trace. That spelling is a tax, not a
+//!   feature of the algorithm: the macro looks for an opcode dispatch `match`
+//!   in the portal loop and errors with `could not find opcode dispatch match`
+//!   without one, so a portal whose loop is a plain `while` over an input has
+//!   to invent a program for it. Letting a matchless portal lower is a
+//!   standing majit follow-up; nothing here is blocked on it.
 //! * The regex root is a red `ref(NodeRec)` promoted once per iteration. The
 //!   promote is what makes the root a `ConstPtr`; the `_immutable_fields_`
 //!   declaration on `NodeRec` is what makes every read below it fold, so the
@@ -132,6 +137,26 @@ struct MatchState {
 pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static LAST_OPS_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static LAST_BODY: std::sync::Mutex<Vec<majit_ir::OpCode>> = std::sync::Mutex::new(Vec::new());
+/// Bridges compiled, aborts, and guard failures.
+///
+/// This portal has the same four counters as `shortcircuit`'s for one reason:
+/// the branching module's whole finding is a comparison against this one, and
+/// a side that reports "not measured" cannot be the control. A control that
+/// answers zero is a result; a control that answers `None` is an omission.
+pub static BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Guard failures, counted only while [`GUARD_FAILURE_PROBE`] is set.
+pub static GUARD_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether [`mainloop`] installs the guard-failure callback at all.
+///
+/// The other three fire on compile and abort events, a handful of times per
+/// run and never on the path a character takes. This one fires on every deopt,
+/// so leaving it installed would put an instrument inside the quantity the
+/// timing rows measure. It is installed per call, and the timed rows run with
+/// it off — the same discipline `shortcircuit` uses, which is what keeps the
+/// two portals' timed rows comparable to each other.
+pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[majit_macros::jit_interp(
     state = MatchState,
@@ -166,12 +191,24 @@ fn mainloop(
     len: i64,
     first: i64,
 ) -> i64 {
+    use std::sync::atomic::Ordering::Relaxed;
     let mut driver: JitDriver<MatchState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, ops_after, opcodes| {
-        COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);
+        COMPILES.fetch_add(1, Relaxed);
+        LAST_OPS_AFTER.store(ops_after, Relaxed);
         *LAST_BODY.lock().unwrap() = opcodes.to_vec();
     });
+    driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
+        BRIDGES.fetch_add(1, Relaxed);
+    });
+    driver.set_on_trace_abort(|_gk, _permanent| {
+        ABORTS.fetch_add(1, Relaxed);
+    });
+    if GUARD_FAILURE_PROBE.load(Relaxed) {
+        driver.set_on_guard_failure(|_gk, _trace_id, _fail_index| {
+            GUARD_FAILURES.fetch_add(1, Relaxed);
+        });
+    }
     let mut pc: usize = 0;
     let mut state = MatchState {
         root,

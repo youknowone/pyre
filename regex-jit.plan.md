@@ -508,16 +508,20 @@ would be a mis-report.
 
 * Regex size is bounded by the 6000-op trace limit. `n = 20` is 93 nodes, well
   inside it.
-* `lower_call_value` reads `config.call_returns` in only the `ResidualRef` and
-  `NurseryAllocRef` arms; every `*Wrapped` arm, including the
-  `ElidableRef*Wrapped` family, falls through to a tail returning
-  `struct_type: None`. That closes the elidable-accessor route to constant node
-  addresses. It is **not** on this plan's critical path — Stage 1 uses immutable
-  fields instead — so record it as a separate finding; the fix is a ~5-line hoist
-  of that lookup into the shared tail.
-* `#[jit_interp]` requires a `match`. A one-instruction portal satisfies it with
-  a single-arm `match opcode`. Note the shape tax in the example header and file
-  "let a matchless portal lower" as a separate follow-up.
+* ~~`lower_call_value` reads `config.call_returns` in only the `ResidualRef` and
+  `NurseryAllocRef` arms; every `*Wrapped` arm falls through to a tail returning
+  `struct_type: None`.~~ **Closed** (`f47e7c32fbb`, `4bfc01c34aa`): the shared
+  tail now attaches `declared_return_struct(func)` for a `BindingKind::Ref`
+  result, so every `*_ref_wrapped` policy carries the same `struct_type` the two
+  early-returning arms did. It was off this plan's critical path — Stage 1 uses
+  immutable fields — and it was fixed anyway, because a ref binding with no
+  `struct_type` degrades its WHOLE dispatch arm to an abort stub while the
+  concrete path keeps returning the right answer.
+* `#[jit_interp]` requires a `match` — `codegen_trace.rs` errors with `could not
+  find opcode dispatch match` without one — so a portal whose loop is a plain
+  `while` has to invent a program for it. **Noted** in `jit_interp.rs`'s module
+  doc; "let a matchless portal lower" stands as a majit follow-up, and nothing
+  in this plan is blocked on it. Still open.
 
 ## Rejected alternatives
 
@@ -1772,7 +1776,11 @@ it, identically on both backends:
 | 32,768 | 32,676 | 84 |
 
 8.0x the failures, 8.4x the bridges, and 0.997 failures per character at both
-lengths. `trace_eagerness` is 200, so one guard must fail 200 times to be worth
+lengths. The masking portal — the same input, the same tree, the counters now
+wired on that side too — answers **1 guard failure, 0 bridges** over the same
+4096 characters, which is what makes 4080 a verdict rather than a large number.
+
+`trace_eagerness` is 200, so one guard must fail 200 times to be worth
 a bridge and a pass of `n` characters can grow at most about `n / 200` of them
 however many mark patterns the tree has. Bridging is not converging on the
 pattern and stopping; it is trailing it at a fixed rate the deopt outruns.
@@ -1851,4 +1859,10 @@ The post's other experiments:
   loop's own.
 * **`&&`/`||` instead of `&`/`|`.** Measured, and the post's claim holds by a
   different mechanism than it states — see the module doc of `shortcircuit.rs`
-  and the bridge section above.
+  and the bridge section above. Re-measured after the bridge fix, twice, at
+  1M characters: masking / branching 1706x and 1848x, no-JIT / branching 378x
+  and 405x, against 2128x and 399x before the fix. All three absolute rows fell
+  by about the same factor (2.2-2.7x) between those runs because the machine
+  went from load 8 to load 34-83; the ratios, taken inside one process, did
+  not. The branching portal stays about 400x slower than the same algorithm
+  with no JIT under it, which is the verdict the module doc reports.
