@@ -1656,7 +1656,7 @@ fn derive_program_metadata(
                 // `enum_variant_by_discriminant` (kept below) supplies the
                 // switch-arm discr→name mapping — both independent of the
                 // base ClassDef.
-                let fieldless = variants.iter().all(|v| v.fields.is_empty());
+                let fieldless = type_decl_is_fieldless_enum(td, llbc);
                 let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
                 if !fieldless {
                     let rows: Vec<(String, String)> =
@@ -6222,6 +6222,32 @@ impl<'a> Lowering<'a> {
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
                         return self.resolve_place(mir_bb, *inner);
                     }
+                    // A zero-sized field has no runtime representation, so a
+                    // projection from a payload-free enum reads no bytes.
+                    // Give the projected value the `Void` kind rather than
+                    // materialising it in a value bank.  `getkind(lltype.Void)`
+                    // is `'void'`, and both `NON_VOID_ARGS`
+                    // (`call.py:220-221`) and `add_in_correct_list`
+                    // (`jtransform.py:449`) drop a void argument, so the value
+                    // takes neither a calldescr `arg_classes` slot nor an
+                    // argument-bank entry.  That is what the callee's machine
+                    // ABI expects: a zero-sized parameter occupies no argument
+                    // register, so declaring a slot for it would shift every
+                    // later argument by one register at the residual-call
+                    // boundary.  A bank-classified value would take that slot —
+                    // `Ref` is what an opaque zero-sized ADT falls back to.
+                    // No defining operation, matching the bare
+                    // `Constant(None, lltype.Void)` the argument lists skip.
+                    // Keep this collapse scoped to a fieldless-enum base: a
+                    // zero-sized field in any other aggregate retains that
+                    // aggregate's ordinary field model.
+                    if self.tyref_is_fieldless_enum(&inner.ty)
+                        || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
+                    {
+                        return Ok(self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void));
+                    }
                     // Narrow a classdef-less raw-pointer-deref base to
                     // `SomeInstance(<pointee root>)` before the field read.
                     // A `(*p).field` where `p: *mut/*const <Struct>` deref's to
@@ -6872,7 +6898,7 @@ impl<'a> Lowering<'a> {
         let TypeDeclKind::Enum(variants) = &td.kind else {
             return None;
         };
-        if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+        if !type_decl_is_fieldless_enum(td, self.llbc) {
             return None;
         }
         variants.get(variant_idx)?.discriminant_i64()
@@ -10165,10 +10191,7 @@ impl<'a> Lowering<'a> {
                         .as_ref()
                         .and_then(|t| self.tyref_ref_adt_def_id(t))
                         .and_then(|id| self.llbc.type_by_id(id))
-                        .is_some_and(|td| {
-                            matches!(&td.kind, TypeDeclKind::Enum(vs)
-                                if !vs.is_empty() && vs.iter().all(|v| v.fields.is_empty()))
-                        });
+                        .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc));
                     if pointee_fieldless {
                         self.local_var[dest_local] = Some(args[0].clone());
                         let target_bb = self.block_id[target];
@@ -14753,7 +14776,7 @@ impl<'a> Lowering<'a> {
     fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(type_decl_is_fieldless_enum)
+            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
     /// [`Self::tyref_is_fieldless_enum`] through a `&` borrow — the shape a
@@ -14764,7 +14787,7 @@ impl<'a> Lowering<'a> {
     fn tyref_is_borrowed_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_ref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(type_decl_is_fieldless_enum)
+            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option`:
@@ -16434,12 +16457,16 @@ impl<'a> Lowering<'a> {
         let TypeDeclKind::Enum(variants) = &td.kind else {
             return false;
         };
-        variants.iter().all(|variant| variant.fields.is_empty())
-            && td
-                .layout_for_target("")
-                .and_then(|l| l.discriminant_offset())
-                .unwrap_or(0)
-                == 0
+        variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .all(|f| tyref_is_zero_sized(&f.ty, self.llbc))
+        }) && td
+            .layout_for_target("")
+            .and_then(|l| l.discriminant_offset())
+            .unwrap_or(0)
+            == 0
     }
 
     /// The resolved JSON body of a [`TyRef`], following the dedup
@@ -19963,6 +19990,22 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
 }
 
+/// Whether `ty` resolves to a type Charon's resolved layout reports as
+/// zero-sized on every target it emitted.  A zero-sized field occupies no
+/// bytes of its owner, so an enum whose every variant field is zero-sized
+/// has no payload at all and is the same by-value tag integer a
+/// syntactically fieldless enum is.
+fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
+    let def_id = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
+    };
+    def_id
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .and_then(|td| td.layout_for_target(""))
+        .is_some_and(|layout| layout.size == Some(0))
+}
+
 /// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
 /// standalone [`tyref_to_value_type`] helper (which holds no `Lowering`):
 /// `true` when `ty` resolves to an enum with at least one variant and
@@ -20026,7 +20069,7 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
         return peeled_a_ref
             && inline_adt_def_id(v)
                 .and_then(|def_id| llbc.type_by_id(def_id))
-                .is_some_and(type_decl_is_fieldless_enum);
+                .is_some_and(|td| type_decl_is_fieldless_enum(td, llbc));
     }
 }
 
@@ -20121,7 +20164,7 @@ fn tyref_fieldless_enum_def<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDe
         TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
     }?;
     llbc.type_by_id(def_id)
-        .filter(|td| type_decl_is_fieldless_enum(td))
+        .filter(|td| type_decl_is_fieldless_enum(td, llbc))
 }
 
 /// The integer-comparison `BinOp` opname a derived `PartialEq` method on
@@ -20138,13 +20181,17 @@ fn fieldless_enum_cmp_binop(method: &str) -> Option<&'static str> {
 }
 
 /// Whether a `TypeDecl` is a fieldless (C-like) enum: at least one
-/// variant, every variant carrying zero payload fields.  Such an enum is
-/// modelled by-value as its discriminant integer, so it has no
-/// `SomeInstance` at all.
-fn type_decl_is_fieldless_enum(td: &TypeDecl) -> bool {
+/// variant, every variant carrying zero payload bytes (no fields, or only
+/// zero-sized ones).  A zero-sized field occupies no bytes in the enum, so
+/// it is not a payload.  Such an enum is modelled by-value as its
+/// discriminant integer, so it has no `SomeInstance` at all.
+fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
     match &td.kind {
         TypeDeclKind::Enum(variants) => {
-            !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
+            !variants.is_empty()
+                && variants
+                    .iter()
+                    .all(|v| v.fields.iter().all(|f| tyref_is_zero_sized(&f.ty, llbc)))
         }
         _ => false,
     }
@@ -25987,7 +26034,7 @@ fn debug_enum_variants_by_discr(llbc: &Llbc, owner_root: &str) -> Option<Vec<(i6
     let TypeDeclKind::Enum(variants) = &td.kind else {
         return None;
     };
-    if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+    if !type_decl_is_fieldless_enum(td, llbc) {
         return None; // not fieldless
     }
     let by_discr: Vec<(i64, String)> = variants
