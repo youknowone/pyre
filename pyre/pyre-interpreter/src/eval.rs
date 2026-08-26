@@ -2263,6 +2263,14 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         {
             pyre_object::gc_interp::safepoint();
         }
+        // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
+        // execute this plain evaluator (their JitDriver state is thread-owned),
+        // so they must poll the same process breaker as compiled/JIT-warm
+        // loops; otherwise a non-allocating Python loop can prevent collection
+        // and fork/finalization STW forever.
+        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
+            majit_gc::gc_sync::safepoint_poll();
+        }
         // A bounded major collection that reached `max_heap_size` owes a
         // `MemoryError` — incminimark.py `major_collection_step` raises one
         // there, and the safepoint above is where the interpreter path's
@@ -2277,20 +2285,17 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // to reach. `take_memory_error` opens with a relaxed load and returns
         // on it, so the ordinary dispatch pays that load and a branch against a
         // word it just touched.
+        //
+        // After the park above, not before it: `handle_exception` runs Python
+        // and allocates, and both bits can be armed at once — this thread's
+        // own breach and another thread's STW request. Delivering first would
+        // run a handler through a world the collector has asked to stop.
         if majit_ir::eval_breaker_word::take_memory_error() {
             let mut err = crate::PyError::memory_error("");
             if handle_exception(frame, &mut err, &mut next_instr) {
                 continue;
             }
             return Err(err);
-        }
-        // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
-        // execute this plain evaluator (their JitDriver state is thread-owned),
-        // so they must poll the same process breaker as compiled/JIT-warm
-        // loops; otherwise a non-allocating Python loop can prevent collection
-        // and fork/finalization STW forever.
-        if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
-            majit_gc::gc_sync::safepoint_poll();
         }
 
         if next_instr >= code.instructions.len() {
