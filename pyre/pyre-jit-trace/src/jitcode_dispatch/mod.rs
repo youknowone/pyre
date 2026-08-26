@@ -8474,6 +8474,18 @@ fn walker_guard_int_exact_as_float<Sym: WalkSym>(
 /// A float arithmetic operand legitimately rounds (`space.float_w`), but a
 /// comparison is decided against the int's exact value (`_compare`), so only
 /// the compare specialization sets it.
+///
+/// The int arm pins `w_class` here rather than leaving it to the caller.  The
+/// unbox proves `ob_type`, which an `int` subclass shares with `int`, while
+/// every gate that admits one of these folds read `w_class`; without the pin a
+/// trace recorded on an exact int keeps answering for a subclass whose
+/// `__float__` returns something else.  Making it part of the coercion is what
+/// keeps the obligation from being restated — and forgotten — per arm.
+/// The float arm carries no pin: reading a `float` subclass's payload is what
+/// `try_get_double` does too, so the coerced value is the one the builtin would
+/// have seen.  An operation that instead *dispatches* on the operand's class
+/// (`space.add`, `space.lt`) needs the float arm pinned as well and takes
+/// [`walker_coerce_dispatching_operand_to_float`].
 fn walker_coerce_operand_to_float<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8498,6 +8510,31 @@ fn walker_coerce_operand_to_float<Sym: WalkSym>(
     };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(val));
+    if is_int {
+        walker_guard_exact_w_class(ctx, op_pc, obj, walker_numeric_builtin_class(concrete_obj))?;
+    }
+    Ok(raw)
+}
+
+/// [`walker_coerce_operand_to_float`] for an operation that dispatches on the
+/// operand's Python-level class instead of only reading its payload.  A `float`
+/// subclass overriding `__add__` / `__lt__` reaches a different implementation
+/// than the one recorded, and the unbox proves only `ob_type`, so pin `w_class`
+/// on that arm too.
+fn walker_coerce_dispatching_operand_to_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    is_int: bool,
+    val: f64,
+    exact_int: bool,
+) -> Result<OpRef, DispatchError> {
+    let raw =
+        walker_coerce_operand_to_float(ctx, op_pc, obj, concrete_obj, is_int, val, exact_int)?;
+    if !is_int {
+        walker_guard_exact_w_class(ctx, op_pc, obj, walker_numeric_builtin_class(concrete_obj))?;
+    }
     Ok(raw)
 }
 
