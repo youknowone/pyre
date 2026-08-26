@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=hot
 # A global trace function installs `sys.setprofile()` from the loop frame's own
 # `call` event, so the frame is already past every gate that decides how it will
 # run by the time it becomes profiled.
