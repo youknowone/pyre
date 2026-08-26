@@ -878,13 +878,25 @@ fn memoryview_pack_value(
     itemsize: usize,
     w_val: PyObjectRef,
 ) -> Result<Vec<u8>, crate::PyError> {
+    // `type_error_int` / `value_error_int` — the wrong kind of object and a
+    // value the format cannot hold are reported separately.
     let bad_type =
         || crate::PyError::type_error(format!("memoryview: invalid type for format '{fmt}'"));
+    let bad_value =
+        || crate::PyError::value_error(format!("memoryview: invalid value for format '{fmt}'"));
+    // `fix_error_int` — a failed coercion is restated as the format's own
+    // error; anything that is neither a type nor a range complaint keeps its
+    // own identity.
+    let fix_error = |err: crate::PyError| match err.kind {
+        crate::PyErrorKind::TypeError => bad_type(),
+        crate::PyErrorKind::OverflowError | crate::PyErrorKind::ValueError => bad_value(),
+        _ => err,
+    };
+    // `err_range`.
     let range = |v: i64, lo: i64, hi: i64| -> Result<(), crate::PyError> {
-        if (lo..=hi).contains(&v) {
-            Ok(())
-        } else {
-            Err(bad_type())
+        match (lo..=hi).contains(&v) {
+            true => Ok(()),
+            false => Err(bad_value()),
         }
     };
     // Integer formats coerce via `__index__` (`pack_single`/`PyNumber_Index`),
@@ -893,15 +905,11 @@ fn memoryview_pack_value(
         if unsafe { pyre_object::is_int_or_long(w_val) } {
             Ok(w_val)
         } else {
-            match unsafe { crate::baseobjspace::space_index(w_val) } {
-                Ok(index) => Ok(index),
-                Err(err) if err.kind == crate::PyErrorKind::TypeError => Err(bad_type()),
-                Err(err) => Err(err),
-            }
+            unsafe { crate::baseobjspace::space_index(w_val) }.map_err(fix_error)
         }
     };
     let int_val = || -> Result<i64, crate::PyError> {
-        crate::baseobjspace::int_w(as_index()?).map_err(|_| bad_type())
+        crate::baseobjspace::int_w(as_index()?).map_err(fix_error)
     };
     let bytes = match memoryview_format_code(fmt) {
         b'b' => {
@@ -939,34 +947,21 @@ fn memoryview_pack_value(
             v.to_ne_bytes().to_vec()
         }
         b'L' | b'Q' | b'N' | b'P' => {
-            let v = crate::baseobjspace::uint_w(as_index()?).map_err(|_| bad_type())?;
+            let v = crate::baseobjspace::uint_w(as_index()?).map_err(fix_error)?;
             v.to_ne_bytes().to_vec()
         }
         b'f' => {
             // `PackFormatIterator.accept_float_arg`: use `space.float_w`,
-            // including a user `__float__`; only TypeError becomes the
-            // memoryview format error and other user exceptions propagate.
-            let v = match crate::baseobjspace::float_w(w_val) {
-                Ok(value) => value,
-                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
-                Err(err) => return Err(err),
-            } as f32;
+            // including a user `__float__`; other user exceptions propagate.
+            let v = crate::baseobjspace::float_w(w_val).map_err(fix_error)? as f32;
             v.to_ne_bytes().to_vec()
         }
         b'd' => {
-            let v = match crate::baseobjspace::float_w(w_val) {
-                Ok(value) => value,
-                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
-                Err(err) => return Err(err),
-            };
+            let v = crate::baseobjspace::float_w(w_val).map_err(fix_error)?;
             v.to_ne_bytes().to_vec()
         }
         b'e' => {
-            let v = match crate::baseobjspace::float_w(w_val) {
-                Ok(value) => value,
-                Err(err) if err.kind == crate::PyErrorKind::TypeError => return Err(bad_type()),
-                Err(err) => return Err(err),
-            };
+            let v = crate::baseobjspace::float_w(w_val).map_err(fix_error)?;
             crate::module::r#struct::pack_half(v)?
                 .to_ne_bytes()
                 .to_vec()
