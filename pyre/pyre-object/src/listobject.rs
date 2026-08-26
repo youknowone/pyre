@@ -3191,9 +3191,11 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
             for &v in items {
                 let _ = crate::gc_roots::pin_root(w_int_new(v));
             }
-            (0..items.len())
-                .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-                .collect()
+            let mut objects = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
+            }
+            objects
         }
         ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => {
@@ -3203,9 +3205,11 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
             for &v in items {
                 let _ = crate::gc_roots::pin_root(w_float_new(v));
             }
-            (0..items.len())
-                .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-                .collect()
+            let mut objects = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
+            }
+            objects
         }
         ListStrategy::Bytes => {
             // The wraps allocate, so the list has to be reachable by slot for

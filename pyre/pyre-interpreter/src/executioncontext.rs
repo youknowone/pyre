@@ -1672,10 +1672,11 @@ impl ExecutionContext {
         // Enumerating a dict materialises key objects and can collect.  Keep
         // only owned key strings across that operation; raw values must be
         // looked up again after the module allocation.
-        let keys: Vec<String> = unsafe { pyre_object::w_dict_str_entries(self.builtins_module) }
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        let entries = unsafe { pyre_object::w_dict_str_entries(self.builtins_module) };
+        let mut keys = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            keys.push(key);
+        }
         let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
         // function.py BuiltinFunction.w_moduleobj. The defining
         // module object does not exist while `new_builtin_module_dict` fills

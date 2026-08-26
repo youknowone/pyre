@@ -3641,9 +3641,10 @@ unsafe fn pull_iterator_tuple(
             Err(e) => return Err(e),
         }
     }
-    let items: Vec<PyObjectRef> = (0..n)
-        .map(|k| pyre_object::gc_roots::shadow_stack_get(base + k))
-        .collect();
+    let mut items = Vec::with_capacity(n);
+    for index in 0..n {
+        items.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+    }
     Ok(Some(items))
 }
 
@@ -9616,7 +9617,7 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     }
     // typeobject.py:288-291 — walk direct subclasses recursively.
     let subs = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
-    for w_sub in subs {
+    for &w_sub in &subs {
         mutated(w_sub, key);
     }
 }
@@ -14966,9 +14967,13 @@ fn _unpackiterable_known_length_jitlook(
             got = count,
         )));
     }
-    Ok((0..count)
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index))
-        .collect())
+    let mut items = Vec::with_capacity(count);
+    for index in 0..count {
+        items.push(pyre_object::gc_roots::shadow_stack_get(
+            root_base + 1 + index,
+        ));
+    }
+    Ok(items)
 }
 
 /// pypy/interpreter/baseobjspace.py:1159-1163 base default + the
@@ -15528,7 +15533,10 @@ unsafe fn builtin_iter_override(
         )));
     }
     let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
-    iter_check_is_iterator(w_iter).map(Some)
+    match iter_check_is_iterator(w_iter) {
+        Ok(w_iter) => Ok(Some(w_iter)),
+        Err(err) => Err(err),
+    }
 }
 
 /// `iter(obj)` — PyPy: space.iter(w_obj)
@@ -16450,10 +16458,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     }
                 }
             }
-            let items = item_slots
-                .into_iter()
-                .map(pyre_object::gc_roots::shadow_stack_get)
-                .collect();
+            let mut items = Vec::with_capacity(item_slots.len());
+            for slot in item_slots {
+                items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+            }
             return Ok(pyre_object::w_tuple_new(items));
         }
         // itertools.product — PyPy W_Product.fill_next_result /
@@ -16498,12 +16506,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let initial = pyre_object::w_list_new(
-                    item_slots
-                        .into_iter()
-                        .map(pyre_object::gc_roots::shadow_stack_get)
-                        .collect(),
-                );
+                let mut initial_items = Vec::with_capacity(item_slots.len());
+                for slot in item_slots {
+                    initial_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+                }
+                let initial = pyre_object::w_list_new(initial_items);
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 (*(w_self as *mut pyre_object::interp_itertools::W_Product)).lst = initial;
                 pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
@@ -16575,12 +16582,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            return Ok(pyre_object::w_tuple_new(
-                result_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            let mut result = Vec::with_capacity(result_slots.len());
+            for slot in result_slots {
+                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
+            }
+            return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.combinations — PyPy W_Combinations.descr_next.
         if pyre_object::interp_itertools::is_combinations(obj) {
@@ -16618,12 +16624,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                pyre_object::w_list_new(
-                    item_slots
-                        .into_iter()
-                        .map(pyre_object::gc_roots::shadow_stack_get)
-                        .collect(),
-                )
+                let mut items = Vec::with_capacity(item_slots.len());
+                for slot in item_slots {
+                    items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+                }
+                pyre_object::w_list_new(items)
             } else {
                 // Copy the previous result before mutating, exactly as
                 // `result_w = self.last_result_w[:]`.
@@ -16634,12 +16639,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let result = pyre_object::w_list_new(
-                    old_item_slots
-                        .into_iter()
-                        .map(pyre_object::gc_roots::shadow_stack_get)
-                        .collect(),
-                );
+                let mut old_items = Vec::with_capacity(old_item_slots.len());
+                for slot in old_item_slots {
+                    old_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+                }
+                let result = pyre_object::w_list_new(old_items);
                 let result = pyre_object::gc_roots::pin_root(result);
                 let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
@@ -16727,12 +16731,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            return Ok(pyre_object::w_tuple_new(
-                result_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            let mut result = Vec::with_capacity(result_slots.len());
+            for slot in result_slots {
+                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
+            }
+            return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.combinations_with_replacement — PyPy
         // W_CombinationsWithReplacement.descr_next inherits the combinations
@@ -16775,12 +16778,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                pyre_object::w_list_new(
-                    item_slots
-                        .into_iter()
-                        .map(pyre_object::gc_roots::shadow_stack_get)
-                        .collect(),
-                )
+                let mut items = Vec::with_capacity(item_slots.len());
+                for slot in item_slots {
+                    items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+                }
+                pyre_object::w_list_new(items)
             } else {
                 let mut old_item_slots = Vec::with_capacity(r);
                 for i in 0..r {
@@ -16789,12 +16791,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let result = pyre_object::w_list_new(
-                    old_item_slots
-                        .into_iter()
-                        .map(pyre_object::gc_roots::shadow_stack_get)
-                        .collect(),
-                );
+                let mut old_items = Vec::with_capacity(old_item_slots.len());
+                for slot in old_item_slots {
+                    old_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+                }
+                let result = pyre_object::w_list_new(old_items);
                 let result = pyre_object::gc_roots::pin_root(result);
                 let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
@@ -16867,12 +16868,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            return Ok(pyre_object::w_tuple_new(
-                result_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            let mut result = Vec::with_capacity(result_slots.len());
+            for slot in result_slots {
+                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
+            }
+            return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.permutations — PyPy W_Permutations.descr_next.
         if pyre_object::interp_itertools::is_permutations(obj) {
@@ -16913,12 +16913,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            let result = pyre_object::w_tuple_new(
-                result_item_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            );
+            let mut result_items = Vec::with_capacity(result_item_slots.len());
+            for slot in result_item_slots {
+                result_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
+            }
+            let result = pyre_object::w_tuple_new(result_items);
             let _ = pyre_object::gc_roots::pin_root(result);
             let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 

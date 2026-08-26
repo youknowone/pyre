@@ -738,8 +738,8 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
         let dict = pyre_object::gc_roots::pin_root(dict);
         let source = pyre_object::gc_roots::pin_root(source);
         let key_base = sp + 2;
-        for key in keys {
-            let _ = pyre_object::gc_roots::pin_root(key);
+        for index in 0..keys.len() {
+            let _ = pyre_object::gc_roots::pin_root(keys[index]);
         }
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
         for i in 0..key_len {
