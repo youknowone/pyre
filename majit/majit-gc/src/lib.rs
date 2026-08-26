@@ -912,9 +912,6 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// Free memory associated with invalidated JIT compiled code.
-    fn jit_free(&mut self, _code_ptr: usize, _size: usize) {}
-
     /// Pin a nursery object so it won't move during minor collection.
     /// Returns true if pinning succeeded.
     fn pin(&mut self, _obj: GcRef) -> bool {
@@ -1439,9 +1436,6 @@ impl GcAllocator for GcHandle {
     fn gc_step(&mut self) -> bool {
         gc_sync::gc_op(|gc| gc.gc_step())
     }
-    fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        gc_sync::gc_op(|gc| gc.jit_free(code_ptr, size))
-    }
     fn pin(&mut self, obj: GcRef) -> bool {
         gc_sync::gc_op(|gc| gc.pin(obj))
     }
@@ -1554,48 +1548,6 @@ pub trait GcRewriter: Send {
     }
 }
 
-/// Stack map — records which frame slots contain GC references at a safepoint.
-///
-/// At each guard (potential GC safepoint), the backend records a stack map
-/// so the GC can find all live references in compiled code.
-#[derive(Debug, Clone)]
-pub struct GcMap {
-    /// Bitmap: bit N is set if frame slot N contains a GC reference.
-    pub ref_bitmap: Vec<u64>,
-}
-
-impl GcMap {
-    pub fn new() -> Self {
-        GcMap {
-            ref_bitmap: Vec::new(),
-        }
-    }
-
-    pub fn set_ref(&mut self, slot: usize) {
-        let word = slot / 64;
-        let bit = slot % 64;
-        if word >= self.ref_bitmap.len() {
-            self.ref_bitmap.resize(word + 1, 0);
-        }
-        self.ref_bitmap[word] |= 1u64 << bit;
-    }
-
-    pub fn is_ref(&self, slot: usize) -> bool {
-        let word = slot / 64;
-        let bit = slot % 64;
-        if word >= self.ref_bitmap.len() {
-            return false;
-        }
-        (self.ref_bitmap[word] >> bit) & 1 != 0
-    }
-}
-
-impl Default for GcMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Process-global active GC allocator hooks
 // ─────────────────────────────────────────────────────────────────────
@@ -1657,7 +1609,6 @@ pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
 /// Process-global callback that checks whether a type id indexes the active
 /// collector's registered type table.
 pub type IsRegisteredTypeIdFn = fn(typeid: u32) -> bool;
-pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
 /// Process-global callback that answers `rgc.can_move(gcref)`
 /// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
@@ -1675,7 +1626,6 @@ global_hook!(static ACTIVE_IS_REGISTERED_TYPE_ID: IsRegisteredTypeIdFn);
 global_hook!(static ACTIVE_CAN_MOVE: CanMoveFn);
 static ACTIVE_SUPPORTS_GUARD_GC_TYPE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-global_hook!(static ACTIVE_EXTRA_ROOT_WALKER: ExtraRootWalkerFn);
 
 /// Bundle of callbacks the metainterp / executor can reach through
 /// process-global cells. Mirrors the fan-out of methods RPython's optimizer
@@ -1754,19 +1704,6 @@ pub fn override_gc_guard_hooks_for_test(hooks: ActiveGcGuardHooks) -> GuardHooks
     let prev = current_gc_guard_hooks();
     set_active_gc_guard_hooks(hooks);
     GuardHooksTestGuard { prev, _lock: lock }
-}
-
-/// Install a process-global callback that exposes non-shadow-stack roots
-/// owned by the embedding runtime.
-pub fn set_active_extra_root_walker(walker: Option<ExtraRootWalkerFn>) {
-    ACTIVE_EXTRA_ROOT_WALKER.set(walker);
-}
-
-/// Walk the active runtime's extra GC roots.
-pub fn walk_active_extra_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
-    if let Some(f) = ACTIVE_EXTRA_ROOT_WALKER.get() {
-        f(visitor);
-    }
 }
 
 /// Hand the collector the payload address of every jitframe that is currently

@@ -1147,8 +1147,6 @@ pub struct MiniMarkGC {
     /// shadow instead of a fresh allocation.  Cleared after each
     /// minor collection.
     nursery_objects_shadows: AddressMap<usize>,
-    /// Registry of compiled code regions for GC root scanning.
-    pub compiled_code_registry: CompiledCodeRegistry,
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
@@ -1292,7 +1290,6 @@ impl MiniMarkGC {
             max_number_of_pinned_objects,
             pinned_objects_in_nursery: 0,
             nursery_objects_shadows: AddressMap::default(),
-            compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: AddressMap::default(),
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
@@ -3055,10 +3052,6 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
         }
-        crate::walk_active_extra_roots(&mut |gcref| {
-            self.drag_out_root(gcref);
-        });
-
         // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.drag_out_root(gcref);
@@ -5142,10 +5135,6 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
         }
-
-        crate::walk_active_extra_roots(&mut |gcref| {
-            result.push((*gcref, "active_extra_root"));
-        });
 
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push((*gcref, "extra_root"));
@@ -7880,201 +7869,9 @@ impl MiniMarkGC {
         !hdr.is_forwarded() && hdr.has_flag(flags::PINNED)
     }
 
-    /// Free memory associated with invalidated JIT compiled code.
-    ///
-    /// `code_ptr` and `size` identify the compiled code region to release.
-    /// The region is looked up and removed from the compiled code registry
-    /// so the GC no longer scans it for root references.
-    pub fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        // Find and remove any compiled code region that matches the given range.
-        self.compiled_code_registry
-            .regions
-            .retain(|r| !(r.code_start == code_ptr && r.code_size == size));
-    }
-
     /// Number of objects in the remembered set (for testing / diagnostics).
     pub fn remembered_set_len(&self) -> usize {
         self.remembered_set.len()
-    }
-}
-
-/// Safepoint GC map: records which frame slots contain GC references
-/// at a specific program point (guard or call site).
-///
-/// The Cranelift backend builds these during compilation and stores them
-/// alongside the compiled code. During collection, the GC uses them to
-/// find live references on the stack.
-#[derive(Debug, Clone)]
-pub struct SafepointMap {
-    /// Map from code offset to GcMap.
-    pub entries: Vec<SafepointEntry>,
-}
-
-/// A single safepoint entry.
-#[derive(Debug, Clone)]
-pub struct SafepointEntry {
-    /// Offset in the compiled code (bytes from function start).
-    pub code_offset: u32,
-    /// Bitmap of which frame slots contain GC references.
-    pub gc_map: crate::GcMap,
-}
-
-impl SafepointMap {
-    pub fn new() -> Self {
-        SafepointMap {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Add a safepoint entry.
-    pub fn add(&mut self, code_offset: u32, gc_map: crate::GcMap) {
-        self.entries.push(SafepointEntry {
-            code_offset,
-            gc_map,
-        });
-    }
-
-    /// Look up the GcMap for a given code offset.
-    pub fn lookup(&self, code_offset: u32) -> Option<&crate::GcMap> {
-        self.entries
-            .iter()
-            .find(|e| e.code_offset == code_offset)
-            .map(|e| &e.gc_map)
-    }
-}
-
-impl Default for SafepointMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Registry of compiled code regions and their safepoint maps.
-///
-/// When the GC needs to scan the stack during collection, it uses the return
-/// address to find which compiled code region is active, then looks up the
-/// safepoint map to determine which frame slots contain GC references.
-///
-/// From rpython/jit/backend/llsupport/gc.py GcRootMap_asmgcc / GcRootMap_shadowstack.
-pub struct CompiledCodeRegistry {
-    /// Compiled code regions, sorted by start address for binary search.
-    regions: Vec<CompiledCodeRegion>,
-}
-
-/// A single compiled code region with its safepoint map.
-#[derive(Debug, Clone)]
-pub struct CompiledCodeRegion {
-    /// Start address of the compiled code.
-    pub code_start: usize,
-    /// Size of the compiled code in bytes.
-    pub code_size: usize,
-    /// Safepoint map for this region.
-    pub safepoint_map: SafepointMap,
-    /// Frame size in slots (each slot = 8 bytes).
-    pub frame_size_slots: u32,
-    /// JitCellToken number for identification.
-    pub loop_token: u64,
-}
-
-impl CompiledCodeRegistry {
-    pub fn new() -> Self {
-        CompiledCodeRegistry {
-            regions: Vec::new(),
-        }
-    }
-
-    /// Register a compiled code region.
-    pub fn register(&mut self, region: CompiledCodeRegion) {
-        self.regions.push(region);
-        // Keep sorted by code_start for binary search
-        self.regions.sort_by_key(|r| r.code_start);
-    }
-
-    /// Unregister a compiled code region (e.g., when invalidating a loop).
-    pub fn unregister(&mut self, loop_token: u64) {
-        self.regions.retain(|r| r.loop_token != loop_token);
-    }
-
-    /// Look up a compiled code region containing the given return address.
-    ///
-    /// Returns the region and the offset within it.
-    pub fn find_region(&self, return_addr: usize) -> Option<(&CompiledCodeRegion, u32)> {
-        // Binary search for the region containing this address
-        let idx = self
-            .regions
-            .binary_search_by(|r| {
-                if return_addr < r.code_start {
-                    std::cmp::Ordering::Greater
-                } else if return_addr >= r.code_start + r.code_size {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .ok()?;
-
-        let region = &self.regions[idx];
-        let offset = (return_addr - region.code_start) as u32;
-        Some((region, offset))
-    }
-
-    /// Scan a compiled frame for GC references using the safepoint map.
-    ///
-    /// Given a return address (from the call stack) and the frame base pointer,
-    /// enumerates all frame slots that contain GC references.
-    ///
-    /// # Safety
-    /// `frame_base` must point to a valid JIT frame with at least
-    /// `region.frame_size_slots` slots.
-    pub unsafe fn scan_frame(
-        &self,
-        return_addr: usize,
-        frame_base: *const usize,
-    ) -> Vec<*mut GcRef> {
-        let mut roots = Vec::new();
-
-        let (region, offset) = match self.find_region(return_addr) {
-            Some(r) => r,
-            None => return roots,
-        };
-
-        let gc_map = match region.safepoint_map.lookup(offset) {
-            Some(map) => map,
-            None => return roots,
-        };
-
-        // Enumerate all slots marked as GC references
-        for word_idx in 0..gc_map.ref_bitmap.len() {
-            let mut bits = gc_map.ref_bitmap[word_idx];
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                let slot_idx = word_idx * 64 + bit;
-
-                if slot_idx < region.frame_size_slots as usize {
-                    let slot_ptr = unsafe { frame_base.add(slot_idx) } as *mut GcRef;
-                    roots.push(slot_ptr);
-                }
-
-                bits &= bits - 1; // Clear lowest set bit
-            }
-        }
-
-        roots
-    }
-
-    /// Number of registered regions.
-    pub fn len(&self) -> usize {
-        self.regions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
-    }
-}
-
-impl Default for CompiledCodeRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -8455,10 +8252,6 @@ impl GcAllocator for MiniMarkGC {
 
     fn gc_step(&mut self) -> bool {
         self.gc_step()
-    }
-
-    fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        self.jit_free(code_ptr, size);
     }
 
     fn pin(&mut self, obj: GcRef) -> bool {
@@ -11605,210 +11398,6 @@ mod tests {
         );
     }
 
-    // ── SafepointMap tests ──
-
-    #[test]
-    fn test_safepoint_map_register_and_lookup() {
-        let mut smap = SafepointMap::new();
-
-        let mut gc_map_0 = crate::GcMap::new();
-        gc_map_0.set_ref(0);
-        gc_map_0.set_ref(3);
-
-        let mut gc_map_1 = crate::GcMap::new();
-        gc_map_1.set_ref(1);
-        gc_map_1.set_ref(7);
-
-        smap.add(100, gc_map_0);
-        smap.add(200, gc_map_1);
-
-        // Lookup existing entries.
-        let found_0 = smap.lookup(100).unwrap();
-        assert!(found_0.is_ref(0));
-        assert!(found_0.is_ref(3));
-        assert!(!found_0.is_ref(1));
-
-        let found_1 = smap.lookup(200).unwrap();
-        assert!(found_1.is_ref(1));
-        assert!(found_1.is_ref(7));
-        assert!(!found_1.is_ref(0));
-
-        // Lookup non-existent offset returns None.
-        assert!(smap.lookup(999).is_none());
-    }
-
-    #[test]
-    fn test_safepoint_map_empty() {
-        let smap = SafepointMap::new();
-        assert!(smap.lookup(0).is_none());
-        assert!(smap.entries.is_empty());
-    }
-
-    // ── CompiledCodeRegistry tests ──
-
-    #[test]
-    fn test_compiled_code_registry_register_and_find() {
-        let mut registry = CompiledCodeRegistry::new();
-        assert!(registry.is_empty());
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(16, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 42,
-        });
-
-        assert_eq!(registry.len(), 1);
-
-        // Address inside the region.
-        let (region, offset) = registry.find_region(0x1010).unwrap();
-        assert_eq!(region.loop_token, 42);
-        assert_eq!(offset, 0x10);
-
-        // Address at the start.
-        let (region, offset) = registry.find_region(0x1000).unwrap();
-        assert_eq!(region.loop_token, 42);
-        assert_eq!(offset, 0);
-
-        // Address outside the region.
-        assert!(registry.find_region(0x900).is_none());
-        assert!(registry.find_region(0x1100).is_none());
-    }
-
-    #[test]
-    fn test_compiled_code_registry_multiple_regions() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x3000,
-            code_size: 0x200,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 8,
-            loop_token: 2,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 0x80,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 2,
-            loop_token: 3,
-        });
-
-        assert_eq!(registry.len(), 3);
-
-        // Each region should be findable.
-        assert_eq!(registry.find_region(0x1050).unwrap().0.loop_token, 1);
-        assert_eq!(registry.find_region(0x2040).unwrap().0.loop_token, 3);
-        assert_eq!(registry.find_region(0x3100).unwrap().0.loop_token, 2);
-
-        // Gap between regions returns None.
-        assert!(registry.find_region(0x1200).is_none());
-    }
-
-    #[test]
-    fn test_compiled_code_registry_unregister() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 10,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 20,
-        });
-
-        assert_eq!(registry.len(), 2);
-
-        registry.unregister(10);
-        assert_eq!(registry.len(), 1);
-        assert!(registry.find_region(0x1050).is_none());
-        assert_eq!(registry.find_region(0x2050).unwrap().0.loop_token, 20);
-    }
-
-    #[test]
-    fn test_compiled_code_registry_safepoint_lookup_for_root_scanning() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x20, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x5000,
-            code_size: 0x200,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 99,
-        });
-
-        // Simulate finding a return address and looking up the safepoint map.
-        let return_addr = 0x5020;
-        let (region, offset) = registry.find_region(return_addr).unwrap();
-        let gc_map = region.safepoint_map.lookup(offset).unwrap();
-
-        // Verify the GC map identifies the correct slots.
-        assert!(gc_map.is_ref(0), "slot 0 should be a GC ref");
-        assert!(!gc_map.is_ref(1), "slot 1 should not be a GC ref");
-        assert!(gc_map.is_ref(2), "slot 2 should be a GC ref");
-        assert!(!gc_map.is_ref(3), "slot 3 should not be a GC ref");
-    }
-
-    #[test]
-    fn test_scan_frame_enumerates_gc_ref_slots() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x10, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0xA000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 77,
-        });
-
-        // Allocate a fake frame on the stack.
-        let frame: [usize; 4] = [111, 222, 333, 444];
-        let frame_base = frame.as_ptr();
-
-        let return_addr = 0xA010;
-        let roots = unsafe { registry.scan_frame(return_addr, frame_base) };
-
-        // Should find slots 0 and 2.
-        assert_eq!(roots.len(), 2);
-        unsafe {
-            assert_eq!(*(roots[0] as *const usize), 111);
-            assert_eq!(*(roots[1] as *const usize), 333);
-        }
-    }
-
     // ── Incremental marking tests ──
 
     #[test]
@@ -12196,99 +11785,6 @@ mod tests {
         assert_eq!(gc.major_collections, majors_before + 1);
         assert_eq!(gc.oldgen.object_count(), 1);
         assert_eq!(root.0, live.0);
-        gc.roots.clear();
-    }
-
-    // ── GC stress tests ──
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn test_gc_stress_with_safepoint_scanning() {
-        // Register a compiled code region with a safepoint map, then
-        // allocate objects under pressure so nursery collections fire.
-        // After collection, verify that roots discovered via scan_frame
-        // point to valid, promoted objects.
-
-        let ptr_size = std::mem::size_of::<GcRef>();
-        let mut gc = test_gc(512); // small nursery to force frequent collections
-        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size * 2, vec![0, ptr_size]));
-
-        // Build a compiled code registry with a safepoint map marking
-        // frame slots 0 and 2 as GC references.
-        let mut registry = CompiledCodeRegistry::new();
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x50, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-
-        // Simulate a JIT frame: slots 0 and 2 hold GcRefs, slots 1 and 3
-        // hold non-pointer data.
-        let obj_a = gc.alloc_with_type(tid, ptr_size * 2);
-        let obj_b = gc.alloc_with_type(tid, ptr_size * 2);
-        unsafe {
-            *(obj_a.0 as *mut GcRef) = GcRef::NULL;
-            *((obj_a.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-            *(obj_b.0 as *mut GcRef) = GcRef::NULL;
-            *((obj_b.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-        }
-
-        let frame: [usize; 4] = [obj_a.0, 0xDEAD, obj_b.0, 0xBEEF];
-
-        // Register frame slots as GC roots (simulating what the backend does
-        // at a safepoint).
-        let roots_from_frame = unsafe { registry.scan_frame(0x1050, frame.as_ptr()) };
-        assert_eq!(roots_from_frame.len(), 2);
-
-        // Register the scanned slots as roots with the GC.
-        for root_ptr in &roots_from_frame {
-            unsafe {
-                gc.roots.add(*root_ptr);
-            }
-        }
-
-        // Allocate many objects to force multiple nursery collections.
-        for i in 0..200 {
-            let filler = gc.alloc_with_type(tid, ptr_size * 2);
-            unsafe {
-                *(filler.0 as *mut u64) = i as u64;
-            }
-        }
-        assert!(
-            gc.minor_collections > 0,
-            "should have triggered nursery collections"
-        );
-
-        // Read back the GcRefs from the frame slots (the GC may have updated
-        // them when it promoted the objects).
-        let ref_a = GcRef(frame[0]);
-        let ref_b = GcRef(frame[2]);
-
-        // The original nursery objects should have been forwarded.
-        // The frame slots must now point to valid (non-nursery) addresses.
-        assert!(!ref_a.is_null());
-        assert!(!ref_b.is_null());
-        assert!(
-            !gc.is_in_nursery(ref_a.0),
-            "object A should have been promoted out of nursery"
-        );
-        assert!(
-            !gc.is_in_nursery(ref_b.0),
-            "object B should have been promoted out of nursery"
-        );
-
-        // Verify non-GC slots are untouched.
-        assert_eq!(frame[1], 0xDEAD);
-        assert_eq!(frame[3], 0xBEEF);
-
         gc.roots.clear();
     }
 
@@ -13222,7 +12718,7 @@ cache size\t: 8192 kB\n";
         gc.roots.clear();
     }
 
-    // ── Pin / Unpin / jit_free tests ──
+    // ── Pin / Unpin tests ──
 
     #[test]
     fn test_pin_prevents_nursery_move() {
@@ -13477,42 +12973,6 @@ cache size\t: 8192 kB\n";
 
         crate::shadow_stack::pop_jf_to(0);
         gc.roots.clear();
-    }
-
-    #[test]
-    fn test_jit_free_unregisters_code() {
-        let mut gc = test_gc(4096);
-
-        let smap = SafepointMap::new();
-        gc.compiled_code_registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 256,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-
-        let smap2 = SafepointMap::new();
-        gc.compiled_code_registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 512,
-            safepoint_map: smap2,
-            frame_size_slots: 8,
-            loop_token: 2,
-        });
-
-        assert_eq!(gc.compiled_code_registry.len(), 2);
-
-        // Free the first region.
-        gc.jit_free(0x1000, 256);
-
-        assert_eq!(gc.compiled_code_registry.len(), 1);
-        assert!(gc.compiled_code_registry.find_region(0x1050).is_none());
-        assert!(gc.compiled_code_registry.find_region(0x2050).is_some());
-
-        // Free the second region.
-        gc.jit_free(0x2000, 512);
-        assert_eq!(gc.compiled_code_registry.len(), 0);
     }
 
     #[test]
