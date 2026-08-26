@@ -5412,14 +5412,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // so it is observed on the very next call the way every runtime does it.
     if let Some(resolved) = kwonly_defaults {
         // Taken off `callable_guard_op`, which the resolve proved names
-        // `callable`.  `function.py` does not list `w_kw_defs` among the
-        // `_immutable_fields_`, and `fset_func_kwdefaults` is a plain store, so
-        // there is no invalidation to record against -- the cells baked below
-        // are this mapping's, and only pinning the slot that holds it makes
-        // that true on every later execution.  A `f.__kwdefaults__ = {...}`
-        // rebind fails the guard, and so does a callee defined inside the loop,
-        // whose next iteration builds a mapping of its own.  `defs_w` carries
-        // the same shape for the positional defaults.
+        // `callable`.
+        //
+        // `function.py` DOES declare `w_kw_defs?`, and `function_set_kwdefaults`
+        // already notifies `QuasiImmutSlot::WKwDefs`, so the orthodox pin is the
+        // quasi-immutable marker `defs_w` installs a few lines up rather than a
+        // guard.  It is not a drop-in here: that install dereferences
+        // `callable_guard_op`, which is why `defs_w` gates it on
+        // `guards_the_callee_function`, and the callee this fold is for is the
+        // baked module-level one.  Settling that case is what the swap waits on.
+        //
+        // A `GuardValue` on the slot stands in meanwhile.  It is stricter than
+        // the hint -- a per-call read where upstream pays none -- and sound for
+        // the reason the marker would be: the cells baked below belong to one
+        // mapping, and only pinning the slot that holds it makes that true on
+        // every later execution.  A `f.__kwdefaults__ = {...}` rebind fails the
+        // guard, and so does a callee defined inside the loop, whose next
+        // iteration builds a mapping of its own.
         walker_guard_function_field(
             ctx,
             op.pc,
