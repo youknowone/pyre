@@ -3069,6 +3069,18 @@ struct Lowering<'a> {
     /// carries a stale place, and keyed on the referent being an atomic so a
     /// body's ordinary borrows never enter the map.
     atomic_ref_place: std::collections::HashMap<usize, Place>,
+    /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
+    /// the variant's name.
+    ///
+    /// Charon does not hand the ordering to `load` / `store` as a constant
+    /// operand: it assigns `_i = Ordering::<V>` as a fieldless-enum
+    /// `Aggregate` and passes `move _i`, so the variant is only knowable from
+    /// that statement.  [`Lowering::is_atomic_store`]'s arm folds a `Relaxed`
+    /// store and nothing else — a `Release` store lowered as an unordered
+    /// `FieldWrite` would DROP a barrier the residual call it replaces still
+    /// performs (`w_type_set_version_tag` publishes `version_tag` with
+    /// `Release` against an `Acquire` reader).
+    atomic_ordering_locals: std::collections::HashMap<usize, String>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -3381,6 +3393,7 @@ impl<'a> Lowering<'a> {
             builder_mode: false,
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
+            atomic_ordering_locals: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             result_exc_call_results: Vec::new(),
@@ -4239,6 +4252,16 @@ impl<'a> Lowering<'a> {
                     }
                     None => {
                         self.atomic_ref_place.remove(&(i as usize));
+                    }
+                }
+                // `_i = Ordering::<V>` — the ordering the store arm has to
+                // read before it may fold.  Same last-write-wins discipline.
+                match self.atomic_ordering_variant(&rvalue) {
+                    Some(name) => {
+                        self.atomic_ordering_locals.insert(i as usize, name);
+                    }
+                    None => {
+                        self.atomic_ordering_locals.remove(&(i as usize));
                     }
                 }
                 // Capture the construction `owner_root` if this binding
@@ -8065,7 +8088,25 @@ impl<'a> Lowering<'a> {
                 // an acquire or a release could not be expressed here whether
                 // this arm fired or not.  Relaxed, the only ordering pyre
                 // writes, IS this store exactly.
-                if args.len() == 3 && self.is_atomic_store(&reg) {
+                //
+                // ONLY a `Relaxed` store folds.  A stronger ordering is not
+                // decoration: `w_type_set_version_tag` publishes `version_tag`
+                // with `Release` against `w_type_get_version_tag`'s `Acquire`
+                // reader, and today that store reaches the CALL, which performs
+                // the release.  Replacing it with an unordered `FieldWrite`
+                // would let a traced class mutation publish the new cache key
+                // before the dictionary changes behind it are visible.  So the
+                // ordering is read (`atomic_ordering_locals`) and anything but
+                // `Relaxed` keeps the residual call it has today.
+                if args.len() == 3
+                    && self.is_atomic_store(&reg)
+                    && arg_locals
+                        .get(2)
+                        .copied()
+                        .flatten()
+                        .and_then(|l| self.atomic_ordering_locals.get(&l))
+                        .is_some_and(|ordering| ordering == "Relaxed")
+                {
                     // A receiver this body did not bind as a borrow of a
                     // field — or one borrowing a whole local rather than a
                     // field of one — leaves no place to write to.  Fall
@@ -10611,6 +10652,35 @@ impl<'a> Lowering<'a> {
     /// write emits, so `lower_call` lowers it to the same `FieldWrite`.
     fn is_atomic_store(&self, reg: &RegularCall) -> bool {
         self.is_atomic_method(reg, "store")
+    }
+
+    /// The `core::sync::atomic::Ordering` variant name an `Rvalue::Aggregate`
+    /// builds, or `None` when the rvalue is not one.
+    ///
+    /// Keyed on the enum's own path and read back by variant NAME rather than
+    /// index, so a reordering of `Ordering`'s variants cannot silently turn a
+    /// `Release` into a `Relaxed`.
+    fn atomic_ordering_variant(&self, rvalue: &Rvalue) -> Option<String> {
+        let Rvalue::Aggregate(kind, _) = rvalue else {
+            return None;
+        };
+        // Same head shapes `resolve_aggregate_adt` decodes: a bare `type_id`
+        // or a full `TypeDeclRef` object.
+        let adt = kind.as_object()?.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let td = self.llbc.type_by_id(type_id)?;
+        if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
+            return None;
+        }
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
+        Some(variants.get(variant_idx)?.name.clone())
     }
 
     /// `<core::sync::atomic::Atomic*>::<method>(&self, ..)` — an inherent
