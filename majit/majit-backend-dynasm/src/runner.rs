@@ -348,6 +348,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
     majit_gc::set_active_gc_memory_stats(Some(dynasm_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(dynasm_major_threshold_reached));
+    majit_gc::set_active_minor_collections_since_major(Some(dynasm_minor_collections_since_major));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
@@ -846,6 +847,13 @@ fn dynasm_major_threshold_reached() -> bool {
         return r;
     }
     majit_gc::gc_sync::gc_op(|g| g.major_threshold_reached())
+}
+
+fn dynasm_minor_collections_since_major() -> usize {
+    if let Some(r) = gc_box::with_mut(|g| g.minor_collections_since_major()) {
+        return r;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.minor_collections_since_major())
 }
 
 /// Host-side root-register trampoline. Bridges

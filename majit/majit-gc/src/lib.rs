@@ -972,6 +972,16 @@ pub trait GcAllocator: Send {
         (0, 0)
     }
 
+    /// Minor collections run since the last major finished.
+    ///
+    /// Not derivable from [`collection_counts`](Self::collection_counts): that
+    /// pair is cumulative, and the caller cannot subtract a snapshot it was
+    /// never handed. `gc.get_count`'s second element is this number. Default
+    /// `0` for stub allocators, which run no collections to count.
+    fn minor_collections_since_major(&self) -> usize {
+        0
+    }
+
     /// Whether a JIT inline nursery bump of `type_id` is equivalent to
     /// `alloc_with_type`'s fast path: the type registers no destructor and is
     /// not a weakref (either would need a side-list push at allocation, i.e.
@@ -1462,6 +1472,9 @@ impl GcAllocator for GcHandle {
     }
     fn collection_counts(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.collection_counts())
+    }
+    fn minor_collections_since_major(&self) -> usize {
+        gc_sync::gc_query_reentrant(|gc| gc.minor_collections_since_major())
     }
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.type_alloc_is_plain(type_id))
@@ -2732,6 +2745,29 @@ pub fn active_major_threshold_reached() -> bool {
     match ACTIVE_MAJOR_THRESHOLD_REACHED.get() {
         Some(f) => f(),
         None => false,
+    }
+}
+
+/// Process-global callback for [`GcAllocator::minor_collections_since_major`],
+/// installed by whichever backend owns the GC. The interpreter's `gc` module
+/// asks through this rather than through `gc_sync`'s singleton, because the
+/// wasm backend keeps its GC somewhere that singleton does not reach.
+pub type MinorCollectionsSinceMajorFn = fn() -> usize;
+
+global_hook!(static ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR: MinorCollectionsSinceMajorFn);
+
+/// Install the minors-since-major callback for the active backend.
+pub fn set_active_minor_collections_since_major(hook: Option<MinorCollectionsSinceMajorFn>) {
+    ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR.set(hook);
+}
+
+/// Minor collections the active backend's GC has run since its last major.
+/// `0` when no backend has installed a hook, which is also the truthful
+/// answer for a process that has collected nothing.
+pub fn active_minor_collections_since_major() -> usize {
+    match ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR.get() {
+        Some(f) => f(),
+        None => 0,
     }
 }
 

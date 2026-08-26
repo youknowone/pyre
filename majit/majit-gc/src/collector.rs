@@ -1015,6 +1015,22 @@ pub struct MiniMarkGC {
     pub minor_collections: usize,
     /// Count of major collections performed.
     pub major_collections: usize,
+    /// [`minor_collections`](Self::minor_collections) as it stood when the last
+    /// major *cycle* ended, so the difference is the minors run since.
+    ///
+    /// No incminimark counterpart: it exists for `gc.get_count`, whose second
+    /// element 3.14 defines as the generation-0 collections run since
+    /// generation 1 was last collected. A major here collects both older
+    /// generations, so it is what resets that count.
+    ///
+    /// Sampled at the FINALIZING -> SCANNING transition and not in
+    /// `finish_incremental_cycle`, which is a sweep-to-finalize seam rather
+    /// than the end: `do_collect_full` runs a minor before every remaining
+    /// step, so one more still runs after that seam, and sampling there leaves
+    /// `gc.collect()` reporting a minor the collection had not yet finished
+    /// running. Measured, not assumed — see
+    /// `minors_accumulate_until_a_major_finishes`.
+    minor_collections_at_major_end: usize,
     /// `incminimark.py:self.hooks`, supplied by the translated standalone
     /// target and restricted to its allocation-free low-level surface.
     hooks: GcHooks,
@@ -1259,6 +1275,7 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
+            minor_collections_at_major_end: 0,
             hooks: GcHooks,
             stat_ac_arenas_count: 0,
             stat_rawmalloced_total_size: 0,
@@ -5812,6 +5829,9 @@ impl MiniMarkGC {
                 // incminimark.py:2623-2631: recursive collections from a
                 // handler must see a collector ready to start a new scan.
                 self.gc_state = GcState::Scanning;
+                // The cycle is over here, which is what `gc.get_count`'s
+                // second element counts from.
+                self.minor_collections_at_major_end = self.minor_collections;
                 self.execute_finalizer_triggers();
             }
         }
@@ -8110,6 +8130,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn collection_counts(&self) -> (usize, usize) {
         (self.minor_collections, self.major_collections)
+    }
+
+    fn minor_collections_since_major(&self) -> usize {
+        self.minor_collections - self.minor_collections_at_major_end
     }
 
     fn get_write_barrier_descr(&self) -> Option<crate::WriteBarrierDescr> {
@@ -11853,6 +11877,41 @@ mod tests {
         assert_eq!(gc.major_collections, 1);
         assert_eq!(gc.oldgen.object_count(), 1);
         assert_eq!(unsafe { *(root.0 as *const u64) }, 0x0517_EA5E);
+        gc.roots.clear();
+    }
+
+    /// `gc.get_count`'s second element: minors accumulate and a finished major
+    /// is what resets them.
+    ///
+    /// Driven through `do_collect_full`, the operation `gc.collect()` runs, so
+    /// the state the interpreter reports afterwards is the state asserted
+    /// here. Stepping by hand would count differently: the reset lives in
+    /// `finish_incremental_cycle`, and a full collection runs minors around
+    /// its steps.
+    #[test]
+    fn minors_accumulate_until_a_major_finishes() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        assert_eq!(gc.minor_collections_since_major(), 0);
+
+        gc.do_collect_nursery();
+        gc.do_collect_nursery();
+        assert_eq!(gc.minor_collections_since_major(), 2);
+
+        // A survivor, so the major has something to trace.
+        let mut root = gc.alloc_with_type(tid, 16);
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.do_collect_full();
+        assert!(gc.major_collections >= 1, "a full collection runs a major");
+        assert_eq!(
+            gc.minor_collections_since_major(),
+            0,
+            "a finished major resets the minors counted since the last one"
+        );
+
+        gc.do_collect_nursery();
+        assert_eq!(gc.minor_collections_since_major(), 1);
         gc.roots.clear();
     }
 

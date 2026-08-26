@@ -501,6 +501,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
     majit_gc::set_active_gc_memory_stats(Some(gc_memory_stats_via_active_runtime));
     majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
+    majit_gc::set_active_minor_collections_since_major(Some(
+        minor_collections_since_major_via_active_runtime,
+    ));
     majit_gc::set_active_root_hooks(
         Some(gc_add_root_via_active_runtime),
         Some(gc_remove_root_via_active_runtime),
@@ -2016,6 +2019,10 @@ fn gc_memory_stats_via_active_runtime() -> majit_gc::GcMemoryStats {
 /// safepoint (incminimark.py `threshold_reached`).
 fn major_threshold_reached_via_active_runtime() -> bool {
     with_cranelift_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
+}
+
+fn minor_collections_since_major_via_active_runtime() -> usize {
+    with_cranelift_gc(|gc| gc.minor_collections_since_major()).unwrap_or(0)
 }
 
 /// Host-side root-register trampoline. Bridges

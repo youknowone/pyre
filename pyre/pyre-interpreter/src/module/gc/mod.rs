@@ -1683,8 +1683,36 @@ crate::py_module! {
                 .map(|slot| w_int_new(slot.load(Ordering::Relaxed)))
                 .collect(),
         )),
+        // `gc_get_count_impl` reads three fields and only the first is an
+        // object count: element 0 is tracked-container allocations minus
+        // deallocations since generation 0 was collected, while elements 1 and
+        // 2 count *collections* -- generation-0 collections since generation 1
+        // was collected, and generation-1 collections since generation 2 was.
+        // Collecting a generation zeroes its own count and every younger one.
+        //
+        // Under the generation mapping `NUM_GENERATIONS` already publishes --
+        // 0 is the nursery, 1 the generation this collector keeps empty, 2
+        // what is not in the nursery -- a minor collection is the generation-0
+        // one and a major collects both older generations at once.  So element
+        // 1 is the minors run since the last major, and element 2 is exact at
+        // zero: nothing here ever collects generation 1 on its own, so there
+        // is never a generation-1 collection to have run since the last major.
+        //
+        // Element 0 stays zero because no counter can be truthful here.  The
+        // allocation seam is keyed by a majit type id and nothing else
+        // (`try_gc_alloc(type_id, payload_size)`), and the tracked predicate is
+        // not a function of that key -- `cpython_object_is_gc` reaches the
+        // object's type and, for a type object, the object itself, so one type
+        // id covers both a tracked heap type and an untracked static one.
+        // Even a decidable bit would undercount: every backend emits the
+        // nursery bump inline and merges several objects into one, so compiled
+        // code allocates without passing any counter site, and a virtualized
+        // allocation is removed outright.  Counting by walking instead is what
+        // `gc.get_objects` costs, four orders of magnitude above this call.
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
-            w_int_new(0), w_int_new(0), w_int_new(0),
+            w_int_new(0),
+            w_int_new(majit_gc::active_minor_collections_since_major() as i64),
+            w_int_new(0),
         ])),
         "get_debug"     / 0 = |_| Ok(w_int_new(GC_DEBUG.load(Ordering::Relaxed))),
         "set_debug"     / 1 = |args| {

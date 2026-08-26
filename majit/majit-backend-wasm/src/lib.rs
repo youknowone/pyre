@@ -1017,6 +1017,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
     majit_gc::set_active_gc_memory_stats(Some(active_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(active_gc_major_threshold_reached));
+    majit_gc::set_active_minor_collections_since_major(Some(
+        active_gc_minor_collections_since_major,
+    ));
     majit_gc::set_active_finalizer_hooks(
         Some(wasm_register_finalizer),
         Some(wasm_finalizer_next_dead),
@@ -1067,6 +1070,12 @@ pub fn active_gc_memory_stats() -> majit_gc::GcMemoryStats {
 /// safepoint, which is on by default on wasm.
 pub fn active_gc_major_threshold_reached() -> bool {
     with_wasm_active_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
+}
+
+/// Minor collections the active GC has run since its last major, or `0` when
+/// none is installed.
+pub fn active_gc_minor_collections_since_major() -> usize {
+    with_wasm_active_gc(|gc| gc.minor_collections_since_major()).unwrap_or(0)
 }
 
 /// Diagnostic: `(minor_collections, major_collections)` of the active GC, or
