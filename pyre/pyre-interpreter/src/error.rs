@@ -2050,6 +2050,11 @@ impl PyError {
 
     /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
     /// is one and on the host's stream when there is not.
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
     pub(crate) fn write_report_line(buf: &[u8]) {
         if !Self::write_to_sys_stderr(buf) {
             emit_report_to_host_stderr(buf);
