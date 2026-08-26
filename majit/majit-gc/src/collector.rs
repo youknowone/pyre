@@ -7573,6 +7573,22 @@ impl MiniMarkGC {
     /// A move within one object carries its items across card boundaries while
     /// the card bits stay where they are, so the per-card record is no longer
     /// true of the object and only the whole-object record is.
+    ///
+    /// Nothing calls this outside tests, and nothing could act on it if it
+    /// did: `CARDS_SET` is only ever set behind a `HAS_CARDS` test, and the
+    /// one non-test place that sets `HAS_CARDS`, `alloc_in_oldgen_with_cards`,
+    /// has no production caller. So the guard above rejects every object pyre
+    /// can build today.
+    ///
+    /// It stops rejecting them the moment a production caller of that
+    /// allocator lands, and the sites that owe this call then are the item
+    /// moves in `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
+    /// `object_remove` and `object_drain` each shift items with a bare
+    /// `ptr::copy`. Upstream reaches this barrier from those operations
+    /// through `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
+    /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
+    /// list is not an rtyper-lowered list, so it has no such seam and the
+    /// calls have to be written at those three sites.
     pub fn writebarrier_before_move(&mut self, array_addr: usize) {
         if self.config.card_page_indices == 0 {
             return;
