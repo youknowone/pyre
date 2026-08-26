@@ -679,6 +679,11 @@ pub enum OpKind {
         class_root: Option<String>,
     },
     ConstInt(i64),
+    /// Word-sized unsigned integer constant. RPython stores the same Python
+    /// integer value as `ConstInt`, but its `Constant.concretetype` is
+    /// `lltype.Unsigned`; keeping the source tag prevents `r_uint ∪ int`
+    /// merges when MIR joins an unsigned literal with another `usize` value.
+    ConstUInt(u64),
     /// Translation-time `r_longlonglong` constant. This carrier may
     /// appear in flow/rtyping graphs but must never be coerced into a
     /// JIT register-kind `ConstInt`.
@@ -2802,6 +2807,10 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         let (bool_case, int_case) = match kind {
             Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
             Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n)),
+            Some(OpKind::ConstUInt(n)) => (
+                (*n == 0 || *n == 1).then_some(*n != 0),
+                i64::try_from(*n).ok(),
+            ),
             _ => continue,
         };
         let block = &graph.blocks[block_idx];
@@ -3399,12 +3408,15 @@ pub fn fuse_boxing_alloc(
         Some(only)
     }
 
-    let is_malloc_typed = |target: &CallTarget| -> bool {
+    let is_gc_malloc = |target: &CallTarget| -> bool {
         matches!(target, CallTarget::FunctionPath { segments }
             if segments.len() >= 2
                 && matches!(
                     segments[segments.len() - 1].as_str(),
-                    "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+                    "malloc"
+                        | "malloc_typed"
+                        | "malloc_typed_managed"
+                        | "malloc_typed_stable"
                 )
                 && segments[segments.len() - 2] == "lltype")
     };
@@ -3822,7 +3834,7 @@ pub fn fuse_boxing_alloc(
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            if !is_malloc_typed(target) || args.len() != 1 {
+            if !is_gc_malloc(target) || args.len() != 1 {
                 continue;
             }
             let Some(result) = &op.result else {
@@ -9366,7 +9378,7 @@ mod tests {
                         segments: vec![
                             crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
-                            "malloc_typed".into(),
+                            "malloc".into(),
                         ],
                     },
                     args: vec![agg.clone()],

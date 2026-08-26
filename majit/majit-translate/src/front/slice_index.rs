@@ -536,6 +536,7 @@ fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
         .find_map(|op| {
             (op.result.as_ref() == Some(&var)).then_some(match op.kind {
                 OpKind::ConstInt(value) => Some(value),
+                OpKind::ConstUInt(value) => i64::try_from(value).ok(),
                 _ => None,
             })?
         })
@@ -803,6 +804,7 @@ fn array_len_base_is_stable(
         let operations = &block.operations[start..end];
         operations.iter().all(|op| match &op.kind {
             OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
             | OpKind::ConstInt128(_)
             | OpKind::ConstUInt128(_)
             | OpKind::ConstBool(_)

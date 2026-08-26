@@ -431,6 +431,7 @@ pub(crate) fn remap_op_kind(
             class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::ConstUInt(v) => OpKind::ConstUInt(*v),
         OpKind::ConstInt128(v) => OpKind::ConstInt128(*v),
         OpKind::ConstUInt128(v) => OpKind::ConstUInt128(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
@@ -914,6 +915,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
@@ -1188,6 +1190,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // dependency-routing classification.
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)

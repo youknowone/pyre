@@ -8816,6 +8816,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: same_as, cast_*, hint → cannot raise
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)

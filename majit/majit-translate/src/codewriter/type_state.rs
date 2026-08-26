@@ -116,6 +116,7 @@ fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
 pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
     match kind {
         OpKind::ConstInt(_) => Some(ConcreteType::Signed),
+        OpKind::ConstUInt(_) => Some(ConcreteType::Signed),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => None,
         OpKind::ConstBool(_) => Some(ConcreteType::Signed),
         // `_we_are_jitted` symbolic — `Bool` concretetype folds to int

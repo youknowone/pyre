@@ -322,6 +322,15 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstUInt(n) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Int(*n as i64),
+                            LowLevelType::Unsigned,
+                        )),
+                    );
+                }
                 OpKind::ConstBool(b) => {
                     map.insert(
                         result,
@@ -1084,6 +1093,7 @@ pub fn translate_op(
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
         OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::ConstRefNull
@@ -2187,7 +2197,7 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                         }
                     }
-                    // Fail-closed on an UNFUSED `lltype::malloc_typed`.  A boxing
+                    // Fail-closed on an UNFUSED `lltype::malloc[_typed]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
                     // runs only where `fuse_boxing_alloc` (`model.rs`) could
                     // resolve the cluster's header: a constant `ob_type`
@@ -2211,14 +2221,14 @@ pub fn translate_op(
                         && segments[segments.len() - 2] == "lltype"
                         && matches!(
                             segments[segments.len() - 1].as_str(),
-                            "malloc_typed" | "malloc_typed_managed"
+                            "malloc" | "malloc_typed" | "malloc_typed_managed"
                         )
                     {
                         return Err(TyperError::message(
-                            "`lltype::malloc_typed[_managed]` survived fuse_boxing_alloc unfused; \
+                            "`lltype::malloc[_typed/_managed]` survived fuse_boxing_alloc unfused; \
                              the cluster's header did not resolve to a constant type \
-                             pointer standing for its own `w_class`, and no general \
-                             malloc->new lowering is ported"
+                             pointer standing for its own `w_class`, so no safe \
+                             malloc->new lowering could be proven"
                                 .to_string(),
                         ));
                     }
@@ -2860,6 +2870,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
+        OpKind::ConstUInt(_) => "ConstUInt",
         OpKind::ConstBool(_) => "ConstBool",
         OpKind::ConstSymbolic { .. } => "ConstSymbolic",
         OpKind::ConstFloat(_) => "ConstFloat",
@@ -3044,6 +3055,10 @@ fn legacy_const_define_hlvalue(
         OpKind::ConstInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n),
             LowLevelType::Signed,
+        )))),
+        OpKind::ConstUInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(*n as i64),
+            LowLevelType::Unsigned,
         )))),
         OpKind::ConstInt128(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int128(*n),

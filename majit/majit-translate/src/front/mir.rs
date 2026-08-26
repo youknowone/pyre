@@ -72,7 +72,8 @@
 //!   - `Assert` — strip and forward to the success target.
 //!
 //! ### Constants
-//!   - `Scalar(Signed|Unsigned|Isize|Usize)` → `ConstInt`.
+//!   - `Scalar(Signed|Isize)` → `ConstInt`; `Scalar(Unsigned|Usize)` →
+//!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
@@ -2876,10 +2877,10 @@ fn simplify_lowered_graph(
     // `core::ptr::write<T>` never becomes one shared FunctionDesc whose `T`
     // argument would merge unrelated object classes.
     let mut dirty = crate::model::lower_struct_ptr_writes(graph, struct_field_attrs) > 0;
-    // Lower the boxing-constructor idiom `malloc_typed(W_FloatObject{…})`
-    // to a native `NewWithVtable` + payload store before the dead-aggregate
-    // sweep, which then reclaims the orphaned construct-on-stack ctor and
-    // header field writes.
+    // Lower the allocation idiom `malloc[_typed](W_Object { ... })` to a
+    // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
+    // which then reclaims the orphaned construct-on-stack ctor and header
+    // field writes.
     dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
@@ -4957,6 +4958,26 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
+                    // Pointer -> unsigned-word cast is two operations in
+                    // RPython, not a `cast_ptr_to_int` whose result is merely
+                    // labelled Unsigned.  `rbuiltin.py:528-539`
+                    // (`rtype_cast_primitive`) first emits
+                    // `cast_ptr_to_int(..., resulttype=Signed)` and then
+                    // `gen_cast(..., TGT=Unsigned)`.  Rust's `p as usize`
+                    // reaches this arm directly, so materialise that same
+                    // sequence: the inner call produces the orthodox Signed
+                    // address integer and `r_uint` performs the second,
+                    // same-word retype.  Omitting it leaves `p as usize`
+                    // annotated `SomeInteger()` and makes it fail to join a
+                    // genuine `0usize` (`SomeInteger(unsigned=True)`).
+                    if matches!(src_kind, Some(ValueType::Ref(_)))
+                        && matches!(dst_kind, ValueType::Unsigned)
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        let (retype, result) =
+                            push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
+                        return Ok((Some(retype), result));
+                    }
                     return Ok(
                         match src_kind
                             .as_ref()
@@ -5778,6 +5799,7 @@ impl<'a> Lowering<'a> {
     ) -> Result<Variable, LowerError> {
         let op = match decode_constant(self.llbc, value)? {
             DecodedConst::Int(n) => OpKind::ConstInt(n),
+            DecodedConst::UInt(n) => OpKind::ConstUInt(n),
             DecodedConst::Int128(n) => OpKind::ConstInt128(n),
             DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
@@ -6984,6 +7006,7 @@ impl<'a> Lowering<'a> {
         }
         match decode_literal(found?).ok()? {
             DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
             DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
             DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
             DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
@@ -17470,12 +17493,13 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
 /// `allocate_stable(payload: Self)`.
 ///
 /// Each builds `Self { ob: <header>, ..payload }` then calls
-/// `lltype::malloc_typed[_stable]` — a non-numeric boxing allocation with no
-/// ported general `malloc->new` lowering (`fuse_boxing_alloc` rewrites only
-/// the numeric boxes `W_Float`/`W_Int`/`W_Complex`/`W_Long`; every other
-/// mallocable struct hits the fail-closed `flowspace_adapter` guard).  So the
-/// constructor body cannot be traced; the faithful treatment is the
-/// `register_external` analog — residualize the whole `allocate` call.
+/// `lltype::malloc_typed[_stable]`.  The concrete caller-side allocation
+/// clusters now lower generically through `fuse_boxing_alloc`, but this shared
+/// `Self` body has no concrete registered struct layout/type identity at its
+/// own translation boundary.  It therefore cannot prove the malloc-to-new
+/// rewrite and hits the fail-closed `flowspace_adapter` guard.  The faithful
+/// treatment of that generic wrapper is the `register_external` analog —
+/// residualize the whole `allocate` call.
 /// [`Lowering::impl_method_owner`] declines the `CallTarget::Method` hint for
 /// the `payload`-named `Self` argument (routing through
 /// `CallTarget::FunctionPath`); this collection feeds the matching registry
@@ -18192,6 +18216,52 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
         // pair touching Void/State/Unknown): alias the operand.
         _ => None,
     }
+}
+
+/// Emit RPython's pointer-to-Unsigned primitive cast sequence.
+///
+/// `rbuiltin.py:528-539` first produces a Signed address integer with
+/// `cast_ptr_to_int`, then applies `gen_cast(..., Unsigned)`.  The caller
+/// appends the returned `r_uint` operation after the Signed producer pushed
+/// here, preserving that ordering while fitting [`Lowering::build_rvalue`]'s
+/// one-returned-operation interface.
+fn push_ptr_to_unsigned_cast(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    arg: Variable,
+) -> (OpKind, Variable) {
+    let signed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(signed.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: [
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "cast_ptr_to_int",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+            args: vec![arg],
+            result_ty: ValueType::Int,
+        },
+    });
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let retype = OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        },
+        args: vec![signed],
+        result_ty: ValueType::Unsigned,
+    };
+    (retype, result)
 }
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
@@ -21463,6 +21533,7 @@ fn rvalue_variant_name(rv: &Rvalue) -> &'static str {
 /// emit. Widen as the corpus grows past `straight_line_add`.
 enum DecodedConst {
     Int(i64),
+    UInt(u64),
     Int128(i128),
     UInt128(u128),
     Bool(bool),
@@ -21721,7 +21792,7 @@ fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<Cons
 fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
     match value {
         ConstLit::Int(n) => Some(OpKind::ConstInt(n)),
-        ConstLit::UInt(n) => Some(OpKind::ConstInt(n as i64)),
+        ConstLit::UInt(n) => Some(OpKind::ConstUInt(n)),
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
         ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
@@ -22122,11 +22193,10 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
                         .parse()
                         .map_err(|e| LowerError::Schema(format!("Scalar Signed parse: {e}")))?,
                 ),
-                "Unsigned" | "Usize" => DecodedConst::Int(
+                "Unsigned" | "Usize" => DecodedConst::UInt(
                     v_str
                         .parse::<u64>()
-                        .map_err(|e| LowerError::Schema(format!("Scalar Unsigned parse: {e}")))?
-                        as i64,
+                        .map_err(|e| LowerError::Schema(format!("Scalar Unsigned parse: {e}")))?,
                 ),
                 _ => {
                     return Err(LowerError::Unsupported(format!(
@@ -24614,6 +24684,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
     for op in &block.operations {
         let pure = match &op.kind {
             OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
@@ -24746,7 +24817,8 @@ mod tests {
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
         fn_ptr_family_for, json_ty_is_thin_pointer_element,
         json_ty_rpython_gc_pointer_element_spelling, json_ty_scalar_element_spelling,
-        shaped_array_parts, simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -24883,6 +24955,16 @@ mod tests {
         assert!(matches!(
             decode_literal(&unsigned).expect("decode U128"),
             DecodedConst::UInt128(value) if value == u128::MAX
+        ));
+
+        let word = serde_json::json!({
+            "Scalar": {
+                "Unsigned": ["Usize", "624"]
+            }
+        });
+        assert!(matches!(
+            decode_literal(&word).expect("decode usize"),
+            DecodedConst::UInt(624)
         ));
     }
 
@@ -28368,6 +28450,56 @@ mod tests {
         ));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!("Unsize")));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
+    }
+
+    #[test]
+    fn pointer_to_usize_cast_keeps_rpython_signed_then_unsigned_sequence() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+
+        let (retype, result) = push_ptr_to_unsigned_cast(&mut graph, entry, ptr.clone());
+        graph
+            .block_mut(entry)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: retype,
+            });
+
+        let ops = &graph.block(entry).operations;
+        let (signed, signed_arg) = match &ops[1] {
+            crate::model::SpaceOperation {
+                result: Some(signed),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Int,
+                    },
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_int") => {
+                (signed, &args[0])
+            }
+            other => panic!("first cast must be Signed cast_ptr_to_int: {other:?}"),
+        };
+        assert_eq!(signed_arg, &ptr);
+        match &ops[2] {
+            crate::model::SpaceOperation {
+                result: Some(actual_result),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Unsigned,
+                    },
+            } if segments.last().map(String::as_str) == Some("r_uint") => {
+                assert_eq!(actual_result, &result);
+                assert_eq!(&args[0], signed);
+            }
+            other => panic!("second cast must retype to Unsigned with r_uint: {other:?}"),
+        }
     }
 
     /// Only a byte pointee spells the type-erased address; a pointee-typed

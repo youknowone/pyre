@@ -489,6 +489,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
     match &op.kind {
         OpKind::Call { .. } => "call".to_string(),
         OpKind::ConstInt(_) => "const_int".to_string(),
+        OpKind::ConstUInt(_) => "const_uint".to_string(),
         OpKind::ConstFloat(_) => "const_float".to_string(),
         OpKind::ConstStr(_) => "const_str".to_string(),
         OpKind::CallElidable {
@@ -601,6 +602,9 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
         }
         // format.py `'$%r' % (x.value,)` — constants print as $<value>.
         OpKind::ConstInt(value) => {
+            let _ = write!(out, "${value}");
+        }
+        OpKind::ConstUInt(value) => {
             let _ = write!(out, "${value}");
         }
         OpKind::ConstFloat(bits) => {
@@ -794,7 +798,7 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
             'f' => RegKind::Float,
             _ => RegKind::Ref,
         },
-        OpKind::ConstInt(_) => RegKind::Int,
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) => RegKind::Int,
         OpKind::ConstFloat(_) => RegKind::Float,
         OpKind::ConstStr(_) => RegKind::Ref,
         OpKind::ConstBool(_) => RegKind::Int,

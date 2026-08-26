@@ -62,15 +62,14 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::call_registry::{CallRegistry, FunctionEntry, FunctionPathKey};
+use crate::translator::rtyper::call_registry::{
+    exception_object_result_annotation, is_exception_object_materializer,
+};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{
     FlowspaceAdapterOutput, LegacyToTyped, LegacyToTypedCandidates,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-use crate::translator::rtyper::call_registry::{
-    exception_object_result_annotation,
-    is_exception_object_materializer,
-};
 
 /// The `graph.return_type` marker the front-end stamps on a
 /// `dont_look_inside` callee that returns `*mut PyObject` (a
@@ -1153,6 +1152,7 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::NewList { .. }
             | OpKind::GetSlice { .. }
             | OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
@@ -1728,15 +1728,11 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     if msg.contains("noneify() not supported") {
         return Some("noneify-on-ptr");
     }
-    // `flowspace_adapter::translate_op` rejected an UNFUSED
-    // `lltype::malloc_typed` `FunctionPath` (the finding's "option (b)"
-    // fail-closed guard).  `fuse_boxing_alloc` rewrites only the three
-    // numeric boxing structs to `NewWithVtable`; every other mallocable
-    // GC struct's `malloc_typed` survives with no ported
-    // `jtransform.rewrite_op_malloc` general lowering, so the adapter
-    // fails loud rather than matching a wrong residual `simple_call`.
-    // Skip-classify so the census falls back to the legacy walker until
-    // the general malloc->new path lands (boxing-lowering epic #134/#142).
+    // `flowspace_adapter::translate_op` rejected an UNFUSED GC malloc
+    // `FunctionPath`. `fuse_boxing_alloc` is the general source-aggregate to
+    // `NewWithVtable` lowering; a cluster whose owner/header/payload cannot be
+    // proven stays fail-closed here instead of becoming a residual allocator
+    // call with the wrong JIT semantics.
     if msg.contains("survived fuse_boxing_alloc unfused") {
         return Some("malloc-typed-unfused");
     }
@@ -1881,39 +1877,27 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     for (path, graph) in function_graphs.iter() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
-        // `pyre_object::lltype::malloc_typed` is the GC allocation intrinsic,
-        // recognised as a host builtin (annotator `malloc_typed_alloc`, HOST_ENV
-        // `pyre_object.lltype` module).  Its real body calls the un-flowable
-        // `<T as GcType>::type_id()` trait accessor, so lifting it records a
-        // poison lift-error that surfaces on the first boxing caller.  Skip
+        // `pyre_object::lltype::malloc[_typed]` are GC allocation intrinsics,
+        // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
+        // `pyre_object.lltype` module). Their real bodies enter the host
+        // allocator (`malloc_typed` first reads the un-flowable
+        // `<T as GcType>::type_id()` trait accessor), so lifting either records
+        // a poison lift-error that surfaces on the first boxing caller. Skip
         // registering it as a user function: with no registry entry, callsites
         // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
         // this failed user-graph entry (Layer-1 `call_registry.lookup`).
         //
-        // NARROW-LOWERING HAZARD — the HOST_ENV resolution is faithful ONLY for
-        // the numeric boxing structs (`W_FloatObject`/`W_IntObject`/
-        // `W_ComplexObject`/`W_LongObject`, per `model.rs payload_fields`) that
-        // `fuse_boxing_alloc` rewrites to a native
-        // `NewWithVtable` during MIR `simplify_lowered_graph`
-        // (`front/mir.rs:1409`, `model.rs` `payload_fields`) — *before* the
-        // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
-        // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py`) lowers
-        // EVERY mallocable GC struct to `new`/`new_with_vtable`; pyre has not
-        // ported that general path. So an UNFUSED `malloc_typed` (any non-numeric
-        // struct — `W_BytesObject`, `W_UnicodeObject`, the dict family, …)
-        // survives to Layer-3b and resolves to a residual `simple_call` carrying
-        // a symbolic fnaddr the executor cannot run. This is currently LATENT,
-        // not a live miscompile: the production tracer is FBW (non-numeric boxes
-        // run the genuine runtime `malloc_typed` GC helper), and the rtyper op
-        // stream is Path-2 census-only, never the assembled stream. Before any
-        // non-numeric box constructor is promoted toward Path-2 codegen, a
-        // fail-closed guard (the finding's "option (b)") must land FIRST in
-        // `flowspace_adapter::translate_op` — reject a surviving `[.., "lltype",
-        // "malloc_typed"]` `FunctionPath` with a `TyperError` (classified in
-        // `is_known_unported`) so the graph census-Skips to the legacy walker
-        // instead of silently matching a wrong residual call. Tracked by the
-        // boxing-lowering epic (#134/#142).
-        if canonical_strip == ["lltype", "malloc_typed"]
+        // `fuse_boxing_alloc` now derives every payload from the registered
+        // struct layout and rewrites a proven `malloc[_typed](T { ... })`
+        // cluster to `NewWithVtable` plus setfields, matching
+        // `jtransform.rewrite_op_malloc` (`jtransform.py`).  A surviving call
+        // is still not a residual boundary: it means the frontend could not
+        // prove the allocation header/type identity.  The fail-closed guard in
+        // `flowspace_adapter::translate_op` therefore rejects every surviving
+        // `malloc`, `malloc_typed`, or `malloc_typed_managed` call instead of
+        // emitting an executable symbolic fnaddr.
+        if canonical_strip == ["lltype", "malloc"]
+            || canonical_strip == ["lltype", "malloc_typed"]
             || canonical_strip == ["lltype", "malloc_typed_managed"]
         {
             crate::decline::record(
@@ -3335,11 +3319,9 @@ fn classify_unported_reason(reason: &str) -> &'static str {
     {
         "FRONTEND-TYPED-PTR (address-of-local / host-static / null)"
     } else if reason.contains("survived fuse_boxing_alloc unfused") {
-        // A non-numeric boxing struct's `lltype::malloc_typed` reached the
-        // adapter with no `NewWithVtable` fusion and no ported general
-        // malloc->new lowering (`flowspace_adapter::translate_op` fail-closed
-        // guard). The boxing-lowering epic (#134/#142) drains this bucket.
-        "UNFUSED-MALLOC (non-numeric boxing struct)"
+        // A GC allocation reached the adapter without the frontend proving
+        // its header/type identity and lowering it to `NewWithVtable`.
+        "UNFUSED-MALLOC (unproven GC allocation header)"
     } else if reason.contains("dict key eq function not wired") {
         // `OrderedDictRepr::require_direct_compare_key` fail-closed gate —
         // a dict key repr with a custom `get_ll_eq_function` (str, instance)

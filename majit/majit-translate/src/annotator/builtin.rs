@@ -292,10 +292,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
     // `bootstrap_std_modules`).
     analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
-    // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic.
+    // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics.
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
     // (`flowspace/model.rs`); recognising it as a builtin keeps its body out
     // of the looked-inside set (the `<T as GcType>::type_id()` accessor wall).
+    analyzer_for(&mut reg, "pyre_object.lltype.malloc", malloc_typed_alloc);
     analyzer_for(
         &mut reg,
         crate::runtime_names::modules::MALLOC_TYPED,
@@ -1974,12 +1975,14 @@ fn lltype_cast_pointer(
     )))
 }
 
-/// Analyzer for `pyre_object::lltype::malloc_typed::<T>(value: T) -> *mut T`
-/// — the GC allocation intrinsic (`lltype.malloc(STRUCT, flavor='gc')`
-/// parity).  Registered as a builtin so the body is NEVER looked-inside:
-/// it calls `<T as GcType>::type_id()`, a trait accessor that lowers to the
-/// unregistered bare-leaf path `["GcType","type_id"]` (no flowable graph),
-/// which would poison every boxing caller's lift.  A successful malloc
+/// Analyzer for `pyre_object::lltype::malloc[_typed]::<T>(value: T) -> *mut T`
+/// — the GC allocation intrinsics (`lltype.malloc(STRUCT, flavor='gc')`
+/// parity). Registered as builtins so their allocator implementations are
+/// NEVER looked-inside. In particular, `malloc_typed` calls
+/// `<T as GcType>::type_id()`, a trait accessor with no flowable graph, while
+/// the untyped `malloc` reaches the host GC-header allocator. Both are the
+/// source spelling consumed by `fuse_boxing_alloc`, just as RPython's rtyper
+/// emits one `malloc` op for `jtransform.rewrite_op_malloc`. A successful malloc
 /// returns a non-null heap pointer to the same struct the argument
 /// constructs, so the result is `SomeInstance(T)` with `can_be_none =
 /// false` (OOM takes the MemoryError exception edge, not a null result).
@@ -1992,10 +1995,10 @@ fn malloc_typed_alloc(
 ) -> Result<SomeValue, AnnotatorError> {
     if !kwds.is_empty() || args_s.len() != 1 {
         return Err(AnnotatorError::new(
-            "malloc_typed() expects a single (value) positional argument",
+            "malloc[_typed]() expects a single (value) positional argument",
         ));
     }
-    match arg_at(args_s, 0, "malloc_typed") {
+    match arg_at(args_s, 0, "malloc[_typed]") {
         SomeValue::Instance(inst) => {
             // lltype.py `malloc(T)`: only `isinstance(T, Struct)`
             // is mallocable; everything else falls to
@@ -2014,7 +2017,7 @@ fn malloc_typed_alloc(
             )))
         }
         other => Err(AnnotatorError::new(format!(
-            "malloc_typed(): expected a struct value to box, got {other:?}"
+            "malloc[_typed](): expected a struct value to box, got {other:?}"
         ))),
     }
 }
@@ -2552,6 +2555,7 @@ mod tests {
         assert!(is_registered("zip"));
         assert!(is_registered("min"));
         assert!(is_registered("max"));
+        assert!(is_registered("pyre_object.lltype.malloc"));
     }
 
     #[test]

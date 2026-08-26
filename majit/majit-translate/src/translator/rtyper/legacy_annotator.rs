@@ -265,6 +265,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
+        OpKind::ConstUInt(_) => ValueType::Unsigned,
         OpKind::ConstInt128(_) => ValueType::Int128,
         OpKind::ConstUInt128(_) => ValueType::UInt128,
         OpKind::ConstBool(_) => ValueType::Bool,

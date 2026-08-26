@@ -2323,7 +2323,7 @@ impl HostEnv {
                 .expect("core.ptr.null_mut bound above"),
         );
 
-        // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic
+        // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics
         // (`lltype.malloc(STRUCT, flavor='gc')` parity).  Exposed as a host
         // builtin so its body is never looked-inside; the `malloc_typed_alloc`
         // analyzer types the result as `SomeInstance(T)`.  Callsites carry the
@@ -2331,6 +2331,10 @@ impl HostEnv {
         // which `translate_op`'s Layer-3b resolves via this module
         // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
         let lltype_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_LLTYPE);
+        lltype_module.module_set(
+            "malloc",
+            HostObject::new_builtin_callable("pyre_object.lltype.malloc"),
+        );
         lltype_module.module_set(
             "malloc_typed",
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_TYPED),
