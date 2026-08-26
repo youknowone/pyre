@@ -345,7 +345,7 @@ spec_folds! {
     TruthBool            => ("truth_bool",               "residual_call", "-"),
     UnaryPositiveInt     => ("unary_positive_int",       "residual_call", "-"),
     UnaryNegativeInt     => ("unary_negative_int",       "residual_call", "-"),
-    UnaryInvertInt       => ("unary_invert_int",         "residual_call", "-"),
+    UnaryInvertDescent   => ("unary_invert_descent",     "residual_call", "-"),
     StoreSubscr          => ("store_subscr",             "residual_call", "-"),
     Setslice             => ("setslice",                 "residual_call", "-"),
     GetIter              => ("get_iter",                 "residual_call", "-"),

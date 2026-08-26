@@ -275,6 +275,38 @@ pub(crate) fn compiler_bigint_residual_path(segments: &[String]) -> Option<Vec<S
     )
 }
 
+/// The interpreter's own unary RBigInt wrappers.
+///
+/// A descent reaches `descroperation::bigint_neg` / `bigint_invert` as an
+/// unlowered helper and stops there, so the `<RBigInt as Neg>::neg` call in
+/// their bodies is never seen and
+/// [`bigint_unop_residual_path`](crate::front::bigint_binop::bigint_unop_residual_path)
+/// never applies.  Swapping the wrapper itself reaches the same two residuals
+/// the operator spelling reaches, the way [`divmod_projection_residual_path`]
+/// does for the binary wrappers.
+pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_neg") => "jit_bigint_neg",
+        Some("bigint_invert") => "jit_bigint_invert",
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some(
+        ["pyre_interpreter", "objspace", "descroperation", residual]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Zero-checked interpreter seams for the two projections of
 /// `rbigint.divmod`. Each returns a direct RBigInt handle at source level, so
 /// the target swap is ABI-identical to the other pointer residual mappings.
@@ -312,6 +344,44 @@ mod tests {
 
     fn segs(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn maps_the_unary_wrappers_and_nothing_else() {
+        for (wrapper, residual) in [
+            ("bigint_neg", "jit_bigint_neg"),
+            ("bigint_invert", "jit_bigint_invert"),
+        ] {
+            assert_eq!(
+                unop_wrapper_residual_path(&segs(&[
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    wrapper,
+                ])),
+                Some(segs(&[
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    residual,
+                ])),
+            );
+        }
+        // The owner is load-bearing: a same-named function anywhere else is
+        // not this wrapper and keeps its own body.
+        assert_eq!(
+            unop_wrapper_residual_path(&segs(&["pyre_object", "longobject", "bigint_neg"])),
+            None,
+        );
+        assert_eq!(
+            unop_wrapper_residual_path(&segs(&[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "bigint_clone",
+            ])),
+            None,
+        );
     }
 
     #[test]

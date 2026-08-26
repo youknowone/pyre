@@ -222,10 +222,12 @@ build.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 55 hand-written trace-time specialization rows, and an
-unset variable suppresses none. It is a measurement instrument — suppressing a
-fold is how the descent wall behind it is made to print — so it retires with
-the folds it selects, not before them.
+off that many of the 74 hand-written trace-time specialization rows (the
+`spec_folds!` invocation at `jitcode_dispatch/diag.rs:342-417`; count them
+there rather than trusting this sentence), and an unset variable suppresses
+none. It is a measurement instrument — suppressing a fold is how the descent
+wall behind it is made to print — so it retires with the folds it selects,
+not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
 wasm backend, where the guest reads no environment and the runner has to arm

@@ -398,6 +398,11 @@ thread_local! {
     /// thread. Resolved by graph key rather than by name -- see
     /// [`compute_pathed_jitcode_index`].
     static TUPLE_GETITEM_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+    /// Cached `ALL_JITCODES` index of `invert_inner` for the current thread.
+    /// Resolved by graph key: `neg` and `invert` held indices 2798/2809 in only
+    /// two of eight observed cache generations, so an index is not stable
+    /// across builds and a path is.
+    static INVERT_INNER_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
 /// Scan the build-time names index for the unique entry equal to `name`.
@@ -502,6 +507,24 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
 /// `_known` reader is what keeps the length test in the trace: the caller's
 /// trace-time range check proves only that THIS receiver is long enough, while
 /// the recorded `arraylen` guard is what holds for the next one.
+/// The charon `invert_inner` body in `ALL_JITCODES`, resolved by the graph key
+/// the codewriter allocated it under and cached per thread. `None` if the
+/// helper is absent from the build-time pipeline.
+///
+/// This is `descroperation.rs` `invert` past its `__invert__` override probe
+/// and its bool slot -- the two arms a descent cannot take. What is left is the
+/// `int` arm, the `long` arm, the instance fallback and the terminal
+/// `TypeError`, so a caller that has pinned an exact `int` or `long` receiver
+/// records one of the first two and nothing else.
+pub fn invert_inner_jitcode() -> Option<Arc<JitCode>> {
+    let idx = INVERT_INNER_JITCODE_INDEX.with(|cell| {
+        *cell.get_or_init(|| {
+            compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::invert_inner")
+        })
+    })?;
+    get_jitcode_by_index(idx)
+}
+
 pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = TUPLE_GETITEM_JITCODE_INDEX.with(|cell| {
         *cell.get_or_init(|| {

@@ -5436,21 +5436,23 @@ fn mapdict_qmut_force_enabled() -> bool {
 /// is deliberately not a mutation).  Dropping the check would fold a wrong
 /// answer, so a null falls through to the live residual read.
 ///
-/// !! THIS FOLD CURRENTLY FIRES NOWHERE.  Measured 2026-08-24 on release
-/// dynasm over every `bench/synth` fixture that contains a nested function (71
-/// of them, selected by AST rather than by name): the `load_deref` census row
-/// is reported by all 71, `consulted` totals 46, and `fired` totals 0.  Its
-/// ideal shape — a write-once freevar read from a hot `while` — reads
-/// `consulted=1 fired=0` too, so this is not a coverage gap in the corpus.
+/// !! THIS FOLD CURRENTLY FIRES NOWHERE, AND THE FIRST GUARD IS WHY.
+/// Re-measured 2026-08-26 on release dynasm with every early return named
+/// through `decline!`: over the whole corpus the census row reads
+/// `consulted=59 fired=0`, and over the 359 `bench/synth` fixtures holding a
+/// nested function every one of the 38 declines reports `cell-not-constant`.
+/// No other reason is reported anywhere.  Its ideal shape — a write-once
+/// freevar read from a hot `while` — reports the same single reason, as does a
+/// closure callee called from a hot loop, so this is not a coverage gap in the
+/// corpus and the later guards are unreached rather than merely quiet.
 ///
-/// `ever_mutated` is not what declines: `CellFamily::new` is born `false` and
-/// a write-once binding never sets it.  The first guard, `jit.isconstant` /
-/// [`OpRef::is_constant`], is the suspect — a cell read out of the frame's own
-/// cells region is red — but which guard actually declines has NOT been
-/// isolated, so do not repeat that as established.  The `can_move` gate on the
-/// contents postdates that measurement, so it is not what declined then.  A
-/// `spec-folds=load_deref` directive would therefore fail today; the row
-/// exists, unguarded, and is documented here rather than gated.
+/// So `jit.isconstant` / [`OpRef::is_constant`] is established, not suspected:
+/// the cell arrives red because it is read out of the frame's own cells
+/// region.  `ever_mutated` was never a candidate — `CellFamily::new` is born
+/// `false` and a write-once binding never sets it — and the `can_move` gate on
+/// the contents is likewise never reached.  A `spec-folds=load_deref`
+/// directive would therefore fail today; the row exists, unguarded, and is
+/// documented here rather than gated.
 ///
 /// The one admission that made closure callees inline, and with them their
 /// cells reach a sub-walk as constants, was `RuntimeHelperKind::LoadDeref` in
@@ -5461,15 +5463,25 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<OpRef>, DispatchError> {
+    /// Name the guard that declined, so that "this fold fires nowhere" can be
+    /// attributed to one of them instead of re-derived by reading.
+    macro_rules! decline {
+        ($why:literal) => {{
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LOAD-DEREF {}", $why);
+            }
+            return Ok(None);
+        }};
+    }
     // nestedscope.py `if jit.isconstant(self)`.
     let Some(&cell_op) = r_args.first() else {
-        return Ok(None);
+        decline!("no-cell-operand");
     };
     if !cell_op.is_constant() {
-        return Ok(None);
+        decline!("cell-not-constant");
     }
     let Some(majit_ir::Value::Ref(cell_ref)) = ctx.trace_ctx.box_value(cell_op) else {
-        return Ok(None);
+        decline!("cell-box-not-ref");
     };
     // `NO_CONCRETE` is `usize::MAX - 1`, not zero, so `is_null` does not cover
     // it and `is_cell` would dereference it.  It means "this box carries no
@@ -5478,24 +5490,24 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // alongside the null the way `state.rs` reads a `Value::Ref`
     // (`frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE`).
     let cell = cell_ref.0 as pyre_object::PyObjectRef;
-    if cell.is_null()
-        || cell_ref == majit_ir::GcRef::NO_CONCRETE
-        || !unsafe { pyre_object::is_cell(cell) }
-    {
-        return Ok(None);
+    if cell.is_null() || cell_ref == majit_ir::GcRef::NO_CONCRETE {
+        decline!("cell-null-or-no-concrete");
+    }
+    if !unsafe { pyre_object::is_cell(cell) } {
+        decline!("not-a-cell");
     }
     let family = unsafe { pyre_object::w_cell_family(cell) };
     if family.is_null() {
-        return Ok(None);
+        decline!("family-null");
     }
     // nestedscope.py `if not self.family.ever_mutated`.
     if unsafe { (*family).ever_mutated.get() } {
-        return Ok(None);
+        decline!("ever-mutated");
     }
     // nestedscope.py `w_res = self._elidable_get(); if w_res is not None`.
     let contents = unsafe { pyre_object::w_cell_get(cell) };
     if contents.is_null() {
-        return Ok(None);
+        decline!("contents-unbound");
     }
     // A cell holds an arbitrary object, so baking its address needs the gate
     // the other walker folds carry.  A RECORDED `ConstPtr` is forwarded at
@@ -5509,7 +5521,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // family is a `Box::into_raw` leak outside the collector entirely, so the
     // contents are the one edge that needs gating.
     if majit_gc::can_move(majit_ir::GcRef(contents as usize)) {
-        return Ok(None);
+        decline!("contents-movable");
     }
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(
@@ -6282,18 +6294,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #61: UNARY_INVERT `~int` fold.  `~x` always fits an int, so the fold
-    // emits a plain `IntInvert` behind a `GUARD_CLASS INT` (no overflow guard),
-    // eliding the `CALL_MAY_FORCE`.  A bool / subclass / non-int operand
-    // declines to the generic leg.
+    // UNARY_INVERT.  Descend `invert_inner` -- `invert` past the override probe
+    // and the bool slot -- rather than re-emit its integer arm by hand.  This
+    // replaced `unary_invert_int`, whose site it took whole: with the descent
+    // in, that fold measured `consulted=0` on every fixture that exercises `~`.
+    // Falls through to the generic residual when the body is absent from this
+    // build or reaches a helper the build did not lower.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && spec_gate(SpecFold::UnaryInvertInt, || {
-            try_walker_specialize_unary_invert_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
+        && spec_gate(SpecFold::UnaryInvertDescent, || {
+            try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
         .is_some()
     {

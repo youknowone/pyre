@@ -531,18 +531,33 @@ recorder, or the green accounts for.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 70 `try_walker_specialize_*` functions — 68 in
-`jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
-`inline_call.rs` — roughly 10.3k lines of body inside `specialize.rs`'s 17k,
-described by the 73 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
-and some rows are gate labels inside a larger arm rather than functions of
-their own). The counts are exact and the line figures deliberately are not:
-a fold count moves only when a fold is added or retired, while a line count
-moves whenever anyone touches the file and carries no part of the argument.
-Both are re-derivable: `rg -c 'fn try_walker_specialize_'` over the three
-files and the length of `SPEC_FOLD_ROWS`. Nothing in this charter named that layer
-before 2026-08-26, which is itself the finding: it is the largest single
-adaptation in the tree.
+pyre records traces through 69 `try_walker_specialize_*` functions — 67 in
+`jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
+(`load_deref`) and `inline_call.rs` (`instance_next`) — 9,865 lines of body
+inside `specialize.rs`'s 16,933, described by the 74 rows of
+`SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
+Nothing in this charter named that layer before 2026-08-26, which is itself
+the finding: it is the largest single adaptation in the tree.
+
+Re-derive every number here before citing it; this section has published
+two miscounts, and both survived because the recipe beside them did not run.
+Every command below is quoted as it must be typed.
+
+* Rows — `spec_folds!` opens at `diag.rs:342` and closes at `:418`:
+  `sed -n '342,418p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`.
+  `-F` is load-bearing: without it the `(` is an unclosed regex group and
+  `rg` exits 2 rather than counting.
+* Definitions — `rg -c` reports one count *per file*, so it answers 67/1/1
+  rather than 69. Sum the matches instead:
+  `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
+* Body lines — sum the brace-matched span of each `fn try_walker_specialize_*`
+  in `specialize.rs`; no one-liner does it.
+* Corpus — `ls pyre/bench/synth/*.py | wc -l`. Non-recursive **on purpose**:
+  a recursive walk sweeps `_pending`, `foriter57` and `iter57` and answers
+  530, over-counting by 46. Do not "fix" this to a `find`.
+
+`specialize.rs`'s own line count moved seven times in seven commits and is
+not a usable identifier for a tree.
 
 **Why it exists.** PyPy's objspace is RPython, so the tracer walks into it and
 `optimizeopt/` only ever sees ordinary recorded operations. pyre's objspace is
@@ -551,23 +566,15 @@ job is to *recognise* that residual and answer in its place. Upstream has no
 equivalent job, which means the obvious convergence — "retire the folds in
 favour of the ported optimizer" — is not available as stated. Group by group:
 
-| group | nearest upstream |
-|---|---|
-| unbox → raw int/float/bigint arithmetic, compare, truth | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
-| opaque builtin call → pure elidable call | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
-| residual → `new_with_vtable` / `new_array` so it stays virtual | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
-| guarded heap field / array / mapdict read and write | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
-| type-identity shortcut | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
-| frame / execution-context introspection | none at any layer; PyPy forces the virtualizable instead |
-| function-object construction | none |
-
-The table carries no per-group count on purpose. It used to carry one, reached
-by the same method that first published 74/72/17,349/76 for the totals above —
-none of which matched any tree this branch ever had — so its rows were
-unreliable individually as well as in sum. A fold's group is decided by what it
-emits in place of the residual and not by its label, which is a question each
-of the 70 bodies has to be read to answer, and the claim below needs only which
-upstream construct each group maps to.
+| group | n | nearest upstream |
+|---|---|---|
+| unbox → raw int/float/bigint arithmetic, compare, truth | 17 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| opaque builtin call → pure elidable call | 19 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
+| residual → `new_with_vtable` / `new_array` so it stays virtual | 10 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
+| guarded heap field / array / mapdict read and write | 19 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
+| type-identity shortcut | 0 | retired 2026-08-24; was `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
+| function-object construction | 2 | none |
 
 Four groups have only downstream cleanup upstream, two have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
@@ -578,33 +585,43 @@ generation debt, but its stated repair is now the right one.
 
 **What was tried.** A gateway-wrapper pilot gave `math.sqrt` its own jitcode
 and a published `fnaddr`; the descent still declined on 433 transitive
-blockers and retired zero folds. A separate census over the synthetic corpus
-found no fold with `consulted=0`, so the layer is not merely carrying dead
-arms — `load_deref` alone never fired.
+blockers and retired zero folds. A census over the whole corpus — 481
+synthetic plus the macro benches, every one of the 73 rows observed — found
+no fold with `consulted=0`, so the layer is not merely carrying dead arms.
+`load_deref` alone never fires, and naming each of its early returns shows
+why: all 38 declines across the 359 fixtures holding a nested function report
+the same first guard, `OpRef::is_constant`, so its cell always arrives red.
+That is a missing capability rather than dead weight — closure-callee
+inlining needs the fold, the fold needs constant cells, and constant cells
+need the inlining.
 
 **What does not hold it in place.** 23 fixtures carry a `spec-folds=` header
-and they name 44 distinct labels between them, so 29 of the 73 rows have no
+and they name 44 distinct folds between them, so 29 of the 73 rows have no
 fixture coupling at all. Retirement is blocked by reach, not by headers.
-(`rg -o 'spec-folds=[A-Za-z0-9_,]+' pyre/bench/synth/*.py`, split on commas,
-against the row list.)
 
-**The bounded first step is not specified.** This entry named one — the
-type-identity group, "`builtin_type`, `builtin_isinstance`,
-`builtin_issubclass`, 291 lines" — and **none of those three exists**: no
-`try_walker_specialize_` function and no `SPEC_FOLD_ROWS` row carries any of
-those names, so neither the group membership nor the 291 lines was ever
-measurable. The folds whose names point that way are `builtin_type_getattr`,
-`load_type_attr` and `load_type_name_attr`, and whether they are one group is
-exactly the question the removed `n` column could not answer. Specifying a
-first step therefore needs the grouping settled from the fold bodies first;
-until then there is no measurement to run, and any plan quoting those three
-names is quoting something that is not in the tree.
+**The bounded first step has been taken, and it does not settle the
+question.** The type-identity group — `builtin_type`, `builtin_isinstance`,
+`builtin_issubclass`, plus `builtin_hasattr` — left `SPEC_FOLD_ROWS` in
+`4953fb0edf8`, on the evidence that suppressing each one moved no stdout, no
+`[jit-stats]` counter and no wall clock. That is gate neutrality, not a
+descent: nothing in that change demonstrates the trace now carries the
+interpreter's own `abstract_isinstance_w` shape, and `isinstance` is still
+recognised outside the layer, at `residual_call.rs:3416`, where it gates
+replay-safety, carries no row, and the census cannot see it. Read that
+commit's message with care — it claims five retirements including
+`load_type_name_attr`, but its diff never touches that identifier and the
+fold is live at `specialize.rs:3931`.
 
-**Falsification.** If making a group's callables descendable does not let its
-folds be retired with the corpus unchanged, then reach is not the binding
-constraint and this entry is wrong — the layer would then be compensating for
-something the descent cannot reach in principle, and the right response is to
-say what that is rather than to widen the descent again.
+**Falsification.** A retirement counts against this entry only if the trace
+it leaves is the interpreter's own shape. `MAJIT_LOG=1`'s
+`--- trace (before opt) ---` must show the residual replaced by ordinary
+recorded operations, matching `PYPYLOG=jit-log-opt:FILE pypy3` on the same
+fixture. A retirement that only shows unchanged counters — as the four above
+do — proves the fold was not load-bearing, not that reach arrived. If reach
+does arrive for a group and its folds still cannot be retired, then reach is
+not the binding constraint and this entry is wrong: the layer would be
+compensating for something the descent cannot reach in principle, and the
+right response is to say what that is rather than to widen the descent again.
 
 ---
 

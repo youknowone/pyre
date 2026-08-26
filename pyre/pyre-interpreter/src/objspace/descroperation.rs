@@ -4986,7 +4986,20 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // non-overriding subclasses fall through to the by-layout comparison slot,
     // which gives the inherited builtin comparison.
     unsafe {
-        if let Some(result) = try_compare_override(a, b, op)? {
+        // A pair of exact builtins cannot reach an override, so the probe can
+        // only answer `None` for it: `is_instance` is false for both, and
+        // `subclass_special_override` returns `None` on
+        // `is_exact_builtin_instance` before it looks anything up.  Deciding
+        // that here spares the pair a reverse-dunder resolution and two MRO
+        // lookups, which is the whole of the probe for the commonest
+        // comparison there is.
+        //
+        // Only the probe is skipped.  The subtype ordering below still runs
+        // for such a pair, because `bool` is a proper subclass of `int` and
+        // both are exact builtin instances.
+        let pair_can_override = !pyre_object::is_exact_builtin_instance(a)
+            || !pyre_object::is_exact_builtin_instance(b);
+        if pair_can_override && let Some(result) = try_compare_override(a, b, op)? {
             return Ok(result);
         }
         // PyPy `descroperation.py:_make_comparison_impl` swaps the operands
@@ -5004,7 +5017,11 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             && !is_instance(b)
             && let (Some(a_type), Some(b_type)) =
                 (crate::typedef::r#type(a), crate::typedef::r#type(b))
-            && a_type != b_type
+            // Spelled as a raw-pointer identity, the way this file spells every
+            // other one.  `NonNull`'s own `!=` goes through `NonNull::ne`,
+            // which is not a call a trace can lower, and this test now sits on
+            // the walked path for an exact-builtin pair.
+            && !std::ptr::eq(a_type.as_ptr(), b_type.as_ptr())
             && issubtype_cached(b_type.as_ptr(), a_type.as_ptr())
         {
             return compare_slot(b, a, reverse_compare_op(op));
@@ -5582,6 +5599,22 @@ pub fn invert(a: PyObjectRef) -> PyResult {
             crate::warn::warn_category_w(bool_invert_deprecation_text(), "DeprecationWarning", 2)?;
             return Ok(w_int_new(!int_value(a)));
         }
+        invert_inner(a)
+    }
+}
+
+/// [`invert`] past its `__invert__` override probe and its bool slot.
+///
+/// Split out so that a trace can descend this body rather than re-emit it by
+/// hand.  The two arms left behind are what stop such a descent: the probe's
+/// `needs_numeric_unaryop_dispatch` is `dont_look_inside` and is the second
+/// operation the body executes, and the bool slot's deprecation warning
+/// reaches `lookup_exc_class`.  A caller that has already proven an exact
+/// `int` receiver takes neither, so entering here records the integer arm
+/// alone.  Every other caller reaches this through [`invert`] and is
+/// unaffected.
+pub fn invert_inner(a: PyObjectRef) -> PyResult {
+    unsafe {
         if is_int(a) {
             return Ok(w_int_new(!int_value(a)));
         }
