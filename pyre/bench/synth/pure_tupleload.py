@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=6
-# The ceiling sits between the two measured states: folded this runs 2.6x
-# pypy, and with `subscr_specialised_pair` suppressed about 198x.
+# The ceiling sits between the two measured states: served this runs 2.6x pypy,
+# and with the arity-2 reader off the loop pays the opaque residual (about 198x
+# when the retired `subscr_specialised_pair` fold was the only reader).
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
 # getarrayitem in the JIT walker (OptPure CSEs / const-folds the element load).
 #
@@ -12,9 +13,10 @@
 # the trace-time `ob_type == &TUPLE_TYPE` gate declines it to the non-pure /
 # residual path. It MUST NOT SIGSEGV and MUST stay correct.
 #
-# Case C builds a fresh arity-2 pair per iteration and reads both halves, which
-# is the `subscr_specialised_pair` fold's own shape. Suppressing that one fold
-# measures 46.3x here (0.092s -> 4.257s), the largest single-fold effect in the
+# Case C builds a fresh arity-2 pair per iteration and reads both halves. This
+# is the shape `subscr_tuple_descent` serves by descending `w_tuple_getitem`;
+# the hand-written `subscr_specialised_pair` reader it replaced measured 46.3x
+# here when suppressed (0.092s -> 4.257s), the largest single-fold effect in the
 # corpus, so this loop is what keeps the ceiling below honest.
 
 
