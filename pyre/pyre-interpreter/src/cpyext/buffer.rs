@@ -960,26 +960,39 @@ unsafe fn geometry(view: *const CPyBuffer) -> (Vec<i64>, Vec<i64>, Vec<i64>, i64
 /// and follow the pointer a non-negative suboffset names.
 ///
 /// # Safety
-/// `view` must point at a filled `Py_buffer`, and `indices` must name one
-/// in-bounds index per dimension.
-unsafe fn element_of(view: *const CPyBuffer, indices: &[i64]) -> *mut u8 {
-    let strides = unsafe { (*view).strides };
-    let suboffsets = unsafe { (*view).suboffsets };
-    let mut pointer = unsafe { (*view).buf } as *mut u8;
+/// `base` must address live storage the given geometry describes, and
+/// `indices` must name one in-bounds index per dimension.
+unsafe fn element_at(
+    base: *mut u8,
+    strides: &[i64],
+    suboffsets: &[i64],
+    indices: &[i64],
+) -> *mut u8 {
+    let mut pointer = base;
     for (axis, &index) in indices.iter().enumerate() {
-        let stride = match strides.is_null() {
-            true => 0,
-            false => unsafe { *strides.add(axis) as i64 },
-        };
+        let stride = strides.get(axis).copied().unwrap_or(0);
         pointer = unsafe { pointer.offset((stride * index) as isize) };
-        if !suboffsets.is_null() {
-            let suboffset = unsafe { *suboffsets.add(axis) };
-            if suboffset >= 0 {
-                pointer = unsafe { (*(pointer as *mut *mut u8)).offset(suboffset) };
+        match suboffsets.get(axis).copied() {
+            Some(suboffset) if suboffset >= 0 => {
+                pointer = unsafe { (*(pointer as *mut *mut u8)).offset(suboffset as isize) };
             }
+            _ => {}
         }
     }
     pointer
+}
+
+/// The address of the element `indices` names, over the geometry the view
+/// describes: a request without `PyBUF_STRIDES` leaves `strides` NULL and the
+/// element steps by the C-contiguous strides `init_shape_strides`
+/// reconstructs, not by nothing.
+///
+/// # Safety
+/// `view` must point at a filled `Py_buffer`, and `indices` must already be
+/// bounds-checked against its shape.
+unsafe fn element_of(view: *const CPyBuffer, indices: &[i64]) -> *mut u8 {
+    let (_, strides, suboffsets, _, _) = unsafe { geometry(view) };
+    unsafe { element_at((*view).buf as *mut u8, &strides, &suboffsets, indices) }
 }
 
 /// Walk every element of `view` in `order`, handing each element's address and
@@ -988,14 +1001,15 @@ unsafe fn element_of(view: *const CPyBuffer, indices: &[i64]) -> *mut u8 {
 /// # Safety
 /// `view` must point at a filled `Py_buffer`.
 unsafe fn walk(view: *const CPyBuffer, order: u8, mut visit: impl FnMut(*mut u8, usize, usize)) {
-    let (shape, _, _, itemsize, _) = unsafe { geometry(view) };
+    let (shape, strides, suboffsets, itemsize, _) = unsafe { geometry(view) };
     if shape.iter().any(|&extent| extent <= 0) {
         return;
     }
+    let base = unsafe { (*view).buf } as *mut u8;
     let mut indices = vec![0i64; shape.len()];
     let mut position = 0usize;
     loop {
-        let element = unsafe { element_of(view, &indices) };
+        let element = unsafe { element_at(base, &strides, &suboffsets, &indices) };
         visit(element, position, itemsize as usize);
         position += itemsize as usize;
         if !advance(&mut indices, &shape, order) {
