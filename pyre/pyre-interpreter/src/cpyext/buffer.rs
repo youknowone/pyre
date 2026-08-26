@@ -1042,6 +1042,15 @@ pub unsafe extern "C" fn PyBuffer_ToContiguous(
         return -1;
     }
     let target = buf as *mut u8;
+    // A view already contiguous in the requested order copies as one run.
+    // This is what 'A' asks for over a Fortran-contiguous source: its own
+    // physical bytes, not the C-order walk below.
+    if unsafe { PyBuffer_IsContiguous(view, order) } != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping((*view).buf as *const u8, target, length as usize)
+        };
+        return 0;
+    }
     unsafe {
         walk(view, order as u8, |element, position, itemsize| {
             std::ptr::copy_nonoverlapping(element, target.add(position), itemsize)
@@ -1069,6 +1078,14 @@ pub unsafe extern "C" fn PyBuffer_FromContiguous(
         return -1;
     }
     let source = buf as *const u8;
+    // As in `PyBuffer_ToContiguous`, an already-contiguous destination takes
+    // the whole run at once.
+    if unsafe { PyBuffer_IsContiguous(view, order) } != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(source, (*view).buf as *mut u8, length as usize)
+        };
+        return 0;
+    }
     unsafe {
         walk(view, order as u8, |element, position, itemsize| {
             std::ptr::copy_nonoverlapping(source.add(position), element, itemsize)
