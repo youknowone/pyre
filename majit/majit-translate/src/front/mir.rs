@@ -4736,7 +4736,7 @@ impl<'a> Lowering<'a> {
             result: Some(narrowed.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__pyre_cast_instance".to_string(), root.to_string()],
+                    segments: vec!["__cast_instance_intrinsic".to_string(), root.to_string()],
                 },
                 args: vec![value],
                 result_ty: ValueType::Ref(Some(root.to_string())),
@@ -6308,7 +6308,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "__pyre_cast_instance".to_string(),
+                                    "__cast_instance_intrinsic".to_string(),
                                     "PyObject".to_string(),
                                 ],
                             },
@@ -8097,7 +8097,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__pyre_cast_instance".to_string(),
+                                        "__cast_instance_intrinsic".to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -28888,7 +28888,7 @@ mod tests {
                         target: CallTarget::FunctionPath { segments },
                         ..
                     } if segments == &[
-                        "__pyre_cast_instance".to_string(),
+                        "__cast_instance_intrinsic".to_string(),
                         "PyObject".to_string(),
                     ]
                 ) && matches!(
@@ -28936,7 +28936,10 @@ mod tests {
                         target: CallTarget::FunctionPath { segments },
                         ..
                     } if segments.as_slice()
-                        == ["__pyre_cast_instance".to_string(), "PyObject".to_string()]
+                        == [
+                            "__cast_instance_intrinsic".to_string(),
+                            "PyObject".to_string(),
+                        ]
                 )
             })
         });
@@ -29235,7 +29238,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
-                } if segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                } if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
                     && segments.get(1).is_some_and(|root| root.ends_with("PyObject"))
             )
         });
@@ -29933,7 +29936,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
                     ..
-                } if segments == &["__pyre_cast_instance", "PyObject"]
+                } if segments == &["__cast_instance_intrinsic", "PyObject"]
             )
         };
         let join = graph.blocks.iter().find_map(|block| {
@@ -30038,7 +30041,7 @@ mod tests {
                             target: CallTarget::FunctionPath { segments },
                             ..
                         },
-                    ) if segments == &["__pyre_cast_instance", owner] => Some(result),
+                    ) if segments == &["__cast_instance_intrinsic", owner] => Some(result),
                     _ => None,
                 })
                 .expect("typed raw allocation destination");
@@ -30617,9 +30620,9 @@ mod tests {
             "{owner}.exc_object must retain its concrete object-pointer spelling, got {ty}"
         );
         let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
-        bk.set_pyre_struct_fields(std::rc::Rc::new(fields));
+        bk.set_struct_fields(std::rc::Rc::new(fields));
         let crate::annotator::model::SomeValue::Instance(projected) =
-            bk.project_pyre_field_type(&ty)
+            bk.project_struct_field_type(&ty)
         else {
             panic!("{owner}.exc_object field must project to an instance annotation")
         };
@@ -30667,7 +30670,7 @@ mod tests {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath { segments },
                                 ..
-                            } if segments == &["__pyre_cast_instance", "PyObject"]
+                            } if segments == &["__cast_instance_intrinsic", "PyObject"]
                         )
                 }),
                 "PyError::{field_name} null must retain the declared PyObject class"
@@ -30720,7 +30723,7 @@ mod tests {
                                 OpKind::Call {
                                     target: CallTarget::FunctionPath { segments },
                                     ..
-                                } if segments == &["__pyre_cast_instance", "PyObject"]
+                                } if segments == &["__cast_instance_intrinsic", "PyObject"]
                             )
                     }),
                 "PyError::{} projection write must retain the declared PyObject class",

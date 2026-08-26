@@ -4525,14 +4525,14 @@ mod tests {
         let bk = bk();
         assert!(
             matches!(
-                bk.project_pyre_field_type("BytesBlock"),
+                bk.project_struct_field_type("BytesBlock"),
                 SomeValue::String(_)
             ),
             "BytesBlock is the owner of RPython STR.chars, not a nominal instance"
         );
         assert!(
             matches!(
-                bk.project_pyre_field_type("*const BytesBlock"),
+                bk.project_struct_field_type("*const BytesBlock"),
                 SomeValue::String(_)
             ),
             "a BytesBlock pointer must keep the same string annotation"

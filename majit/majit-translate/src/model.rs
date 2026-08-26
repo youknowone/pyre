@@ -3072,7 +3072,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// the stores are operations in each caller graph.
 ///
 /// The MIR front has already made the concrete type explicit on both sides:
-/// the destination is a `__pyre_cast_instance(T)` result and the value is a
+/// the destination is a `__cast_instance_intrinsic(T)` result and the value is a
 /// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Calls in
 /// the source often split the aggregate from the stable allocation with
 /// residual GC hooks; resolve only phis whose every incoming path reaches the
@@ -3182,7 +3182,8 @@ pub fn lower_struct_ptr_writes(
                         },
                     ) if result == destination
                         && args.len() == 1
-                        && segments.first().map(String::as_str) == Some("__pyre_cast_instance")
+                        && segments.first().map(String::as_str)
+                            == Some("__cast_instance_intrinsic")
                         && segments.len() == 2 =>
                     {
                         Some(segments[1].as_str())

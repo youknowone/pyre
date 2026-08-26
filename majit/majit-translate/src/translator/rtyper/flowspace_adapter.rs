@@ -3488,7 +3488,7 @@ pub(crate) fn derive_subject_inputcells(
                 // nominal instance.  The MIR front folds
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same
-                // `SomeString` cell that `project_pyre_field_type` assigns it.
+                // `SomeString` cell that `project_struct_field_type` assigns it.
                 // A generic raw-slice owner does not take this path.
                 if class_root.as_deref() == Some("BytesBlock") {
                     cells.push(crate::annotator::model::s_str0());
@@ -4758,7 +4758,7 @@ mod tests {
             "PyObject".to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
         );
-        bk.set_pyre_struct_fields(Rc::new(fields));
+        bk.set_struct_fields(Rc::new(fields));
 
         let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("source-typed PyObject input must seed a concrete class");
