@@ -208,10 +208,6 @@ pub fn get_root_stack_limit_addr() -> usize {
 }
 
 thread_local! {
-    /// shadowstack.py:287 `root_stack_depth`. Growable via
-    /// `increase_root_stack_depth`; can never shrink.
-    static MAX_SHADOW_STACK_DEPTH: Cell<usize> = const { Cell::new(DEFAULT_SHADOW_STACK_DEPTH) };
-
     /// Thread-local shadow stack for individual GcRef roots.
     static SHADOW_STACK: RefCell<ShadowStack> = const { RefCell::new(ShadowStack::new()) };
 
@@ -532,12 +528,17 @@ pub fn after_fork_child() {
 /// The shadow stack itself.
 struct ShadowStack {
     entries: Vec<GcRef>,
+    /// shadowstack.py:281 `root_stack_depth`, which upstream keeps on the
+    /// `ShadowStackPool` beside the stack it caps rather than in a key of its
+    /// own.  Growable via `increase_root_stack_depth`; can never shrink.
+    max_depth: usize,
 }
 
 impl ShadowStack {
     const fn new() -> Self {
         ShadowStack {
             entries: Vec::new(),
+            max_depth: DEFAULT_SHADOW_STACK_DEPTH,
         }
     }
 }
@@ -549,8 +550,7 @@ pub fn push(gcref: GcRef) -> usize {
     SHADOW_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.entries.len();
-        let max = MAX_SHADOW_STACK_DEPTH.with(|c| c.get());
-        assert!(depth < max, "shadow stack overflow");
+        assert!(depth < ss.max_depth, "shadow stack overflow");
         ss.entries.push(gcref);
         depth
     })
@@ -810,7 +810,7 @@ pub fn depth() -> usize {
 /// rpython/memory/gctransform/shadowstack.py:351
 /// `increase_root_stack_depth` parity. Grows BOTH:
 ///   * the per-thread safety cap for the generic GcRef shadow stack
-///     (`MAX_SHADOW_STACK_DEPTH`); and
+///     (`ShadowStack::max_depth`); and
 ///   * the jitframe shadow stack's backing buffer (reallocates via
 ///     the per-thread backing buffer so compiled code can push up to
 ///     `new_depth` jitframes without running off the end).
@@ -818,9 +818,10 @@ pub fn depth() -> usize {
 /// Never shrinks. Called from `sys.setrecursionlimit` with
 /// `int(new_limit * 0.001 * 163840)` (pypy/module/sys/vm.py).
 pub fn increase_root_stack_depth(new_depth: usize) {
-    MAX_SHADOW_STACK_DEPTH.with(|c| {
-        if new_depth > c.get() {
-            c.set(new_depth);
+    SHADOW_STACK.with(|ss| {
+        let mut ss = ss.borrow_mut();
+        if new_depth > ss.max_depth {
+            ss.max_depth = new_depth;
         }
     });
     JF_ROOT_STACK.with(|stack| {
@@ -1114,7 +1115,7 @@ pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64, exc: &mut i64) ->
     BH_REGS_STACK.with(|ss| {
         let mut ss = ss.borrow_mut();
         let depth = ss.len();
-        let max = MAX_SHADOW_STACK_DEPTH.with(|c| c.get());
+        let max = SHADOW_STACK.with(|s| s.borrow().max_depth);
         assert!(depth < max, "blackhole regs stack overflow");
         ss.push(BhRegsEntry {
             regs_ptr: regs.as_mut_ptr(),
