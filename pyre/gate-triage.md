@@ -232,7 +232,7 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (73): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
