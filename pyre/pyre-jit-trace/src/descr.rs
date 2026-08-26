@@ -5665,6 +5665,20 @@ pub fn pyframe_flags_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
+/// `PyFrame.failed_attr_cleanup` — the byte carrying the failed-attribute
+/// finalizer state.  Its "run the deferred cleanup at the next opcode" value is
+/// `u8::MAX`, so a `NewWithVtable` that leaves the slot holding recycled
+/// nursery bytes can read as an armed request.  Located by offset, like
+/// [`pyframe_flags_descr`], so appending another field cannot repoint it.
+pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET)
+        .expect("PyFrame descr group has no failed_attr_cleanup field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1570,8 +1570,9 @@ pub fn emit_new_pyframe_inline_with_params(
         return None;
     }
     use crate::descr::{
-        pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
-        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
+        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
+        pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1660,6 +1661,15 @@ pub fn emit_new_pyframe_inline_with_params(
     // seed TraceCtx's concrete sanity cache with the constructor-time zero;
     // a later mark_as_escaped read must observe the carrier's current byte.
 
+    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
+    // reference, so `clear_gc_fields` does not reach it. incminimark's
+    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
+    // recycled nursery bytes, and the byte's "run the deferred cleanup before
+    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
+    // dispatch on this frame run a full non-moving old-gen collection.
+    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
+
     // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
@@ -1713,8 +1723,9 @@ pub fn emit_new_pyframe_inline_self_recursive(
         return None;
     }
     use crate::descr::{
-        pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
-        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
+        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
+        pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1793,6 +1804,15 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // See emit_new_pyframe_inline_with_params: the trace store is required for
     // materialization, but its constructor-time value is not the concrete
     // carrier's necessarily later record-time state.
+
+    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
+    // reference, so `clear_gc_fields` does not reach it. incminimark's
+    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
+    // recycled nursery bytes, and the byte's "run the deferred cleanup before
+    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
+    // dispatch on this frame run a full non-moving old-gen collection.
+    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
 
     // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
