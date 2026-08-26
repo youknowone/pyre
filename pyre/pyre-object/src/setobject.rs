@@ -507,7 +507,7 @@ unsafe fn scan_set_key_reentrant(
                 let stored_slot = crate::gc_roots::shadow_stack_len();
                 let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(key.obj);
+                key.obj = crate::gc_roots::pin_root(key.obj);
 
                 let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
@@ -1002,10 +1002,10 @@ unsafe fn w_set_contains_key_for_update(
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(stored.obj);
+                let stored_obj = crate::gc_roots::pin_root(stored.obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(key.obj);
-                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+                key.obj = crate::gc_roots::pin_root(key.obj);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
                 key.obj = crate::gc_roots::shadow_stack_get(key_slot);
                 if crate::dictmultiobject::take_dict_key_error() {
@@ -1069,10 +1069,10 @@ unsafe fn w_set_remove_key_for_update(
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(stored.obj);
+                let stored_obj = crate::gc_roots::pin_root(stored.obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(key.obj);
-                let equal = crate::dictmultiobject::dict_keys_equal(stored.obj, key.obj);
+                key.obj = crate::gc_roots::pin_root(key.obj);
+                let equal = crate::dictmultiobject::dict_keys_equal(stored_obj, key.obj);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
                 key.obj = crate::gc_roots::shadow_stack_get(key_slot);
                 if crate::dictmultiobject::take_dict_key_error() {
