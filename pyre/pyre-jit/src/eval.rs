@@ -5277,6 +5277,19 @@ fn build_jit_driver_pair() -> JitDriverPair {
             // (i64, i64) -> f64
             pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
                 as i64,
+            // (i64, i64, i64) -> f64.  Reading an unboxed float attribute is the
+            // only residual a `self.x` loop over float-valued mapdict storage
+            // leaves behind, so an un-vouched one puts a host trampoline on
+            // every iteration -- the byte-identical loop over an int attribute
+            // crosses zero times, because its `(i64, i64, i64) -> i64` twin
+            // already lowers through the arity-keyed family.
+            pyre_jit_trace::helpers::jit_mapdict_unboxed_read_f as *const () as usize as i64,
+            // (i64, i64, i64, f64) -> ().  The store counterpart of the read
+            // above: a void result with a float parameter is outside the
+            // uniform word family `residual_call_void_true_arity` covers, so
+            // without this it stays on the trampoline even though the read no
+            // longer does.
+            pyre_jit_trace::helpers::jit_mapdict_unboxed_write_f as *const () as usize as i64,
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());

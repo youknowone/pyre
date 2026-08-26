@@ -1160,9 +1160,58 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 /// as a graph-level `UnaryOp { op: "str" }`; `jtransform` lowers the
 /// Int-operand form to a residual call here (the Ref-operand form is
 /// identity, mirroring `ll_str` on a string).
-#[majit_macros::elidable]
+///
+/// NOT elidable, though `ll_int2dec` is: `descr_repr` (intobject.py) renders
+/// with the elidable helper and wraps the result in a separate
+/// `space.newutf8` allocation, and this function does both.  Marking the pair
+/// elidable let the pure pass share one call between two `str(i)` sites, which
+/// `is_w` makes visible — a `str` of `_len() > 1` has storage identity, so the
+/// shared box answered `str(i) is str(i)` True against False everywhere else.
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
     w_str_new_managed(&int_str_text(v)) as i64
+}
+
+/// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
+/// arm of `descr_getitem` (`unicodeobject.py`), restricted to what it answers
+/// without running Python.
+///
+/// The receiver crosses as a boxed reference and the index as a raw machine
+/// integer.  A `PY_NULL` declines and resumes the subscript in the
+/// interpreter, which is where negative indices, `IndexError`, `__index__`
+/// coercion and every non-exact receiver belong.
+///
+/// Elidable despite `w_str_get_index_storage`: a non-ASCII payload memoizes
+/// its code-point index table on first read, and that write stores exactly
+/// what the next call would recompute — the same shape as the string hash
+/// `try_hash_value` memoizes, which `EffectInfo.__new__` already admits for
+/// an `EF_ELIDABLE_*` call.  A `str` is immutable, so the code point at an
+/// index is fixed for the life of the object.  Its only failure is the
+/// allocation, so `call.py getcalldescr` picks its `cr == "mem"` branch
+/// rather than the conservative can-raise one.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_str_getitem(s: i64, index: i64) -> i64 {
+    let obj = s as PyObjectRef;
+    // The index is a machine int, 64-bit on every target, while `usize` is
+    // 32 bits on the wasm guest.  Converting is what declines a negative
+    // index and one past `usize::MAX` alike: an `as` cast would truncate
+    // `2**32` to `0` and answer `s[0]` where the interpreter raises
+    // `IndexError`.
+    let Ok(index) = usize::try_from(index) else {
+        return PY_NULL as i64;
+    };
+    if obj.is_null() {
+        return PY_NULL as i64;
+    }
+    unsafe {
+        if !crate::pyobject::is_exact_type(obj, &crate::pyobject::STR_TYPE) {
+            return PY_NULL as i64;
+        }
+        match w_str_codepoint_at(obj, index) {
+            Some(code_point) => w_str_from_codepoint(code_point.to_u32()) as i64,
+            None => PY_NULL as i64,
+        }
+    }
 }
 
 /// The text [`jit_int_str`] wraps.  Split out so a caller can check what the

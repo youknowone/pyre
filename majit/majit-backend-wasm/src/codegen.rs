@@ -1808,7 +1808,10 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
 }
 
 /// Wasm parameter types and result type of a residual call lowered directly.
-type TypedResidualSig = (Vec<ValType>, ValType);
+/// A residual callee's wasm signature taken from its call descr: the
+/// parameter sequence, and the result -- `None` for a callee that returns
+/// nothing, which wasm spells as an empty result list rather than a type.
+type TypedResidualSig = (Vec<ValType>, Option<ValType>);
 
 /// If `op` is a residual float CALL with only float arguments, return its wasm
 /// parameter types — eligible for a direct `call_indirect` returning `f64`.
@@ -1821,7 +1824,7 @@ type TypedResidualSig = (Vec<ValType>, ValType);
 ///
 /// This includes `CallMayForceF`: the wasm virtualizable is always
 /// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
-fn residual_call_float_sig(
+fn residual_call_typed_sig(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> Option<TypedResidualSig> {
@@ -1835,7 +1838,21 @@ fn residual_call_float_sig(
     ) && !matches!(
         op.opcode,
         CallR | CallPureR | CallLoopinvariantR | CallMayForceR
+    ) && !matches!(
+        op.opcode,
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
     ) {
+        return None;
+    }
+    // The uniform families are preferred wherever they can express the callee,
+    // and the emit arm tries them first. Declining here rather than at the call
+    // site keeps the four predicates disjoint, so the signature collected for an
+    // op is always the signature its emit reaches -- a type collected for an op
+    // the i64 family claims would declare an index nothing branches to.
+    if residual_call_i64_arity(op).is_some()
+        || residual_call_void_word_arity(op).is_some()
+        || residual_call_void_true_arity(op).is_some()
+    {
         return None;
     }
     let descr = op.getdescr()?;
@@ -1844,9 +1861,13 @@ fn residual_call_float_sig(
         return None;
     }
     let result = match cd.result_type() {
-        Type::Float => ValType::F64,
-        Type::Int | Type::Ref => ValType::I64,
-        Type::Void => return None,
+        Type::Float => Some(ValType::F64),
+        Type::Int | Type::Ref => Some(ValType::I64),
+        // A callee that returns nothing still needs its own type when a float
+        // parameter puts it outside `residual_call_void_true_arity`'s uniform
+        // word family.  `all_float` below is false for it, so it reaches the
+        // allow-list check like every other mixed shape.
+        Type::Void => None,
     };
     let arg_types = cd.arg_types();
     // Every argument `f64` and an `f64` result is the shipped shape and needs
@@ -1854,7 +1875,7 @@ fn residual_call_float_sig(
     // pointer in disguise. Anything else -- a word beside a float, or a word
     // result over float arguments -- is only as good as the descr, so the
     // callee has to be named by `set_faithful_residual_call_addrs`.
-    let all_float = result == ValType::F64 && arg_types.iter().all(|t| *t == Type::Float);
+    let all_float = result == Some(ValType::F64) && arg_types.iter().all(|t| *t == Type::Float);
     if !all_float {
         // Only a compile-time callee can be checked against the allow-list; a
         // register-form func pointer is a different target on every execution.
@@ -2026,7 +2047,7 @@ fn has_trampoline_calls(
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
             direct_helper_i64_arity(op, &ref_values).is_none()
-                && residual_call_float_sig(op, constants).is_none()
+                && residual_call_typed_sig(op, constants).is_none()
                 && residual_call_void_true_arity(op).is_none()
         }
         // `New*` and ref-store write barriers are covered by
@@ -3000,13 +3021,13 @@ pub fn build_wasm_module(
     // Typed float residual calls use their descr's faithful wasm ABI instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
-    let mut float_residual_sigs = Vec::new();
+    let mut typed_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
         for op in analysis_ops {
-            if let Some(sig) = residual_call_float_sig(op, constants)
-                && !float_residual_sigs.contains(&sig)
+            if let Some(sig) = residual_call_typed_sig(op, constants)
+                && !typed_residual_sigs.contains(&sig)
             {
-                float_residual_sigs.push(sig);
+                typed_residual_sigs.push(sig);
             }
         }
     }
@@ -3026,7 +3047,7 @@ pub fn build_wasm_module(
     let needs_table = needs_call
         || bridge_dispatch
         || residual_max_arity.is_some()
-        || !float_residual_sigs.is_empty()
+        || !typed_residual_sigs.is_empty()
         || true_void_residual_max_arity.is_some()
         || ca.emit_ca
         || inline_trip.is_some();
@@ -3108,17 +3129,19 @@ pub fn build_wasm_module(
     // the parameter sequence and the result come from the call descr (`i64`
     // for Int/Ref, `f64` for Float); the emitter uses this map to select the
     // exact `call_indirect` type for each callee.
-    let float_residual_type_base = next_type_idx;
-    let float_residual_type_indices = float_residual_sigs
+    let typed_residual_type_base = next_type_idx;
+    let typed_residual_type_indices = typed_residual_sigs
         .iter()
         .cloned()
         .enumerate()
-        .map(|(offset, sig)| (sig, float_residual_type_base + offset as u32))
+        .map(|(offset, sig)| (sig, typed_residual_type_base + offset as u32))
         .collect::<indexmap::IndexMap<TypedResidualSig, u32>>();
-    for (params, result) in float_residual_type_indices.keys() {
-        types.ty().function(params.clone(), vec![*result]);
+    for (params, result) in typed_residual_type_indices.keys() {
+        types
+            .ty()
+            .function(params.clone(), result.iter().copied().collect::<Vec<_>>());
     }
-    next_type_idx += float_residual_type_indices.len() as u32;
+    next_type_idx += typed_residual_type_indices.len() as u32;
     let true_void_residual_type_base = next_type_idx;
     if let Some(max) = true_void_residual_max_arity {
         for n in 0..=max {
@@ -3262,7 +3285,7 @@ pub fn build_wasm_module(
         *external_jump_key,
         *frame,
         residual_max_arity.map(|_| residual_type_base),
-        &float_residual_type_indices,
+        &typed_residual_type_indices,
         true_void_residual_max_arity.map(|_| true_void_residual_type_base),
         ca.clone(),
         ca_helper_type_idx,
@@ -3339,7 +3362,7 @@ fn build_function(
     // Exact wasm type indices for direct typed residual calls, keyed by their
     // descr-derived parameter sequence and result. Float SSA values are
     // converted to/from their i64 bit carrier around the call.
-    float_residual_type_indices: &indexmap::IndexMap<TypedResidualSig, u32>,
+    typed_residual_type_indices: &indexmap::IndexMap<TypedResidualSig, u32>,
     // Base wasm type index of the `(i64×n) -> ()` true-void residual-call
     // types (type `true_void_residual_type_base + n` for arity `n`), or
     // `None` when the trace has no eligible true-void residual call.
@@ -5825,9 +5848,9 @@ fn build_function(
                             frame,
                         );
                     }
-                } else if let Some((sig, &type_idx)) = residual_call_float_sig(op, constants)
+                } else if let Some((sig, &type_idx)) = residual_call_typed_sig(op, constants)
                     .and_then(|sig| {
-                        float_residual_type_indices
+                        typed_residual_type_indices
                             .get(&sig)
                             .map(|type_idx| (sig, type_idx))
                     })
@@ -5848,11 +5871,17 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
-                    if !OpRef::raw_is_constant(vi) {
+                    // A void callee leaves nothing on the stack, so there is
+                    // neither a local to home it in nor a value to drop.
+                    let homed = if sig.1.is_none() {
+                        None
+                    } else if !OpRef::raw_is_constant(vi) {
                         sink.local_set(value_types.local(vi));
+                        Some(vi)
                     } else {
                         sink.drop(); // value-producing call whose result is unused
-                    }
+                        None
+                    };
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,
@@ -5866,7 +5895,7 @@ fn build_function(
                             ref_homes,
                             &liveness,
                             op_idx,
-                            (!OpRef::raw_is_constant(vi)).then_some(vi),
+                            homed,
                             frame,
                         );
                     }

@@ -376,6 +376,7 @@ pub const SPEC_FOLD_ROWS: &[(&str, &str, &str)] = &[
     ("subscr_tuple_descent",      "specialize",    "subscr"),
     ("subscr_tuple",              "specialize",    "subscr"),
     ("subscr_specialised_pair",   "specialize",    "subscr"),
+    ("subscr_str",                "specialize",    "subscr"),
     ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
     ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
     ("instance_next",             "residual_call", "-"),

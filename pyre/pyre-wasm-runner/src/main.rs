@@ -1479,6 +1479,7 @@ fn load_main_module(engine: &Engine, module_path: &Path, variant: &str) -> Resul
     let cache_disabled = std::env::var_os("PYRE_WASM_NO_CACHE").is_some();
     let wasm_bytes = std::fs::read(module_path)
         .with_context(|| format!("read wasm module {}", module_path.display()))?;
+    probe_call_hist_note_module(module_path);
     let hash = wasm_content_hash(&wasm_bytes);
     let cache_path = cache_path_for(module_path, variant);
     let key_path = cache_key_path_for(module_path, variant);
@@ -1656,7 +1657,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "majit_host",
         "jit_call_host",
         |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-            if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32) {
+            if let Err(e) =
+                jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32, "host")
+            {
                 eprintln!("[jit_call_host] {e:?}");
             }
         },
@@ -1807,9 +1810,12 @@ fn jit_compile_trace(
     let jit_call = Func::wrap(
         &mut *caller,
         |mut inner: Caller<'_, Host>, frame_ptr: i32| {
-            if let Err(e) =
-                jit_call_trampoline(&mut inner, frame_ptr as u32, CALL_RESULT_OFS as u32)
-            {
+            if let Err(e) = jit_call_trampoline(
+                &mut inner,
+                frame_ptr as u32,
+                CALL_RESULT_OFS as u32,
+                "trace",
+            ) {
                 eprintln!("[jit_call] {e:?}");
             }
         },
@@ -1817,7 +1823,8 @@ fn jit_compile_trace(
     let jit_call_compact = Func::wrap(
         &mut *caller,
         |mut inner: Caller<'_, Host>, frame_ptr: i32, call_area_ofs: i32| {
-            if let Err(e) = jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32)
+            if let Err(e) =
+                jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32, "trace")
             {
                 eprintln!("[jit_call_compact] {e:?}");
             }
@@ -1999,8 +2006,9 @@ fn report_dead_call_slot(func_ptr: u32) {
 
 /// Dispatch a residual call requested by a running trace.
 // PROBE(PYRE_WASM_CALL_HIST): temporary per-callee crossing histogram.
-static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
-    std::sync::Mutex::new(None);
+static PROBE_CALL_HIST: std::sync::Mutex<
+    Option<std::collections::BTreeMap<(&'static str, u32), u64>>,
+> = std::sync::Mutex::new(None);
 
 /// Whether `PYRE_WASM_CALL_HIST` was set, read once.
 ///
@@ -2013,6 +2021,98 @@ fn probe_call_hist_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_WASM_CALL_HIST").is_some())
 }
 
+/// The module the histogram's slots index into, recorded so the dump can name
+/// them. Only the path is kept: resolving costs a re-read and a parse of the
+/// whole module, which is worth paying once at exit and never when the probe
+/// is off.
+static PROBE_CALL_HIST_MODULE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+fn probe_call_hist_note_module(module_path: &Path) {
+    if !probe_call_hist_enabled() {
+        return;
+    }
+    *PROBE_CALL_HIST_MODULE.lock().unwrap() = Some(module_path.to_path_buf());
+}
+
+/// Symbol for each function-table slot the histogram can report.
+///
+/// A slot is not a function index: the table is filled by the element
+/// segments, so the slot is resolved to a function index through them and only
+/// then to a name. Both index spaces count imports first, so the function
+/// index an element segment holds is the one the name section names, with no
+/// adjustment.
+///
+/// Every failure is silent and yields an empty map -- the caller falls back to
+/// printing the bare slot, which is what this probe did before. A diagnostic
+/// that cannot name a symbol is still worth its counts.
+fn probe_call_hist_slot_names() -> std::collections::BTreeMap<u32, String> {
+    use wasmparser::{ElementItems, ElementKind, Name, Operator, Payload};
+
+    let mut out = std::collections::BTreeMap::new();
+    let path = PROBE_CALL_HIST_MODULE.lock().unwrap().clone();
+    let Some(path) = path else { return out };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return out;
+    };
+
+    let mut slot_to_func: std::collections::BTreeMap<u32, u32> = Default::default();
+    let mut func_to_name: std::collections::BTreeMap<u32, String> = Default::default();
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload {
+            Ok(Payload::ElementSection(reader)) => {
+                for element in reader {
+                    let Ok(element) = element else { continue };
+                    // Only an active segment puts entries in the table; a
+                    // passive or declared one is never indexed by a call.
+                    let ElementKind::Active { offset_expr, .. } = element.kind else {
+                        continue;
+                    };
+                    // The table offset every real segment uses is a plain
+                    // `i32.const`; anything else is not a shape this resolves.
+                    let mut ops = offset_expr.get_operators_reader().into_iter();
+                    let base = match ops.next() {
+                        Some(Ok(Operator::I32Const { value })) => value as u32,
+                        _ => continue,
+                    };
+                    let ElementItems::Functions(funcs) = element.items else {
+                        continue;
+                    };
+                    for (i, func) in funcs.into_iter().enumerate() {
+                        let Ok(func) = func else { continue };
+                        slot_to_func.insert(base + i as u32, func);
+                    }
+                }
+            }
+            Ok(Payload::CustomSection(c)) if c.name() == "name" => {
+                let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(
+                    c.data(),
+                    c.data_offset(),
+                ));
+                for subsection in reader {
+                    let Ok(Name::Function(map)) = subsection else {
+                        continue;
+                    };
+                    for naming in map {
+                        let Ok(naming) = naming else { continue };
+                        func_to_name.insert(
+                            naming.index,
+                            rustc_demangle::demangle(naming.name).to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (slot, func) in slot_to_func {
+        if let Some(name) = func_to_name.get(&func) {
+            out.insert(slot, name.clone());
+        }
+    }
+    out
+}
+
 pub(crate) fn probe_call_hist_dump() {
     if !probe_call_hist_enabled() {
         return;
@@ -2023,13 +2123,15 @@ pub(crate) fn probe_call_hist_dump() {
     let mut v: Vec<_> = m.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1));
     eprintln!("[probe] call_hist total={total} distinct={}", v.len());
-    for (slot, n) in v.into_iter().take(15) {
+    let names = probe_call_hist_slot_names();
+    for ((source, slot), n) in v.into_iter().take(15) {
         let pct = if total > 0 {
             *n as f64 * 100.0 / total as f64
         } else {
             0.0
         };
-        eprintln!("[probe] call_hist slot={slot} n={n} pct={pct:.1}");
+        let name = names.get(slot).map(String::as_str).unwrap_or("?");
+        eprintln!("[probe] call_hist src={source} slot={slot} n={n} pct={pct:.1} name={name}");
     }
 }
 
@@ -2044,6 +2146,7 @@ fn jit_call_trampoline(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
+    source: &'static str,
 ) -> Result<()> {
     let host = caller.data_mut();
     let outer_child_ns = std::mem::take(&mut host.jit_call_child_ns);
@@ -2051,7 +2154,7 @@ fn jit_call_trampoline(
     host.jit_call_depth += 1;
     host.jit_call_depth_max = host.jit_call_depth_max.max(host.jit_call_depth);
     let entered = std::time::Instant::now();
-    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs);
+    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs, source);
     let elapsed = entered.elapsed().as_nanos();
     let host = caller.data_mut();
     host.jit_call_depth -= 1;
@@ -2064,6 +2167,7 @@ fn jit_call_trampoline_inner(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
+    source: &'static str,
 ) -> Result<()> {
     caller.data_mut().jit_call_count += 1;
     let memory = caller.data().memory.context("memory")?;
@@ -2074,7 +2178,7 @@ fn jit_call_trampoline_inner(
     if probe_call_hist_enabled() {
         let mut g = PROBE_CALL_HIST.lock().unwrap();
         *g.get_or_insert_with(Default::default)
-            .entry(func_ptr)
+            .entry((source, func_ptr))
             .or_insert(0) += 1;
     }
 

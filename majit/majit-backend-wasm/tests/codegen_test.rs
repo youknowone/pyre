@@ -2380,6 +2380,86 @@ fn test_true_void_float_arg_call_keeps_trampoline() {
     assert!(indirect_calls.is_empty());
 }
 
+/// The vouched twin of `test_true_void_float_arg_call_keeps_trampoline`: once
+/// the callee is named, the same `(f64) -> ()` shape lowers in-module. No
+/// uniform family can express it -- the word families cannot carry an `f64`,
+/// and the typed family is the only arm whose result may be `Type::Void` --
+/// so this is the one path that exercises the void arm end to end.
+#[test]
+fn test_vouched_true_void_float_arg_call_lowers_in_module() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
+    ];
+    // `void_call` names its callee with `OpRef::const_int(42)`.
+    majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls.len(), 1);
+    assert_eq!(
+        function_type(&bytes, indirect_calls[0].0 as usize),
+        (vec![wasmparser::ValType::F64], vec![])
+    );
+    assert_eq!(drops, 0, "a genuine void call has no result to drop");
+}
+
+/// The precedence guard inside `residual_call_typed_sig`. Admitting a
+/// `Type::Void` result put the typed family in reach of ops the two uniform
+/// void families already claim, and a type collected for such an op would
+/// declare an index no branch targets. The guard's observable is that naming
+/// the callee changes nothing: both void families still win, so the vouched
+/// build is byte-identical to the plain one.
+#[test]
+fn test_vouching_a_uniform_word_callee_emits_the_same_module() {
+    let shapes: Vec<(Vec<Type>, Vec<OpRef>, usize)> = vec![
+        // `residual_call_void_true_arity` -- all-word args, no result at all.
+        (
+            vec![Type::Int, Type::Ref],
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
+            0,
+        ),
+        // `residual_call_void_word_arity` -- the dummy-word C ABI, whose
+        // ignored result is dropped after the i64-family call.
+        (vec![Type::Int], vec![OpRef::input_arg_int(0)], 8),
+    ];
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    for (arg_types, args, result_size) in shapes {
+        let build = || {
+            let ops = vec![
+                void_call(arg_types.clone(), &args, result_size),
+                Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+            ];
+            build_module_default(&inputargs, &ops, &indexmap::IndexMap::new()).0
+        };
+        majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
+        let plain = build();
+        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+        let vouched = build();
+        majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
+
+        validate_wasm(&plain);
+        validate_wasm(&vouched);
+        assert_eq!(
+            plain, vouched,
+            "a callee a uniform family can express must reach its emit through \
+             that family, so vouching it must change no byte"
+        );
+    }
+}
+
 #[test]
 fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];

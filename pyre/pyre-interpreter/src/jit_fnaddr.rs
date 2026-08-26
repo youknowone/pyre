@@ -2341,6 +2341,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str,
     );
+    cpa2(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_getitem",
+        "pyre_object::jit_str_getitem",
+        pyre_object::jit_str_getitem,
+    );
     // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
     // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
     // The non-virtual shrink reallocs a raw low-level string down to its final
