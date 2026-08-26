@@ -753,7 +753,15 @@ fn run_python_impl(source: &str) -> String {
     {
         use pyre_interpreter::launch_env::{self, LaunchFlags};
         launch_env::set_launch_env(LAUNCH_ENV.with(|e| e.borrow().clone()));
-        match launch_env::finalize(LaunchFlags::default()) {
+        // `-B`, because the seam this target sees a filesystem through reads
+        // and does not write.  The source loader would otherwise try to cache
+        // the bytecode of every module it compiles, and `_write_atomic` reaches
+        // for `posix.open`, which no read-only `posix` publishes.
+        let flags = LaunchFlags {
+            dont_write_bytecode: true,
+            ..LaunchFlags::default()
+        };
+        match launch_env::finalize(flags) {
             Ok(flags) => {
                 pyre_interpreter::importing::set_no_site(flags.no_site);
                 pyre_interpreter::importing::set_runtime_flags(&flags);
