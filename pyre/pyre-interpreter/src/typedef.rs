@@ -8284,11 +8284,42 @@ fn init_frame_type(ns: PyObjectRef) {
     // recover the right instruction — the same adaptation `tb_lasti`
     // uses (`typedef.rs` tb_lasti getter).
     //
-    // A negative `last_instr` is the not-yet-started sentinel, not a
-    // coordinate, so it is handed out as-is: `PyFrame_GetLasti` scales only
-    // the non-negative case (`lasti < 0 ? -1 : lasti * sizeof(_Py_CODEUNIT)`)
-    // and `pyframe.py fget_f_lasti` returns `last_instr` unscaled. Scaling it
-    // reported `-2`, a value neither reference produces.
+    // A negative `last_instr` means the frame has not run an instruction, and
+    // that is not a coordinate this getter can hand out: `frame_lasti_get_impl`
+    // turns only a negative `_PyInterpreterFrame_LASTI` into `-1`, and the
+    // pointer is not negative there.  Frame setup consumes the
+    // compiler-inserted prologue, so the pointer rests on the first `RESUME`
+    // -- `code->_co_firsttraceable` -- which is what the `call` event reports:
+    // 0 for a plain function, 2 past a closure's `COPY_FREE_VARS`, 4 past a
+    // generator's `RETURN_GENERATOR` / `POP_TOP`.  Handing out `-1` instead
+    // named a coordinate no frame ever executes.  `pyframe.py fget_f_lasti`
+    // returns `last_instr` unscaled and stops there, so both adaptations live
+    // here rather than in [`PyFrame::fget_f_lasti`].
+    //
+    // A generator is the one shape whose not-yet-started frame rests somewhere
+    // else: `RETURN_GENERATOR` is what built the generator, so the frame it
+    // left behind sits on the instruction after it until the first resumption
+    // walks on to the `RESUME`.  Only the generator's own started flag
+    // separates the two, and the frame is reachable from Python in both states
+    // through `gi_frame`.
+    //
+    // That flag is read through the back-reference, which is cleared when the
+    // generator is collected (`generator_finalize`) and when a generator that
+    // never ran finishes.  A frame that outlives its generator therefore
+    // cannot say which of the two it rests on, and the sentinel stands: the
+    // `RESUME` would be the coordinate for a frame still at its `call` event,
+    // which this one is not.
+    //
+    // The flag alone does not separate a first `send` from a first `throw`,
+    // which marks the generator started and then injects before the `RESUME`
+    // is reached -- that frame is still on the instruction after
+    // `RETURN_GENERATOR`.  Nothing reads it there: the trace events that
+    // would are not emitted for an injection into a generator that never ran,
+    // and the frame is unlinked by the time the call returns.  Whatever
+    // starts emitting them owns that distinction.
+    //
+    // `-1` is left for a code object with no `RESUME` too, where that index
+    // runs past the end and the frame starts no line either.
     let lasti_getter = make_builtin_function_with_arity(
         "f_lasti",
         |args| {
@@ -8296,7 +8327,28 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            let lasti = unsafe { &*f }.fget_f_lasti() as i64;
+            let frame = unsafe { &*f };
+            let lasti = frame.fget_f_lasti();
+            let lasti = if lasti < 0 {
+                let code = frame.code();
+                let owner = frame.get_generator();
+                let index = match crate::pycode::after_return_generator_index(code) {
+                    Some(after_return_generator) => (!owner.is_null()).then(|| {
+                        if unsafe { pyre_object::generator::w_generator_is_started(owner) } {
+                            crate::pycode::first_traceable_index(code)
+                        } else {
+                            after_return_generator
+                        }
+                    }),
+                    None => Some(crate::pycode::first_traceable_index(code)),
+                };
+                match index {
+                    Some(index) if index < code.instructions.len() => index as i64,
+                    _ => -1,
+                }
+            } else {
+                lasti as i64
+            };
             Ok(pyre_object::w_int_new(if lasti < 0 {
                 -1
             } else {

@@ -3477,6 +3477,28 @@ pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
     index
 }
 
+/// The index the frame of a generator that has not been resumed rests on.
+///
+/// `RETURN_GENERATOR` is what builds the generator object, so by the time a
+/// caller holds it that instruction has run and the frame it left behind sits
+/// on the next one.  The index is not a constant: a closure generator's
+/// `COPY_FREE_VARS` precedes `RETURN_GENERATOR` and shifts it along.
+///
+/// `None` for a code object with no `RETURN_GENERATOR`, which is every code
+/// object that is not a generator, coroutine or async generator.
+pub fn after_return_generator_index(code: &crate::CodeObject) -> Option<usize> {
+    use crate::bytecode::Instruction;
+
+    let mut index = 0;
+    while let Some(op) = base_op(code, index) {
+        if matches!(op, Instruction::ReturnGenerator) {
+            return Some(index + 1);
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Whether the instruction at `pc` may be reported to a trace function as the
 /// start of a source line.
 ///

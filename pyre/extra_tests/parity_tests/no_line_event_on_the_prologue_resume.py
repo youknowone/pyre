@@ -11,9 +11,9 @@
 # without the filter reports an extra `line` event at line 0 before the first
 # statement, and `pdb` stops on `<string>(0)` where 3.14 stops on `(1)`.
 #
-# The `call` event's `f_lasti` is deliberately not compared: `_PyInterpreterFrame
-# _LASTI` is 0 while the frame sits on its `RESUME`, where this runtime reports
-# "not started", and that convention gap is a separate open item.
+# The `call` event's `f_lasti` is not compared here, but for a narrower reason:
+# it names the very `_co_firsttraceable` this filter is written against, so
+# `f_lasti_names_the_resume_on_the_call_event.py` pins it on its own.
 #
 # PyPy 7.3.20 is a 3.11 line table whose module body has no line-0 range, so
 # its event list differs for that reason.
