@@ -157,7 +157,7 @@ impl W_StringIO {
         this.publish_refs();
 
         if this.readuniversal {
-            let io = crate::importing::get_sys_module("_io")
+            let io = crate::importing::get_builtin_module("_io")
                 .ok_or_else(|| crate::PyError::runtime_error("_io module is not initialized"))?;
             let decoder_type = crate::baseobjspace::getattr_str(io, "IncrementalNewlineDecoder")?;
             let decoder = crate::call::call_function_impl_result(

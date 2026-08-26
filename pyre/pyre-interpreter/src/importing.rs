@@ -2818,6 +2818,22 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
 
+/// `space.getbuiltinmodule(name)` — the module object for a registered builtin,
+/// minted on the first ask.
+///
+/// `sys.modules` holds what has been imported; `space.builtin_modules` holds
+/// every builtin the space was built with, and `getbuiltinmodule` creates the
+/// module the first time one is named.  An interpreter-level reader of pyre's
+/// own builtin needs the second: `_io`'s newline decoder is an app-level class
+/// that lives on the `_io` module object and nowhere else, so a program that
+/// never imported `_io` would otherwise not be able to open a text file.
+pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
+    if let Some(module) = check_sys_modules(name) {
+        return Some(module);
+    }
+    create_builtin_module(name, std::ptr::null()).ok().flatten()
+}
+
 /// Return the interpreter-owned `sys` module, bypassing the Python-visible
 /// `sys.modules` mapping.
 ///
