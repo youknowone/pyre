@@ -5894,9 +5894,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // silently.  The three call helpers are the whole population that owes an
     // event -- every other `RuntimeHelperKind` reaching this dispatcher erases an
     // operator dispatch, which reports nothing on cpython, pypy3 or pyre
-    // alike.  A `CallFn` naming a Python callee owes no `c_call` either, but
-    // the fold gives the walker no way to tell, and declining is the safe
-    // answer: the frame runs interpreted and reports exactly.
+    // alike.
+    //
+    // A `CallFn` naming a PYTHON callee owes no `c_call` either, and
+    // `call_valuestack` draws that line at `is_builtin_code(w_func)`.  The
+    // walker could be told: operand 0 of the plain `CallFn` shape carries the
+    // callable, and a `GuardValue` pins the recording-time answer.  Measured
+    // 2026-08-26, that is NOT enough and the narrowing was reverted --
+    // `profile_hook_armed_before_a_hot_loop` fails on all three backends.
+    // Admitting the trace for the Python callee also admits every FOLDED
+    // builtin in the same loop body, and a fold never reaches this dispatcher
+    // at all, so `len`'s `c_call` / `c_return` stop firing.  The decline on
+    // the Python call was what protected them.  Reporting has to be RECORDED
+    // into the trace before any of this can narrow; declining is the safe
+    // answer until then.
     //
     // This converges rather than retracing forever: `abort_count` reaches
     // `MAX_TRACE_ABORT_COUNT` on the profiled green key and the cell latches

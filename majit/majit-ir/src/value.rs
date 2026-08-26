@@ -1247,9 +1247,11 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// guard, so the ceiling is the inlined callee's unrecorded `call_trace` /
 /// `return_trace` (see `walker_ec_enter`, `jitcode_dispatch/inline_call.rs`)
 /// and not the green.  It is also not what protects a profiler installed
-/// BEFORE the frame is entered — measured, such a frame never reaches a trace
-/// at all (`loops_compiled = 0`, `loops_aborted = 0`), because
-/// `eval_with_jit_inner` routes it to `execute_frame_plain`.  The green is
+/// BEFORE the frame is entered.  That used to be answered by the frame never
+/// reaching a trace at all, because the JIT-eligibility gate sent every
+/// profiled frame down `execute_frame_plain`; the gate now reads only the
+/// per-frame `f_trace`, so a profiled frame does reach a trace — measured on
+/// a call-bearing hot loop, `loops_compiled = 1`, `loops_aborted = 5`.  The green is
 /// still live at a back edge even so: `setprofile` runs `force_all_frames(True)`,
 /// which sets `is_being_profiled` on every frame ALREADY running, and one of
 /// those can be sitting in a compiled loop.  Tracing has no green of its own
