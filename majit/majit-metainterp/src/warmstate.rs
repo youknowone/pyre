@@ -684,6 +684,17 @@ pub struct WarmEnterState {
     /// warmspot.py:110: memory_manager — generation-based loop aging.
     /// pyjitpl.py: try_to_free_some_loops calls next_generation().
     pub memory_manager: crate::memmgr::MemoryManager,
+    /// Bumped by every mutation that can change what
+    /// [`Self::maybe_compile_decision`] answers for a key it already refused
+    /// at the abort ceiling: installing a cell, which resets `abort_count` to
+    /// zero, and attaching a procedure token, which can make the key runnable
+    /// through a sibling cell in the same chain.
+    ///
+    /// It exists so a caller can cache that refusal rather than re-derive it
+    /// per back edge. The refusal is pure — it bumps a diagnostic slot and
+    /// returns `NotHot` above `decay_all_counters`, deliberately — so a cache
+    /// keyed on this counter changes nothing but the work spent reaching it.
+    cell_generation: u64,
 }
 
 /// Result of checking whether a green key is hot.
@@ -793,6 +804,7 @@ impl WarmEnterState {
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
+            cell_generation: 0,
         }
     }
 
@@ -897,6 +909,34 @@ impl WarmEnterState {
         }
         let bucket = self.bucket_of(cell_key);
         self.counter.tick(bucket, self.increment_threshold)
+    }
+
+    /// The counter [`Self::cell_generation`] documents.
+    pub fn cell_generation(&self) -> u64 {
+        self.cell_generation
+    }
+
+    fn bump_cell_generation(&mut self) {
+        self.cell_generation = self.cell_generation.wrapping_add(1);
+    }
+
+    /// Whether [`Self::maybe_compile_decision`] would refuse `cell_key` at the
+    /// abort ceiling.
+    ///
+    /// The condition is restated here rather than shared with that decision
+    /// because the decision reads the cell once and answers four other
+    /// questions from the same borrow, while a caller asking only this one
+    /// wants it alone. The two must agree, which
+    /// `is_ceiling_latched_agrees_with_the_decision_it_mirrors` asserts.
+    pub fn is_ceiling_latched(&self, cell_key: u64) -> bool {
+        let Some(cell) = self.cell_by_key(cell_key) else {
+            return false;
+        };
+        if cell.is_compiled() || cell.is_tracing() {
+            return false;
+        }
+        let dead_token = cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
+        !dead_token && cell.abort_ceiling_latched()
     }
 
     /// The `dead_token` gate below is narrower than
@@ -1344,7 +1384,9 @@ impl WarmEnterState {
         let token = token.into();
         let cell = self.ensure_cell_by_key(cell_key);
         cell.flags &= !jc_flags::TRACING;
-        cell.set_procedure_token(token, false)
+        let previous = cell.set_procedure_token(token, false);
+        self.bump_cell_generation();
+        previous
     }
 
     /// Typed form of [`Self::attach_procedure_to_interp`].
@@ -1367,7 +1409,9 @@ impl WarmEnterState {
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags &= !jc_flags::TRACING;
-        cell.set_procedure_token(token, false)
+        let previous = cell.set_procedure_token(token, false);
+        self.bump_cell_generation();
+        previous
     }
 
     /// warmstate.py `cell.set_procedure_token(procedure_token, tmp=True)`.
@@ -1388,6 +1432,7 @@ impl WarmEnterState {
         let token = token.into();
         let cell = self.ensure_cell_by_key(cell_key);
         let _old = cell.set_procedure_token(token, true);
+        self.bump_cell_generation();
     }
 
     /// warmstate.py `finally: cell.flags &= ~JC_TRACING` parity —
@@ -2897,6 +2942,7 @@ impl WarmEnterState {
     /// upstream needs no equivalent because it hands the cell object itself
     /// on (warmstate.py:483/:511) and never re-derives it from a number.
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
+        self.bump_cell_generation();
         let mut keep = newcell.map(Box::new);
         if let Some(cell) = &mut keep
             && cell.cell_key.is_none()
@@ -6734,6 +6780,83 @@ mod tests {
             ws.get_cell_for_key(&key).is_none(),
             "the dead cell must be gone: the ceiling returned before \
              cleanup_chain and left it in the bucket",
+        );
+    }
+
+    #[test]
+    fn is_ceiling_latched_agrees_with_the_decision_it_mirrors() {
+        let mut ws = WarmEnterState::new(2);
+        let cell_key = 42u64;
+        ws.ensure_cell_by_key(cell_key);
+        assert!(
+            !ws.is_ceiling_latched(cell_key),
+            "a fresh cell is not latched",
+        );
+
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing(cell_key, false);
+        }
+        assert!(ws.is_ceiling_latched(cell_key));
+
+        // The refusal is what this predicate stands in for, and it leaves the
+        // generation alone — otherwise a cache keyed on it would be
+        // invalidated by the very answer it is caching.
+        let generation = ws.cell_generation();
+        assert!(matches!(
+            ws.maybe_compile_decision(cell_key),
+            HotResult::NotHot
+        ));
+        assert_eq!(ws.cell_generation(), generation);
+        assert!(
+            ws.is_ceiling_latched(cell_key),
+            "the refusal did not consume the latch",
+        );
+
+        // `install_new_cell` keeps a cell that is not removable, so this one
+        // stays latched; what matters for a cache is that the generation moves
+        // anyway, because the same call drops removable cells and lets a fresh
+        // one trace in their place.
+        ws.install_new_cell(cell_key, None);
+        assert_ne!(ws.cell_generation(), generation);
+    }
+
+    #[test]
+    fn a_dead_token_is_not_a_ceiling_latch_because_the_decision_cleans_it_up() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![7, 11]);
+        let token_num = ws.alloc_token_number();
+        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing_for_key(&key, false);
+        }
+        let cell = ws
+            .get_cell_for_key(&key)
+            .expect("fixture: the cell is still there");
+        assert!(
+            cell.abort_count >= MAX_TRACE_ABORT_COUNT,
+            "fixture: the ceiling must be latched",
+        );
+        let cell_key = cell.cell_key.expect("fixture: the cell carries its key");
+        assert!(
+            !ws.is_ceiling_latched(cell_key),
+            "a dead token takes the cleanup path, so the decision does NOT \
+             refuse at the ceiling and a cache must not answer for it",
+        );
+    }
+
+    #[test]
+    fn attaching_a_procedure_token_moves_the_generation_a_cache_keys_on() {
+        let mut ws = WarmEnterState::new(2);
+        let cell_key = 7u64;
+        ws.ensure_cell_by_key(cell_key);
+        let generation = ws.cell_generation();
+        let token_num = ws.alloc_token_number();
+        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(token_num));
+        assert_ne!(
+            ws.cell_generation(),
+            generation,
+            "a token can make a latched key runnable through its chain, so a \
+             cache must be told",
         );
     }
 }
