@@ -1115,9 +1115,10 @@ pub(crate) fn strides_from_shape(shape: &[i64], itemsize: i64) -> Vec<i64> {
     s
 }
 
-/// `get_offset` — the byte offset of `index` along dimension `dim`,
-/// bounds-checked against `shape[dim]` (negative indices wrap).
-unsafe fn memoryview_get_offset(
+/// `lookup_dimension` — `index` wrapped into dimension `dim` and bounds-checked
+/// against `shape[dim]`.  The byte arithmetic is `element_ptr`'s, because a
+/// dimension carrying a suboffset has no byte offset to add.
+unsafe fn memoryview_check_dimension(
     mv: PyObjectRef,
     dim: i64,
     index: i64,
@@ -1125,7 +1126,6 @@ unsafe fn memoryview_get_offset(
     use pyre_object::memoryview::*;
     unsafe {
         let shape = w_memoryview_native_shape(mv);
-        let strides = w_memoryview_native_strides(mv);
         let nitems = shape.get(dim as usize).copied().unwrap_or(0);
         let mut idx = index;
         if idx < 0 {
@@ -1137,7 +1137,7 @@ unsafe fn memoryview_get_offset(
                 dim + 1
             )));
         }
-        Ok(strides.get(dim as usize).copied().unwrap_or(0) * idx)
+        Ok(idx)
     }
 }
 
@@ -1151,15 +1151,15 @@ pub(crate) unsafe fn index_check(w: PyObjectRef) -> bool {
     unsafe { pyre_object::is_int(w) || crate::baseobjspace::lookup(w, "__index__").is_some() }
 }
 
-/// `_start_from_tuple` — the summed byte offset of a multi-index tuple
-/// (one integer per dimension).
+/// `_start_from_tuple` — the wrapped, bounds-checked index of every dimension
+/// a multi-index tuple names.
 unsafe fn memoryview_start_from_tuple(
     mv: PyObjectRef,
     index: PyObjectRef,
-) -> Result<i64, crate::PyError> {
+) -> Result<Vec<i64>, crate::PyError> {
     unsafe {
         let n = pyre_object::w_tuple_len(index) as i64;
-        let mut start = 0;
+        let mut indices = Vec::with_capacity(n as usize);
         for dim in 0..n {
             let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
             if !index_check(w) {
@@ -1170,9 +1170,28 @@ unsafe fn memoryview_start_from_tuple(
             // Python code and may release this memoryview before the offset
             // reads its view geometry.
             memoryview_check_released(mv)?;
-            start += memoryview_get_offset(mv, dim, index)?;
+            indices.push(memoryview_check_dimension(mv, dim, index)?);
         }
-        Ok(start)
+        Ok(indices)
+    }
+}
+
+/// The element at `indices`, unpacked through the view's format.  The bytes
+/// come from `ptr_from_index`'s address rather than a byte index, because a
+/// dimension carrying a suboffset dereferences on the way.
+///
+/// # Safety
+/// `indices` must be wrapped and bounds-checked, and the view live.
+unsafe fn memoryview_unpack_at(
+    mv: PyObjectRef,
+    indices: &[i64],
+    fmt: &str,
+    itemsize: usize,
+) -> PyObjectRef {
+    unsafe {
+        let element = pyre_object::memoryview::w_memoryview_view(mv).element_ptr(indices);
+        let bytes = std::slice::from_raw_parts(element, itemsize);
+        memoryview_unpack_element(fmt, bytes, 0, itemsize)
     }
 }
 
@@ -1227,16 +1246,10 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 ));
             }
             // `ptr_from_index` -> `lookup_dimension`: the bound is `shape[0]`,
-            // not `length / itemsize`, and the step is `strides[0]`.
-            let base = (w_memoryview_offset(mv) + memoryview_get_offset(mv, 0, i)?) as usize;
-            let full = w_memoryview_view(mv).backing().as_bytes();
+            // not `length / itemsize`.
+            let index = memoryview_check_dimension(mv, 0, i)?;
             let fmt = w_memoryview_format_str(mv);
-            return Ok(memoryview_unpack_element(
-                fmt,
-                full,
-                base,
-                itemsize as usize,
-            ));
+            return Ok(memoryview_unpack_at(mv, &[index], fmt, itemsize as usize));
         }
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
@@ -1253,17 +1266,10 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                         "cannot index {length}-dimension view with {ndim}-element tuple"
                     )));
                 }
-                let start = memoryview_start_from_tuple(mv, index)?;
+                let indices = memoryview_start_from_tuple(mv, index)?;
                 let itemsize = w_memoryview_itemsize(mv);
-                let base = (w_memoryview_offset(mv) + start) as usize;
-                let full = w_memoryview_view(mv).backing().as_bytes();
                 let fmt = w_memoryview_format_str(mv);
-                return Ok(memoryview_unpack_element(
-                    fmt,
-                    full,
-                    base,
-                    itemsize as usize,
-                ));
+                return Ok(memoryview_unpack_at(mv, &indices, fmt, itemsize as usize));
             }
             if all_slice {
                 return Err(crate::PyError::not_implemented(
@@ -1374,13 +1380,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             // released the view (`bytes_from_value` → `_check_released` →
             // `setbytes`).
             memoryview_check_released(mv)?;
-            let start = memoryview_start_from_tuple(mv, index)?;
-            let addr = (offset + start) as usize;
-            let full = w_memoryview_view(mv)
-                .backing()
-                .as_bytes_mut()
+            let indices = memoryview_start_from_tuple(mv, index)?;
+            let target = w_memoryview_view(mv)
+                .element_ptr_mut(&indices)
                 .expect("writable backing checked above");
-            full[addr..addr + isz].copy_from_slice(&packed);
+            std::slice::from_raw_parts_mut(target, isz).copy_from_slice(&packed);
             return Ok(w_none());
         }
         if !index_check(index) {
@@ -1392,16 +1396,14 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         // `memory_ass_sub`: `__index__` is arbitrary Python code and may have
         // released this view before the offset reads its geometry (gh-92888).
         memoryview_check_released(mv)?;
-        let item_offset = memoryview_get_offset(mv, 0, i)?;
+        let element = memoryview_check_dimension(mv, 0, i)?;
         let packed = memoryview_pack_value(&fmt, isz, value)?;
         // Re-check release after value coercion (see tuple path above).
         memoryview_check_released(mv)?;
-        let addr = (offset + item_offset) as usize;
-        let full = w_memoryview_view(mv)
-            .backing()
-            .as_bytes_mut()
+        let target = w_memoryview_view(mv)
+            .element_ptr_mut(&[element])
             .expect("writable backing checked above");
-        full[addr..addr + isz].copy_from_slice(&packed);
+        std::slice::from_raw_parts_mut(target, isz).copy_from_slice(&packed);
         Ok(w_none())
     }
 }
@@ -1589,44 +1591,37 @@ fn memoryview_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
-/// `_tolist_rec` — the nested element-value list of dimension `idim` of an
-/// N-D view, reading the raw backing by true strides.  The innermost
-/// dimension unpacks `shape[ndim-1]` elements stepping `pos` by
-/// `strides[ndim-1]`; an outer dimension collects `shape[idim]` sublists,
-/// advancing `start` by `strides[idim]`.
+/// `_tolist_rec` — the nested element-value list of dimension `idim`.  The
+/// elements arrive already in C order from the view's own gather, which is
+/// what applies the strides and follows any suboffsets, so this only groups
+/// `shape[idim]` of them per level.
 unsafe fn memoryview_tolist_rec(
-    mv: PyObjectRef,
+    shape: &[i64],
     fmt: &str,
-    full: &[u8],
+    data: &[u8],
     isz: usize,
-    ndim: i64,
-    idim: i64,
-    start: i64,
+    idim: usize,
+    cursor: &mut usize,
 ) -> PyObjectRef {
-    use pyre_object::memoryview::*;
     unsafe {
-        let dimshape = w_memoryview_native_shape(mv)
-            .get(idim as usize)
-            .copied()
-            .unwrap_or(0);
-        let dimstride = w_memoryview_native_strides(mv)
-            .get(idim as usize)
-            .copied()
-            .unwrap_or(0);
+        let dimshape = shape.get(idim).copied().unwrap_or(0).max(0);
         // Every element is pinned as built, the sublists included, and read
         // back inside the scope `w_list_new` runs in (`build_list_storage`).
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         let mut count = 0;
-        let mut pos = start;
         for _ in 0..dimshape {
-            let element = if idim == ndim - 1 {
-                memoryview_unpack_element(fmt, full, pos as usize, isz)
+            let element = if idim + 1 == shape.len() {
+                if *cursor + isz > data.len() {
+                    break;
+                }
+                let at = *cursor;
+                *cursor += isz;
+                memoryview_unpack_element(fmt, data, at, isz)
             } else {
-                memoryview_tolist_rec(mv, fmt, full, isz, ndim, idim + 1, pos)
+                memoryview_tolist_rec(shape, fmt, data, isz, idim + 1, cursor)
             };
             let _ = pyre_object::gc_roots::pin_root(element);
-            pos += dimstride;
             count += 1;
         }
         let items = (0..count)
@@ -1650,14 +1645,25 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
-        let full = pyre_object::memoryview::w_memoryview_view(mv)
-            .backing()
-            .as_bytes();
-        let start = pyre_object::memoryview::w_memoryview_offset(mv);
+        let data = memoryview_gather_bytes(mv);
         if ndim == 0 {
-            return Ok(memoryview_unpack_element(fmt, full, start as usize, isz));
+            if isz == 0 || data.len() < isz {
+                return Err(crate::PyError::not_implemented(
+                    "memoryview: unsupported format",
+                ));
+            }
+            return Ok(memoryview_unpack_element(fmt, &data, 0, isz));
         }
-        Ok(memoryview_tolist_rec(mv, fmt, full, isz, ndim, 0, start))
+        let shape = pyre_object::memoryview::w_memoryview_native_shape(mv);
+        let mut cursor = 0;
+        Ok(memoryview_tolist_rec(
+            &shape,
+            fmt,
+            &data,
+            isz,
+            0,
+            &mut cursor,
+        ))
     }
 }
 
@@ -2442,6 +2448,11 @@ pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
         if ndim == 0 {
             return (true, true);
         }
+        // `init_flags`: an indirect view is contiguous in neither order,
+        // whatever its strides say.
+        if !w_memoryview_native_suboffsets(mv).is_empty() {
+            return (false, false);
+        }
         let itemsize = w_memoryview_itemsize(mv);
         let length = w_memoryview_length(mv);
         let shape = w_memoryview_native_shape(mv);
@@ -2486,7 +2497,9 @@ fn memoryview_suboffsets(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let mv = memoryview_getset_receiver(args);
     unsafe {
         memoryview_check_released(mv)?;
-        Ok(pyre_object::w_tuple_new(vec![]))
+        Ok(memoryview_wrap_dims(
+            &pyre_object::memoryview::w_memoryview_native_suboffsets(mv),
+        ))
     }
 }
 
