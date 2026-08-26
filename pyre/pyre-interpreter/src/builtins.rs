@@ -1225,6 +1225,11 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
         let ndim = w_memoryview_ndim(mv);
+        // `memory_subscript`: a zero-dimensional view takes only the empty
+        // tuple, which reads its one element, and `...`, which is itself.
+        if ndim == 0 && pyre_object::pyobject::is_ellipsis(index) {
+            return Ok(mv);
+        }
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
         }
@@ -1306,6 +1311,12 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let itemsize = w_memoryview_itemsize(mv);
         let isz = itemsize.max(0) as usize;
         let fmt = w_memoryview_format_str(mv).to_owned();
+        // `memory_ass_sub`: `...` names a zero-dimensional view's one element,
+        // exactly as the empty tuple does.
+        let index = match w_memoryview_ndim(mv) == 0 && pyre_object::pyobject::is_ellipsis(index) {
+            true => pyre_object::w_tuple_new(vec![]),
+            false => index,
+        };
         let count = w_memoryview_native_shape(mv).first().copied().unwrap_or(0);
         let stride0 = w_memoryview_stride0(mv);
         let offset = w_memoryview_offset(mv);
