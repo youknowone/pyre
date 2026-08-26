@@ -438,83 +438,6 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_none())
 }
 
-/// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
-/// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
-/// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
-/// integer fields, with the integer-seconds times at 7..10 under the
-/// hidden `_integer_atime`/`_integer_mtime`/`_integer_ctime` names; the
-/// float `st_atime`/`st_mtime`/`st_ctime`, the `st_*_ns` integers, and the
-/// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
-/// extras.
-fn stat_result_seq_type() -> PyObjectRef {
-    static STAT_RESULT_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *STAT_RESULT_SEQ_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
-            // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
-            "os.stat_result",
-            // `app_posix.py:20-37` — slots 7..10 are the hidden integer
-            // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
-            // named-only extras, never indexable.
-            &[
-                "st_mode",
-                "st_ino",
-                "st_dev",
-                "st_nlink",
-                "st_uid",
-                "st_gid",
-                "st_size",
-                "_integer_atime",
-                "_integer_mtime",
-                "_integer_ctime",
-            ],
-            // `app_posix.py:38-69` — named-only extras ordered by their
-            // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
-            // `structseq_descr_new` fills surplus sequence items into
-            // this list in order, so the list order must match PyPy's
-            // index sort, not the build-time population order.
-            &[
-                // float times, indices 11..13.
-                "st_atime",
-                "st_mtime",
-                "st_ctime",
-                // `app_posix.py:45-52` — present where the platform's
-                // `struct stat` carries them (every Unix target),
-                // indices 20..23.
-                #[cfg(unix)]
-                "st_blksize",
-                #[cfg(unix)]
-                "st_blocks",
-                #[cfg(unix)]
-                "st_rdev",
-                // `rposix_stat.py` exposes `st_flags` where the C
-                // `struct stat` carries it (BSD family / macOS).
-                #[cfg(target_os = "macos")]
-                "st_flags",
-                // `build_stat_result` (interp_posix.py) +
-                // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
-                // — the sub-second nanosecond remainders, indices 40..42.
-                "nsec_atime",
-                "nsec_mtime",
-                "nsec_ctime",
-                // full nanosecond timestamps, indices 50..52.
-                "st_atime_ns",
-                "st_mtime_ns",
-                "st_ctime_ns",
-                // The Windows members of `stat_result_fields`, which sit
-                // after every time and platform extra there too.
-                #[cfg(windows)]
-                "st_birthtime",
-                #[cfg(windows)]
-                "st_birthtime_ns",
-                #[cfg(windows)]
-                "st_file_attributes",
-                #[cfg(windows)]
-                "st_reparse_tag",
-            ],
-        ) as usize
-    }) as PyObjectRef
-}
-
 /// `os.terminal_size` structseq — `(columns, lines)`.
 fn terminal_size_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -4997,7 +4920,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             extras.push(("st_birthtime", pyre_object::w_float_new(birthtime_f)));
             extras.push(("st_birthtime_ns", w_time_ns(f.birthtime_ns)));
         }
-        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
     }
     /// Build a `stat_result` from the sandbox wire `StatBuf` (sandbox build
     /// only, hence unix-only): the controller delivers the 10 protocol fields
@@ -5053,7 +4976,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ];
         #[cfg(target_os = "macos")]
         extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
-        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
     }
     /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
     /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
@@ -6731,7 +6654,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
-    crate::module_ns_store(ns, "stat_result", stat_result_seq_type());
+    crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::module_ns_store(
         ns,

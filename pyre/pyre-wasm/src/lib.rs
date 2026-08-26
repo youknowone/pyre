@@ -281,6 +281,17 @@ mod host_fs_provider {
             let p = path.to_string_lossy();
             unsafe { host_file_size(p.as_ptr(), p.len() as u32) >= 0 }
         }
+        fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+            let p = path.to_string_lossy();
+            let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
+            match size < 0 {
+                true => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}", path.display()),
+                )),
+                false => Ok(size as u64),
+            }
+        }
         fn is_dir(&self, path: &Path) -> bool {
             let p = path.to_string_lossy();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }

@@ -4053,8 +4053,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
-    // native-only because `posix` is absent on wasm32; registering these after
-    // unconditional rclasses keeps their type IDs stable across targets.
+    // native-only because wasm32's `posix` publishes no `scandir`; registering
+    // these after unconditional rclasses keeps their type IDs stable across
+    // targets.
     #[cfg(not(target_arch = "wasm32"))]
     register_pyre_class(
         &mut gc,

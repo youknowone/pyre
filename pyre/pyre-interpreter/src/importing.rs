@@ -118,6 +118,14 @@ pub trait SourceProvider: Send + Sync {
     /// Read the whole file at `path` as raw bytes.  Source files carry a BOM
     /// or a PEP 263 cookie, so decoding belongs to the caller, not here.
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    /// Byte length of the regular file at `path`.
+    ///
+    /// Defaults to the length of a whole read, which every provider can
+    /// answer; one that knows the size without transferring the bytes
+    /// overrides it.
+    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+        Ok(self.read_to_bytes(path)?.len() as u64)
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -154,6 +162,19 @@ fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
 #[cfg(feature = "host_env")]
 pub fn read_source_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     with_source_provider(|p| p.read_to_bytes(path))
+}
+
+/// Whether the seam sees `path` as a directory, and the size it reports for a
+/// regular file — the two probes `posix.stat` answers from on a target whose
+/// only view of a filesystem is this seam.
+#[cfg(feature = "host_env")]
+pub fn source_is_dir(path: &Path) -> bool {
+    with_source_provider(|p| p.is_dir(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
+    with_source_provider(|p| p.file_size(path))
 }
 
 /// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
@@ -214,6 +235,9 @@ impl SourceProvider for HostFsProvider {
     }
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         host_fs::read(path)
+    }
+    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+        host_fs::metadata(path).map(|meta| meta.len())
     }
 }
 
@@ -647,7 +671,7 @@ pub fn install_builtin_modules() {
     // module literally named `posix` does not exist. os.py picks `os.name` and
     // the `path` module (posixpath vs ntpath) from which of the two names is in
     // `sys.builtin_module_names`.
-    #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+    #[cfg(not(windows))]
     pyre_install_module!(posix);
     #[cfg(windows)]
     pyre_install_module!("nt"(posix));
