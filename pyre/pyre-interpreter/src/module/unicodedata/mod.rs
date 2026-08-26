@@ -246,9 +246,23 @@ fn normalize_form(func: &str, obj: PyObjectRef) -> Result<NormalizeForm, PyError
             "{func}() argument 1 must be str, not {ty}"
         )));
     }
-    let s = unsafe { w_str_get_wtf8(obj) }.as_str().unwrap_or_default();
-    s.parse::<NormalizeForm>()
-        .map_err(|()| PyError::value_error("invalid normalization form"))
+    let s = unsafe { w_str_get_wtf8(obj) };
+    // `interp_ucd.py UCD.normalize` selects the four forms with an explicit
+    // source-order string branch.  Keep that graph shape instead of routing
+    // through Rust's generic `FromStr::from_str` + `Result::map_err`, which
+    // has no RPython counterpart and hides the useful constant comparisons
+    // behind two foreign generic calls.
+    if s == "NFC" {
+        Ok(NormalizeForm::Nfc)
+    } else if s == "NFD" {
+        Ok(NormalizeForm::Nfd)
+    } else if s == "NFKC" {
+        Ok(NormalizeForm::Nfkc)
+    } else if s == "NFKD" {
+        Ok(NormalizeForm::Nfkd)
+    } else {
+        Err(PyError::value_error("invalid normalization form"))
+    }
 }
 
 /// Borrow the string argument to be normalized (`unistr`).

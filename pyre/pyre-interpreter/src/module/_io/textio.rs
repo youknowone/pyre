@@ -444,9 +444,15 @@ impl W_TextIOWrapper {
             if !pyre_object::is_str(newline) {
                 return Err(crate::PyError::type_error("illegal newline type"));
             }
-            let value = pyre_object::w_str_get_wtf8(newline)
-                .as_str()
-                .map_err(|_| crate::PyError::value_error("illegal newline value"))?;
+            // `interp_textio.py unwrap_newline` performs a direct
+            // `space.utf8_w` conversion followed by the value branch.  Spell
+            // the fallible host conversion as the same direct branch instead
+            // of introducing Rust's generic `Result::map_err` closure into
+            // the translated graph.
+            let value = match pyre_object::w_str_get_wtf8(newline).as_str() {
+                Ok(value) => value,
+                Err(_) => return Err(crate::PyError::value_error("illegal newline value")),
+            };
             if !matches!(value, "" | "\n" | "\r" | "\r\n") {
                 return Err(crate::PyError::value_error(format!(
                     "illegal newline value: {value}"
