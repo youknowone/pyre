@@ -3630,10 +3630,17 @@ fn bh_size_spec_from_callcontrol(
     // `index_in_parent`; without the base tag in this list both the tag and
     // payload are slot 0 and the payload replaces the tag despite living at
     // byte offset 8.
+    // `Option::Some` is on this list for the same reason its two `Result`
+    // siblings are: `front/mir.rs` gives it the same explicit shell, so the
+    // blackhole must reconstruct the same inherited tag slot or the payload
+    // takes slot 0 here while living at byte 8 there.  `None` carries no
+    // payload row, so it needs no reconstruction.
     let result_variant = layout_owner.ends_with("result::Result::Ok")
         || layout_owner.ends_with("result::Result::Err")
+        || layout_owner.ends_with("option::Option::Some")
         || layout_owner == "Result::Ok"
-        || layout_owner == "Result::Err";
+        || layout_owner == "Result::Err"
+        || layout_owner == "Option::Some";
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -3759,10 +3766,10 @@ fn bh_all_field_specs_for_struct(
     specs
 }
 
-/// Build the variant-owned portion of the explicit `Result<T, PyError>`
-/// shell.  The front end deliberately represents this as one inherited tag
-/// word followed by one-word payload fields (`front/mir.rs`'s
-/// `synthetic_result_shell`), rather than as Rust's native enum layout.  The
+/// Build the variant-owned portion of the explicit `Result<T, PyError>` /
+/// `Option<T>` shell.  The front end deliberately represents these as one
+/// inherited tag word followed by one-word payload fields (`front/mir.rs`'s
+/// `explicit_sum_shell`), rather than as Rust's native enum layout.  The
 /// shared nominal layout registry cannot describe each generic payload at
 /// once, so read the concrete instantiation's rows directly and place them
 /// after the inherited tag, matching RPython's concrete low-level STRUCT.

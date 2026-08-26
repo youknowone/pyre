@@ -1273,7 +1273,8 @@ fn register_synthetic_positional_metadata(
     }
 }
 
-/// Byte size of the explicit `Result` shell that carries `field_offsets`.
+/// Byte size of the explicit `Result` / `Option` shell that carries
+/// `field_offsets`.
 ///
 /// The shell is a non-overlapping `[tag@0 | payload@8 | ...]` laid out by this
 /// module rather than borrowed from Rust's enum layout, so its size follows
@@ -1281,7 +1282,7 @@ fn register_synthetic_positional_metadata(
 /// A fixed 16 would truncate any shell that ever records more than one payload
 /// word.  The floor keeps a tag-only shell at the full `[tag | payload]` width,
 /// matching the `size.max(16)` the codewriter applies to the same shell.
-fn result_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64 {
+fn sum_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64 {
     field_offsets
         .values()
         .copied()
@@ -1646,10 +1647,14 @@ fn derive_program_metadata(
                 // `{enum_leaf}::{variant}`.  No cross-variant dedup: each
                 // variant owns its field namespace.
                 let enum_layout = td.layout_for_target(&target);
-                // `Result<T, E>` is not materialised as Rust's native enum in
-                // translated code.  The inverse exception transform removes
-                // ordinary `?` paths; a hand-written `match` that remains is
-                // represented by the explicit rtyper shell emitted below:
+                // `Result<T, E>` and `Option<T>` are not materialised as
+                // Rust's native enums in translated code.  The inverse
+                // exception transform removes ordinary `?` paths; a
+                // hand-written `match` that remains, and every
+                // runtime-discriminant pair `emit_tagged_pair_aggregate`
+                // synthesises (`checked_neg`, `usize::try_from`,
+                // `i64::try_from(&RBigInt)`), are represented by the explicit
+                // rtyper shell emitted below:
                 // `{ __discriminant: Signed, __pos_0: payload }`.  Rust's
                 // niche layout commonly places both the implicit tag and the
                 // payload at offset 0, but applying that host layout to this
@@ -1659,7 +1664,20 @@ fn derive_program_metadata(
                 // the graph declares, so give that synthetic struct its own
                 // non-overlapping layout instead of borrowing Rust's enum
                 // layout.
-                let synthetic_result_shell = name == "core::result::Result";
+                //
+                // `Option` needs it for the same reason and did not have it:
+                // `Option<i64>` registered `__discriminant` and
+                // `Some.__pos_0` both at offset 0 of an 8-byte parent, so a
+                // descent into any body holding a `checked_neg` read `-v` as
+                // the tag and aborted on the match's unreachable arm.  A
+                // pointer-niche `Option` is diverted to a bare nullable
+                // pointer before any constructor is emitted
+                // (`tyref_is_niche_option_ptr`) and never allocates, and the
+                // base tag stays at offset 0 either way, so the shell only
+                // moves the payload of an Option this front end actually
+                // builds.
+                let explicit_sum_shell =
+                    name == "core::result::Result" || name == "core::option::Option";
                 // Register the enum BASE in `exact_layouts`: a single
                 // `__discriminant` field at the tag's real byte position
                 // (`discriminator.Branch.offset` via `discriminant_offset`).
@@ -1671,13 +1689,13 @@ fn derive_program_metadata(
                 // tag (`discriminant_offset` → `None`) and also registers 0.
                 // Fieldless enums skip this (int-valued, no base ClassDef).
                 if !fieldless {
-                    if synthetic_result_shell {
+                    if explicit_sum_shell {
                         let mut base_offsets = std::collections::HashMap::new();
                         base_offsets.insert("__discriminant".to_string(), 0);
                         exact_layouts.insert(
                             base_sid,
                             crate::front::semantic::ExactLayout {
-                                size: Some(result_shell_size(&base_offsets)),
+                                size: Some(sum_shell_size(&base_offsets)),
                                 align: Some(8),
                                 field_offsets: base_offsets,
                             },
@@ -1724,7 +1742,7 @@ fn derive_program_metadata(
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
-                            let field_offset = if synthetic_result_shell {
+                            let field_offset = if explicit_sum_shell {
                                 Some(8 + (i as u64) * 8)
                             } else {
                                 enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
@@ -1748,9 +1766,9 @@ fn derive_program_metadata(
                         record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
                         record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
-                        if synthetic_result_shell {
+                        if explicit_sum_shell {
                             let exact = crate::front::semantic::ExactLayout {
-                                size: Some(result_shell_size(&voffsets)),
+                                size: Some(sum_shell_size(&voffsets)),
                                 align: Some(8),
                                 field_offsets: voffsets,
                             };
