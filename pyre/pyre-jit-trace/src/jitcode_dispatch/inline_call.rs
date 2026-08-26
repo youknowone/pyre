@@ -4198,15 +4198,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if ctx.trace_ctx.heap_cache().is_unescaped(callable_guard_op) {
             return resolved_inline_decline(op.pc, line!());
         }
-        let resolved: Option<KwonlyDefaultsInline> =
-            crate::jitcode_dispatch::diag::spec_gate(
-                crate::jitcode_dispatch::diag::SpecFold::KwonlyDefaultsInline,
-                || {
-                    Ok::<_, DispatchError>(unsafe {
-                        kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count)
-                    })
-                },
-            )?;
+        let resolved: Option<KwonlyDefaultsInline> = crate::jitcode_dispatch::diag::spec_gate(
+            crate::jitcode_dispatch::diag::SpecFold::KwonlyDefaultsInline,
+            || {
+                Ok::<_, DispatchError>(unsafe {
+                    kwonly_defaults_for_inline(callable, w_code, nparams, kwonly_count)
+                })
+            },
+        )?;
         let Some(resolved) = resolved else {
             return resolved_inline_decline(op.pc, line!());
         };
