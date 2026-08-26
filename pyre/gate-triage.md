@@ -222,7 +222,7 @@ build.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 73 hand-written trace-time specialization rows (the
+off that many of the 74 hand-written trace-time specialization rows (the
 `spec_folds!` invocation at `jitcode_dispatch/diag.rs:342-417`; count them
 there rather than trusting this sentence), and an unset variable suppresses
 none. It is a measurement instrument — suppressing a fold is how the descent

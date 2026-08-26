@@ -533,18 +533,29 @@ recorder, or the green accounts for.
 
 pyre records traces through 69 `try_walker_specialize_*` functions — 67 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
-(`load_deref`) and `inline_call.rs` (`instance_next`) — 9,886 lines of body
-inside `specialize.rs`'s 16,880, described by the 73 rows of
+(`load_deref`) and `inline_call.rs` (`instance_next`) — 9,865 lines of body
+inside `specialize.rs`'s 16,933, described by the 74 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
-Re-derive every number here before citing it; this section has already
-published one miscount. Rows: `spec_folds!` spans `diag.rs:342-417`, so
-`sed -n '342,417p' … | rg -c '=> ("'`. Definitions:
-`rg -c 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs'`. Corpus:
-`ls pyre/bench/synth/*.py | wc -l` — a git pathspec glob crosses `/` and
-sweeps `_pending`, `foriter57` and `iter57`, over-counting by 46.
+Re-derive every number here before citing it; this section has published
+two miscounts, and both survived because the recipe beside them did not run.
+Every command below is quoted as it must be typed.
+
+* Rows — `spec_folds!` opens at `diag.rs:342` and closes at `:418`:
+  `sed -n '342,418p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`.
+  `-F` is load-bearing: without it the `(` is an unclosed regex group and
+  `rg` exits 2 rather than counting.
+* Definitions — `rg -c` reports one count *per file*, so it answers 67/1/1
+  rather than 69. Sum the matches instead:
+  `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
+* Body lines — sum the brace-matched span of each `fn try_walker_specialize_*`
+  in `specialize.rs`; no one-liner does it.
+* Corpus — `ls pyre/bench/synth/*.py | wc -l`. Non-recursive **on purpose**:
+  a recursive walk sweeps `_pending`, `foriter57` and `iter57` and answers
+  530, over-counting by 46. Do not "fix" this to a `find`.
+
 `specialize.rs`'s own line count moved seven times in seven commits and is
 not a usable identifier for a tree.
 
