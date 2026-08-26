@@ -6289,6 +6289,25 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // UNARY_NEGATIVE.  Descend `neg_inner` -- `neg` past the override probe --
+    // rather than re-emit its integer arm by hand, the same shape the invert
+    // descent below takes.  Sits ahead of the `unary_negative_int` fold so that
+    // fold's `consulted` count reads whether the descent took the site; the
+    // fold stays for every operand the descent declines (a bool, a subclass, a
+    // non-int) and for a build whose `neg_inner` body is absent or reaches a
+    // helper the build did not lower.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
+        && spec_gate(SpecFold::UnaryNegativeDescent, || {
+            try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // #61: UNARY_NEGATIVE `-int` fold.  `-x` is `0 - x`; the fold emits
     // `IntSubOvf(0, x)` behind a `GUARD_CLASS INT` (reusing the binary-sub
     // overflow discipline), eliding the `CALL_MAY_FORCE`.  A bool / subclass /
