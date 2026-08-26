@@ -2568,6 +2568,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true, // object has __new__
             typedef_hasdict: false,         // object typedef declares no __dict__
+            dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         pyre_object::w_type_set_layout(type_obj, layout);
         // object: hasdict=False, weakrefable=False (bare object() has no __dict__)
@@ -2694,6 +2695,7 @@ fn new_typeobject_with_metatype_and_layout(
                     base_layout: parent_layout,
                     acceptable_as_base_class: (*parent_layout).acceptable_as_base_class,
                     typedef_hasdict: (*parent_layout).typedef_hasdict,
+                    dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
                 }),
             }
         } else {
@@ -2708,6 +2710,7 @@ fn new_typeobject_with_metatype_and_layout(
                 // that declares `__dict__` does its own dict management, so
                 // mapdict must not add a second one (typeobject.py:253-257).
                 typedef_hasdict: has_dict,
+                dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
@@ -2809,6 +2812,7 @@ pub fn make_builtin_type_with_bases_and_layout(
                 base_layout: parent_layout,
                 acceptable_as_base_class: has_new,
                 typedef_hasdict: has_dict,
+                dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
@@ -8535,8 +8539,11 @@ fn dict_view_as_set_op(
         let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
         crate::call::call_function_impl_result(w_set_type, &[lhs])?
     };
-    let method = crate::baseobjspace::getattr_str(w_set, methname)?;
-    crate::call::call_function_impl_result(method, &[rhs])?;
+    // `dictmultiobject.py _as_set_op` — `space.call_method(w_set, methname,
+    // w_other)`, which is `callmethod.py call_method_opt`: the in-place set
+    // method is a method descriptor on an instance with no dictionary, so the
+    // call reaches it without materialising a bound method first.
+    crate::baseobjspace::call_method_result(w_set, methname, &[rhs])?;
     Ok(w_set)
 }
 

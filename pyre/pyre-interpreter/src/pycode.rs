@@ -718,6 +718,30 @@ pub struct PyCode {
     /// `PY_NULL` until first realized by [`w_code_name_obj`]; the storage,
     /// immortality and root-walk argument are `w_qualname`'s verbatim.
     pub w_name: PyObjectRef,
+    /// The last `(addrq, line)` pair [`w_code_addr2line`] resolved for this
+    /// code object, packed as `addrq << 32 | line as u32`.
+    ///
+    /// `_PyCode_CheckLineNumber` restarts the linetable decode at the first
+    /// range on every call, so an offset deep in a function costs a walk
+    /// proportional to how far in it sits.  The offsets asked about repeat:
+    /// `pytraceback.py record_application_traceback` resolves `tb_lineno` at
+    /// the moment the traceback node is built, so a line that raises in a loop
+    /// asks the same question every iteration, and `f_lineno` on a suspended
+    /// frame does the same.  Both inputs the walk reads — `co_linetable` on
+    /// the `CodeObject` and [`PyCode::co_firstlineno_raw`] — are fixed once
+    /// the wrapper is published (`code.replace` boxes a fresh one), so a
+    /// repeat of the previous question already has its answer.
+    ///
+    /// [`ADDR2LINE_MEMO_EMPTY`] is the unset value: it spells an `addrq` no
+    /// memoised query carries, since the negative offsets answer
+    /// `co_firstlineno` without walking anything.
+    ///
+    /// Direct-mapped over [`ADDR2LINE_MEMO_WAYS`] slots rather than a single
+    /// one: the offsets a loop asks about alternate (the raising instruction
+    /// and the handler that reads `tb_lineno` sit on different lines of the
+    /// same code object), and one slot answers only whichever of them asked
+    /// last.
+    pub addr2line_memo: [std::sync::atomic::AtomicI64; ADDR2LINE_MEMO_WAYS],
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -730,6 +754,16 @@ pub const CODE_W_WEAKREFLIFELINE_OFFSET: usize = std::mem::offset_of!(PyCode, w_
 pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualname);
 /// Field offset of `w_name` within `PyCode`.
 pub const CODE_W_NAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_name);
+/// Slots in [`PyCode::addr2line_memo`].  A power of two: the slot is picked
+/// by masking the offset.
+pub const ADDR2LINE_MEMO_WAYS: usize = 4;
+
+/// [`PyCode::addr2line_memo`] before any offset has been resolved.
+///
+/// `addrq` is `i32::MIN`, which the memoised arm never stores: it takes only
+/// non-negative offsets.
+pub const ADDR2LINE_MEMO_EMPTY: i64 = i64::MIN;
+
 /// Field offset of `co_firstlineno_raw` within `PyCode`.
 pub const CODE_CO_FIRSTLINENO_RAW_OFFSET: usize = std::mem::offset_of!(PyCode, co_firstlineno_raw);
 /// Field offset of `hidden_applevel` within `PyCode`.
@@ -1153,6 +1187,9 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         co_names_w,
         w_qualname: pyre_object::PY_NULL,
         w_name: pyre_object::PY_NULL,
+        addr2line_memo: std::array::from_fn(|_| {
+            std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
+        }),
     };
     // PyPy's `PyCode` is an ordinary GC object.  Keep the address stable for
     // the raw `code_ptr -> wrapper` JIT seam, but let the collector reclaim
@@ -1401,6 +1438,10 @@ fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -
     let obj = box_code_object(code);
     unsafe {
         (*(obj as *mut PyCode)).co_firstlineno_raw = firstlineno;
+        // The stamp is one of the two inputs `addr2line_memo` caches against.
+        for slot in &(*(obj as *mut PyCode)).addr2line_memo {
+            slot.store(ADDR2LINE_MEMO_EMPTY, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     // `w_code_new` recorded `first_line_number`, which drops the zero and
     // negative values this stamp carries; re-record the exact one so the
@@ -3421,7 +3462,25 @@ pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
         if code.is_null() {
             return -1;
         }
-        code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq)
+        // Only the walking arm is worth remembering: `addrq < 0` answers
+        // `co_firstlineno` without touching the table, and an offset outside
+        // `i32` cannot be spelled in the packed pair.
+        let key = match i32::try_from(addrq) {
+            Ok(offset) if offset >= 0 => offset,
+            _ => return code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq),
+        };
+        let memo =
+            &(*(w_code as *const PyCode)).addr2line_memo[key as usize & (ADDR2LINE_MEMO_WAYS - 1)];
+        let packed = memo.load(std::sync::atomic::Ordering::Relaxed);
+        if (packed >> 32) as i32 == key {
+            return packed as i32;
+        }
+        let line = code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq);
+        memo.store(
+            ((key as i64) << 32) | (line as u32 as i64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        line
     }
 }
 

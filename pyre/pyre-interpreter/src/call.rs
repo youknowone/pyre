@@ -6026,6 +6026,7 @@ pub unsafe fn create_all_slots(
                 } else {
                     (*base_layout).typedef_hasdict
                 },
+                dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);

@@ -123,6 +123,69 @@ impl std::hash::Hasher for ObjectKeyHasher {
 
 pub type ObjectKeyBuildHasher = std::hash::BuildHasherDefault<ObjectKeyHasher>;
 
+/// The hasher for the `&str`-keyed entry tables (`celldict.py`'s module
+/// storage).
+///
+/// RPython hashes a string with `ll_strhash`, a cheap multiply/xor chain whose
+/// result is cached on the string object, so a dict probe on a name costs one
+/// load upstream.  Rust's default `RandomState` is SipHash-1-3, which is a
+/// keyed MAC: it exists to make hash-collision denial of service impractical
+/// for tables fed untrusted keys, and these tables are fed program identifiers.
+/// Every module-global read and write paid that MAC per probe.
+///
+/// FNV-1a over whole 8-byte words, so a name costs one or two rounds rather
+/// than one per byte.  Streaming: `Hash for str` writes the bytes and then a
+/// terminator, so the state carries across `write` calls.
+pub struct StrKeyHasher(u64);
+
+impl Default for StrKeyHasher {
+    #[inline]
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl StrKeyHasher {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0 ^ word).wrapping_mul(Self::PRIME);
+    }
+}
+
+impl std::hash::Hasher for StrKeyHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // One final avalanche so the low bits the table indexes with carry the
+        // whole digest.
+        let h = self.0;
+        (h ^ (h >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 1
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.mix(bytes.len() as u64);
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.mix(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(tail));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix(value as u64);
+    }
+}
+
+pub type StrKeyBuildHasher = std::hash::BuildHasherDefault<StrKeyHasher>;
+
 /// View a key as `&str` only when it is a str whose backing is valid UTF-8.
 /// A lone-surrogate str returns `None` so the `&str`-keyed proxy fast paths
 /// (which cannot represent it) fall through to the generic object-keyed path.

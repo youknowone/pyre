@@ -43,7 +43,35 @@ pub struct Layout {
     /// staticmethod/classmethod) needs the distinct-TypeDef convergence and is
     /// deferred with it.
     pub typedef_hasdict: bool,
+    /// Absolute slot index of the reserved [`DICT_DATA_SLOT`] payload for
+    /// instances of this layout, or `-1` when no layout in the chain
+    /// reserves one.
+    ///
+    /// `typeobject.py create_all_slots` resolves each slot's index while the
+    /// layout is being built and hands the index to the `Member` it installs;
+    /// nothing re-derives a slot position from its name afterwards.  The
+    /// reserved dict-mapping slot is resolved the same way — [`leak_layout`]
+    /// fills this in for every layout it seals, walking `base_layout` once so
+    /// an inheriting layout answers with the index its base reserved.
+    ///
+    /// Construction sites pass [`DICT_DATA_SLOT_UNRESOLVED`]; the value they
+    /// pass is overwritten.
+    pub dict_data_slot: i32,
 }
+
+/// Layout-slot name reserved for a dict subclass's mapping payload, pyre's
+/// object-resident stand-in for the intrinsic `W_DictMultiObject` field a
+/// PyPy dict subclass carries.
+///
+/// The name holds a space so no class can declare it: `__slots__` entries are
+/// rejected unless they are identifiers.  A spellable name would collide —
+/// the user's member is installed first and the reserved name appended after
+/// it, so the resolved index would be the user's and the mapping payload
+/// would overwrite their slot.
+pub const DICT_DATA_SLOT: &str = "dict subclass w_dict_data";
+
+/// [`Layout::dict_data_slot`] before [`leak_layout`] resolves it.
+pub const DICT_DATA_SLOT_UNRESOLVED: i32 = -1;
 
 impl Layout {
     /// typeobject.py issublayout(parent):
@@ -345,8 +373,34 @@ pub fn name_storage_gc_type_id() -> u32 {
 }
 
 /// Leak a Layout to get a 'static pointer for sharing.
-pub fn leak_layout(layout: Layout) -> *const Layout {
+///
+/// Seals [`Layout::dict_data_slot`] on the way through: the name scan runs
+/// once here rather than on every read of a dict subclass's mapping payload.
+pub fn leak_layout(mut layout: Layout) -> *const Layout {
+    layout.dict_data_slot = resolve_dict_data_slot(&layout);
     crate::lltype::malloc_raw(layout)
+}
+
+/// Absolute index of `layout`'s reserved [`DICT_DATA_SLOT`], own or
+/// inherited, or [`DICT_DATA_SLOT_UNRESOLVED`] when the chain reserves none.
+///
+/// The base's index is already sealed — a base layout is leaked before any
+/// layout can name it — so only this layout's own `newslotnames` is scanned.
+fn resolve_dict_data_slot(layout: &Layout) -> i32 {
+    let first_slot = layout
+        .nslots
+        .saturating_sub(layout.newslotnames.len() as u32);
+    if let Some(offset) = layout
+        .newslotnames
+        .iter()
+        .position(|name| name == DICT_DATA_SLOT)
+    {
+        return (first_slot + offset as u32) as i32;
+    }
+    if layout.base_layout.is_null() {
+        return DICT_DATA_SLOT_UNRESOLVED;
+    }
+    unsafe { (*layout.base_layout).dict_data_slot }
 }
 
 /// Builtin types (`w_type_new_builtin`) are process-global, so their root
@@ -1728,6 +1782,7 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
         base_layout: old.base_layout,
         acceptable_as_base_class: v,
         typedef_hasdict: old.typedef_hasdict,
+        dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
     });
     (*(obj as *mut W_TypeObject)).layout = new_layout;
 }
@@ -1993,6 +2048,7 @@ mod tests {
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true,
             typedef_hasdict: false,
+            dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         let child = leak_layout(Layout {
             typedef: &INSTANCE_TYPE,
@@ -2001,6 +2057,7 @@ mod tests {
             base_layout: root,
             acceptable_as_base_class: true,
             typedef_hasdict: false,
+            dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         unsafe {
             assert!((*child).issublayout(root));
@@ -2018,6 +2075,7 @@ mod tests {
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true,
             typedef_hasdict: false,
+            dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         // Same Layout pointer → equal
         assert!(Layout::expands_equal(root, true, true, root, true, true));
@@ -2044,6 +2102,7 @@ mod tests {
                 base_layout: std::ptr::null(),
                 acceptable_as_base_class: true,
                 typedef_hasdict,
+                dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             });
             w_type_set_layout(w_type, layout);
             w_type_set_hasdict(w_type, true);
@@ -2088,6 +2147,7 @@ mod tests {
             base_layout: std::ptr::null(),
             acceptable_as_base_class: true,
             typedef_hasdict: false,
+            dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
 
         unsafe fn builtin_with_layout(name: &str, layout: *const Layout) -> PyObjectRef {
