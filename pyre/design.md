@@ -531,13 +531,22 @@ recorder, or the green accounts for.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 74 `try_walker_specialize_*` functions — 72 in
-`jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
-`inline_call.rs` — 10,858 lines of body inside `specialize.rs`'s 17,349,
-described by the 76 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
-and one row-less fold exists). Nothing in this charter named that layer before
-2026-08-26, which is itself the finding: it is the largest single adaptation
-in the tree.
+pyre records traces through 69 `try_walker_specialize_*` functions — 67 in
+`jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
+(`load_deref`) and `inline_call.rs` (`instance_next`) — 9,886 lines of body
+inside `specialize.rs`'s 16,880, described by the 73 rows of
+`SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
+Nothing in this charter named that layer before 2026-08-26, which is itself
+the finding: it is the largest single adaptation in the tree.
+
+Re-derive every number here before citing it; this section has already
+published one miscount. Rows: `spec_folds!` spans `diag.rs:342-417`, so
+`sed -n '342,417p' … | rg -c '=> ("'`. Definitions:
+`rg -c 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs'`. Corpus:
+`ls pyre/bench/synth/*.py | wc -l` — a git pathspec glob crosses `/` and
+sweeps `_pending`, `foriter57` and `iter57`, over-counting by 46.
+`specialize.rs`'s own line count moved seven times in seven commits and is
+not a usable identifier for a tree.
 
 **Why it exists.** PyPy's objspace is RPython, so the tracer walks into it and
 `optimizeopt/` only ever sees ordinary recorded operations. pyre's objspace is
@@ -552,7 +561,7 @@ favour of the ported optimizer" — is not available as stated. Group by group:
 | opaque builtin call → pure elidable call | 19 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
 | residual → `new_with_vtable` / `new_array` so it stays virtual | 10 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
 | guarded heap field / array / mapdict read and write | 19 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
-| type-identity shortcut | 3 | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| type-identity shortcut | 0 | retired 2026-08-24; was `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
 | frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
 | function-object construction | 2 | none |
 
@@ -565,26 +574,41 @@ generation debt, but its stated repair is now the right one.
 
 **What was tried.** A gateway-wrapper pilot gave `math.sqrt` its own jitcode
 and a published `fnaddr`; the descent still declined on 433 transitive
-blockers and retired zero folds. A separate census over the synthetic corpus
-found no fold with `consulted=0`, so the layer is not merely carrying dead
-arms — `load_deref` alone never fired.
+blockers and retired zero folds. A census over the whole corpus — 481
+synthetic plus the macro benches, every one of the 73 rows observed — found
+no fold with `consulted=0`, so the layer is not merely carrying dead arms.
+`load_deref` alone never fires, and naming each of its early returns shows
+why: all 38 declines across the 359 fixtures holding a nested function report
+the same first guard, `OpRef::is_constant`, so its cell always arrives red.
+That is a missing capability rather than dead weight — closure-callee
+inlining needs the fold, the fold needs constant cells, and constant cells
+need the inlining.
 
-**What does not hold it in place.** Only 15 fixtures carry a `spec-folds=`
-header and they name 25 distinct folds between them, so 51 of the 76 rows have
-no fixture coupling at all. Retirement is blocked by reach, not by headers.
+**What does not hold it in place.** 23 fixtures carry a `spec-folds=` header
+and they name 44 distinct folds between them, so 29 of the 73 rows have no
+fixture coupling at all. Retirement is blocked by reach, not by headers.
 
-**The bounded first step** is the type-identity group — `builtin_type`,
-`builtin_isinstance`, `builtin_issubclass`, 291 lines — because it is the
-smallest group that is entirely fixture-free *and* whose upstream counterpart
-is a pass that pyre has already ported (`PtrEq | InstancePtrEq` is registered
-in `executor.rs` and reached through `OptPure`). Its go/no-go is a
-measurement, not a design question: whether the descent declines on those
-three callables and on which blocker. Until that is run, the step is proposed
-and not accepted.
+**The bounded first step has been taken, and it does not settle the
+question.** The type-identity group — `builtin_type`, `builtin_isinstance`,
+`builtin_issubclass`, plus `builtin_hasattr` — left `SPEC_FOLD_ROWS` in
+`4953fb0edf8`, on the evidence that suppressing each one moved no stdout, no
+`[jit-stats]` counter and no wall clock. That is gate neutrality, not a
+descent: nothing in that change demonstrates the trace now carries the
+interpreter's own `abstract_isinstance_w` shape, and `isinstance` is still
+recognised outside the layer, at `residual_call.rs:3416`, where it gates
+replay-safety, carries no row, and the census cannot see it. Read that
+commit's message with care — it claims five retirements including
+`load_type_name_attr`, but its diff never touches that identifier and the
+fold is live at `specialize.rs:3931`.
 
-**Falsification.** If making those three callables descendable does not let
-their folds be retired with the corpus unchanged, then reach is not the
-binding constraint and this entry is wrong — the layer would then be
+**Falsification.** A retirement counts against this entry only if the trace
+it leaves is the interpreter's own shape. `MAJIT_LOG=1`'s
+`--- trace (before opt) ---` must show the residual replaced by ordinary
+recorded operations, matching `PYPYLOG=jit-log-opt:FILE pypy3` on the same
+fixture. A retirement that only shows unchanged counters — as the four above
+do — proves the fold was not load-bearing, not that reach arrived. If reach
+does arrive for a group and its folds still cannot be retired, then reach is
+not the binding constraint and this entry is wrong: the layer would be
 compensating for something the descent cannot reach in principle, and the
 right response is to say what that is rather than to widen the descent again.
 
