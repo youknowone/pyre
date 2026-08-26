@@ -8082,13 +8082,26 @@ impl<'a> Lowering<'a> {
                 // gets away with aliasing the receiver Variable; a write does,
                 // so recover the borrowed slot from the `&self` operand
                 // ([`Lowering::atomic_ref_place`]) and emit the same
-                // `FieldWrite` a plain `slot = value` assignment would.  The
-                // ordering arg is discarded, as it is on the load: the traced
-                // model has no fences at all — every field write in a walked
-                // body is already an unordered store — so a body that needed
-                // an acquire or a release could not be expressed here whether
-                // this arm fired or not.  Relaxed, the only ordering pyre
-                // writes, IS this store exactly.
+                // `FieldWrite` a plain `slot = value` assignment would.
+                //
+                // PRECONDITION, and it is a real one: a `FieldWrite` lowers to
+                // one plain machine store, which implements a RELAXED atomic
+                // store only where that store is single-copy atomic — i.e. the
+                // backend emits ONE store for the slot's width.  It does on
+                // every target pyre emits for: `mov` / `str` for a naturally
+                // aligned word or narrower on x86_64 and aarch64, and `iN.store`
+                // for every atomic width on wasm32.  Relaxed buys freedom from
+                // tearing and nothing else — no fence, no `lock` prefix — so
+                // under that condition the emitted access IS the access the
+                // residual call would have performed.  What would break it is a
+                // slot the backend has to split: an `AtomicU64` field on a
+                // 32-bit NATIVE target, which pyre has none of.  The threshold
+                // is deliberately NOT checked here: it is a per-backend store
+                // granularity, not a front-end fact, and spelling it as
+                // `target_word_size()` would decline `AtomicI64` on wasm32,
+                // where `i64.store` is a single instruction.  Adding such a
+                // target means teaching the BACKEND, or declining there.
+                // The load fold rests on the same precondition.
                 //
                 // ONLY a `Relaxed` store folds.  A stronger ordering is not
                 // decoration: `w_type_set_version_tag` publishes `version_tag`
