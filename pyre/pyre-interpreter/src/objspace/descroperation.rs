@@ -733,7 +733,12 @@ pub extern "C" fn jit_bigint_invert(a: i64) -> pyre_object::longobject::JitBigIn
 // first operand being the opaque `BigInt` ADT and the second being an
 // integer. See the operator-residual module note above.
 
-/// `rbigint.lshift` by a machine `usize` — `&BigInt << (b as usize)`.
+/// `rbigint.lshift(a, count)`, with the count kept as the `i64` `lshift`
+/// takes.  Narrowing it to a machine `usize` first truncates a count of
+/// 2**32 or more on a 32-bit target, which answers with the operand shifted
+/// by the low word instead of by the count.  A count the result cannot
+/// represent publishes MemoryError and answers null, as
+/// [`jit_bigint_lshift_count`] does; `Shl` would panic instead.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_shl(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
@@ -741,13 +746,26 @@ pub extern "C" fn jit_bigint_shl(a: i64, b: i64) -> pyre_object::longobject::Jit
         if b == 0 || (&*a).get_sign() == 0 {
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a << (b as usize)),
-        )
+        match (&*a).lshift(b) {
+            Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
+                pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+            ),
+            Err(_) => {
+                crate::runtime_ops::jit_publish_exception(
+                    pyre_object::interp_exceptions::memory_error_singleton(),
+                );
+                pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut())
+            }
+        }
     }
 }
 
-/// `rbigint.rshift` by a machine `usize` — `&BigInt >> (b as usize)`.
+/// `rbigint.rshift(a, count)`, with the count kept as the `i64` `rshift`
+/// takes.  Narrowing it to a machine `usize` first truncates a count of
+/// 2**32 or more on a 32-bit target, which answers with the operand
+/// unshifted where the shift is a total right shift.  A negative count
+/// publishes MemoryError and answers null rather than panicking through
+/// `Shr`; the JIT arm guards it non-negative before the call.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_shr(a: i64, b: i64) -> pyre_object::longobject::JitBigIntResult {
     let a = a as *const BigInt;
@@ -755,9 +773,17 @@ pub extern "C" fn jit_bigint_shr(a: i64, b: i64) -> pyre_object::longobject::Jit
         if b == 0 {
             return pyre_object::longobject::encode_jit_bigint_result(a as *mut BigInt);
         }
-        pyre_object::longobject::encode_jit_bigint_result(
-            pyre_object::longobject::alloc_bigint_nursery_collecting(&*a >> (b as usize)),
-        )
+        match (&*a).rshift(b, false) {
+            Ok(value) => pyre_object::longobject::encode_jit_bigint_result(
+                pyre_object::longobject::alloc_bigint_nursery_collecting(value),
+            ),
+            Err(_) => {
+                crate::runtime_ops::jit_publish_exception(
+                    pyre_object::interp_exceptions::memory_error_singleton(),
+                );
+                pyre_object::longobject::encode_jit_bigint_result(std::ptr::null_mut())
+            }
+        }
     }
 }
 
@@ -5855,6 +5881,32 @@ mod tests {
             let m = jit_w_long_mod_raw(a as i64, b as i64) as *mut BigInt;
             assert_eq!(*m, x.r#mod(&y).expect("test divisor is nonzero"));
         }
+    }
+
+    /// A shift count wider than a machine word must shift by the count, not by
+    /// its low word.  `usize` is 32 bits on wasm32 while `intval` is `i64` on
+    /// every target, so `2**33` reaches these residuals as an ordinary
+    /// `W_IntObject`; narrowing it first answered `x >> 2**33` with `x`.
+    ///
+    /// This discriminates only on a 32-bit target — on a 64-bit host the
+    /// narrowing that used to be here was lossless, so both spellings pass.
+    #[test]
+    fn test_rbigint_shift_residuals_take_a_count_wider_than_a_machine_word() {
+        let wide = 1i64 << 33;
+        let positive = BigInt::one().lshift(200).unwrap().int_add(12345);
+        let negative = positive.neg();
+        let p = pyre_object::longobject::alloc_bigint_nursery(positive);
+        let n = pyre_object::longobject::alloc_bigint_nursery(negative);
+
+        // Arithmetic right shift: to zero, and to -1 for a negative operand.
+        assert!(unsafe { &*decoded_bigint_result(jit_bigint_shr(p as i64, wide)) }.get_sign() == 0);
+        assert_eq!(
+            unsafe { &*decoded_bigint_result(jit_bigint_shr(n as i64, wide)) }.toint(),
+            Ok(-1)
+        );
+        // `jit_bigint_shl` takes the identical route (`lshift(b)`), but a count
+        // this wide asks it for a result of hundreds of megabytes, so it is not
+        // asserted here.
     }
 
     #[test]
