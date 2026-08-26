@@ -5304,14 +5304,15 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
         let storage = &*w_module_dict_get_storage(obj);
-        // Wrapping a name allocates, so a value zipped in before a later wrap
-        // would be pre-move in the Rust-heap result.  Wrap every name into a
-        // root slot first, then walk the values — which the cell storage keeps
-        // traced — with no allocation left to run.
+        // Wrapping a name the intern table has not seen allocates, so a value
+        // zipped in before a later wrap would be pre-move in the Rust-heap
+        // result.  Wrap every name into a root slot first, then walk the
+        // values — which the cell storage keeps traced — with no allocation
+        // left to run.
         let roots = crate::gc_roots::push_roots();
         let keys_base = roots.base();
         for k in strategy.getiterkeys(storage) {
-            let _ = roots.pin_root(crate::w_str_new(k));
+            let _ = roots.pin_root(crate::celldict::_wrapkey(k));
         }
         strategy
             .getitervalues(storage)
@@ -5332,12 +5333,13 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// cannot hold a live iterator ([`DictStrategy::nth_item`]).  Serving that
 /// cursor from the default `nth_item` — `self.items(w_dict).into_iter()
 /// .nth(index)` — makes the stand-in quadratic: [`w_module_dict_items_inner`]
-/// wraps EVERY name with [`crate::w_str_new`], so an `n`-entry dict costs `n`
-/// wraps per step.  Those strings are also the immortal flavour (`w_str_new`
-/// allocates through `malloc_raw`), so nothing reclaims them: measured, a
+/// wraps EVERY name, so an `n`-entry dict costs `n` wraps per step: measured, a
 /// 350-name module dict walked ten times grew peak RSS by 156.8 MB where
 /// CPython grew none, and removing it took 10.3 MB off interpreter startup —
-/// `dir(module)` inside `importlib._bootstrap` pays this walk.
+/// `dir(module)` inside `importlib._bootstrap` pays this walk.  The wrap
+/// itself is [`crate::celldict::_wrapkey`], which interns rather than minting;
+/// what it costs on a repeat is a table hit, and the per-step count is still
+/// what this cursor exists to hold at one.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
@@ -5355,7 +5357,7 @@ pub unsafe fn w_module_dict_nth_item_inner(
     // back afterwards — the cell storage keeps it traced.
     let roots = crate::gc_roots::push_roots();
     let key_slot = roots.base();
-    let _ = roots.pin_root(crate::w_str_new(key));
+    let _ = roots.pin_root(crate::celldict::_wrapkey(key));
     let value = strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)?;
     Some((roots.get(key_slot), value))
 }
