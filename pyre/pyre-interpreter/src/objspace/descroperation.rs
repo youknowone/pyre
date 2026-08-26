@@ -1994,7 +1994,11 @@ pub(crate) unsafe fn tuple_repeat(t: PyObjectRef, n: PyObjectRef) -> PyResult {
 
 /// The builtin sequences repeat through `sq_repeat`, never `nb_multiply`.
 pub(crate) unsafe fn is_repeat_sequence(obj: PyObjectRef) -> bool {
-    is_str(obj) || is_list(obj) || is_tuple(obj) || pyre_object::bytesobject::is_bytes_like(obj)
+    is_str(obj)
+        || is_list(obj)
+        || is_tuple(obj)
+        || pyre_object::bytesobject::is_bytes_like(obj)
+        || crate::module::_collections::is_deque(obj)
 }
 
 /// `sequence_repeat` for a receiver [`is_repeat_sequence`] accepted, with the
@@ -2006,8 +2010,10 @@ unsafe fn sequence_repeat(seq: PyObjectRef, count: PyObjectRef) -> PyResult {
         list_repeat(seq, count)
     } else if is_tuple(seq) {
         tuple_repeat(seq, count)
-    } else {
+    } else if pyre_object::bytesobject::is_bytes_like(seq) {
         bytes_repeat(seq, count)
+    } else {
+        crate::module::_collections::deque_repeat(seq, count)
     }
 }
 
@@ -3059,25 +3065,36 @@ pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: &[&str]) -> 
     if pyre_object::is_exact_builtin_instance(obj) {
         return false;
     }
-    let tp: *const pyre_object::PyType = if is_str(obj) {
-        &pyre_object::STR_TYPE
+    let t = if is_str(obj) {
+        let Some(t) = crate::typedef::gettypefor(&pyre_object::STR_TYPE) else {
+            return false;
+        };
+        t.as_ptr()
     } else if is_list(obj) {
-        &pyre_object::LIST_TYPE
+        let Some(t) = crate::typedef::gettypefor(&pyre_object::LIST_TYPE) else {
+            return false;
+        };
+        t.as_ptr()
     } else if is_tuple(obj) {
-        &pyre_object::TUPLE_TYPE
+        let Some(t) = crate::typedef::gettypefor(&pyre_object::TUPLE_TYPE) else {
+            return false;
+        };
+        t.as_ptr()
     } else if pyre_object::bytesobject::is_bytes_like(obj) {
-        if pyre_object::bytesobject::is_bytes(obj) {
+        let tp = if pyre_object::bytesobject::is_bytes(obj) {
             &pyre_object::bytesobject::BYTES_TYPE
         } else {
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE
-        }
+        };
+        let Some(t) = crate::typedef::gettypefor(tp) else {
+            return false;
+        };
+        t.as_ptr()
+    } else if crate::module::_collections::is_deque(obj) {
+        crate::module::_collections::type_object()
     } else {
         return false;
     };
-    let Some(t) = crate::typedef::gettypefor(tp) else {
-        return false;
-    };
-    let t = t.as_ptr();
     dunders
         .iter()
         .any(|dunder| dunder_overridden(obj, dunder, t))

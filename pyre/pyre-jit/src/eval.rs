@@ -1156,7 +1156,7 @@ unsafe fn unicode_user_object_custom_trace(
 /// the list).  Forward each live element slot in place, exactly as
 /// `tuple_object_custom_trace`, so a moving collector relocates young
 /// elements and a major collection marks them.  Only the Object strategy
-/// stores `PyObjectRef`s; Integer/Float keep unboxed arrays (`items` null)
+/// stores `PyObjectRef`s; Integer/Float/Bytes keep typed arrays (`items` null)
 /// and Empty has no block.  Trace `length` live slots, not capacity — the
 /// spare tail past the live length may hold stale pointers a shrink left
 /// behind.
@@ -1205,6 +1205,21 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         && pyre_object::gc_hook::try_gc_owns_object(unsafe { *float_block_slot } as *mut u8)
     {
         f(float_block_slot as *mut majit_ir::GcRef);
+    }
+    // BytesListStrategy stores erased `rpython str` pointers in a
+    // `GcArray(GCREF)`. A managed block's varsize trace walks the entries;
+    // the std::alloc fallback must be walked here explicitly.
+    let bytes_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).bytes_items.block) };
+    let bytes_block = unsafe { *bytes_block_slot };
+    if !bytes_block.is_null() {
+        if pyre_object::gc_hook::try_gc_owns_object(bytes_block as *mut u8) {
+            f(bytes_block_slot as *mut majit_ir::GcRef);
+        } else {
+            let base = unsafe { pyre_object::object_array::items_block_items_base(bytes_block) };
+            for i in 0..list.bytes_items.len() {
+                f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+            }
+        }
     }
 }
 

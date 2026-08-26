@@ -1,3 +1,5 @@
+import pickle
+
 from testutils import assert_raises
 
 
@@ -119,3 +121,10 @@ for count in (0, 1, 3):
 with assert_raises(TypeError) as caught:
     property().__set_name__(owner=object, name="value")
 assert str(caught.exception) == "property.__set_name__() takes no keyword arguments"
+
+# A property stores four native descriptor fields which an empty __newobj__
+# cannot reconstruct.  CPython 3.14 rejects the inherited object reducer.
+with assert_raises(TypeError):
+    property().__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+with assert_raises(TypeError):
+    pickle.dumps(property())

@@ -26,6 +26,7 @@ assert b() is a
 assert repr(b).startswith("<weakref at ")
 proxy_repr_target = X()
 assert repr(proxy(proxy_repr_target)).startswith("<weakproxy at ")
+assert_raises(TypeError, lambda: ref.__repr__(42))
 
 try:
     weakref._remove_dead_weakref(X.__dict__, "missing")

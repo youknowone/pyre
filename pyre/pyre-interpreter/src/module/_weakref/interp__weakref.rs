@@ -249,6 +249,11 @@ impl Drop for InstanceRoot {
 /// )
 /// ```
 fn init_weakref_type(ns: PyObjectRef) {
+    // [3.14-spec] PyPy `W_Weakref.typedef` supplies a descriptive string,
+    // while CPython 3.14 `_PyWeakref_RefType.tp_doc` is null.  Leave the key
+    // to `ensure_common_attributes`, which publishes the observable
+    // `ReferenceType.__dict__["__doc__"] is None` without changing PyPy's
+    // weakref payload or ownership.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -822,6 +827,14 @@ pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
 /// ```
 pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
+    // PyPy's interp2app gateway types W_WeakrefBase.descr__repr__ as a
+    // `weakref-or-proxy` method before entering this shared body.
+    if !is_w_weakref(w_self) && !is_w_abstract_proxy(w_self) {
+        return Err(PyError::type_error(format!(
+            "'weakref-or-proxy' object expected, got '{}' instead",
+            crate::baseobjspace::object_functionstr_type_name(w_self)
+        )));
+    }
     let w_obj = dereference(w_self);
     let type_name = unsafe {
         match crate::typedef::r#type(w_self) {

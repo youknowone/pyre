@@ -103,6 +103,40 @@ fn hidden_applevel(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     Ok(w_func)
 }
 
+/// `interp_magic.py strategy` — expose the live implementation strategy of a
+/// dict, list, set, or mapdict-backed instance.
+///
+/// This is intentionally a diagnostic of the representation pyre actually
+/// uses. In particular, ascii lists and integer sets currently report their
+/// Object strategies; that makes those remaining PyPy strategy ports
+/// visible instead of hiding them behind a missing `__pypy__` function.
+fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let obj = args[0];
+    let dict = crate::type_methods::resolve_dict_backing(obj);
+    if !dict.is_null() && unsafe { pyre_object::is_dict(dict) } {
+        return Ok(pyre_object::w_str_new(unsafe {
+            pyre_object::dictmultiobject::w_dict_strategy_name(dict)
+        }));
+    }
+    if unsafe { pyre_object::is_list(obj) } {
+        return Ok(pyre_object::w_str_new(unsafe {
+            pyre_object::listobject::w_list_strategy_name(obj)
+        }));
+    }
+    if unsafe { pyre_object::setobject::is_set_or_frozenset(obj) } {
+        // W_SetObject currently has one ObjectKey-backed representation.  The
+        // helper reports that real shape; EmptySetStrategy and
+        // IntegerSetStrategy remain explicit builtin-type porting work.
+        return Ok(pyre_object::w_str_new("ObjectSetStrategy"));
+    }
+    if let Some(name) = unsafe { crate::objspace::std::mapdict::mapdict_strategy_repr(obj) } {
+        return Ok(pyre_object::w_str_from_wtf8(name));
+    }
+    Err(crate::PyError::type_error(
+        "expecting dict or list or set object, or instance of some kind",
+    ))
+}
+
 /// `interp_dict.py:43-45 / 79-81` `isinstance(w_obj, W_DictMultiObject)`:
 /// resolve the backing of an exact dict, module dict, or dict subclass,
 /// rejecting a read-only `mappingproxy` (a `W_Root`, not a `W_DictMultiObject`)
@@ -247,6 +281,7 @@ crate::py_module! {
         "objects_in_repr" / 0 = objects_in_repr,
         "write_unraisable" / 3 = write_unraisable,
         "hidden_applevel" / 1 = hidden_applevel,
+        "strategy" / 1 = strategy,
         "newmemoryview" / * = interp_buffer::newmemoryview,
     },
     extra_init: |ns| {

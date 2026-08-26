@@ -2511,6 +2511,22 @@ fn new_builtin_typeobject(
     layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
+    // `typeobject.py ensure_common_attributes` runs for every PyPy TypeDef,
+    // not only for types which spell these entries in their rawdict.  Keep
+    // the same common preparation at the single builtin construction point:
+    // every type owns a `__doc__` entry, and `ensure_hash` prevents a type
+    // defining equality from silently inheriting an unrelated hash.
+    let ns = dict_ptr as PyObjectRef;
+    unsafe {
+        if pyre_object::w_dict_getitem_str(ns, "__doc__").is_none() {
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", pyre_object::w_none());
+        }
+        if pyre_object::w_dict_getitem_str(ns, "__eq__").is_some()
+            && pyre_object::w_dict_getitem_str(ns, "__hash__").is_none()
+        {
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__hash__", pyre_object::w_none());
+        }
+    }
     let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
     let w_metatype = match w_metatype.is_null() {
         true => w_type(),
@@ -2746,6 +2762,23 @@ pub fn make_builtin_type_with_bases(
             (*parent_layout).typedef
         }
     };
+    make_builtin_type_with_bases_and_layout(name, init, bases, layout_pytype)
+}
+
+/// [`make_builtin_type_with_bases`] with an explicit interpreter TypeDef
+/// identity for a concrete class that introduces its own instance Layout.
+///
+/// PyPy `setup_builtin_type` receives the concrete `instancetypedef` even for
+/// a TypeDef with multiple declared bases.  Most multi-base builtins introduce
+/// no interpreter class and use the wrapper above; concrete owners such as
+/// `interp_group.W_BaseExceptionGroup` take this path.
+pub fn make_builtin_type_with_bases_and_layout(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    bases: &[PyObjectRef],
+    layout_pytype: *const PyType,
+) -> PyObjectRef {
+    let base = bases[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
@@ -15081,6 +15114,26 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
                 function_descr_call_impl(positional, kwargs, descr)
             }),
         );
+        // [3.14-spec] PyPy keeps slot functions as
+        // `FunctionWithFixedCode`, while CPython's `PyWrapperDescr_Type`
+        // publishes its own `__repr__` slot.  The public descriptor type is
+        // already the CPython projection; route the slot through the same
+        // exact-carrier formatter used by `space.repr` rather than duplicating
+        // its text here.
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            make_builtin_function_with_arity(
+                "__repr__",
+                |args| {
+                    let descr = slot_wrapper_receiver(args[0], "__repr__")?;
+                    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                        crate::display::py_repr_wtf8(descr)?
+                    }))
+                },
+                1,
+            ),
+        );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
@@ -19136,7 +19189,16 @@ fn init_complex_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__complex__",
                 |args| {
-                    // Return a plain `complex` with the same components.
+                    // PyPy `W_ComplexObject.descr_complex` creates a base
+                    // complex, while `W_ComplexObject.is_w` makes that result
+                    // identical-by-value to an exact receiver.  Pyre follows
+                    // CPython 3.14 `ComplexTest.test___complex__` for complex
+                    // identity, so preserve the same observable result by
+                    // returning an exact receiver itself.  A strict subclass
+                    // still has to shed its class through a fresh base value.
+                    if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::COMPLEX_TYPE) } {
+                        return Ok(args[0]);
+                    }
                     let (re, im) = unsafe {
                         (
                             pyre_object::w_complex_get_real(args[0]),
@@ -25877,7 +25939,7 @@ fn setlike_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 fn setlike_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         Ok(pyre_object::w_str_from_wtf8_managed(
-            crate::display::py_repr_wtf8(args[0])?,
+            crate::display::set_repr_wtf8(args[0])?,
         ))
     }
 }

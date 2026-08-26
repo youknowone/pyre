@@ -4884,6 +4884,9 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         // leave construction to the ordinary residual instead of emitting an
         // Integer array whose values would have the wrong representation.
         ListStrategy::IntOrFloat => return Ok(None),
+        // The generic residual constructs the erased rpython-string array.
+        // The walker has no BytesBlock payload emitter yet.
+        ListStrategy::Bytes => return Ok(None),
         // Empty is impossible here (len >= 1); decline defensively.
         ListStrategy::Empty => return Ok(None),
     };
@@ -12959,7 +12962,8 @@ unsafe fn orthodox_list_append_recognize(
         // traced strategy from the concrete one the commit installs.
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
-            && !pyre_object::is_float_strategy_item(value);
+            && !pyre_object::is_float_strategy_item(value)
+            && !pyre_object::pyobject::is_exact_type(value, &pyre_object::bytesobject::BYTES_TYPE);
         if !int_ok && !float_ok && !obj_ok {
             return None;
         }

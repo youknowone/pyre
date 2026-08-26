@@ -4648,8 +4648,9 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         }
         // `W_AbstractBytesObject.is_w` (bytesobject.py): for distinct
         // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
-        // identity) — distinct `bytes` never share their backing buffer, so
-        // `false`; `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
+        // identity); BytesListStrategy re-wraps the same erased rpython string,
+        // so distinct wrappers may deliberately share that backing block.
+        // `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
         // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::bytesobject::BYTES_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::bytesobject::BYTES_TYPE)
@@ -4657,7 +4658,8 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let len1 = pyre_object::bytesobject::w_bytes_len(w_one);
             let len2 = pyre_object::bytesobject::w_bytes_len(w_two);
             if len2 > 1 {
-                return false;
+                return pyre_object::bytesobject::w_bytes_block(w_one)
+                    == pyre_object::bytesobject::w_bytes_block(w_two);
             }
             if len2 == 0 {
                 return len1 == 0;
@@ -5155,6 +5157,9 @@ pub(crate) fn native_slot_get(
     if unsafe { pyre_object::is_list(obj) } {
         return Ok(unsafe { pyre_object::listobject::w_list_slot_get(obj, index as usize) });
     }
+    if crate::module::_collections::is_deque(obj) {
+        return Ok(unsafe { crate::module::_collections::deque_slot_get(obj, index as usize) });
+    }
     if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
         return Ok(unsafe { pyre_object::weakref::w_weakref_object_slot_get(obj, index as usize) });
     }
@@ -5199,6 +5204,10 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::listobject::w_list_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
+    if crate::module::_collections::is_deque(obj) {
+        unsafe { crate::module::_collections::deque_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
     if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
         unsafe { pyre_object::weakref::w_weakref_object_slot_set(obj, index as usize, value) };
         return Ok(true);
@@ -5234,6 +5243,9 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::is_list(obj) } {
         return Ok(unsafe { pyre_object::listobject::w_list_slot_del(obj, index as usize) });
+    }
+    if crate::module::_collections::is_deque(obj) {
+        return Ok(unsafe { crate::module::_collections::deque_slot_del(obj, index as usize) });
     }
     if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
         return Ok(unsafe { pyre_object::weakref::w_weakref_object_slot_del(obj, index as usize) });
@@ -5791,9 +5803,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         // `__thisclass__`, ...) remain visible.
     }
 
-    // Native itertools fallback methods.  The corresponding TypeDefs expose
-    // these slots directly; this path remains for the iterator families whose
-    // TypeDefs have not yet been installed.
+    // Native itertools fallback methods.  Every concrete iterator TypeDef now
+    // exposes the iterator slots directly; keep this dispatch only as the
+    // interpreter-level next/iter adapter used by those implementations.
     unsafe {
         if pyre_object::interp_itertools::is_count(obj)
             || pyre_object::interp_itertools::is_repeat(obj)
@@ -5817,21 +5829,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
                 "__next__" => Some((iter_next_method, "__next__", 1)),
                 "__iter__" => Some((iter_self_method, "__iter__", 1)),
-                // pairwise exposes no additional methods; cycle and chain
-                // still use the old PyPy pickle fallbacks until their own
-                // TypeDefs are ported.
-                "__reduce__" if pyre_object::interp_itertools::is_cycle(obj) => {
-                    Some((cycle_reduce_method, "__reduce__", 1))
-                }
-                "__setstate__" if pyre_object::interp_itertools::is_cycle(obj) => {
-                    Some((cycle_setstate_method, "__setstate__", 2))
-                }
-                "__reduce__" if pyre_object::interp_itertools::is_chain(obj) => {
-                    Some((chain_reduce_method, "__reduce__", 1))
-                }
-                "__setstate__" if pyre_object::interp_itertools::is_chain(obj) => {
-                    Some((chain_setstate_method, "__setstate__", 2))
-                }
                 _ => None,
             };
             if let Some((func, sname, arity)) = entry {
@@ -18282,124 +18279,6 @@ pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     Ok(obj)
-}
-
-/// `cycle.__reduce__` — `interp_itertools.py W_Cycle.descr_reduce`:
-/// `(type(self), (iterable,), (list(saved), index))`.  The saved buffer is
-/// copied into a fresh list (`space.newlist(self.saved_w)`) so later
-/// cycling cannot mutate the pickled state.
-fn cycle_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    // Capture every field before any allocation (`w_list_new` /
-    // `w_tuple_new` may collect): the saved elements go into a `Vec`
-    // that `w_list_new` pins, and `w_iterable` / `index` are read up
-    // front rather than across an allocation.
-    let w_type = crate::typedef::r#type(args[0]).map_or(PY_NULL, |p| p.as_ptr());
-    let it = unsafe { &*(args[0] as *const pyre_object::interp_itertools::W_Cycle) };
-    let w_iterable = it.w_iterable;
-    let index = it.index;
-    let n = unsafe { pyre_object::w_list_len(it.saved) };
-    let mut saved = Vec::with_capacity(n);
-    for i in 0..n as i64 {
-        saved.push(
-            unsafe { pyre_object::w_list_getitem(it.saved, i) }
-                .expect("cycle saved index in range"),
-        );
-    }
-    let state = w_tuple_new(vec![w_list_new(saved), w_int_new(index)]);
-    Ok(w_tuple_new(vec![
-        w_type,
-        w_tuple_new(vec![w_iterable]),
-        state,
-    ]))
-}
-
-/// `cycle.__setstate__` — `interp_itertools.py W_Cycle.descr_setstate`:
-/// unpack `(saved, index)`, replace `saved_w` with a fresh list of the
-/// unpacked elements, and restore `index`.  Reassigning the `saved`
-/// pointer field requires the GC write barrier so an old→young edge is
-/// recorded.
-fn cycle_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    // `unpackiterable` iterates the pickled state and may collect; pin the
-    // receiver and the state tuple so they (and, transitively, the saved
-    // list reached through the tuple) survive each iteration.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let w_self = args[0];
-    let w_state = if args.len() > 1 { args[1] } else { w_none() };
-    let w_self = pyre_object::gc_roots::pin_root(w_self);
-    let w_state = pyre_object::gc_roots::pin_root(w_state);
-    let state_w = unpackiterable(w_state, 2)?;
-    let saved_w = unpackiterable(state_w[0], -1)?;
-    let w_saved = w_list_new(saved_w);
-    let index = int_w(state_w[1])?;
-    let it = unsafe { &mut *(w_self as *mut pyre_object::interp_itertools::W_Cycle) };
-    it.saved = w_saved;
-    pyre_object::gc_hook::try_gc_write_barrier(w_self as *mut u8);
-    it.index = index;
-    Ok(w_none())
-}
-
-/// `chain.__reduce__` — `interp_itertools.py W_Chain.descr_reduce`.  While
-/// the chain still has a live `w_iterables` the state carries `(w_iterables,)`
-/// or `(w_iterables, w_it)` so `__setstate__` can restore both; the args
-/// tuple is empty because `chain()` takes no positional arguments (the
-/// iterables come back through `__setstate__`).  A spent chain
-/// (`w_iterables is None`) reduces to just `(type, ())`.
-fn chain_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    // Read the pointer fields before any allocation (`w_tuple_new` may
-    // collect); `w_type` mirrors `space.type(self)`.
-    let w_type = crate::typedef::r#type(args[0]).map_or(PY_NULL, |p| p.as_ptr());
-    let w_iterables = unsafe { pyre_object::interp_itertools::w_chain_get_iterables(args[0]) };
-    let w_it = unsafe { pyre_object::interp_itertools::w_chain_get_it(args[0]) };
-    if !w_iterables.is_null() {
-        let inner = if !w_it.is_null() {
-            vec![w_iterables, w_it]
-        } else {
-            vec![w_iterables]
-        };
-        Ok(w_tuple_new(vec![
-            w_type,
-            w_tuple_new(vec![]),
-            w_tuple_new(inner),
-        ]))
-    } else {
-        Ok(w_tuple_new(vec![w_type, w_tuple_new(vec![])]))
-    }
-}
-
-/// `chain.__setstate__` — `interp_itertools.py W_Chain.descr_setstate`:
-/// unpack the pickled state and restore `w_iterables` (and, with two
-/// elements, `w_it`).  Reassigning the pointer fields records an old→young
-/// edge, so the setters run the GC write barrier.
-fn chain_setstate_method(args: &[PyObjectRef]) -> PyResult {
-    // `unpackiterable` iterates the pickled state and may collect; pin the
-    // receiver and the state so they (and, transitively, the unpacked
-    // elements) survive each iteration.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let w_self = args[0];
-    let w_state = if args.len() > 1 { args[1] } else { w_none() };
-    let w_self = pyre_object::gc_roots::pin_root(w_self);
-    let w_state = pyre_object::gc_roots::pin_root(w_state);
-    let state = unpackiterable(w_state, -1)?;
-    let n = state.len();
-    if n < 1 {
-        return Err(PyError::type_error(format!(
-            "function takes at least 1 argument ({n} given)"
-        )));
-    } else if n == 1 {
-        unsafe {
-            pyre_object::interp_itertools::w_chain_set_iterables(w_self, state[0]);
-        }
-    } else if n == 2 {
-        unsafe {
-            pyre_object::interp_itertools::w_chain_set_iterables(w_self, state[0]);
-            pyre_object::interp_itertools::w_chain_set_it(w_self, state[1]);
-        }
-    } else {
-        return Err(PyError::type_error(format!(
-            "function takes at most 2 arguments ({n} given)"
-        )));
-    }
-    Ok(w_none())
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)

@@ -688,7 +688,7 @@ crate::py_module! {
             let dispatch_table = pickler::copyreg_dispatch_table();
             let _ = pyre_object::gc_roots::pin_root(dispatch_table);
             let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_memo = pyre_object::listobject::w_list_new(Vec::new());
+            let w_memo = pyre_object::listobject::w_list_new_empty();
             // Pass `file` so `pickle_core` streams the frames to it directly.
             pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -738,7 +738,7 @@ crate::py_module! {
             let dispatch_table = pickler::copyreg_dispatch_table();
             let _ = pyre_object::gc_roots::pin_root(dispatch_table);
             let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_memo = pyre_object::listobject::w_list_new(Vec::new());
+            let w_memo = pyre_object::listobject::w_list_new_empty();
             // No file: `pickle_core` accumulates and returns the pickle bytes.
             pickler::pickle_core(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),

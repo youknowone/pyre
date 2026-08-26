@@ -6,6 +6,8 @@
 import sys
 import types
 import weakref
+from array import array
+from collections import deque
 
 from testutils import assert_raises
 
@@ -71,6 +73,35 @@ assert str(7) == "7"
 
 assert isinstance(memoryview.__doc__, str)
 assert "memoryview" in memoryview.__doc__
+
+for view_type in (type({}.keys()), type({}.values()), type({}.items())):
+    assert "__doc__" in view_type.__dict__
+    assert view_type.__dict__["__doc__"] is None
+
+# `typeobject.py ensure_common_attributes` gives every TypeDef an own doc
+# entry; `ensure_hash` suppresses an inherited object hash when equality is
+# defined locally.
+assert "__doc__" in array.__dict__
+assert array.__doc__.startswith("array(typecode [, initializer]) -> array\n")
+assert "itemsize -- the length in bytes of one array item" in array.__doc__
+assert array.__dict__["__hash__"] is None
+assert_raises(TypeError, hash, array("i"))
+
+assert deque.__dict__["__doc__"] == (
+    "A list-like sequence optimized for data accesses near its endpoints."
+)
+for weak_type in (
+    weakref.ReferenceType,
+    weakref.ProxyType,
+    weakref.CallableProxyType,
+):
+    assert "__doc__" in weak_type.__dict__
+    assert weak_type.__dict__["__doc__"] is None
+
+wrapper_descriptor = type(object.__str__)
+assert wrapper_descriptor.__name__ == "wrapper_descriptor"
+assert "__repr__" in wrapper_descriptor.__dict__
+assert wrapper_descriptor.__dict__["__repr__"](object.__str__) == repr(object.__str__)
 
 # --- SPEC-omit: PyPy TypeDef key, CPython 3.14 type dict has no such key ---
 

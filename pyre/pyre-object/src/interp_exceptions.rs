@@ -15,6 +15,16 @@ use crate::pyobject::*;
 use rustpython_wtf8::Wtf8;
 
 pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException");
+/// PyPy `interp_group.W_BaseExceptionGroup` is a concrete interpreter class
+/// over `W_BaseException`, so its TypeDef owns a child instance Layout.
+///
+/// Pyre flattens the group's fields into [`W_BaseException`], and group
+/// instances therefore keep the BaseException/Exception `ob_type` selected by
+/// their leaf policy.  This static is consequently a TypeDef/Layout identity,
+/// not a separately allocated object vtable, and is deliberately absent from
+/// `pyobject::all_foreign_pytypes`.
+pub static EXC_BASE_EXCEPTION_GROUP_LAYOUT_TYPE: PyType =
+    crate::pyobject::new_pytype("BaseExceptionGroup");
 pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
 pub static EXC_ARITHMETIC_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ArithmeticError");
 pub static EXC_OVERFLOW_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OverflowError");

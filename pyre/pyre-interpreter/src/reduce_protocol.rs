@@ -399,26 +399,51 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         let args_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_args);
         let _ = pyre_object::gc_roots::pin_root(w_kwargs);
-        // objectobject.py:276 / `_PyObject_GetState(required)`: a type whose
-        // instances carry C-level state that `__dict__`/`__slots__` cannot
-        // reconstruct, and that supplies no `__getnewargs__`, cannot be
-        // rebuilt via `__newobj__`.  `reduce_newobj` gates this on
-        // `tp_basicsize` exceeding the object+dict+weakref+slots baseline;
-        // pyre has no basicsize notion, so recognise the native layouts that
-        // reach object-reduce with unreconstructable C-level state: `module`
-        // (native name + dict payload) and `memoryview` (private buffer view
-        // geometry/export state).  This is the `_PyObject_GetState(required)`
-        // `staticmethod` / `classmethod` likewise keep their wrapped function
-        // in native descriptor storage that an empty `__newobj__` cannot
-        // restore. This is the `_PyObject_GetState(required)` refusal used by
-        // CPython 3.14 for every pickle protocol.
-        if !hasargs
-            && unsafe {
-                pyre_object::is_module(current_obj())
-                    || pyre_object::memoryview::is_w_memoryview(current_obj())
-                    || pyre_object::function::is_staticmethod(current_obj())
-                    || pyre_object::function::is_classmethod(current_obj())
+        // CPython 3.14 `object_getstate_default(required)`: when no
+        // `__getnewargs__` supplied constructor state, a native layout whose
+        // basicsize exceeds the plain object + managed dict/weakref/slots
+        // baseline cannot be rebuilt through an empty `__newobj__` call.
+        // PyPy reaches the same safe shape by giving picklable native TypeDefs
+        // their own reducer instead of teaching object.__reduce_ex__ their
+        // fields.  Pyre's `ob_type` is the RPython-vtable/layout tag: only the
+        // plain INSTANCE_TYPE layout has no hidden native payload.  Lists and
+        // dicts are the two upstream exceptions because reduce_2 serializes
+        // their contents through listitems/dictitems below.  This one layout
+        // test replaces the incomplete per-type census (module, memoryview,
+        // staticmethod, classmethod) and also covers property and every
+        // itertools TypeDef whose 3.14 type supplies no reducer.
+        let native_layout = unsafe {
+            !std::ptr::eq(
+                pyre_object::ll_type(current_obj()),
+                &pyre_object::INSTANCE_TYPE as *const pyre_object::PyType,
+            )
+        };
+        // `object_getstate` hands the call to an overriding `__getstate__`
+        // and only falls through to `object_getstate_default(required)` when
+        // the type still uses `object.__getstate__`; `descr__reduce_ex__`
+        // spells the same gate as a `space.lookup` of the hook.  A native
+        // layout that publishes its own hook is rebuilt from the state that
+        // hook returns, so the refusal below must not see it: `_io.BytesIO`
+        // and `_io.StringIO` hold a native buffer and pickle for exactly this
+        // reason.  `getnewargs` above can collect, so the type is read back
+        // rather than reused.
+        let w_type = crate::typedef::r#type(current_obj())
+            .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
+        let supplies_getstate = unsafe {
+            let w_cls_getstate =
+                crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__getstate__");
+            let w_obj_getstate =
+                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__getstate__");
+            match (w_cls_getstate, w_obj_getstate) {
+                (Some(w_cls), Some(w_obj)) => !crate::baseobjspace::is_w(w_cls, w_obj),
+                (w_cls, _) => w_cls.is_some(),
             }
+        };
+        if !hasargs
+            && native_layout
+            && !supplies_getstate
+            && !unsafe { pyre_object::is_list(current_obj()) }
+            && !unsafe { pyre_object::is_dict(current_obj()) }
         {
             return Err(PyError::type_error(format!(
                 "cannot pickle '{}' object",

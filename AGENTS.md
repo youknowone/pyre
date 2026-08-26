@@ -10,6 +10,13 @@ the user explicitly expands the scope. A skipped CPython test does not override
 this boundary; fix PyPy's real public-module owner or fallback instead. See
 “Module presence follows PyPy” below for the full rule and examples.
 
+**Hard stop:** if neither the real `pypy3` import nor an upstream PyPy owner can
+be verified, do not add the module or keep it in the implementation backlog.
+
+**Known exclusions:** `_testlimitedcapi` is a CPython-only test helper, and
+PyPy has no `_datetime` extension module. Do not implement either one; preserve
+and repair PyPy's pure-Python `datetime` path when the public module is broken.
+
 ## The JIT is generated from the interpreter source
 
 pyre is structured like PyPy: `pyre-interpreter` is the RPython-interpreter

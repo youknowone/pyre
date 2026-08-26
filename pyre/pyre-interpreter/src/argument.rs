@@ -97,24 +97,19 @@ pub fn raise_type_error(
 /// parallel string-typed list), so the typed dispatch reduces to byte
 /// equality of the underlying utf8.
 ///
-/// TODO: pyre's `W_UnicodeObject` does not yet
-/// expose an `eq_w` method, so the byte-equality is open-coded via
-/// `pyre_object::w_str_get_value` and gated on `is_str`.  The identity
-/// fast path `is_w` is preserved as the cheap shortcut PyPy gets from
-/// CPython-style interned-string identity.  Routing through
-/// `space.eq_w` (the generic 2-arg fallback) would invoke Python-level
-/// `__eq__` on hand-built Arguments and silently drift.
+/// The identity fast path `is_w` is preserved as the cheap shortcut PyPy gets
+/// from CPython-style interned-string identity.  The typed fallback routes
+/// through `W_UnicodeObject.eq_w`; using generic `space.eq_w` here would invoke
+/// Python-level `__eq__` on hand-built Arguments and silently drift.
 pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
     for &w_other in keys_w {
         if crate::baseobjspace::is_w(w_other, w_key) {
             return true;
         }
         unsafe {
-            // Compared as raw buffers: `**{'\ud800': 1}` puts a lone surrogate
-            // in a keyword name, which has no `&str` spelling.
             if pyre_object::is_str(w_other)
                 && pyre_object::is_str(w_key)
-                && pyre_object::w_str_get_wtf8(w_other) == pyre_object::w_str_get_wtf8(w_key)
+                && pyre_object::w_str_eq_w(w_other, w_key)
             {
                 return true;
             }

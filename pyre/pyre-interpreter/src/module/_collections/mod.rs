@@ -65,6 +65,11 @@ pub struct W_Deque {
     maxlen: i64,
     /// Lightweight iteration-lock counter (`interp_deque.py` `state`); bumped on every mutation.
     state: i64,
+    /// PyPy `BaseUserClassMapdict` indexed storage for a deque subclass's
+    /// app-level `__slots__`.  The translated user layout owns these values;
+    /// pyre's fixed native payload keeps the equivalent object-resident list.
+    /// `PY_NULL` means no slot has been assigned yet.
+    w_slots: PyObjectRef,
 }
 
 // PyPy's deque block/endpoint transitions execute atomically under its GIL.
@@ -133,6 +138,31 @@ fn block_set(block_obj: PyObjectRef, index: i64, value: PyObjectRef) {
 
 fn deque_len(self_obj: PyObjectRef) -> i64 {
     W_Deque::from_obj(self_obj).map(|d| d.len).unwrap_or(0)
+}
+
+/// Whether `obj` has PyPy's `W_Deque` layout, including a Python subclass.
+pub(crate) fn is_deque(obj: PyObjectRef) -> bool {
+    W_Deque::from_obj(obj).is_some()
+}
+
+/// Read one app-level `__slots__` entry from a deque subclass.
+pub(crate) unsafe fn deque_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe { pyre_object::slots::slot_get(obj, index, deque_slots_field) }
+}
+
+/// Write one app-level `__slots__` entry on a deque subclass.
+pub(crate) unsafe fn deque_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    unsafe { pyre_object::slots::slot_set(obj, index, value, deque_slots_field) }
+}
+
+/// Clear one app-level `__slots__` entry on a deque subclass.
+pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    unsafe { pyre_object::slots::slot_del(obj, index, deque_slots_field) }
+}
+
+/// Address of `W_Deque::w_slots` for the shared native-subclass slot helpers.
+unsafe fn deque_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_Deque)).w_slots }
 }
 
 /// Snapshot the backing list into a `Vec`.
@@ -795,13 +825,33 @@ fn deque_compare(
 
 /// `W_Deque.mul` — repeat the elements `num` times, then re-bound by
 /// `maxlen` by routing through the constructor (which trims).
-fn deque_repeat(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    if !unsafe { is_int(n) } {
-        return Ok(pyre_object::w_not_implemented());
-    }
-    let num = unsafe { w_int_get_value(n) }.max(0);
+pub(crate) fn deque_repeat(
+    self_obj: PyObjectRef,
+    n: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // PyPy's W_Deque.mul receives `w_int` and starts with `space.int_w`.
+    // CPython v3.14.6 routes the public sq_repeat slot through
+    // abstract.c sequence_repeat first, so only __index__ is admitted and an
+    // oversized result names an index-sized integer.  Keep PyPy's body below
+    // after applying that observable gateway contract.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::pin_roots(&[self_obj, n]);
+    let w_count =
+        crate::baseobjspace::getindex_repeat(pyre_object::gc_roots::shadow_stack_get(roots + 1))?;
+    let num = crate::baseobjspace::int_w(w_count)?.max(0) as usize;
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(roots);
     let base = snapshot(self_obj);
-    let mut items = Vec::with_capacity(base.len().saturating_mul(num as usize));
+    // interp_deque.py W_Deque.mul: ovfcheck(self.len * num) raises
+    // MemoryError.  `try_reserve_exact` is the implicit allocation edge that
+    // follows the explicit overflow check in the RPython body.
+    let total = base
+        .len()
+        .checked_mul(num)
+        .ok_or_else(|| crate::PyError::memory_error(""))?;
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(total)
+        .map_err(|_| crate::PyError::memory_error(""))?;
     for _ in 0..num {
         items.extend_from_slice(&base);
     }
@@ -815,7 +865,14 @@ fn deque_repeat(self_obj: PyObjectRef, n: PyObjectRef) -> Result<PyObjectRef, cr
     }
 }
 
-#[crate::pyre_methods(weakrefable, unhashable)]
+// [3.14-spec] PyPy `W_Deque.typedef` owns the older constructor-oriented doc;
+// CPython 3.14 `_collectionsmodule.c` `deque_init__doc__` is the observable
+// type doc.  Keep PyPy's TypeDef owner and project only that string.
+#[crate::pyre_methods(
+    doc = "A list-like sequence optimized for data accesses near its endpoints.",
+    weakrefable,
+    unhashable
+)]
 impl W_Deque {
     // `deque_new` allocates an empty unbounded payload; the construction
     // arguments (`iterable`, `maxlen`) are consumed by `__init__`, so they
@@ -844,6 +901,7 @@ impl W_Deque {
             len: 0,
             maxlen: -1,
             state: 0,
+            w_slots: PY_NULL,
         })
     }
 
@@ -1266,10 +1324,15 @@ impl W_Deque {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         // `W_Deque.imul` — empty or *1 is self; *<=0 clears; else
         // repeat in place, trimmed by maxlen.
-        if !unsafe { is_int(n) } {
-            return Ok(pyre_object::w_not_implemented());
-        }
-        let num = unsafe { w_int_get_value(n) };
+        // As in `deque_repeat`, the public descriptor applies CPython 3.14's
+        // sq_repeat __index__ contract before the PyPy W_Deque.imul body.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let roots = pyre_object::gc_roots::pin_roots(&[self_obj, n]);
+        let w_count = crate::baseobjspace::getindex_repeat(
+            pyre_object::gc_roots::shadow_stack_get(roots + 1),
+        )?;
+        let num = crate::baseobjspace::int_w(w_count)?;
+        let self_obj = pyre_object::gc_roots::shadow_stack_get(roots);
         // Nothing between the snapshot and the write-back runs Python, so the
         // whole read-modify-write fits under one stripe — without it a
         // concurrent `append` lands between them and is dropped by `store`.
@@ -1282,8 +1345,18 @@ impl W_Deque {
             store(self_obj, vec![]);
             return Ok(self_obj);
         }
-        let mut items = Vec::with_capacity(base.len().saturating_mul(num as usize));
-        for _ in 0..num {
+        // interp_deque.py W_Deque.imul: ovfcheck(self.len * num), followed by
+        // the allocation's implicit MemoryError edge.
+        let repeat = num as usize;
+        let total = base
+            .len()
+            .checked_mul(repeat)
+            .ok_or_else(|| crate::PyError::memory_error(""))?;
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(total)
+            .map_err(|_| crate::PyError::memory_error(""))?;
+        for _ in 0..repeat {
             items.extend_from_slice(&base);
         }
         if let Some(m) = maxlen_bound(self_obj)

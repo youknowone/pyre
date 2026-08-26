@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+from testutils import assert_raises
 
 
 # Python 3.14's defaultdict.__missing__ preserves a value installed by a
@@ -72,6 +73,67 @@ assert d == deque([], 4)
 assert deque([1, 2, 3]) * 2 == deque([1, 2, 3, 1, 2, 3])
 
 assert deque([1, 2, 3], 4) * 2 == deque([3, 1, 2, 3])
+
+
+class DequeRepeatIndex:
+    def __index__(self):
+        # The receiver and count must stay rooted across arbitrary Python code.
+        import gc
+
+        gc.collect()
+        return 2
+
+
+class DequeRepeatReflected:
+    def __rmul__(self, other):
+        return ("reflected", other)
+
+
+class DequeRepeatOverride(deque):
+    def __mul__(self, other):
+        return ("override", other)
+
+    def __rmul__(self, other):
+        return ("reflected override", other)
+
+
+class SlottedDeque(deque):
+    __slots__ = ("slot_value", "__dict__")
+
+
+repeat_source = deque([1, 2])
+assert repeat_source * DequeRepeatIndex() == deque([1, 2, 1, 2])
+assert DequeRepeatIndex() * repeat_source == deque([1, 2, 1, 2])
+assert repeat_source * DequeRepeatReflected() == ("reflected", repeat_source)
+repeat_override = DequeRepeatOverride([1])
+assert repeat_override * 3 == ("override", 3)
+assert 3 * repeat_override == ("reflected override", 3)
+assert_raises(TypeError, deque.__mul__, repeat_source, object())
+assert_raises(OverflowError, lambda: repeat_source * (10**100))
+
+slotted_deque = SlottedDeque([1])
+slotted_deque.slot_value = 2
+slotted_deque.dict_value = 3
+assert slotted_deque.__dict__ == {"dict_value": 3}
+assert slotted_deque.__getstate__() == (
+    {"dict_value": 3},
+    {"slot_value": 2},
+)
+del slotted_deque.slot_value
+assert_raises(AttributeError, getattr, slotted_deque, "slot_value")
+
+repeat_big = deque([0])
+repeat_big *= 2**8
+assert_raises(MemoryError, lambda: repeat_big * (2**56))
+assert_raises(MemoryError, lambda: (2**56) * repeat_big)
+
+
+def repeat_big_in_place():
+    value = repeat_big.copy()
+    value *= 2**56
+
+
+assert_raises(MemoryError, repeat_big_in_place)
 
 # Optional constructor args, including the `maxlen` keyword form.
 assert deque(maxlen=5).maxlen == 5

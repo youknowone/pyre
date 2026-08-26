@@ -226,6 +226,7 @@ with assert_raises(SyntaxError):
 # __complex__
 z = 3 + 4j
 assert z.__complex__() == z
+assert z.__complex__() is z
 assert type(z.__complex__()) == complex
 
 
