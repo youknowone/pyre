@@ -3059,15 +3059,22 @@ struct Lowering<'a> {
     /// Variable for a base/index without a backing local (a constant).
     index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
     /// MIR locals bound by `_i = &place` where `place` is a
-    /// `core::sync::atomic` slot, mapped to that borrowed place.
+    /// `core::sync::atomic` slot, mapped to the place they borrowed.
     ///
     /// `<Atomic*>::store(&self, v, ord)` is a call, so the write target
     /// survives only as the receiver operand; the load fold gets away with
     /// aliasing the receiver Variable because a read needs no place, but a
-    /// write does.  Recorded last-write-wins like
-    /// [`Lowering::positional_aggregate_locals`], so a rebound local never
-    /// carries a stale place, and keyed on the referent being an atomic so a
-    /// body's ordinary borrows never enter the map.
+    /// write does.  Keyed on the referent being an atomic, so a body's
+    /// ordinary borrows never enter the map.
+    ///
+    /// Only locals outside [`Lowering::multi_assigned_locals`] enter, the
+    /// same restriction [`Lowering::const_discriminant_locals`] carries and
+    /// for the same reason: MIR locals are not SSA and this map is not a
+    /// flow-state, so a local borrowed from `&a` in one block and `&b` in
+    /// another would hand the store whichever block happened to be lowered
+    /// last rather than the definition that reaches it — a write to the
+    /// wrong field.  A local assigned once in the whole body carries the
+    /// reaching place at every use of it; a rebound one stays a call.
     atomic_ref_place: std::collections::HashMap<usize, Place>,
     /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
     /// the variant's name.
@@ -3079,7 +3086,9 @@ struct Lowering<'a> {
     /// store and nothing else — a `Release` store lowered as an unordered
     /// `FieldWrite` would DROP a barrier the residual call it replaces still
     /// performs (`w_type_set_version_tag` publishes `version_tag` with
-    /// `Release` against an `Acquire` reader).
+    /// `Release` against an `Acquire` reader).  Which makes reading the WRONG
+    /// variant a dropped barrier, so this map carries the single-assignment
+    /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
     atomic_ordering_locals: std::collections::HashMap<usize, String>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
@@ -4246,22 +4255,14 @@ impl<'a> Lowering<'a> {
                 // `<Atomic*>::store` through this local can write to the
                 // place rather than to the value it resolved to.  Read
                 // before `build_rvalue` consumes the rvalue.
-                match atomic_ref_referent(&rvalue, self.llbc) {
-                    Some(place) => {
+                if !self.multi_assigned_locals.contains(&(i as usize)) {
+                    if let Some(place) = atomic_ref_referent(&rvalue, self.llbc) {
                         self.atomic_ref_place.insert(i as usize, place);
                     }
-                    None => {
-                        self.atomic_ref_place.remove(&(i as usize));
-                    }
-                }
-                // `_i = Ordering::<V>` — the ordering the store arm has to
-                // read before it may fold.  Same last-write-wins discipline.
-                match self.atomic_ordering_variant(&rvalue) {
-                    Some(name) => {
+                    // `_i = Ordering::<V>` — the ordering the store arm has
+                    // to read before it may fold.
+                    if let Some(name) = self.atomic_ordering_variant(&rvalue) {
                         self.atomic_ordering_locals.insert(i as usize, name);
-                    }
-                    None => {
-                        self.atomic_ordering_locals.remove(&(i as usize));
                     }
                 }
                 // Capture the construction `owner_root` if this binding
@@ -8109,16 +8110,19 @@ impl<'a> Lowering<'a> {
                 {
                     // A receiver this body did not bind as a borrow of a
                     // field — or one borrowing a whole local rather than a
-                    // field of one — leaves no place to write to.  Fall
-                    // through to the ordinary call path, which is what an
-                    // unrecognised `store` already lowers to, rather than
-                    // inventing a target or failing a graph that compiles
-                    // today.
+                    // field of one, or one rebound elsewhere in the body —
+                    // leaves no place to write to.  Fall through to the
+                    // ordinary call path, which is what an unrecognised
+                    // `store` already lowers to, rather than inventing a
+                    // target or failing a graph that compiles today.  The
+                    // place is copied, not taken: one borrow stored through
+                    // twice folds both times.
                     let referent = arg_locals
                         .first()
                         .copied()
                         .flatten()
-                        .and_then(|l| self.atomic_ref_place.remove(&l));
+                        .and_then(|l| self.atomic_ref_place.get(&l))
+                        .map(clone_place);
                     if let Some(referent) = referent {
                         let field_ty = clone_tyref(&referent.ty);
                         if let PlaceKind::Projection(inner, elem) = referent.kind {
