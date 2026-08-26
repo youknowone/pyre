@@ -9213,6 +9213,34 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
+        // Retarget the interpreter's own unary RBigInt wrappers to the same
+        // residuals.  A descent reaches `descroperation::bigint_neg` /
+        // `bigint_invert` as an unlowered helper and never walks their
+        // bodies, so the `<RBigInt as Neg>::neg` call inside is not a call the
+        // retarget above ever sees.  Guarded like the divmod projections:
+        // sole operand and destination both the opaque `BigInt` ADT.  Same
+        // pure-target-swap, fail-safe contract.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && tyref_is_rbigint(&call.dest.ty, self.llbc)
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && let Some(residual) = crate::front::rbigint_call::unop_wrapper_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
+            }
+        } else {
+            op_kind
+        };
+
         // `RBigInt::digits{,_mut}` is only the Rust view adapter for
         // RPython's direct `self._digits` GcArray field.  Project the field
         // itself so the annotator receives the `[Signed]` SomeList registered
