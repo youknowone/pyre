@@ -1814,6 +1814,10 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let len = w_list_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+        // BaseRangeListStrategy.getslice materialises the receiver before
+        // delegating to IntegerListStrategy, even though slicing is otherwise
+        // a read-only operation.
+        obj = pyre_object::listobject::w_list_materialize_range(obj);
         let mut items = Vec::new();
         let mut i = start;
         for n in 0..slicelength {

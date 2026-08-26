@@ -5082,8 +5082,13 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         // The generic residual constructs AsciiListStrategy's erased UTF-8
         // storage; the walker has no raw UnicodeValueStorage emitter yet.
         ListStrategy::Ascii => return Ok(None),
-        // Empty is impossible here (len >= 1); decline defensively.
-        ListStrategy::Empty | ListStrategy::Size => return Ok(None),
+        // Empty is impossible here (len >= 1); decline defensively. Range
+        // storage is built only by the interpreter-internal `make_range_list`
+        // seam and has no walker-native erased-tuple emitter yet.
+        ListStrategy::Empty
+        | ListStrategy::Size
+        | ListStrategy::SimpleRange
+        | ListStrategy::Range => return Ok(None),
     };
 
     // Concrete shadow: a fresh list built from the element shadows

@@ -90,7 +90,11 @@ fn list_get_physical_size(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
     if !unsafe { pyre_object::is_list(w_list) } {
         return Err(crate::PyError::type_error("expected list"));
     }
-    let size = unsafe { pyre_object::listobject::w_list_physical_size(w_list) };
+    let Some(size) = (unsafe { pyre_object::listobject::w_list_physical_size(w_list) }) else {
+        return Err(crate::PyError::value_error(
+            "can't get physical size of list",
+        ));
+    };
     Ok(pyre_object::w_int_new(size as i64))
 }
 

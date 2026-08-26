@@ -1190,10 +1190,16 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let list = unsafe { &mut *list_ptr };
     f(&mut list.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    if list.strategy == pyre_object::listobject::ListStrategy::Size && !list.items.is_null() {
-        // SizeListStrategy is an ordinary shared RPython strategy instance.
-        // Pyre keeps its mutable state box in the otherwise inactive `items`
-        // edge so clones preserve that identity without growing every list.
+    if matches!(
+        list.strategy,
+        pyre_object::listobject::ListStrategy::Size
+            | pyre_object::listobject::ListStrategy::SimpleRange
+            | pyre_object::listobject::ListStrategy::Range
+    ) && !list.items.is_null()
+    {
+        // SizeListStrategy is an ordinary shared RPython strategy instance;
+        // the range strategies share their immutable erased tuple. Pyre keeps
+        // either state box in the otherwise inactive `items` edge.
         let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
         if pyre_object::gc_hook::try_gc_owns_object(unsafe { *items_slot } as *mut u8) {
             f(items_slot as *mut majit_ir::GcRef);

@@ -16031,6 +16031,10 @@ pub(crate) fn sort_list_in_place(
     if key_fn.is_none() {
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe {
+            if pyre_object::listobject::w_list_sort_range(list, reverse) {
+                return Ok(());
+            }
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
             if let Some((items, len)) = pyre_object::listobject::w_list_int_items_raw(list) {
                 sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
                 return Ok(());

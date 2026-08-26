@@ -1319,16 +1319,22 @@ pub fn emit_promote_empty_list_inline(
         }
         pyre_object::listobject::ListStrategy::Empty
         | pyre_object::listobject::ListStrategy::Size
+        | pyre_object::listobject::ListStrategy::SimpleRange
+        | pyre_object::listobject::ListStrategy::Range
         | pyre_object::listobject::ListStrategy::IntOrFloat
         | pyre_object::listobject::ListStrategy::Bytes
         | pyre_object::listobject::ListStrategy::Ascii => {
             // The specialized first-append path only admits Integer, Float,
             // or Object. Exact bytes are declined before this emitter;
             // IntOrFloat is reached later by a numeric strategy transition.
+            // BaseRangeListStrategy append materialises first, so compact
+            // range storage cannot enter this Empty-to-typed emitter.
             debug_assert!(matches!(
                 strategy,
                 pyre_object::listobject::ListStrategy::Empty
                     | pyre_object::listobject::ListStrategy::Size
+                    | pyre_object::listobject::ListStrategy::SimpleRange
+                    | pyre_object::listobject::ListStrategy::Range
                     | pyre_object::listobject::ListStrategy::IntOrFloat
                     | pyre_object::listobject::ListStrategy::Bytes
                     | pyre_object::listobject::ListStrategy::Ascii

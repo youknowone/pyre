@@ -587,16 +587,33 @@ pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "extend", true)?;
     arity_exact(args, "extend", 1)?;
-    let list = args[0];
-    let other = args[1];
+    let mut list = args[0];
+    let mut other = args[1];
     unsafe {
         // listobject.py:1019-1033 only takes the storage-copy path when a
         // list/tuple uses its inherited iterator.  An overridden subclass
         // must use the generic incremental iterator path below.
         if is_exact_list(other) {
+            // BaseRangeListStrategy.extend switches its receiver before even
+            // an empty donor is examined. Keep both operands rooted across
+            // that materialisation and the append loop it feeds.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::pin_roots(&[list, other]);
+            list = pyre_object::listobject::w_list_materialize_range(list);
+            other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             let n = w_list_len(other);
+            if w_list_len(list) == 0 && pyre_object::listobject::w_list_is_range_strategy(other) {
+                // EmptyListStrategy._extend_from_list delegates to the
+                // donor's copy_into; BaseRangeListStrategy shares its
+                // immutable erased tuple rather than appending boxed ints.
+                pyre_object::listobject::w_list_setslice(list, 0, 0, other)
+                    .expect("range copy_into an empty exact list");
+                return Ok(w_none());
+            }
             pyre_object::listobject::w_list_reserve_for_extend(list, n);
             for i in 0..n {
+                list = pyre_object::gc_roots::shadow_stack_get(root_base);
+                other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
                 if let Some(item) = w_list_getitem(other, i as i64) {
                     pyre_object::listobject::w_list_append_preallocated(list, item);
                 }
@@ -786,7 +803,7 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     arity_no_args(args, "copy")?;
     let list = args[0];
     unsafe {
-        if let Some(clone) = pyre_object::listobject::w_list_clone_if_size(list) {
+        if let Some(clone) = pyre_object::listobject::w_list_clone_if_shared_strategy(list) {
             return Ok(clone);
         }
         let n = w_list_len(list);

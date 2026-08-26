@@ -2136,7 +2136,7 @@ pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // W_ListObject.descr_add: when the left operand is empty, clone the right
     // operand. A SizeListStrategy clone retains that exact strategy instance.
     if len_a == 0
-        && let Some(clone) = pyre_object::listobject::w_list_clone_if_size(b)
+        && let Some(clone) = pyre_object::listobject::w_list_clone_if_shared_strategy(b)
     {
         return Ok(clone);
     }
@@ -2206,6 +2206,9 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
 /// storage instead of building a fresh list.
 pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> Result<(), PyError> {
     let count = repeat_count(n)?;
+    // BaseRangeListStrategy.inplace_mul materialises before delegating for
+    // every multiplier, including 0 and 1.
+    let list = pyre_object::listobject::w_list_materialize_range(list);
     if pyre_object::listobject::w_list_sizehint(list).is_some() {
         return Ok(());
     }
