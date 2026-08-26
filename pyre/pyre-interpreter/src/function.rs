@@ -1708,6 +1708,77 @@ pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef)
     }
 }
 
+/// `function.py Function.init_kwdefaults_dict` — a definition's keyword-only
+/// defaults are rebuilt into the namespace mapping, whose entries carry a
+/// version a trace can pin, so filling one reads a normally-constant entry
+/// rather than probing an ordinary dict on every call.
+///
+/// Upstream consumes the `(name, value)` pairs `MAKE_FUNCTION` unpacks and
+/// never sees the mapping the bytecode built.  The 3.14 opcode hands that
+/// mapping over already built, so the rebuild reads it back out here instead.
+///
+/// Only a definition converts.  `f.__kwdefaults__ = d` stores `d` itself, as
+/// `fset_func_kwdefaults` does, which is why this cannot move into
+/// `function_set_kwdefaults` — both paths share that sink.  Rebuilding twice is
+/// a no-op: what comes back is no longer an exact `dict` and returns unchanged.
+///
+/// A mapping holding a key that is not an exact `str` is returned as it
+/// arrived; the namespace storage would only switch back to the general one.
+///
+/// # Safety
+/// `w_kw_defs` must be null, `None`, or a live mapping.
+pub unsafe fn init_kwdefaults_dict(w_kw_defs: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        if w_kw_defs.is_null()
+            || pyre_object::is_none(w_kw_defs)
+            || !pyre_object::is_exact_type(w_kw_defs, &pyre_object::DICT_TYPE)
+        {
+            return w_kw_defs;
+        }
+        let items = pyre_object::dictmultiobject::w_dict_items(w_kw_defs);
+        if !items
+            .iter()
+            .all(|&(key, _)| pyre_object::is_exact_type(key, &pyre_object::STR_TYPE))
+        {
+            return w_kw_defs;
+        }
+        // Every store mints a cell, so the pairs read out above are published
+        // before the mapping is allocated, and both they and the receiver are
+        // re-read from the shadow stack after each store.
+        let roots = pyre_object::gc_roots::push_roots();
+        let flat: Vec<PyObjectRef> = items
+            .iter()
+            .flat_map(|&(key, value)| [key, value])
+            .collect();
+        let pairs_base = roots.publish(&flat);
+        let dict_slot = roots.publish(&[pyre_object::dictmultiobject::w_module_dict_new()]);
+        for index in 0..items.len() {
+            pyre_object::dictmultiobject::w_dict_store(
+                roots.get(dict_slot),
+                roots.get(pairs_base + index * 2),
+                roots.get(pairs_base + index * 2 + 1),
+            );
+        }
+        roots.get(dict_slot)
+    }
+}
+
+/// Store the keyword-only defaults a definition installs, rebuilding them
+/// through [`init_kwdefaults_dict`] on the way in.  The rebuild allocates, so
+/// the function is published across it.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn function_set_kwdefaults_from_definition(obj: PyObjectRef, kwdefaults: PyObjectRef) {
+    unsafe {
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.publish(&[obj]);
+        let w_kw_defs = init_kwdefaults_dict(kwdefaults);
+        function_set_kwdefaults(roots.get(obj_slot), w_kw_defs);
+    }
+}
+
 /// PyPy-compatible `__dict__` storage field alias.
 #[inline]
 /// # Safety

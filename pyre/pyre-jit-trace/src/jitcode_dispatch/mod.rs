@@ -9589,18 +9589,48 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     stored: pyre_object::PyObjectRef,
     guard_frame_globals: bool,
 ) -> Result<bool, DispatchError> {
-    let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
-    let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
-    let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
-
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
     if !walker_pin_namespace_version(ctx, op_pc, ns)? {
         return Ok(false);
     }
+    let (result_opref, _) = emit_namespace_cell_value(ctx, op_pc, stored)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
+    // `pyjitpl.py _opimpl_residual_call*` finishes its no-raise
+    // tail with `metainterp.clear_exception()`.  The fold replaces a
+    // SUCCESSFUL (non-raising) `load_global_fn` residual, so it must mirror
+    // that clear: in a handler body the except-side `LOAD_GLOBAL` runs with a
+    // standing `last_exc_value` (the just-raised exception being matched), and
+    // the residual success arm (`ctx.last_exc_value = None` at the
+    // `exec_result` Ok leg) is what drains it before the handler's trailing
+    // `catch_exception/L`.  Without this clear the elided residual leaves
+    // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    Ok(true)
+}
+
+/// The value half of [`emit_namespace_cell_fold`], for callers with no jitcode
+/// destination register to write: bake `stored` as a `ConstPtr`, read the live
+/// field behind a mutable cell, and hand back the operand together with the
+/// object it stands for.
+///
+/// The caller has already proven `stored` foldable and non-null AND pinned the
+/// namespace version — that marker is what revokes the constant this emits.
+/// Writing a destination is deliberately left out: `write_ref_reg` also stamps
+/// `ctx.vstack_last_ref`, so a caller that is not standing in for a residual
+/// must not be made to go through it.
+fn emit_namespace_cell_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    stored: pyre_object::PyObjectRef,
+) -> Result<(OpRef, pyre_object::PyObjectRef), DispatchError> {
+    let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
+    let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
+    let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
     // Bake the stored value/cell as a `ConstPtr` (pypy `ConstPtr(cell)`). The
-    // `QuasiimmutField(strategy, version)` guard above invalidates the loop on a
+    // `QuasiimmutField(strategy, version)` guard the caller took invalidates the loop on a
     // rebind / strategy-version bump (`_setitem_str_cell_known` calls
     // `mutated()` before every write that replaces the stored pointer), and the
     // registered `ConstPtr` walkers keep the address current across a moving
@@ -9646,19 +9676,7 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     // walker handlers see the resolved value instead of `Null`.
     ctx.trace_ctx
         .set_opref_concrete(result_opref, result_concrete);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
-    // `pyjitpl.py _opimpl_residual_call*` finishes its no-raise
-    // tail with `metainterp.clear_exception()`.  The fold replaces a
-    // SUCCESSFUL (non-raising) `load_global_fn` residual, so it must mirror
-    // that clear: in a handler body the except-side `LOAD_GLOBAL` runs with a
-    // standing `last_exc_value` (the just-raised exception being matched), and
-    // the residual success arm (`ctx.last_exc_value = None` at the
-    // `exec_result` Ok leg) is what drains it before the handler's trailing
-    // `catch_exception/L`.  Without this clear the elided residual leaves
-    // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
-    Ok(true)
+    Ok((result_opref, result_obj))
 }
 
 /// STORE dual of [`emit_namespace_cell_fold`]: `QUASIIMMUT_FIELD(ns, slot)` +

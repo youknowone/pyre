@@ -69,7 +69,7 @@ pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) ->
     let attr = attr as PyObjectRef;
     match flag {
         0 => unsafe { crate::function_set_defaults(func, attr) },
-        1 => unsafe { crate::function_set_kwdefaults(func, attr) },
+        1 => unsafe { crate::function::function_set_kwdefaults_from_definition(func, attr) },
         2 => {
             // `function.py fset_func_annotations` — the eager
             // annotations dict is stamped on the typed `Function.w_ann`

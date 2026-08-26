@@ -173,6 +173,21 @@ pub extern "C" fn jit_force_vref(frame: i64) -> i64 {
         as usize as i64
 }
 
+/// Rebuild a definition's keyword-only defaults into the namespace mapping —
+/// `function.py init_kwdefaults_dict`, reached as a residual because it
+/// allocates.  The SET_FUNCTION_ATTRIBUTE fold stores the result rather than
+/// the operand, so a compiled replay installs the same flavour the recording
+/// did.
+///
+/// Spelled on the machine word for [`jit_dict_value_at`]'s reason: a
+/// `*mut PyObject` parameter is `i32` on wasm32 while the residual-call ABI is
+/// uniformly `(i64 x n) -> i64`.
+pub extern "C" fn jit_init_kwdefaults_dict(dict: i64) -> i64 {
+    unsafe {
+        pyre_interpreter::function::init_kwdefaults_dict(dict as pyre_object::PyObjectRef) as i64
+    }
+}
+
 pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
     unsafe {
         jit_dict_exact_lookup_or_null(
