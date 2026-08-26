@@ -1984,21 +1984,11 @@ fn run_module(module: &str, no_site: bool) {
     })();
 
     if let Err(e) = result {
-        if e.kind == PyErrorKind::SystemExit {
-            finalize_system_exit(e, canonical, ec_ptr);
-        }
-        let is_keyboard_interrupt = is_keyboard_interrupt(&e);
-        // targetpypystandalone.py:88 `finally: space.finish()` — finalize on
-        // every exit path, not only on SystemExit.  Print first: the raw
-        // `PyObjectRef` fields of `e` are not GC-visible and `finalize_runtime`
-        // collects.
-        pyre_interpreter::eprint_exception(&e, true);
-        finalize_runtime(canonical, ec_ptr);
-        maybe_print_jit_stats();
-        if is_keyboard_interrupt {
-            terminate_by_sigint();
-        }
-        std::process::exit(1);
+        // `_run_module_as_main` ends the same run as a script does, so its
+        // failure takes the same exit: `app_main.py` reports every top-level
+        // exception through `display_exception`, which is what reaches a
+        // `sys.excepthook` the module installed.
+        handle_main_error(e, canonical, ec_ptr);
     }
     finalize_runtime(canonical, ec_ptr);
     maybe_print_jit_stats();

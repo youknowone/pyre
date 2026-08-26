@@ -4545,20 +4545,22 @@ fn call_decode_error_handler(
     // in: the reread object (unicodeobject.c insize), or the one it started
     // on (`multibytecodec_decerror`'s `size`).
     let length = new_bytes.as_ref().map_or(data.len(), Vec::len) as i64;
-    let mut newpos =
-        match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
-            Ok(n) => n,
-            Err(e) => {
-                if e.kind == crate::PyErrorKind::OverflowError {
-                    -1
-                } else {
-                    return Err(e);
-                }
+    // interp_codecs.py `call_errorhandler`: the negative fold sits in the
+    // `else` clause of the conversion, so it runs only when `int_w` succeeded.
+    // A position too large for the machine integer becomes -1 and reaches the
+    // bounds test unfolded, which rejects it; folding it would land on 0 for a
+    // one-unit input and hand the same span back to the handler forever.
+    let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
+        Ok(n) if n < 0 => n + length,
+        Ok(n) => n,
+        Err(e) => {
+            if e.kind == crate::PyErrorKind::OverflowError {
+                -1
+            } else {
+                return Err(e);
             }
-        };
-    if newpos < 0 {
-        newpos += length;
-    }
+        }
+    };
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,
@@ -4644,7 +4646,11 @@ pub(crate) fn call_registered_encode_error_handler(
     // newpos folds against the source CHARACTER length and resumes into the
     // original code-point sequence.
     let length = char_len as i64;
-    let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
+    // The negative fold applies only to a position that converted, exactly as
+    // in the decode branch above: an overflowing one stays -1 so the bounds
+    // test below rejects it.
+    let newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) if n < 0 => n + length,
         Ok(n) => n,
         Err(e) => {
             if e.kind == crate::PyErrorKind::OverflowError {
@@ -4654,9 +4660,6 @@ pub(crate) fn call_registered_encode_error_handler(
             }
         }
     };
-    if newpos < 0 {
-        newpos += length;
-    }
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(
             crate::PyErrorKind::IndexError,

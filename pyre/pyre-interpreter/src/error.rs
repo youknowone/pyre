@@ -3954,6 +3954,8 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         return false;
     }
     let _roots = pyre_object::gc_roots::push_roots();
+    let sys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(sys);
     let hook_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(hook);
     // Materialising the instance is what gives the hook something to report;
@@ -3980,6 +3982,25 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
     } else {
         w_tb
     });
+    // `app_main.py display_exception` sets the sys.last_xxx attributes before
+    // it resolves the hook, so a hook that inspects them -- a post-mortem
+    // debugger is the reason they exist -- finds the exception it was handed.
+    // `last_exc` names the exception itself and the three beside it are the
+    // triple that predates it, as `PyErr_PrintEx` stores them.  A store that
+    // fails leaves that one name alone.
+    for (name, slot) in [
+        ("last_exc", exc_slot),
+        ("last_type", type_slot),
+        ("last_value", exc_slot),
+        ("last_traceback", tb_slot),
+    ] {
+        let stored = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(sys_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        );
+        drop(stored);
+    }
     let arguments = [
         pyre_object::gc_roots::shadow_stack_get(type_slot),
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -3989,12 +4010,15 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         pyre_object::gc_roots::shadow_stack_get(hook_slot),
         &arguments,
     );
-    if let Err(mut failure) = reported {
-        failure.write_unraisable(
-            pyre_object::w_none(),
-            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
-            pyre_object::gc_roots::shadow_stack_get(hook_slot),
-        );
+    if let Err(failure) = reported {
+        // `display_exception`'s `except BaseException` arm: the hook is named
+        // as the thing that failed, its own report is printed, and the answer
+        // is that the exception has *not* been reported -- the caller prints it
+        // below the `Original exception was:` header this leaves behind.
+        emit_report_to_host_stderr(b"Error calling sys.excepthook:\n");
+        eprint_exception(&failure, true);
+        emit_report_to_host_stderr(b"\nOriginal exception was:\n");
+        return false;
     }
     true
 }
