@@ -5079,6 +5079,9 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         // The generic residual constructs the erased rpython-string array.
         // The walker has no BytesBlock payload emitter yet.
         ListStrategy::Bytes => return Ok(None),
+        // The generic residual constructs AsciiListStrategy's erased UTF-8
+        // storage; the walker has no raw UnicodeValueStorage emitter yet.
+        ListStrategy::Ascii => return Ok(None),
         // Empty is impossible here (len >= 1); decline defensively.
         ListStrategy::Empty => return Ok(None),
     };

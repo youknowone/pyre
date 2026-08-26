@@ -928,8 +928,9 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 /// emit reproduces it for any element types and for zero arguments.
 pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
-        list_bytes_items_len_descr, list_float_items_len_descr, list_int_items_len_descr,
-        list_items_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
+        list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
+        w_list_size_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -972,6 +973,7 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
         list_int_items_len_descr(),
         list_float_items_len_descr(),
         list_bytes_items_len_descr(),
+        list_ascii_items_len_descr(),
     ] {
         let inactive_len_idx = inactive_len_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], inactive_len_descr);
@@ -1007,8 +1009,8 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// OptVirtualize folds the whole wrapper when the list never escapes.
 pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     use crate::descr::{
-        list_bytes_items_len_descr, list_float_items_len_descr, list_int_items_len_descr,
-        list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
+        list_int_items_len_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
     };
 
     let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
@@ -1024,6 +1026,7 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
         list_int_items_len_descr(),
         list_float_items_len_descr(),
         list_bytes_items_len_descr(),
+        list_ascii_items_len_descr(),
     ] {
         let inactive_len_idx = inactive_len_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], inactive_len_descr);
@@ -1150,8 +1153,8 @@ pub fn emit_typed_list_inline(
     strategy: pyre_object::listobject::ListStrategy,
 ) -> OpRef {
     use crate::descr::{
-        list_bytes_items_len_descr, list_float_items_len_descr, list_int_items_len_descr,
-        list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
+        list_int_items_len_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
     };
 
     let len = raws.len();
@@ -1189,6 +1192,7 @@ pub fn emit_typed_list_inline(
         list_int_items_len_descr(),
         list_float_items_len_descr(),
         list_bytes_items_len_descr(),
+        list_ascii_items_len_descr(),
     ] {
         let scalar_idx = scalar_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, zero], scalar_descr);
@@ -1328,7 +1332,8 @@ pub fn emit_promote_empty_list_inline(
         }
         pyre_object::listobject::ListStrategy::Empty
         | pyre_object::listobject::ListStrategy::IntOrFloat
-        | pyre_object::listobject::ListStrategy::Bytes => {
+        | pyre_object::listobject::ListStrategy::Bytes
+        | pyre_object::listobject::ListStrategy::Ascii => {
             // The specialized first-append path only admits Integer, Float,
             // or Object. Exact bytes are declined before this emitter;
             // IntOrFloat is reached later by a numeric strategy transition.
@@ -1337,6 +1342,7 @@ pub fn emit_promote_empty_list_inline(
                 pyre_object::listobject::ListStrategy::Empty
                     | pyre_object::listobject::ListStrategy::IntOrFloat
                     | pyre_object::listobject::ListStrategy::Bytes
+                    | pyre_object::listobject::ListStrategy::Ascii
             ));
         }
     }

@@ -1246,6 +1246,20 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
             }
         }
     }
+    // AsciiListStrategy has the same `GcArray(GCREF)` shape, with each entry
+    // naming the shared `W_UnicodeObject._utf8` storage rather than a wrapper.
+    let ascii_block_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).ascii_items.block) };
+    let ascii_block = unsafe { *ascii_block_slot };
+    if !ascii_block.is_null() {
+        if pyre_object::gc_hook::try_gc_owns_object(ascii_block as *mut u8) {
+            f(ascii_block_slot as *mut majit_ir::GcRef);
+        } else {
+            let base = unsafe { pyre_object::object_array::items_block_items_base(ascii_block) };
+            for i in 0..list.ascii_items.len() {
+                f(unsafe { base.add(i) } as *mut majit_ir::GcRef);
+            }
+        }
+    }
 }
 
 /// Custom trace for `W_MemoryView`.  Its geometry and backing live in an

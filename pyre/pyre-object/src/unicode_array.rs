@@ -1,0 +1,284 @@
+use std::ops::{Index, IndexMut};
+
+use crate::object_array::{
+    ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, items_block_capacity,
+    items_block_items_base,
+};
+use crate::pyobject::PyObjectRef;
+use rustpython_wtf8::Wtf8Buf;
+
+/// PyPy `AsciiListStrategy`'s erased `[rpython str]` storage.
+///
+/// Each entry is the GC pointer to a `Wtf8Buf`, not a boxed
+/// `W_UnicodeObject`.  `ItemsBlock` is the runtime's `GcArray(GCREF)` shape, so
+/// its existing varsize trace forwards both the backing block and every raw
+/// string pointer it contains.
+#[repr(C)]
+pub struct UnicodeArray {
+    pub block: *mut ItemsBlock,
+    len: usize,
+}
+
+pub const UNICODE_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(UnicodeArray, block);
+pub const UNICODE_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(UnicodeArray, len);
+
+impl UnicodeArray {
+    #[inline]
+    fn base(&self) -> *mut PyObjectRef {
+        unsafe { items_block_items_base(self.block) }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            block: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    pub fn from_vec(values: Vec<*const Wtf8Buf>) -> Self {
+        let mut refs = Vec::with_capacity(values.len());
+        for value in values {
+            refs.push(value as PyObjectRef);
+        }
+        let len = refs.len();
+        Self {
+            block: unsafe { alloc_list_items_block_gc(&refs) },
+            len,
+        }
+    }
+
+    #[must_use]
+    pub fn pin_block(&self) -> usize {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(self.block as PyObjectRef);
+        slot
+    }
+
+    pub fn reload_block(&mut self, slot: usize) {
+        self.block = crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock;
+    }
+
+    pub fn install(&mut self, fresh: UnicodeArray) {
+        let _roots = crate::gc_roots::push_roots();
+        let slot = fresh.pin_block();
+        *self = fresh;
+        self.reload_block(slot);
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        unsafe { items_block_capacity(self.block) }
+    }
+
+    #[inline]
+    pub fn spare_capacity(&self) -> usize {
+        self.capacity().saturating_sub(self.len)
+    }
+
+    #[inline]
+    pub fn heap_capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    #[inline]
+    pub fn set_len(&mut self, new_len: usize) {
+        assert!(new_len <= self.capacity());
+        self.len = new_len;
+    }
+
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        false
+    }
+
+    /// The room `capacity` must already hold for `additional` more entries.
+    ///
+    /// A fresh block is young, and this array is embedded in the owning
+    /// `W_ListObject` — the only object through which a collection reaches it.
+    /// An old-gen owner that gains that edge without being on the remembered
+    /// set is skipped by the minor collection that would forward the block, and
+    /// the block, along with every `Wtf8Buf` reachable only through it, is
+    /// reclaimed while the list still names it. `UnicodeArray` cannot reach its
+    /// owner to barrier it, so it never allocates a block: the list reserves
+    /// room through `W_ListObject::ascii_grow`, which barriers on both sides of
+    /// the allocation. Refuse loudly rather than grow behind the owner's back.
+    #[inline]
+    fn assert_room(&self, additional: usize) {
+        assert!(
+            self.len + additional <= self.capacity(),
+            "UnicodeArray needs {additional} more slot(s) than its capacity {}; \
+             reserve through W_ListObject::ascii_grow first",
+            self.capacity(),
+        );
+    }
+
+    #[inline]
+    fn barrier(&self) {
+        if !self.block.is_null() {
+            crate::gc_hook::try_gc_write_barrier(self.block as *mut u8);
+        }
+    }
+
+    pub fn push(&mut self, value: *const Wtf8Buf) {
+        let _roots = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+        self.assert_room(1);
+        self.barrier();
+        unsafe { *self.base().add(self.len) = crate::gc_roots::shadow_stack_get(value_slot) };
+        self.len += 1;
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[*const Wtf8Buf] {
+        unsafe { std::slice::from_raw_parts(self.base() as *const *const Wtf8Buf, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [*const Wtf8Buf] {
+        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const Wtf8Buf, self.len) }
+    }
+
+    pub fn to_vec(&self) -> Vec<*const Wtf8Buf> {
+        self.as_slice().to_vec()
+    }
+
+    pub fn insert(&mut self, index: usize, value: *const Wtf8Buf) {
+        assert!(index <= self.len);
+        let _roots = crate::gc_roots::push_roots();
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+        self.assert_room(1);
+        self.barrier();
+        unsafe {
+            let p = self.base().add(index);
+            std::ptr::copy(p, p.add(1), self.len - index);
+            *p = crate::gc_roots::shadow_stack_get(value_slot);
+        }
+        self.len += 1;
+    }
+
+    pub fn set(&mut self, index: usize, value: *const Wtf8Buf) {
+        assert!(index < self.len);
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+        self.barrier();
+        unsafe { *self.base().add(index) = crate::gc_roots::shadow_stack_get(slot) };
+    }
+
+    pub fn remove(&mut self, index: usize) -> *const Wtf8Buf {
+        assert!(index < self.len);
+        let value = self.as_slice()[index];
+        unsafe {
+            let p = self.base().add(index);
+            std::ptr::copy(p.add(1), p, self.len - index - 1);
+            *p.add(self.len - index - 1) = std::ptr::null_mut();
+        }
+        self.len -= 1;
+        value
+    }
+
+    pub fn pop(&mut self) -> *const Wtf8Buf {
+        assert!(self.len > 0);
+        let value = self.as_slice()[self.len - 1];
+        self.len -= 1;
+        unsafe { *self.base().add(self.len) = std::ptr::null_mut() };
+        value
+    }
+
+    pub fn reverse(&mut self) {
+        self.as_mut_slice().reverse();
+    }
+
+    pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const Wtf8Buf]) {
+        let old_len = self.len;
+        let start = start.min(old_len);
+        let removed = remove_count.min(old_len - start);
+        let new_len = old_len - removed + values.len();
+        let _roots = crate::gc_roots::push_roots();
+        let root_base = crate::gc_roots::shadow_stack_len();
+        for &value in values {
+            let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+        }
+        assert!(
+            new_len <= self.capacity(),
+            "UnicodeArray splice needs {new_len} slots but capacity is {}; \
+             reserve through W_ListObject::ascii_grow first",
+            self.capacity(),
+        );
+        self.barrier();
+        unsafe {
+            let base = self.base();
+            std::ptr::copy(
+                base.add(start + removed),
+                base.add(start + values.len()),
+                old_len - start - removed,
+            );
+            self.len = new_len;
+            for i in 0..values.len() {
+                *base.add(start + i) = crate::gc_roots::shadow_stack_get(root_base + i);
+            }
+            for i in new_len..old_len {
+                *base.add(i) = std::ptr::null_mut();
+            }
+        }
+    }
+
+    pub fn drain(&mut self, range: std::ops::Range<usize>) {
+        assert!(range.start <= range.end && range.end <= self.len);
+        let count = range.end - range.start;
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let base = self.base();
+            std::ptr::copy(
+                base.add(range.end),
+                base.add(range.start),
+                self.len - range.end,
+            );
+            for i in self.len - count..self.len {
+                *base.add(i) = std::ptr::null_mut();
+            }
+        }
+        self.len -= count;
+    }
+
+    pub fn clear(&mut self) {
+        unsafe {
+            for i in 0..self.len {
+                *self.base().add(i) = std::ptr::null_mut();
+            }
+        }
+        self.len = 0;
+    }
+}
+
+impl Drop for UnicodeArray {
+    fn drop(&mut self) {
+        unsafe { dealloc_list_items_block(self.block) };
+    }
+}
+
+impl Index<usize> for UnicodeArray {
+    type Output = *const Wtf8Buf;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+impl IndexMut<usize> for UnicodeArray {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}

@@ -2981,6 +2981,7 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// `tuple`/`frozenset`) use `IDTAG_SPECIAL`.
 const IDTAG_SHIFT: i64 = 4;
 const IDTAG_INT: i64 = 1;
+const IDTAG_ALT_UID: i64 = 2;
 const IDTAG_FLOAT: i64 = 5;
 const IDTAG_SPECIAL: i64 = 11;
 
@@ -3062,28 +3063,24 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
             return Some(pyre_object::intobject::w_int_new(uid));
         }
         if is_exact_type(obj, &STR_TYPE) {
-            // `W_UnicodeObject.immutable_unique_id` (unicodeobject.py).
-            // `l` is the codepoint count (`_len()`), not the byte length.
-            // `l > 1` is address-based (upstream `compute_unique_id(_utf8) +
-            // IDTAG_ALT_UID`); returning `None` falls back to the object
-            // address, invariant-preserving with `is_w` returning `false`
-            // for distinct len>1 strings. `l <= 1` is unique-ified: for a
-            // single codepoint `base = ~codepoint_at_pos(_utf8, 0)`
-            // (negative), and `base = 257` for the empty string.
-            let l = pyre_object::unicodeobject::w_str_len(obj);
-            if l > 1 {
-                return None;
+            // `W_UnicodeObject.immutable_unique_id` (unicodeobject.py): more
+            // than one code point uses the `_utf8` storage identity, which
+            // AsciiListStrategy preserves across wrapper allocation. Empty
+            // and one-code-point strings are unique-ified from the code point.
+            let len = pyre_object::unicodeobject::w_str_len(obj);
+            if len > 1 {
+                let storage = pyre_object::unicodeobject::w_str_storage(obj);
+                return Some(pyre_object::intobject::w_int_new(
+                    pyre_object::gc_hook::gc_identity_hash(storage as usize) as i64 + IDTAG_ALT_UID,
+                ));
             }
-            let base: i64 = if l == 1 {
-                // `code_points()` yields the codepoint regardless of
-                // surrogates, matching `rutf8.codepoint_at_pos`.
-                let cp = pyre_object::unicodeobject::w_str_get_wtf8(obj)
+            let base: i64 = if len == 1 {
+                let codepoint = pyre_object::unicodeobject::w_str_get_wtf8(obj)
                     .code_points()
                     .next()
                     .expect("len==1 str has a code point")
                     .to_u32();
-                // `(neg << IDTAG_SHIFT) | IDTAG_SPECIAL` == `+` (low 4 bits 0).
-                !(cp as i64)
+                !(codepoint as i64)
             } else {
                 257
             };
@@ -4027,6 +4024,28 @@ fn _flat_pycall_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_unique_id_matches_pypy_storage_and_codepoint_rules() {
+        crate::test_hooks::install_hash_hook();
+
+        let ascii = pyre_object::unicodeobject::w_str_new_managed("ascii");
+        let ascii_uid = immutable_unique_id(ascii).expect("exact str has a unique id");
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(ascii) };
+        assert_eq!(
+            unsafe { pyre_object::intobject::w_int_get_value(ascii_uid) },
+            pyre_object::gc_hook::gc_identity_hash(storage as usize) as i64 + IDTAG_ALT_UID
+        );
+
+        // The branch is based on `_len()`, so one non-ASCII code point uses
+        // the value-derived special id even though UTF-8 encodes it in bytes.
+        let one = pyre_object::unicodeobject::w_str_new_managed("é");
+        let one_uid = immutable_unique_id(one).expect("exact str has a unique id");
+        assert_eq!(
+            unsafe { pyre_object::intobject::w_int_get_value(one_uid) },
+            (!(0xe9_i64) << IDTAG_SHIFT) + IDTAG_SPECIAL
+        );
+    }
 
     #[test]
     fn test_function_create() {

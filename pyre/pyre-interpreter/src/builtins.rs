@@ -16042,6 +16042,9 @@ pub(crate) fn sort_list_in_place(
             if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
                 return Ok(());
             }
+            if pyre_object::listobject::w_list_sort_strings(list, reverse) {
+                return Ok(());
+            }
         }
     }
     unsafe {

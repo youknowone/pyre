@@ -4668,17 +4668,17 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
                 && pyre_object::bytesobject::w_bytes_getitem(w_one, 0)
                     == pyre_object::bytesobject::w_bytes_getitem(w_two, 0);
         }
-        // `W_UnicodeObject.is_w` (unicodeobject.py): `_len()` is the
-        // codepoint count. When it is > 1, upstream returns `s1 is s2`
-        // (utf8 storage identity) — distinct `str`s never share storage, so
-        // `false`; when it is <= 1 (unique-ified) it returns `s1 == s2`,
-        // i.e. WTF-8 byte equality. `str` subclasses keep pointer identity
-        // through the exact-type gate.
+        // `W_UnicodeObject.is_w` (unicodeobject.py): strings longer than one
+        // code point use `_utf8` storage identity; AsciiListStrategy
+        // deliberately re-wraps that same storage. Zero- and one-code-point
+        // strings are unique-ified and compare by value.
+        // `str` subclasses keep pointer identity through the exact-type gate.
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::STR_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::STR_TYPE)
         {
             if pyre_object::unicodeobject::w_str_len(w_one) > 1 {
-                return false;
+                return pyre_object::unicodeobject::w_str_storage(w_one)
+                    == pyre_object::unicodeobject::w_str_storage(w_two);
             }
             return pyre_object::unicodeobject::w_str_get_wtf8(w_one)
                 == pyre_object::unicodeobject::w_str_get_wtf8(w_two);
@@ -19900,6 +19900,29 @@ pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_is_w_uses_codepoint_count_and_shared_storage() {
+        crate::test_hooks::install_hash_hook();
+
+        // PyPy unique-ifies one-code-point strings by value even when their
+        // UTF-8 representation occupies multiple bytes.
+        let non_ascii_one = pyre_object::unicodeobject::w_str_new_managed("é");
+        let non_ascii_one_again = pyre_object::unicodeobject::w_str_new_managed("é");
+        assert!(is_w(non_ascii_one, non_ascii_one_again));
+
+        // Longer strings compare their erased `_utf8` storage, which is what
+        // AsciiListStrategy preserves while allocating fresh wrappers.
+        let original = pyre_object::unicodeobject::w_str_new_managed("ascii");
+        let shared = unsafe {
+            pyre_object::unicodeobject::w_str_from_storage(
+                pyre_object::unicodeobject::w_str_storage(original),
+            )
+        };
+        let distinct = pyre_object::unicodeobject::w_str_new_managed("ascii");
+        assert!(is_w(original, shared));
+        assert!(!is_w(original, distinct));
+    }
 
     #[test]
     fn call_expands_packed_arguments_and_keywords() {
