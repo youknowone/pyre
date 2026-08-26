@@ -3118,7 +3118,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
     if name == "f_lasti"
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
-        && spec_gate("frame_lasti", || {
+        && spec_gate(SpecFold::FrameLasti, || {
             try_walker_specialize_frame_lasti(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
         })?
         .is_some()
@@ -3127,7 +3127,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
     if name == "f_lineno"
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
-        && spec_gate("frame_lineno", || {
+        && spec_gate(SpecFold::FrameLineno, || {
             try_walker_specialize_frame_lineno(ctx, op_pc, obj, concrete_obj, dst, dst_bank)
         })?
         .is_some()
@@ -6615,7 +6615,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // `selfrec_bridge_nontail_promote` loses a bridge to `abrt_bridge` and runs
     // 2.4x slower.  `try_walker_specialize_subscr_tuple` keeps that arm.
     if specialised_pair_kind(unsafe { (*list_obj).ob_type }).is_some() {
-        if let Some(hit) = spec_gate("subscr_tuple_descent", || {
+        if let Some(hit) = spec_gate(SpecFold::SubscrTupleDescent, || {
             try_walker_orthodox_subscr_tuple_item(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
             )
@@ -6625,7 +6625,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     }
 
     if tuple_canonical {
-        return spec_gate("subscr_tuple", || {
+        return spec_gate(SpecFold::SubscrTuple, || {
             try_walker_specialize_subscr_tuple(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
             )
@@ -6638,7 +6638,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // variable-width UTF-8 and a fixed-stride read would be wrong the moment
     // the string is not ASCII.
     if unsafe { pyre_object::is_exact_type(list_obj, &pyre_object::STR_TYPE) } {
-        return spec_gate("subscr_str", || {
+        return spec_gate(SpecFold::SubscrStr, || {
             try_walker_specialize_subscr_str(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
             )
@@ -12143,7 +12143,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
     if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
         // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py) keeps a
         // dedicated long/int arm; every other operand shape stays generic.
-        return spec_gate("builtin_divmod_long_int", || {
+        return spec_gate(SpecFold::BuiltinDivmodLongInt, || {
             try_walker_specialize_builtin_divmod_long_int(
                 ctx,
                 op,
@@ -15907,7 +15907,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     };
     if unsafe { pyre_object::functional::is_zip(iter_obj) } {
-        return spec_gate("zip_two_tuple_iters", || {
+        return spec_gate(SpecFold::ZipTwoTupleIters, || {
             try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj)
         });
     }
