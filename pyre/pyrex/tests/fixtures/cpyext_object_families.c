@@ -287,6 +287,34 @@ static PyObject *mv_compound_format(PyObject *self, PyObject *unused)
     return PyMemoryView_FromBuffer(&view);
 }
 
+/* Three native formats one word wide, differing only in signedness: `n` is a
+   `Py_ssize_t`, `N` a `size_t` and `P` a `void *`.  A reader that takes the
+   item's width and ignores its code answers a word with the top bit set the
+   same way for all three. */
+static unsigned long long word_storage[2] = {0xffffffffffffffffULL, 1};
+static Py_ssize_t word_shape[1] = {2};
+static Py_ssize_t word_strides[1] = {sizeof(unsigned long long)};
+
+static PyObject *mv_word_format(PyObject *self, PyObject *args)
+{
+    Py_buffer view;
+    const char *format = NULL;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "s", &format)) {
+        return NULL;
+    }
+    memset(&view, 0, sizeof(view));
+    view.buf = word_storage;
+    view.len = (Py_ssize_t)sizeof(word_storage);
+    view.itemsize = (Py_ssize_t)sizeof(word_storage[0]);
+    view.format = (char *)format;
+    view.ndim = 1;
+    view.shape = word_shape;
+    view.strides = word_strides;
+    view.readonly = 1;
+    return PyMemoryView_FromBuffer(&view);
+}
+
 /* ── struct.Struct ── */
 
 /* `_struct.c` keeps the byte size and the value count as fields of
@@ -323,6 +351,7 @@ static PyMethodDef methods[] = {
 
     {"mv_contiguous", mv_contiguous, METH_VARARGS, NULL},
     {"mv_compound_format", mv_compound_format, METH_NOARGS, NULL},
+    {"mv_word_format", mv_word_format, METH_VARARGS, NULL},
 
     M("wr_check", wr_check), M("wr_check_ref", wr_check_ref),
     M("wr_check_proxy", wr_check_proxy), M("wr_new_ref", wr_new_ref),

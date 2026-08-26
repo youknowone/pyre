@@ -131,9 +131,14 @@ fn format_of(format: *const c_char) -> String {
 }
 
 /// One dimension vector, or the derived default when the exporter answered a
-/// request that does not ask for it -- `init_shape_strides`.
+/// request that does not ask for it -- `init_shape_strides`.  A zero-dimensional
+/// view has no dimensions, and fabricating one leaves every caller reading an
+/// axis its own index vector does not have.
 fn dims(pointer: *const isize, ndim: i64, derived: &[i64]) -> Vec<i64> {
-    if pointer.is_null() || ndim <= 0 {
+    if ndim <= 0 {
+        return Vec::new();
+    }
+    if pointer.is_null() {
         return derived.to_vec();
     }
     (0..ndim as usize)
@@ -482,6 +487,9 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     // The exporter's own storage, which the collector does not move: the
     // address stays the one C was handed for as long as the export is open.
     let first = unsafe { carrier.backing().as_bytes() }.as_ptr() as usize;
+    // `init_shape_strides` answers NULL for a zero-dimensional view, and an
+    // empty `Vec` hands out a dangling address rather than one.
+    let axes = carrier.ndim() != 0;
     unsafe {
         (*view).buf = (first + carrier.offset() as usize) as *mut c_void;
         (*view).obj = exporter;
@@ -493,11 +501,11 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
             true => export.format.as_mut_ptr() as *mut c_char,
             false => std::ptr::null_mut(),
         };
-        (*view).shape = match flags & PY_BUF_ND == PY_BUF_ND {
+        (*view).shape = match axes && flags & PY_BUF_ND == PY_BUF_ND {
             true => export.shape.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
-        (*view).strides = match flags & PY_BUF_STRIDES == PY_BUF_STRIDES {
+        (*view).strides = match axes && flags & PY_BUF_STRIDES == PY_BUF_STRIDES {
             true => export.strides.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
@@ -1098,7 +1106,8 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const CPyBuffer) -> *mut
         return std::ptr::null_mut();
     }
     let (_, strides, itemsize, length) = unsafe { geometry(view) };
-    if strides.first() != Some(&itemsize) || unsafe { (*view).ndim } > 1 {
+    let ndim = unsafe { (*view).ndim };
+    if ndim > 1 || (ndim == 1 && strides.first() != Some(&itemsize)) {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::BufferError,
             "cpyext: only a contiguous one-dimensional Py_buffer becomes a memoryview",

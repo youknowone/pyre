@@ -19,6 +19,8 @@ unsafe extern "C" {
     fn PyArg_ParseTupleAndKeywords();
     fn PyArg_UnpackTuple();
     fn _PyArg_CheckPositional();
+    fn _PyArg_ParseTupleAndKeywordsFast();
+    fn _PyArg_UnpackKeywords();
     // `src/modsupport.c`
     fn Py_BuildValue();
     fn Py_VaBuildValue();
@@ -45,6 +47,8 @@ pub(super) fn ensure_linked() {
         PyArg_ParseTupleAndKeywords as *const (),
         PyArg_UnpackTuple as *const (),
         _PyArg_CheckPositional as *const (),
+        _PyArg_ParseTupleAndKeywordsFast as *const (),
+        _PyArg_UnpackKeywords as *const (),
         Py_BuildValue as *const (),
         Py_VaBuildValue as *const (),
         PyObject_CallFunction as *const (),

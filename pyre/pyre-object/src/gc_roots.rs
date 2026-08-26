@@ -474,6 +474,101 @@ pub fn push_roots() -> RootScope {
     RootScope::new()
 }
 
+/// A set of freshly allocated items held as GC roots while the rest of the
+/// set is still being built.
+///
+/// A plain `Vec<PyObjectRef>` is not a root area, so an element sitting in one
+/// while a later element allocates is unreachable to the collector: old-gen is
+/// mark-sweep, and an element with no heap edge yet is sweepable rather than
+/// merely immobile. `build_list_storage` states the resulting rule for its
+/// callers -- every element must be pinned, and stay pinned across the block
+/// allocation the constructor itself performs.
+///
+/// Slots are addressed as `base + i`, so only ONE set may be open at a time on
+/// a thread: a second bracket's pins land above this one's base and take the
+/// slots it expects, which would hand back the wrong elements rather than
+/// unrooted ones. Build a nested set inside a block that closes before the
+/// outer `push`, as the `_socket` and `pyexpat` conversions do. A debug build
+/// asserts this.
+///
+/// [`take`](Self::take) borrows, so the bracket outlives the statement that
+/// builds the container:
+///
+/// ```ignore
+/// let mut items = RootedItems::new();
+/// while ... {
+///     items.push(allocating_call(...));
+/// }
+/// w_list_new(items.take())
+/// ```
+pub struct RootedItems {
+    scope: RootScope,
+    base: usize,
+    len: usize,
+}
+
+impl RootedItems {
+    /// Open a bracket for a set that is about to be built.
+    #[inline]
+    pub fn new() -> Self {
+        let scope = push_roots();
+        let base = scope.base();
+        Self {
+            scope,
+            base,
+            len: 0,
+        }
+    }
+
+    /// Pin one more item. Pinning is what makes the earlier ones survive this
+    /// item's allocation, so push each as it is produced rather than in a
+    /// second pass over a `Vec`.
+    #[inline]
+    pub fn push(&mut self, item: PyObjectRef) {
+        self.assert_owns_the_top();
+        let _ = self.scope.pin_root(item);
+        self.len += 1;
+    }
+
+    /// The slots this set reads back are `base..base + len`, which is only
+    /// what it pinned while nothing else pins above it.
+    #[inline]
+    fn assert_owns_the_top(&self) {
+        debug_assert_eq!(
+            shadow_stack_len(),
+            self.base + self.len,
+            "another root bracket is open above this one and its pins take these slots"
+        );
+    }
+
+    /// How many items have been pinned.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read every pinned item back out of its slot. A relocation between the
+    /// pin and this read rewrote the slot in place, so these are the live
+    /// words. The bracket stays open -- the caller's constructor allocates.
+    pub fn take(&self) -> Vec<PyObjectRef> {
+        self.assert_owns_the_top();
+        (0..self.len)
+            .map(|i| self.scope.get(self.base + i))
+            .collect()
+    }
+}
+
+impl Default for RootedItems {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pin a [`PyObjectRef`] as a live GC root for the duration of the
 /// surrounding [`RootScope`]. Mirrors RPython's per-livevar
 /// `setarrayitem(rootstk, idx, gcref)` emitted by

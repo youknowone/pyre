@@ -866,6 +866,15 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             const NAME_SLOTS: u32 = 4;
             let mut slot = |i: u32| fbw.call(&mut store, i).unwrap_or(0);
             let walks = slot(0);
+            // `fbw_diag::record` keeps the FIRST `RING_ENTRIES` walks and lets
+            // later ones bump the totals only, while the native reader prints
+            // every walk it takes. A run past the ring therefore hands back a
+            // tally that reads like the whole population and diffs short
+            // against the native one, so name the shortfall instead of leaving
+            // a `sort | uniq -c` over these lines silently truncated.
+            if walks > u64::from(RING_ENTRIES) {
+                eprintln!("[fbw-census] (first {RING_ENTRIES} walks of {walks})");
+            }
             for entry in 0..RING_ENTRIES.min(walks as u32) {
                 let base = RING_BASE + entry * RING_STRIDE;
                 let mut end = String::new();

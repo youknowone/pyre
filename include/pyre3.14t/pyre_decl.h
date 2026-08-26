@@ -6,7 +6,9 @@
  *
  * An export a hand-written header renames to an inline fast path is
  * left out: that header declares it ahead of the rename, which a
- * declaration here would come after.
+ * declaration here would come after.  So is one a header under
+ * `internal/` declares, which is reached by including that header
+ * and not by including `Python.h`.
  */
 #ifndef PYRE_DECL_H
 #define PYRE_DECL_H
@@ -360,6 +362,9 @@ PyAPI_FUNC(void *) PyModule_GetState(PyObject *);
 PyAPI_FUNC(PyObject *) PyModule_New(const char *);
 PyAPI_FUNC(PyObject *) PyModule_NewObject(PyObject *);
 PyAPI_FUNC(int) PyModule_SetDocString(PyObject *, const char *);
+PyAPI_FUNC(int) PyState_AddModule(PyObject *, PyModuleDef *);
+PyAPI_FUNC(PyObject *) PyState_FindModule(PyModuleDef *);
+PyAPI_FUNC(int) PyState_RemoveModule(PyModuleDef *);
 
 /* cpyext/number.rs */
 PyAPI_FUNC(int) PyIndex_Check(PyObject *);
@@ -553,6 +558,15 @@ PyAPI_FUNC(double) PyOS_string_to_double(const char *, char **, PyObject *);
 /* cpyext/pythonrun.rs */
 PyAPI_FUNC(int) Py_IsFinalizing(void);
 PyAPI_FUNC(int) Py_IsInitialized(void);
+
+/* cpyext/pytime.rs */
+PyAPI_FUNC(double) PyTime_AsSecondsDouble(PyTime_t);
+PyAPI_FUNC(int) PyTime_Monotonic(PyTime_t *);
+PyAPI_FUNC(int) PyTime_MonotonicRaw(PyTime_t *);
+PyAPI_FUNC(int) PyTime_PerfCounter(PyTime_t *);
+PyAPI_FUNC(int) PyTime_PerfCounterRaw(PyTime_t *);
+PyAPI_FUNC(int) PyTime_Time(PyTime_t *);
+PyAPI_FUNC(int) PyTime_TimeRaw(PyTime_t *);
 
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);

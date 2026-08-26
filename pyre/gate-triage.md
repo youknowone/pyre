@@ -251,8 +251,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
 `PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
-`PYRE_GEN_ENTRY_DIAG`,
-`PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
+`PYRE_GEN_ENTRY_DIAG`, `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
 `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
@@ -325,11 +324,20 @@ gate restores the whole-environment copy, so the size of that effect stays
 measurable on one binary. It goes when the allowlist stops being the thing
 under measurement.
 
-## §7 — Additional runtime diagnostic
+`PYRE_GC_SIZE_AUDIT` is the one entry here that aborts rather than reports: at
+every fixed-size stamp it compares the block's payload against the size the
+type id declares and panics when the block is the smaller of the two. The
+mismatch it looks for is otherwise silent at the stamp and surfaces an
+arbitrary number of collections later in whichever object followed, so the
+audit trades a report for a stack that still holds the caller. It goes when a
+stamp cannot outlive its block's extent.
+
+## §7 — Additional runtime diagnostics
 
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
+| `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 
 ## Summary
 

@@ -162,10 +162,17 @@ WASM_TIMEOUT_SCALE = 4.0
 # What does is the rest of the census, and it is worth stating because the
 # ceiling has now been widened twice by a fixture that was never going to be
 # caught by widening it. Two ubuntu runs of one base gate 299 fixtures between
-# them. Outside the two that still carry an allowance (builtin_folds_hot
-# 8.6/9.2x, math_folds_hot 3.9/3.9x) the worst is foriter_make_function_body at
-# 3.74x, then short_circuit_boxed_int_cross_fn 3.0x/3.5x and
-# pickle_terminal_raise_resume steady at 3.4x.
+# them, and the worst is foriter_make_function_body at 3.74x, then
+# short_circuit_boxed_int_cross_fn 3.0x/3.5x and pickle_terminal_raise_resume
+# steady at 3.4x.
+#
+# ⛔Every one of those is a gated reading, not an exempted one: no fixture in
+# the tree carries a `max-wasm-ratio` header any more. This paragraph used to
+# except builtin_folds_hot and math_folds_hot as allowance-holders and no longer
+# can. The ratios are from a base that has since moved -- one later ubuntu run
+# of 249 gated fixtures read pickle_terminal_raise_resume worst at 3.26x with
+# foriter_make_function_body absent from the table, which under the union rule
+# below is a reason to census again, not a refutation of 3.74x.
 #
 # Under the highest-observed-plus-15% rule the allowances are fitted with, that
 # 3.74x asks for 4.30x -- ABOVE this constant. 4.0 is therefore not slack: it
@@ -335,7 +342,12 @@ PERF_RETRY_RUNS = 5 if sys.platform == "win32" else 3
 SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S = 5
 CARGO_CONFIG = {
     "dynasm": {
-        "extra": ["--no-default-features", "--features", "dynasm"],
+        # `cpyext`, because the CPython suite step that rides this backend's
+        # Linux leg builds `_testbuffer`, `_testsinglephase` and
+        # `_testmultiphase` against the binary built here: without the feature
+        # `test_buffer` skips `TestBufferProtocol` wholesale, which is 95 of
+        # that module's cases, and `test_importlib.extension` skips too.
+        "extra": ["--no-default-features", "--features", "dynasm,cpyext"],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
@@ -1015,6 +1027,12 @@ def _first_stderr_line(stderr):
     return f"  {reason}"
 
 
+# Characters of a Rust panic's message body to keep. Wide enough for the
+# collector's longest `GC BUG` diagnostic, whose trailing fields are the ones
+# that attribute a crash nobody can reproduce on demand.
+PANIC_BODY_CHARS = 2000
+
+
 def _jit_panic_reason(stderr):
     """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
     nonzero internal_compile_panics stat, else None.
@@ -1046,11 +1064,14 @@ def _jit_panic_reason(stderr):
                 # crash with no way to attribute it. At 400 the two
                 # `invalid type_id` diagnostics, which reach about 800
                 # characters once their eight-word holder and child dumps are
-                # in, are cut inside the first dump.
+                # in, are cut inside the first dump, and at 1200 the major
+                # collector's own is cut at `site=` — dropping both
+                # generations, the remembered-set membership and the enclosing
+                # container.
                 for follow in lines[idx + 1 :]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:1200]}"
+                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
                         break
                 return reason
         return "rust panic"

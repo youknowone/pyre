@@ -143,7 +143,7 @@ SCALARS = {
     "i32": "int32_t", "u32": "uint32_t", "i64": "int64_t", "u64": "uint64_t",
     # Named aliases the Rust side spells the same way the header does, so the
     # comparison is against the reference name rather than its width.
-    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t",
+    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t", "PyTime_t": "PyTime_t",
     # A Rust function that never returns has no C spelling of its own: the
     # header declares it `void` and marks the fact separately.
     "!": "void",
@@ -244,8 +244,10 @@ def read_header_inlines():
 
 C_SOURCE_DIR = CPYEXT / "src"
 
+# `stars` takes a `const` between two of them, so that a definition answering
+# `PyObject *const *` is read rather than passed over as no definition at all.
 C_DEFINITION = re.compile(
-    r"^(?P<ret>[A-Za-z_][A-Za-z0-9_ ]*?)\s*(?P<stars>\**)\s*"
+    r"^(?P<ret>[A-Za-z_][A-Za-z0-9_ ]*?)\s*(?P<stars>\**(?:\s*const\s*\**)?)\s*"
     r"(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^;{]*?)\)\s*\{",
     re.M | re.S)
 
@@ -293,6 +295,23 @@ def read_renamed_exports():
         for match in RENAME.finditer(text):
             if match.group("name") in declared:
                 yield match.group("name")
+
+
+INTERNAL_HEADER_DIR = HEADER_DIR / "internal"
+
+
+def read_internal_declarations():
+    """The entry points only a header under `internal/` declares.
+
+    CPython keeps these out of an installed tree, and pyre ships them on the
+    same terms.  A declaration in the generated header would undo that: it is
+    reached by including `Python.h` alone, which is exactly the extension the
+    internal header is meant to be closed to.
+    """
+    for path in sorted(INTERNAL_HEADER_DIR.glob("*.h")):
+        text = strip_comments(path.read_text(errors="replace"))
+        for match in HAND_DECLARED.finditer(text):
+            yield match.group("name")
 
 
 STATIC = re.compile(
@@ -528,10 +547,10 @@ def check_data(record, typedefs, misspelled):
 
 def command_generate(args):
     declarations, _, _ = load_record()
-    renamed = set(read_renamed_exports())
+    withheld = set(read_renamed_exports()) | set(read_internal_declarations())
     by_module = {}
     for module, name, params, ret in read_exports():
-        if name in renamed:
+        if name in withheld:
             continue
         # CPython's own spelling wherever it has one: `check` has already
         # established the two describe the same call, and the reference
@@ -550,7 +569,9 @@ def command_generate(args):
         " *",
         " * An export a hand-written header renames to an inline fast path is",
         " * left out: that header declares it ahead of the rename, which a",
-        " * declaration here would come after.",
+        " * declaration here would come after.  So is one a header under",
+        " * `internal/` declares, which is reached by including that header",
+        " * and not by including `Python.h`.",
         " */",
         "#ifndef PYRE_DECL_H",
         "#define PYRE_DECL_H",
