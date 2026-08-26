@@ -190,14 +190,22 @@ pub struct FingerprintFields {
     /// repository — the common case.  Kept opaque; this side does not model
     /// the encoding, only whether the value moved.
     pub external: String,
+    /// `artefacts=` verbatim: one `<file name>=<size>:<sha256>` per artefact
+    /// the crate writes, space-separated and `shlex`-quoted.  The only field
+    /// here that describes an OUTPUT rather than an input: the other three
+    /// answer "would a fresh extraction write different bytes", this one
+    /// answers "are these still the bytes it wrote".  Kept opaque for the same
+    /// reason as `external=`.
+    pub artefacts: String,
 }
 
 /// Parse all required fields out of `--fingerprint`'s stdout.
 ///
-/// `external=` is required rather than defaulted to empty.  The driver prints
-/// it on every invocation, so an output without it is a shape this reader does
-/// not model, and defaulting would read "nothing outside the repo" off an
-/// answer that never made that claim.  Its absence collapses to `None` — the
+/// `external=` and `artefacts=` are required rather than defaulted to empty.
+/// The driver prints both on every invocation, so an output without one is a
+/// shape this reader does not model, and defaulting would read "nothing
+/// outside the repo" — or "the bytes are the ones extraction wrote" — off an
+/// answer that never made that claim.  Their absence collapses to `None` — the
 /// oracle did not answer — which is the same disposition an unparseable digest
 /// gets, and which a caller reports rather than passes over in silence.
 pub fn parse_fingerprint_fields(stdout: &str) -> Option<FingerprintFields> {
@@ -208,5 +216,6 @@ pub fn parse_fingerprint_fields(stdout: &str) -> Option<FingerprintFields> {
         source: parse_fingerprint_stdout(stdout)?,
         closure: closure_is_hash.then_some(closure)?,
         external: stamp_field(stdout, "external=")?,
+        artefacts: stamp_field(stdout, "artefacts=")?,
     })
 }

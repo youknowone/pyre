@@ -522,11 +522,18 @@ fn llbc_current_fingerprint(
 /// skips a crate whose stamp still matches, so this is the comparison the
 /// producer trusts, evaluated by the consumer.
 ///
-/// `source=` and `external=` remain stale gates. `closure=` preserves the old
-/// whole-cargo-closure hash, but a mismatch there alone warns: the artefact's
-/// declared inputs did not move, while a trait impl outside its file table can
-/// still affect method resolution. The standalone `--check` uses the same
-/// three-way verdict.
+/// `source=`, `external=` and `artefacts=` are stale gates. `closure=`
+/// preserves the old whole-cargo-closure hash, but a mismatch there alone
+/// warns: the artefact's declared inputs did not move, while a trait impl
+/// outside its file table can still affect method resolution. The standalone
+/// `--check` uses the same three-way verdict.
+///
+/// `artefacts=` is the only one of the four that describes an OUTPUT. The
+/// input fields answer "would a fresh extraction write different bytes"; a
+/// build killed part-way through a Charon write leaves a short artefact under
+/// a stamp whose inputs have not moved, and all three answer "current" over
+/// it. Comparing it here, rather than only in `--check`, is what keeps a plain
+/// `cargo build` from consuming those bytes.
 ///
 /// A stale artefact fails the build.  It was warning-only, on the argument
 /// that the build still works for everything whose layout did not move; the
@@ -634,6 +641,15 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "stamp carries no external= line"));
             continue;
         };
+        // Required for the same reason, and the only field here that describes
+        // what is IN `build/llbc` rather than what went into it.  A stamp too
+        // old to carry it cannot answer whether these are still the bytes
+        // extraction wrote, and "nobody checked" is not a licence to read
+        // their offsets.
+        let Some(recorded_artefacts) = stamp_field(&stamp, "artefacts=") else {
+            unknown.push((crate_name, "stamp carries no artefacts= line"));
+            continue;
+        };
         let Some(recorded_platform) = stamp_field(&stamp, "platform=") else {
             unknown.push((crate_name, "stamp carries no platform= line"));
             continue;
@@ -664,6 +680,14 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         }
         if recorded_external != current.external {
             stale.push((crate_name, "external", recorded_external, current.external));
+        }
+        if recorded_artefacts != current.artefacts {
+            stale.push((
+                crate_name,
+                "artefacts",
+                recorded_artefacts,
+                current.artefacts,
+            ));
         }
         if source_matches && recorded_closure != current.closure {
             closure_warnings.push(crate_name);
@@ -700,6 +724,17 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         "cargo::warning"
     };
     for (crate_name, field, recorded, current) in &stale {
+        // Both sides are a per-file list, so printing them the way a digest is
+        // printed would put kilobytes on one cargo line and still not say
+        // which file moved.  `--check` renders that with `artefact_diff`.
+        if *field == "artefacts" {
+            println!(
+                "{directive}=LLBC STALE: {crate_name}.ullbc, or a layout sidecar beside it, is \
+                 not the bytes its stamp was written over; run \
+                 `python3 scripts/extract-llbc.py --check` for which file and how it differs"
+            );
+            continue;
+        }
         // The other fields are hashes of the tree; `platform` is not.
         let subject = if *field == "platform" {
             "this build is"
