@@ -8219,6 +8219,12 @@ impl<S: JitState> JitDriver<S> {
             retrace.storage.as_ref(),
         );
         if resume_data_result.is_none() {
+            if crate::bridge_debug_enabled() {
+                eprintln!(
+                    "[bridgeB] resume data could not be rebuilt — giving up on the bridge",
+                );
+            }
+            self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
             self.meta.abort_trace(false);
             self.clear_tracing_session_state();
             self.resume_data_result = None;
@@ -8255,6 +8261,7 @@ impl<S: JitState> JitDriver<S> {
                     resume_data_result.as_ref().map_or(0, |r| r.frames.len()),
                 );
             }
+            self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
             self.meta.abort_trace(false);
             self.clear_tracing_session_state();
             self.resume_data_result = None;

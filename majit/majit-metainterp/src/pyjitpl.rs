@@ -392,6 +392,12 @@ pub enum AbortReason {
     /// `Counters.ABORT_BRIDGE` / `ABORT_BAD_LOOP`: generic abort path —
     /// used when pyre cannot classify the reason more precisely.
     Generic,
+    /// `Counters.ABORT_BRIDGE`, named: `compile.py giveup()` — a bridge that
+    /// cannot be built at all. Shares [`AbortReason::Generic`]'s integer, so
+    /// the hook payload is unchanged; the point of the separate variant is
+    /// that a give-up site can say so, which keeps it out of the
+    /// nothing-was-staged tally the `abort_trace` fallback keeps.
+    Bridge,
 }
 
 impl AbortReason {
@@ -402,7 +408,7 @@ impl AbortReason {
     pub const fn as_int(self) -> i32 {
         match self {
             AbortReason::TooLong => 12,
-            AbortReason::Generic => 13,
+            AbortReason::Generic | AbortReason::Bridge => 13,
         }
     }
 }
