@@ -10,6 +10,45 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
+/// `_PyArg_BadArgument` — how a clinic-converted argument is reported.  A
+/// one-argument function names no position; `None` names itself where every
+/// other value names its type.
+fn bad_arg(fname: &str, pos: Option<usize>, want: &str, w_obj: PyObjectRef) -> crate::PyError {
+    let at = match pos {
+        Some(n) => format!(" {n}"),
+        None => String::new(),
+    };
+    crate::PyError::type_error(format!(
+        "{fname}() argument{at} must be {want}, not {}",
+        crate::type_methods::clinic_arg_type_name(w_obj)
+    ))
+}
+
+/// The `Py_buffer` converter's own wording, which names neither the function
+/// nor the position and quotes the type it was handed.
+fn bad_buffer_arg(w_obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "a bytes-like object is required, not '{}'",
+        crate::type_methods::arg_type_name(w_obj)
+    ))
+}
+
+/// `str(accept={str, NoneType})` — a codec's handler name, which `None`
+/// spells as `strict`.
+fn codec_errors_arg(
+    fname: &str,
+    pos: usize,
+    w_errors: PyObjectRef,
+) -> Result<String, crate::PyError> {
+    if unsafe { pyre_object::is_none(w_errors) } {
+        Ok("strict".to_string())
+    } else if unsafe { is_str(w_errors) } {
+        Ok(crate::baseobjspace::str_utf8_w(w_errors)?.to_string())
+    } else {
+        Err(bad_arg(fname, Some(pos), "str or None", w_errors))
+    }
+}
+
 struct CodecState {
     codec_search_path: PyObjectRef,
     codec_search_cache: PyObjectRef,
@@ -474,7 +513,7 @@ pub(crate) fn validate_error_handler(errors: &str) -> Result<(), crate::PyError>
     } else {
         Err(crate::PyError::new(
             crate::PyErrorKind::LookupError,
-            format!("unknown error handler name {errors}"),
+            format!("unknown error handler name '{errors}'"),
         ))
     }
 }
@@ -492,9 +531,7 @@ fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     };
     if !unsafe { is_str(w_errors) } {
-        return Err(crate::PyError::type_error(
-            "lookup_error() argument must be str",
-        ));
+        return Err(bad_arg("lookup_error", None, "str", w_errors));
     }
     let errors = crate::baseobjspace::str_utf8_w(w_errors)?;
     if let Some(w_handler) = with_codec_state(|state| unsafe {
@@ -504,7 +541,7 @@ fn lookup_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     Err(crate::PyError::new(
         crate::PyErrorKind::LookupError,
-        format!("unknown error handler name {errors}"),
+        format!("unknown error handler name '{errors}'"),
     ))
 }
 
@@ -515,9 +552,7 @@ fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     };
     if !unsafe { is_str(w_errors) } {
-        return Err(crate::PyError::type_error(
-            "register_error() argument 1 must be str",
-        ));
+        return Err(bad_arg("register_error", Some(1), "str", w_errors));
     }
     if !is_callable(w_handler) {
         return Err(crate::PyError::type_error("argument must be callable"));
@@ -531,6 +566,43 @@ fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         );
     });
     Ok(w_none())
+}
+
+/// `_codecs__unregister_error` — drop a handler previously installed by
+/// `register_error`.  Returns whether a handler of that name was registered,
+/// so removing an unknown name is not an error.  The eight handlers installed
+/// by [`register_builtin_error_handlers`] are refused: the codec loops reach
+/// them by name, so un-registering one would leave those lookups unanswerable.
+fn unregister_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(w_errors) = args.first().copied() else {
+        return Err(crate::PyError::type_error(
+            "_unregister_error() missing argument",
+        ));
+    };
+    if !unsafe { is_str(w_errors) } {
+        return Err(bad_arg("_unregister_error", None, "str", w_errors));
+    }
+    let errors = crate::baseobjspace::str_utf8_w(w_errors)?;
+    if matches!(
+        errors,
+        "strict"
+            | "ignore"
+            | "replace"
+            | "xmlcharrefreplace"
+            | "backslashreplace"
+            | "surrogateescape"
+            | "surrogatepass"
+            | "namereplace"
+    ) {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            format!("cannot un-register built-in error handler '{errors}'"),
+        ));
+    }
+    let removed = with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_delitem_str(state.codec_error_registry, errors)
+    });
+    Ok(w_bool_from(removed))
 }
 
 fn register_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -588,7 +660,7 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error("lookup() missing encoding"));
     };
     if !unsafe { is_str(w_encoding) } {
-        return Err(crate::PyError::type_error("lookup() argument must be str"));
+        return Err(bad_arg("lookup", None, "str", w_encoding));
     }
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
     // PyPy's `space.text0_w` gateway rejects this before normalization.  A
@@ -698,16 +770,73 @@ fn call_codec(
         }
     };
     if !unsafe { pyre_object::is_tuple(w_res) } || unsafe { pyre_object::w_tuple_len(w_res) } != 2 {
+        // The two messages are spelled differently upstream -- the decoder's
+        // has no space after the comma -- and the difference is observable.
         let msg = if action.starts_with("en") {
             "encoder must return a tuple (object, integer)".to_string()
         } else if action.starts_with("de") {
-            "decoder must return a tuple (object, integer)".to_string()
+            "decoder must return a tuple (object,integer)".to_string()
         } else {
             format!("{action} must return a tuple (object, integer)")
         };
         return Err(crate::PyError::type_error(msg));
     }
     Ok(unsafe { pyre_object::w_tuple_getitem(w_res, 0).unwrap_or_else(w_none) })
+}
+
+/// `PyCodec_Encode` / `PyCodec_Decode` — the arbitrary-object entry points.
+///
+/// Unlike `str.encode` / `bytes.decode` these place no restriction on either
+/// side: the codec is looked up without the text-encoding test and its coder is
+/// handed the object as it stands, so a codec answering with something other
+/// than `bytes` (or `str`) is answered with, rather than reported.  An `errors`
+/// argument that was not supplied is not invented either -- the coder is called
+/// with one argument, which is what lets a coder taking only the object work.
+fn codec_encode_or_decode(
+    w_obj: PyObjectRef,
+    w_encoding: PyObjectRef,
+    w_errors: Option<PyObjectRef>,
+    encode: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let name = if encode { "encode" } else { "decode" };
+    if !unsafe { is_str(w_encoding) } {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() argument 'encoding' must be str, not {}",
+            crate::type_methods::clinic_arg_type_name(w_encoding)
+        )));
+    }
+    // Only an omitted argument is absent: `None` is a value the coder is not
+    // asked to accept, so it is refused the way any other non-`str` is.
+    let errors = match w_errors {
+        None => None,
+        Some(w_errors) if unsafe { is_str(w_errors) } => {
+            Some(crate::baseobjspace::str_utf8_w(w_errors)?.to_string())
+        }
+        Some(w_errors) => {
+            return Err(crate::PyError::type_error(format!(
+                "{name}() argument 'errors' must be str, not {}",
+                crate::type_methods::clinic_arg_type_name(w_errors)
+            )));
+        }
+    };
+    // The lookup runs Python -- an uncached name imports its `encodings`
+    // module and calls every registered search function -- so the object
+    // outlives it on the shadow stack rather than in a plain local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
+    let w_codec_info = lookup_codec(&[w_str_new(&encoding)])?;
+    let w_coder = unsafe {
+        pyre_object::w_tuple_getitem(w_codec_info, i64::from(!encode)).unwrap_or_else(w_none)
+    };
+    call_codec(
+        w_coder,
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        if encode { "encoding" } else { "decoding" },
+        &encoding,
+        errors.as_deref(),
+    )
 }
 
 pub(crate) fn encode_text_codec(
@@ -784,16 +913,20 @@ fn forget_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn encode_with_name(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
+    fname: &str,
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_obj) } {
-        return Err(crate::PyError::type_error("encoder argument must be str"));
+        return Err(bad_arg(fname, Some(1), "str", w_obj));
     }
+    let errors = codec_errors_arg(fname, 2, errors)?;
     // PyPy `make_encoder_wrapper`: convert to unicode, call unicodehelper
     // encoder, return `(bytes, unicode_length)`.
     let encode_method = crate::baseobjspace::getattr_str(w_obj, "encode")?;
-    let encoded =
-        crate::call::call_function_impl_result(encode_method, &[w_str_new(encoding), errors])?;
+    let encoded = crate::call::call_function_impl_result(
+        encode_method,
+        &[w_str_new(encoding), w_str_new(&errors)],
+    )?;
     Ok(w_tuple_new(vec![
         encoded,
         w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64),
@@ -803,19 +936,21 @@ fn encode_with_name(
 fn decode_with_name(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
+    fname: &str,
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "decoder argument must be bytes-like",
-        ));
+        return Err(bad_buffer_arg(w_obj));
     }
+    let errors = codec_errors_arg(fname, 2, errors)?;
     // PyPy `make_decoder_wrapper`: decode a bytes buffer and return
     // `(unicode, bytes_consumed)`.
     let consumed = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj).len() };
     let decode_method = crate::baseobjspace::getattr_str(w_obj, "decode")?;
-    let decoded =
-        crate::call::call_function_impl_result(decode_method, &[w_str_new(encoding), errors])?;
+    let decoded = crate::call::call_function_impl_result(
+        decode_method,
+        &[w_str_new(encoding), w_str_new(&errors)],
+    )?;
     Ok(w_tuple_new(vec![decoded, w_int_new(consumed as i64)]))
 }
 
@@ -823,12 +958,7 @@ fn decode_with_name(
 /// TypeError (rather than the file-write helper's own wording) when the object
 /// is not a bytes-like buffer.
 fn decode_input_bytes(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|_| {
-        crate::PyError::type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(w_obj)
-        ))
-    })
+    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|_| bad_buffer_arg(w_obj))
 }
 
 /// PyPy `interp_codecs.utf_{16,32}_ex_decode`: the three-value entry point
@@ -840,15 +970,10 @@ fn utf16_32_ex_decode_impl(
     byteorder: i64,
     w_final: PyObjectRef,
     is32: bool,
+    fname: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let errors = if unsafe { pyre_object::is_none(errors) } {
-        "strict"
-    } else if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        return Err(crate::PyError::type_error("errors must be str or None"));
-    };
     let data = decode_input_bytes(w_obj)?;
+    let errors = codec_errors_arg(fname, 2, errors)?;
     let fixed_be = match byteorder {
         0 => None,
         -1 => Some(false),
@@ -860,7 +985,7 @@ fn utf16_32_ex_decode_impl(
         is32,
         fixed_be,
         codec,
-        errors,
+        &errors,
         crate::baseobjspace::is_true(w_final)?,
     )?;
     Ok(w_tuple_new(vec![
@@ -880,21 +1005,16 @@ fn utf16_32_decode_impl(
     is32: bool,
     fixed_be: Option<bool>,
     codec: &str,
+    fname: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let errors = if unsafe { pyre_object::is_none(errors) } {
-        "strict"
-    } else if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        return Err(crate::PyError::type_error("errors must be str or None"));
-    };
     let data = decode_input_bytes(w_obj)?;
+    let errors = codec_errors_arg(fname, 2, errors)?;
     let (decoded, consumed, _) = crate::type_methods::decode_utf16_32_helper(
         &data,
         is32,
         fixed_be,
         codec,
-        errors,
+        &errors,
         crate::baseobjspace::is_true(w_final)?,
     )?;
     Ok(w_tuple_new(vec![
@@ -911,20 +1031,14 @@ fn utf8_decode_impl(
     errors: PyObjectRef,
     w_final: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let errors = if unsafe { pyre_object::is_none(errors) } {
-        "strict"
-    } else if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        return Err(crate::PyError::type_error("errors must be str or None"));
-    };
     let data = decode_input_bytes(w_obj)?;
+    let errors = codec_errors_arg("utf_8_decode", 2, errors)?;
     // `interp_codecs.utf_8_decode`: `surrogatepass` is the one handler that
     // decodes a complete ED A0..BF 80..BF sequence in the state machine and
     // retains an incomplete one for the next chunk.
     let (decoded, consumed) = crate::typedef::decode_utf8_with_errors_incremental(
         &data,
-        errors,
+        &errors,
         crate::baseobjspace::is_true(w_final)?,
         errors == "surrogatepass",
     )?;
@@ -934,81 +1048,211 @@ fn utf8_decode_impl(
     ]))
 }
 
+/// `charmapencode_lookup` — map one code point through the encoding table and
+/// append its bytes to `out`.
+///
+/// Answers `false` for a character the table leaves undefined, which a missing
+/// key and an explicit `None` value both express; the caller turns a run of
+/// those into one error span.  A mapping that raises anything other than
+/// `LookupError` / `KeyError` propagates, so a `__getitem__` of its own is not
+/// mistaken for "undefined".
+fn charmap_output(
+    w_mapping: PyObjectRef,
+    cp: u32,
+    out: &mut Vec<u8>,
+) -> Result<bool, crate::PyError> {
+    if unsafe { is_str(w_mapping) } && cp as usize >= unsafe { w_str_len(w_mapping) } {
+        return Ok(false);
+    }
+    // Minting the key can collect, and a table read can run a `__getitem__` of
+    // its own, so the table is pinned and re-read rather than carried across
+    // either in a plain local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let w_key = pyre_object::gc_roots::pin_root(w_int_new(cp as i64));
+    let w_mapping = pyre_object::gc_roots::shadow_stack_get(sp);
+    let w_ch = match crate::baseobjspace::getitem(w_mapping, w_key) {
+        Ok(w_ch) => w_ch,
+        Err(e)
+            if matches!(
+                e.kind,
+                crate::PyErrorKind::LookupError | crate::PyErrorKind::KeyError
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if unsafe { pyre_object::bytesobject::is_bytes_like(w_ch) } {
+        out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(w_ch) });
+        Ok(true)
+    } else if unsafe { pyre_object::is_int(w_ch) } {
+        let x = unsafe { pyre_object::w_int_get_value(w_ch) };
+        if !(0..256).contains(&x) {
+            return Err(crate::PyError::type_error(
+                "character mapping must be in range(256)",
+            ));
+        }
+        out.push(x as u8);
+        Ok(true)
+    } else if unsafe { pyre_object::is_none(w_ch) } {
+        Ok(false)
+    } else {
+        Err(crate::PyError::type_error(
+            "character mapping must return integer, bytes or None, not str",
+        ))
+    }
+}
+
+/// `utf8_encode_charmap` — encode through a code-point-to-bytes table.
+///
+/// Characters the table leaves undefined are gathered into one run and handed
+/// to the error handler registered under `errors`, so a handler sees a single
+/// span rather than one call per character.  A `str` replacement is mapped
+/// through the table in turn — that is what lets `"replace"` emit whatever the
+/// table gives for `?` — and a replacement the table cannot encode reports the
+/// span that was originally undefined, not the replacement's own position.
 fn charmap_encode_impl(
     w_unicode: PyObjectRef,
     errors: PyObjectRef,
     w_mapping: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { pyre_object::is_none(w_mapping) } {
-        return encode_with_name(w_unicode, errors, "latin-1");
+        return encode_with_name(w_unicode, errors, "charmap_encode", "latin-1");
     }
     if !unsafe { is_str(w_unicode) } {
-        return Err(crate::PyError::type_error(
-            "charmap_encode() argument must be str",
-        ));
+        return Err(bad_arg("charmap_encode", Some(1), "str", w_unicode));
     }
-    let errors_s = if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        "strict"
-    };
+    // The loop below runs a Python error handler, which can move the string
+    // the name was read out of, so the name is owned rather than viewed.
+    let errors_s = codec_errors_arg("charmap_encode", 2, errors)?;
+    let cps: Vec<u32> = unsafe { w_str_get_wtf8(w_unicode) }
+        .code_points()
+        .map(|cp| cp.to_u32())
+        .collect();
+    let char_len = cps.len();
     let mut out = Vec::new();
-    for cp in unsafe { w_str_get_wtf8(w_unicode) }.code_points() {
-        let w_ch = match crate::baseobjspace::getitem(w_mapping, w_int_new(cp.to_u32() as i64)) {
-            Ok(w_ch) => w_ch,
-            Err(e)
-                if matches!(
-                    e.kind,
-                    crate::PyErrorKind::LookupError | crate::PyErrorKind::KeyError
-                ) =>
-            {
-                match errors_s {
-                    "ignore" => continue,
-                    "replace" => {
-                        out.push(b'?');
-                        continue;
-                    }
-                    _ => {
-                        return Err(crate::PyError::new(
-                            crate::PyErrorKind::UnicodeEncodeError,
-                            "character maps to <undefined>",
-                        ));
-                    }
-                }
+    // The code points are copied out above, so only the two objects have to
+    // survive the collections a table read or a handler call can trigger.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_unicode);
+    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let mut i = 0usize;
+    while i < char_len {
+        if charmap_output(
+            pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            cps[i],
+            &mut out,
+        )? {
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        let mut end = i + 1;
+        let mut probe = Vec::new();
+        while end < char_len {
+            probe.clear();
+            if charmap_output(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                cps[end],
+                &mut probe,
+            )? {
+                break;
             }
-            Err(e) => return Err(e),
-        };
-        if unsafe { pyre_object::bytesobject::is_bytes_like(w_ch) } {
-            out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(w_ch) });
-        } else if unsafe { pyre_object::is_int(w_ch) } {
-            let x = unsafe { pyre_object::w_int_get_value(w_ch) };
-            if !(0..256).contains(&x) {
-                return Err(crate::PyError::type_error(
-                    "character mapping must be in range(256)",
+            end += 1;
+        }
+
+        match errors_s.as_str() {
+            "strict" => {
+                return Err(crate::typedef::unicode_encode_error(
+                    "charmap",
+                    pyre_object::gc_roots::shadow_stack_get(sp),
+                    start,
+                    end,
+                    "character maps to <undefined>",
                 ));
             }
-            out.push(x as u8);
-        } else if unsafe { pyre_object::is_none(w_ch) } {
-            match errors_s {
-                "ignore" => {}
-                "replace" => out.push(b'?'),
-                _ => {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::UnicodeEncodeError,
-                        "character maps to <undefined>",
-                    ));
-                }
+            "ignore" => {
+                i = end;
             }
-        } else {
-            return Err(crate::PyError::type_error(
-                "character mapping must return integer, bytes or None, not str",
-            ));
+            _ => {
+                let (replacement, newpos) =
+                    crate::type_methods::call_registered_encode_error_handler(
+                        &errors_s,
+                        "charmap",
+                        pyre_object::gc_roots::shadow_stack_get(sp),
+                        char_len,
+                        start,
+                        end,
+                        "character maps to <undefined>",
+                    )?;
+                match replacement {
+                    crate::type_methods::EncodeReplacement::Bytes(bytes) => {
+                        out.extend_from_slice(&bytes);
+                    }
+                    crate::type_methods::EncodeReplacement::Str(replacement_cps) => {
+                        for replacement_cp in replacement_cps {
+                            if !charmap_output(
+                                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                                replacement_cp,
+                                &mut out,
+                            )? {
+                                return Err(crate::typedef::unicode_encode_error(
+                                    "charmap",
+                                    pyre_object::gc_roots::shadow_stack_get(sp),
+                                    start,
+                                    end,
+                                    "character maps to <undefined>",
+                                ));
+                            }
+                        }
+                    }
+                }
+                i = newpos;
+            }
         }
     }
+    // The reported count is the input's own length, which the handler cannot
+    // change however far it moved the resume position.
+    let char_count = unsafe { pyre_object::w_str_len(pyre_object::gc_roots::shadow_stack_get(sp)) };
+    // Pinned because minting the bytes below can collect and move it.
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(char_count as i64));
+    let w_encoded = w_bytes_from_bytes(&out);
     Ok(w_tuple_new(vec![
-        w_bytes_from_bytes(&out),
-        w_int_new(unsafe { pyre_object::w_str_len(w_unicode) } as i64),
+        w_encoded,
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
     ]))
+}
+
+/// `charmapdecode_lookup` — read one byte's entry out of a decoding table.
+///
+/// Answers `None` for a byte the table has no entry for.  Minting the key can
+/// collect and a table can carry a `__getitem__` of its own, so the table is
+/// pinned across both and re-read rather than carried in a plain local.
+fn charmap_decode_lookup(
+    w_mapping: PyObjectRef,
+    b: u8,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let w_key = pyre_object::gc_roots::pin_root(w_int_new(b as i64));
+    let w_mapping = pyre_object::gc_roots::shadow_stack_get(sp);
+    match crate::baseobjspace::getitem(w_mapping, w_key) {
+        Ok(w_ch) => Ok(Some(w_ch)),
+        Err(e)
+            if matches!(
+                e.kind,
+                crate::PyErrorKind::LookupError | crate::PyErrorKind::KeyError
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn charmap_decode_impl(
@@ -1017,25 +1261,27 @@ fn charmap_decode_impl(
     w_mapping: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { pyre_object::is_none(w_mapping) } {
-        return decode_with_name(w_obj, errors, "latin-1");
+        return decode_with_name(w_obj, errors, "charmap_decode", "latin-1");
     }
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "charmap_decode() argument must be bytes-like",
-        ));
+        return Err(bad_buffer_arg(w_obj));
     }
-    let errors_s = if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        "strict"
-    };
+    // The loop below runs a table's own `__getitem__` and an error handler, so
+    // a name viewed out of the string it was read from would not survive it.
+    let errors_s = codec_errors_arg("charmap_decode", 2, errors)?;
     // A custom error handler may replace `exc.object`; decoding then resumes
     // from the new bytes (`data`).
-    let mut data: std::borrow::Cow<[u8]> =
-        std::borrow::Cow::Borrowed(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) });
+    // The input is copied rather than viewed: those same calls can collect, and
+    // a slice into the object's live buffer would not survive it moving.
+    let mut data: Vec<u8> = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec();
     // charmap_decode reports the number of input bytes consumed, which stays
     // the original length even if a handler replaces `exc.object`.
     let orig_len = data.len();
+    // Only the table has to outlive those calls; a string table's code points
+    // are copied out of it up front.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_mapping);
     let mapping_chars: Option<Vec<_>> = if unsafe { is_str(w_mapping) } {
         Some(
             unsafe { w_str_get_wtf8(w_mapping) }
@@ -1056,18 +1302,7 @@ fn charmap_decode_impl(
                 w_str_from_wtf8(one)
             })
         } else {
-            match crate::baseobjspace::getitem(w_mapping, w_int_new(b as i64)) {
-                Ok(w_ch) => Some(w_ch),
-                Err(e)
-                    if matches!(
-                        e.kind,
-                        crate::PyErrorKind::LookupError | crate::PyErrorKind::KeyError
-                    ) =>
-                {
-                    None
-                }
-                Err(e) => return Err(e),
-            }
+            charmap_decode_lookup(pyre_object::gc_roots::shadow_stack_get(sp), b)?
         };
         // A mapped char maps to itself unless it signals "undefined" (a missing
         // entry, the `￾` sentinel, or `None`).
@@ -1086,9 +1321,14 @@ fn charmap_decode_impl(
                         "character mapping must be in range(0x110000)",
                     ));
                 }
-                out.push(rustpython_wtf8::CodePoint::from_u32(x as u32).unwrap());
-                i += 1;
-                continue;
+                // The sentinel says "undefined" whichever way the table spells
+                // it, so an integer entry falls through to the error handler
+                // exactly as the one-character string does.
+                if x != 0xFFFE {
+                    out.push(rustpython_wtf8::CodePoint::from_u32(x as u32).unwrap());
+                    i += 1;
+                    continue;
+                }
             } else if !unsafe { pyre_object::is_none(w_ch) } {
                 return Err(crate::PyError::type_error(
                     "character mapping must return integer, None or str",
@@ -1097,7 +1337,7 @@ fn charmap_decode_impl(
         }
         // The byte maps to <undefined>: run the decode error handler over the
         // single byte at `i` (`str_decode_charmap` span `pos .. pos + 1`).
-        match errors_s {
+        match errors_s.as_str() {
             "ignore" => i += 1,
             "replace" => {
                 out.push_char('\u{FFFD}');
@@ -1121,7 +1361,7 @@ fn charmap_decode_impl(
             }
             _ => {
                 let (np, nb) = crate::type_methods::call_registered_decode_error_handler(
-                    errors_s,
+                    &errors_s,
                     "charmap",
                     &data[..],
                     i,
@@ -1130,7 +1370,7 @@ fn charmap_decode_impl(
                     &mut out,
                 )?;
                 if let Some(nb) = nb {
-                    data = std::borrow::Cow::Owned(nb);
+                    data = nb;
                 }
                 i = np;
             }
@@ -1194,12 +1434,14 @@ fn utf7_encode_unit(out: &mut Vec<u8>, unit: u32, base64bits: &mut u32, base64bu
     *base64buffer &= (1 << *base64bits) - 1;
 }
 
-fn utf7_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn utf7_encode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "utf_7_encode() argument must be str",
-        ));
+        return Err(bad_arg("utf_7_encode", Some(1), "str", w_obj));
     }
+    let _errors = codec_errors_arg("utf_7_encode", 2, errors)?;
     // PyPy `unicodehelper.py:utf8_encode_utf_7`.
     let mut out = Vec::new();
     let mut in_shift = false;
@@ -1313,16 +1555,11 @@ fn utf7_decode_impl(
     is_final: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "utf_7_decode() argument must be bytes-like",
-        ));
+        return Err(bad_buffer_arg(w_obj));
     }
     // PyPy `unicodehelper.py:str_decode_utf_7`.
-    let errors_s = if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        "strict"
-    };
+    let errors_s = codec_errors_arg("utf_7_decode", 2, errors)?;
+    let errors_s = errors_s.as_str();
     // A custom error handler may replace `exc.object`; decoding then resumes
     // from the new bytes (`data`).
     let mut data: std::borrow::Cow<[u8]> =
@@ -1496,12 +1733,14 @@ fn push_ascii_hex_escape(out: &mut Vec<u8>, prefix: u8, cp: u32, digits: usize) 
     }
 }
 
-fn unicode_escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn unicode_escape_encode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "unicode_escape_encode() argument must be str",
-        ));
+        return Err(bad_arg("unicode_escape_encode", Some(1), "str", w_obj));
     }
+    let _errors = codec_errors_arg("unicode_escape_encode", 2, errors)?;
     // PyPy `unicodehelper.py:utf8_encode_unicode_escape`.
     let mut out = Vec::new();
     for cp in unsafe { w_str_get_wtf8(w_obj) }.code_points() {
@@ -1632,24 +1871,46 @@ fn unicode_escape_hex(
     unicode_escape_run_error(data, out, pos_delta, pos - 2, endinpos, message, errors)
 }
 
+/// The `DeprecationWarning` text an unrecognised escape earns while decoding.
+///
+/// `prefix` distinguishes the two decoders: the bytes-to-bytes transform names
+/// the sequence as a `bytes` literal, the text one as a `str` literal.  The
+/// wording stops after the "will not work in the future" sentence -- the longer
+/// report carrying a "Did you mean" suggestion belongs to the compiler, which
+/// has the surrounding literal to suggest a raw string for.
+fn invalid_escape_warning(prefix: &str, sequence: &str, octal: bool) -> String {
+    let kind = if octal {
+        "an invalid octal escape sequence"
+    } else {
+        "an invalid escape sequence"
+    };
+    format!("{prefix}\"\\{sequence}\" is {kind}. Such sequences will not work in the future. ")
+}
+
+/// Acquire a backslash-escape decoder's input.  A `str` answers with its own
+/// bytes and any buffer producer with the bytes it exposes, which is what lets
+/// a `memoryview` -- including a sliced one, whose bytes are not contiguous
+/// with the object it was taken from -- reach the decoder.
+fn escape_decoder_input(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    if unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
+        Ok(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec())
+    } else if unsafe { is_str(w_obj) } {
+        Ok(unsafe { w_str_get_wtf8(w_obj) }.as_bytes().to_vec())
+    } else if let Some(src) = crate::typedef::buffer_as_bytes_like(w_obj)? {
+        Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
+    } else {
+        Err(bad_buffer_arg(w_obj))
+    }
+}
+
 fn unicode_escape_decode_impl(
     w_obj: PyObjectRef,
     errors: PyObjectRef,
+    final_: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let initial: Vec<u8> = if unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec()
-    } else if unsafe { is_str(w_obj) } {
-        unsafe { w_str_get_wtf8(w_obj) }.as_bytes().to_vec()
-    } else {
-        return Err(crate::PyError::type_error(
-            "unicode_escape_decode() argument must be bytes-like or str",
-        ));
-    };
-    let errors_s = if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else {
-        "strict"
-    };
+    let initial = escape_decoder_input(w_obj)?;
+    let errors_s = codec_errors_arg("unicode_escape_decode", 2, errors)?;
+    let errors_s = errors_s.as_str();
     // `unicodehelper.py:str_decode_unicode_escape` (final=True). A custom error
     // handler may replace `exc.object`; decoding then resumes from the new
     // bytes (`data`), and `pos_delta` keeps the reported consumed count
@@ -1658,6 +1919,7 @@ fn unicode_escape_decode_impl(
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     let mut pos = 0usize;
     let mut pos_delta = 0i64;
+    let mut first_escape_warning: Option<String> = None;
     while pos < data.len() {
         let ch = data[pos];
         if ch != b'\\' {
@@ -1668,6 +1930,12 @@ fn unicode_escape_decode_impl(
         let escape_start = pos;
         pos += 1;
         if pos >= data.len() {
+            if !final_ {
+                // More input may follow, so the backslash is left unconsumed
+                // rather than reported: what it introduces is still unknown.
+                pos = escape_start;
+                break;
+            }
             let end = data.len();
             pos = unicode_escape_run_error(
                 &mut data,
@@ -1695,12 +1963,23 @@ fn unicode_escape_decode_impl(
             b'v' => out.push_char('\x0b'),
             b'a' => out.push_char('\x07'),
             b'0'..=b'7' => {
+                let octal_start = pos - 1;
                 let mut value = (ch - b'0') as u32;
                 for _ in 0..2 {
                     if pos < data.len() && matches!(data[pos], b'0'..=b'7') {
                         value = (value << 3) + (data[pos] - b'0') as u32;
                         pos += 1;
                     }
+                }
+                // Only three octal digits are read, so the largest escape is
+                // `\777`; anything past `\377` leaves the byte range the
+                // sequence is written to address.
+                if value > 0o377 && first_escape_warning.is_none() {
+                    first_escape_warning = Some(invalid_escape_warning(
+                        "",
+                        &String::from_utf8_lossy(&data[octal_start..pos]),
+                        true,
+                    ));
                 }
                 out.push(rustpython_wtf8::CodePoint::from_u32(value).unwrap());
             }
@@ -1710,6 +1989,14 @@ fn unicode_escape_decode_impl(
                     b'u' => (4usize, "truncated \\uXXXX escape"),
                     _ => (8usize, "truncated \\UXXXXXXXX escape"),
                 };
+                if !final_ && pos + digits > data.len() {
+                    // The escape runs off the end of this chunk; the digits it
+                    // is missing can still arrive.  A sequence the chunk does
+                    // decide -- four bytes that are not all hex -- is reported
+                    // here whether or not more input follows.
+                    pos = escape_start;
+                    break;
+                }
                 pos = unicode_escape_hex(
                     &mut data,
                     &mut out,
@@ -1721,18 +2008,48 @@ fn unicode_escape_decode_impl(
                 )?;
             }
             b'N' => {
-                // pyre has no Unicode-name database, so a `\N` escape never
-                // resolves; it is always reported as an error.
+                // `\N{NAME}` is resolved through the character database.  Only
+                // a name that names one character resolves, so a named
+                // sequence is reported as unknown; a name that is empty,
+                // unterminated, or not introduced by a brace at all is
+                // malformed instead, and each spelling reports its own span.
                 let (msg, end) = if pos < data.len() && data[pos] == b'{' {
-                    let mut look = pos + 1;
+                    let name_start = pos + 1;
+                    let mut look = name_start;
                     while look < data.len() && data[look] != b'}' {
                         look += 1;
                     }
-                    if look < data.len() && data[look] == b'}' {
-                        ("unknown Unicode character name", look + 1)
-                    } else {
+                    if look >= data.len() {
+                        if !final_ {
+                            // The closing brace can arrive with the next chunk.
+                            pos = escape_start;
+                            break;
+                        }
                         ("malformed \\N character escape", data.len())
+                    } else if look == name_start {
+                        // An empty name is not a name to look up.
+                        ("malformed \\N character escape", name_start)
+                    } else {
+                        // Owned so the database read does not borrow `data`,
+                        // which the error path below hands out mutably.
+                        let name = String::from_utf8(data[name_start..look].to_vec()).ok();
+                        match name
+                            .as_deref()
+                            .and_then(rustpython_unicode::lookup_character)
+                        {
+                            Some(ch) => {
+                                out.push_char(ch);
+                                pos = look + 1;
+                                continue;
+                            }
+                            None => ("unknown Unicode character name", look + 1),
+                        }
                     }
+                } else if pos >= data.len() && !final_ {
+                    // `\N` at the very end: the byte deciding whether a name
+                    // follows has not arrived yet.
+                    pos = escape_start;
+                    break;
                 } else {
                     ("malformed \\N character escape", pos)
                 };
@@ -1747,14 +2064,42 @@ fn unicode_escape_decode_impl(
                 )?;
             }
             _ => {
+                if first_escape_warning.is_none() {
+                    first_escape_warning = Some(invalid_escape_warning(
+                        "",
+                        &char::from(ch).to_string(),
+                        false,
+                    ));
+                }
                 out.push_char('\\');
                 out.push(rustpython_wtf8::CodePoint::from_u32(ch as u32).unwrap());
             }
         }
     }
+    if let Some(message) = first_escape_warning {
+        crate::warn::warn_deprecation(&message)?;
+    }
     Ok(w_tuple_new(vec![
         w_str_from_wtf8_managed(out),
         w_int_new(pos as i64 + pos_delta),
+    ]))
+}
+
+/// `unicode_escape_decode`'s raw counterpart: only `\uXXXX` and
+/// `\UXXXXXXXX` are escapes, every other byte -- a lone backslash included --
+/// standing for its own Latin-1 code point.
+fn raw_unicode_escape_decode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+    final_: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let data = escape_decoder_input(w_obj)?;
+    let errors_s = codec_errors_arg("raw_unicode_escape_decode", 2, errors)?;
+    let (out, consumed) =
+        crate::type_methods::decode_raw_unicode_escape_stateful(&data, &errors_s, final_)?;
+    Ok(w_tuple_new(vec![
+        w_str_from_wtf8_managed(out),
+        w_int_new(consumed as i64),
     ]))
 }
 
@@ -1770,17 +2115,10 @@ fn escape_decode_impl(
     } else if let Some(src) = crate::typedef::buffer_as_bytes_like(w_obj)? {
         unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec()
     } else {
-        return Err(crate::PyError::type_error(
-            "escape_decode() argument must be bytes-like or str",
-        ));
+        return Err(bad_buffer_arg(w_obj));
     };
-    let errors_s = if unsafe { is_str(errors) } {
-        crate::baseobjspace::str_utf8_w(errors)?
-    } else if unsafe { pyre_object::is_none(errors) } {
-        "strict"
-    } else {
-        return Err(crate::PyError::type_error("errors must be str or None"));
-    };
+    let errors_s = codec_errors_arg("escape_decode", 2, errors)?;
+    let errors_s = errors_s.as_str();
 
     let mut out = Vec::with_capacity(data.len());
     let mut pos = 0usize;
@@ -1823,9 +2161,10 @@ fn escape_decode_impl(
                     .iter()
                     .fold(0u16, |value, digit| value * 8 + (digit - b'0') as u16);
                 if raw >= 256 && first_escape_warning.is_none() {
-                    first_escape_warning = Some(format!(
-                        "invalid octal escape sequence '\\{}'",
-                        String::from_utf8_lossy(&data[octal_start..pos])
+                    first_escape_warning = Some(invalid_escape_warning(
+                        "b",
+                        &String::from_utf8_lossy(&data[octal_start..pos]),
+                        true,
                     ));
                 }
                 out.push(raw as u8);
@@ -1862,8 +2201,11 @@ fn escape_decode_impl(
                 out.push(b'\\');
                 pos -= 1;
                 if first_escape_warning.is_none() {
-                    first_escape_warning =
-                        Some(format!("invalid escape sequence '\\{}'", char::from(other)));
+                    first_escape_warning = Some(invalid_escape_warning(
+                        "b",
+                        &char::from(other).to_string(),
+                        false,
+                    ));
                 }
             }
         }
@@ -1880,13 +2222,14 @@ fn escape_decode_impl(
 
 /// `interp_codecs.py escape_encode` / `string_escape_encode(data,
 /// quote=False)` — the inverse bytes transform.
-fn escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn escape_encode_impl(
+    w_obj: PyObjectRef,
+    errors: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_bytes(w_obj) } {
-        return Err(crate::PyError::type_error(format!(
-            "escape_encode() argument 1 must be bytes, not {}",
-            crate::type_methods::arg_type_name(w_obj)
-        )));
+        return Err(bad_arg("escape_encode", Some(1), "bytes", w_obj));
     }
+    let _errors = codec_errors_arg("escape_encode", 2, errors)?;
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
     let mut out = Vec::with_capacity(data.len());
     for byte in data {
@@ -1895,6 +2238,7 @@ fn escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
             b'\n' => out.extend_from_slice(b"\\n"),
             b'\r' => out.extend_from_slice(b"\\r"),
             b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\'' => out.extend_from_slice(b"\\'"),
             0x20..=0x7e => out.push(*byte),
             value => out.extend_from_slice(format!("\\x{value:02x}").as_bytes()),
         }
@@ -1912,9 +2256,7 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     };
     if !unsafe { is_str(chars) } {
-        return Err(crate::PyError::type_error(
-            "charmap_build() argument must be str",
-        ));
+        return Err(bad_arg("charmap_build", None, "str", chars));
     }
 
     // PyPy `interp_codecs.py charmap_build`: build a dict mapping
@@ -1932,15 +2274,6 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_charmap)
 }
 
-/// `_PyArg_BadArgument`, which names the argument by its position rather
-/// than by the name the signature gives it.
-fn bad_argument(name: &str, position: usize, expected: &str, w_obj: PyObjectRef) -> crate::PyError {
-    crate::PyError::type_error(format!(
-        "{name}() argument {position} must be {expected}, not {}",
-        crate::type_methods::arg_type_name(w_obj)
-    ))
-}
-
 /// The `errors` argument the code page entry points share: `None` is
 /// `strict`, a `str` is itself, and nothing else is accepted.
 #[cfg(windows)]
@@ -1948,14 +2281,8 @@ fn code_page_errors(
     name: &str,
     position: usize,
     w_errors: PyObjectRef,
-) -> Result<&'static str, crate::PyError> {
-    if unsafe { pyre_object::is_none(w_errors) } {
-        return Ok("strict");
-    }
-    if !unsafe { is_str(w_errors) } {
-        return Err(bad_argument(name, position, "str or None", w_errors));
-    }
-    crate::baseobjspace::str_utf8_w(w_errors)
+) -> Result<String, crate::PyError> {
+    codec_errors_arg(name, position, w_errors)
 }
 
 /// The code page number argument.  A negative number names no code page and
@@ -1980,10 +2307,10 @@ fn code_page_encode_impl(
     w_errors: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_str) } {
-        return Err(bad_argument(name, position, "str", w_str));
+        return Err(bad_arg(name, Some(position), "str", w_str));
     }
     let errors = code_page_errors(name, position + 1, w_errors)?;
-    let bytes = crate::unicodehelper_win32::encode_code_page(code_page, w_str, errors)?;
+    let bytes = crate::unicodehelper_win32::encode_code_page(code_page, w_str, &errors)?;
     Ok(w_tuple_new(vec![
         pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
         w_int_new(unsafe { w_str_len(w_str) } as i64),
@@ -2004,7 +2331,7 @@ fn code_page_decode_impl(
     let errors = code_page_errors(name, position + 1, w_errors)?;
     let is_final = crate::baseobjspace::is_true(w_final)?;
     let (text, consumed) =
-        crate::unicodehelper_win32::decode_code_page(code_page, &data, errors, is_final)?;
+        crate::unicodehelper_win32::decode_code_page(code_page, &data, &errors, is_final)?;
     // `final` is the caller promising that no continuation is coming, so the
     // whole buffer reads as consumed: nothing is being held back for one.
     let consumed = if is_final { data.len() } else { consumed };
@@ -2090,9 +2417,6 @@ crate::py_module! {
             data: PyObjectRef,
             #[default(w_none())] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            if !unsafe { pyre_object::is_none(errors) || is_str(errors) } {
-                return Err(bad_argument("readbuffer_encode", 2, "str or None", errors));
-            }
             // `Py_buffer(accept={str, buffer})`: a str contributes its own
             // UTF-8 bytes, anything else the buffer it exposes.
             let bytes = if unsafe { is_str(data) } {
@@ -2100,6 +2424,7 @@ crate::py_module! {
             } else {
                 decode_input_bytes(data)?
             };
+            let _errors = codec_errors_arg("readbuffer_encode", 2, errors)?;
             Ok(w_tuple_new(vec![
                 pyre_object::bytesobject::w_bytes_from_bytes(&bytes),
                 w_int_new(bytes.len() as i64),
@@ -2109,33 +2434,33 @@ crate::py_module! {
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "ascii")
+            encode_with_name(obj, errors, "ascii_encode", "ascii")
         }
         fn ascii_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] _final: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "ascii")
+            decode_with_name(obj, errors, "ascii_decode", "ascii")
         }
         fn latin_1_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "latin-1")
+            encode_with_name(obj, errors, "latin_1_encode", "latin-1")
         }
         fn latin_1_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] _final: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "latin-1")
+            decode_with_name(obj, errors, "latin_1_decode", "latin-1")
         }
         fn utf_8_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-8")
+            encode_with_name(obj, errors, "utf_8_encode", "utf-8")
         }
         fn utf_8_decode(
             obj: PyObjectRef,
@@ -2148,14 +2473,14 @@ crate::py_module! {
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-16")
+            encode_with_name(obj, errors, "utf_16_encode", "utf-16")
         }
         fn utf_16_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, false, None, "utf16")
+            utf16_32_decode_impl(obj, errors, final_, false, None, "utf16", "utf_16_decode")
         }
         fn utf_16_ex_decode(
             obj: PyObjectRef,
@@ -2163,46 +2488,62 @@ crate::py_module! {
             #[default(0i64)] byteorder: i64,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, false)
+            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, false, "utf_16_ex_decode")
         }
         fn utf_16_be_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-16-be")
+            encode_with_name(obj, errors, "utf_16_be_encode", "utf-16-be")
         }
         fn utf_16_be_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, false, Some(true), "utf16-be")
+            utf16_32_decode_impl(
+                obj,
+                errors,
+                final_,
+                false,
+                Some(true),
+                "utf16-be",
+                "utf_16_be_decode",
+            )
         }
         fn utf_16_le_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-16-le")
+            encode_with_name(obj, errors, "utf_16_le_encode", "utf-16-le")
         }
         fn utf_16_le_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, false, Some(false), "utf16-le")
+            utf16_32_decode_impl(
+                obj,
+                errors,
+                final_,
+                false,
+                Some(false),
+                "utf16-le",
+                "utf_16_le_decode",
+            )
         }
         fn utf_32_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-32")
+            encode_with_name(obj, errors, "utf_32_encode", "utf-32")
         }
         fn utf_32_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, true, None, "utf32")
+            utf16_32_decode_impl(obj, errors, final_, true, None, "utf32", "utf_32_decode")
         }
         fn utf_32_ex_decode(
             obj: PyObjectRef,
@@ -2210,52 +2551,73 @@ crate::py_module! {
             #[default(0i64)] byteorder: i64,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, true)
+            utf16_32_ex_decode_impl(obj, errors, byteorder, final_, true, "utf_32_ex_decode")
         }
         fn utf_32_be_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-32-be")
+            encode_with_name(obj, errors, "utf_32_be_encode", "utf-32-be")
         }
         fn utf_32_be_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, true, Some(true), "utf32-be")
+            utf16_32_decode_impl(
+                obj,
+                errors,
+                final_,
+                true,
+                Some(true),
+                "utf32-be",
+                "utf_32_be_decode",
+            )
         }
         fn utf_32_le_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "utf-32-le")
+            encode_with_name(obj, errors, "utf_32_le_encode", "utf-32-le")
         }
         fn utf_32_le_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
             #[default(w_bool_from(false))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf16_32_decode_impl(obj, errors, final_, true, Some(false), "utf32-le")
+            utf16_32_decode_impl(
+                obj,
+                errors,
+                final_,
+                true,
+                Some(false),
+                "utf32-le",
+                "utf_32_le_decode",
+            )
         }
         fn raw_unicode_escape_encode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            encode_with_name(obj, errors, "raw-unicode-escape")
+            encode_with_name(
+                obj,
+                errors,
+                "raw_unicode_escape_encode",
+                "raw-unicode-escape",
+            )
         }
         fn raw_unicode_escape_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(true))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            decode_with_name(obj, errors, "raw-unicode-escape")
+            raw_unicode_escape_decode_impl(obj, errors, crate::baseobjspace::is_true(final_)?)
         }
         fn utf_7_encode(
             obj: PyObjectRef,
-            #[default(w_str_new("strict"))] _errors: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            utf7_encode_impl(obj)
+            utf7_encode_impl(obj, errors)
         }
         fn utf_7_decode(
             obj: PyObjectRef,
@@ -2266,16 +2628,16 @@ crate::py_module! {
         }
         fn unicode_escape_encode(
             obj: PyObjectRef,
-            #[default(w_str_new("strict"))] _errors: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            unicode_escape_encode_impl(obj)
+            unicode_escape_encode_impl(obj, errors)
         }
         fn unicode_escape_decode(
             obj: PyObjectRef,
             #[default(w_str_new("strict"))] errors: PyObjectRef,
-            #[default(w_bool_from(false))] _final: PyObjectRef,
+            #[default(w_bool_from(true))] final_: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            unicode_escape_decode_impl(obj, errors)
+            unicode_escape_decode_impl(obj, errors, crate::baseobjspace::is_true(final_)?)
         }
         fn escape_decode(
             obj: PyObjectRef,
@@ -2285,9 +2647,9 @@ crate::py_module! {
         }
         fn escape_encode(
             obj: PyObjectRef,
-            #[default(w_str_new("strict"))] _errors: PyObjectRef,
+            #[default(w_str_new("strict"))] errors: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            escape_encode_impl(obj)
+            escape_encode_impl(obj, errors)
         }
         fn charmap_encode(
             obj: PyObjectRef,
@@ -2303,39 +2665,25 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             charmap_decode_impl(obj, errors, mapping)
         }
-        // `encode(obj, encoding='utf-8', errors='strict')` — text path of
-        // `PyCodec_Encode`: a str is encoded via `str.encode`; anything
-        // else passes through unchanged.
         fn encode(
             obj: PyObjectRef,
             #[default(w_str_new("utf-8"))] encoding: PyObjectRef,
-            #[default(w_str_new("strict"))] errors: PyObjectRef,
+            errors: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            if unsafe { is_str(obj) } {
-                let m = crate::baseobjspace::getattr_str(obj, "encode")?;
-                return crate::call::call_function_impl_result(m, &[encoding, errors]);
-            }
-            Ok(obj)
+            codec_encode_or_decode(obj, encoding, errors, true)
         }
-        // `decode(obj, encoding='utf-8', errors='strict')` — text path of
-        // `PyCodec_Decode`: bytes / bytearray decode via `.decode`;
-        // anything else passes through unchanged.
         fn decode(
             obj: PyObjectRef,
             #[default(w_str_new("utf-8"))] encoding: PyObjectRef,
-            #[default(w_str_new("strict"))] errors: PyObjectRef,
+            errors: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            if unsafe { is_bytes(obj) || is_bytearray(obj) } {
-                let m = crate::baseobjspace::getattr_str(obj, "decode")?;
-                return crate::call::call_function_impl_result(m, &[encoding, errors]);
-            }
-            Ok(obj)
+            codec_encode_or_decode(obj, encoding, errors, false)
         }
     },
     functions: {
         "lookup_error"     / 1 = lookup_error,
         "register_error"   / 2 = register_error,
-        "_unregister_error" / 1 = |_| Ok(w_bool_from(false)),
+        "_unregister_error" / 1 = unregister_error,
         "register"       / 1 = register_codec,
         "unregister"     / 1 = unregister,
         "lookup"         / 1 = lookup_codec,

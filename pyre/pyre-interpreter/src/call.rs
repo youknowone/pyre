@@ -4644,7 +4644,14 @@ pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
                     .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
             };
         if is_kwds {
-            if unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") }.is_some() {
+            // An explicit `metaclass=type` still reaches `descr___prepare__`,
+            // which answers `newdict(module=True)`, so the body runs in a
+            // module dict exactly as the implicit winner does.  Any other
+            // metaclass may define its own `__prepare__` and is undecidable
+            // from here.  The base test below keeps the winner `type`.
+            if let Some(metaclass) = unsafe { pyre_object::w_dict_getitem_str(last, "metaclass") }
+                && !std::ptr::eq(metaclass, crate::typedef::w_type())
+            {
                 return false;
             }
             base_args = &base_args[..base_args.len() - 1];

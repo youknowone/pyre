@@ -2222,6 +2222,24 @@ impl Default for BlackholeInterpBuilder {
     }
 }
 
+/// `blackhole.py _get_method`: the generated handler wrapper assigns
+/// `self.position` and only then re-raises, so a raising instruction leaves the
+/// frame pointing past itself.  Only `RaiseException` carries a coordinate
+/// because only it is read again -- `handle_exception_in_frame` is the sole
+/// consumer of `position` on an error path, and the two control-flow errors end
+/// the frame without another dispatch.
+///
+/// `BlackholeInterpreter::dispatch_step` applies this for the trait path; the
+/// two loops below reach the dispatch table directly, so they apply it here.
+fn sync_raise_position(bh: &mut BlackholeInterpreter, err: &DispatchError) {
+    if let DispatchError::RaiseException {
+        resume_position, ..
+    } = *err
+    {
+        bh.position = resume_position;
+    }
+}
+
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
         Self {
@@ -2429,7 +2447,13 @@ impl BlackholeInterpBuilder {
             if opcode >= self.dispatch_table.len() {
                 panic!("bad opcode {opcode} at position {}", position - 1);
             }
-            position = self.dispatch_table[opcode](bh, code, position)?;
+            position = match self.dispatch_table[opcode](bh, code, position) {
+                Ok(next) => next,
+                Err(err) => {
+                    sync_raise_position(bh, &err);
+                    return Err(err);
+                }
+            };
         }
     }
 
@@ -2483,7 +2507,13 @@ impl BlackholeInterpBuilder {
             let opname = self._insns[opcode_idx].as_str();
             probe(&*bh, pc, opcode, opname);
             position += 1;
-            position = self.dispatch_table[opcode_idx](bh, code, position)?;
+            position = match self.dispatch_table[opcode_idx](bh, code, position) {
+                Ok(next) => next,
+                Err(err) => {
+                    sync_raise_position(bh, &err);
+                    return Err(err);
+                }
+            };
         }
     }
 
@@ -2638,9 +2668,12 @@ fn handle_jitexception_dispatch(
 /// warmspot.py: result = handle_jitexception(e)
 /// warmspot.py:1041-1050: bhcaller._setup_return_value_{i,r,f}(result)
 ///
-/// Returns Ok(()) on success (return value set in bhcaller),
-/// or Err(exc_value) if the exception should be propagated as a
-/// regular exception (ExitFrameWithExceptionRef).
+/// Returns Ok(()) on success (return value set in bhcaller), or the
+/// `JitException` this level could not absorb: `ExitFrameWithExceptionRef`,
+/// which the caller propagates as a regular exception, or the pyre-only
+/// `BailToInterpreter`, which no portal level can absorb at all -- there is no
+/// result to install and no exception to deliver, only a frame the interpreter
+/// has to take back.
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -2649,7 +2682,7 @@ fn handle_jitexception_in_portal(
     bhcaller: &mut BlackholeInterpreter,
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
-) -> Result<(), i64> {
+) -> Result<(), JitException> {
     // warmspot.py handle_jitexception: while True loop.
     // ContinueRunningNormally → portal_runner → may raise JitException → loop.
     let mut current_exc = exc;
@@ -2665,9 +2698,18 @@ fn handle_jitexception_in_portal(
                 }
                 return Ok(());
             }
-            Err(JitException::ExitFrameWithExceptionRef(exc_ref)) => {
+            Err(exc @ JitException::ExitFrameWithExceptionRef(_)) => {
                 // warmspot.py:998-1005: raise as regular exception
-                return Err(exc_ref.0 as i64);
+                return Err(exc);
+            }
+            // A `portal_runner` that re-entered the portal and hit an
+            // `abort_permanent` marker or an unresolved callee reports the bail
+            // here.  `handle_jitexception` refuses one before its walk for the
+            // same reason this arm refuses to redispatch it: dispatching a bail
+            // neither invokes the runner nor changes the exception, so looping
+            // back would spin on the same value forever.
+            Err(exc @ JitException::BailToInterpreter) => {
+                return Err(exc);
             }
             Err(next_exc) => {
                 // warmspot.py:967-968, 979-980: JitException from portal_runner
@@ -2785,9 +2827,21 @@ fn handle_jitexception(
     //
     // In Rust we can do this directly since JitException carries the result.
     let caller = bh.nextblackholeinterp.as_mut().unwrap();
-    let current_exc = match handle_jitexception_in_portal(caller, exc, portal_runner) {
+    let portal_outcome = handle_jitexception_in_portal(caller, exc, portal_runner);
+    let current_exc = match portal_outcome {
         Ok(()) => 0,
-        Err(regular_exc) => regular_exc,
+        Err(JitException::ExitFrameWithExceptionRef(exc_ref)) => exc_ref.0 as i64,
+        // The bail leaves by the same exit the pre-walk refusal above takes:
+        // no level absorbs it, so the chain is released and it propagates to
+        // `_run_forever`'s caller.  The terminal image belongs to the re-entered
+        // portal's own chain, which released it before reporting the bail, so
+        // there is none to publish here.
+        Err(exc @ JitException::BailToInterpreter) => {
+            builder.release_chain(Some(bh));
+            return Err(exc);
+        }
+        // `handle_jitexception_in_portal` returns only those two.
+        Err(other) => unreachable!("portal level reported {other:?}"),
     };
     // blackhole.py:1780: return blackholeinterp, lle
     Ok((bh, current_exc))

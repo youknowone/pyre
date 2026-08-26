@@ -65,22 +65,38 @@ def check_explicit_cause():
 
 
 def check_rendered_implicit_context():
+    seen = set()
     rendered = ""
-    for _ in range(N):
+    for index in range(N):
         try:
             try:
                 raise KeyError("inner")
             except KeyError:
                 raise ValueError("outer")
         except ValueError as exc:
-            stream = io.StringIO()
-            previous = sys.stderr
-            sys.stderr = stream
-            try:
-                sys.excepthook(type(exc), exc, exc.__traceback__)
-            finally:
-                sys.stderr = previous
-            rendered = stream.getvalue()
+            # The fields this loop exists to virtualize, read on every
+            # iteration. The render is `traceback._print_exception_bltin`,
+            # which `sys.excepthook` reaches the way `_PyErr_Display` does:
+            # app-level, and costing more per call than the whole rest of this
+            # file. It runs on the last iteration, inside the loop body so it
+            # still renders an exception the compiled loop produced.
+            seen.add(
+                (
+                    exc.__suppress_context__,
+                    type(exc.__context__),
+                    exc.__traceback__ is not None,
+                )
+            )
+            if index == N - 1:
+                stream = io.StringIO()
+                previous = sys.stderr
+                sys.stderr = stream
+                try:
+                    sys.excepthook(type(exc), exc, exc.__traceback__)
+                finally:
+                    sys.stderr = previous
+                rendered = stream.getvalue()
+    assert seen == {(False, KeyError, True)}, seen
     assert "During handling of the above exception" in rendered, rendered
 
 

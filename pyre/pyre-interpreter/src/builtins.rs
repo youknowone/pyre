@@ -4514,22 +4514,31 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = args.get(1).copied().unwrap_or_else(w_none);
     let traceback = args.get(2).copied().unwrap_or_else(w_none);
-    let mut rendered = Vec::new();
-    crate::error::write_exception_from_parts(&mut rendered, value, traceback)
-        .map_err(|_| crate::PyError::runtime_error("sys.excepthook: failed to write exception"))?;
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
     let stderr = crate::importing::get_sys_module("sys")
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    // An application that set `sys.stderr = None` disabled the stream, and
+    // `PyErr_Display` returns without printing in that case -- ahead of
+    // `_PyErr_Display`, so neither renderer runs, which is why the test sits
+    // here rather than beside the write below.  Only a missing `sys` or a
+    // failing lookup may fall through to the host seam; treating the two alike
+    // leaks the render past the configured sink.
+    if let Some(stderr) = stderr
+        && (stderr.is_null() || unsafe { pyre_object::is_none(stderr) })
+    {
+        return Ok(w_none());
+    }
+    // `_PyErr_Display` offers the exception to the stdlib renderer before
+    // reaching its own, and that renderer writes to `sys.stderr` itself.
+    if crate::error::display_through_traceback_module(value, traceback) {
+        return Ok(w_none());
+    }
+    let mut rendered = Vec::new();
+    crate::error::write_exception_from_parts(&mut rendered, value, traceback)
+        .map_err(|_| crate::PyError::runtime_error("sys.excepthook: failed to write exception"))?;
     if let Some(stderr) = stderr {
-        // An application that set `sys.stderr = None` disabled the stream, and
-        // `_PyErr_Display` returns without printing in that case.  Only a
-        // missing `sys` or a failing lookup may fall through to the host seam;
-        // treating the two alike leaks the render past the configured sink.
-        if stderr.is_null() || unsafe { pyre_object::is_none(stderr) } {
-            return Ok(w_none());
-        }
         // The render is assembled from text the printer already escaped, so it
         // is well-formed WTF-8; a decode failure would mean a byte no writer
         // put there, and the lossy read is the last resort for it.
@@ -8107,6 +8116,23 @@ fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(exc)
 }
 
+/// Convert a Unicode error bound through `__index__` and enforce the
+/// platform's `Py_ssize_t` range before storing it as a plain integer.
+pub(crate) fn unicode_error_index_w(w_value: PyObjectRef) -> Result<i64, crate::PyError> {
+    let value = space_index_w(w_value).map_err(|err| {
+        if err.kind == crate::PyErrorKind::OverflowError
+            && err.message_text() == "int too large to convert to int"
+        {
+            crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+        } else {
+            err
+        }
+    })?;
+    isize::try_from(value)
+        .map(|value| value as i64)
+        .map_err(|_| crate::PyError::overflow_error("Python int too large to convert to C ssize_t"))
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py:433-445
 /// W_UnicodeTranslateError.descr_init` —
 ///
@@ -8141,24 +8167,24 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
     let w_reason = args[4];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_object) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_object)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 4 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 4 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `W_BaseException.descr_init(self, space, [w_object, w_start,
         // w_end, w_reason])` → `self.args_w = args_w`.  The
@@ -8194,25 +8220,24 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_reason = args[5];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_encoding) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_encoding)
+            )));
         }
         if !crate::baseobjspace::isinstance_bytes_like_w(w_object_in) {
-            return Err(crate::PyError::type_error(
-                "argument 2 must be bytes-like, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                crate::error::type_name_of(w_object_in)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 5 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 5 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
         // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
         // `space.newbytes` coerce buffer-protocol producers
@@ -8246,10 +8271,12 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             };
             pyre_object::w_bytes_from_bytes(data)
         };
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         // `interp_exceptions.py:1058-1059` — the args list passed to
         // `W_BaseException.descr_init` is the un-coerced
@@ -8287,30 +8314,31 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     let w_reason = args[5];
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(w_encoding) {
-            return Err(crate::PyError::type_error(
-                "argument 1 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 1 must be str, not {}",
+                crate::error::type_name_of(w_encoding)
+            )));
         }
         if !crate::baseobjspace::isinstance_str_w(w_object) {
-            return Err(crate::PyError::type_error(
-                "argument 2 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 2 must be str, not {}",
+                crate::error::type_name_of(w_object)
+            )));
         }
-        if !crate::baseobjspace::isinstance_int_w(w_start) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
-        if !crate::baseobjspace::isinstance_int_w(w_end) {
-            return Err(crate::PyError::type_error("an integer is required"));
-        }
+        let start = unicode_error_index_w(w_start)?;
+        let end = unicode_error_index_w(w_end)?;
         if !crate::baseobjspace::isinstance_str_w(w_reason) {
-            return Err(crate::PyError::type_error(
-                "argument 5 must be str, not other",
-            ));
+            return Err(crate::PyError::type_error(format!(
+                "argument 5 must be str, not {}",
+                crate::error::type_name_of(w_reason)
+            )));
         }
+        let w_start_value = pyre_object::w_int_new(start);
+        let w_end_value = pyre_object::w_int_new(end);
         pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
         pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end);
+        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
+        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
         pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
             w_encoding, w_object, w_start, w_end, w_reason,
@@ -9663,19 +9691,27 @@ fn exception_group_split_inner(
     Ok((sides[0], sides[1]))
 }
 
+/// `ceval.c _PyEval_ExceptionGroupMatch`, answering `CHECK_EG_MATCH`.
+///
+/// The third element is true exactly when `matching` is a group this call built
+/// around a non-group exception.  Such a wrapper is born here with an empty
+/// traceback and upstream gives it an entry for the frame running the opcode,
+/// which is the frame a later re-raise reports the group as passing through;
+/// only the caller holds that frame, so the decision travels out instead of the
+/// record.
 pub(crate) fn exception_group_match(
     w_exc: PyObjectRef,
     w_type: PyObjectRef,
-) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+) -> Result<(PyObjectRef, PyObjectRef, bool), crate::PyError> {
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     if crate::eval::check_exc_match_against(w_exc, w_type) {
         if crate::baseobjspace::isinstance(w_exc, base_group)? {
-            return Ok((w_exc, pyre_object::w_none()));
+            return Ok((w_exc, pyre_object::w_none(), false));
         }
         let message = unsafe { pyre_object::w_str_new("") };
         let exceptions = pyre_object::w_tuple_new(vec![w_exc]);
         let group = exception_group_new(&[base_group, message, exceptions])?;
-        return Ok((group, pyre_object::w_none()));
+        return Ok((group, pyre_object::w_none(), true));
     }
     if crate::baseobjspace::isinstance(w_exc, base_group)? {
         // Partial match: call the (overridable) `split` method and validate it
@@ -9698,9 +9734,9 @@ pub(crate) fn exception_group_match(
         // the first two elements (match, rest) are used.
         let matching = unsafe { pyre_object::w_tuple_getitem(pair, 0) }.unwrap();
         let rest = unsafe { pyre_object::w_tuple_getitem(pair, 1) }.unwrap();
-        return Ok((matching, rest));
+        return Ok((matching, rest, false));
     }
-    Ok((pyre_object::w_none(), w_exc))
+    Ok((pyre_object::w_none(), w_exc, false))
 }
 
 fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -12716,12 +12752,61 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // so the byte comparison is exact.
     fn opens_triple_quote(source: &str, loc: usize) -> bool {
         let bytes = source.as_bytes();
-        bytes.get(loc).is_some_and(|quote| {
-            bytes.get(loc + 1) == Some(quote) && bytes.get(loc + 2) == Some(quote)
+        // The location names the literal, and a literal starts at its prefix:
+        // `rb"""` opens its triple quote two bytes further on than `"""` does.
+        // `tokenize.py StringPrefix` admits at most two prefix letters.
+        let start = (loc..loc + 2)
+            .take_while(|index| bytes.get(*index).is_some_and(u8::is_ascii_alphabetic))
+            .last()
+            .map_or(loc, |index| index + 1);
+        bytes.get(start).is_some_and(|quote| {
+            bytes.get(start + 1) == Some(quote) && bytes.get(start + 2) == Some(quote)
         })
     }
 
-    let incomplete = if allow_incomplete {
+    // A single-quoted string that meets a newline is over -- that is where
+    // `tok_get_normal_mode` reports `unterminated string literal` -- unless a
+    // continuation took the newline, which carries the string onto the next
+    // line. Reach the end of the source while it is still open and the
+    // tokenizer stops at `E_EOFS` instead, which is more input wanted rather
+    // than a bad program.
+    //
+    // So the string runs to the end only when every newline between its quote
+    // and the end sits behind a continuation; the text after the final newline
+    // has no newline to escape and is where the string is allowed to still be
+    // open. A backslash escapes the character after it, so it is the parity of
+    // the run ending a line that says whether that line's newline was taken.
+    // `a = 'a`, `a = 'a\` and `a = 'a\\` all reach the end still open, while
+    // `a = 'a` and `a = 'a\\` each followed by a newline meet it unescaped and
+    // are errors -- which is how `codeop._maybe_compile`, retrying every
+    // command with one newline appended, tells the two apart.
+    fn ends_open_backslash_run(segment: &str) -> bool {
+        segment.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+    }
+
+    fn string_continues_to_eof(source: &str, loc: usize) -> bool {
+        source.get(loc..).is_some_and(|tail| {
+            let mut segments = tail.split('\n');
+            segments.next_back();
+            segments.all(ends_open_backslash_run)
+        })
+    }
+
+    // A source holding nothing but blank lines and comments has no statement
+    // to fail on, so the parser can only have run out of input: `eval` wants
+    // an expression and the tokenizer reaches EOF still looking for one.
+    fn holds_no_statement(source: &str) -> bool {
+        source.lines().all(|line| {
+            let line = line.trim_start();
+            line.is_empty() || line.starts_with('#')
+        })
+    }
+
+    let incomplete = if !allow_incomplete {
+        false
+    } else if holds_no_statement(source) {
+        true
+    } else {
         match &e {
             crate::compile::CompileError::Parse(error) => match &error.error {
                 ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
@@ -12730,7 +12815,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                     InterpolatedStringErrorType::UnterminatedTripleQuotedString,
                 )) => true,
                 ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
-                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                    let loc = error.raw_location.start().to_usize();
+                    opens_triple_quote(source, loc) || string_continues_to_eof(source, loc)
                 }
                 ParseErrorType::OtherError(message)
                     if message.starts_with("Expected an indented block after")
@@ -12759,10 +12845,40 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                 // but the newline retry as this `OtherError` shape.  CPython
                 // keeps both attempts incomplete; preserve RustPython's
                 // triple-quote test across that parser-shape variation.
+                // `unterminated_string_message` writes `triple-quoted` only
+                // for a literal opened with three quotes, so the message is
+                // itself the evidence and no position has to be read: such a
+                // literal runs to the end of the source by construction, which
+                // is `E_EOFS` -- more input wanted.  `raw_location` cannot
+                // answer it anyway, being ruff's own range rather than the one
+                // the CPython-shaped override reports; for `f"""` the two sit
+                // on different offsets.
                 ParseErrorType::OtherError(message)
-                    if message.starts_with("unterminated triple-quoted string literal") =>
+                    if message.starts_with("unterminated triple-quoted ") =>
                 {
-                    opens_triple_quote(source, error.raw_location.start().to_usize())
+                    true
+                }
+                // The single-quoted spelling arrives the same way, and the
+                // generic arm below reads only whether the source ends on a
+                // newline -- which answers `a = 'a` but gets `a = 'a\` with one
+                // appended wrong, the one shape `codeop._maybe_compile` builds
+                // for every command it retries.
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("unterminated string literal") =>
+                {
+                    let loc = error.raw_location.start().to_usize();
+                    opens_triple_quote(source, loc) || string_continues_to_eof(source, loc)
+                }
+                // A closing bracket with no opener, or one that does not
+                // match the opener, is wrong where it stands rather than short
+                // of input: the tokenizer reports it away from `E_EOF`, so no
+                // continuation makes it parse.  `'x' was never closed` is the
+                // opposite case and `is_unclosed_bracket` answers it above.
+                ParseErrorType::OtherError(message)
+                    if message.starts_with("unmatched ")
+                        || message.starts_with("closing parenthesis ") =>
+                {
+                    false
                 }
                 ParseErrorType::OtherError(_) => {
                     error.raw_location.end().to_usize() >= source.len() && !source.ends_with('\n')
@@ -12771,8 +12887,6 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             },
             _ => false,
         }
-    } else {
-        false
     };
 
     // `syntax_error_subclass` can supply a replacement message, so it
@@ -12813,6 +12927,55 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                 } else {
                     format!("invalid character '{tok}' (U+{code:04X})")
                 }
+            }
+            // The generic parse failures.  CPython's grammar reports a
+            // specific message only where an `invalid_*` rule matches and
+            // spells `invalid syntax` for everything else, so ruff's own
+            // wording for the same shapes is renamed rather than kept: two
+            // statements sharing a line (`x = 1 y = 2`, `impor math`,
+            // `asynch def f(): pass`), a statement that never started
+            // (`x := 0`), and an unmet token expectation (`del x y`,
+            // `for x im n:`).  The arms above stay ahead of these, and a later
+            // one that recognizes a shape CPython does name keeps overwriting
+            // the message the way the fstring and scope-conflict passes below
+            // already do.
+            //
+            // `traceback._find_keyword_typos` also depends on this: it offers a
+            // misspelled keyword only for a SyntaxError whose message is
+            // exactly `invalid syntax`, and a keyword typo reaches the parser
+            // as a name opening a second statement on the line.
+            ParseErrorType::SimpleStatementsOnSameLine
+            | ParseErrorType::SimpleAndCompoundStatementOnSameLine
+            | ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
+            ParseErrorType::OtherError(message) if message == "Expected a statement" => {
+                "invalid syntax".to_owned()
+            }
+            // `ast.c` reports these three through `ast_error`, lower-case and
+            // with `follows` where ruff writes `cannot follow`.
+            ParseErrorType::PositionalAfterKeywordArgument => {
+                "positional argument follows keyword argument".to_owned()
+            }
+            ParseErrorType::PositionalAfterKeywordUnpacking => {
+                "positional argument follows keyword argument unpacking".to_owned()
+            }
+            ParseErrorType::InvalidArgumentUnpackingOrder => {
+                "iterable argument unpacking follows keyword argument unpacking".to_owned()
+            }
+            // The grammar names this one where a call argument is a bare
+            // comprehension: `f(x for x in y, 1)`, `sum(x for x in y, 2)`,
+            // `foo(x, y for y in z, p)`.  A comprehension in a subscript is a
+            // different rejection and reaches a different variant, which is why
+            // renaming this one does not touch `a[x for x in y]`.
+            ParseErrorType::UnparenthesizedGeneratorExpression => {
+                "Generator expression must be parenthesized".to_owned()
+            }
+            // `tok_get_normal_mode` says what it found rather than what it
+            // wanted: a backslash is a continuation only when the newline is
+            // the next character, and anything else after it -- a space, a
+            // comment -- ends the line there.  Running out of source instead is
+            // a different rejection and keeps its own wording.
+            ParseErrorType::Lexical(LexicalErrorType::LineContinuationError) => {
+                "unexpected character after line continuation character".to_owned()
             }
             _ => e.to_string(),
         }
@@ -13012,6 +13175,48 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // is the remaining retag.
     if let Some((name, _)) = subclass {
         error.retag_exception_class(name);
+    }
+    // `pegen.c _PyPegen_set_syntax_error_metadata` hangs the parser's own view
+    // of the failure on the exception -- the start of the last statement it
+    // finished, and the whole source -- and `traceback._find_keyword_typos`
+    // re-tokenizes that slice to offer a misspelled keyword.  Only the parser
+    // records it; a codegen SyntaxError carries none, and the incomplete-input
+    // retag has returned above without one, as upstream's does.
+    //
+    // pyre always parses from a string, so the source is the one in hand.  The
+    // statement start is parser state the ruff error does not carry, and `0` is
+    // what the parser itself records until a statement finishes -- what all but
+    // two of `TestKeywordTypoSuggestions.TYPO_CASES` are given, the other two
+    // getting `1`, which the helper floors to the same slice index as `0`.
+    // Where a statement has finished the constant widens that slice rather than
+    // narrowing it, so the helper's own 1024-character ceiling turns the
+    // suggestion off earlier on a long file, and it keeps the line numbers the
+    // helper reports absolute instead of relative to the slice.
+    if parser_error {
+        // The exception is materialised and pinned before the tuple elements
+        // are built: until it is stamped it lives only in this Rust `PyError`,
+        // which the collector does not scan, so an allocation below could sweep
+        // it.  Each element is likewise pinned as it is made and reloaded at the
+        // end, the discipline `syntax_error_located` uses for the details tuple.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
+        let source_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+        let zero_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
+        let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);
+        let metadata = pyre_object::w_tuple_new(vec![
+            zero,
+            zero,
+            pyre_object::gc_roots::shadow_stack_get(source_slot),
+        ]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                metadata,
+            );
+        }
     }
     error
 }
@@ -13524,6 +13729,9 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
         // includes ONLY_AST and enables constant folding.
         let syntax_check_only = flags & PYCF_OPTIMIZED_AST == PYCF_ONLY_AST;
+        // Kept for the incomplete-input retry below, which the tree builder's
+        // own `opts` has been moved into by then.
+        let retry_opts = opts.clone();
         let result = if source_is_ast {
             // An already materialised AST under plain `PyCF_ONLY_AST` is
             // handed straight back, so `compile(tree, ..., PyCF_ONLY_AST) is
@@ -13551,6 +13759,33 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             )
         };
         return result.map_err(|error| {
+            // `PyCF_ALLOW_INCOMPLETE_INPUT` is a parser flag upstream
+            // (`PyPARSE_ALLOW_INCOMPLETE_INPUT`, read by `_PyPegen_run_parser`),
+            // so asking for a tree answers `_IncompleteInputError` exactly where
+            // asking for code does.  That is the request
+            // `traceback._find_keyword_typos` makes of every keyword it offers:
+            // it accepts a candidate whose source compiles *or* is incomplete,
+            // and a suite header left open by the slice it cut is the ordinary
+            // outcome -- so a plain SyntaxError here rejects every suggestion
+            // whose statement spans more than the failing line.
+            //
+            // The tree builder reports a parse failure without the structure
+            // that decision reads, so the source goes through the compiling
+            // parser to get it; that parse stops at the same failure and never
+            // reaches code generation, and it runs only for a source that has
+            // already failed under the flag -- which is `codeop` and that
+            // helper, nothing else.
+            if flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0
+                && let Some(text) = source_str.as_deref()
+                && let Err(structured) =
+                    crate::compile::compile_source_with_opts(text, mode, &filename, retry_opts)
+            {
+                return replace_compile_syntax_error_filename(
+                    compile_err_to_syntax_error_maybe_incomplete(structured, text, true),
+                    &filename,
+                    filename_bytes.as_deref(),
+                );
+            }
             replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
         });
     }

@@ -1633,6 +1633,67 @@ fn clear_shutdown_modules(
     collect_and_run_finalizers(ec_ptr);
 }
 
+/// `pylifecycle.c finalize_modules_delete_special`, the step `finalize_modules`
+/// takes before it releases any module namespace.
+///
+/// `sys` and `builtins` are torn down last of all, so a user value parked on
+/// one of them outlives every destructor that might complain about it; upstream
+/// clears the usual hiding places up front for that reason.
+///
+/// `sys.meta_path` is among them, and clearing it is what makes an import
+/// attempted from a `__del__` running this late raise `ImportError` instead of
+/// succeeding.  `finalize_modules` reaches that state for every module because
+/// it goes on to empty `sys.modules`, which this step does not: a module
+/// already imported stays importable from a destructor running here.
+///
+/// The three standard streams are restored from their `__`-prefixed originals
+/// rather than cleared, so a destructor still has somewhere to write.
+fn finalize_delete_special() {
+    // `path_hooks` and `path_importer_cache` are cleared by
+    // `_PyImport_FiniExternal`, past where this runs, so they are not here.
+    const SYS_CLEARED: [&str; 10] = [
+        "path",
+        "argv",
+        "ps1",
+        "ps2",
+        "last_exc",
+        "last_type",
+        "last_value",
+        "last_traceback",
+        "__interactivehook__",
+        "meta_path",
+    ];
+    const SYS_STREAMS: [(&str, &str); 3] = [
+        ("stdin", "__stdin__"),
+        ("stdout", "__stdout__"),
+        ("stderr", "__stderr__"),
+    ];
+    if let Some(builtins) = pyre_interpreter::importing::get_sys_module("builtins") {
+        let dict = unsafe { pyre_object::w_module_get_w_dict(builtins) };
+        if !dict.is_null() {
+            unsafe { pyre_object::w_dict_setitem_str(dict, "_", pyre_object::w_none()) };
+        }
+    }
+    let Some(sys) = pyre_interpreter::importing::get_sys_module("sys") else {
+        return;
+    };
+    let dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
+    if dict.is_null() {
+        return;
+    }
+    for name in SYS_CLEARED {
+        // `_PySys_ClearAttrString` binds `None` rather than deleting the name,
+        // so a late reader finds a value that is not there instead of a name
+        // that is not there.
+        unsafe { pyre_object::w_dict_setitem_str(dict, name, pyre_object::w_none()) };
+    }
+    for (name, original) in SYS_STREAMS {
+        let value = unsafe { pyre_object::w_dict_getitem_str(dict, original) }
+            .unwrap_or_else(pyre_object::w_none);
+        unsafe { pyre_object::w_dict_setitem_str(dict, name, value) };
+    }
+}
+
 /// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
 /// threads, collect already-unreachable cycles, then release `__main__`
 /// globals from newest to oldest while the older globals their `__del__`
@@ -1675,6 +1736,10 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // itself holds, so without this a stream owned by any other module loses
     // its buffered writes.
     pyre_interpreter::module::_io::flush_all_streams();
+    // `finalize_modules` opens with this and every release below is its module
+    // teardown, so the clearing has to precede the whole walk rather than sit
+    // beside `clear_shutdown_modules`.
+    finalize_delete_special();
     let mut swept_something_finalizable = collect_and_run_finalizers(ec_ptr);
     let (mut released, mut swept) = (0usize, 0usize);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
@@ -2023,7 +2088,14 @@ fn handle_main_error(
     // on every exit path, not only on SystemExit.  Print first: the raw
     // `PyObjectRef` fields of `e` are not GC-visible and
     // `finalize_runtime` collects.
-    pyre_interpreter::eprint_exception(&e, true);
+    //
+    // `PyErr_Print` is what ends a top-level run upstream, and it reports
+    // through `sys.excepthook`; the direct print is the arm it takes when there
+    // is no hook to reach.
+    let mut e = e;
+    if !pyre_interpreter::error::print_exception_via_excepthook(&mut e) {
+        pyre_interpreter::eprint_exception(&e, true);
+    }
     finalize_runtime(canonical, ec_ptr);
     maybe_print_jit_stats();
     if is_keyboard_interrupt {
@@ -2052,8 +2124,14 @@ fn eval_source_in_main(
         Err(e) => {
             // Render the `File "…", line N` + source + caret + `SyntaxError:`
             // banner for the malformed source, matching an interactive run.
-            let err = pyre_interpreter::compile_err_to_syntax_error(e, source);
-            pyre_interpreter::eprint_syntax_error(&err);
+            // A main file that will not compile is reported by the same
+            // `PyErr_Print` every other top-level failure is, so the hook sees
+            // it too and the stdlib renderer is what offers the keyword the
+            // author meant.
+            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source);
+            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+                pyre_interpreter::eprint_syntax_error(&err);
+            }
             std::process::exit(1);
         }
     };

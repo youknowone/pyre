@@ -3117,6 +3117,19 @@ pub fn gc_set_max_heap_size(size: usize) {
     gc_sync::gc_op(|gc| gc.set_max_heap_size(size));
 }
 
+/// incminimark.py `max_heap_size_already_raised` — whether the program has
+/// already been handed the one `MemoryError` a bounded heap owes it.
+///
+/// The next breach after that one ends the process, so this is what a caller
+/// asks before running Python on its behalf: a module body, a finalizer or any
+/// other nested dispatch collects on a heap that is by definition at its limit,
+/// and the abort takes away whatever the caller had not finished writing.
+/// Unbounded heaps never set it, so the question answers `false` unless a limit
+/// is in force.
+pub fn gc_max_heap_already_raised() -> bool {
+    gc_sync::gc_op(|gc| gc.max_heap_already_raised())
+}
+
 /// rgc.py `move_out_of_nursery` — "Returns another object which is a copy of
 /// obj; but at any point (either now or in the future) the returned object
 /// might suddenly become identical to the one returned.  NOTE: Only use for
