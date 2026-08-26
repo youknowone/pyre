@@ -3217,21 +3217,29 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // tuple, or another nonnumeric immutable value, while the typed
             // jitcode constant pool was classified exactly above.
             let dst_boxed_int = ei.runtime_helper == majit_ir::RuntimeHelperKind::BoxInt;
-            // `clear_in_flight_exception` is not a read, so it stays out of the
-            // list above, but it reaches the same verdict from the other side.
-            // It writes `PY_NULL` into the propagation carrier -- a slot that
-            // exists only to keep a raised exception rooted for the collector,
-            // which nothing reads back as a value -- and `push_exc_info`
-            // performs the same clear at the same point, so re-running this
-            // body reaches the same state rather than doubling anything.
-            // `residual_call.rs` already spells that judgement for this exact
-            // helper, as `writes_gc_liveness_root_only` in the in-flight
-            // FOR_ITER accounting; the question this scan asks of a replay is
-            // the one that comment answers.
-            let clears_gc_liveness_root =
-                ei.runtime_helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
+            // `clear_in_flight_exception` is ABSENT from that list on purpose,
+            // and not because replaying it would double anything: it writes
+            // `PY_NULL` into the propagation carrier, a slot held only to keep
+            // a raised exception rooted for the collector, and `push_exc_info`
+            // performs the same clear at the same point -- which is why
+            // `residual_call.rs` does call it side-effect-free, as
+            // `writes_gc_liveness_root_only`.  Exempting it here is a
+            // PESSIMIZATION, measured, because of where the verdict sends the
+            // body rather than what the verdict says.  The helper is emitted
+            // only by the `push_exc_info` lowering, so a body carrying it owns
+            // an exception table; `verdict()` collapses to `Dirty` on any
+            // poison, `Dirty` reaches `foriter_dirty_bound`, and a
+            // `foriter_dirty_bound` inline that survives has a seeded frame
+            // (`inline_call.rs` declines it without one) -- the
+            // `MetaInterp.perform_call` shape, which in `pyjitpl.py` is the
+            // ONLY way a callee body is inlined at all.  Dropping the poison
+            // promotes the body to `DeferredCall`, whose admission forbids an
+            // exception table outright because ITS abort rewinds to the
+            // caller's CALL: seven `bench/synth` fixtures lose the inline, and
+            // widening that admission does not give it back, because the two
+            // routes do not produce the same inline.  Make the deferred route
+            // frame a handler-bearing callee before making this scan accurate.
             let provably_side_effect_free = replay_safe_read
-                || clears_gc_liveness_root
                 || ei.check_is_elidable()
                 || ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant;
             let accepted_numeric_op = if provably_side_effect_free {
