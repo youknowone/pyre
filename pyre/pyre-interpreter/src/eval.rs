@@ -2271,6 +2271,38 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
             majit_gc::gc_sync::safepoint_poll();
         }
+        // A bounded major collection that reached `max_heap_size` owes a
+        // `MemoryError` — incminimark.py `major_collection_step` raises one
+        // there, and the safepoint above is where the interpreter path's
+        // collections happen but it returns `()` and cannot raise. Deliver it
+        // here, at the same seam an asynchronously delivered signal uses below:
+        // the block search runs at `last_instr`, so a `try` around the region
+        // that was running catches it rather than the frame unwinding.
+        //
+        // Reads the word rather than `dispatch_breaker`: the safepoint above is
+        // the usual armer and it runs after that load, so testing the loaded
+        // copy would defer delivery by a dispatch this loop is not guaranteed
+        // to reach. `take_memory_error` opens with a relaxed load and returns
+        // on it, so the ordinary dispatch pays that load and a branch against a
+        // word it just touched.
+        //
+        // After the park above, not before it: `handle_exception` runs Python
+        // and allocates, and both bits can be armed at once — this thread's
+        // own breach and another thread's STW request. Delivering first would
+        // run a handler through a world the collector has asked to stop.
+        if majit_ir::eval_breaker_word::take_memory_error() {
+            // Park again, on a fresh read: the test above ran against the
+            // dispatch-time copy of the word, and the collection between them
+            // is a whole major cycle, so a request that arrived during it is
+            // not in that copy. Delivery runs a Python handler, which must not
+            // run through a world the collector has asked to stop.
+            majit_gc::gc_sync::safepoint_poll();
+            let mut err = crate::PyError::memory_error("");
+            if handle_exception(frame, &mut err, &mut next_instr) {
+                continue;
+            }
+            return Err(err);
+        }
 
         if next_instr >= code.instructions.len() {
             return Ok(w_none());

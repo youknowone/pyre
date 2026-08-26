@@ -528,6 +528,10 @@ pub fn after_fork_child() {
     STW_DEPTH.store(0, Ordering::SeqCst);
     GC_SYNC.stw_requested.store(false, Ordering::Release);
     majit_ir::eval_breaker_word::clear_stw();
+    // Same reason, for the other deferred bit: a `MemoryError` owed to a thread
+    // that did not survive the fork has no dispatch loop left to raise it in
+    // the child.
+    majit_ir::eval_breaker_word::memory_error_after_fork_child();
     let mut state = GC_SYNC.quiesce.lock().unwrap();
     state.running = usize::from(registered && running);
     GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);

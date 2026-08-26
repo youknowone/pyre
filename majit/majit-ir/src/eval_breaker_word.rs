@@ -15,6 +15,12 @@
 //!   bit4 EB_GC    — the old-gen allocator reached the next-major threshold;
 //!                   OR'd in by the collector, consumed by the interpreter
 //!                   dispatch-loop GC safepoint.
+//!   bit5 EB_MEMORY_ERROR — a bounded major collection exhausted the heap;
+//!                   OR'd in by the collector where upstream raises, consumed
+//!                   by the dispatch loop, which raises `MemoryError` there.
+//!                   Published for every thread because it is a deopt trigger,
+//!                   but delivered only to the thread whose collection
+//!                   exhausted the heap; see `set_memory_error`.
 //! A compiled loop loads the whole word at the back-edge and deopts to the
 //! interpreter when it is non-zero. The interpreter/warm-up loop and the STW
 //! park gate remain authoritative; this word is only the JIT's deopt trigger.
@@ -28,6 +34,7 @@
 //! can briefly deopt before the request is visible, then resume and re-deopt
 //! until coherence propagates it; this is a bounded park-latency window.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// bit0 — async action / signal pending (mirrors a negative ticker).
@@ -41,12 +48,19 @@ pub const EB_GC_INTERP: usize = 8;
 /// bit4 — the old-gen allocator crossed the next-major threshold and a
 /// collection is owed at the next root-complete point.
 pub const EB_GC: usize = 16;
+/// bit5 — a bounded major collection reached `max_heap_size` and a
+/// `MemoryError` is owed at the next root-complete point.
+pub const EB_MEMORY_ERROR: usize = 32;
 /// Bits that require a compiled loop to deopt to the interpreter.
 ///
 /// `EB_GC` belongs here: the allocator only arms the request, and the
 /// collection itself runs at the dispatch-loop safepoint, so a compiled loop
 /// has to leave machine code for the request to be serviced at all.
-pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC;
+///
+/// `EB_MEMORY_ERROR` belongs here for the same reason: the exception is raised
+/// by the dispatch loop, so a compiled loop that never returns to it would run
+/// on past a heap the collector has already declared exhausted.
+pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC | EB_MEMORY_ERROR;
 
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
@@ -137,6 +151,154 @@ pub fn take_gc() -> bool {
     EVAL_BREAKER_WORD.fetch_and(!EB_GC, Ordering::Relaxed) & EB_GC != 0
 }
 
+// --- memory error (bit5): armed by the collector, raised by the dispatch loop ---
+
+thread_local! {
+    /// Whether *this* thread armed a `MemoryError` its own dispatch loop has
+    /// not raised yet.
+    ///
+    /// The exception belongs to the thread whose collection exhausted the
+    /// heap, the way upstream's `raise MemoryError` unwinds through whichever
+    /// driver was on the stack. The bit alone cannot say that: it is process
+    /// global, and a stop-the-world collection resumes the other mutators
+    /// before the collecting one returns to its dispatch loop, so without this
+    /// an unrelated thread could reach a back edge first and take an exception
+    /// nothing it did earned — leaving the thread that did exhaust the heap
+    /// running on toward the fatal rung.
+    static MEMORY_ERROR_OWED: OwedMemoryError = const { OwedMemoryError(Cell::new(false)) };
+}
+
+/// This thread's half of the debt [`MEMORY_ERROR_OWERS`] counts.
+///
+/// A type with a destructor rather than a bare `Cell`, because a thread can
+/// exit still owing one: the exception is raised by a dispatch loop, and a
+/// thread whose loop has already returned never reaches another. Left on the
+/// census that debt is unpayable — the count never falls to zero, so no later
+/// owner clears the bit, and `EB_MEMORY_ERROR` is in `JIT_BREAKER_MASK`, so
+/// every back edge in the process fails from then on. It also freezes the
+/// collector's ladder, which reads [`memory_error_armed`] to tell a breach
+/// that repeats an exception the program already has from one that is new.
+struct OwedMemoryError(Cell<bool>);
+
+impl Drop for OwedMemoryError {
+    fn drop(&mut self) {
+        if self.0.replace(false) {
+            release_one_owed();
+        }
+    }
+}
+
+/// Take one undelivered exception off the census, clearing the bit if it was
+/// the last.
+fn release_one_owed() {
+    if MEMORY_ERROR_OWERS.fetch_sub(1, Ordering::AcqRel) != 1 {
+        return;
+    }
+    EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
+    // Another thread may have armed one between the decrement and the clear,
+    // and set a bit this then removed. Re-publish the summary it is owed;
+    // setting an already-set bit is what the racing arm did anyway, so this is
+    // idempotent rather than a second signal.
+    if MEMORY_ERROR_OWERS.load(Ordering::Acquire) != 0 {
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+    }
+}
+
+/// Rebuild the census around the one thread `fork()` leaves running.
+///
+/// `rthread.thread_after_fork()` parity: the child has only the thread that
+/// called `fork()`, and the others' debts have no dispatch loop left to pay
+/// them there. A vanished thread runs no destructor, so [`OwedMemoryError`]
+/// cannot clear them either, and keeping the count would arm the bit in the
+/// child for good.
+pub fn memory_error_after_fork_child() {
+    let owed_here = MEMORY_ERROR_OWED.with(|owed| owed.0.get());
+    MEMORY_ERROR_OWERS.store(usize::from(owed_here), Ordering::SeqCst);
+    if owed_here {
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+    } else {
+        EVAL_BREAKER_WORD.fetch_and(!EB_MEMORY_ERROR, Ordering::Relaxed);
+    }
+}
+
+/// How many threads owe an undelivered `MemoryError`.
+///
+/// The bit is the summary a back edge polls, and only the last owner to
+/// deliver may clear it. Counting is what tells that owner apart from the
+/// others.
+static MEMORY_ERROR_OWERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that a bounded major collection reached `max_heap_size`.
+///
+/// incminimark.py `major_collection_step` reacts to that with a plain `raise
+/// MemoryError`, so upstream's exception surfaces wherever the collection was
+/// driven from. Most of pyre's collections are driven from the dispatch-loop
+/// safepoint, which returns `()` and cannot raise, so the collector arms this
+/// bit and the loop raises on the next dispatch instead. The bit rather than a
+/// return value, because the safepoint is one of several drivers — an
+/// allocation, a finalizer run and an explicit collection request reach the
+/// same collection — and only the dispatch loop can turn any of them into an
+/// exception.
+///
+/// Call this on the thread that drove the collection: the exception is owed to
+/// that thread, and the bit only publishes that one is owed to someone.
+pub fn set_memory_error() {
+    MEMORY_ERROR_OWED.with(|owed| {
+        if owed.0.replace(true) {
+            // Already owed here and not yet delivered, so the count and the
+            // bit already stand for this thread.
+            return;
+        }
+        MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+    });
+}
+
+/// Whether a `MemoryError` armed by [`set_memory_error`] is still owed, to any
+/// thread.
+///
+/// [`take_memory_error`] clears the bit as the last owner delivers, so this
+/// reads true for exactly the window between arming an exception and every
+/// thread that was owed one raising it. The collector reads it to tell a breach
+/// that arrives inside that window from one that arrives after the program has
+/// had its exception — a question about the program, not about a thread, which
+/// is why this reads the process-wide summary.
+pub fn memory_error_armed() -> bool {
+    EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_MEMORY_ERROR != 0
+}
+
+/// Whether *this* thread is the one still owed a `MemoryError`.
+///
+/// The collector's max-heap ladder asks it to tell a breach that repeats an
+/// exception this thread has already been given from one that is new to it.
+/// [`memory_error_armed`] cannot answer that: it reports the process-wide
+/// summary, so an exception owed to another thread would read as this thread's
+/// own and silence a breach that thread never caused.
+pub fn memory_error_owed_here() -> bool {
+    MEMORY_ERROR_OWED.with(|owed| owed.0.get())
+}
+
+/// Consume the `MemoryError` owed to *this* thread, reporting whether one was.
+///
+/// A thread that is not owed one leaves the bit alone and deopts again at its
+/// next back edge, until the owner delivers. That window is bounded the way the
+/// STW one is: arming happens inside the owner's own safepoint, so its very
+/// next dispatch takes it.
+pub fn take_memory_error() -> bool {
+    // Same shape as `take_gc`: the taker runs per dispatch and the armer only
+    // when a bounded heap is exhausted, so keep the common case a plain load.
+    if EVAL_BREAKER_WORD.load(Ordering::Relaxed) & EB_MEMORY_ERROR == 0 {
+        return false;
+    }
+    MEMORY_ERROR_OWED.with(|owed| {
+        if !owed.0.replace(false) {
+            return false;
+        }
+        release_one_owed();
+        true
+    })
+}
+
 /// Depth of the operation chain between the poll's load and its guard.
 ///
 /// The recorder emits `RawLoadI -> IntAnd -> IntIsTrue -> GuardFalse`, so two
@@ -204,6 +366,164 @@ mod tests {
 
     fn bind(op: Op) -> crate::operand::Operand {
         crate::operand::Operand::from_bound_op(&Rc::new(op))
+    }
+
+    /// Both memory-error tests read the process-global bit and assert on its
+    /// resting state, so they cannot run at the same time as each other.
+    static MEMORY_ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The owed `MemoryError` is one-shot: armed once by the collector, raised
+    /// once by the dispatch loop of the thread it is owed to. A second take
+    /// must see nothing, or one breach would raise two `MemoryError`s.
+    ///
+    /// It must also be a bit the back-edge poll tests, since the raise happens
+    /// in the dispatch loop and a compiled loop has to leave machine code to
+    /// get there.
+    #[test]
+    fn the_owed_memory_error_is_taken_exactly_once() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !take_memory_error(),
+            "nothing has armed the bit, so it must not report one pending"
+        );
+        set_memory_error();
+        assert_ne!(
+            load() & JIT_BREAKER_MASK,
+            0,
+            "an armed MemoryError must fail the back-edge poll"
+        );
+        assert!(take_memory_error(), "the armed bit is reported once");
+        assert!(!take_memory_error(), "and only once");
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "taking it clears it, so later back edges are not deopted"
+        );
+    }
+
+    /// The exception belongs to the thread whose collection exhausted the
+    /// heap, not to whichever dispatch loop polls first.
+    ///
+    /// Upstream raises inside the collection, so the driver on that thread's
+    /// stack is the one that receives it. Pyre defers through a process-global
+    /// word, and a stop-the-world collection resumes the other mutators before
+    /// the collecting one returns to its own dispatch loop — so without
+    /// ownership the first unrelated thread to reach a back edge would take an
+    /// exception nothing it did earned, and the thread that did exhaust the
+    /// heap would run on toward the fatal rung with nothing owed to it.
+    #[test]
+    fn the_owed_memory_error_goes_to_the_thread_that_armed_it() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The owner stays alive until it has delivered. A thread that exits
+        // still owing hands the debt back — see the test below — so joining it
+        // here would clear the very bit this test is watching.
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (deliver_tx, deliver_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            set_memory_error();
+            // The summary is published for everyone, so a compiled loop on any
+            // thread leaves machine code — the bit is the deopt trigger, not
+            // the delivery.
+            assert_ne!(load() & EB_MEMORY_ERROR, 0);
+            assert!(memory_error_armed());
+            armed_tx.send(()).unwrap();
+            deliver_rx.recv().unwrap();
+            assert!(take_memory_error(), "the owner is the thread that raises");
+        });
+        armed_rx.recv().unwrap();
+
+        assert!(
+            memory_error_armed(),
+            "the exception is still owed, so the summary stays published"
+        );
+        assert!(
+            !take_memory_error(),
+            "this thread armed nothing, so it is owed nothing"
+        );
+        assert_ne!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "and a thread that is owed nothing must not clear the owner's bit"
+        );
+
+        deliver_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the last owner to deliver clears the summary"
+        );
+    }
+
+    /// A thread can exit while still owed one, and the debt has to leave the
+    /// census with it. The exception is raised by a dispatch loop, so a thread
+    /// whose loop has already returned never reaches another; left counted,
+    /// nothing can ever clear the bit again.
+    #[test]
+    fn a_thread_that_exits_still_owing_hands_the_debt_back() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::thread::spawn(|| {
+            set_memory_error();
+            assert!(
+                memory_error_armed(),
+                "the summary is published while it lives"
+            );
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the owner exited without delivering, so nothing is owed any more"
+        );
+        assert!(
+            !take_memory_error(),
+            "and no other thread inherits an exception it never earned"
+        );
+    }
+
+    /// `fork()` leaves one thread running, so in the child every other thread's
+    /// debt is unpayable. The census has to be rebuilt around the survivor.
+    #[test]
+    fn the_fork_child_keeps_only_the_surviving_threads_debt() {
+        let _guard = MEMORY_ERROR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A sibling's debt, modelled by hand: a thread that vanishes at
+        // `fork()` runs no destructor, so an owner spawned here — which does —
+        // cannot stand in for one.
+        MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
+        EVAL_BREAKER_WORD.fetch_or(EB_MEMORY_ERROR, Ordering::Relaxed);
+
+        memory_error_after_fork_child();
+        assert_eq!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "the thread that called fork owes nothing, so the child owes nothing"
+        );
+        assert_eq!(MEMORY_ERROR_OWERS.load(Ordering::Acquire), 0);
+
+        // The survivor's own debt is the half that is kept.
+        set_memory_error();
+        MEMORY_ERROR_OWERS.fetch_add(1, Ordering::AcqRel);
+        memory_error_after_fork_child();
+        assert_ne!(
+            load() & EB_MEMORY_ERROR,
+            0,
+            "an exception owed to the surviving thread is still owed after the fork"
+        );
+        assert!(
+            take_memory_error(),
+            "and it is still that thread's to raise"
+        );
+        assert_eq!(load() & EB_MEMORY_ERROR, 0);
     }
 
     fn int(value: i64) -> crate::operand::Operand {

@@ -9064,6 +9064,43 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // maybe_compile_and_run, jit_merge_point).
         let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
 
+        // The plain evaluator's twin: a bounded major collection that reached
+        // `max_heap_size` owes a `MemoryError`, and the safepoint above — which
+        // is where the interpreter path collects — cannot raise one.
+        // `EB_MEMORY_ERROR` is in `JIT_BREAKER_MASK`, so a compiled loop leaves
+        // machine code for this seam instead of running on past an exhausted
+        // heap, and delivering before `jit_merge_point` below keeps a hot loop
+        // from re-entering compiled code with the exception still owed.
+        //
+        // Reads the word rather than `dispatch_breaker`, and the difference is
+        // not academic: the safepoint above is the usual armer and it runs
+        // after that load, so `dispatch_breaker` is one dispatch stale. This
+        // loop is not guaranteed a next dispatch — measured, a run under
+        // `--heapsize` reaches this seam with the bit set exactly once — so a
+        // stale test does not delay the exception, it drops it, and the
+        // program's next sign of a full heap is the abort on the second breach.
+        if majit_ir::eval_breaker_word::take_memory_error() {
+            // Park again, on a fresh read: the test above ran against the
+            // dispatch-time copy of the word, and the collection between them
+            // is a whole major cycle, so a request that arrived during it is
+            // not in that copy. Delivery runs a Python handler, which must not
+            // run through a world the collector has asked to stop.
+            majit_gc::gc_sync::safepoint_poll();
+            let mut err = pyre_interpreter::PyError::memory_error("");
+            let mut next_instr = unsafe { &*f }.next_instr();
+            if pyre_interpreter::eval::handle_exception(
+                unsafe { &mut *f },
+                &mut err,
+                &mut next_instr,
+            ) {
+                // handle_exception allocates → re-seed before the write.
+                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
+                continue;
+            }
+            return LoopResult::Done(Err(err));
+        }
+
         if unsafe { &*f }.next_instr() >= code.instructions.len() {
             return LoopResult::Done(Ok(w_none()));
         }

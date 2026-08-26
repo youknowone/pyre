@@ -475,11 +475,19 @@ impl Default for OldGen {
 
 impl Drop for OldGen {
     fn drop(&mut self) {
-        for object in self.old_rawmalloced_objects.drain(..) {
-            unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
-        }
-        for object in self.raw_malloc_might_sweep.drain(..) {
-            unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
+        // All three raw-malloc lists, because a block is on exactly one of
+        // them and teardown can arrive at any point in a cycle: between a
+        // young rawmalloc birth and the minor that would sweep it, or mid
+        // sweep with `raw_malloc_might_sweep` still holding the remainder.
+        let lists = [
+            &mut self.old_rawmalloced_objects,
+            &mut self.raw_malloc_might_sweep,
+            &mut self.young_rawmalloced_objects,
+        ];
+        for list in lists {
+            for object in list.drain(..) {
+                unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
+            }
         }
     }
 }
