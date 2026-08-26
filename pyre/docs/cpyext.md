@@ -564,11 +564,35 @@ Known divergences, each documented at its definition:
   a `bytes` nor a `str` mirror carries the field the reference header reads,
   the storage being a cached copy rather than a tail allocated with the
   object;
-- a C exporter's view must be C-contiguous and free of suboffsets: a strided or
-  indirect export is refused. The `Py_buffer` a `bf_getbuffer` filled in is kept
-  and handed back to `bf_releasebuffer` unchanged -- `internal` is the
-  exporter's own state -- keyed by the exported address, since the interpreter
-  object it belongs to moves and the foreign memory does not;
+- a C exporter's view keeps whatever geometry it declares -- strided,
+  multi-dimensional, or indirect through `suboffsets`. Where a contiguous
+  one-dimensional export becomes the same `RawBufferView` any in-heap exporter
+  produces, everything else rides on a variant carrying its own `shape`,
+  `strides` and `suboffsets`, ported from `CPyBuffer`
+  (`pypy/module/cpyext/buffer.py`). Two deliberate deviations go with it, both
+  toward CPython 3.14 and away from what pypy does today:
+  - **suboffsets are honoured, where pypy declines them.** `BufferView.get_offset`
+    carries `# TODO suboffsets?` at the `ADJUST_PTR` site, `_init_flags` guards
+    `MEMORYVIEW_PIL` behind `if False`, and `w_get_suboffsets` answers `()`
+    unconditionally. pyre implements `HAVE_PTR` / `ADJUST_PTR`, `init_suboffsets`
+    and the `_Py_MEMORYVIEW_PIL` flag rule instead. An element behind a
+    suboffset has no byte offset within the backing, so the address is chained
+    dimension by dimension rather than summed, and the byte-slice bound the
+    direct walk clamps against does not apply to it: past the first
+    dereference the exporter's own pointers are the only description of the
+    target, which is the trust CPython extends as well.
+  - **a slice's length is `product(shape) * itemsize`, where `BufferSlice.getlength`
+    is `shape[0] * itemsize`.** pypy has the same formula in-tree as
+    `bytecount_from_shape`, but nothing reads it back; pyre folded
+    `W_MemoryView.length` into the view, so the arm takes `init_len`'s answer.
+  A window is computed for the storage a strided export addresses, because
+  `Buffer::as_bytes` hands out a bounded slice where CPython and pypy both index
+  a raw pointer: a negative stride reaches below `Py_buffer.buf`, so the block
+  is lowered to the window's low end and the view's offset carries the shift.
+  The `Py_buffer` a `bf_getbuffer` filled in is kept and handed back to
+  `bf_releasebuffer` unchanged -- `internal` is the exporter's own state --
+  keyed by the exported address, since the interpreter object it belongs to
+  moves and the foreign memory does not;
 - a `memoryview` that is never released never ends its export, pyre having no
   reference counting to end it at the last drop;
 - the argument parser words a bad argument its own way: every message is
