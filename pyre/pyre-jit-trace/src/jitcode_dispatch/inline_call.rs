@@ -824,6 +824,14 @@ fn descent_unlowered_helper_scan_enabled() -> bool {
 /// This is deliberately separate from the memoized decision above: production
 /// needs only the effect-aware verdict, while the diagnostic pays to enumerate
 /// the whole body and every callee named by `inline_call_*`.
+///
+/// The blockers print as bare symbolic funcbox hashes, which name nothing on
+/// their own. The hash-to-path map is not in the binary — it is snapshotted by
+/// the translation pipeline (`symbolic_fnaddr_paths_snapshot`) and written to
+/// the codegen cache, so resolve a hash by reading `symbolic_fnaddr_paths` out
+/// of the newest `build/pyre-jit-trace-cache/*/*/jit_metadata.json` (newest by
+/// mtime — older generations hold different jitcode indices for the same path).
+/// A hash whose high bit is set is stored there as a negative `i64`.
 fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
     if !fbw_inline_diag_enabled() {
         return;
@@ -848,6 +856,105 @@ fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
         "[builtin-inline-blockers] jitcode={jitcode_index} n={} {named}",
         blockers.len()
     );
+
+    let mut reachable = Vec::new();
+    collect_descent_effect_aware_blockers(
+        jitcode_index,
+        false,
+        &mut std::collections::HashSet::new(),
+        &mut reachable,
+    );
+    let after_effect = reachable.iter().filter(|&&(_, effect)| effect).count();
+    let named = reachable
+        .iter()
+        .map(|&(blocker, effect)| format!("{blocker:#x}{}", if effect { "*" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[builtin-inline-reachable] jitcode={jitcode_index} n={} after_effect={after_effect} {named}",
+        reachable.len()
+    );
+}
+
+/// Every un-lowered helper an effect-aware walk of `jitcode_index` reaches,
+/// each paired with whether an effect had already been applied on some path to
+/// it — the `*` suffix in the `[builtin-inline-reachable]` line.
+///
+/// [`summarize_descent_blockers`] answers the production question, "does this
+/// descent abort unrewindably", and so stops at the first blocker on each path
+/// and names one.  Removing a wall asks the other question: what stands behind
+/// that first blocker, because clearing it only moves the decline to the next.
+/// This walk therefore records a blocker and keeps going, which turns the
+/// decline into a work list — and, read against
+/// [`collect_descent_unlowered_helper_blockers`]'s whole-body census, separates
+/// the helpers a descent can actually reach from the ones sitting on arms it
+/// never takes.
+///
+/// The two lists are not one walk with a flag because they answer to different
+/// costs: the census enumerates bytes, while this reruns the dataflow.
+///
+/// Blockers found in an `inline_call` callee are appended after the caller's
+/// own rather than interleaved at the call, so this is walk order per body and
+/// not strictly byte order across the descent.  The first blocker is already
+/// named by the decline line; what this adds is the set.
+///
+/// A body is walked at most once per entry-effect state rather than once per
+/// path reaching it.  Both are sound for a set, but re-walking runs this
+/// body-wide fixpoint once per path through the callee DAG, which does not
+/// terminate in practice: the whole-body census next door survives the same
+/// shape only because its per-body cost is one linear decode.
+fn collect_descent_effect_aware_blockers(
+    jitcode_index: usize,
+    entry_effect: bool,
+    visited: &mut std::collections::HashSet<(usize, bool)>,
+    out: &mut Vec<(i64, bool)>,
+) {
+    if !visited.insert((jitcode_index, entry_effect)) {
+        return;
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return;
+    };
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    // Collected rather than recorded in place: both hooks would otherwise hold
+    // `out` borrowed at once.
+    let mut here: Vec<(i64, bool)> = Vec::new();
+    let mut callees: Vec<(usize, bool)> = Vec::new();
+    summarize_body_blockers_with(
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index, caller_effect| {
+            let callee = descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
+            callees.push((callee, caller_effect));
+            // The memoizing entry point, so a cycle among callees terminates
+            // inside it rather than through this walk's own `seen`.
+            Some(descent_blocker_summary(callee))
+        },
+        &mut |blocker, effect| {
+            here.push((blocker, effect));
+            false
+        },
+    );
+    for (blocker, effect) in here {
+        record_reachable_blocker(out, blocker, entry_effect || effect);
+    }
+    for (callee, caller_effect) in callees {
+        collect_descent_effect_aware_blockers(callee, entry_effect || caller_effect, visited, out);
+    }
+}
+
+/// Add one blocker to the reachable list, keeping the first sighting's position
+/// and widening its effect flag: reaching the same helper once with an effect
+/// behind it is what makes it a decline, however many effect-free paths also
+/// reach it.
+fn record_reachable_blocker(out: &mut Vec<(i64, bool)>, blocker: i64, effect: bool) {
+    match out.iter_mut().find(|(known, _)| *known == blocker) {
+        Some((_, known_effect)) => *known_effect |= effect,
+        None => out.push((blocker, effect)),
+    }
 }
 
 /// Collect the distinct symbolic funcboxes in a body's decoded byte stream and
@@ -1060,6 +1167,35 @@ pub(crate) fn summarize_body_blockers(
     constants_i: &[i64],
     mut callee_summary: impl FnMut(usize) -> Option<DescentBlockerSummary>,
 ) -> DescentBlockerSummary {
+    summarize_body_blockers_with(
+        code,
+        num_regs_i,
+        constants_i,
+        |descr_index, _caller_effect| callee_summary(descr_index),
+        &mut |_blocker, _effect| true,
+    )
+}
+
+/// [`summarize_body_blockers`] with the two hooks the diagnostic needs.
+///
+/// `on_blocker` is told each blocker and whether an effect had been applied
+/// before it, and answers whether the walk stops there.  The production
+/// summary stops, because that is where the descent aborts; a walk that wants
+/// what stands *behind* the first blocker keeps going, treating the call as
+/// having returned an unknown value — which is what the destination-blanking
+/// below already does for any non-`int_copy` write.
+///
+/// `callee_summary` is additionally told the caller's effect state at the
+/// `inline_call`, which the summary itself does not need — it folds the two
+/// cases through `blocker_after_effect.or(blocker_effect_free)` — but which a
+/// walk descending into the callee needs to classify what it finds there.
+fn summarize_body_blockers_with(
+    code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
+    on_blocker: &mut dyn FnMut(i64, bool) -> bool,
+) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
     // Instruction starts, so a decoded branch target that lands mid-op (or
@@ -1164,21 +1300,23 @@ pub(crate) fn summarize_body_blockers(
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
-                // The walk stops here, so this op has no successors.
                 let slot = if effect {
                     &mut summary.blocker_after_effect
                 } else {
                     &mut summary.blocker_effect_free
                 };
                 slot.get_or_insert(*fnaddr);
-                continue;
+                if on_blocker(*fnaddr, effect) {
+                    // The walk stops here, so this op has no successors.
+                    continue;
+                }
             }
         } else if d.opname.starts_with("inline_call") {
             // `inline_call_*` opens with the `d` descr operand, a two-byte
             // index into the descriptor pool, naming the callee JitCode.
             let descr_index = code.get(d.pc + 1).copied().unwrap_or(0) as usize
                 | ((code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
-            if let Some(callee) = callee_summary(descr_index) {
+            if let Some(callee) = callee_summary(descr_index, effect) {
                 // Entering with an effect behind us turns every blocker the
                 // callee holds into one that cannot be rewound.
                 let after = if effect {
