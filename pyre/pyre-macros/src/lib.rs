@@ -203,7 +203,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             // supplied positionals; the Signature binder has already
             // rejected genuine positional overflow before entering here.
             quote! {
-                if __pyre_positional_count > #total
+                if __pyre_positional_count > #total as i64
                     && args.len() != __PYRE_PARAM_NAMES.len()
                 {
                     return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
@@ -211,13 +211,13 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         } else {
             quote! {
-                if __pyre_positional_count > #total {
+                if __pyre_positional_count > #total as i64 {
                     return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
                 }
             }
         };
         quote! {
-            if __pyre_positional_count < #required {
+            if __pyre_positional_count < #required as i64 {
                 return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
             }
             #too_many_guard
@@ -2040,10 +2040,14 @@ fn expand_pyre_methods(
                         return crate::gateway::method_noarg_failure(
                             args,
                             #arity_name,
-                            #receiver_slots,
+                            #receiver_slots as i64,
                         );
                     }
-                    let __pyre_positional_count = args.len();
+                    // PyPy `argument.py:_match_signature` carries argument
+                    // counts as RPython Signed.  Keep this generated gateway
+                    // local in that type; `usize` belongs only at Rust slice
+                    // indexing boundaries.
+                    let __pyre_positional_count = args.len() as i64;
                 }
             } else {
                 quote! {
@@ -2127,27 +2131,37 @@ fn expand_pyre_methods(
                         crate::gateway::method_arity_failure(
                             #arity_name,
                             #expected,
-                            __pyre_positional_count.saturating_sub(#receiver_slots),
+                            __pyre_user_positional_count,
                         )
                     }
                 } else {
                     quote! {
                         crate::gateway::method_min_arity_failure(
                             #arity_name,
-                            #visible_required,
-                            __pyre_positional_count.saturating_sub(#receiver_slots),
+                            #visible_required as i64,
+                            __pyre_user_positional_count,
                         )
                     }
                 };
                 quote! {
-                    if __pyre_positional_count < #expected_min {
+                    // PyPy's `input_argcount`/`upfront` calculation is
+                    // ordinary Signed arithmetic.  Spell out the lower
+                    // bound instead of introducing Rust's integer-method
+                    // call into every generated gateway graph.
+                    let __pyre_user_positional_count =
+                        if __pyre_positional_count > #receiver_slots as i64 {
+                            __pyre_positional_count - #receiver_slots as i64
+                        } else {
+                            0i64
+                        };
+                    if __pyre_positional_count < #expected_min as i64 {
                         return #too_few;
                     }
-                    if __pyre_positional_count > #expected_total {
+                    if __pyre_positional_count > #expected_total as i64 {
                         return crate::gateway::method_arity_failure(
                             #arity_name,
                             #expected,
-                            __pyre_positional_count.saturating_sub(#receiver_slots),
+                            __pyre_user_positional_count,
                         );
                     }
                 }

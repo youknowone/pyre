@@ -5163,9 +5163,13 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// every `__majit_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
-pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
-    let mut count = 0;
-    while count < args.len() && !args[count].is_null() {
+pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
+    // PyPy `argument.py:_match_signature` keeps `num_args`, `upfront`, and
+    // every derived argument count as ordinary RPython Signed values.  Rust
+    // slice indexing needs `usize`, but that is an indexing adapter, not the
+    // semantic type of the gateway count.
+    let mut count = 0i64;
+    while count < args.len() as i64 && !args[count as usize].is_null() {
         count += 1;
     }
     count

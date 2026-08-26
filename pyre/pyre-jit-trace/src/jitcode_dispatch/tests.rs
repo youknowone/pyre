@@ -676,6 +676,17 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 }
 
 #[test]
+fn gateway_positional_count_uses_rpython_signed() {
+    let count = named_jitcode("leading_non_null_count")
+        .expect("gateway positional-count helper jitcode");
+    assert_eq!(count.calldescr.result_type, 'i');
+    assert!(
+        count.calldescr.result_signed,
+        "PyPy argument.py keeps num_args/upfront/input_argcount as RPython Signed"
+    );
+}
+
+#[test]
 fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
         named_jitcode("__majit_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
