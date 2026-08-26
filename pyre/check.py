@@ -2111,6 +2111,59 @@ def synth_spec_folds(path):
     return names
 
 
+def synth_fixture_headers(path):
+    """Every directive `path` owes, read in one pass.
+
+    Which of the readers above apply depends on the fixture's kind, so that
+    rule lives here rather than being restated at each consumer. Raises
+    `ValueError` on this fixture's first unusable directive.
+    """
+    selfcheck = synth_selfcheck(path)
+    headers = {
+        "selfcheck": selfcheck,
+        "skip_backends": synth_skip_backends(path),
+        "spec_folds": synth_spec_folds(path),
+    }
+    if selfcheck:
+        interpreted = synth_selfcheck_interpreted(path)
+        headers["interpreted"] = interpreted
+        headers["want_compiles"] = (
+            () if interpreted else synth_selfcheck_compiles(path)
+        )
+    else:
+        headers["max_pypy_ratio"] = synth_perf_gate(path)
+        headers["max_rss_mb"] = synth_rss_gate(path)
+        headers["skip_cpython"] = synth_skip_cpython(path)
+        headers["no_cpython"] = synth_no_cpython(path)
+        # `_apply_snapshot_gate` reads these two per backend and nothing there
+        # catches a `ValueError`, so an unusable value in either arrived as a
+        # traceback out of a backend run. Read here for the raise alone; the
+        # gate still reads them itself, once it knows which backend it is.
+        synth_ungated_jitstats(path)
+        synth_jitstats_bands(path)
+    return headers
+
+
+def report_unusable_headers(errors):
+    """Name every fixture whose header could not be read, not just the first.
+
+    `pyre/bench/synth/` is shared, so a directive this script requires reds
+    every fixture that arrives without it, and stopping at the first one costs
+    a CI run per name. Fixtures that fail the same way share a block, so the
+    guidance the reader wrote is printed once instead of once per fixture.
+    """
+    groups = {}
+    for path, message in errors:
+        groups.setdefault(message.replace(str(path), "<fixture>"), []).append(path)
+    print(f"{red('ERROR')}: {len(errors)} fixture(s) with a header this suite cannot read")
+    for message, paths in groups.items():
+        print()
+        for path in paths:
+            print(f"  {path}")
+        for line in message.splitlines():
+            print(f"    {line}")
+
+
 # `[spec-census] fold=<label> consulted=N fired=N suppressed=N site=... parent=...`
 SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
 
@@ -4499,20 +4552,16 @@ class Check:
                 self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
         return False
 
-    def run_synthetic_bench(self, path, timeout):
+    def run_synthetic_bench(self, path, timeout, headers):
         self.maybe_refresh_startups()
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
-        try:
-            max_pypy_ratio = synth_perf_gate(path)
-            max_rss_mb = synth_rss_gate(path)
-            skip_backends = synth_skip_backends(path)
-            skip_cpython = synth_skip_cpython(path)
-            no_cpython = synth_no_cpython(path)
-            spec_folds = synth_spec_folds(path)
-        except ValueError as e:
-            print(f"{red('ERROR')}: {e}")
-            sys.exit(1)
+        max_pypy_ratio = headers["max_pypy_ratio"]
+        max_rss_mb = headers["max_rss_mb"]
+        skip_backends = headers["skip_backends"]
+        skip_cpython = headers["skip_cpython"]
+        no_cpython = headers["no_cpython"]
+        spec_folds = headers["spec_folds"]
 
         print(f"  {name}")
 
@@ -4622,36 +4671,34 @@ class Check:
 
         print(bold("synthetic parity suite"))
         print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
+        # Read every fixture's header before running any of them: a missing or
+        # malformed directive is an authoring error, and it is reported with
+        # the others of its kind rather than one per run.
+        headers, unusable = {}, []
         for path in paths:
             try:
-                selfcheck = synth_selfcheck(path)
-                skip_backends = synth_skip_backends(path) if selfcheck else ()
-                # Every header a selfcheck fixture owes, read inside the same
-                # try: a missing or malformed directive is an authoring error
-                # to report by name, not a traceback out of the suite loop.
-                selfcheck_folds = synth_spec_folds(path) if selfcheck else ()
-                interpreted = selfcheck and synth_selfcheck_interpreted(path)
-                want_compiles = (
-                    synth_selfcheck_compiles(path)
-                    if selfcheck and not interpreted
-                    else ()
-                )
+                headers[path] = synth_fixture_headers(path)
             except ValueError as e:
-                print(f"{red('ERROR')}: {e}")
-                sys.exit(1)
-            if selfcheck:
+                unusable.append((path, str(e)))
+        if unusable:
+            report_unusable_headers(unusable)
+            sys.exit(1)
+
+        for path in paths:
+            header = headers[path]
+            if header["selfcheck"]:
                 self.run_selfcheck(
                     f"synth/{path.stem}",
                     str(path),
                     self.args.synthetic_timeout,
-                    skip_backends=skip_backends,
-                    require_jit=not interpreted,
-                    spec_folds=selfcheck_folds,
-                    want_compiles=want_compiles,
+                    skip_backends=header["skip_backends"],
+                    require_jit=not header["interpreted"],
+                    spec_folds=header["spec_folds"],
+                    want_compiles=header["want_compiles"],
                 )
             else:
                 self.run_synthetic_bench(
-                    str(path), self.args.synthetic_timeout,
+                    str(path), self.args.synthetic_timeout, header,
                 )
         # A fixture that loses its cpython reference also loses the
         # cpython/pypy output cross-check, so the count belongs in the summary
