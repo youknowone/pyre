@@ -4285,8 +4285,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // variant alone — `def _read_from_buffer(self, size=-1)` reaches the scan
     // with `size` as `Ref(<int object>)` and is exactly the shape that
     // miscompiled.
-    let callee_binds_an_unboxed_local = callee_arg_concretes.iter().any(|c| {
-        let classified = match *c {
+    let binding_is_unboxed = |concrete: ConcreteValue| {
+        let classified = match concrete {
             ConcreteValue::Ref(obj) => ConcreteValue::from_pyobj(obj),
             other => other,
         };
@@ -4294,7 +4294,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             classified,
             ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_)
         )
-    });
+    };
+    let callee_binds_an_unboxed_local = callee_arg_concretes
+        .iter()
+        .copied()
+        .any(&binding_is_unboxed);
     // Vararg/over-arity calls still use the ordinary residual path. A closure
     // is admissible when it has freevars only: the existing cell objects can
     // be threaded into this callee's own frame exactly as
@@ -5611,16 +5615,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             if !callee_code.cellvars.is_empty() {
                 return resolved_inline_decline(op.pc, line!());
             }
-            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
-            // identity residual call whose operands must be Ref (the codewriter
-            // PopJumpIfNone arm), then a branch guard.  When the multiframe inline
-            // int-specializes the tested local, the mid-body guard resume cannot
-            // source that operand's Ref form from the callee register banks
-            // (`collect_callee_active_boxes` would read a stale/mismatched box), so
-            // the encoded liveness stream disagrees with the decoder
-            // (`resume.rs decode_ref: unexpected tag`) and the caller frame is
-            // corrupted. Decline to the ordinary residual call until
-            // the multi-frame resume reboxes int-specialized identity operands.
+            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
+            // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
+            // result feeds the exitswitch -- no residual call and no boxed
+            // bool.  What the shape does need is the tested value popped as a
+            // Ref (`pop_ref_or_fresh`, the codewriter PopJumpIfNone arm).  When
+            // the multiframe inline int-specializes the tested local, the
+            // mid-body guard resume cannot source that operand's Ref form from
+            // the callee register banks (`collect_callee_active_boxes` would
+            // read a stale/mismatched box), so the encoded liveness stream
+            // disagrees with the decoder (`resume.rs decode_ref: unexpected
+            // tag`) and the caller frame is corrupted.  Decline to the ordinary
+            // residual call until the multi-frame resume reboxes
+            // int-specialized identity operands.
             // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
             // int bank, so no Ref rebox is needed.  A strict straight-line callee
             // has no branch at all, so this scan never fires for it.
@@ -5673,7 +5680,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             // frame is corrupted.  This is independent of kept
                             // depth: a statement-level `if x is None:` reads
                             // depth 1 and still carries it.
-                            || callee_binds_an_unboxed_local
+                            || match crate::liveness::branch_operand_local(callee_code, pc) {
+                                // The branch reads its operand straight out of
+                                // a parameter slot the body never reassigns, so
+                                // that one binding answers which bank holds it.
+                                // `if o is None:` over `def g(x, *, o=None)`
+                                // tests `o`; `x` being an int says nothing about
+                                // `o`.  The shape that miscompiled tests the int
+                                // itself -- `_read_from_buffer(self, size=-1)`
+                                // with `if size is None` -- and still declines.
+                                Some(local) if local < seeded_locals => {
+                                    binding_is_unboxed(callee_arg_concretes[local])
+                                }
+                                // Anything else on top of the stack is not
+                                // described by the incoming bindings, so keep
+                                // the whole-signature answer.
+                                _ => callee_binds_an_unboxed_local,
+                            }
                     )
                 });
                 if has_is_none_branch {
